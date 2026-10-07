@@ -127,7 +127,7 @@ contract NativeEthVaultTest is Test {
         assertEq(vault.currentRoot(), root);
         assertEq(address(vault).balance, uint256(UNITS) * 1 gwei);
         assertFalse(vault.usedNullifiers(99));
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
     }
 
@@ -143,7 +143,7 @@ contract NativeEthVaultTest is Test {
         assertEq(vault.currentRoot(), root);
         assertEq(address(vault).balance, uint256(UNITS) * 1 gwei);
         assertFalse(vault.usedNullifiers(99));
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
     }
 
@@ -160,7 +160,7 @@ contract NativeEthVaultTest is Test {
         assertEq(address(vault).balance, uint256(UNITS) * 1 gwei);
         assertEq(treasury.balance, 0);
         assertTrue(vault.usedNullifiers(99));
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.PendingWithdrawal));
         (bool exists,, uint256 nullifier, uint128 balance, address destination, uint64 retainedDeadline) =
             vault.pendingWithdrawals(0);
@@ -186,7 +186,7 @@ contract NativeEthVaultTest is Test {
 
     function test_nativeExpiryPayout() public {
         deposit();
-        (,, uint64 expiry,) = vault.notes(0);
+        (,, uint64 expiry,,) = vault.notes(0);
         vm.warp(expiry);
         vault.claimExpired(0, siblings);
         assertEq(treasury.balance, uint256(UNITS) * 1 gwei);

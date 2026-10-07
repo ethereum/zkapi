@@ -76,7 +76,7 @@ contract ZkApiVaultTest is Test {
         assertEq(user.balance, 700_000 gwei);
         assertEq(treasury.balance, 300_000 gwei);
         assertTrue(vault.usedNullifiers(99));
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.Closed));
     }
 
@@ -103,7 +103,7 @@ contract ZkApiVaultTest is Test {
         });
         vault.initiateEscapeWithdrawal(inputs, "", emptySiblings);
 
-        (,,, Types.NoteStatus pendingStatus) = vault.notes(0);
+        (,,, Types.NoteStatus pendingStatus,) = vault.notes(0);
         assertEq(uint256(pendingStatus), uint256(Types.NoteStatus.PendingWithdrawal));
         (bool exists,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
         assertTrue(exists);
@@ -119,7 +119,7 @@ contract ZkApiVaultTest is Test {
 
         assertEq(user.balance, 800_000 gwei);
         assertEq(treasury.balance, 200_000 gwei);
-        (,,, Types.NoteStatus finalStatus) = vault.notes(0);
+        (,,, Types.NoteStatus finalStatus,) = vault.notes(0);
         assertEq(uint256(finalStatus), uint256(Types.NoteStatus.Closed));
         (bool stillExists,,,,,) = vault.pendingWithdrawals(0);
         assertFalse(stillExists);
@@ -142,7 +142,7 @@ contract ZkApiVaultTest is Test {
 
         _initiateEscape(siblings);
         _challengeAndAssertRestored(request, siblings, escapeRoot);
-        (,,, Types.NoteStatus otherStatus) = vault.notes(1);
+        (,,, Types.NoteStatus otherStatus,) = vault.notes(1);
         assertEq(uint256(otherStatus), uint256(Types.NoteStatus.Active));
         assertEq(address(vault).balance, 2 * uint256(DEPOSIT) * 1 gwei);
     }
@@ -159,7 +159,7 @@ contract ZkApiVaultTest is Test {
 
         _initiateEscape(emptySiblings);
         _challengeAndAssertRestored(request, emptySiblings, escapeRoot);
-        (,,, Types.NoteStatus otherStatus) = vault.notes(1);
+        (,,, Types.NoteStatus otherStatus,) = vault.notes(1);
         assertEq(uint256(otherStatus), uint256(Types.NoteStatus.Closed));
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
@@ -170,7 +170,7 @@ contract ZkApiVaultTest is Test {
         vault.mutualClose(other, "", emptySiblings);
 
         _challengeAndAssertRestored(request, emptySiblings, request.activeRoot);
-        (,,, Types.NoteStatus otherStatus) = vault.notes(1);
+        (,,, Types.NoteStatus otherStatus,) = vault.notes(1);
         assertEq(uint256(otherStatus), uint256(Types.NoteStatus.Closed));
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
@@ -262,7 +262,7 @@ contract ZkApiVaultTest is Test {
 
     function _siblingsWithOtherLeaf(uint32 otherNoteId) private view returns (uint256[32] memory siblings) {
         siblings = emptySiblings;
-        (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(otherNoteId);
+        (bytes32 commitment, uint128 amount, uint64 expiryTs,,) = vault.notes(otherNoteId);
         siblings[0] = NoteLeafLib.computeLeaf(otherNoteId, commitment, amount, expiryTs);
     }
 
@@ -324,7 +324,7 @@ contract ZkApiVaultTest is Test {
     }
 
     function _assertPending() private view {
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.PendingWithdrawal));
         (bool exists,,,,,) = vault.pendingWithdrawals(0);
         assertTrue(exists);
@@ -342,7 +342,7 @@ contract ZkApiVaultTest is Test {
         vm.prank(treasury);
         vault.challengeEscapeWithdrawal(0, request, hex"cafe", siblings);
         assertEq(vault.currentRoot(), expectedRoot);
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
         (bool exists,,,,,) = vault.pendingWithdrawals(0);
         assertFalse(exists);
@@ -350,5 +350,114 @@ contract ZkApiVaultTest is Test {
         vm.warp(deadline);
         vm.expectRevert(Errors.NotPendingWithdrawal.selector);
         vault.finalizeEscapeWithdrawal(0);
+    }
+
+    function test_claimExpiredExtendsByPausedTimeDuringNoteLifetime() public {
+        // Pre-deposit pause should not count toward Alice's extension.
+        vault.pause();
+        vm.warp(block.timestamp + 5 days);
+        vault.unpause();
+        assertEq(vault.totalPausedTime(), 5 days);
+
+        _depositFirstNote();
+        (,, uint64 aliceExpiry,, uint64 aliceSnapshot) = vault.notes(0);
+        assertEq(aliceSnapshot, 5 days);
+
+        vault.pause();
+        vm.warp(block.timestamp + 2 days);
+        vault.unpause();
+
+        address bob = address(0xB0B);
+        vm.deal(bob, uint256(DEPOSIT) * 1 gwei);
+        uint256[32] memory bobSiblings = _siblingsWithOtherLeaf(0);
+        vm.prank(bob);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(43)), DEPOSIT, bobSiblings);
+        (,, uint64 bobExpiry,, uint64 bobSnapshot) = vault.notes(1);
+        assertEq(bobSnapshot, 7 days);
+
+        vault.pause();
+        vm.warp(block.timestamp + 3 days);
+        vault.unpause();
+        assertEq(vault.totalPausedTime(), 10 days);
+
+        // Alice lived through pauses #2+#3 (5d); Bob only through #3 (3d).
+        uint256 aliceExtension = uint256(vault.totalPausedTime()) - uint256(aliceSnapshot);
+        uint256 bobExtension = uint256(vault.totalPausedTime()) - uint256(bobSnapshot);
+        assertEq(aliceExtension, 5 days);
+        assertEq(bobExtension, 3 days);
+
+        uint256 aliceEffective = uint256(aliceExpiry) + aliceExtension;
+        uint256 bobEffective = uint256(bobExpiry) + bobExtension;
+
+        // Original expiry is not enough for either note.
+        uint256[32] memory aliceSiblings = _siblingsWithOtherLeaf(1);
+        uint256[32] memory bobSiblingsForClaim = _siblingsWithOtherLeaf(0);
+
+        vm.warp(uint256(aliceExpiry));
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(0, aliceSiblings);
+        vm.warp(uint256(bobExpiry));
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(1, bobSiblingsForClaim);
+
+        // Claim Alice first (longer extension from earlier deposit), then Bob.
+        vm.warp(aliceEffective - 1);
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(0, aliceSiblings);
+
+        vm.warp(aliceEffective);
+        vault.claimExpired(0, aliceSiblings);
+        (,,, Types.NoteStatus aliceStatus,) = vault.notes(0);
+        assertEq(uint256(aliceStatus), uint256(Types.NoteStatus.Closed));
+
+        vm.warp(bobEffective - 1);
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(1, emptySiblings);
+
+        vm.warp(bobEffective);
+        vault.claimExpired(1, emptySiblings);
+        (,,, Types.NoteStatus bobStatus,) = vault.notes(1);
+        assertEq(uint256(bobStatus), uint256(Types.NoteStatus.Closed));
+        assertEq(treasury.balance, 2 * uint256(DEPOSIT) * 1 gwei);
+    }
+
+    function test_claimExpiredBlockedWhilePausedPastOriginalExpiry() public {
+        _depositFirstNote();
+        (,, uint64 expiryTs,,) = vault.notes(0);
+
+        vault.pause();
+        vm.warp(uint256(expiryTs) + 1 days);
+
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(0, emptySiblings);
+
+        // Live pause continues to extend every second.
+        vm.warp(block.timestamp + 10 days);
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(0, emptySiblings);
+
+        vault.unpause();
+        // After unpause, extension freezes at the completed pause duration.
+        vm.warp(uint256(expiryTs) + vault.totalPausedTime());
+        vault.claimExpired(0, emptySiblings);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
+        assertEq(uint256(status), uint256(Types.NoteStatus.Closed));
+    }
+
+    function test_pauseCannotResetPausedAtWhileAlreadyPaused() public {
+        vault.pause();
+        uint64 firstPausedAt = vault.pausedAt();
+        vm.warp(block.timestamp + 1 days);
+        vm.expectRevert(Errors.Paused.selector);
+        vault.pause();
+        assertEq(vault.pausedAt(), firstPausedAt);
+
+        vault.unpause();
+        assertEq(vault.totalPausedTime(), 1 days);
+        assertEq(vault.pausedAt(), 0);
+        assertFalse(vault.paused());
+
+        vm.expectRevert(Errors.NotPaused.selector);
+        vault.unpause();
     }
 }
