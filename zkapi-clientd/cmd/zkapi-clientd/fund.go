@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -20,11 +21,15 @@ import (
 
 var errFundingWaitStopped = errors.New("stopped waiting; inspect saved status before continuing")
 
+// With --json, the validated quote is the only standard output; status text
+// moves here so scripts can read the quote ID without parsing prose.
+var walletStatusOutput io.Writer = os.Stderr
+
 func runFunding(ctx context.Context, c config.Config, args []string, out io.Writer) (result error) {
 	submitted := false
 	defer func() {
 		if result != nil && submitted {
-			result = fmt.Errorf("%w; recover saved progress with zkapi-clientd config and use the same --config-dir", result)
+			result = fmt.Errorf("%w; recover saved progress with zkapi-clientd fund --resume or zkapi-clientd config, and use the same --config-dir", result)
 		}
 	}()
 	if len(args) > 0 && args[0] == "return" {
@@ -35,6 +40,11 @@ func runFunding(ctx context.Context, c config.Config, args []string, out io.Writ
 	usdText := flags.String("usd", "", "USD amount converted once to a fixed ETH principal; prepare a quote")
 	approval := flags.String("approve", "", "approve the displayed quote ID")
 	resume := flags.Bool("resume", false, "recover the saved signed deposit without authorizing a new transaction")
+	jsonOutput := flags.Bool("json", false, "with --amount or --usd, print the validated quote as JSON on standard output and status text on standard error")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "Usage: zkapi-clientd fund [--usd N [--json] | --amount ETH [--json] | --approve QUOTE_ID | --resume]\n       zkapi-clientd fund return [--to ADDRESS [--amount ETH] [--json] | --approve QUOTE_ID | --resume]\nWithout options, show the funding address and saved progress. Requires a running daemon.\nA quote never signs; --approve signs only that exact unexpired quote.")
+		flags.PrintDefaults()
+	}
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -55,6 +65,13 @@ func runFunding(ctx context.Context, c config.Config, args []string, out io.Writ
 	}
 	if flags.NArg() != 0 || selected > 1 {
 		return errors.New("choose --amount, --usd, --approve, or --resume separately")
+	}
+	if *jsonOutput && *amountText == "" && *usdText == "" {
+		return errors.New("--json applies only to --amount or --usd quotes")
+	}
+	quoteOut := out
+	if *jsonOutput {
+		out = walletStatusOutput
 	}
 	var amount, usd uint64
 	var err error
@@ -106,6 +123,9 @@ func runFunding(ctx context.Context, c config.Config, args []string, out io.Writ
 			return errors.New("deposit quote changed the selected USD amount; request a fresh quote")
 		}
 		printPaymentQuote(out, quote, "zkapi-clientd fund")
+		if *jsonOutput {
+			return writeScriptQuote(quoteOut, quote)
+		}
 		return nil
 	}
 	if *approval != "" {

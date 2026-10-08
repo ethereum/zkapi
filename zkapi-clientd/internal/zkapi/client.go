@@ -67,10 +67,10 @@ func (e *Error) Error() string {
 		return "Sepolia password is missing or incorrect; stop the daemon and run zkapi-clientd config to enter the current shared password"
 	}
 	if e.Code == "withdrawal_conflict" || e.Code == "withdrawal_pending" {
-		return "zkAPI withdrawal is reserved; run zkapi-clientd config --menu and choose withdraw to resume the saved destination"
+		return "zkAPI withdrawal is reserved; run zkapi-clientd withdraw or zkapi-clientd config --menu to resume the saved destination"
 	}
 	if e.Status == http.StatusPaymentRequired {
-		return "zkAPI private balance needs funding; run zkapi-clientd config to add funding"
+		return "zkAPI private balance needs funding; run zkapi-clientd config or zkapi-clientd fund to add funding"
 	}
 	if e.Status == http.StatusConflict {
 		return "zkAPI wallet has a pending lease; wait for settlement or recover it"

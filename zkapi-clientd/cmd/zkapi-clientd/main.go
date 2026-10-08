@@ -64,8 +64,10 @@ func run(args []string) error {
 		help()
 		return nil
 	}
-	if args[0] != "config" && args[0] != "serve" {
-		return errors.New("unknown command; use zkapi-clientd config or zkapi-clientd serve (--help for usage)")
+	switch args[0] {
+	case "config", "serve", "fund", "withdraw":
+	default:
+		return errors.New("unknown command; use zkapi-clientd config, serve, fund, or withdraw (--help for usage)")
 	}
 	if dir == "" {
 		dir, err = config.DefaultDir()
@@ -84,8 +86,11 @@ func run(args []string) error {
 		defer ui.Close()
 		return runConfigure(ctx, dir, args[1:], ui, os.Stdout)
 	}
+	if args[0] == "fund" || args[0] == "withdraw" {
+		return runWalletCommand(dir, args[0], args[1:], os.Stdout)
+	}
 	if args[0] == "serve" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-		fmt.Println("Usage: zkapi-clientd serve\nRun the saved configuration. Run zkapi-clientd config to configure missing prerequisites.")
+		fmt.Println("Usage: zkapi-clientd serve [--allow-unfunded]\nRun the saved configuration. Run zkapi-clientd config to configure missing prerequisites.\n  --allow-unfunded  keep running while the wallet cannot spend (no deposit, empty balance, or reserved withdrawal);\n                    inference returns funding_required or withdrawal_pending until it can")
 		return nil
 	}
 	c, err := config.Load(dir)
@@ -95,12 +100,50 @@ func run(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	expected := c
-	c, err = serveConfig(c, args[1:])
+	c, allowUnfunded, err := serveConfig(c, args[1:])
 	if err != nil {
 		return err
 	}
-	return runConfiguredServe(ctx, dir, c, expected, os.Stdout)
+	return runConfiguredServe(ctx, dir, c, expected, os.Stdout, allowUnfunded)
 
+}
+
+// Wallet commands are clients of the running daemon's authenticated admin API.
+// Quoting never signs; only --approve with the exact displayed quote ID spends.
+func runWalletCommand(dir, command string, args []string, out io.Writer) error {
+	c, err := config.Load(dir)
+	if helpRequested(args) {
+		// Help wins even where the flag parser would read it as a value
+		// (fund --approve --help), so it never runs the command.
+		help := []string{"--help"}
+		if command == "fund" && len(args) > 0 && args[0] == "return" {
+			help = []string{"return", "--help"}
+		}
+		args = help
+	} else if err != nil {
+		return configurationRequired(err)
+	}
+	// Help needs no configuration: flag parsing returns before any request.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if command == "fund" {
+		err = runFunding(ctx, c, args, out)
+	} else {
+		err = runWithdrawal(ctx, c, args, out)
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		return nil
+	}
+	return err
+}
+
+func helpRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "-help" || arg == "--help" {
+			return true
+		}
+	}
+	return false
 }
 
 func help() {
@@ -108,8 +151,12 @@ func help() {
 
   config                 Show status, configure or edit settings, and prepare the wallet
   serve                  Run inference using the saved configuration
+                         (--allow-unfunded keeps it running until the wallet can spend)
+  fund                   Quote, approve, or resume a deposit through the running daemon
+  withdraw               Quote, approve, or resume a withdrawal through the running daemon
 
 Run zkapi-clientd config --help for configuration options.
+Run zkapi-clientd fund --help or zkapi-clientd withdraw --help for wallet options.
 Run zkapi-clientd --version to show the installed version.
 Config: ZKAPI_CLIENTD_CONFIG_DIR or the OS user config directory / zkapi-clientd.
 Mainnet is the default; Sepolia keeps a separate wallet.
@@ -147,18 +194,19 @@ func initialize(dir string, args []string) error {
 }
 
 // Serving uses the saved network without rewriting wallet state.
-func serveConfig(c config.Config, args []string) (config.Config, error) {
+func serveConfig(c config.Config, args []string) (config.Config, bool, error) {
 	f := flag.NewFlagSet("serve", flag.ContinueOnError)
+	allowUnfunded := f.Bool("allow-unfunded", false, "keep running while the wallet cannot spend; inference returns funding_required until it can")
 	if err := f.Parse(args); err != nil {
-		return config.Config{}, err
+		return config.Config{}, false, err
 	}
 	if f.NArg() != 0 {
-		return config.Config{}, errors.New("serve accepts no arguments; use zkapi-clientd config to change settings")
+		return config.Config{}, false, errors.New("serve accepts no arguments; use zkapi-clientd config to change settings")
 	}
 	if err := config.Validate(c); err != nil {
-		return config.Config{}, err
+		return config.Config{}, false, err
 	}
-	return c, nil
+	return c, *allowUnfunded, nil
 }
 
 func zkConfig(c config.Config, client *http.Client) zkapi.Config {
@@ -183,10 +231,10 @@ func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.
 		}
 		switch remote.Status {
 		case http.StatusPaymentRequired:
-			return nil, &server.BackendError{Status: 402, Code: "funding_required", Message: "The private balance needs funding. Run zkapi-clientd config to add funding."}
+			return nil, &server.BackendError{Status: 402, Code: "funding_required", Message: "The private balance needs funding. Run zkapi-clientd config or zkapi-clientd fund to add funding."}
 		case http.StatusConflict:
 			if remote.Code == "withdrawal_pending" || remote.Code == "withdrawal_conflict" {
-				return nil, &server.BackendError{Status: 409, Code: "withdrawal_pending", Message: "The private balance is reserved for withdrawal. Run zkapi-clientd config --menu and choose withdraw to recover the saved destination."}
+				return nil, &server.BackendError{Status: 409, Code: "withdrawal_pending", Message: "The private balance is reserved for withdrawal. Run zkapi-clientd withdraw, or zkapi-clientd config --menu and choose withdraw, to recover the saved destination."}
 			}
 			return nil, &server.BackendError{Status: 409, Code: "wallet_conflict", Message: "The wallet could not safely prepare fresh anonymous access. Run zkapi-clientd config to check its state."}
 		}

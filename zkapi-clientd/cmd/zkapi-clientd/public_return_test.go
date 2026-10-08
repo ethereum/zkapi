@@ -36,6 +36,32 @@ func TestPublicReturnQuotesExactWeiWithoutApproval(t *testing.T) {
 	}
 }
 
+func TestPublicReturnJSONPrintsOnlyTheQuoteOnStandardOutput(t *testing.T) {
+	s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/admin/return/quote" {
+			t.Errorf("quoting authorized a transaction: %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(paymentTestQuote("return"))
+	}))
+	defer s.Close()
+	var out, status bytes.Buffer
+	previous := walletStatusOutput
+	walletStatusOutput = &status
+	defer func() { walletStatusOutput = previous }()
+	if err := runFunding(context.Background(), fundingTestConfig(s), []string{"return", "--to", withdrawalTestDestination, "--json"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	quote := decodeScriptQuote(t, &out, "id", "kind", "network", "address", "destination", "amount_wei", "max_fee_wei", "required_total_wei", "shortfall_wei", "expires_at")
+	if quote["kind"] != "return" || quote["amount_wei"] != "750001000000000" || !strings.Contains(status.String(), "--approve "+testQuoteID) {
+		t.Fatalf("unexpected quote %v or status %s", quote, status.String())
+	}
+	for _, args := range [][]string{{"return", "--json"}, {"return", "--json", "--resume"}, {"return", "--json", "--approve", testQuoteID}} {
+		if err := runFunding(context.Background(), fundingTestConfig(s), args, &bytes.Buffer{}); err == nil {
+			t.Fatalf("%v accepted --json without a quote", args)
+		}
+	}
+}
+
 func TestPublicReturnApprovalAndResumeRetainAmountAndRecipient(t *testing.T) {
 	for _, mode := range []string{"approve", "resume"} {
 		for _, mutation := range []string{"", "destination", "amount"} {

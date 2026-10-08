@@ -43,7 +43,7 @@ func runPublicReturn(ctx context.Context, c config.Config, args []string, out io
 	submitted := false
 	defer func() {
 		if result != nil && submitted {
-			result = fmt.Errorf("%w; recover saved progress with zkapi-clientd config --menu, choose return, and use the same --config-dir", result)
+			result = fmt.Errorf("%w; recover saved progress with zkapi-clientd fund return --resume or zkapi-clientd config --menu (choose return), and use the same --config-dir", result)
 		}
 	}()
 	flags := flag.NewFlagSet("fund return", flag.ContinueOnError)
@@ -51,6 +51,11 @@ func runPublicReturn(ctx context.Context, c config.Config, args []string, out io
 	amountText := flags.String("amount", "", "exact ETH amount (up to 18 decimals); omit to sweep an EOA after reserving fees")
 	approve := flags.String("approve", "", "approve the displayed return quote ID")
 	resume := flags.Bool("resume", false, "recover the saved signed public return")
+	jsonOutput := flags.Bool("json", false, "with --to, print the validated quote as JSON on standard output and status text on standard error")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "Usage: zkapi-clientd fund return [--to ADDRESS [--amount ETH] [--json] | --approve QUOTE_ID | --resume]\nReturn public ETH from the local signing address. Requires a running daemon.")
+		flags.PrintDefaults()
+	}
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -65,6 +70,13 @@ func runPublicReturn(ctx context.Context, c config.Config, args []string, out io
 	}
 	if flags.NArg() != 0 || (*amountText != "" && *to == "") || (*approve != "" && (*to != "" || *resume)) || (*resume && *to != "") {
 		return errors.New("use --to ADDRESS [--amount ETH], --approve QUOTE_ID, or --resume separately")
+	}
+	if *jsonOutput && *to == "" {
+		return errors.New("--json applies only to --to quotes")
+	}
+	quoteOut := out
+	if *jsonOutput {
+		out = walletStatusOutput
 	}
 	var err error
 	destination, amount := "", ""
@@ -96,6 +108,9 @@ func runPublicReturn(ctx context.Context, c config.Config, args []string, out io
 			return errors.New("return quote changed the destination or amount")
 		}
 		printPaymentQuote(out, q, "zkapi-clientd fund return")
+		if *jsonOutput {
+			return writeScriptQuote(quoteOut, q)
+		}
 		return nil
 	}
 	path, method := "/admin/return", http.MethodGet

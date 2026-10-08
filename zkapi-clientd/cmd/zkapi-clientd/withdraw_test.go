@@ -107,6 +107,67 @@ func TestWithdrawDestinationOnlyPreparesBoundQuote(t *testing.T) {
 	}
 }
 
+func TestWithdrawJSONPrintsOnlyTheQuoteOnStandardOutput(t *testing.T) {
+	s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if r.URL.Path != "/admin/withdrawal/quote" {
+				t.Errorf("quoting authorized a transaction: %s", r.URL.Path)
+			}
+			_ = json.NewEncoder(w).Encode(paymentTestQuote("withdrawal"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(withdrawalTestStatus("ready"))
+	}))
+	defer s.Close()
+	var out, status bytes.Buffer
+	previous := walletStatusOutput
+	walletStatusOutput = &status
+	defer func() { walletStatusOutput = previous }()
+	if err := runWithdrawal(context.Background(), withdrawalTestConfig(s), []string{"--to", withdrawalTestDestination, "--json"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	quote := decodeScriptQuote(t, &out, "id", "kind", "network", "address", "destination", "amount_wei", "max_fee_wei", "required_total_wei", "shortfall_wei", "expires_at")
+	if quote["id"] != testQuoteID || quote["kind"] != "withdraw" || quote["amount_wei"] != "99971000000000" || !strings.EqualFold(quote["destination"].(string), withdrawalTestDestination) {
+		t.Fatalf("unexpected quote: %v", quote)
+	}
+	if !strings.Contains(status.String(), "--approve "+testQuoteID) {
+		t.Fatalf("status text missing: %s", status.String())
+	}
+}
+
+func TestWithdrawJSONOnlyAppliesToQuotes(t *testing.T) {
+	c := config.Config{Backend: "zkapi", Listen: "127.0.0.1:1"}
+	for _, args := range [][]string{{"--json"}, {"--json", "--resume"}, {"--json", "--approve", testQuoteID}, {"--json", "--to", withdrawalTestDestination, "--confirm", "0x" + strings.Repeat("1", 64)}} {
+		if err := runWithdrawal(context.Background(), c, args, &bytes.Buffer{}); err == nil || strings.Contains(err.Error(), "unavailable") {
+			t.Fatalf("%v reached the daemon: %v", args, err)
+		}
+	}
+}
+
+func TestWithdrawJSONFailsWithoutANewQuote(t *testing.T) {
+	for _, phase := range []string{"withdrawal_pending", "confirming", "complete"} {
+		t.Run(phase, func(t *testing.T) {
+			s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("--json without a quote submitted %s", r.URL.Path)
+				}
+				state := withdrawalTestStatus(phase)
+				state["transaction_hash"] = "0x" + strings.Repeat("a", 64)
+				_ = json.NewEncoder(w).Encode(state)
+			}))
+			defer s.Close()
+			var out bytes.Buffer
+			previous := walletStatusOutput
+			walletStatusOutput = io.Discard
+			defer func() { walletStatusOutput = previous }()
+			err := runWithdrawal(context.Background(), withdrawalTestConfig(s), []string{"--to", withdrawalTestDestination, "--json"}, &out)
+			if err == nil || !strings.Contains(err.Error(), "no quote prepared") || out.Len() != 0 {
+				t.Fatalf("stdout %q, error %v", out.String(), err)
+			}
+		})
+	}
+}
+
 func TestWithdrawSavedDestinationCannotChange(t *testing.T) {
 	for _, phase := range []string{"waiting_settlement", "waiting_funds", "withdrawal_pending", "confirming", "reverted"} {
 		t.Run(phase, func(t *testing.T) {

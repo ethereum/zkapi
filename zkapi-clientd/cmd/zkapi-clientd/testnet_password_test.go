@@ -180,7 +180,7 @@ func TestConfiguredServePasswordFailureCannotStartCompanionOrFunding(t *testing.
 		t.Fatal(err)
 	}
 	listener.Close()
-	err = runConfiguredServe(context.Background(), dir, c, c, io.Discard)
+	err = runConfiguredServe(context.Background(), dir, c, c, io.Discard, false)
 	if err == nil || !strings.Contains(err.Error(), "Run zkapi-clientd config") || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("serve did not return password setup guidance: %v", err)
 	}

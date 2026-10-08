@@ -27,7 +27,7 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 			result = errWithdrawalWaitStopped
 		}
 		if result != nil && submitted {
-			result = fmt.Errorf("%w; recover saved progress with zkapi-clientd config --menu, choose withdraw, and use the same --config-dir", result)
+			result = fmt.Errorf("%w; recover saved progress with zkapi-clientd withdraw or zkapi-clientd config --menu (choose withdraw), and use the same --config-dir", result)
 		}
 	}()
 	flags := flag.NewFlagSet("withdraw", flag.ContinueOnError)
@@ -35,6 +35,11 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	confirmationText := flags.String("confirm", "", "confirm an independently submitted matching withdrawal after a finalized local revert")
 	approval := flags.String("approve", "", "approve the displayed withdrawal quote ID")
 	resume := flags.Bool("resume", false, "recover a saved signed withdrawal without authorizing a new transaction")
+	jsonOutput := flags.Bool("json", false, "with --to, print a newly prepared quote as JSON on standard output and status text on standard error")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "Usage: zkapi-clientd withdraw [--to ADDRESS [--json] | --approve QUOTE_ID | --resume]\nWithout options, show the private balance and saved progress. Requires a running daemon.\nA quote never signs; --approve signs only that exact unexpired quote.")
+		flags.PrintDefaults()
+	}
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -61,6 +66,13 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	})
 	if confirmationSet && (!destinationSet || !validWithdrawalTransactionHash(*confirmationText)) {
 		return errors.New("--confirm requires --to and a valid 32-byte transaction hash")
+	}
+	if *jsonOutput && (!destinationSet || confirmationSet) {
+		return errors.New("--json applies only to --to quotes")
+	}
+	quoteOut := out
+	if *jsonOutput {
+		out = walletStatusOutput
 	}
 	destination := ""
 	var err error
@@ -96,6 +108,12 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 		} else if state.Phase != "reverted" {
 			return errors.New("--confirm is available only after the saved withdrawal finalized as reverted")
 		}
+	}
+	if *jsonOutput && (state.Phase == "complete" || state.Phase == "withdrawal_pending" || state.Phase == "confirming") {
+		// Standard output must hold a quote; never exit successfully or
+		// resume a signed withdrawal without printing one.
+		withdrawalResumeInstructions(out, state)
+		return fmt.Errorf("no quote prepared; the saved withdrawal is %s", state.Phase)
 	}
 	if state.Phase == "complete" {
 		if destination != "" && !strings.EqualFold(destination, state.Destination) {
@@ -174,6 +192,9 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 				return errors.New("withdrawal quote changed the selected note or destination")
 			}
 			printPaymentQuote(out, quote, "zkapi-clientd withdraw")
+			if *jsonOutput {
+				return writeScriptQuote(quoteOut, quote)
+			}
 			return nil
 		}
 	}

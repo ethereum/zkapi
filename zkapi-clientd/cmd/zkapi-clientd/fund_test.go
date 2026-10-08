@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -127,6 +129,66 @@ func TestFundAmountOnlyQuotesExactDeposit(t *testing.T) {
 	}
 	if strings.Join(methods, ",") != "GET /admin/funding/address,POST /admin/funding/quote" {
 		t.Fatalf("wrong funding sequence: %v", methods)
+	}
+}
+
+func TestFundJSONPrintsOnlyTheQuoteOnStandardOutput(t *testing.T) {
+	s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			if r.URL.Path != "/admin/funding/quote" {
+				t.Errorf("quoting authorized a transaction: %s", r.URL.Path)
+			}
+			q := paymentTestQuote("deposit")
+			q.InputMicroUSD = 5_000_000
+			_ = json.NewEncoder(w).Encode(q)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(fundingTestStatus("ready"))
+	}))
+	defer s.Close()
+	var out, status bytes.Buffer
+	previous := walletStatusOutput
+	walletStatusOutput = &status
+	defer func() { walletStatusOutput = previous }()
+	if err := runFunding(context.Background(), fundingTestConfig(s), []string{"--usd", "5", "--json"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	quote := decodeScriptQuote(t, &out, "id", "kind", "network", "address", "amount_wei", "max_fee_wei", "required_total_wei", "shortfall_wei", "expires_at")
+	if quote["id"] != testQuoteID || quote["kind"] != "fund" || quote["network"] != "mainnet" || quote["amount_wei"] != "750001000000000" || quote["max_fee_wei"] != "30000" || quote["required_total_wei"] != "750001000025000" || quote["shortfall_wei"] != "0" {
+		t.Fatalf("unexpected quote: %v", quote)
+	}
+	if !strings.Contains(status.String(), "--approve "+testQuoteID) || !strings.Contains(status.String(), "Quoting does not sign") {
+		t.Fatalf("status text missing: %s", status.String())
+	}
+}
+
+// decodeScriptQuote requires exactly one JSON object with exactly the
+// documented keys, so wallet internals cannot leak into script output.
+func decodeScriptQuote(t *testing.T, out *bytes.Buffer, keys ...string) map[string]any {
+	t.Helper()
+	var quote map[string]any
+	decoder := json.NewDecoder(out)
+	if err := decoder.Decode(&quote); err != nil || decoder.More() {
+		t.Fatalf("standard output is not exactly one JSON object: %v", err)
+	}
+	got := make([]string, 0, len(quote))
+	for key := range quote {
+		got = append(got, key)
+	}
+	sort.Strings(got)
+	sort.Strings(keys)
+	if !reflect.DeepEqual(got, keys) {
+		t.Fatalf("quote keys = %v, want %v", got, keys)
+	}
+	return quote
+}
+
+func TestFundJSONOnlyAppliesToQuotes(t *testing.T) {
+	c := config.Config{Backend: "zkapi", Listen: "127.0.0.1:1"}
+	for _, args := range [][]string{{"--json"}, {"--json", "--resume"}, {"--json", "--approve", testQuoteID}} {
+		if err := runFunding(context.Background(), c, args, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "--json applies only") {
+			t.Fatalf("%v: %v", args, err)
+		}
 	}
 }
 

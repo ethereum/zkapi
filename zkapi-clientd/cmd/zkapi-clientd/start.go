@@ -218,6 +218,7 @@ type startOptions struct {
 	network, usd, model, listen        string
 	prepared                           *config.Config
 	setupOnly, checkOnly, quietStartup bool
+	allowUnfunded                      bool // serve --allow-unfunded; only changes the resume hint here
 }
 
 func parseStartOptions(args []string) (startOptions, error) {
@@ -480,7 +481,8 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 	readyCancel()
 	clearSetupProgress(ui)
 	err = runtime.fund(life, c, options.usd, options.model, ui)
-	if err != nil {
+	waiting := errors.Is(err, errWalletNotReady)
+	if err != nil && !waiting {
 		return err
 	}
 	if err := life.Err(); err != nil {
@@ -489,14 +491,22 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 	if options.setupOnly {
 		return nil
 	}
-	ui.Printf("\nReady for inference.\n")
+	if waiting {
+		ui.Printf("\nLocal API running; inference is unavailable until the wallet can spend.\n")
+	} else {
+		ui.Printf("\nReady for inference.\n")
+	}
 	showClientConnection(c, ui)
 	showCustomProfileHint(dir, ui)
 	if attached {
 		ui.Printf("The existing daemon continues running.\n")
 		return nil
 	}
-	ui.Printf("Leave this terminal running. Ctrl+C stops the daemon; run zkapi-clientd serve to resume.\n")
+	resume := "zkapi-clientd serve"
+	if options.allowUnfunded {
+		resume += " --allow-unfunded"
+	}
+	ui.Printf("Leave this terminal running. Ctrl+C stops the daemon; run %s to resume.\n", resume)
 	logs.enable()
 	result = <-done
 	done = nil

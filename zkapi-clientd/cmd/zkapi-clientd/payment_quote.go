@@ -126,6 +126,35 @@ func requestPaymentQuote(ctx context.Context, c config.Config, method, path, kin
 	return q, nil
 }
 
+// scriptQuote is the stable --json form of a validated quote: what a script
+// needs to check and approve it. Commitments, nonces, note IDs, deployment and
+// gas details stay internal.
+type scriptQuote struct {
+	ID               string `json:"id"`
+	Kind             string `json:"kind"`
+	Network          string `json:"network"`
+	Address          string `json:"address"`
+	Destination      string `json:"destination,omitempty"`
+	AmountWei        string `json:"amount_wei"`
+	MaxFeeWei        string `json:"max_fee_wei"`
+	RequiredTotalWei string `json:"required_total_wei"`
+	ShortfallWei     string `json:"shortfall_wei"`
+	ExpiresAt        int64  `json:"expires_at"`
+}
+
+func writeScriptQuote(w io.Writer, q zkapi.AddressPaymentQuote) error {
+	amount := q.PrincipalWei
+	if q.Kind == "withdrawal" {
+		amount = new(big.Int).Mul(new(big.Int).SetUint64(q.Amount), big.NewInt(1_000_000_000)).String()
+	}
+	network := "mainnet"
+	if q.ChainID == 11155111 {
+		network = "sepolia"
+	}
+	kind := map[string]string{"deposit": "fund", "withdrawal": "withdraw", "return": "return"}[q.Kind]
+	return json.NewEncoder(w).Encode(scriptQuote{ID: q.ID, Kind: kind, Network: network, Address: q.Address, Destination: q.Destination, AmountWei: amount, MaxFeeWei: q.FeeReserveWei, RequiredTotalWei: q.RequiredTotalWei, ShortfallWei: q.ShortfallWei, ExpiresAt: q.ExpiresAt})
+}
+
 func printPaymentQuote(out io.Writer, q zkapi.AddressPaymentQuote, command string) {
 	if _, guided := out.(setupUIWriter); guided {
 		command = ""

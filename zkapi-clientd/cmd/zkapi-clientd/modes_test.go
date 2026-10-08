@@ -19,12 +19,16 @@ func TestServeUsesSavedZKAPIWithoutChangingWalletConfiguration(t *testing.T) {
 	c.ZKAPI.Network = "sepolia"
 	c.ZKAPI.Binary = "/missing/companion"
 	c.ZKAPI.ProofSetupDir = "/missing/proof-assets"
-	got, err := serveConfig(c, nil)
-	if err != nil || !reflect.DeepEqual(got, c) {
-		t.Fatalf("serve changed wallet configuration: %v", err)
+	got, allowUnfunded, err := serveConfig(c, nil)
+	if err != nil || !reflect.DeepEqual(got, c) || allowUnfunded {
+		t.Fatalf("serve changed wallet configuration or defaulted to unfunded serving: %v", err)
 	}
-	for _, args := range [][]string{{"--backend", "both"}, {"--backend", ""}, {"--backend", "ticket", "unexpected"}, {"--network", "sepolia"}} {
-		if _, err := serveConfig(c, args); err == nil {
+	got, allowUnfunded, err = serveConfig(c, []string{"--allow-unfunded"})
+	if err != nil || !reflect.DeepEqual(got, c) || !allowUnfunded {
+		t.Fatalf("--allow-unfunded changed wallet configuration or was ignored: %v", err)
+	}
+	for _, args := range [][]string{{"--backend", "both"}, {"--backend", ""}, {"--backend", "ticket", "unexpected"}, {"--network", "sepolia"}, {"--allow-unfunded", "unexpected"}} {
+		if _, _, err := serveConfig(c, args); err == nil {
 			t.Fatalf("accepted invalid serve arguments %q", args)
 		}
 	}

@@ -1,6 +1,6 @@
 # Client configuration and use
 
-The public commands are `zkapi-clientd config` and `zkapi-clientd serve`.
+The public commands are `zkapi-clientd config`, `serve`, `fund` and `withdraw`.
 The client only supports zkAPI private ETH balances. Ticket issuance, import,
 redemption and ticket-based inference are not included.
 
@@ -56,6 +56,9 @@ zkapi-clientd config --api-key          # show that key when requested
 zkapi-clientd config --key-reuse-window-seconds 0  # fresh key per inference request
 ```
 
+To fund from a script instead, see
+[scripted funding and withdrawal](#scripted-funding-and-withdrawal).
+
 Use the arrow keys (or `j`/`k`) and Enter to select wallet actions and networks.
 Esc or `q` cancels a selection. Text prompts remain available when output is
 redirected. Ctrl+C stops safely and preserves saved progress; run
@@ -65,6 +68,86 @@ redirected. Ctrl+C stops safely and preserves saved progress; run
 to `config`. Configuration stops temporary services it starts; an existing
 compatible service it reused remains running. Stop a running service before
 editing its configuration.
+
+By default `serve` exits when the wallet cannot spend: before the first
+deposit, with an empty private balance, or while a withdrawal is reserved.
+`serve --allow-unfunded` logs a warning instead and keeps running, without
+reporting itself ready for inference. Inference returns `402 funding_required`
+(or `409 withdrawal_pending`) until the wallet can spend, and a deposit made
+through the running daemon takes effect without a restart. Companion and wallet
+status errors still stop `serve`.
+
+## Scripted funding and withdrawal
+
+On a host without a terminal, `zkapi-clientd config --network mainnet` creates
+the profile, then stops with an error at the first wallet question without
+spending anything. Start `serve --allow-unfunded` (for example as a service,
+see [background services](CLI_PACKAGING.md#platform-packages-and-background-services))
+and fund the wallet with `fund`.
+
+`fund` and `withdraw` never read the terminal. They act through the running
+daemon (`serve`, a background service, or a temporary `config` daemon) and its
+authenticated local admin API, using the API key in `config.json` and the
+owner-only `management-token` file. Run them as the service user with the same
+`--config-dir`. Anyone who can read that directory can authorize payments, as
+with the admin API; keep it private.
+
+Every payment takes two steps:
+
+1. A quote (`fund --usd N`, `fund --amount ETH`, `withdraw --to ADDRESS` or
+   `fund return --to ADDRESS`)
+   shows the fixed amount, destination, local signing address and maximum
+   network fee. It signs nothing.
+2. `--approve QUOTE_ID` signs and broadcasts only that exact quote, if it is
+   still the saved quote and has not expired. Quotes expire after 30 seconds,
+   and a new quote replaces the previous one.
+
+Approval waits until the deposit is active, or until the withdrawal is final
+(about 15 minutes). If it is interrupted, `--resume` recovers the saved signed
+transaction and never authorizes another. Without options, each command shows
+the address, balances and saved progress. Commands exit with a nonzero status
+on failure.
+
+Add `--json` to a quote to print it as one JSON object on standard output,
+with status text on standard error. If no new quote is prepared, for example
+because a signed withdrawal is already saved, the command exits nonzero and
+prints nothing on standard output. Amounts are decimal strings in wei.
+
+| Key | Value |
+| --- | --- |
+| `id` | Quote ID to pass to `--approve` |
+| `kind` | `fund`, `withdraw` or `return` |
+| `network` | `mainnet` or `sepolia` |
+| `address` | Local signing address that pays fees (and the deposit) |
+| `destination` | Recipient; `withdraw` and `return` only |
+| `amount_wei` | Fixed deposit principal, withdrawn private balance, or returned amount |
+| `max_fee_wei` | Maximum network fee approved with the quote |
+| `required_total_wei` | Public ETH the signing address needs for this quote: the deposit or returned amount (none for `withdraw`) plus the required network fee, which can be lower than `max_fee_wei` |
+| `shortfall_wei` | ETH still missing on the signing address; `"0"` when funded |
+| `expires_at` | Expiry as a Unix time in milliseconds |
+
+The wallet holds one note, and a note cannot be topped up. To add funds after
+a deposit, withdraw the note (for example to an address you control), then fund
+a new one. A withdrawal cannot be quoted while an inference key is still
+settling. Settlement starts when the key reuse window ends (60 seconds by
+default), so retry `withdraw --to` after that. `fund return --to ADDRESS`
+sends public ETH left on the local signing address, with the same quote and
+`--approve` steps.
+
+```sh
+# Show the local signing address. Send it ETH for the deposit plus network fees.
+zkapi-clientd fund
+
+# Quote a $20 deposit and approve that exact quote once the address is funded.
+quote=$(zkapi-clientd fund --usd 20 --json)
+if [ "$(printf '%s' "$quote" | jq -r .shortfall_wei)" = 0 ]; then
+  zkapi-clientd fund --approve "$(printf '%s' "$quote" | jq -r .id)"
+fi
+
+# Withdraw the full private balance, closing the note.
+quote=$(zkapi-clientd withdraw --to 0xYourAddress --json)
+zkapi-clientd withdraw --approve "$(printf '%s' "$quote" | jq -r .id)"
+```
 
 ## Sepolia
 
@@ -140,6 +223,9 @@ Returning `all` requires an ordinary Ethereum account with no deployed code.
 For a delegated or contract recipient, choose an exact ETH amount and leave
 room for the displayed maximum fee. The exact-amount path still simulates the
 transfer and requires destination, amount and fee approval.
+
+`zkapi-clientd withdraw` and `zkapi-clientd fund return` do the same from a
+script; see [scripted funding and withdrawal](#scripted-funding-and-withdrawal).
 
 ## Inference and activity
 

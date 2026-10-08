@@ -506,6 +506,53 @@ func TestGuidedStartOwnedDaemonRemainsForegroundAndStopsOnCancel(t *testing.T) {
 	}
 }
 
+func TestUnfundedServeKeepsRunningWithoutReportingReady(t *testing.T) {
+	dir, _ := startTestConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ui := &startTestUI{}
+	var serving atomic.Bool
+	runtime := startRuntime{
+		probe: func(context.Context, config.Config) (bool, error) { return serving.Load(), nil },
+		serve: func(ctx context.Context, _ string, _ config.Config, _ io.Writer) error {
+			serving.Store(true)
+			<-ctx.Done()
+			return nil
+		},
+		companion: func(context.Context, config.Config) error { return nil },
+		fund:      func(context.Context, config.Config, string, string, setupPrompter) error { return errWalletNotReady },
+		interval:  time.Millisecond, timeout: time.Second,
+	}
+	result := make(chan error, 1)
+	go func() { result <- guidedStart(ctx, dir, startOptions{allowUnfunded: true}, ui, io.Discard, runtime) }()
+	deadline := time.After(2 * time.Second)
+	for {
+		ui.mu.Lock()
+		text := ui.output.String()
+		ui.mu.Unlock()
+		if strings.Contains(text, "Leave this terminal running") {
+			if !strings.Contains(text, "Local API running; inference is unavailable until the wallet can spend.") || strings.Contains(text, "Ready for inference") {
+				t.Fatalf("unfunded serve reported readiness: %s", text)
+			}
+			if !strings.Contains(text, "run zkapi-clientd serve --allow-unfunded to resume") {
+				t.Fatalf("resume hint drops --allow-unfunded: %s", text)
+			}
+			break
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("unfunded serve stopped: %v", err)
+		case <-deadline:
+			t.Fatalf("unfunded serve never started: %s", text)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGuidedStartReportsOwnedDaemonFailure(t *testing.T) {
 	dir, _ := startTestConfig(t)
 	want := errors.New("companion binary is missing")

@@ -42,6 +42,8 @@ To update, stop `serve`, rerun the install command, then start `serve` again. Yo
 
 To withdraw, run `zkapi-clientd config --menu` and choose `withdraw`. It asks for the destination and waits for extra ETH for fees only if needed.
 
+For unattended use (a background service, container, CI job or script), `serve --allow-unfunded` starts before the wallet is funded, and `zkapi-clientd fund` and `zkapi-clientd withdraw` manage the wallet through the running daemon without prompts. Every payment is a quote followed by `--approve` with that exact quote ID. See [scripted funding and withdrawal](docs/CLI_ZKAPI.md#scripted-funding-and-withdrawal).
+
 [More options, including Tor, Sepolia and Docker clients](docs/CLI_ZKAPI.md) · [Installation details](docs/CLI_PACKAGING.md) · [Privacy](docs/PRIVACY.md)
 
 [NixOS, AUR, and Homebrew packages with background services](docs/CLI_PACKAGING.md#platform-packages-and-background-services) are also available in this repository.
