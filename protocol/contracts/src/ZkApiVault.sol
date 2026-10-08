@@ -34,6 +34,10 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
 
     address public treasury;
     bool public paused;
+    /// @dev Sum of completed pause durations. Live pause time is added in `_pausedTimeNow`.
+    uint64 public totalPausedTime;
+    /// @dev Timestamp when the current pause started; 0 if not paused.
+    uint64 public pausedAt;
     uint256 public currentRoot;
     uint32 public nextNoteId;
 
@@ -107,7 +111,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
         uint256 newRoot = MerkleUpdateLib.verifyAndUpdate(currentRoot, noteId, 0, newLeaf, siblings);
 
         currentRoot = newRoot;
-        notes[noteId] = Types.Note(commitment, amount, expiryTs, Types.NoteStatus.Active);
+        notes[noteId] = Types.Note(commitment, amount, expiryTs, Types.NoteStatus.Active, _pausedTimeNow());
         nextNoteId = noteId + 1;
         emit NoteDeposited(noteId, commitment, amount, expiryTs, newRoot);
     }
@@ -208,7 +212,8 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
     function claimExpired(uint32 noteId, uint256[32] calldata siblings) external nonReentrant {
         Types.Note storage note = notes[noteId];
         if (note.status != Types.NoteStatus.Active) revert Errors.NoteNotActive();
-        if (block.timestamp < note.expiryTs) revert Errors.NoteNotExpired();
+        uint64 extension = _pausedTimeNow() - note.pausedSnapshot;
+        if (block.timestamp < uint256(note.expiryTs) + uint256(extension)) revert Errors.NoteNotExpired();
         uint256 newRoot = MerkleUpdateLib.verifyAndUpdate(currentRoot, noteId, _leaf(noteId, note), 0, siblings);
         uint128 amount = note.depositAmount;
         currentRoot = newRoot;
@@ -224,11 +229,21 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
     }
 
     function pause() external onlyOwner {
+        if (paused) revert Errors.Paused();
         paused = true;
+        pausedAt = uint64(block.timestamp);
     }
 
     function unpause() external onlyOwner {
+        if (!paused) revert Errors.NotPaused();
+        totalPausedTime += uint64(block.timestamp) - pausedAt;
+        pausedAt = 0;
         paused = false;
+    }
+
+    /// @dev Cumulative paused time including any in-progress pause.
+    function _pausedTimeNow() private view returns (uint64) {
+        return totalPausedTime + (paused ? uint64(block.timestamp) - pausedAt : 0);
     }
 
     function _closeActive(Types.WithdrawalPublicInputs calldata inputs, uint256[32] calldata siblings) private {

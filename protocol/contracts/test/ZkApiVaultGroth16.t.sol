@@ -85,7 +85,7 @@ contract ZkApiVaultGroth16Test is Test {
             _withdrawal("escape_after_close");
         vault.initiateEscapeWithdrawal(withdrawal, withdrawalProof, emptySiblings);
         _challenge(request, requestProof, emptySiblings, restoredRoot);
-        (,,, Types.NoteStatus otherStatus) = vault.notes(1);
+        (,,, Types.NoteStatus otherStatus,) = vault.notes(1);
         assertEq(uint256(otherStatus), uint256(Types.NoteStatus.Closed));
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
         assertEq(USER.balance, uint256(DEPOSIT) * 1 gwei);
@@ -103,7 +103,7 @@ contract ZkApiVaultGroth16Test is Test {
         vault.initiateEscapeWithdrawal(withdrawal, withdrawalProof, siblings);
         vm.expectRevert(Errors.InvalidProof.selector);
         vault.challengeEscapeWithdrawal(0, request, requestProof, siblings);
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.PendingWithdrawal));
     }
 
@@ -122,7 +122,7 @@ contract ZkApiVaultGroth16Test is Test {
 
     function _siblingsWithOtherLeaf(uint32 otherNoteId) private view returns (uint256[32] memory siblings) {
         siblings = emptySiblings;
-        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(otherNoteId);
+        (bytes32 commitment, uint128 amount, uint64 expiry,,) = vault.notes(otherNoteId);
         siblings[0] = NoteLeafLib.computeLeaf(otherNoteId, commitment, amount, expiry);
     }
 
@@ -155,7 +155,7 @@ contract ZkApiVaultGroth16Test is Test {
         vm.prank(TREASURY);
         vault.challengeEscapeWithdrawal(0, request, proof, siblings);
         assertEq(vault.currentRoot(), restoredRoot);
-        (,,, Types.NoteStatus status) = vault.notes(0);
+        (,,, Types.NoteStatus status,) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
         (bool exists,,,,,) = vault.pendingWithdrawals(0);
         assertFalse(exists);

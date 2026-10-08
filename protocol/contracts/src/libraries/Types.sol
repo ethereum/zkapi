@@ -15,6 +15,10 @@ library Types {
         uint128 depositAmount;
         uint64 expiryTs;
         NoteStatus status;
+        /// @dev Snapshot of vault cumulative paused time at deposit. Used so
+        /// claimExpired treats only pauses during this note's lifetime as an
+        /// extension of expiryTs (expiryTs itself stays immutable for leaves).
+        uint64 pausedSnapshot;
     }
 
     struct PendingWithdrawalData {

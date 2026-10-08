@@ -56,6 +56,9 @@ library Errors {
     /// @notice The contract is paused.
     error Paused();
 
+    /// @notice The contract is not paused.
+    error NotPaused();
+
     /// @notice The caller is not authorized for this operation.
     error Unauthorized();
 
