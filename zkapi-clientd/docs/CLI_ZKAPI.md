@@ -212,6 +212,46 @@ settlement, which can arrive after the response ends. Routine helper
 readiness/retry messages are hidden. The foreground daemon stops if its helper
 exits; only an external service manager can restart it.
 
+### Embeddings and video generation
+
+These routes require models that the issuer's operator has enabled. Until then
+they return `400 model_not_enabled`, and the model lists below are empty.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /v1/embeddings` | OpenRouter embeddings request and response |
+| `GET /v1/embeddings/models` | Enabled embedding models and allowances |
+| `POST /v1/videos` | Submit a video job; returns `202` with a local job |
+| `GET /v1/videos/{id}` | Job status |
+| `GET /v1/videos/{id}/content?index=0` | Download a completed output |
+| `DELETE /v1/videos/{id}` | Forget a finished job and release its key |
+| `GET /v1/videos/models` | Enabled video models and allowances |
+
+A model is enabled for an endpoint when the issuer's model policy gives it a
+reviewed allowance and OpenRouter's catalog for that endpoint lists it. Chat
+models and models without an explicit allowance are rejected; there is no
+fallback allowance. Requests and responses use OpenRouter's shapes. `user`,
+`session_id`, `trace` and provider routing preferences are removed; video
+`callback_url` and `previous_job_id` are also removed, while
+`provider.options` is kept.
+
+Embeddings follow the chat rules above, including key reuse. A video job
+takes a fresh key and holds it, and the wallet's single lease, until the job
+fails or is cancelled or expired upstream, all of its outputs have been
+downloaded, it is deleted, or the key's usable lifetime ends
+(`oa_lease_expires_at`; about four and a half minutes for a five-minute
+lease). Chat and embeddings requests wait meanwhile. A video submission made
+while another job is active or still being submitted returns
+`409 video_job_active`. Settlement then retires the
+key as usual. Download the content before the key expires; afterwards the
+job reports `410 video_content_expired`, or status `expired` if it had not
+finished. A job that outlives its key may still be charged by the provider.
+
+Job IDs are local. The provider's job ID and key are not returned, and the
+daemon never follows provider-supplied URLs. Job records are kept in memory
+for an hour, contain no prompt or video, and are lost on restart. OpenRouter
+does not offer zero data retention for video generation.
+
 ### Mainnet production issuer and verifier
 
 Version `0.1.4` switches Mainnet to issuer

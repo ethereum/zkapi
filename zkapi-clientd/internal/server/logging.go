@@ -83,8 +83,15 @@ func logMethod(method string) string {
 
 func logRoute(path string) string {
 	switch path {
-	case "/v1/models", "/v1/chat/completions":
+	case "/v1/models", "/v1/chat/completions", "/v1/embeddings", "/v1/embeddings/models", "/v1/videos", "/v1/videos/models":
 		return path
+	}
+	// Job IDs are never logged, only the fixed route template.
+	if _, content, ok := videoRoute(path); ok {
+		if content {
+			return "/v1/videos/{id}/content"
+		}
+		return "/v1/videos/{id}"
 	}
 	return ""
 }

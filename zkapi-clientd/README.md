@@ -27,6 +27,8 @@ zkapi-clientd serve
 
 Leave that terminal running. In Open WebUI or another OpenAI-compatible client, set the base URL to **`http://127.0.0.1:8787/v1`** and leave the API key empty (use `local` if the app requires a value). Select a model and chat. The endpoint accepts local connections only.
 
+Embeddings and video generation routes are available for models the issuer enables; see [embeddings and video generation](docs/CLI_ZKAPI.md#embeddings-and-video-generation).
+
 The default reuses an OpenRouter key for a fixed window of up to 60 seconds.
 Compatible requests from different chats, local clients, and Open WebUI's title
 and follow-up requests can share a key and its spending cap; the provider can

@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -77,7 +78,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []byte(`{"status":"ok"}`))
 		return
 	}
-	keylessInference := !a.RequireAPIKey && (r.URL.Path == "/v1/models" || r.URL.Path == "/v1/chat/completions")
+	keylessInference := !a.RequireAPIKey && inferencePath(r.URL.Path)
 	if keylessInference {
 		if !localInferenceRequest(r) {
 			writeError(w, 403, "local_connection_required", "Connect to this API through localhost.")
@@ -130,9 +131,15 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.complete(w, r)
 	case r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/models":
 		writeError(w, 405, "method_not_allowed", "Method not allowed.")
+	case mediaPath(r.URL.Path):
+		a.media(w, r)
 	default:
-		writeError(w, 404, "not_found", "Use /v1/models or /v1/chat/completions.")
+		writeError(w, 404, "not_found", "Use /v1/models, /v1/chat/completions, /v1/embeddings or /v1/videos.")
 	}
+}
+
+func inferencePath(path string) bool {
+	return path == "/v1/models" || path == "/v1/chat/completions" || mediaPath(path)
 }
 
 // The listener is restricted to a numeric loopback address by configuration.
@@ -219,6 +226,12 @@ func sanitize(body []byte) (json.RawMessage, bool, error) {
 }
 
 func (a *API) complete(w http.ResponseWriter, r *http.Request) {
+	a.post(w, r, sanitize, a.backend.Complete)
+}
+
+// post runs one JSON request through the shared queue, slot and response
+// forwarding used by chat completions.
+func (a *API) post(w http.ResponseWriter, r *http.Request, clean func([]byte) (json.RawMessage, bool, error), call func(context.Context, json.RawMessage) (*http.Response, error)) {
 	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || media != "application/json" {
 		writeError(w, 415, "unsupported_media_type", "Use Content-Type: application/json.")
@@ -245,7 +258,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 413, "invalid_body", "Request body is too large or unreadable (16 MiB maximum).")
 		return
 	}
-	clean, streaming, err := sanitize(body)
+	cleaned, streaming, err := clean(body)
 	if err != nil {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return
@@ -263,7 +276,26 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 408, "request_cancelled", "The request was canceled while waiting for inference.")
 		return
 	}
-	response, err := a.backend.Complete(ctx, clean)
+	response, err := call(ctx, cleaned)
+	kind := jsonBody
+	if streaming {
+		kind = eventStream
+	}
+	a.relay(ctx, w, control, response, err, kind)
+}
+
+type responseKind int
+
+const (
+	jsonBody responseKind = iota
+	eventStream
+	videoBody
+)
+
+// relay maps a backend result to the local response. Only allowlisted errors,
+// headers and content types cross; bodies are copied without buffering.
+func (a *API) relay(ctx context.Context, w http.ResponseWriter, control *http.ResponseController, response *http.Response, err error, kind responseKind) {
+	streaming := kind == eventStream
 	if err != nil {
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			writeError(w, 408, "request_cancelled", "The request was canceled or timed out while waiting for inference.")
@@ -308,13 +340,25 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if streaming && contentType != "text/event-stream" {
-		writeError(w, 502, "stream_unavailable", "The inference provider did not return an event stream.")
-		return
-	}
-	if !streaming && contentType != "application/json" {
-		writeError(w, 502, "invalid_upstream_response", "The inference provider did not return JSON.")
-		return
+	switch kind {
+	case eventStream:
+		if contentType != "text/event-stream" {
+			writeError(w, 502, "stream_unavailable", "The inference provider did not return an event stream.")
+			return
+		}
+	case videoBody:
+		if !strings.HasPrefix(contentType, "video/") && contentType != "application/octet-stream" {
+			writeError(w, 502, "invalid_upstream_response", "The provider did not return video content.")
+			return
+		}
+		if response.ContentLength > 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(response.ContentLength, 10))
+		}
+	default:
+		if contentType != "application/json" {
+			writeError(w, 502, "invalid_upstream_response", "The inference provider did not return JSON.")
+			return
+		}
 	}
 	w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 	w.Header().Set("X-Accel-Buffering", "no")

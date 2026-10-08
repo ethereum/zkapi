@@ -140,9 +140,15 @@ func untieredModelBudget(id string) uint64 {
 }
 
 func (c *Client) publicModelIDs(ctx context.Context) (map[string]bool, error) {
+	return c.catalogIDs(ctx, "/models")
+}
+
+// catalogIDs reads one public, credential-free OpenRouter model catalog. The
+// complete list is fetched; the selected model is never transmitted.
+func (c *Client) catalogIDs(ctx context.Context, path string) (map[string]bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.config.InferenceBaseURL+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.config.InferenceBaseURL+path, nil)
 	if err != nil {
 		return nil, &Error{http.StatusBadGateway, "models_unavailable"}
 	}

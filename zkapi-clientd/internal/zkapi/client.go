@@ -53,6 +53,10 @@ type Client struct {
 	config         Config
 	local          *http.Client
 	inference      *http.Client
+	videoMu        sync.Mutex
+	videoJobs      map[string]*videoJob
+	activeVideo    *videoJob // owns requestSlot until released
+	videoSubmit    bool      // a submission is in progress; guarded by videoMu
 }
 
 // Error is safe to return to API consumers: raw companion/provider messages
@@ -113,7 +117,7 @@ func New(config Config) (*Client, error) {
 	inference.CheckRedirect = noRedirect
 	inference.Jar = nil
 	local := &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}, CheckRedirect: noRedirect, Timeout: 4 * time.Minute}
-	return &Client{config: config, local: local, inference: &inference, usedLeases: make(map[[32]byte]uint64), requestSlot: make(chan struct{}, 1), settlementPoll: 5 * time.Second, settlementWake: make(chan struct{}, 1), now: time.Now}, nil
+	return &Client{config: config, local: local, inference: &inference, usedLeases: make(map[[32]byte]uint64), videoJobs: make(map[string]*videoJob), requestSlot: make(chan struct{}, 1), settlementPoll: 5 * time.Second, settlementWake: make(chan struct{}, 1), now: time.Now}, nil
 }
 
 func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -246,6 +250,12 @@ func (c *Client) Check(ctx context.Context) error {
 // Raw SSE bytes remain available to the gateway immediately; no fake streaming
 // or complete-response buffering occurs in either Go or the proof companion.
 func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Response, error) {
+	return c.forward(ctx, chatEndpoint, body)
+}
+
+// forward sends one synchronous request to an OpenRouter endpoint under the
+// same lease, ownership and no-retry rules as chat completions.
+func (c *Client) forward(ctx context.Context, endpoint endpoint, body json.RawMessage) (*http.Response, error) {
 	// Keep one owner through the entire provider response, not just through
 	// obtaining its headers. A queued caller must never spend a lease after
 	// cancellation, including when cancellation races with an available slot.
@@ -268,7 +278,7 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	lease, err := c.waitForLease(ctx, body)
+	lease, err := c.waitForLease(ctx, endpoint, body)
 	if err != nil {
 		return nil, err
 	}
@@ -277,14 +287,14 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 		c.cachedLease = nil
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.InferenceBaseURL+"/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.InferenceBaseURL+endpoint.path, bytes.NewReader(body))
 	if err != nil {
 		c.cachedLease = nil
 		return nil, fmt.Errorf("create inference request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+lease.APIKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Accept", endpoint.accept)
 	response, err := c.inference.Do(req)
 	if response != nil {
 		response.Header.Del("X-OA-Verification-Status")
@@ -337,7 +347,7 @@ type reusableLease struct {
 	until  time.Time
 }
 
-func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (providerLease, error) {
+func (c *Client) waitForLease(ctx context.Context, endpoint endpoint, body json.RawMessage) (providerLease, error) {
 	waiting, retirementAttempted := false, false
 	for {
 		if err := ctx.Err(); err != nil {
@@ -348,13 +358,14 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 		}
 		// Read policy after queueing and again after each settlement wait, so
 		// a disabled model or changed spending tier cannot use stale pricing.
-		limit, err := c.requestBudget(ctx, body)
+		limit, err := c.endpointBudget(ctx, endpoint, body)
 		if err != nil {
 			return providerLease{}, err
 		}
 		// Refresh public model policy even for cached access. A window never
 		// slides, and a different coarse cap cannot expand an existing key.
-		if cached := c.cachedLease; cached != nil && c.config.KeyReuseWindow > 0 &&
+		// Long-running jobs always take a fresh key of their own.
+		if cached := c.cachedLease; cached != nil && !endpoint.fresh && c.config.KeyReuseWindow > 0 &&
 			cached.budget == limit && c.now().Before(cached.until) {
 			activity.Report(ctx, activity.Event{Kind: activity.KeyReused, Key: cached.serial})
 			return cached.providerLease, nil
@@ -367,6 +378,9 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 				return providerLease{}, err
 			}
 			accepted, err := c.acceptLease(lease, limit)
+			if err == nil && endpoint.fresh {
+				c.cachedLease = nil
+			}
 			if err == nil {
 				activity.Report(ctx, activity.Event{Kind: activity.KeyFresh, Key: accepted.serial})
 			}

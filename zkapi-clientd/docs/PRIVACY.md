@@ -7,6 +7,12 @@ The wallet/prover helper receives neither prompts nor responses nor model IDs.
 The provider sees the inference content. Client applications may store their
 own transcripts; the daemon cannot hide content already given to that UI.
 
+Embeddings and video requests take the same path. A video job's record holds
+the local and provider job IDs, its key until release, status and cost; it
+holds no prompt or video and is kept only in memory. The provider retains
+generated video briefly so it can be retrieved; OpenRouter does not offer
+zero data retention for video generation.
+
 Direct HTTPS is the default. It exposes the source IP to destination services
 and uses local DNS, so network timing/IP can correlate activity even though
 credential issuance is unlinkable. Optional Wisp carries destination TLS with
