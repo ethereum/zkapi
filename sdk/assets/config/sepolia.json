@@ -1,18 +1,26 @@
 {
-  "deployment_manifest_url": null,
-  "allowed_deployment_manifest_urls": [],
+  "deployment_manifest_url": "https://zkapi-sepolia.openanonymity.ai/v0.2/config.json",
+  "allowed_deployment_manifest_urls": [
+    "https://zkapi-sepolia.openanonymity.ai/v0.2/config.json"
+  ],
   "trusted_deployment": {
-    "deployment_status": "not_deployed",
-    "deployment_id": null,
+    "deployment_status": "deployed",
+    "deployment_id": "zkapi-native-eth-sepolia-concession-v1",
     "chain_id": 11155111,
-    "contract_address": null,
-    "deploy_block": null,
+    "contract_address": "0x8c521805e0192b26a4fab14ed01515d7eded2428",
+    "deploy_block": 11921353,
     "billing_token_address": null,
-    "protocol_server_url": null,
-    "indexer_url": null,
+    "protocol_server_url": "https://zkapi-sepolia.openanonymity.ai/v0.2",
+    "indexer_url": "https://zkapi-sepolia.openanonymity.ai/v0.2",
     "request_charge_cap": 50000,
-    "state_signing_key": null,
-    "clearance_signing_key": null,
+    "state_signing_key": {
+      "x": "0x2a791a6e824eb42e30417f9b3df78629a27ab50efbaebfa18246f0aa365b46ac",
+      "y": "0x2f35b097b13403e3441bb8ff48e14a8c6375ec57e68c55e43750ff389ea267e5"
+    },
+    "clearance_signing_key": {
+      "x": "0x110d4715f4e2b956d5befcd29bd48a534e9d2b587563f65c73695545dfbc1ced",
+      "y": "0x08b9f81f0b694bf228ae80c2776fd51e3de48ea2bcd52598da0a1733ea12a822"
+    },
     "rpc_url": "https://ethereum-sepolia-rpc.publicnode.com",
     "billing_asset": "native_eth",
     "billing_unit": "gwei",
@@ -27,11 +35,11 @@
     "request_verifying_key_sha256": "2f0d787b32ee7e153dda038443eef4463dd59accd1d27eb751061b6a053aef81",
     "request_vk_keccak256": "0x4d6c1a19dafd1d93488bf60059ab458f4aa1849a405eb0b6e13fd7f3d575b872",
     "withdrawal_vk_keccak256": "0x293e7d3c553b79f9389f4448a8c50e79aef637161ded055d541988a0135ec5dd",
-    "vault_runtime_codehash": null,
-    "proof_adapter_address": null,
-    "adapter_runtime_codehash": null,
-    "poseidon_library_address": null,
-    "poseidon_runtime_codehash": null,
+    "vault_runtime_codehash": "0x4055fae40dd7acae941c3745f89d70086874174c4201fd09ec4ff7c3d9e584ba",
+    "proof_adapter_address": "0x1cb37128e337770969a7d526ceed129a3369e5d5",
+    "adapter_runtime_codehash": "0x2abf1afd7afbdf1dc659d2e322dd2e0e1cec9a3e89ca6b4734b5d22743b85c72",
+    "poseidon_library_address": "0xd0bfa3cfa6e86b42741c9e948e9d0aad4a18564f",
+    "poseidon_runtime_codehash": "0x2277ab8f8a65631afa14ce275a00d11cb5599d9ff5f4c85c8b1c750146ae6056",
     "challenge_period": 43200,
     "note_ttl": 2592000,
     "max_pause_duration": 604800,
@@ -39,15 +47,87 @@
     "vault_revision": 3,
     "exit_concession": 1,
     "clearance_ownership_proof": "required",
+    "allow_dev_setup": true,
     "canary": null,
-    "verifier_url": null,
+    "verifier_url": "https://verifier2.openanonymity.ai",
     "openrouter_inference_base": "https://openrouter.ai/api/v1",
-    "gasless": null
+    "gasless": {
+      "entry_point_address": "0x0000000071727de22e5e9d8baf0edac6f37da032",
+      "entry_point_runtime_codehash": "0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58",
+      "sender_creator_address": "0xefc2c1444ebcc4db75e7613d20c6a62ff67a167c",
+      "sender_creator_runtime_codehash": "0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689",
+      "withdrawal_paymaster_address": "0x9321f63759d2174dd47c886e9d9b68daa1e11ae9",
+      "withdrawal_paymaster_runtime_codehash": "0xc7c7505a29ea2b72efb1c17e4e20257e4c622773e1ffcef92b07941115519ec2",
+      "withdrawal_account_factory_address": "0xf6ca69529aebfecb2eb346b78d2f106fa74c3e7b",
+      "withdrawal_account_factory_runtime_codehash": "0x76deafda4f26ddfcc55b05525b0b5bbfd49a9a1e0051be1d1e19eada0de7c118",
+      "withdrawal_account_implementation_address": "0x4bf793610b4605cf7181d7e5a13c4f16a244beb5",
+      "withdrawal_account_implementation_runtime_codehash": "0xfaac79102daac406da7abbfc7e9295caa498963f94222fe7f2faa7513b35d791",
+      "account_creation_code": "0x600d80380380916000396000f336600060003760a0603d36396000600060a036016000734bf793610b4605cf7181d7e5a13c4f16a244beb55af43d600060003e3d600082603b57fd5bf3",
+      "account_creation_code_keccak256": "0x46e7408ab8174cd687d10c341d581312c4718b8e9b13d3582bad57014ba2686a",
+      "bundler_url": null,
+      "gas_policy": {
+        "call_floor": [
+          600000,
+          650000,
+          260000,
+          80000
+        ],
+        "call_cap": [
+          950000,
+          1100000,
+          400000,
+          150000
+        ],
+        "call_default": [
+          687500,
+          762500,
+          295000,
+          97500
+        ],
+        "postop_floor": 250000,
+        "postop_cap": 350000,
+        "postop_default": 270000,
+        "verification_floor": 50000,
+        "verification_floor_init": 140000,
+        "verification_cap": 400000,
+        "verification_default": 70000,
+        "verification_default_init": 180000,
+        "pvg_floor": 40000,
+        "pvg_cap": 150000,
+        "pm_verification_floor": 420000,
+        "pm_verification_cap": 496000,
+        "pm_verification_default": 450000,
+        "postop_base_gas": 17000,
+        "postop_escape_gas": 71200,
+        "postop_finalize_extra_gas": 5000,
+        "postop_escape_forward_gas": 30000,
+        "eoa_push_gas": 9100,
+        "new_account_gas": 25000,
+        "payout_push_gas": 100000,
+        "credit_gas": 46000,
+        "account_call_overhead_gas": 55500,
+        "account_call_overhead_escape_gas": 28900,
+        "margin_gas": 15000,
+        "finalize_reserve_gas": 1020000,
+        "max_attempts": 3
+      },
+      "policy": {
+        "max_sponsored_cost_wei": "50000000000000000",
+        "flat_fee_wei": "0",
+        "min_escape_net_wei": "10000000000000000",
+        "escapes_enabled": false
+      },
+      "fee_ceilings": {
+        "max_fee_wei": "200000000000",
+        "priority_fee_wei": "3000000000"
+      },
+      "uneconomic_fraction_percent": 25
+    }
   },
   "proving_keys_base_url": "./proofs/",
   "credits_per_usd": null,
   "billing_token_symbol": "ETH",
   "billing_token_decimals": 9,
   "require_oa_key_source": true,
-  "deployment_api_proxy_path": "/zkapi-deployment/"
+  "deployment_api_proxy_path": "/zkapi-deployment-v2c/"
 }

@@ -2,14 +2,16 @@ import { readFileSync } from 'node:fs';
 
 /**
  * The shipped network profile filled in as a deployed vault of this SDK's
- * circuit and setup. The shipped profiles are `not_deployed` placeholders, so
- * tests that need a deployment take its pins from here.
+ * circuit and setup. The shipped mainnet profile is a `not_deployed` placeholder (Sepolia pins the
+ * deployed vault), so tests that need a test deployment take its pins from here.
  */
 export function deployedProfile(network = 'sepolia', changes = {}) {
     const config = JSON.parse(readFileSync(new URL(`../../assets/config/${network}.json`, import.meta.url), 'utf8'));
     const { deployment_status: _placeholder, ...trusted } = config.trusted_deployment;
     return {
         ...config,
+        // Fixed here: the shipped Sepolia profile pins the successor's route.
+        deployment_api_proxy_path: '/zkapi-deployment/',
         deployment_manifest_url: 'https://protocol.example/config.json',
         allowed_deployment_manifest_urls: ['https://protocol.example/config.json'],
         trusted_deployment: {
