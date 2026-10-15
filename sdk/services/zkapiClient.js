@@ -2203,7 +2203,8 @@ class ZkapiClient extends EventTarget {
         feeCapWei = null,
         bundlerUrl = null,
         allowExpensiveGas = false,
-        selfBundle = false
+        selfBundle = false,
+        expectedWithdrawalOperationId = null
     } = {}) {
         // The password dialog must not transfer an earlier withdrawal click
         // to a successor note installed by another tab while it was open.
@@ -2224,7 +2225,8 @@ class ZkapiClient extends EventTarget {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const options = { destination, concede, fees, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle };
+        const options = { destination, concede, fees, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle,
+            expectedWithdrawalOperationId };
         const operation = (async () => {
             try {
                 return await this.performWithdrawal(mode, onStatus, options);
@@ -2265,7 +2267,8 @@ class ZkapiClient extends EventTarget {
         feeCapWei = null,
         bundlerUrl = null,
         allowExpensiveGas = false,
-        selfBundle = false
+        selfBundle = false,
+        expectedWithdrawalOperationId = null
     } = {}) {
         const requestedDestination = normalizeWithdrawalDestination(requested, this.config?.funding);
         const note = this.note;
@@ -2282,6 +2285,7 @@ class ZkapiClient extends EventTarget {
             // no transaction is ever sent from the wallet.
             return this.performGaslessWithdrawal(mode, onStatus, {
                 requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from, note,
+                expectedWithdrawalOperationId,
                 durablePrepared: await browserWalletRuntime.currentPreparedWithdrawal()
             });
         }
@@ -2397,6 +2401,8 @@ class ZkapiClient extends EventTarget {
                         reprove,
                         earlyConcession: concede,
                         walletRequest,
+                        expectedNoteId: note.note_id,
+                        expectedWithdrawalOperationId: attempt === 0 ? expectedWithdrawalOperationId : null,
                         ...(refusedRoot != null ? { refusedRoot } : {}),
                         onProgress: (_phase, message) => onStatus(message)
                     });
@@ -2450,7 +2456,12 @@ class ZkapiClient extends EventTarget {
                     this.config.funding.contract_address,
                     { conceded: plan.public_inputs.conceded }
                 );
-                const claim = await browserWalletRuntime.claimPreparedWithdrawalSubmission();
+                const claim = await browserWalletRuntime.claimPreparedWithdrawalSubmission({
+                    operationId: plan.operationId ?? null,
+                    noteId: plan.noteId ?? plan.public_inputs?.note_id ?? null,
+                    mode: plan.mode,
+                    destination
+                });
                 submission = claim;
                 submittedHash = claim.transactionHash || submittedHash;
                 if (submittedHash) {
@@ -3901,7 +3912,7 @@ class ZkapiClient extends EventTarget {
     }
 
     async followGaslessWithdrawal(mode, onStatus, { requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from,
-        durablePrepared, note, claimed }) {
+        durablePrepared, note, claimed, expectedWithdrawalOperationId = null }) {
         if (durablePrepared && !isGaslessWithdrawal(durablePrepared)) throw gaslessError('gasless_plan_mismatch');
         if (requestedDestination && durablePrepared?.payout && durablePrepared.payout.toLowerCase() !== requestedDestination) {
             throw new Error('This withdrawal is already bound to a different destination. Resume it with its saved address.');
@@ -3970,6 +3981,8 @@ class ZkapiClient extends EventTarget {
                         reprove,
                         earlyConcession: concede,
                         walletRequest,
+                        expectedNoteId: note.note_id,
+                        expectedWithdrawalOperationId: attempt === 0 ? expectedWithdrawalOperationId : null,
                         gasless: { payout, transit: context.transit },
                         onProgress: (_phase, message) => onStatus(message)
                     });

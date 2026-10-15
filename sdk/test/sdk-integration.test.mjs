@@ -75,13 +75,13 @@ test('host configuration resolves explicit paths and retains trusted same-origin
     }
 });
 
-test('the shipped network profiles are placeholders that no host build accepts', async () => {
+test('the shipped mainnet profile is a placeholder that no host build accepts', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'zkapi-sdk-assets-'));
     try {
         const pinned = await verifyBrowserSdkAssets();
         assert.equal(pinned.schema, 2);
         assert.equal(pinned.circuitId, 'zkapi-v2-concession-v1');
-        for (const network of ['sepolia', 'mainnet']) {
+        for (const network of ['mainnet']) {
             await assert.rejects(buildBrowserSdkAssets({ outDir: path.join(temp, network), network, build }),
                 { code: 'deployment_not_deployed' });
             await assert.rejects(fs.access(path.join(temp, network)), 'nothing was written');

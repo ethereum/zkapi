@@ -148,7 +148,7 @@ test('static proof keys are the concession development setup and match its manif
     }
 });
 
-for (const network of ['sepolia', 'mainnet']) {
+for (const network of ['mainnet']) {
     test(`the ${network} profile is a not_deployed placeholder pinning the shipped circuit, setup and keys`, () => {
         const config = JSON.parse(fs.readFileSync(path.join(__dirname, `assets/config/${network}.json`), 'utf8'));
         const manifest = JSON.parse(fs.readFileSync(path.join(root, 'assets/manifest.json'), 'utf8'));
@@ -329,4 +329,22 @@ test('browser deposits refresh an unsigned Merkle path before submission', () =>
     assert.match(client, /await browserWalletRuntime\.refreshPendingDeposit\([\s\S]*Number\(amount\),[\s\S]*expectedActiveRoot/);
     assert.match(client, /const attempts = 3/);
     assert.match(client, /error\?\.code !== 'stale_root'/);
+});
+
+test('the sepolia profile pins the deployed concession vault, its signing keys and the successor route', () => {
+    const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'assets/config/sepolia.json'), 'utf8'));
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'assets/manifest.json'), 'utf8'));
+    const trusted = config.trusted_deployment;
+    assert.notEqual(trusted.deployment_status, 'not_deployed');
+    assert.equal(trusted.chain_id, 11155111);
+    assert.equal(trusted.circuit_id, 'zkapi-v2-concession-v1');
+    assert.equal(trusted.setup_id, manifest.setupId);
+    assert.equal(trusted.request_proving_key_sha256, sha256(path.join(root, 'assets/proofs/request.pk')));
+    assert.equal(trusted.withdrawal_proving_key_sha256, sha256(path.join(root, 'assets/proofs/withdrawal.pk')));
+    assert.equal(trusted.vault_revision, 3);
+    assert.match(trusted.contract_address, /^0x[0-9a-fA-F]{40}$/);
+    assert.equal(trusted.protocol_server_url, trusted.indexer_url);
+    assert.equal(config.deployment_manifest_url, `${trusted.protocol_server_url}/config.json`);
+    assert.deepEqual(config.allowed_deployment_manifest_urls, [config.deployment_manifest_url]);
+    assert.equal(config.deployment_api_proxy_path, '/zkapi-deployment-v2c/');
 });
