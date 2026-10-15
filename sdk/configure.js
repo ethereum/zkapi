@@ -3,8 +3,14 @@
 // provingKeysBaseUrlOverride lets exits fetch the withdrawal key from another
 // origin (design §6.4 E7) when the host is gone or hostile; the build-pinned
 // SHA-256 still applies.
+// verifyProviderKey and assertProviderKey are the host's provider-key policy:
+// the first replaces the SDK's own submission of an ephemeral key to the OA
+// verifier (it receives the evidence and answers the verifier's verdict, or a
+// reviewed trusted-station fallback); the second is a synchronous check at each
+// checkout of a key. Without them the SDK submits the key itself and accepts
+// only the verifier's own approval, exactly as before.
 let options = Object.freeze({ transport: null, configUrl: null, workerUrl: null, mode: 'browser', requestTestnetPassword: null,
-    provingKeysBaseUrlOverride: null });
+    provingKeysBaseUrlOverride: null, verifyProviderKey: null, assertProviderKey: null });
 let initializing = false;
 
 function absoluteUrl(value, label) {
@@ -25,7 +31,7 @@ export function configureBrowserSdk(next = {}) {
         throw new TypeError('zkAPI browser SDK configuration must be an object.');
     }
     const unknown = Object.keys(next).filter(key => !['transport', 'configUrl', 'workerUrl', 'mode', 'requestTestnetPassword',
-        'provingKeysBaseUrlOverride'].includes(key));
+        'provingKeysBaseUrlOverride', 'verifyProviderKey', 'assertProviderKey'].includes(key));
     if (unknown.length) throw new TypeError(`Unknown zkAPI browser SDK option: ${unknown.join(', ')}.`);
     const merged = { ...options, ...next };
     if (merged.transport !== null && typeof merged.transport !== 'function') {
@@ -33,6 +39,11 @@ export function configureBrowserSdk(next = {}) {
     }
     if (merged.requestTestnetPassword !== null && typeof merged.requestTestnetPassword !== 'function') {
         throw new TypeError('requestTestnetPassword must be a password-dialog function.');
+    }
+    for (const name of ['verifyProviderKey', 'assertProviderKey']) {
+        if (merged[name] !== null && typeof merged[name] !== 'function') {
+            throw new TypeError(`${name} must be a provider verification function.`);
+        }
     }
     if (merged.mode !== 'browser') {
         throw new TypeError('Only browser mode is supported; local daemon and automatic probing modes have been removed.');

@@ -1190,7 +1190,9 @@ class BrowserWalletRuntime extends EventTarget {
                 expires_at: this.activeLease.expires_at,
                 settle_after: this.activeLease.settle_after,
                 spending_limit_usd: Number(this.activeLease.spending_limit_usd),
-                station_id: this.activeLease.verification?.station_id || null
+                station_id: this.activeLease.verification?.station_id || null,
+                verifierSubmitKeyProof: this.activeLease.verifierSubmitKeyProof
+                    ? structuredClone(this.activeLease.verifierSubmitKeyProof) : null
             }
             : null;
         const prepared = this.runtime?.preparedWithdrawal;
@@ -1686,6 +1688,7 @@ class BrowserWalletRuntime extends EventTarget {
                     || details.message
                     || payload.error_message
                     || payload.message
+                    || payload.detail
                     || `HTTP ${response.status}`,
                 response.status,
                 details.error_code
@@ -2760,19 +2763,48 @@ class BrowserWalletRuntime extends EventTarget {
                 || Number(evidence.key_valid_till) - Number(lease.expires_at) > 60) {
                 throw new Error('The OA evidence expiry does not safely cover the lease.');
             }
-            const verification = await this.remoteJson(`${this.config.openrouter.verifier_url}/submit_key`, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                signal,
-                body: JSON.stringify({
-                    station_id: evidence.station_id,
-                    api_key: lease.api_key,
-                    key_valid_till: evidence.key_valid_till,
-                    station_signature: evidence.station_signature,
-                    org_signature: evidence.org_signature
+            const hostVerify = browserSdkOptions().verifyProviderKey;
+            const verification = hostVerify
+                ? await hostVerify({
+                    verifierUrl: this.config.openrouter.verifier_url,
+                    keyData: {
+                        stationId: evidence.station_id,
+                        key: lease.api_key,
+                        expiresAtUnix: evidence.key_valid_till,
+                        stationSignature: evidence.station_signature,
+                        orgSignature: evidence.org_signature,
+                        recentlyAttested: evidence.station_recently_attested === true
+                    },
+                    signal
                 })
-            });
-            if (verification.status !== 'verified') throw new Error('The trusted OA verifier rejected the ephemeral key.');
+                : await this.remoteJson(`${this.config.openrouter.verifier_url}/submit_key`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    signal,
+                    body: JSON.stringify({
+                        station_id: evidence.station_id,
+                        api_key: lease.api_key,
+                        key_valid_till: evidence.key_valid_till,
+                        station_signature: evidence.station_signature,
+                        org_signature: evidence.org_signature
+                    })
+                });
+            throwIfAborted(signal);
+            if (verification?.status !== 'verified'
+                && !(hostVerify && verification?.status === 'verifier-unavailable'
+                    && verification.trustedStationFallback)) {
+                throw new Error('The trusted OA verifier rejected the ephemeral key.');
+            }
+            // Host policy approval is distinct from a verifier's approval. Never
+            // persist the key or expose raw verifier responses in wallet snapshots.
+            lease.verifierSubmitKeyProof = {
+                status: verification.status,
+                detail: verification.detail || null,
+                recordedAt: verification.recordedAt || new Date().toISOString(),
+                stationId: evidence.station_id,
+                ...(hostVerify && verification.trustedStationFallback
+                    ? { trustedStationFallback: structuredClone(verification.trustedStationFallback) } : {})
+            };
         }
     }
 
@@ -3767,6 +3799,12 @@ class BrowserWalletRuntime extends EventTarget {
                 'lease_pending'
             );
         }
+        // Synchronous host check runs before checkout, so a later ban or changed
+        // policy cannot reuse a cached key or leak an in-flight reservation.
+        browserSdkOptions().assertProviderKey?.({
+            station_id: lease.verification?.station_id || null,
+            verifierSubmitKeyProof: lease.verifierSubmitKeyProof || null
+        });
         lease.inFlight += 1;
         let released = false;
         return {
