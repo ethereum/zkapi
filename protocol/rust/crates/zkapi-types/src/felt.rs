@@ -50,6 +50,11 @@ impl Felt252 {
         if s.len() > 64 {
             return Err("hex string too long for felt252".to_string());
         }
+        // The byte-indexed slices below need ASCII, and `from_str_radix`
+        // would otherwise accept a leading sign.
+        if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid hex: expected only hexadecimal digits".to_string());
+        }
         let padded = format!("{:0>64}", s);
         let mut bytes = [0u8; 32];
         for i in 0..32 {
@@ -182,6 +187,21 @@ mod tests {
         assert_eq!(json, "\"0xff\"");
         let back: Felt252 = serde_json::from_str(&json).unwrap();
         assert_eq!(f, back);
+    }
+
+    #[test]
+    fn test_rejects_non_ascii_hex_without_panicking() {
+        // Multi-byte characters made the byte-indexed slices land inside a
+        // character once the string was padded by character count.
+        assert!(Felt252::from_hex("0x€").is_err());
+        assert!(Felt252::from_hex("é").is_err());
+        assert!(serde_json::from_str::<Felt252>("\"0x€\"").is_err());
+    }
+
+    #[test]
+    fn test_rejects_signed_hex_digits() {
+        assert!(Felt252::from_hex("0x+f").is_err());
+        assert!(Felt252::from_hex("+f").is_err());
     }
 
     #[test]
