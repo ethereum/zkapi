@@ -95,6 +95,14 @@ const json = value => JSON.stringify(value, (_, v) => typeof v === 'bigint' ? v.
 const hex = value => `0x${BigInt(value).toString(16)}`;
 const word = value => BigInt(value).toString(16).padStart(64, '0');
 const felt = value => `0x${word(value)}`;
+
+// Shared by the wallet driver and both companion deposit paths. The empty-slot
+// siblings stay local for the saved exit path; the vault appends the note itself.
+export function depositNativeNote(vaultSend, from, commitment, amount) {
+    return vaultSend(from, 'deposit', [felt(commitment), amount],
+        { value: BigInt(amount) * GWEI, operation: 'deposit' });
+}
+
 // Explicit agents bypass Node's optional global environment-proxy support.
 const localAgent = new http.Agent({ keepAlive: false, proxyEnv: {} });
 
@@ -1192,8 +1200,7 @@ async function main() {
             const snapshot = await synchronizedTree();
             const params = await client('deposit_params');
             const merkle = await client('tree_path', { args: { snapshot, note_id: snapshot.next_note_id, require_existing: false } });
-            const receipt = await vaultSend(from, 'deposit', [felt(params.registration_commitment), amount, merkle.siblings],
-                { value: BigInt(amount) * GWEI, operation: 'deposit' });
+            const receipt = await depositNativeNote(vaultSend, from, params.registration_commitment, amount);
             assert.equal(receipt.status, '0x1');
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
@@ -1496,11 +1503,16 @@ async function main() {
             const call = async (command, data = {}, timeout = 300_000) => {
                 check();
                 const id = ++nextId;
-                return new Promise((resolve, reject) => {
+                const result = await new Promise((resolve, reject) => {
                     const timer = setTimeout(() => { pending.delete(id); reject(new Error(`SDK ${command} timed out`)); }, timeout);
                     pending.set(id, { command, resolve: value => { clearTimeout(timer); resolve(value); }, reject: error => { clearTimeout(timer); reject(error); } });
                     child.stdin.write(JSON.stringify({ id, command, ...data }) + '\n');
                 });
+                // A deposit receipt does not mean the indexer has observed its
+                // leaf yet. Driver requests already wait in treePath; give SDK
+                // scenarios the same ready tree before their next operation.
+                if (command === 'deposit') await synchronizedTree();
+                return result;
             };
             call.close = async () => { await call('close', {}, 5_000).catch(() => {}); await stop(child); };
             sdkAgents.push(call);
@@ -1825,8 +1837,7 @@ async function main() {
             assert.equal(bridge.value.exit_concession, 1);
             const plan = await companion.call('POST', '/deposit/prepare', { amount: DEPOSIT });
             assert.equal(plan.status, 200, json(plan.value));
-            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), DEPOSIT, plan.value.zero_path],
-                { value: BigInt(DEPOSIT) * GWEI, operation: 'deposit' });
+            const receipt = await depositNativeNote(vaultSend, account.companion, plan.value.commitment, DEPOSIT);
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
             assert.equal(noteId, plan.value.next_note_id);
@@ -1890,8 +1901,7 @@ async function main() {
         async function companionDeposit(companion, amount = DEPOSIT) {
             const plan = await companion.call('POST', '/deposit/prepare', { amount });
             assert.equal(plan.status, 200, json(plan.value));
-            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), amount, plan.value.zero_path],
-                { value: BigInt(amount) * GWEI, operation: 'deposit' });
+            const receipt = await depositNativeNote(vaultSend, account.companion, plan.value.commitment, amount);
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
             const note = await noteView(noteId);

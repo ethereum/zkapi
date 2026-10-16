@@ -46,4 +46,5 @@ cargo build --locked --release --target-dir target/acceptance \
 # project whose Deploy.s.sol deploys them.
 (cd protocol/contracts && forge build)
 (cd demo/contracts && forge build)
+node --test scripts/acceptance/deposit.test.mjs
 exec node scripts/v2-acceptance.mjs --bin-dir target/acceptance/release "$@"
