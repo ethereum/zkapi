@@ -2,7 +2,7 @@
   "schema": 2,
   "circuitId": "zkapi-v2-concession-v1",
   "setupId": "dev",
-  "sourceRevision": "2902585cd7ecc1d57f12cfcb57ec86057b09e65a",
+  "sourceRevision": "3e1f8f38e2ffee1fdfda69673cfb19d953895f8d",
   "toolchain": {
     "rustc": "1.99.0",
     "wasmBindgen": "0.2.117"

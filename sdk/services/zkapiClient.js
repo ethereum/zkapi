@@ -3,7 +3,7 @@ import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateN
 import { beginBrowserSdkInitialization } from '../configure.js';
 import browserWalletRuntime from './browserWalletRuntime.js';
 import { ENTRY_POINT_ERRORS, contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
-import { EXIT_FALLBACK_GAS_LIMIT, bufferedGasLimit } from './zkapiGas.mjs';
+import { EXIT_FALLBACK_GAS_LIMIT, MAX_TRANSACTION_GAS_LIMIT, bufferedGasLimit } from './zkapiGas.mjs';
 import { normalizeWalletError, walletErrorMessage } from './zkapiWalletError.mjs';
 import { backgroundWithdrawalClaims, isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHistory.mjs';
@@ -2187,6 +2187,50 @@ class ZkapiClient extends EventTarget {
             }
         }
         return this.confirmBrowserDepositReceipt(plan, receipt, vaultAddress, onStatus);
+    }
+
+    /**
+     * What a wallet-paid withdrawal can cost, before any clearance exists.
+     * Calldata is unknown then, so the supported transaction gas ceiling is
+     * reserved at twice the current gas price (an escape needs a second,
+     * later transaction). Read-only: it never closes or prepares a note, and
+     * MetaMask still reviews the real fee. `shortfallWei` is what the connected
+     * account lacks, and the page shows it as a top-up rather than an error.
+     */
+    async getWithdrawalFeeBudget(mode = 'mutual') {
+        if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a withdrawal method.');
+        if (!this.config?.funding || !this.ethereum?.request) {
+            throw Object.assign(new Error('Connect MetaMask to check the network fee.'), { code: 'withdrawal_wallet_disconnected' });
+        }
+        const quantity = value => {
+            if (typeof value !== 'string' || !/^0x(?:0|[1-9a-f][0-9a-f]{0,63})$/i.test(value)) throw new Error('Invalid wallet fee data.');
+            return BigInt(value);
+        };
+        const accounts = await this.ethereum.request({ method: 'eth_accounts' });
+        const address = accounts?.[0]?.toLowerCase();
+        if (!/^0x[0-9a-f]{40}$/.test(address || '') || /^0x0{40}$/.test(address)) {
+            throw Object.assign(new Error('Connect MetaMask to check the network fee.'), { code: 'withdrawal_wallet_disconnected' });
+        }
+        await this.assertFundingChain();
+        const gasPrice = quantity(await this.ethereum.request({ method: 'eth_gasPrice' }));
+        if (gasPrice <= 0n) throw new Error('Invalid wallet fee data.');
+        const transactionFee = MAX_TRANSACTION_GAS_LIMIT * gasPrice * 2n;
+        const reserve = transactionFee * (mode === 'escape' ? 2n : 1n);
+        if (reserve >= 1n << 256n) throw new Error('Invalid wallet fee data.');
+        const balance = quantity(await this.ethereum.request({ method: 'eth_getBalance', params: [address, 'pending'] }));
+        await this.assertFundingChain();
+        const current = await this.ethereum.request({ method: 'eth_accounts' });
+        if (current?.[0]?.toLowerCase() !== address) throw new Error('MetaMask account changed. Check the fee again.');
+        return {
+            address,
+            chainId: Number(this.config.funding.chain_id),
+            mode,
+            balanceWei: balance.toString(),
+            feeReserveWei: reserve.toString(),
+            transactionFeeWei: transactionFee.toString(),
+            shortfallWei: (reserve > balance ? reserve - balance : 0n).toString(),
+            expiresAt: Date.now() + 30_000
+        };
     }
 
     /**
