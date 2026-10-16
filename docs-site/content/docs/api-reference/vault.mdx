@@ -24,9 +24,9 @@ root the vault ever held (`isKnownRoot`).
 
 | Field | Value |
 |---|---|
-| Method | `deposit(bytes32 commitment, uint128 amount, uint256[32] siblings)` (payable, `0xc588341c`) |
+| Method | `deposit(bytes32 commitment, uint128 amount)` (payable, `0x56d2e1ea`) |
 | Caller | User's wallet, while not paused |
-| Effect | Checks the empty-slot path against `currentRoot`, adds the note leaf, records the new root in `knownRoots`, escrows the native ETH, and emits `NoteDeposited(noteId, commitment, amount, expiryTs, newRoot)` |
+| Effect | Assigns the next note ID, appends the leaf using the vault's tree frontier, records the new root in `knownRoots`, escrows the native ETH, and emits `NoteDeposited(noteId, commitment, amount, expiryTs, newRoot)`; no sibling path is required |
 
 Here `commitment` is the Poseidon registration derived from the note secret,
 not the anonymous balance commitment signed by the server. The deposited leaf
@@ -278,7 +278,7 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `ChallengeExpired()` | `0xf06506c5` | A defeat or raise at or after the deadline |
 | `ChallengeNotExpired()` | `0x151f07fe` | A finalization before the deadline |
 | `NoteNotClosed()` | `0xb91b2a5d` | `retireClosedLeaf` for a note that is not closed |
-| `StaleRoot()` | `0x607447de` | A deposit's or retirement's siblings do not reproduce the current root |
+| `StaleRoot()` | `0x607447de` | A retirement's siblings do not reproduce the current root |
 | `InvalidDeploymentBinding()` | `0x9722445b` | Another protocol version, chain, vault or key, or an invalid `nextNullifier` |
 | `InvalidProof()` | `0x09bde339` | The Groth16 proof does not verify |
 | `InvalidFelt()` | `0x2ab898cc` | A value at or above the BN254 scalar field modulus |

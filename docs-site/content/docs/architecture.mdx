@@ -97,10 +97,11 @@ adapter and Poseidon library against the manifest. Each fails closed.
 1. The wallet checks the deployment: the runtime code hashes of the vault,
    adapter and Poseidon library and the vault's and adapter's getters,
    through the wallet provider that will sign and the pinned RPC.
-2. It samples a secret, computes the v2 registration commitment, and obtains
-   the next note ID and an empty-slot path from the indexed tree.
-3. The user calls `deposit(commitment, amount, siblings)` on the pinned vault
-   with exactly `amount × 1 gwei` in transaction value.
+2. It samples a secret and computes the v2 registration commitment. It can
+   keep the next empty slot's path locally for the note's exit proof.
+3. The user calls `deposit(commitment, amount)` on the pinned vault with
+   exactly `amount × 1 gwei` in transaction value. The vault assigns the next
+   note ID and appends the leaf itself; no siblings are sent.
 4. The vault emits `NoteDeposited` with the registration commitment, amount,
    expiry and new root; the indexer updates its tree.
 5. The wallet confirms the note, saves its Merkle path at the deposit's root,
