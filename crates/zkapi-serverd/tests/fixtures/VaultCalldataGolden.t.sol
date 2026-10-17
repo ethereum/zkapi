@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 // Golden calldata, getter selectors and layouts, and event layouts of the
-// revision-3 vault, taken from the real contracts (protocol/contracts/src:
+// revision-4 vault, taken from the real contracts (protocol/contracts/src:
 // ZkApiVault, Types, Events and IZkApiProofAdapter), never from a copy of
 // their declarations: vault_calldata_golden.json is this test's output.
 // check-calldata-golden.sh runs it with forge and compares (CI), or rewrites
@@ -20,7 +20,8 @@ import {IZkApiProofAdapter} from "zkapi/interfaces/IZkApiProofAdapter.sol";
 /// layouts are the compiler's.
 contract VaultEvents is Events {
     function emitAll() external {
-        emit NoteDeposited(7, bytes32(uint256(0x0c0c)), 1_000_000, 2_000_000_000, 0x0a0a);
+        emit NoteDeposited(7, bytes32(uint256(0x0c0c)), 1_000_000, 2_000_000_000);
+        emit NotesActivated(4, 4, 0x0d0d, true);
         emit MutualClose(7, 0x0101, 900_000, address(0x1111111111111111111111111111111111111111));
         emit EscapeWithdrawalInitiated(
             7, 0x0101, 900_000, address(0x1111111111111111111111111111111111111111), 2_000_086_400, 0x0a0a
@@ -63,7 +64,7 @@ contract GoldenTest is Test {
         w.protocolVersion = 2;
         w.chainId = 1;
         w.contractAddress = 0x00112233445566778899AABbCCdDeeFf00112233;
-        w.activeRoot = 0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9;
+        w.registrationCommitment = 0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9;
         w.stateSigningKeyX = 0x1111111111111111111111111111111111111111111111111111111111111111;
         w.stateSigningKeyY = 0x2222222222222222222222222222222222222222222222222222222222222222;
         w.clearanceSigningKeyX = 0x0555555555555555555555555555555555555555555555555555555555555555;
@@ -78,6 +79,8 @@ contract GoldenTest is Test {
             w.conceded = 123456789;
         }
         w.validUntil = type(uint64).max;
+        // depositAmount 3,000,000 and expiryTs 4,000,000,000, packed.
+        w.noteMetadata = uint256(3_000_000) | (uint256(4_000_000_000) << 128);
     }
 
     function line(string memory key, bytes memory value) internal pure {
@@ -111,6 +114,20 @@ contract GoldenTest is Test {
             siblings[i] = (i + 1) * 0x0101010101010101;
         }
         line("calldata.retire", abi.encodeCall(ZkApiVault.retireClosedLeaf, (9, siblings)));
+        line(
+            "calldata.activate",
+            abi.encodeCall(
+                ZkApiVault.activateNotes,
+                (
+                    8,
+                    4,
+                    0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9,
+                    0x1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a,
+                    proof()
+                )
+            )
+        );
+        line("calldata.activate_on_chain", abi.encodeCall(ZkApiVault.activateNotesOnChain, (16, 16, siblings)));
 
         // Every vault and adapter function the server, challenger, indexer,
         // signer and clients call or decode. Public getters have selectors
@@ -128,8 +145,11 @@ contract GoldenTest is Test {
         selector("finalizeEscapeWithdrawal", vault.finalizeEscapeWithdrawal.selector);
         selector("claimEscapePayout", vault.claimEscapePayout.selector);
         selector("claimExpired", vault.claimExpired.selector);
-        selector("knownRoots", vault.knownRoots.selector);
-        selector("isKnownRoot", vault.isKnownRoot.selector);
+        selector("activateNotes", vault.activateNotes.selector);
+        selector("activateNotesOnChain", vault.activateNotesOnChain.selector);
+        selector("activationCursor", vault.activationCursor.selector);
+        selector("isActivated", vault.isActivated.selector);
+        selector("paused", vault.paused.selector);
         selector("currentRoot", vault.currentRoot.selector);
         selector("usedNullifiers", vault.usedNullifiers.selector);
         selector("challengedNullifiers", vault.challengedNullifiers.selector);
@@ -139,7 +159,7 @@ contract GoldenTest is Test {
         selector("escapePayoutCredits", vault.escapePayoutCredits.selector);
         selector("effectiveExpiry", vault.effectiveExpiry.selector);
         selector("CONCESSION_ESCAPE_VERSION", vault.CONCESSION_ESCAPE_VERSION.selector);
-        selector("ROOT_HISTORY_WINDOW", vault.ROOT_HISTORY_WINDOW.selector);
+        selector("NOTE_BOUND_EXIT_VERSION", vault.NOTE_BOUND_EXIT_VERSION.selector);
         selector("proofAdapter", vault.proofAdapter.selector);
         selector("challengePeriod", vault.challengePeriod.selector);
         selector("noteTtl", vault.noteTtl.selector);
@@ -152,19 +172,24 @@ contract GoldenTest is Test {
         selector("CIRCUIT_ID_HASH", adapter.CIRCUIT_ID_HASH.selector);
         selector("REQUEST_VK_HASH", adapter.REQUEST_VK_HASH.selector);
         selector("WITHDRAWAL_VK_HASH", adapter.WITHDRAWAL_VK_HASH.selector);
+        selector("INSERTION1_VK_HASH", adapter.INSERTION1_VK_HASH.selector);
+        selector("INSERTION4_VK_HASH", adapter.INSERTION4_VK_HASH.selector);
+        selector("INSERTION16_VK_HASH", adapter.INSERTION16_VK_HASH.selector);
+        selector("assertValidInsertion", adapter.assertValidInsertion.selector);
 
         // The words each struct getter returns (the adapter is never called
         // by these reads).
         getterWords(address(vault), "pendingWithdrawals", abi.encodeCall(vault.pendingWithdrawals, (0)));
         getterWords(address(vault), "pendingConcessions", abi.encodeCall(vault.pendingConcessions, (0)));
         getterWords(address(vault), "notes", abi.encodeCall(vault.notes, (0)));
-        getterWords(address(vault), "knownRoots", abi.encodeCall(vault.knownRoots, (0)));
+        getterWords(address(vault), "activationCursor", abi.encodeCall(vault.activationCursor, ()));
 
         // topic0, every topic (32-byte words, topic0 first) and the data of
         // each event as the vault emits it.
         VaultEvents events = new VaultEvents();
-        string[11] memory names = [
+        string[12] memory names = [
             "NoteDeposited",
+            "NotesActivated",
             "MutualClose",
             "EscapeWithdrawalInitiated",
             "EscapeConcessionRecorded",

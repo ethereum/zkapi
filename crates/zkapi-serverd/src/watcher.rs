@@ -45,17 +45,18 @@ pub const RAISE_SELECTOR: [u8; 4] = [0xdd, 0x00, 0x64, 0xba];
 /// `retireClosedLeaf(uint32 noteId, uint256[32] siblings)`.
 pub const RETIRE_SIGNATURE: &str = "retireClosedLeaf(uint32,uint256[32])";
 pub const RETIRE_SELECTOR: [u8; 4] = [0xe4, 0x1f, 0x4c, 0x31];
-/// `initiateEscapeWithdrawal(WithdrawalPublicInputs inputs, bytes proof)`.
-pub const ESCAPE_SIGNATURE: &str = "initiateEscapeWithdrawal((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)";
-pub const ESCAPE_SELECTOR: [u8; 4] = [0xa3, 0x8d, 0x62, 0xaa];
+/// `initiateEscapeWithdrawal(WithdrawalPublicInputs inputs, bytes proof)`,
+/// with the 17-word note-bound tuple of vault revision 4.
+pub const ESCAPE_SIGNATURE: &str = "initiateEscapeWithdrawal((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256),bytes)";
+pub const ESCAPE_SELECTOR: [u8; 4] = [0x8e, 0x11, 0x04, 0x92];
 /// `mutualClose(WithdrawalPublicInputs inputs, bytes proof)`.
-pub const MUTUAL_CLOSE_SIGNATURE: &str = "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)";
-pub const MUTUAL_CLOSE_SELECTOR: [u8; 4] = [0x72, 0xcd, 0x2e, 0x44];
+pub const MUTUAL_CLOSE_SIGNATURE: &str = "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256),bytes)";
+pub const MUTUAL_CLOSE_SELECTOR: [u8; 4] = [0x5a, 0xcd, 0x3b, 0x15];
 /// Calldata lengths of the vault calls (§4.2-§4.5).
 pub const DEFEAT_CALLDATA_LEN: usize = 740;
 pub const RAISE_CALLDATA_LEN: usize = 772;
 pub const RETIRE_CALLDATA_LEN: usize = 1_060;
-pub const WITHDRAWAL_CALLDATA_LEN: usize = 836;
+pub const WITHDRAWAL_CALLDATA_LEN: usize = 868;
 /// A Groth16 proof: eight big-endian 32-byte coordinates.
 pub const PROOF_LEN: usize = 256;
 
@@ -431,8 +432,8 @@ pub fn retire_calldata(note_id: u32, siblings: &[Felt252; MERKLE_DEPTH]) -> Vec<
 }
 
 /// `initiateEscapeWithdrawal` (kind 0) or `mutualClose` (kind 1) calldata:
-/// `selector | 16 tuple words | offset 0x220 | len 256 | 8 proof words`,
-/// 836 bytes. Refuses an ownership proof (kind 2), which every vault entry
+/// `selector | 17 tuple words | offset 0x240 | len 256 | 8 proof words`,
+/// 868 bytes. Refuses an ownership proof (kind 2), which every vault entry
 /// point rejects, and a kind-0 statement without a distinct successor
 /// nullifier or a kind-1 statement with a successor or a concession.
 pub fn withdrawal_calldata(
@@ -444,7 +445,7 @@ pub fn withdrawal_calldata(
     }
     address_word(&inputs.contract_address, "withdrawal contract address")?;
     for (value, name) in [
-        (&inputs.active_root, "active root"),
+        (&inputs.registration_commitment, "registration commitment"),
         (&inputs.state_signing_key_x, "state signing key x"),
         (&inputs.state_signing_key_y, "state signing key y"),
         (&inputs.clearance_signing_key_x, "clearance signing key x"),
@@ -473,8 +474,8 @@ pub fn withdrawal_calldata(
     for word in inputs.to_field_elements() {
         data.extend_from_slice(word.as_bytes());
     }
-    // The bytes offset after the static 16-word tuple and itself: 17 words.
-    data.extend_from_slice(Felt252::from_u64(17 * 32).as_bytes());
+    // The bytes offset after the static 17-word tuple and itself: 18 words.
+    data.extend_from_slice(Felt252::from_u64(18 * 32).as_bytes());
     data.extend_from_slice(Felt252::from_u64(PROOF_LEN as u64).as_bytes());
     data.extend_from_slice(proof);
     debug_assert_eq!(data.len(), WITHDRAWAL_CALLDATA_LEN);
@@ -857,7 +858,9 @@ pub(crate) mod tests {
             protocol_version: 2,
             chain_id: 1,
             contract_address: felt("0x00112233445566778899aabbccddeeff00112233"),
-            active_root: felt("0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"),
+            registration_commitment: felt(
+                "0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9",
+            ),
             state_signing_key_x: felt(
                 "0x1111111111111111111111111111111111111111111111111111111111111111",
             ),
@@ -884,6 +887,8 @@ pub(crate) mod tests {
             },
             conceded: if kind == 0 { 123_456_789 } else { 0 },
             valid_until: u64::MAX,
+            deposit_amount: 3_000_000,
+            expiry: 4_000_000_000,
         }
     }
 

@@ -59,7 +59,7 @@ for (const line of lines.slice(start + 1)) {
     vectors.events[name][field] = value;
   } else throw new Error(`unexpected forge line: ${line}`);
 }
-const names = ["defeat", "raise", "escape", "close", "retire"];
+const names = ["defeat", "raise", "escape", "close", "retire", "activate", "activate_on_chain"];
 for (const name of names) {
   if (!vectors[name]) throw new Error(`forge did not print ${name}`);
 }

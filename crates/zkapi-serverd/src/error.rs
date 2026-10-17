@@ -39,6 +39,21 @@ pub enum ServerError {
     #[error("clearance requires a kind-2 ownership proof of the note")]
     ClearanceOwnershipRequired,
 
+    /// A verified ownership proof names a registration commitment, amount or
+    /// expiry other than what the vault recorded for its note.
+    #[error("the ownership proof does not match the note the vault recorded")]
+    NoteBindingMismatch,
+
+    /// The vault holds the note, but not as Active (an escape is pending or
+    /// it is closed): a mutual close of it would revert.
+    #[error("the note is not active in the vault")]
+    NoteNotActive,
+
+    /// The vault (as this server's RPC sees it) holds no note at the proof's
+    /// note ID yet; retry once the deposit is visible.
+    #[error("the vault has no note at this ID yet; retry once the deposit is confirmed")]
+    NoteNotRecorded,
+
     #[error("capacity exhausted")]
     CapacityExhausted,
 
@@ -126,6 +141,9 @@ impl ServerError {
             ServerError::Internal(_) => "internal_error",
             ServerError::Unsettleable(_) => "lease_unsettleable",
             ServerError::ClearanceOwnershipRequired => "clearance_ownership_required",
+            ServerError::NoteBindingMismatch => "note_binding_mismatch",
+            ServerError::NoteNotActive => "note_not_active",
+            ServerError::NoteNotRecorded => "note_not_recorded",
             ServerError::CapacityExhausted => "capacity_exhausted",
             ServerError::NullifierUsed => "nullifier_used",
             ServerError::Database(_) => "database_error",
@@ -155,6 +173,9 @@ impl ServerError {
             ServerError::LeaseRecordUnreadable => false,
             ServerError::Unsettleable(_) => false,
             ServerError::ClearanceOwnershipRequired => false,
+            ServerError::NoteBindingMismatch => false,
+            ServerError::NoteNotActive => false,
+            ServerError::NoteNotRecorded => true,
             ServerError::InvalidProof(_) => false,
             ServerError::Replay => false,
             ServerError::NoteExpired => false,

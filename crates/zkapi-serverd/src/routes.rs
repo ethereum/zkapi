@@ -195,8 +195,9 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
 /// The vault's currentRoot() for a server whose indexer cannot serve a
 /// verified root at startup (unverified, stale or replaying), instead of
 /// --initial-root (0x0 by default), which would refuse every new request as
-/// stale_root until the poller reads a verified root. Clearance already
-/// accepts the same read; --initial-root remains the fallback.
+/// stale_root until the poller reads a verified root. The poller confirms
+/// it with the indexer before admission accepts it; --initial-root remains
+/// the fallback.
 async fn startup_root_from_vault(config: &ServerConfig) -> Felt252 {
     let read = async {
         anyhow::Ok(
@@ -1220,8 +1221,8 @@ fn error_to_response(
     client_request_id: &str,
     processor: &RequestProcessor,
 ) -> ErrorHttpResponse {
-    // A clearance StaleRoot carries the vault root it read; report that,
-    // not this server's possibly lagging indexer root.
+    // An admission StaleRoot carries the root admission accepts; report
+    // that, not one read later.
     let latest_root = match err {
         ServerError::StaleRoot { latest_root } => {
             Some(Felt252::from_hex(latest_root).unwrap_or_else(|_| processor.current_root()))
@@ -1245,10 +1246,12 @@ fn build_error_response(
         | ServerError::InvalidRequest(_)
         | ServerError::OaKeyPolicyRejected
         | ServerError::ClearanceOwnershipRequired
+        | ServerError::NoteBindingMismatch
         | ServerError::ProtocolMismatch(_) => StatusCode::BAD_REQUEST,
         ServerError::StaleRoot { .. }
         | ServerError::NativeQuoteExpired
         | ServerError::NativeQuoteSuperseded => StatusCode::CONFLICT,
+        ServerError::NoteNotActive | ServerError::NoteNotRecorded => StatusCode::CONFLICT,
         ServerError::Replay | ServerError::NullifierUsed => StatusCode::CONFLICT,
         ServerError::LeasePending | ServerError::LeaseSettlementPending { .. } => {
             StatusCode::CONFLICT
@@ -1434,6 +1437,24 @@ mod rate_limit_tests {
                 "capacity_exhausted",
                 true,
             ),
+            (
+                ServerError::NoteBindingMismatch,
+                StatusCode::BAD_REQUEST,
+                "note_binding_mismatch",
+                false,
+            ),
+            (
+                ServerError::NoteNotActive,
+                StatusCode::CONFLICT,
+                "note_not_active",
+                false,
+            ),
+            (
+                ServerError::NoteNotRecorded,
+                StatusCode::CONFLICT,
+                "note_not_recorded",
+                true,
+            ),
         ] {
             let (actual, _, Json(body)) = build_error_response(&error, "clearance", None);
             assert_eq!(actual, status, "{code}");
@@ -1479,19 +1500,19 @@ mod rate_limit_tests {
     fn stale_root_errors_report_the_root_carried_by_the_error() {
         let processor = crate::routes::settlement_route_tests::processor();
         processor.update_root(Felt252::from_u64(5));
-        let vault_root = Felt252::from_u64(0x7007);
+        let admitted_root = Felt252::from_u64(0x7007);
         let ErrorHttpResponse(response) = error_to_response(
             &ServerError::StaleRoot {
-                latest_root: vault_root.to_hex(),
+                latest_root: admitted_root.to_hex(),
             },
-            "clearance",
+            "request",
             &processor,
         );
         let (status, _, Json(body)) = *response;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.error_code, "stale_root");
         assert!(body.retriable);
-        assert_eq!(body.latest_root, Some(vault_root));
+        assert_eq!(body.latest_root, Some(admitted_root));
     }
 
     #[test]
@@ -1542,7 +1563,10 @@ mod startup_tests {
             "eth_call",
             crate::deployment::CONCESSION_ESCAPE_VERSION_SELECTOR,
         ),
-        ("eth_call", crate::deployment::ROOT_HISTORY_WINDOW_SELECTOR),
+        (
+            "eth_call",
+            crate::deployment::NOTE_BOUND_EXIT_VERSION_SELECTOR,
+        ),
         ("eth_call", crate::deployment::PROOF_ADAPTER_SELECTOR),
         ("eth_call", crate::deployment::CIRCUIT_ID_HASH_SELECTOR),
         ("eth_call", crate::deployment::REQUEST_VK_HASH_SELECTOR),
@@ -1579,7 +1603,7 @@ mod startup_tests {
     #[derive(Clone)]
     struct Probes {
         version: u64,
-        root_window: u64,
+        note_bound_version: u64,
         adapter: String,
         circuit_id_hash: [u8; 32],
         request_vk: String,
@@ -1590,13 +1614,13 @@ mod startup_tests {
     }
 
     impl Probes {
-        /// A revision-3 deployment of the development setup, as
+        /// A revision-4 deployment of the development setup, as
         /// `crate::deployment::tests::manifest_json` pins it.
         fn matching() -> Self {
             let identity = crate::deployment::tests::dev_identity();
             Self {
                 version: 1,
-                root_window: 86_400,
+                note_bound_version: 1,
                 adapter: ADAPTER.into(),
                 circuit_id_hash: zkapi_proof::compact::CIRCUIT_ID_HASH,
                 request_vk: identity.request_vk_keccak256,
@@ -1708,9 +1732,9 @@ mod startup_tests {
                             number(probes.version)
                         }
                         ("eth_call", Some(_))
-                            if data == crate::deployment::ROOT_HISTORY_WINDOW_SELECTOR =>
+                            if data == crate::deployment::NOTE_BOUND_EXIT_VERSION_SELECTOR =>
                         {
-                            number(probes.root_window)
+                            number(probes.note_bound_version)
                         }
                         ("eth_call", Some(_))
                             if data == crate::deployment::PROOF_ADAPTER_SELECTOR =>
@@ -1998,8 +2022,8 @@ mod startup_tests {
                 "CONCESSION_ESCAPE_VERSION()",
             ),
             (
-                Box::new(|probes| probes.root_window = 3_600),
-                "ROOT_HISTORY_WINDOW()",
+                Box::new(|probes| probes.note_bound_version = 0),
+                "NOTE_BOUND_EXIT_VERSION()",
             ),
             (
                 Box::new(|probes| {
@@ -2131,7 +2155,7 @@ mod startup_tests {
                 .json()
                 .await
                 .unwrap();
-            assert_eq!(health["circuit_id"], "zkapi-v2-concession-v1");
+            assert_eq!(health["circuit_id"], "zkapi-v2-concession-v2");
             assert_eq!(health["setup_id"], "dev");
             assert_eq!(health["exit_concession"], 1);
             assert_eq!(health["settlement_window_seconds"], 300 + 21_600);
@@ -3262,7 +3286,7 @@ pub(crate) mod settlement_route_tests {
         for uri in ["/health", "/v1/attestation"] {
             let (status, body) = get_json(&app, uri).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(body["circuit_id"], "zkapi-v2-concession-v1", "{uri}");
+            assert_eq!(body["circuit_id"], "zkapi-v2-concession-v2", "{uri}");
             assert_eq!(body["setup_id"], "dev", "{uri}");
             assert_eq!(body["exit_concession"], 1, "{uri}");
             assert_eq!(body["settlement_window_seconds"], 300 + 21_600, "{uri}");
@@ -3328,20 +3352,42 @@ pub(crate) mod settlement_route_tests {
         (status, headers, serde_json::from_slice(&body).unwrap())
     }
 
-    /// The kind-2 ownership proof is admitted over HTTP; a legacy (14-field)
-    /// statement is refused at the wire.
+    /// The kind-2 ownership proof is admitted over HTTP once the vault holds
+    /// its note, as recorded and Active; a note the server's RPC has not seen
+    /// is retriable, another note's values are refused, and a legacy
+    /// (14-field) statement is refused at the wire.
     #[tokio::test]
     async fn ownership_proof_clearance_over_http() {
         let fixture = crate::test_support::ownership_fixture().await;
         let (state_seed, clear_seed) = crate::test_support::ownership_seeds();
-        let processor = RequestProcessor::try_new(
-            crate::test_support::ownership_server_config(),
-            Arc::new(NullifierStore::in_memory().unwrap()),
-            Arc::new(ServerSigner::new(&state_seed, &clear_seed)),
-            fixture.root,
-        )
-        .unwrap();
-        let app = create_router(Arc::new(processor));
+        // A server whose vault holds `note` (None: no note at the proof's ID).
+        let app_with = |note: Option<crate::native_billing::VaultNote>| {
+            let processor = RequestProcessor::try_new(
+                crate::test_support::ownership_server_config(),
+                Arc::new(NullifierStore::in_memory().unwrap()),
+                Arc::new(ServerSigner::new(&state_seed, &clear_seed)),
+                Felt252::ZERO,
+            )
+            .unwrap();
+            if let Some(note) = note {
+                fixture.record(&processor, note);
+            }
+            create_router(Arc::new(processor))
+        };
+        let (status, _, body) = post_clearance(&app_with(None), &fixture.request).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error_code"], "note_not_recorded");
+        assert_eq!(body["retriable"], true);
+        assert!(body["latest_root"].is_null());
+        let foreign = crate::native_billing::VaultNote {
+            commitment: Felt252::from_u64(0xc0),
+            ..fixture.note.vault_note()
+        };
+        let (status, _, body) = post_clearance(&app_with(Some(foreign)), &fixture.request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error_code"], "note_binding_mismatch");
+        assert_eq!(body["retriable"], false);
+        let app = app_with(Some(fixture.note.vault_note()));
         let nullifier = fixture.request.withdrawal_nullifier;
         let (status, _, body) = post_clearance(&app, &fixture.request).await;
         assert_eq!(status, StatusCode::OK, "{body}");

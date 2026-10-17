@@ -3,6 +3,8 @@
 //! This crate implements proof verification, nullifier storage, API execution,
 //! Baby-JubJub Schnorr signing, and HTTP routes for the zkAPI server.
 
+pub mod activation_service;
+pub mod activation_status;
 #[cfg(feature = "adversary")]
 pub mod adversary;
 pub mod challenge_service;
@@ -24,6 +26,7 @@ pub mod settlement;
 pub mod signer;
 pub mod successor;
 pub mod testnet_auth;
+pub mod tx_lane;
 pub mod watcher;
 mod writer_lock;
 

@@ -27,7 +27,9 @@
 //! escape finalized) or missed raise (more owed than conceded at
 //! finalization) is recorded; after a missed defeat, `retire_on_miss` retires
 //! the closed note's leaf (`retireClosedLeaf`, with the indexer's path at the
-//! live root).
+//! vault's current root). A note that was never activated has no leaf in the
+//! request tree yet, but activation inserts it whatever the note's status, so
+//! its retirement waits until `activationCursor()` passes the note.
 //!
 //! The configured RPC must expose an operator-controlled transaction signer.
 //! Keys are never loaded by this service; the sender must be dedicated to it.
@@ -37,6 +39,7 @@
 //! blocking reason is published on the operator status endpoint (see
 //! `challenge_status`).
 
+pub use crate::tx_lane::FeePolicy;
 use crate::{
     challenge_status::{
         self, unix_now, AlarmPolicy, BlockedReason, ChainStatus, ChallengeStatus,
@@ -44,9 +47,15 @@ use crate::{
         ObligationState, ObligationStatus, PollStatus, RemainingThresholds, SenderStatus, Severity,
         StatusHandle,
     },
-    deployment::{probe_deployment, ContractReader, DeploymentManifest, ProbeError},
+    deployment::{probe_deployment, DeploymentManifest, ProbeError},
     error::ServerError,
     nullifier_store::{DeploymentBinding, NullifierStore, StatementIdentity},
+    tx_lane::{
+        classify_send_error, felt_u128, felt_u64, headroom, parse_hex_u128, plan_fees,
+        push_superseded, quantity, quantity_u128, refusal_reason, refused_tx_fee,
+        refused_tx_fee_cap, revert_name, rpc_request, selector, transaction_fees, words,
+        write_json_atomically, FeePlan, Fees, RpcError, RpcReader, SendFailure, GWEI, SEND_TIMEOUT,
+    },
     watcher::{
         CallKind, ChallengeWatcher, EvidenceBinding, EvidenceProof, NothingOwed, Owed, OwedBasis,
         SettlementProgress, VaultCall,
@@ -83,11 +92,6 @@ const SEEN_MARGIN_BLOCKS: u64 = 64;
 /// How far the chain's clock may have run ahead of an earlier release's
 /// when it stamped a miss's `recorded_at` (see `legacy_miss_bound`).
 const LEGACY_MISS_CLOCK_MARGIN_SECONDS: u64 = 900;
-const GWEI: u128 = 1_000_000_000;
-/// Older candidate hashes beyond this many are dropped from a nonce's record.
-const MAX_SUPERSEDED_HASHES: usize = 32;
-/// The signer may make several sequential upstream calls for one send.
-const SEND_TIMEOUT: Duration = Duration::from_secs(95);
 const INDEXER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Gas limit of a defeat unless its estimate (plus 20%) is higher (§5.4).
 pub const DEFAULT_DEFEAT_GAS_LIMIT: u64 = 600_000;
@@ -111,93 +115,6 @@ const DEAD_ESCAPE_CONFIRM_SECONDS: u64 = 60;
 /// so such entries cannot spend the per-poll budget of the others.
 const DEAD_ESCAPE_RECHECK_POLLS: u64 = 16;
 const MAX_ERROR_CHARS: usize = 512;
-
-/// EIP-1559 fee proposals. The signer enforces its own caps, which must be at
-/// least these. A same-nonce replacement raises the tip by the minimum valid
-/// step and the fee cap by `bump_percent`; two replacements stay reserved for
-/// the critical threshold. Every bid keeps gas limit x maxFeePerGas within
-/// the transaction fee ceiling.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FeePolicy {
-    pub max_fee_per_gas: u128,
-    pub max_priority_fee_per_gas: u128,
-    pub priority_fee_per_gas: u128,
-    /// Highest gas limit x maxFeePerGas of one challenge transaction (wei).
-    pub tx_fee_cap_wei: u128,
-    pub bump_after_blocks: u64,
-    pub bump_percent: u64,
-}
-
-impl FeePolicy {
-    pub const DEFAULT_PRIORITY_FEE_PER_GAS: u128 = 2 * GWEI;
-    /// 1 ether, the default `--rpc.txfeecap` of geth and reth: their RPC
-    /// refuses a transaction whose gas limit x maxFeePerGas exceeds it.
-    pub const DEFAULT_TX_FEE_CAP_WEI: u128 = 1_000_000_000_000_000_000;
-    pub const DEFAULT_BUMP_AFTER_BLOCKS: u64 = 3;
-    pub const DEFAULT_BUMP_PERCENT: u64 = 25;
-
-    pub fn new(max_fee_per_gas: u128, max_priority_fee_per_gas: u128) -> Self {
-        Self {
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-            priority_fee_per_gas: Self::DEFAULT_PRIORITY_FEE_PER_GAS,
-            tx_fee_cap_wei: Self::DEFAULT_TX_FEE_CAP_WEI,
-            bump_after_blocks: Self::DEFAULT_BUMP_AFTER_BLOCKS,
-            bump_percent: Self::DEFAULT_BUMP_PERCENT,
-        }
-    }
-
-    /// A transaction fee ceiling as the signer reads it: a positive decimal
-    /// wei amount without sign, leading zeros or spaces; empty means the
-    /// default.
-    pub fn parse_tx_fee_cap(value: &str) -> Result<u128, String> {
-        if value.is_empty() {
-            return Ok(Self::DEFAULT_TX_FEE_CAP_WEI);
-        }
-        if value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("must be a positive decimal integer in wei".into());
-        }
-        value
-            .parse()
-            .map_err(|_| "exceeds the largest supported amount".into())
-    }
-
-    pub fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            self.priority_fee_per_gas > 0,
-            "priority fee per gas must be positive"
-        );
-        ensure!(
-            self.max_priority_fee_per_gas <= self.max_fee_per_gas,
-            "max priority fee per gas must not exceed max fee per gas"
-        );
-        // Nodes accept a same-nonce replacement only when both fees rise by
-        // at least 10%, so the tip needs room above the first bid: twice the
-        // first tip allows about five replacements before the critical
-        // threshold and the two reserved for it.
-        ensure!(
-            self.max_priority_fee_per_gas >= self.priority_fee_per_gas.saturating_mul(2),
-            "max priority fee per gas must be at least twice the priority fee per gas, leaving tip headroom for same-nonce replacement"
-        );
-        ensure!(
-            self.max_fee_per_gas <= u128::MAX / 1_000,
-            "max fee per gas is implausibly large"
-        );
-        ensure!(
-            self.tx_fee_cap_wei > 0,
-            "transaction fee cap must be positive"
-        );
-        ensure!(
-            self.bump_after_blocks >= 1,
-            "fee bump interval must be at least one block"
-        );
-        ensure!(
-            (10..=100).contains(&self.bump_percent),
-            "fee bump percent must be between 10 and 100"
-        );
-        Ok(())
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct ChallengeServiceConfig {
@@ -531,22 +448,6 @@ struct HeadInfo {
     base_fee: Option<u128>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Fees {
-    pub max_fee: u128,
-    pub tip: u128,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FeePlan {
-    /// No earlier attempt can occupy the nonce.
-    First,
-    /// Re-send after every earlier attempt left the pools.
-    Resend(Fees),
-    /// Must be a valid replacement of every earlier attempt.
-    Bump(Fees),
-}
-
 #[derive(Clone, Debug)]
 struct Evaluation {
     state: ObligationState,
@@ -717,55 +618,6 @@ impl DeadEscape {
     }
 }
 
-/// A JSON-RPC error object. Display stays `"{method}: {error_json}"`.
-#[derive(Debug)]
-pub(crate) struct RpcError {
-    method: String,
-    error: Value,
-}
-
-impl RpcError {
-    fn code(&self) -> Option<i64> {
-        self.error.get("code").and_then(Value::as_i64)
-    }
-
-    fn reason(&self) -> Option<&str> {
-        self.error.get("data")?.get("reason")?.as_str()
-    }
-
-    fn transaction_hash(&self) -> Option<String> {
-        let hash = self.error.get("data")?.get("transaction_hash")?.as_str()?;
-        let digits = hash.strip_prefix("0x")?;
-        (digits.len() == 64 && digits.chars().all(|c| c.is_ascii_hexdigit()))
-            .then(|| hash.to_ascii_lowercase())
-    }
-}
-
-impl std::fmt::Display for RpcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.method, self.error)
-    }
-}
-
-impl std::error::Error for RpcError {}
-
-/// An HTTP-level RPC failure. It never includes the URL, which may embed a key.
-#[derive(Debug)]
-struct TransportError {
-    method: String,
-    message: String,
-    /// No connection was made, so the request never reached the signer.
-    unsent: bool,
-}
-
-impl std::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.method, self.message)
-    }
-}
-
-impl std::error::Error for TransportError {}
-
 /// Startup check of the server database's deployment binding.
 #[derive(Debug)]
 pub enum DeploymentCheckError {
@@ -785,17 +637,6 @@ impl std::fmt::Display for DeploymentCheckError {
 }
 
 impl std::error::Error for DeploymentCheckError {}
-
-/// Outcome classes of a failed `eth_sendTransaction`.
-enum SendFailure {
-    /// -32602/-32601/-32003: a definitive refusal; nothing was broadcast.
-    Refused(Option<String>),
-    /// A connection never made, or a signer-reported failure before
-    /// broadcast (transient); nothing was broadcast.
-    NotBroadcast(BlockedReason),
-    /// Possibly broadcast, with the candidate hash when the signer reports it.
-    Ambiguous(Option<String>),
-}
 
 enum IndexerFailure {
     Status(u16),
@@ -1101,7 +942,7 @@ impl ChallengeService {
 
     /// The startup checks (§5.4, §5.5): the database binding (as
     /// `verify_deployment_binding`) must be the deployment manifest's; the
-    /// vault and adapter must pass the startup probes (revision 3, the
+    /// vault and adapter must pass the startup probes (revision 4, the
     /// adapter's circuit and verifying-key hashes equal to the loaded keys,
     /// and the three runtime codehashes the manifest pins); and the vault's
     /// challenge period must be the manifest's and pass the G5 and raise
@@ -3125,8 +2966,11 @@ impl ChallengeService {
     }
 
     /// After a missed defeat was paid out: retire the closed note's leaf
-    /// with the indexer's path at the live root, then retire the obligation
-    /// once the leaf is zero there.
+    /// with the indexer's path at the vault's current root, then retire the
+    /// obligation once the leaf is zero there. Root and activation cursor are
+    /// read at one block: a zero leaf is a retirement only in the tree of an
+    /// activated note. Before activation the obligation waits, holding no
+    /// nonce it never broadcast on, since activation inserts the note's leaf.
     async fn reconcile_retirement(
         &mut self,
         note: u32,
@@ -3143,6 +2987,30 @@ impl ChallengeService {
                 );
                 return Err(error);
             }};
+        }
+        let (root, cursor) = match self.tree_state_at(head.number).await {
+            Ok(state) => state,
+            Err(error) => blocked!(BlockedReason::RpcError, error),
+        };
+        if note >= cursor {
+            if nonce_state == NonceState::Mined {
+                self.mined_unconfirmed(note, EvidenceKind::Leaf).await;
+                return Ok(());
+            }
+            if self.release_if_never_broadcast(note).await {
+                self.persist()?;
+            }
+            self.record(
+                note,
+                base(ObligationState::RetiringLeaf).blocked(
+                    BlockedReason::AwaitingActivation,
+                    format!(
+                        "note {note} is not activated yet (activationCursor {cursor}); its leaf \
+                         enters the request tree on activation and is retired then"
+                    ),
+                ),
+            );
+            return Ok(());
         }
         let response = match self
             .indexer_get::<PathResponse>(&format!("/v1/tree/notes/{note}/path"))
@@ -3169,10 +3037,6 @@ impl ChallengeService {
                 BlockedReason::IndexerInvalidResponse,
                 anyhow!("indexer path must have 32 siblings")
             );
-        };
-        let root = match self.live_root().await {
-            Ok(root) => root,
-            Err(error) => blocked!(BlockedReason::RpcError, error),
         };
         if zkapi_core::v2::merkle_root(note, &response.leaf, &siblings) != root {
             let state = self
@@ -3582,7 +3446,7 @@ impl ChallengeService {
             );
             entry.nonce = Some(nonce);
             if let Some(hash) = entry.transaction_hash.take() {
-                push_superseded(&mut entry.attempt, hash);
+                push_superseded(&mut entry.attempt.superseded_hashes, hash);
             }
             entry.attempt.max_fee_per_gas = Some(format!("0x{:x}", fees.max_fee));
             entry.attempt.max_priority_fee_per_gas = Some(format!("0x{:x}", fees.tip));
@@ -3849,6 +3713,7 @@ impl ChallengeService {
                 return Ok(());
             }
             Some("StaleRoot()") => BlockedReason::IndexerPathBehind,
+            Some("NoteNotActivated()") => BlockedReason::AwaitingActivation,
             // The evidence does not match the vault's escape or verifier.
             Some("NotSuccessorEvidence()" | "NotStateEvidence()" | "InvalidProof()") => {
                 BlockedReason::EvidenceInvalid
@@ -3949,7 +3814,7 @@ impl ChallengeService {
             // until the nonce is consumed.
             let entry = self.checkpoint.pending.get_mut(&note).unwrap();
             entry.transaction_hash = None;
-            push_superseded(&mut entry.attempt, hash);
+            push_superseded(&mut entry.attempt.superseded_hashes, hash);
             self.persist()?;
         }
         // The sender is dedicated, so a pending count past this unmined nonce
@@ -4366,7 +4231,7 @@ impl ChallengeService {
         )
     }
 
-    /// The note's escape at `block`: `pendingWithdrawals(note)` (6 words)
+    /// The note's escape at `block`: `pendingWithdrawals(note)` (5 words)
     /// and `pendingConcessions(note)` (3 words), both read at that block
     /// number, strictly decoded and checked against each other
     /// (`finalBalance + conceded == stateBalance`, and a successor nullifier
@@ -4380,7 +4245,7 @@ impl ChallengeService {
         let mut concession = selector("pendingConcessions(uint32)");
         concession.extend_from_slice(argument.as_bytes());
         let pending = self.call_at(withdrawal, tag.clone()).await?;
-        ensure!(pending.len() == 6, "malformed pending withdrawal response");
+        ensure!(pending.len() == 5, "malformed pending withdrawal response");
         let concession = self.call_at(concession, tag).await?;
         ensure!(
             concession.len() == 3,
@@ -4392,14 +4257,14 @@ impl ChallengeService {
             _ => bail!("malformed pending withdrawal flag"),
         };
         ensure!(
-            pending[4].as_bytes()[..12].iter().all(|byte| *byte == 0),
+            pending[3].as_bytes()[..12].iter().all(|byte| *byte == 0),
             "malformed pending withdrawal destination"
         );
         let state = EscapeState {
             exists,
-            nullifier: pending[2],
-            final_balance: felt_u128(&pending[3])?,
-            deadline: felt_u64(&pending[5])?,
+            nullifier: pending[1],
+            final_balance: felt_u128(&pending[2])?,
+            deadline: felt_u64(&pending[4])?,
             next_nullifier: concession[0],
             state_balance: felt_u128(&concession[1])?,
             conceded: felt_u128(&concession[2])?,
@@ -4424,6 +4289,19 @@ impl ChallengeService {
         ensure!(root.len() == 1, "malformed currentRoot response");
         self.vault_root = Some(root[0]);
         Ok(root[0])
+    }
+
+    /// The vault's currentRoot() and activationCursor() at `block`.
+    async fn tree_state_at(&mut self, block: u64) -> anyhow::Result<(Felt252, u32)> {
+        let tag = json!(format!("0x{block:x}"));
+        let root = self.call_at(selector("currentRoot()"), tag.clone()).await?;
+        ensure!(root.len() == 1, "malformed currentRoot response");
+        let cursor = self.call_at(selector("activationCursor()"), tag).await?;
+        ensure!(cursor.len() == 1, "malformed activationCursor response");
+        let cursor =
+            u32::try_from(felt_u64(&cursor[0])?).context("activation cursor exceeds uint32")?;
+        self.vault_root = Some(root[0]);
+        Ok((root[0], cursor))
     }
 
     /// The vault root at a block named by hash (EIP-1898).
@@ -4456,37 +4334,7 @@ impl ChallengeService {
         params: Value,
         timeout: Option<Duration>,
     ) -> anyhow::Result<Value> {
-        let mut request = self
-            .client
-            .post(&self.config.rpc_url)
-            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }));
-        if let Some(timeout) = timeout {
-            request = request.timeout(timeout);
-        }
-        let transport = |error: reqwest::Error| TransportError {
-            method: method.into(),
-            unsent: error.is_connect() || error.is_builder(),
-            message: error.without_url().to_string(),
-        };
-        let response: Value = request
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(transport)?
-            .json()
-            .await
-            .map_err(transport)?;
-        if let Some(error) = response.get("error") {
-            return Err(RpcError {
-                method: method.into(),
-                error: error.clone(),
-            }
-            .into());
-        }
-        response
-            .get("result")
-            .cloned()
-            .with_context(|| format!("{method}: missing RPC result"))
+        rpc_request(&self.client, &self.config.rpc_url, method, params, timeout).await
     }
 
     /// The indexer's internal /health phase (`syncing`, `diverged`, ...),
@@ -4526,24 +4374,7 @@ impl ChallengeService {
     }
 
     fn persist(&self) -> anyhow::Result<()> {
-        let path = &self.config.checkpoint;
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temporary = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&temporary)?;
-        std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&self.checkpoint)?)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
+        write_json_atomically(&self.config.checkpoint, &self.checkpoint)
     }
 }
 
@@ -4714,213 +4545,6 @@ fn evidence_unreadable(error: &anyhow::Error) -> Evaluation {
     )
 }
 
-/// The challenger's RPC as a `ContractReader` for the startup probes.
-struct RpcReader {
-    client: reqwest::Client,
-    url: String,
-}
-
-impl RpcReader {
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
-        let response: Value = self
-            .client
-            .post(&self.url)
-            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| format!("{method}: {}", error.without_url()))?
-            .json()
-            .await
-            .map_err(|error| format!("{method}: {}", error.without_url()))?;
-        if let Some(error) = response.get("error") {
-            return Err(format!("{method}: {error}"));
-        }
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| format!("{method}: missing RPC result"))
-    }
-}
-
-impl ContractReader for RpcReader {
-    async fn contract_word(&self, address: &str, selector: &str) -> Result<[u8; 32], String> {
-        let result = self
-            .rpc(
-                "eth_call",
-                json!([{ "to": address, "data": selector }, "latest"]),
-            )
-            .await?;
-        let word = result
-            .as_str()
-            .and_then(|raw| raw.strip_prefix("0x"))
-            .filter(|raw| raw.len() == 64)
-            .ok_or("getter returned no 32-byte word (is the contract deployed at this address on this chain?)")?;
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(word, &mut bytes).map_err(|_| "malformed ABI word".to_string())?;
-        Ok(bytes)
-    }
-
-    async fn code_hash(&self, address: &str) -> Result<[u8; 32], String> {
-        let code = self.rpc("eth_getCode", json!([address, "latest"])).await?;
-        let body = code
-            .as_str()
-            .and_then(|raw| raw.strip_prefix("0x"))
-            .ok_or("invalid eth_getCode response")?;
-        if body.is_empty() {
-            return Err("no contract code at this address on this chain".into());
-        }
-        let bytes = hex::decode(body).map_err(|_| "invalid eth_getCode response".to_string())?;
-        Ok(Keccak256::digest(&bytes).into())
-    }
-}
-
-/// Plan the fees of one send at its exact gas limit. `tx_fee_limit` is the
-/// highest maxFeePerGas the transaction fee ceiling allows at that gas limit
-/// and bounds every bid like a lower fee cap. A bump raises the tip by the
-/// minimum valid replacement step and the fee cap by `bump_percent`.
-///
-/// Two valid replacements stay in reserve for the critical threshold: other
-/// bids stay within 10/11 of 10/11 of the caps, unless the base fee needs
-/// more, or rose above a pending bid that cannot otherwise be outbid. A
-/// critical send bids 10/11 of the caps, then the caps. `Ok(None)` keeps a
-/// pending attempt when only that reserve is left.
-fn plan_fees(
-    policy: &FeePolicy,
-    plan: FeePlan,
-    base_fee: Option<u128>,
-    critical: bool,
-    tx_fee_limit: Option<u128>,
-    affordable: Option<u128>,
-) -> Result<Option<Fees>, BlockedReason> {
-    let caps = Fees {
-        max_fee: policy
-            .max_fee_per_gas
-            .min(tx_fee_limit.unwrap_or(u128::MAX)),
-        tip: policy.max_priority_fee_per_gas,
-    };
-    if base_fee.is_some_and(|base| base > policy.max_fee_per_gas) {
-        return Err(BlockedReason::BaseFeeAboveFeeCap);
-    }
-    if base_fee.is_some_and(|base| base > caps.max_fee) {
-        return Err(BlockedReason::TxFeeCapReached);
-    }
-    let reserve = |steps: u32| {
-        (0..steps).fold(caps, |fees, _| Fees {
-            max_fee: headroom(fees.max_fee),
-            tip: headroom(fees.tip),
-        })
-    };
-    // Just under the caps, unless the base fee already exceeds that bid.
-    let critical_target = match base_fee {
-        Some(base) if base > headroom(caps.max_fee) => caps,
-        _ => reserve(1),
-    };
-    // The limits of every other bid, raised only as far as the base fee needs.
-    let limit = match base_fee {
-        Some(base) if base > headroom(caps.max_fee) => caps,
-        Some(base) if base > reserve(2).max_fee => reserve(1),
-        _ => reserve(2),
-    };
-    let bid = |tip: u128| {
-        base_fee.map_or(limit.max_fee, |base| {
-            limit
-                .max_fee
-                .min(base.saturating_mul(2).saturating_add(tip))
-        })
-    };
-    // A max fee the ceiling keeps from rising 10% (or below the raised tip)
-    // is reported first: raising only the tip cap cannot help then.
-    let cap_reason = |old: Fees| {
-        let pinned = min_bump(old.max_fee).max(min_bump(old.tip)) > caps.max_fee;
-        if pinned && caps.max_fee < policy.max_fee_per_gas {
-            BlockedReason::TxFeeCapReached
-        } else if min_bump(old.tip) > caps.tip {
-            BlockedReason::TipCapReached
-        } else {
-            BlockedReason::FeeCapReached
-        }
-    };
-    let bump = |old: Fees, limit: Fees| {
-        let tip = min_bump(old.tip)
-            .max(policy.priority_fee_per_gas)
-            .min(limit.tip);
-        let mut max_fee = old
-            .max_fee
-            .saturating_mul(100 + policy.bump_percent as u128)
-            .div_ceil(100);
-        if let Some(base) = base_fee {
-            max_fee = max_fee.max(base.saturating_mul(2).saturating_add(tip));
-        }
-        let fees = Fees {
-            max_fee: max_fee.min(limit.max_fee),
-            tip,
-        };
-        is_valid_bump(old, fees).then_some(fees)
-    };
-    // A target's tip never exceeds its max fee, which the ceiling can lower
-    // below the tip cap.
-    let escalate = |old: Fees| {
-        [critical_target, caps]
-            .into_iter()
-            .map(|fees| Fees {
-                tip: fees.tip.min(fees.max_fee),
-                ..fees
-            })
-            .find(|fees| is_valid_bump(old, *fees))
-            .ok_or_else(|| cap_reason(old))
-    };
-    let mut fees = match plan {
-        FeePlan::First if critical => critical_target,
-        FeePlan::First => Fees {
-            max_fee: bid(policy.priority_fee_per_gas),
-            tip: policy.priority_fee_per_gas,
-        },
-        FeePlan::Resend(old) => {
-            let tip = old.tip.min(caps.tip);
-            let fees = Fees {
-                max_fee: old.max_fee.min(caps.max_fee).max(bid(tip)),
-                tip,
-            };
-            if critical {
-                Fees {
-                    max_fee: fees.max_fee.max(critical_target.max_fee),
-                    tip: fees.tip.max(critical_target.tip),
-                }
-            } else {
-                fees
-            }
-        }
-        FeePlan::Bump(old) if critical => escalate(old)?,
-        FeePlan::Bump(old) => match bump(old, limit) {
-            Some(fees) => fees,
-            // The pending bid can no longer be included: spend the reserve.
-            None if base_fee.is_some_and(|base| base > old.max_fee) => escalate(old)?,
-            None if bump(old, caps).is_none() => return Err(cap_reason(old)),
-            None => return Ok(None),
-        },
-    };
-    fees.tip = fees.tip.min(fees.max_fee);
-    let mut clamped = false;
-    if let Some(limit) = affordable.filter(|limit| fees.max_fee > *limit) {
-        fees.max_fee = limit;
-        fees.tip = fees.tip.min(limit);
-        clamped = true;
-    }
-    let includable = fees.tip > 0 && base_fee.is_none_or(|base| fees.max_fee >= base);
-    let valid = match plan {
-        FeePlan::Bump(old) => is_valid_bump(old, fees),
-        _ => true,
-    };
-    if clamped && !(includable && valid) {
-        return Err(BlockedReason::InsufficientBalance);
-    }
-    if !includable {
-        return Err(BlockedReason::BaseFeeAboveFeeCap);
-    }
-    Ok(Some(fees))
-}
-
 /// Every attempt recorded on a nonce was a definite non-broadcast: a signer
 /// refusal, a failure the signer reports before broadcasting, or a connection
 /// never made. Any other attempt leaves a candidate hash or an unknown attempt,
@@ -4933,160 +4557,24 @@ fn never_broadcast(transaction_hash: Option<&String>, attempt: &NonceAttempts) -
         && attempt.attempts > 0
 }
 
-/// The blocked reason of a definitive signer refusal.
-fn refusal_reason(reason: Option<&str>) -> BlockedReason {
-    match reason {
-        Some("base_fee_above_max_fee") => BlockedReason::BaseFeeAboveMaxFee,
-        Some("insufficient_balance") => BlockedReason::InsufficientBalance,
-        Some("tx_fee_above_cap") => BlockedReason::TxFeeAboveCap,
-        Some("upstream_tx_fee_cap") => BlockedReason::UpstreamTxFeeCap,
-        _ => BlockedReason::SignerRefused,
-    }
-}
-
-/// The signer's transaction fee cap from a `tx_fee_above_cap` refusal: its
-/// `tx_fee_cap_wei`, or else `max_fee_per_gas_allowed` x the gas limit.
-fn refused_tx_fee_cap(error: &anyhow::Error, gas: u64) -> Option<u128> {
-    let data = error.downcast_ref::<RpcError>()?.error.get("data")?;
-    let field = |name: &str| data.get(name).and_then(|value| quantity_u128(value).ok());
-    field("tx_fee_cap_wei")
-        .or_else(|| {
-            Some(
-                field("max_fee_per_gas_allowed")?
-                    .saturating_mul(field("gas_limit").unwrap_or(u128::from(gas))),
-            )
-        })
-        .filter(|cap| *cap > 0)
-}
-
-/// Gas limit x maxFeePerGas of a refused send: the refusal's `gas_limit` and
-/// `max_fee_per_gas` (the bundled signer reports both with
-/// `upstream_tx_fee_cap`), else the send's own. A reported fee that leaves
-/// no bound (zero) cannot be what the node refused; like a zero signer cap,
-/// it is ignored for the send's own.
-fn refused_tx_fee(error: &anyhow::Error, gas: u64, max_fee: u128) -> u128 {
-    let data = error
-        .downcast_ref::<RpcError>()
-        .and_then(|rpc| rpc.error.get("data"));
-    let field = |name: &str| {
-        data.and_then(|data| data.get(name))
-            .and_then(|value| quantity_u128(value).ok())
-    };
-    let reported = field("gas_limit")
-        .unwrap_or(u128::from(gas))
-        .saturating_mul(field("max_fee_per_gas").unwrap_or(max_fee));
-    if headroom(reported) > 0 {
-        reported
-    } else {
-        u128::from(gas).saturating_mul(max_fee)
-    }
-}
-
-/// The smallest value nodes accept as a 10% replacement bump.
-fn min_bump(value: u128) -> u128 {
-    value.saturating_mul(110).div_ceil(100)
-}
-
-/// The largest value that still leaves one valid bump below `cap`.
-fn headroom(cap: u128) -> u128 {
-    cap.saturating_mul(10) / 11
-}
-
-/// Geth, reth, erigon and besu replace a pending transaction only when both
-/// fees rise by at least 10%.
-fn is_valid_bump(old: Fees, new: Fees) -> bool {
-    new.max_fee >= min_bump(old.max_fee) && new.tip >= min_bump(old.tip) && new.tip <= new.max_fee
-}
-
-/// Fees of a pending transaction object; a legacy one bids its gas price as
-/// both fees.
-fn transaction_fees(transaction: &Value) -> Option<Fees> {
-    let field = |name: &str| {
-        transaction
-            .get(name)
-            .filter(|value| !value.is_null())
-            .and_then(|value| quantity_u128(value).ok())
-    };
-    match (field("maxFeePerGas"), field("maxPriorityFeePerGas")) {
-        (Some(max_fee), Some(tip)) => Some(Fees { max_fee, tip }),
-        _ => field("gasPrice").map(|price| Fees {
-            max_fee: price,
-            tip: price,
-        }),
-    }
-}
-
-fn push_superseded(attempt: &mut NonceAttempts, hash: String) {
-    if !attempt.superseded_hashes.contains(&hash) {
-        attempt.superseded_hashes.push(hash);
-    }
-    let excess = attempt
-        .superseded_hashes
-        .len()
-        .saturating_sub(MAX_SUPERSEDED_HASHES);
-    attempt.superseded_hashes.drain(..excess);
-}
-
-fn classify_send_error(error: &anyhow::Error) -> SendFailure {
-    if error
-        .downcast_ref::<TransportError>()
-        .is_some_and(|transport| transport.unsent)
-    {
-        return SendFailure::NotBroadcast(BlockedReason::RpcError);
-    }
-    // Timeouts, HTTP errors and broken responses may follow a broadcast.
-    let Some(rpc) = error.downcast_ref::<RpcError>() else {
-        return SendFailure::Ambiguous(None);
-    };
-    match (rpc.code(), rpc.reason()) {
-        (Some(-32602 | -32601 | -32003), reason) => SendFailure::Refused(reason.map(str::to_owned)),
-        (Some(-32000), Some("simulation_failed")) => {
-            SendFailure::NotBroadcast(BlockedReason::SimulationReverted)
-        }
-        (
-            Some(-32000),
-            Some(
-                "upstream_unavailable"
-                | "upstream_rejected"
-                | "upstream_chain_mismatch"
-                | "base_fee_unavailable",
-            ),
-        ) => SendFailure::NotBroadcast(BlockedReason::RpcError),
-        _ => SendFailure::Ambiguous(rpc.transaction_hash()),
-    }
-}
-
 /// The vault custom error a defeat, raise or retirement simulation reverted
 /// with, when the RPC passes the revert data through.
 fn vault_revert(error: &anyhow::Error) -> Option<&'static str> {
-    let rpc = error.downcast_ref::<RpcError>()?;
-    let candidates = [
-        rpc.error.get("data").and_then(Value::as_str),
-        rpc.error
-            .get("data")
-            .and_then(|data| data.get("data"))
-            .and_then(Value::as_str),
-        rpc.error.get("message").and_then(Value::as_str),
-    ];
-    [
-        "StaleRoot()",
-        "ChallengeExpired()",
-        "NotPendingWithdrawal()",
-        "ReplayedNullifier()",
-        "NotARaise()",
-        "NotSuccessorEvidence()",
-        "NotStateEvidence()",
-        "InvalidProof()",
-        "NoteNotClosed()",
-    ]
-    .into_iter()
-    .find(|signature| {
-        let selector = hex::encode(selector(signature));
-        candidates
-            .iter()
-            .flatten()
-            .any(|text| text.to_ascii_lowercase().contains(&selector))
-    })
+    revert_name(
+        error,
+        &[
+            "StaleRoot()",
+            "ChallengeExpired()",
+            "NotPendingWithdrawal()",
+            "ReplayedNullifier()",
+            "NotARaise()",
+            "NotSuccessorEvidence()",
+            "NotStateEvidence()",
+            "InvalidProof()",
+            "NoteNotClosed()",
+            "NoteNotActivated()",
+        ],
+    )
 }
 
 fn rpc_code(error: &anyhow::Error) -> Option<i64> {
@@ -5232,58 +4720,6 @@ fn decode_scan_event(log: &Value) -> anyhow::Result<ScanEvent> {
     bail!("unexpected event topic {topic0} in the escape scan")
 }
 
-fn selector(signature: &str) -> Vec<u8> {
-    Keccak256::digest(signature.as_bytes())[..4].to_vec()
-}
-fn quantity(value: &Value) -> anyhow::Result<u64> {
-    let value = quantity_u128(value)?;
-    u64::try_from(value).context("quantity exceeds uint64")
-}
-fn quantity_u128(value: &Value) -> anyhow::Result<u128> {
-    let value = value
-        .as_str()
-        .context("expected hex quantity")?
-        .strip_prefix("0x")
-        .context("hex quantity lacks prefix")?;
-    parse_digits_u128(value).context("quantity exceeds uint128")
-}
-fn parse_hex_u128(value: &str) -> Option<u128> {
-    parse_digits_u128(value.strip_prefix("0x")?)
-}
-fn parse_digits_u128(digits: &str) -> Option<u128> {
-    if digits.chars().all(|c| c == '0') {
-        return Some(0);
-    }
-    u128::from_str_radix(digits.trim_start_matches('0'), 16).ok()
-}
-fn felt_u128(value: &Felt252) -> anyhow::Result<u128> {
-    value.to_u128().context("value exceeds uint128")
-}
-fn felt_u64(value: &Felt252) -> anyhow::Result<u64> {
-    ensure!(
-        value.as_bytes()[..24].iter().all(|byte| *byte == 0),
-        "value exceeds uint64"
-    );
-    Ok(u64::from_be_bytes(
-        value.as_bytes()[24..].try_into().unwrap(),
-    ))
-}
-fn words(value: &Value) -> anyhow::Result<Vec<Felt252>> {
-    let raw = value
-        .as_str()
-        .context("expected ABI bytes")?
-        .strip_prefix("0x")
-        .context("ABI bytes lack prefix")?;
-    let bytes = hex::decode(raw)?;
-    ensure!(bytes.len().is_multiple_of(32), "malformed ABI words");
-    Ok(bytes
-        .as_chunks::<32>()
-        .0
-        .iter()
-        .map(|chunk| Felt252(*chunk))
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     /// A checkpoint whose pending obligation or detached nonce records a
@@ -5340,6 +4776,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::tx_lane::{is_valid_bump, min_bump};
     use crate::watcher::tests::{
         finalized_transcript, finalized_v2_request, two_finalized_v2_requests,
     };
@@ -5401,7 +4838,6 @@ mod tests {
         sends: Vec<Value>,
         fail_first_send: bool,
         root: Felt252,
-        siblings: [Felt252; MERKLE_DEPTH],
         head_number: u64,
         head_timestamp: u64,
         /// Deadline of note 0 (and of notes without an explicit withdrawal).
@@ -5421,7 +4857,6 @@ mod tests {
         indexer_health: &'static str,
         roots_by_hash: BTreeMap<String, Felt252>,
         path_unavailable: u32,
-        path_meta: Option<Value>,
         simulation_error: Option<Value>,
         legacy_gas_price: Option<u128>,
         /// eth_estimateGas answer; the default 10M gas gives a 12M gas limit.
@@ -5455,6 +4890,8 @@ mod tests {
         /// A load-balanced RPC's backend behind the head answers latest-block
         /// pendingWithdrawals reads of the default escape with this activity.
         latest_active: Option<bool>,
+        /// activationCursor(): notes below it are activated.
+        activation_cursor: u32,
         /// pendingWithdrawals reads of the default escape at the head block
         /// fail: the backend serving them lacks it.
         head_block_unknown: bool,
@@ -5462,7 +4899,7 @@ mod tests {
 
     impl MockChain {
         fn new(nullifier: Felt252, next_nullifier: Felt252, state_key: (Felt252, Felt252)) -> Self {
-            let siblings = zkapi_core::v2::zero_hashes()[..MERKLE_DEPTH]
+            let siblings: [Felt252; MERKLE_DEPTH] = zkapi_core::v2::zero_hashes()[..MERKLE_DEPTH]
                 .try_into()
                 .unwrap();
             let now = unix_now();
@@ -5493,7 +4930,6 @@ mod tests {
                 sends: vec![],
                 fail_first_send: false,
                 root: zkapi_core::v2::merkle_root(0, &Felt252::ZERO, &siblings),
-                siblings,
                 head_number: 5,
                 head_timestamp: now,
                 deadline: now + 100,
@@ -5510,7 +4946,6 @@ mod tests {
                 indexer_health: "ok",
                 roots_by_hash: BTreeMap::new(),
                 path_unavailable: 0,
-                path_meta: None,
                 simulation_error: None,
                 legacy_gas_price: None,
                 estimate: 10_000_000,
@@ -5527,6 +4962,7 @@ mod tests {
                 forked_block_reads: 0,
                 latest_active: None,
                 head_block_unknown: false,
+                activation_cursor: 1,
             }
         }
 
@@ -5727,7 +5163,6 @@ mod tests {
                         } else {
                             encoded(&[
                                 Felt252::from_u64(*active as u64),
-                                Felt252::from_u64(8),
                                 *nullifier,
                                 Felt252::from_u64(100),
                                 Felt252::from_u64(5),
@@ -5760,7 +5195,6 @@ mod tests {
                         }
                         encoded(&[
                             Felt252::from_u64(active as u64),
-                            Felt252::from_u64(8),
                             state.nullifier,
                             Felt252::from_u64(100),
                             Felt252::from_u64(5),
@@ -5797,6 +5231,8 @@ mod tests {
                     encoded(&[Felt252::from_u64(
                         state.challenged.contains(&nullifier) as u64
                     )])
+                } else if data == call_data("activationCursor()") {
+                    encoded(&[Felt252::from_u64(state.activation_cursor.into())])
                 } else if data == call_data("currentRoot()") {
                     match block.get("blockHash").and_then(Value::as_str) {
                         Some(hash) => match state.roots_by_hash.get(hash) {
@@ -5955,22 +5391,6 @@ mod tests {
             .into_response()
     }
 
-    async fn path(State(state): State<Arc<Mutex<MockChain>>>, Path(note): Path<u32>) -> Response {
-        let mut state = state.lock().unwrap();
-        if state.path_unavailable > 0 {
-            state.path_unavailable -= 1;
-            return unavailable();
-        }
-        let mut body =
-            json!({"note_id": note, "leaf": Felt252::ZERO, "siblings": state.siblings.to_vec()});
-        if let Some(meta) = state.path_meta.as_ref().and_then(Value::as_object) {
-            for (key, value) in meta {
-                body[key] = value.clone();
-            }
-        }
-        Json(body).into_response()
-    }
-
     /// `/v1/tree/notes/{note}/path`: a configured leaf path of the note.
     async fn leaf_path(
         State(state): State<Arc<Mutex<MockChain>>>,
@@ -6073,7 +5493,6 @@ mod tests {
             )));
             let app = Router::new()
                 .route("/", post(rpc))
-                .route("/v1/tree/notes/{note}/zero-path", get(path))
                 .route("/v1/tree/notes/{note}/path", get(leaf_path))
                 .route("/v1/tree/root", get(tree_root))
                 .route("/v1/escapes/pending", get(pending_escapes))
@@ -8160,7 +7579,7 @@ mod tests {
             None
         );
         // Withdrawal-only errors are never named for a challenge.
-        for signature in ["UnknownRoot()", "ChallengedNullifier()"] {
+        for signature in ["NoteBindingMismatch()", "ChallengedNullifier()"] {
             let data = format!("0x{}", hex::encode(selector(signature)));
             assert_eq!(
                 revert(json!({ "code": 3, "message": "execution reverted", "data": data })),
@@ -11287,6 +10706,74 @@ mod tests {
         assert_eq!(kinds(&fixture.sends()), [CallKind::Retire]);
     }
 
+    /// Design C: a missed defeat of a note that was never activated. Its
+    /// slot in the request tree is empty, so a zero leaf there is no
+    /// retirement: the obligation waits (awaiting_activation, sending
+    /// nothing) until activation inserts the closed note's leaf, then
+    /// retires it.
+    #[tokio::test]
+    async fn a_missed_defeat_of_an_unactivated_note_waits_for_its_activation() {
+        let fixture = Fixture::new().await;
+        fixture.chain.lock().unwrap().simulation_error =
+            Some(json!({ "code": -32000, "message": "execution reverted" }));
+        let mut service = fixture.service_with(|config| config.retire_on_miss = true);
+        assert!(service.poll_once().await.is_err());
+        let siblings: [Felt252; MERKLE_DEPTH] = zkapi_core::v2::zero_hashes()[..MERKLE_DEPTH]
+            .try_into()
+            .unwrap();
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head_timestamp = chain.deadline;
+            chain.head_number += 1;
+            chain.activation_cursor = 0;
+            // The indexer serves the empty slot of the unactivated note.
+            chain.leaf_paths.insert(0, (Felt252::ZERO, siblings));
+            chain.root = zkapi_core::v2::merkle_root(0, &Felt252::ZERO, &siblings);
+        }
+        service.poll_once().await.unwrap();
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.pay_out(5);
+            chain.head_number += 3;
+            chain.simulation_error = None;
+        }
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending[&0].retire_leaf);
+        for _ in 0..2 {
+            service.poll_once().await.unwrap();
+            let waiting = obligation(&service.status(), 0);
+            assert_eq!(waiting.state, ObligationState::RetiringLeaf);
+            assert_eq!(
+                waiting.blocked_reason,
+                Some(BlockedReason::AwaitingActivation)
+            );
+            assert!(service.checkpoint.pending[&0].nonce.is_none());
+        }
+        assert!(fixture.sends().is_empty());
+        assert_eq!(service.checkpoint.retired_leaves_total, 0);
+        // Activation inserts the closed note's leaf: now it is retired.
+        let leaf = Felt252::from_u64(0x1eaf);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.activation_cursor = 1;
+            chain.leaf_paths.insert(0, (leaf, siblings));
+            chain.root = zkapi_core::v2::merkle_root(0, &leaf, &siblings);
+            chain.head_number += 1;
+        }
+        service.poll_once().await.unwrap();
+        assert_eq!(kinds(&fixture.sends()), [CallKind::Retire]);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.mined_nonce = 4;
+            chain.leaf_paths.insert(0, (Felt252::ZERO, siblings));
+            chain.root = zkapi_core::v2::merkle_root(0, &Felt252::ZERO, &siblings);
+            chain.head_number += 3;
+        }
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending.is_empty());
+        assert_eq!(service.checkpoint.retired_leaves_total, 1);
+    }
+
     #[tokio::test]
     async fn a_stale_indexer_path_never_sends_a_retirement() {
         let fixture = Fixture::new().await;
@@ -11435,6 +10922,7 @@ mod tests {
             ("notes", "notes(uint32)"),
             ("challengedNullifiers", "challengedNullifiers(uint256)"),
             ("currentRoot", "currentRoot()"),
+            ("activationCursor", "activationCursor()"),
             ("challengePeriod", "challengePeriod()"),
         ] {
             assert_eq!(
@@ -11443,10 +10931,12 @@ mod tests {
                 "{name}"
             );
         }
-        // escape_state's and note_closed_at's strict word counts.
-        assert_eq!(real_getter_words("pendingWithdrawals"), 6);
+        // escape_state's, note_closed_at's and tree_state_at's strict word
+        // counts.
+        assert_eq!(real_getter_words("pendingWithdrawals"), 5);
         assert_eq!(real_getter_words("pendingConcessions"), 3);
         assert_eq!(real_getter_words("notes"), 4);
+        assert_eq!(real_getter_words("activationCursor"), 1);
         let log = |name: &str| {
             let (topics, data) = real_event(name);
             json!({ "topics": topics, "data": data })
@@ -11527,7 +11017,7 @@ mod tests {
         let mut chain = fixture.chain.lock().unwrap();
         for (selector, value) in [
             (CONCESSION_ESCAPE_VERSION_SELECTOR, Felt252::from_u64(1)),
-            (ROOT_HISTORY_WINDOW_SELECTOR, Felt252::from_u64(86_400)),
+            (NOTE_BOUND_EXIT_VERSION_SELECTOR, Felt252::from_u64(1)),
             (
                 PROOF_ADAPTER_SELECTOR,
                 word(&manifest.proof_adapter_address),
@@ -11592,7 +11082,7 @@ mod tests {
         let mut late = fixture.service_with(|config| config.raise_lead_seconds = 70_000);
         assert!(mismatch(late.verify_deployment(&manifest, timing).await)
             .contains("--raise-lead-seconds"));
-        // A vault before revision 3, another adapter verifying key, or other
+        // A vault before revision 4, another adapter verifying key, or other
         // runtime code is refused, each before anything is polled.
         for (change, message) in [
             (
@@ -11603,6 +11093,15 @@ mod tests {
                     );
                 }) as fn(&mut MockChain),
                 "CONCESSION_ESCAPE_VERSION",
+            ),
+            (
+                |chain| {
+                    chain.probe_words.insert(
+                        crate::deployment::NOTE_BOUND_EXIT_VERSION_SELECTOR.into(),
+                        Felt252::ZERO,
+                    );
+                },
+                "NOTE_BOUND_EXIT_VERSION",
             ),
             (
                 |chain| {

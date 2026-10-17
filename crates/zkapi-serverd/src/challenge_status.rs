@@ -141,6 +141,9 @@ pub enum BlockedReason {
     InsufficientBalance,
     NonceConflict,
     NonceBlocked,
+    /// A leaf retirement waits for the note's activation (vault revision 4):
+    /// the note was never activated, and activation inserts its leaf.
+    AwaitingActivation,
 }
 
 impl BlockedReason {

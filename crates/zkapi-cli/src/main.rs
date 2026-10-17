@@ -96,7 +96,7 @@ enum Commands {
             hide_env_values = true
         )]
         openrouter_settlement_deadline_seconds: u64,
-        /// Legacy deployments only. Circuit zkapi-v2-concession-v1 signs a
+        /// Legacy deployments only. Circuit zkapi-v2-concession-v2 signs a
         /// clearance only against a kind-2 ownership proof: the server
         /// refuses to start with this set.
         #[arg(
@@ -130,16 +130,6 @@ enum Commands {
             hide_env_values = true
         )]
         request_limit_max_usd_micros: Option<u128>,
-        /// How long a Merkle root the server observed stays acceptable for a
-        /// clearance ownership proof without a vault read (60..=86400); any
-        /// other root the vault ever held is accepted after one.
-        #[arg(
-            long,
-            env = "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",
-            default_value_t = zkapi_serverd::config::DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS,
-            hide_env_values = true
-        )]
-        clearance_root_window_seconds: u64,
         /// Start although the database holds leases of another lease key
         /// source (the other source type, or another OA org URL or OpenRouter
         /// API base), which this server can neither measure nor delete: each
@@ -386,7 +376,6 @@ async fn main() -> anyhow::Result<()> {
             deployment,
             root_max_staleness_seconds,
             request_limit_max_usd_micros,
-            clearance_root_window_seconds,
             allow_key_source_switch,
             native_billing_rpc_url,
             native_price_feed_address,
@@ -473,7 +462,6 @@ async fn main() -> anyhow::Result<()> {
                 native_billing,
                 proof_setup_dir: cli.proof_setup_dir.clone(),
                 allow_legacy_clearance,
-                clearance_root_window_seconds,
                 root_max_staleness_seconds,
                 request_limit_max_usd_micros,
                 // From the vault, once run_server has verified the binding.
@@ -1072,7 +1060,6 @@ mod tests {
                     allow_legacy_clearance,
                     root_max_staleness_seconds,
                     request_limit_max_usd_micros,
-                    clearance_root_window_seconds,
                     allow_key_source_switch,
                     deployment,
                     ..
@@ -1081,7 +1068,6 @@ mod tests {
                     allow_legacy_clearance,
                     root_max_staleness_seconds,
                     request_limit_max_usd_micros,
-                    clearance_root_window_seconds,
                     allow_key_source_switch,
                     deployment,
                 ),
@@ -1096,8 +1082,6 @@ mod tests {
             "30",
             "--request-limit-max-usd-micros",
             "6000000",
-            "--clearance-root-window-seconds",
-            "600",
             "--allow-key-source-switch",
             "--deployment",
             "/srv/zkapi/deployment.json",
@@ -1109,21 +1093,26 @@ mod tests {
                 true,
                 30,
                 Some(6_000_000),
-                600,
                 true,
                 Some("/srv/zkapi/deployment.json".into())
             )
         );
-        // The proof-less clearance budget is gone with legacy clearance.
-        let mut legacy = base.to_vec();
-        legacy.extend(["--legacy-clearance-max-per-minute", "5"]);
-        assert!(Cli::try_parse_from(legacy).is_err());
+        // The proof-less clearance budget is gone with legacy clearance, and
+        // the clearance root window with root-bound clearances (a clearance
+        // is bound to the note the vault recorded).
+        for removed in [
+            ["--legacy-clearance-max-per-minute", "5"],
+            ["--clearance-root-window-seconds", "600"],
+        ] {
+            let mut legacy = base.to_vec();
+            legacy.extend(removed);
+            assert!(Cli::try_parse_from(legacy).is_err(), "{removed:?}");
+        }
         if [
             "ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS",
             "ZKAPI_ALLOW_LEGACY_CLEARANCE",
             "ZKAPI_ROOT_MAX_STALENESS_SECONDS",
             "ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS",
-            "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",
             "ZKAPI_ALLOW_KEY_SOURCE_SWITCH",
             "ZKAPI_DEPLOYMENT_MANIFEST",
         ]
@@ -1133,7 +1122,7 @@ mod tests {
             eprintln!("skipping default checks: a settlement or clearance variable is set");
             return;
         }
-        assert_eq!(parse(&[]), (21_600, false, 60, None, 3_600, false, None));
+        assert_eq!(parse(&[]), (21_600, false, 60, None, false, None));
     }
 
     #[test]

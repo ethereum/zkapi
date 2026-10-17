@@ -9,7 +9,8 @@
 //! RPC that
 //!
 //! * the vault reports `CONCESSION_ESCAPE_VERSION() == 1` and
-//!   `ROOT_HISTORY_WINDOW() == 86400`, and its `proofAdapter()` is the
+//!   `NOTE_BOUND_EXIT_VERSION() == 1` (revision 4: note-bound withdrawals
+//!   and an activated request tree), and its `proofAdapter()` is the
 //!   manifest's adapter;
 //! * the adapter's `CIRCUIT_ID_HASH()`, `REQUEST_VK_HASH()` and
 //!   `WITHDRAWAL_VK_HASH()` equal this build's circuit and the verifying keys
@@ -29,19 +30,34 @@ use zkapi_types::wire::CurvePointWire;
 use crate::native_billing::NativeBillingOracle;
 use crate::nullifier_store::{DeploymentBinding, StatementIdentity, BINDING_SOURCE_MANIFEST};
 
-/// `CONCESSION_ESCAPE_VERSION()` of a revision-3 vault.
+/// `CONCESSION_ESCAPE_VERSION()` of a revision-3 (or later) vault.
 pub const CONCESSION_ESCAPE_VERSION: u64 = 1;
-/// `ROOT_HISTORY_WINDOW()` of a revision-3 vault.
-pub const ROOT_HISTORY_WINDOW_SECONDS: u64 = 86_400;
+/// `NOTE_BOUND_EXIT_VERSION()` of a revision-4 vault.
+pub const NOTE_BOUND_EXIT_VERSION: u64 = 1;
 /// The `deployment_status` of a profile whose vault does not exist yet.
 pub const NOT_DEPLOYED: &str = "not_deployed";
 
 pub const CONCESSION_ESCAPE_VERSION_SELECTOR: &str = "0x5e00b426"; // CONCESSION_ESCAPE_VERSION()
-pub const ROOT_HISTORY_WINDOW_SELECTOR: &str = "0x1fe72de0"; // ROOT_HISTORY_WINDOW()
+pub const NOTE_BOUND_EXIT_VERSION_SELECTOR: &str = "0x56853816"; // NOTE_BOUND_EXIT_VERSION()
 pub const PROOF_ADAPTER_SELECTOR: &str = "0xefc91e58"; // proofAdapter()
 pub const CIRCUIT_ID_HASH_SELECTOR: &str = "0xda0e8385"; // CIRCUIT_ID_HASH()
 pub const REQUEST_VK_HASH_SELECTOR: &str = "0xfe351488"; // REQUEST_VK_HASH()
 pub const WITHDRAWAL_VK_HASH_SELECTOR: &str = "0x7fcd0926"; // WITHDRAWAL_VK_HASH()
+/// The adapter's insertion verifying-key hashes, which the activation
+/// worker pins its proving keys to.
+pub const INSERTION1_VK_HASH_SELECTOR: &str = "0x1c0bd503"; // INSERTION1_VK_HASH()
+pub const INSERTION4_VK_HASH_SELECTOR: &str = "0x85925b1a"; // INSERTION4_VK_HASH()
+pub const INSERTION16_VK_HASH_SELECTOR: &str = "0xc2b2d1a6"; // INSERTION16_VK_HASH()
+
+/// The adapter getter of the insertion verifying-key hash for `size` notes.
+pub fn insertion_vk_hash_selector(size: usize) -> Option<&'static str> {
+    match size {
+        1 => Some(INSERTION1_VK_HASH_SELECTOR),
+        4 => Some(INSERTION4_VK_HASH_SELECTOR),
+        16 => Some(INSERTION16_VK_HASH_SELECTOR),
+        _ => None,
+    }
+}
 
 /// The fields of a deployment profile the server stack uses. Other fields
 /// of the profile are ignored.
@@ -448,29 +464,22 @@ pub async fn probe_deployment<R: ContractReader + Sync>(
             .all(|byte| *byte == 0)
             .then(|| u64::from_be_bytes(bytes[24..].try_into().expect("8 bytes")))
     };
-    let version = word(
-        CONCESSION_ESCAPE_VERSION_SELECTOR,
-        vault.clone(),
-        "vault CONCESSION_ESCAPE_VERSION() (a revision-3 vault has it)",
-    )
-    .await?;
-    if small(version) != Some(CONCESSION_ESCAPE_VERSION) {
-        return mismatch(format!(
-            "vault CONCESSION_ESCAPE_VERSION() is {}, not {CONCESSION_ESCAPE_VERSION}",
-            hex32(&version)
-        ));
-    }
-    let window = word(
-        ROOT_HISTORY_WINDOW_SELECTOR,
-        vault.clone(),
-        "vault ROOT_HISTORY_WINDOW()",
-    )
-    .await?;
-    if small(window) != Some(ROOT_HISTORY_WINDOW_SECONDS) {
-        return mismatch(format!(
-            "vault ROOT_HISTORY_WINDOW() is {}, not {ROOT_HISTORY_WINDOW_SECONDS}",
-            hex32(&window)
-        ));
+    for (selector, name, expected) in [
+        (
+            CONCESSION_ESCAPE_VERSION_SELECTOR,
+            "vault CONCESSION_ESCAPE_VERSION() (a revision-3 vault has it)",
+            CONCESSION_ESCAPE_VERSION,
+        ),
+        (
+            NOTE_BOUND_EXIT_VERSION_SELECTOR,
+            "vault NOTE_BOUND_EXIT_VERSION() (a revision-4 vault has it)",
+            NOTE_BOUND_EXIT_VERSION,
+        ),
+    ] {
+        let version = word(selector, vault.clone(), name).await?;
+        if small(version) != Some(expected) {
+            return mismatch(format!("{name} is {}, not {expected}", hex32(&version)));
+        }
     }
     let adapter_word = word(
         PROOF_ADAPTER_SELECTOR,
@@ -584,7 +593,7 @@ pub(crate) mod tests {
             "poseidon_runtime_codehash": hex32(&zkapi_proof::compact::keccak256(b"poseidon code")),
             "settlement_window_seconds": 21_905,
             "exit_concession": 1,
-            "vault_revision": 3,
+            "vault_revision": 4,
         })
     }
 
@@ -612,14 +621,25 @@ pub(crate) mod tests {
                 "CONCESSION_ESCAPE_VERSION",
                 CONCESSION_ESCAPE_VERSION_SELECTOR,
             ),
-            ("ROOT_HISTORY_WINDOW", ROOT_HISTORY_WINDOW_SELECTOR),
+            ("NOTE_BOUND_EXIT_VERSION", NOTE_BOUND_EXIT_VERSION_SELECTOR),
             ("proofAdapter", PROOF_ADAPTER_SELECTOR),
             ("CIRCUIT_ID_HASH", CIRCUIT_ID_HASH_SELECTOR),
             ("REQUEST_VK_HASH", REQUEST_VK_HASH_SELECTOR),
             ("WITHDRAWAL_VK_HASH", WITHDRAWAL_VK_HASH_SELECTOR),
+            ("INSERTION1_VK_HASH", INSERTION1_VK_HASH_SELECTOR),
+            ("INSERTION4_VK_HASH", INSERTION4_VK_HASH_SELECTOR),
+            ("INSERTION16_VK_HASH", INSERTION16_VK_HASH_SELECTOR),
         ] {
             assert_eq!(real_selector(name), selector, "{name}");
         }
+        for (size, name) in [
+            (1, "INSERTION1_VK_HASH"),
+            (4, "INSERTION4_VK_HASH"),
+            (16, "INSERTION16_VK_HASH"),
+        ] {
+            assert_eq!(insertion_vk_hash_selector(size), Some(real_selector(name)));
+        }
+        assert_eq!(insertion_vk_hash_selector(2), None);
     }
 
     #[test]

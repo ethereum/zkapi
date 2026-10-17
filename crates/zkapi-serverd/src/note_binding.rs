@@ -118,7 +118,6 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
             let (public, witness) = a
                 .withdrawal(
                     &deployment,
-                    &tree,
                     &DevWithdrawal {
                         kind,
                         destination,
@@ -127,6 +126,12 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
                     },
                 )
                 .unwrap();
+            // The statement names the note as the vault stores it.
+            assert_eq!(public.registration_commitment, a.note.registration());
+            assert_eq!(
+                (public.deposit_amount, public.expiry),
+                (a.note.deposit_amount, a.note.expiry)
+            );
             let proof = withdrawal_prover().prove(&public, witness).unwrap();
             assert!(withdrawal_verifier.verify(&public, &proof).unwrap());
         }

@@ -10,10 +10,6 @@ pub const MIN_SETTLEMENT_RETRY_WINDOW_SECONDS: u64 = 900;
 /// Bound on the background sweep's own latency (tick budget plus attempt
 /// timeout) used by the startup timing check.
 pub const SETTLEMENT_SWEEP_SLACK_SECONDS: u64 = 600;
-/// How long a root the server observed stays acceptable for clearance.
-pub const DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 3_600;
-pub const MIN_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 60;
-pub const MAX_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 86_400;
 /// O5: admission requires a Merkle root on which the indexer and the vault's
 /// currentRoot() agreed at most this long ago.
 pub const DEFAULT_ROOT_MAX_STALENESS_SECONDS: u64 = 60;
@@ -272,14 +268,10 @@ pub struct ServerConfig {
     /// Directory containing the v2 Groth16 proving/verifying key files.
     pub proof_setup_dir: String,
     /// Legacy deployments only: let POST /v2/withdraw/clearance reserve a
-    /// nullifier without an ownership proof. Circuit zkapi-v2-concession-v1
+    /// nullifier without an ownership proof. Circuit zkapi-v2-concession-v2
     /// requires a kind-2 ownership proof: the server refuses to start with
     /// it set.
     pub allow_legacy_clearance: bool,
-    /// How long after the server last observed a Merkle root a clearance
-    /// ownership proof may use it without a vault read. Any other root is
-    /// accepted once the vault's knownRoots(root) holds it (Amendment A1).
-    pub clearance_root_window_seconds: u64,
     /// O5: admission refuses (`root_unavailable`) unless the indexer root and
     /// the vault's currentRoot() agreed at most this many seconds ago.
     pub root_max_staleness_seconds: u64,
@@ -331,13 +323,8 @@ impl ServerConfig {
             "native request cap must fit browser-safe gwei units"
         );
         anyhow::ensure!(
-            (MIN_CLEARANCE_ROOT_WINDOW_SECONDS..=MAX_CLEARANCE_ROOT_WINDOW_SECONDS)
-                .contains(&self.clearance_root_window_seconds),
-            "--clearance-root-window-seconds must be between {MIN_CLEARANCE_ROOT_WINDOW_SECONDS} and {MAX_CLEARANCE_ROOT_WINDOW_SECONDS}"
-        );
-        anyhow::ensure!(
             !self.allow_legacy_clearance,
-            "refusing to start with --allow-legacy-clearance: circuit zkapi-v2-concession-v1 \
+            "refusing to start with --allow-legacy-clearance: circuit zkapi-v2-concession-v2 \
              signs a clearance only against a kind-2 ownership proof"
         );
         anyhow::ensure!(
@@ -441,7 +428,6 @@ impl std::fmt::Debug for ServerConfig {
             native_billing,
             proof_setup_dir,
             allow_legacy_clearance,
-            clearance_root_window_seconds,
             root_max_staleness_seconds,
             request_limit_max_usd_micros,
             challenge_period_seconds,
@@ -467,10 +453,6 @@ impl std::fmt::Debug for ServerConfig {
             .field("native_billing", native_billing)
             .field("proof_setup_dir", proof_setup_dir)
             .field("allow_legacy_clearance", allow_legacy_clearance)
-            .field(
-                "clearance_root_window_seconds",
-                clearance_root_window_seconds,
-            )
             .field("root_max_staleness_seconds", root_max_staleness_seconds)
             .field("request_limit_max_usd_micros", request_limit_max_usd_micros)
             .field("challenge_period_seconds", challenge_period_seconds)
@@ -505,7 +487,6 @@ impl Default for ServerConfig {
             native_billing: None,
             proof_setup_dir: "protocol/setup/v2-concession".to_string(),
             allow_legacy_clearance: false,
-            clearance_root_window_seconds: DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS,
             root_max_staleness_seconds: DEFAULT_ROOT_MAX_STALENESS_SECONDS,
             request_limit_max_usd_micros: None,
             challenge_period_seconds: None,
@@ -647,25 +628,6 @@ mod tests {
             ..crate::test_support::lease_config()
         };
         assert!(overflow.validate_settlement_timing(u64::MAX).is_err());
-    }
-
-    #[test]
-    fn clearance_root_window_is_bounded() {
-        let mut config = ServerConfig {
-            native_billing: Some(crate::test_support::native_config()),
-            openrouter_leases: Some(crate::test_support::lease_config()),
-            ..Default::default()
-        };
-        assert!(!config.allow_legacy_clearance);
-        config.validate_native_mode().unwrap();
-        for window in [0, 59, 86_401] {
-            config.clearance_root_window_seconds = window;
-            assert!(config.validate_native_mode().is_err(), "{window}");
-        }
-        for window in [60, 86_400] {
-            config.clearance_root_window_seconds = window;
-            config.validate_native_mode().unwrap();
-        }
     }
 
     #[test]

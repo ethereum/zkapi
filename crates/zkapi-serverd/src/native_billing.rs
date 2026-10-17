@@ -21,14 +21,20 @@ pub const STATE_SIGNING_KEY_Y_SELECTOR: &str = "0x230e2a24"; // stateSigningKeyY
 pub const CLEARANCE_SIGNING_KEY_X_SELECTOR: &str = "0xdc41d636"; // clearanceSigningKeyX()
 pub const CLEARANCE_SIGNING_KEY_Y_SELECTOR: &str = "0x112cd6bc"; // clearanceSigningKeyY()
 pub const CHALLENGE_PERIOD_SELECTOR: &str = "0xf3f480d9"; // challengePeriod()
-/// Read by the root poller (O5) and after a clearance ownership proof verified.
+/// Read by the root poller (O5).
 pub const CURRENT_ROOT_SELECTOR: &str = "0xfdab463d"; // currentRoot()
 /// Nullifier flags, read before signing (O7) and before serving request data.
 pub const USED_NULLIFIERS_SELECTOR: &str = "0xaad24061"; // usedNullifiers(uint256)
 pub const CHALLENGED_NULLIFIERS_SELECTOR: &str = "0x6cda756a"; // challengedNullifiers(uint256)
-/// Every root the vault ever set (Amendment A1); read for a clearance
-/// ownership proof at a root the server has not seen recently.
-pub const KNOWN_ROOTS_SELECTOR: &str = "0x12ad7381"; // knownRoots(uint256)
+/// The note as the vault stores it (4 words: commitment, depositAmount,
+/// expiryTs, status); read after a clearance ownership proof verified, to
+/// bind the proof to the recorded note.
+pub const NOTES_SELECTOR: &str = "0x9f18e4ed"; // notes(uint32)
+/// `Types.NoteStatus` of `notes(noteId).status`.
+pub const NOTE_STATUS_UNINITIALIZED: u8 = 0;
+pub const NOTE_STATUS_ACTIVE: u8 = 1;
+pub const NOTE_STATUS_PENDING_WITHDRAWAL: u8 = 2;
+pub const NOTE_STATUS_CLOSED: u8 = 3;
 /// keccak256 of `EscapeConcessionRecorded(uint32,uint256,uint128,uint128)`,
 /// the event that names an escape's `nextNullifier` (§4.2 step 11). Its
 /// nullifier is not indexed: a scan reads every such log and compares.
@@ -60,6 +66,46 @@ impl std::fmt::Debug for NativeBillingConfig {
             .field("decimals", &self.decimals)
             .field("max_age_seconds", &self.max_age_seconds)
             .finish()
+    }
+}
+
+/// `notes(noteId)` at one block: what the vault recorded at deposit
+/// (immutable) and the note's status. An unrecorded id reads all zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultNote {
+    pub commitment: Felt252,
+    pub deposit_amount: u128,
+    pub expiry: u64,
+    pub status: u8,
+}
+
+impl VaultNote {
+    /// Input 16 of the withdrawal statement: `amount | expiry << 128`.
+    pub fn metadata(&self) -> Felt252 {
+        zkapi_types::inputs::note_metadata(self.deposit_amount, self.expiry)
+    }
+
+    /// Strictly decode the four ABI words of `notes(noteId)`: a canonical
+    /// commitment, a uint128 amount, a uint64 expiry and a NoteStatus.
+    pub fn decode(raw: &str) -> Result<Self, ServerError> {
+        let body = raw
+            .strip_prefix("0x")
+            .filter(|body| body.len() == 4 * 64 && body.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| invalid("invalid vault notes response"))?;
+        let commitment = Felt252::from_hex_checked(&body[..64])
+            .map_err(|_| invalid("vault note commitment is not a field element"))?;
+        let expiry = u64::try_from(decode_word(raw, 2)?)
+            .map_err(|_| invalid("vault note expiry exceeds uint64"))?;
+        let status = u8::try_from(decode_word(raw, 3)?)
+            .ok()
+            .filter(|status| *status <= NOTE_STATUS_CLOSED)
+            .ok_or_else(|| invalid("invalid vault note status"))?;
+        Ok(Self {
+            commitment,
+            deposit_amount: decode_word(raw, 1)?,
+            expiry,
+            status,
+        })
     }
 }
 
@@ -355,21 +401,12 @@ impl NativeBillingOracle {
         .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
     }
 
-    /// Whether the vault ever set `root` (`knownRoots(root)`, Amendment A1)
-    /// at "latest", after an eth_chainId check.
-    pub async fn vault_known_root(&self, root: &Felt252) -> Result<bool, ServerError> {
+    /// The vault's `notes(noteId)` at "latest", after an eth_chainId check.
+    pub async fn vault_note(&self, note_id: u32) -> Result<VaultNote, ServerError> {
         async {
             self.assert_chain().await?;
-            let data = format!("{KNOWN_ROOTS_SELECTOR}{}", hex::encode(root.as_bytes()));
-            let raw = self.call(&self.contract_address, &data).await?;
-            if raw.len() != 66 {
-                return Err(invalid("invalid vault knownRoots response length"));
-            }
-            match decode_word(&raw, 0)? {
-                0 => Ok(false),
-                1 => Ok(true),
-                _ => Err(invalid("invalid vault knownRoots boolean")),
-            }
+            let data = format!("{NOTES_SELECTOR}{note_id:064x}");
+            VaultNote::decode(&self.call(&self.contract_address, &data).await?)
         }
         .await
         .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
@@ -1063,13 +1100,13 @@ mod tests {
             ("clearanceSigningKeyY()", CLEARANCE_SIGNING_KEY_Y_SELECTOR),
             ("challengePeriod()", CHALLENGE_PERIOD_SELECTOR),
             ("currentRoot()", CURRENT_ROOT_SELECTOR),
-            ("knownRoots(uint256)", KNOWN_ROOTS_SELECTOR),
+            ("notes(uint32)", NOTES_SELECTOR),
         ] {
             let digest = Keccak256::digest(signature.as_bytes());
             assert_eq!(selector, format!("0x{}", hex::encode(&digest[..4])));
         }
         assert_eq!(CURRENT_ROOT_SELECTOR, "0xfdab463d");
-        assert_eq!(KNOWN_ROOTS_SELECTOR, "0x12ad7381");
+        assert_eq!(NOTES_SELECTOR, "0x9f18e4ed");
         assert_eq!(
             ESCAPE_CONCESSION_RECORDED_TOPIC,
             format!(
@@ -1113,12 +1150,12 @@ mod tests {
             ("currentRoot", CURRENT_ROOT_SELECTOR),
             ("usedNullifiers", USED_NULLIFIERS_SELECTOR),
             ("challengedNullifiers", CHALLENGED_NULLIFIERS_SELECTOR),
-            ("knownRoots", KNOWN_ROOTS_SELECTOR),
+            ("notes", NOTES_SELECTOR),
         ] {
             assert_eq!(real_selector(name), selector, "{name}");
         }
-        // knownRoots(root) answers one boolean word.
-        assert_eq!(real_getter_words("knownRoots"), 1);
+        // notes(noteId) answers commitment, depositAmount, expiryTs, status.
+        assert_eq!(real_getter_words("notes"), 4);
         let (topics, data) = real_event("EscapeConcessionRecorded");
         assert_eq!(topics[0], ESCAPE_CONCESSION_RECORDED_TOPIC);
         let vault = "0x00000000000000000000000000000000000000aa";
@@ -1128,6 +1165,126 @@ mod tests {
             next_nullifier_of(&log, vault).unwrap(),
             format!("0x{:064x}", 0x0202)
         );
+    }
+
+    /// `notes(noteId)` is read at latest after the chain check, its four
+    /// words strictly decoded, and an unrecorded id reads Uninitialized.
+    #[tokio::test]
+    async fn vault_note_reads_notes_at_latest_after_chain_check() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded = calls.clone();
+        let commitment =
+            Felt252::from_hex("0x2a1b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80")
+                .unwrap();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = recorded.clone();
+                async move {
+                    calls.lock().unwrap().push(request.clone());
+                    let data = request["params"][0]["data"].as_str().unwrap_or_default();
+                    let result = match request["method"].as_str() {
+                        Some("eth_chainId") => "0xaa36a7".to_string(),
+                        _ if data == format!("{NOTES_SELECTOR}{:064x}", 7) => format!(
+                            "0x{}{:064x}{:064x}{:064x}",
+                            hex::encode(commitment.as_bytes()),
+                            3_000_000,
+                            4_000_000_000u64,
+                            NOTE_STATUS_ACTIVE
+                        ),
+                        _ => format!("0x{}", "0".repeat(256)),
+                    };
+                    Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let vault = "0x0000000000000000000000000000000000000001";
+        let oracle = NativeBillingOracle::new(
+            NativeBillingConfig {
+                rpc_url,
+                feed_address: quote().feed_address,
+                decimals: 8,
+                max_age_seconds: 3600,
+            },
+            11155111,
+            vault.into(),
+        )
+        .unwrap();
+        let note = oracle.vault_note(7).await.unwrap();
+        assert_eq!(
+            note,
+            VaultNote {
+                commitment,
+                deposit_amount: 3_000_000,
+                expiry: 4_000_000_000,
+                status: NOTE_STATUS_ACTIVE,
+            }
+        );
+        assert_eq!(
+            note.metadata(),
+            zkapi_types::inputs::note_metadata(3_000_000, 4_000_000_000)
+        );
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["method"], "eth_chainId");
+            assert_eq!(
+                calls[1]["params"],
+                json!([{"to": vault, "data": format!("0x9f18e4ed{:064x}", 7)}, "latest"])
+            );
+        }
+        let unrecorded = oracle.vault_note(8).await.unwrap();
+        assert_eq!(unrecorded.status, NOTE_STATUS_UNINITIALIZED);
+        assert!(unrecorded.commitment.is_zero());
+        server.abort();
+    }
+
+    #[test]
+    fn vault_note_decoding_is_strict() {
+        let word = |value: u128| format!("{value:064x}");
+        let note = |commitment: &str, amount: &str, expiry: &str, status: &str| {
+            format!("0x{commitment}{amount}{expiry}{status}")
+        };
+        let valid = note(&word(5), &word(3), &word(4), &word(2));
+        assert_eq!(
+            VaultNote::decode(&valid).unwrap(),
+            VaultNote {
+                commitment: Felt252::from_u64(5),
+                deposit_amount: 3,
+                expiry: 4,
+                status: NOTE_STATUS_PENDING_WITHDRAWAL,
+            }
+        );
+        let out_of_field = "f".repeat(64);
+        let wide_expiry = word(u128::from(u64::MAX) + 1);
+        for malformed in [
+            valid[..valid.len() - 2].to_string(),
+            format!("{valid}00"),
+            valid.trim_start_matches("0x").to_string(),
+            note(&out_of_field, &word(3), &word(4), &word(1)),
+            note(&word(5), &word(3), &wide_expiry, &word(1)),
+            note(&word(5), &word(3), &word(4), &word(4)),
+            note(
+                &word(5),
+                &format!("1{}", "0".repeat(63)),
+                &word(4),
+                &word(1),
+            ),
+            note(
+                &word(5),
+                &word(3),
+                &word(4),
+                &format!("+{}", "0".repeat(63)),
+            ),
+        ] {
+            assert!(VaultNote::decode(&malformed).is_err(), "{malformed}");
+        }
+        assert_eq!(NOTE_STATUS_CLOSED, 3);
     }
 
     #[test]
