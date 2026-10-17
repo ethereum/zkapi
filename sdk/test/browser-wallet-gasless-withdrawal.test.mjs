@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    DEPLOYMENT, VAULT, createHarness, depositPath, memoryIndexedDb, noteState, nullifierFor, within
+    DEPLOYMENT, VAULT, createHarness, memoryIndexedDb, noteState, nullifierFor, within
 } from './helpers/request-archive-harness.mjs';
 import { deployedProfile } from './helpers/deployed-profile.mjs';
 import {
@@ -43,13 +43,18 @@ const ETH = 10n ** 18n;
 const GWEI = 10n ** 9n;
 const low = value => String(value).toLowerCase();
 const wei = units => BigInt(units) * GWEI;
+// The profile's close defaults (gaslessProfileFromVectors): a quarter of the
+// way from the paymaster's call floor to its cap, its verification floor + 30,000.
+const GP = VECTORS.gas_policy;
+const CLOSE_CALL_DEFAULT = BigInt(GP.call_floor[0]) + (BigInt(GP.call_hard_cap[0]) - BigInt(GP.call_floor[0])) / 4n;
+const PM_VERIFICATION_DEFAULT = BigInt(GP.pm_verification_floor) + 30_000n;
 
 /**
  * The shared runtime under the harness with a gasless profile, a scripted
  * chain (the exit RPC and the pinned RPC), a scripted bundler over fetch and a
  * fake wallet that only signs.
  */
-async function scenario({ state = noteState({ current_balance: 500_000_000, deposit_path: depositPath('0x51') }), profile = {},
+async function scenario({ state = noteState({ current_balance: 500_000_000 }), profile = {},
     gasless = gaslessProfileFromVectors({ spelling: 'profile', ...profile }), from = OWNER, allow = [] } = {}) {
     indexedDB.clear();
     storage.clear();
@@ -148,7 +153,7 @@ test('a sponsored close creates the transit account, signs the hash once, journa
     assert.equal(wallet.signatures[0].digest, eip191Digest(hash));
     assert.equal(recover(wallet.signatures[0].digest, op.signature), OWNER, 'the signature recovers the owner of S');
     assert.equal(result.userOpHash, hash);
-    // The exact bytes: sender S, nonce key = the withdrawal nullifier, the factory initCode, the 836-byte vault call inside withdraw(bytes).
+    // The exact bytes: sender S, nonce key = the withdrawal nullifier, the factory initCode, the 868-byte vault call inside withdraw(bytes).
     assert.equal(op.sender, S);
     assert.equal(unpackNonce(op.nonce).key, BigInt(nullifier) & ((1n << 192n) - 1n));
     assert.equal(unpackNonce(op.nonce).sequence, 0n);
@@ -156,14 +161,15 @@ test('a sponsored close creates the transit account, signs the hash once, journa
     assert.equal(op.factoryData, encodeCreateAccount(OWNER, PAYEE));
     const plan = (await record()).preparedWithdrawal;
     assert.equal(op.callData, encodeTransitWithdraw(encodeWithdrawal(plan, 'mutual', S, VAULT, { conceded: plan.public_inputs.conceded })));
+    assert.equal(op.callData.slice(74, 138), BigInt(868).toString(16).padStart(64, '0'), 'the vault call is 868 bytes');
     assert.equal(op.paymaster, low(VECTORS.paymaster));
     assert.equal(op.paymasterData, `0x${BigInt(VECTORS.policy.flat_fee_wei).toString(16).padStart(24, '0')}`, 'feeCapWei = the flat fee shown');
     assert.equal(BigInt(op.maxFeePerGas), 2n * chain.baseFee + chain.priorityFee);
     assert.equal(BigInt(op.maxPriorityFeePerGas), chain.priorityFee);
-    assert.equal(BigInt(op.callGasLimit), 642_500n, 'the profile default, not the bundler estimate');
+    assert.equal(BigInt(op.callGasLimit), CLOSE_CALL_DEFAULT, 'the profile default, not the bundler estimate');
     assert.equal(BigInt(op.verificationGasLimit), 180_000n, 'verification_default_init');
     assert.equal(BigInt(op.paymasterPostOpGasLimit), 270_000n);
-    assert.equal(BigInt(op.paymasterVerificationGasLimit), 430_000n);
+    assert.equal(BigInt(op.paymasterVerificationGasLimit), PM_VERIFICATION_DEFAULT);
     // Journaled before eth_sendUserOperation, with the signature; two dry runs (unsigned, then signed) and the EntryPoint hash cross-check.
     assert.equal(journalAtSend.userOpPhase, 'op_built');
     assert.deepEqual(journalAtSend.userOp, op);
@@ -454,10 +460,10 @@ test('refusals before any prompt: the wrong owner account, AA31, a paused paymas
     assert.equal(spike.wallet.signatures.length, 0);
     assert.equal(proofs(spike.h, 'mutual').length, 0, 'the fee ceiling refuses in the pre-flight, before the proof binds S');
 
-    const small = await scenario({ state: noteState({ current_balance: 20_000_000, deposit_path: depositPath('0x51') }) });
+    const small = await scenario({ state: noteState({ current_balance: 20_000_000 }) });
     await assert.rejects(small.withdraw('mutual'), { code: 'payout_below_gas' });
 
-    const uneconomic = await scenario({ state: noteState({ current_balance: 100_000_000, deposit_path: depositPath('0x51') }) });
+    const uneconomic = await scenario({ state: noteState({ current_balance: 100_000_000 }) });
     await assert.rejects(uneconomic.withdraw('mutual'), error => error.code === 'gasless_uneconomic' && error.data.uneconomicFractionPercent === 25n);
     assert.equal(uneconomic.wallet.signatures.length, 0);
     uneconomic.bundler.autoMine = uneconomic.closeBundle();
@@ -1001,7 +1007,7 @@ test('a bundler estimate between the signed default and the paymaster’s cap is
     between.bundler.autoMine = between.closeBundle();
     const result = await within(5_000, between.withdraw('mutual'), 'estimate between the default and the cap');
     assert.equal(result.status, 'closed');
-    assert.equal(BigInt(between.bundler.sent[0].op.callGasLimit), 642_500n, 'the pinned default is still what is signed');
+    assert.equal(BigInt(between.bundler.sent[0].op.callGasLimit), CLOSE_CALL_DEFAULT, 'the pinned default is still what is signed');
     const above = await scenario();
     above.bundler.estimate = { callGasLimit: '0xf4240' };
     await assert.rejects(above.withdraw('mutual'), error => error.code === 'gasless_estimate_above_cap'

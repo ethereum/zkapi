@@ -17,10 +17,6 @@ export const EXIT_TIMING = Object.freeze({
     callTimeoutMs: 20_000,
     // One E1 recovery pass.
     recoveryBudgetMs: 120_000,
-    // One Merkle path rebuild from the vault's logs (§6.6), across every RPC
-    // it tries: long enough for a full mainnet history in 2,000-block
-    // ranges, short enough that a stalling RPC cannot hold an exit.
-    rebuildBudgetMs: 300_000,
     // must_initiate_by = E_low − 12 h.
     mustInitiateMarginSeconds: 43_200,
     // C4: refuse new requests when now + W + 900 + 3600 > must_initiate_by.

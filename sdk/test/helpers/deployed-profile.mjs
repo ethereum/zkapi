@@ -1,9 +1,12 @@
 import { readFileSync } from 'node:fs';
+import { REQUIRED_CIRCUIT_ID } from '../../build.mjs';
 
 /**
  * The shipped network profile filled in as a deployed vault of this SDK's
- * circuit and setup. The shipped profiles are `not_deployed` placeholders, so
- * tests that need a deployment take its pins from here.
+ * circuit, vault revision and setup. The shipped profiles are `not_deployed`
+ * placeholders, so tests that need a deployment take its pins from here (and
+ * browser-wallet-artifacts.test.mjs checks that the placeholders pin the
+ * same circuit and revision).
  */
 export function deployedProfile(network = 'sepolia', changes = {}) {
     const config = JSON.parse(readFileSync(new URL(`../../assets/config/${network}.json`, import.meta.url), 'utf8'));
@@ -14,6 +17,8 @@ export function deployedProfile(network = 'sepolia', changes = {}) {
         allowed_deployment_manifest_urls: ['https://protocol.example/config.json'],
         trusted_deployment: {
             ...trusted,
+            circuit_id: REQUIRED_CIRCUIT_ID,
+            vault_revision: 4,
             deployment_id: `zkapi-test-${network}-concession`,
             contract_address: `0x${'22'.repeat(20)}`,
             deploy_block: 1,

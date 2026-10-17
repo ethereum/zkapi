@@ -64,15 +64,16 @@ function recoveryHarness(t, kind = 'deposit') {
         clearanceReserved: true, withdrawalNullifier: '0x7', recordId: 'record', generation: 2 };
     const deposit = { operationId: 'op', submissionId: 'submission', next_note_id: 7,
         amount: 2000000, commitment: COMMITMENT, secret: 'private-secret',
-        zero_path: Array(32).fill('0x0'), submissionFrom: FROM, submissionNonce: 5 };
+        submissionFrom: FROM, submissionNonce: 5 };
     const plan = { operationId: 'op', submissionId: 'submission', noteId: 7,
         mode: 'mutual', destination: FROM, submissionFrom: FROM, submissionNonce: 5,
         proof: { backend: 'groth16_bn254', proof: Buffer.alloc(256).toString('base64') },
         public_inputs: { protocol_version: 2, chain_id: 1, contract_address: VAULT,
-            active_root: '0x1', state_signing_key_x: '0x1', state_signing_key_y: '0x1',
+            registration_commitment: '0x1', state_signing_key_x: '0x1', state_signing_key_y: '0x1',
             clearance_signing_key_x: '0x1', clearance_signing_key_y: '0x1', note_id: 7,
             final_balance: 1500000, destination: FROM, withdrawal_nullifier: '0x7',
-            kind: 1, next_nullifier: '0x0', conceded: 0, valid_until: 4_000_000_000 } };
+            kind: 1, next_nullifier: '0x0', conceded: 0, valid_until: 4_000_000_000,
+            deposit_amount: 2000000, expiry: 4_100_000_000 } };
     const record = { recordId: 'record', noteId: 7, destination: FROM, mode: 'mutual',
         startOperationId: 'op', startSubmissionId: 'submission', startSubmissionFrom: FROM,
         startSubmissionNonce: 5, preparedWithdrawal: plan,
@@ -334,13 +335,57 @@ test('deposit hash can arrive after read-only recovery confirmed the same saved 
     runtime.deposits = [{ operationId: 'op', noteId: 7, amount: 2000000, status: 'confirmed' }];
     const receipt = { transactionHash: HASH, status: '0x1', logs: [{ address: VAULT,
         topics: [codec.ABI.noteDeposited, `0x${codec.abiWord(7)}`, COMMITMENT],
-        data: `0x${codec.abiWord(2000000)}${codec.abiWord(12345)}${codec.abiWord(123)}` }] };
+        data: `0x${codec.abiWord(2000000)}${codec.abiWord(12345)}` }] };
     const original = h.p.request;
     h.p.request = request => request.method === 'eth_getTransactionReceipt' ? Promise.resolve(receipt) : original(request);
     await h.resume();
     assert.equal(h.remembers.rememberPendingDepositTransaction.mock.calls.length, 0);
     assert.deepEqual(h.p.acks, [HASH]);
 });
+
+// The vault numbers a deposit at inclusion: another deposit included first
+// moves this one past the context's predicted slot 7, and read-only recovery
+// confirms it at its actual id 8. The receipt must name that record's id.
+for (const [label, receiptNoteId, accepted] of [
+    ['is acknowledged at the record\'s actual note id', 8, true],
+    ['is refused when the receipt names another note id than the record', 9, false],
+    ['is refused when the receipt names only the predicted slot', 7, false]
+]) {
+    test(`an overtaken deposit that recovery confirmed ${label}`, async t => {
+        const h = recoveryHarness(t);
+        assert.equal(h.context.noteId, 7, 'the context keeps the predicted slot');
+        h.state.pendingDeposit = null;
+        runtime.deposits = [{ operationId: 'op', noteId: 8, amount: 2000000, status: 'confirmed' }];
+        const receipt = { transactionHash: HASH, status: '0x1', logs: [{ address: VAULT,
+            topics: [codec.ABI.noteDeposited, `0x${codec.abiWord(receiptNoteId)}`, COMMITMENT],
+            data: `0x${codec.abiWord(2000000)}${codec.abiWord(12345)}` }] };
+        const original = h.p.request;
+        h.p.request = request => request.method === 'eth_getTransactionReceipt' ? Promise.resolve(receipt) : original(request);
+        if (accepted) {
+            assert.equal((await h.resume()).status, 'submitted');
+            assert.deepEqual(h.p.acks, [HASH]);
+        } else {
+            await assert.rejects(h.resume(), /no longer matches its saved private note/);
+            assert.deepEqual(h.p.acks, []);
+        }
+        assert.equal(h.remembers.rememberPendingDepositTransaction.mock.calls.length, 0);
+    });
+}
+
+for (const [label, commitment, amount] of [['commitment', `0x${'66'.repeat(32)}`, 2000000], ['amount', COMMITMENT, 1999999]]) {
+    test(`an overtaken recovered deposit is refused when the receipt names another ${label}`, async t => {
+        const h = recoveryHarness(t);
+        h.state.pendingDeposit = null;
+        runtime.deposits = [{ operationId: 'op', noteId: 8, amount: 2000000, status: 'confirmed' }];
+        const receipt = { transactionHash: HASH, status: '0x1', logs: [{ address: VAULT,
+            topics: [codec.ABI.noteDeposited, `0x${codec.abiWord(8)}`, commitment],
+            data: `0x${codec.abiWord(amount)}${codec.abiWord(12345)}` }] };
+        const original = h.p.request;
+        h.p.request = request => request.method === 'eth_getTransactionReceipt' ? Promise.resolve(receipt) : original(request);
+        await assert.rejects(h.resume(), /no longer matches its saved private note/);
+        assert.deepEqual(h.p.acks, []);
+    });
+}
 
 for (const kind of ['background-withdrawal', 'background-replacement']) {
     test(`${kind} accepts the retained original claim after an exact-nonce takeover`, async t => {

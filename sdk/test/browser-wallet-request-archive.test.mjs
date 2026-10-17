@@ -1148,11 +1148,11 @@ test('a failing automatic settlement backs off instead of polling every two seco
     t.mock.timers.tick(60_000);
 });
 
-test('capabilities come only from the build-pinned trust anchor: vault revision 3, required ownership proofs', async () => {
+test('capabilities come only from the build-pinned trust anchor: vault revision 4, required ownership proofs', async () => {
     const runtime = new BrowserWalletRuntime();
     runtime.manifest = { vault_revision: 2, clearance_ownership_proof: 'optional' };
     runtime.browserConfig = { trusted_deployment: {} };
-    assert.deepEqual(runtime.vaultCapabilities(), { vaultRevision: 3, exitConcession: true, payoutCredits: true,
+    assert.deepEqual(runtime.vaultCapabilities(), { vaultRevision: 4, exitConcession: true, payoutCredits: true,
         sendOwnershipProof: true });
 
     const config = deployedProfile();
@@ -1166,7 +1166,7 @@ test('capabilities come only from the build-pinned trust anchor: vault revision 
     assert.doesNotThrow(() => runtime.validateManifestTrust(manifest));
     // A served manifest cannot change them: only the pinned profile counts.
     assert.doesNotThrow(() => runtime.validateManifestTrust({ ...manifest, vault_revision: 2, clearance_ownership_proof: 'optional' }));
-    for (const change of [{ vault_revision: 0 }, { vault_revision: '3' }, { vault_revision: 2 },
+    for (const change of [{ vault_revision: 0 }, { vault_revision: '4' }, { vault_revision: 2 }, { vault_revision: 3 },
         { clearance_ownership_proof: 'always' }, { clearance_ownership_proof: 'optional' }]) {
         runtime.browserConfig = { ...config, trusted_deployment: { ...trusted, ...change } };
         assert.throws(() => runtime.validateManifestTrust(manifest), /invalid trusted/, JSON.stringify(change));

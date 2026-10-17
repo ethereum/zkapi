@@ -2,7 +2,7 @@ import { browserSdkOptions, beginBrowserSdkInitialization, browserSdkTransport }
 import { assertNativeVault, exitRpcUrl, pinnedRpcRequest, urlRpcRequest, validateNativeFunding, validateNativeQuote, validateProofBoundQuote, readNativeQuote, readVaultWord, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote } from './zkapiNativeEth.mjs';
 import { CHAT_SPENDING_TIER_USD } from './zkapiRequestCompat.mjs';
 import { TestnetPasswordAuth, testnetPasswordRequired } from './testnetPasswordAuth.mjs';
-import { sameFelt, waitForExpectedActiveRoot } from './zkapiWithdrawalRoot.mjs';
+import { sameFelt } from './zkapiWithdrawalRoot.mjs';
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import {
     INVALID_SUCCESSOR_DISPOSITION,
@@ -25,7 +25,6 @@ import {
     ownershipProofAction,
     recordClearanceOutcome, recordReleasedProof, releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
 } from './zkapiExitPolicy.mjs';
-import { rebuildNotePath } from './zkapiTreeRebuild.mjs';
 import { buildExitKitPayload, sealExitKit } from './zkapiExitKit.mjs';
 import { canaryLimits, canaryRefusal, deploymentMismatchError, verifyDeployment } from './zkapiDeploymentCheck.mjs';
 import { GASLESS_TIMING, bundlerClient, bundlerUrl as validBundlerUrl, gaslessError, gaslessPins } from './zkapiGasless.mjs';
@@ -90,6 +89,8 @@ const NOTE_NEAR_EXPIRY_MESSAGE = 'This balance is too close to its expiry for a 
 const INVALID_SUCCESSOR_MESSAGE = 'The server settled a private request for this balance with a successor that fails this wallet’s checks. It is treated as withheld: the balance can only be withdrawn, conceding at most that request’s bound.';
 const DEPOSITS_CLOSED_MESSAGE = 'This deployment no longer accepts new deposits. Existing balances and deposits already started can still be completed, recovered and withdrawn.';
 const REQUEST_ARCHIVE_LIMIT_MESSAGE = 'Too many unsettled private requests are recorded for this balance state, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw this balance.';
+const NOTE_NOT_ACTIVATED_MESSAGE = 'This balance is still being activated: its deposit is confirmed and it can be withdrawn at any time, but private chats start once the vault adds it to its note tree.';
+const NOTE_NOT_ACTIVATED_PAUSED_MESSAGE = 'This balance is not activated for private chats yet, and the vault is paused by its owner: no activation lands until it is unpaused.';
 const EXIT_ONLY_MESSAGE = 'Withdrawals work, but new deposits and private chats wait until the operator’s deployment manifest is served and matches this build again.';
 // Every operator call outside exit mode (lease issuance and retirement,
 // recovery, quotes, the indexer, the manifest) ends by this time, so no hung
@@ -98,21 +99,23 @@ const EXIT_ONLY_MESSAGE = 'Withdrawals work, but new deposits and private chats 
 // Exit-mode calls use E0's CALL_TIMEOUT instead.
 const OPERATOR_CALL_TIMEOUT_MS = 90_000;
 const STALE_ROOT_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000]);
+// A clearance answered note_not_recorded (the server's RPC has not seen the
+// deposit yet) is sent again with the same ownership proof after each of
+// these delays, as zkapi-client does.
+const CLEARANCE_RETRY_DELAYS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000]);
 const SETTLEMENT_RETRY_MIN_MS = 2_000;
 const SETTLEMENT_RETRY_MAX_MS = 60_000;
 const VAULT_SELECTORS = Object.freeze({
     currentRoot: '0xfdab463d',
+    nextNoteId: '0x7a2043a3',
+    activationCursor: '0x93e0ce4e',
+    paused: '0x5c975abb',
+    pausedAt: '0x2e55d0f2',
     challengePeriod: '0xf3f480d9',
     effectiveExpiry: '0x7cb4a03c',
     challengedNullifiers: '0x6cda756a'
 });
 const WITHDRAWAL_RESTART = Symbol('withdrawal-restart');
-// E4.1's path sources in order: the deposit-time path (Amendment A1), the
-// operator's indexer checked against the vault, the vault's own logs (§6.6).
-const EXIT_PATH_SOURCES = Object.freeze(['deposit', 'indexer', 'rebuild']);
-// After the vault refused a proof's root: any source but the saved one, and
-// never the refused root itself.
-const AFTER_UNKNOWN_ROOT_SOURCES = Object.freeze(['indexer', 'rebuild']);
 const REQUEST_PUBLIC_INPUT_FIELDS = Object.freeze([
     'request_nullifier', 'authorization_tag', 'anonymous_commitment_x', 'anonymous_commitment_y',
     'solvency_bound', 'request_time'
@@ -155,7 +158,7 @@ function browserConfigUrl() {
     if (!configured) throw new Error('Configure a trusted configUrl before initializing the zkAPI browser SDK.');
     return configured;
 }
-const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v1';
+const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v2';
 // Setups a bundle can be built for; the build-pinned profile names one, and
 // the proof worker must run a bundle of exactly that setup.
 const BUNDLE_SETUP_IDS = Object.freeze(['dev', 'mpc-1']);
@@ -460,6 +463,30 @@ function validClearance(prepared, nullifier) {
         && sameFelt(clearance.withdrawal_nullifier, nullifier));
 }
 
+/**
+ * The lock with its released ownership proof marked as last answered
+ * note_not_recorded (notRecordedAt): an answer that decides nothing (E2.4,
+ * E2.5), kept while the proof waits to be sent again.
+ */
+function markOwnershipNotRecorded(lock, at) {
+    let marked = false;
+    const released = (lock.released || []).map(entry => {
+        if (marked || Number(entry.kind) !== WITHDRAWAL_KIND.ownership) return entry;
+        marked = true;
+        return { ...entry, notRecordedAt: at };
+    });
+    return { ...lock, released };
+}
+
+/**
+ * Whether the lock released only an ownership proof, last answered
+ * note_not_recorded: the attempt ended while it waited to send it again.
+ */
+function ownershipNotRecorded(lock) {
+    const entry = (lock?.released || []).find(item => Number(item.kind) === WITHDRAWAL_KIND.ownership);
+    return entry?.notRecordedAt != null && ownershipOutcome(lock) === 'unknown' && !releasedExitProofs(lock).length;
+}
+
 // Everything of a note state except its bound (bound_at_state), which the
 // prover sets on the state a request proof is made at.
 const STATE_IDENTITY_FIELDS = Object.freeze(['protocol_version', 'chain_id', 'contract_address', 'note_id',
@@ -471,11 +498,75 @@ function sameStateExceptBound(next, current) {
     return STATE_IDENTITY_FIELDS.every(field => JSON.stringify(next[field] ?? null) === JSON.stringify(current[field] ?? null));
 }
 
-/** A note state from the WebAssembly, with the deposit-time path the previous one saved. */
-function withDepositPath(next, previous) {
-    return previous?.deposit_path && next && Number(next.note_id) === Number(previous.note_id)
-        ? { ...next, deposit_path: previous.deposit_path }
+/**
+ * A note state from the WebAssembly (which drops fields it does not know),
+ * with the registration commitment the previous one carried: the vault's
+ * notes[noteId].commitment, which every exit proof of the note must name.
+ */
+function withRegistrationCommitment(next, previous) {
+    return previous?.registration_commitment != null && next && Number(next.note_id) === Number(previous.note_id)
+        ? { ...next, registration_commitment: previous.registration_commitment }
         : next;
+}
+
+/** A uint32 note id or activation cursor (number, bigint or integer string), or null. */
+function activationCursorValue(value) {
+    let number;
+    try {
+        number = value == null || value === '' ? null : BigInt(value);
+    } catch {
+        return null;
+    }
+    return number != null && number >= 0n && number <= 0xffffffffn ? Number(number) : null;
+}
+
+/**
+ * When a paused vault's exits reopen (`reopenAt`, milliseconds, or null when
+ * unknown): exits are open while unpaused and from pausedAt() +
+ * maxPauseDuration on while paused.
+ */
+function pausedWithdrawalNotice(reopenAt) {
+    if (!Number.isFinite(reopenAt)) return 'Withdrawals reopen at the latest when its pause limit ends.';
+    if (reopenAt <= Date.now()) return 'Its pause limit has passed, so the balance can be withdrawn.';
+    return `Withdrawals reopen when it is unpaused, at the latest ${new Date(reopenAt).toLocaleString()}.`;
+}
+
+/**
+ * The refusal of a request from a note whose leaf is not in the vault's tree
+ * yet (noteId >= activationCursor()). Retriable: the operator's batches
+ * activate notes in deposit order. While the vault is paused no batch lands
+ * and exits wait for the pause too, so that refusal says so instead.
+ */
+function noteNotActivatedError(activation) {
+    const position = activation?.queue_position;
+    const queue = position == null ? ''
+        : position === 0 ? ' It is next in the activation queue.'
+            : ` ${position} ${position === 1 ? 'note is' : 'notes are'} ahead of it in the activation queue.`;
+    const paused = activation?.vault_paused === true;
+    const message = paused
+        ? `${NOTE_NOT_ACTIVATED_PAUSED_MESSAGE} ${pausedWithdrawalNotice(activation.exits_reopen_at)}${queue}`
+        : `${NOTE_NOT_ACTIVATED_MESSAGE}${queue}`;
+    return new BrowserWalletHttpError(message, 409, 'note_not_activated', {
+        retriable: true,
+        note_id: activation?.note_id ?? null,
+        activation_cursor: activation?.activation_cursor ?? null,
+        queue_position: position ?? null,
+        vault_paused: activation?.vault_paused ?? null,
+        exits_reopen_at: activation?.exits_reopen_at ?? null
+    });
+}
+
+/**
+ * Whether a withdrawal statement is bound to `state`'s note record: its
+ * deposit amount and expiry (the packed note metadata) are the state's, and
+ * its registration commitment is the one the state carries, when it does.
+ * The vault compares both with notes[noteId] (NoteBindingMismatch).
+ */
+function boundToNote(inputs, state) {
+    return Boolean(inputs) && state?.deposit_amount != null && state?.expiry_ts != null
+        && sameFelt(inputs.deposit_amount, state.deposit_amount)
+        && sameFelt(inputs.expiry, state.expiry_ts)
+        && (state.registration_commitment == null || sameFelt(inputs.registration_commitment, state.registration_commitment));
 }
 
 function nowSeconds() {
@@ -968,8 +1059,8 @@ class BrowserWalletRuntime extends EventTarget {
             throw new BrowserWalletHttpError('This application pins a placeholder profile: no vault for this proof setup is deployed on this network yet.',
                 409, 'deployment_not_deployed');
         }
-        // Vault revision 3 only: the concession exit is not a monotone
-        // upgrade of revision 2, so its own capability must be pinned.
+        // The concession exit is not a monotone upgrade of revision 2, so its
+        // own capability must be pinned.
         if (trusted.exit_concession !== 1) {
             throw new BrowserWalletHttpError('This application build supports only vaults with the concession exit (exit_concession 1).',
                 409, 'exit_concession_required');
@@ -978,9 +1069,10 @@ class BrowserWalletRuntime extends EventTarget {
             throw new Error('browser-config.json contains an invalid trusted setup_id.');
         }
         // Capabilities come only from the build-pinned trust anchor, never
-        // from the served manifest. This build supports vault revision 3 only.
-        if (trusted.vault_revision !== 3) {
-            throw new Error('browser-config.json contains an invalid trusted vault_revision (this build needs 3).');
+        // from the served manifest. This build supports vault revision 4
+        // only: note-bound exits and requests from activated notes.
+        if (trusted.vault_revision !== 4) {
+            throw new Error('browser-config.json contains an invalid trusted vault_revision (this build needs 4).');
         }
         if (trusted.clearance_ownership_proof !== 'required') {
             throw new Error('browser-config.json contains an invalid trusted clearance_ownership_proof (this build needs "required").');
@@ -1085,13 +1177,14 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * Deployment capabilities. This build supports only vault revision 3
-     * (capability exit_concession 1): escape payouts that the destination
-     * rejects are credited, and every clearance carries a kind-2 ownership
-     * proof.
+     * Deployment capabilities. This build supports only vault revision 4
+     * (capability exit_concession 1): exits are bound to the note's record,
+     * a note proves requests once activated, escape payouts that the
+     * destination rejects are credited, and every clearance carries a
+     * kind-2 ownership proof.
      */
     vaultCapabilities() {
-        return { vaultRevision: 3, exitConcession: true, payoutCredits: true, sendOwnershipProof: true };
+        return { vaultRevision: 4, exitConcession: true, payoutCredits: true, sendOwnershipProof: true };
     }
 
     /**
@@ -1240,6 +1333,7 @@ class BrowserWalletRuntime extends EventTarget {
                 credited_amount: credit.creditedAmount
             })),
             active_lease: active,
+            activation: this.activationSummary(),
             late_withdrawal_attempts: (this.runtime?.lateWithdrawalAttempts || [])
                 .filter(attempt => !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status))
                 .map(attempt => ({
@@ -1429,18 +1523,12 @@ class BrowserWalletRuntime extends EventTarget {
                 releasable_after: exits.length ? exitLockDeadAfter(lock) * 1_000 : null
             } : null,
             exit_kit: { state_seq: stateSeq, exported_seq: exported ?? null, out_of_date: exported == null || exported < stateSeq },
-            deposit_path_saved: Boolean(state.deposit_path),
             exit_cost_warning: this.exitCostWarningAt(state),
             exit_rpc_url: exitRpcUrlValue,
             // The exit RPC answered on another chain than the vault's, so
             // exits read the wallet provider and the pinned RPC instead.
             exit_rpc_wrong_chain: Boolean(exitRpcUrlValue) && this.exitRpcChainCheck?.url === exitRpcUrlValue
-                && this.exitRpcChainCheck.matches === false,
-            // Without a saved deposit path an escape's path comes from the
-            // operator's indexer or a log rebuild; the user's own exit RPC
-            // (or an exit kit made on the depositing device) removes that
-            // dependence on the operator.
-            exit_rpc_recommended: !state.deposit_path && !exitRpcUrlValue
+                && this.exitRpcChainCheck.matches === false
         };
     }
 
@@ -1698,22 +1786,229 @@ class BrowserWalletRuntime extends EventTarget {
         return payload;
     }
 
-    async treePath(noteId, requireExisting = true, expectedActiveRoot = null, signal = null) {
-        return waitForExpectedActiveRoot(async () => {
-            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`, { signal });
-            return this.worker.call('treePath', { snapshot, noteId, requireExisting });
-        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds, signal) });
+    /**
+     * A request's path for `noteId` from the indexer's snapshot, at the root
+     * the snapshot verifies. Only an activated note (noteId <
+     * activationCursor(): its leaf is in the vault's tree) has one. A note
+     * that is not is refused with note_not_activated and its queue position,
+     * from the vault's cursor (the snapshot's when the pinned RPC cannot be
+     * read), and whether the vault is paused; a note the vault activated but
+     * the snapshot does not cover yet with indexer_root_lag; one whose
+     * activation neither tells with activation_unavailable. All are
+     * retriable.
+     *
+     * Only the tree is asked for (parts=tree: the header and `leaves`, not
+     * the recorded notes), the same request for every note. An older indexer
+     * ignores the parameter and serves everything, which reads the same.
+     */
+    async treePath(noteId, signal = null) {
+        const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot?parts=tree`, { signal });
+        const indexerCursor = activationCursorValue(snapshot?.activation_cursor);
+        if (indexerCursor != null && noteId < indexerCursor) {
+            this.rememberActivation(noteId, indexerCursor, 'indexer');
+            return this.worker.call('treePath', {
+                snapshot: { root: snapshot.root, next_note_id: snapshot.next_note_id, leaves: snapshot.leaves,
+                    activation_cursor: indexerCursor },
+                noteId,
+                requireExisting: true
+            });
+        }
+        let vaultCursor = null;
+        try {
+            vaultCursor = await this.vaultActivationCursor(signal);
+        } catch (error) {
+            if (isAbortError(error, signal)) throw error;
+        }
+        const activation = this.rememberActivation(noteId, vaultCursor ?? indexerCursor,
+            vaultCursor != null ? 'vault' : 'indexer');
+        // The fresh vault reading decides the refusal: a higher cursor kept
+        // from an earlier reading (another RPC, or a block since reorged)
+        // does not make this one an indexer lag.
+        const activated = vaultCursor != null ? noteId < vaultCursor : activation.activated;
+        if (activated) {
+            throw new BrowserWalletHttpError('The zkAPI indexer is still catching up with the vault’s activated notes. Try again in a few seconds.',
+                503, 'indexer_root_lag', { retriable: true, note_id: noteId, activation_cursor: activation.activation_cursor });
+        }
+        if (activated == null) {
+            throw new BrowserWalletHttpError('Neither the vault nor the zkAPI indexer could tell whether this balance is activated for private chats. Try again shortly.',
+                503, 'activation_unavailable', { retriable: true, note_id: noteId });
+        }
+        const pause = vaultCursor != null ? await this.vaultPause(signal) : null;
+        if (pause && this.activation?.note_id === noteId && !this.activation.activated) Object.assign(this.activation, pause);
+        throw noteNotActivatedError(vaultCursor != null
+            ? { note_id: noteId, activation_cursor: vaultCursor, queue_position: noteId - vaultCursor, ...pause }
+            : activation);
     }
 
-    async nextDepositPath(expectedActiveRoot = null) {
-        return waitForExpectedActiveRoot(async () => {
-            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`);
-            return this.worker.call('treePath', {
-                snapshot,
-                noteId: Number(snapshot.next_note_id),
-                requireExisting: false
-            });
-        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds) });
+    /**
+     * The vault's pause, through `walletRequest` when it answers on the
+     * vault's chain, else the pinned RPC (best effort: null when it cannot be
+     * read). While paused() no activation batch lands (activateNotes is
+     * whenNotPaused), and exits stay shut until the owner unpauses it, at the
+     * latest pausedAt() + maxPauseDuration (`exits_reopen_at`, milliseconds;
+     * null when unknown).
+     */
+    async vaultPause(signal = null, walletRequest = null) {
+        const wallet = this.walletOnVaultChain(walletRequest);
+        const read = async data => {
+            if (wallet) {
+                try {
+                    const word = await abortable(wallet({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
+                        data }, 'latest'] }), signal);
+                    if (/^0x[0-9a-fA-F]{64}$/.test(word || '')) return BigInt(word);
+                } catch (error) {
+                    if (isAbortError(error, signal)) throw error;
+                }
+            }
+            return this.vaultWord(data, signal);
+        };
+        try {
+            const paused = await read(VAULT_SELECTORS.paused);
+            if (paused === 0n) return { vault_paused: false, exits_reopen_at: null };
+            if (paused !== 1n) return null;
+            let reopenAt = null;
+            try {
+                const pausedAt = await read(VAULT_SELECTORS.pausedAt);
+                const limit = this.browserConfig?.trusted_deployment?.max_pause_duration;
+                if (pausedAt > 0n && limit != null) reopenAt = Number((pausedAt + BigInt(limit)) * 1_000n);
+            } catch (error) {
+                if (isAbortError(error, signal)) throw error;
+            }
+            return { vault_paused: true, exits_reopen_at: reopenAt };
+        } catch (error) {
+            if (isAbortError(error, signal)) throw error;
+            return null;
+        }
+    }
+
+    /**
+     * The vault's activationCursor(): through `walletRequest` when it answers
+     * on the vault's chain, else (or when it fails) the pinned RPC.
+     */
+    async vaultActivationCursor(signal = null, walletRequest = null) {
+        const wallet = this.walletOnVaultChain(walletRequest);
+        if (wallet) {
+            try {
+                const word = await abortable(wallet({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
+                    data: VAULT_SELECTORS.activationCursor }, 'latest'] }), signal);
+                const cursor = /^0x[0-9a-fA-F]{64}$/.test(word || '') ? activationCursorValue(BigInt(word)) : null;
+                if (cursor != null) return cursor;
+            } catch (error) {
+                if (isAbortError(error, signal)) throw error;
+            }
+        }
+        const cursor = activationCursorValue(await this.vaultWord(VAULT_SELECTORS.activationCursor, signal));
+        if (cursor == null) throw new Error('The vault returned an invalid activation cursor.');
+        return cursor;
+    }
+
+    /**
+     * Record a reading of the selected note's activation: activated once
+     * noteId < activationCursor(), else its queue position noteId − cursor
+     * (0: the next batch covers it). A missing reading (an unreadable RPC)
+     * never undoes an activation already seen, and within one source the
+     * cursor only advances: a lagging RPC never moves a vault reading back,
+     * nor a lagging indexer an indexer reading. A vault reading does replace
+     * a higher cursor only the indexer reported (its head view, which a
+     * reorg can drop), so the snapshot never stays 'activated' on it, and an
+     * indexer reading never replaces an activation the vault showed.
+     */
+    rememberActivation(noteId, cursor, source) {
+        const id = Number(noteId);
+        const previous = this.activation?.note_id === id ? this.activation : null;
+        const reading = Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : null;
+        const prior = previous?.activation_cursor;
+        const kept = prior != null && (reading == null || (previous.source === 'vault'
+            ? reading < prior || (source !== 'vault' && id < prior)
+            : source !== 'vault' && reading < prior));
+        const activationCursor = kept ? previous.activation_cursor : reading;
+        this.activation = {
+            note_id: id,
+            activation_cursor: activationCursor,
+            activated: activationCursor == null ? null : id < activationCursor,
+            queue_position: activationCursor == null || id < activationCursor ? null : id - activationCursor,
+            source: kept ? previous.source : reading == null ? null : source,
+            checked_at: Date.now()
+        };
+        return this.activation;
+    }
+
+    /**
+     * The selected note's activation for the snapshot (null without a note):
+     * status 'activated' (it proves requests), 'activating' with its queue
+     * position, or 'unknown' before a reading. Exits never wait for it.
+     */
+    activationSummary() {
+        const state = this.runtime?.state;
+        if (!state) return null;
+        const noteId = Number(state.note_id);
+        const known = this.activation?.note_id === noteId ? this.activation : null;
+        return {
+            note_id: noteId,
+            status: known?.activated == null ? 'unknown' : known.activated ? 'activated' : 'activating',
+            activated: known?.activated ?? null,
+            activation_cursor: known?.activation_cursor ?? null,
+            queue_position: known?.queue_position ?? null,
+            source: known?.source ?? null,
+            checked_at: known?.checked_at ?? null,
+            vault_paused: known?.activated === false ? known.vault_paused ?? null : null,
+            exits_reopen_at: known?.activated === false ? known.exits_reopen_at ?? null : null
+        };
+    }
+
+    /**
+     * Read the selected note's activation: the vault's activationCursor()
+     * (through `walletRequest` when given, else the pinned RPC), or the
+     * indexer's cursor when the vault cannot be read, and, while the note is
+     * not activated, the vault's pause. A note the vault showed activated is
+     * not read again; one only the indexer did is, until the vault confirms
+     * it. Returns the snapshot's activation summary.
+     */
+    async refreshActivation({ walletRequest = null, signal = null } = {}) {
+        await this.init();
+        const state = this.runtime?.state;
+        if (!state) return null;
+        const noteId = Number(state.note_id);
+        if (this.activation?.note_id === noteId && this.activation.activated && this.activation.source === 'vault') {
+            return this.activationSummary();
+        }
+        const before = this.activationSummary();
+        let cursor = null;
+        let source = 'vault';
+        try {
+            cursor = await this.vaultActivationCursor(signal, walletRequest);
+        } catch (error) {
+            if (isAbortError(error, signal)) throw error;
+            try {
+                const root = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/root`, { signal });
+                cursor = activationCursorValue(root?.activation_cursor);
+                source = 'indexer';
+            } catch (indexerError) {
+                if (isAbortError(indexerError, signal)) throw indexerError;
+            }
+        }
+        const activation = this.rememberActivation(noteId, cursor, source);
+        if (activation.activated === false && source === 'vault') {
+            Object.assign(activation, await this.vaultPause(signal, walletRequest));
+        }
+        const summary = this.activationSummary();
+        if (['status', 'activation_cursor', 'source', 'vault_paused'].some(field => summary[field] !== before[field])) {
+            this.dispatchEvent(new Event('change'));
+        }
+        return summary;
+    }
+
+    /**
+     * The slot a deposit sent now is predicted to take: the vault's
+     * nextNoteId() as `nextNoteId` gives it (read through the wallet that
+     * will sign) or as the pinned RPC reads it. The vault assigns the id at
+     * inclusion, so confirmation takes it from the receipt.
+     */
+    async nextDepositSlot(nextNoteId = null) {
+        const value = nextNoteId ?? await this.vaultWord(VAULT_SELECTORS.nextNoteId);
+        const slot = activationCursorValue(value);
+        if (slot == null) throw new Error('The vault returned an invalid next note id.');
+        return slot;
     }
 
     canQuotePendingDeposit(pending = this.runtime?.pendingDeposit) {
@@ -1726,14 +2021,43 @@ class BrowserWalletRuntime extends EventTarget {
                 && !LATE_DEPOSIT_TERMINAL_STATUSES.has(attempt.status));
         if (!noActiveAttempt) return false;
         if (pending.phase === 'retry_exact') {
-            return pending.fundingQuoteRetryAuthorized === true && Boolean(pending.ambiguousSubmissions?.length);
+            return pending.fundingQuoteRetryAuthorized === true && Boolean(pending.ambiguousSubmissions?.length)
+                && !this.depositRetryNonceUnknown(pending);
         }
         return pending.phase === 'prepared' && !pending.legacyRecovery
             && !(pending.ambiguousSubmissions || []).some(attempt =>
                 !(pending.resolvedAmbiguousSubmissionIds || []).includes(attempt.submissionId));
     }
 
-    async prepareDepositQuote(amount, expectedActiveRoot) {
+    /**
+     * The sender and nonce an explicit retry of an unknown deposit send
+     * reuses (retryFrom, retryNonce, kept by authorizePendingDepositRetry):
+     * deposit(bytes32,uint128) records a repeated commitment as another
+     * note, so only one transaction at that nonce may ever execute. Null
+     * when no unknown send is pinned.
+     */
+    depositRetryPin(pending = this.runtime?.pendingDeposit) {
+        const nonce = Number(pending?.retryNonce);
+        return /^0x[0-9a-fA-F]{40}$/.test(pending?.retryFrom || '') && pending.retryNonce != null
+            && Number.isSafeInteger(nonce) && nonce >= 0
+            ? { from: pending.retryFrom.toLowerCase(), nonce }
+            : null;
+    }
+
+    /**
+     * Whether an unresolved unknown send of `pending` is not covered by its
+     * retry pin: one saved without its nonce may still execute beside any
+     * retry, so none is sent until recovery finds its note.
+     */
+    depositRetryNonceUnknown(pending = this.runtime?.pendingDeposit) {
+        const pin = this.depositRetryPin(pending);
+        const resolved = pending?.resolvedAmbiguousSubmissionIds || [];
+        return (pending?.ambiguousSubmissions || []).some(attempt => !resolved.includes(attempt.submissionId)
+            && !(pin && String(attempt.from || '').toLowerCase() === pin.from
+                && attempt.nonce != null && Number(attempt.nonce) === pin.nonce));
+    }
+
+    async prepareDepositQuote(amount, nextNoteId = null) {
         await this.init();
         // Exit-only mode refuses new deposits (initialize()).
         await this.assertServiceAvailable();
@@ -1761,7 +2085,6 @@ class BrowserWalletRuntime extends EventTarget {
             const previous = pending || this.runtime.depositQuote;
             const params = previous?.amount === amount ? previous
                 : await this.worker.call('generateDeposit');
-            const path = await this.nextDepositPath(expectedActiveRoot);
             const draft = {
                 ...(pending || {}),
                 operationId: previous?.amount === amount ? previous.operationId : uuid(),
@@ -1769,9 +2092,7 @@ class BrowserWalletRuntime extends EventTarget {
                 amount,
                 secret: params.secret,
                 commitment: params.commitment || params.registration_commitment,
-                next_note_id: path.note_id,
-                active_root: path.active_root,
-                zero_path: path.siblings
+                next_note_id: await this.nextDepositSlot(nextNoteId)
             };
             // A new quote is only a draft. A rejected-before-broadcast pending
             // plan can be requoted, but only for its original amount and identity.
@@ -1840,7 +2161,6 @@ class BrowserWalletRuntime extends EventTarget {
                 throw this.depositsClosedError();
             }
             const params = await this.worker.call('generateDeposit');
-            const path = await this.nextDepositPath();
             const plan = {
                 operationId: uuid(),
                 createdAt: Date.now(),
@@ -1848,9 +2168,7 @@ class BrowserWalletRuntime extends EventTarget {
                 amount: Number(amount),
                 secret: params.secret,
                 commitment: params.registration_commitment,
-                next_note_id: path.note_id,
-                active_root: path.active_root,
-                zero_path: path.siblings
+                next_note_id: await this.nextDepositSlot()
             };
             // Persist the note secret before MetaMask is opened. If the tab is
             // closed after the transaction is submitted, the deposit can still
@@ -1865,7 +2183,7 @@ class BrowserWalletRuntime extends EventTarget {
         return plan;
     }
 
-    async refreshPendingDeposit(amount, expectedActiveRoot = null, { expectedOperationId = null } = {}) {
+    async refreshPendingDeposit(amount, nextNoteId = null, { expectedOperationId = null } = {}) {
         await this.init();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
@@ -1882,17 +2200,11 @@ class BrowserWalletRuntime extends EventTarget {
                 ? pending.transactionHashes
                 : pending.transactionHash ? [pending.transactionHash] : [];
             if (pending.phase !== 'prepared' || pending.submissionId || hashes.length) {
-                throw new Error('This deposit already has a wallet attempt. Check it before refreshing the vault path.');
+                throw new Error('This deposit already has a wallet attempt. Check it before refreshing its vault slot.');
             }
-            const path = await this.nextDepositPath(expectedActiveRoot);
-            const refreshed = {
-                ...pending,
-                next_note_id: path.note_id,
-                active_root: path.active_root,
-                zero_path: path.siblings
-            };
+            const refreshed = { ...pending, next_note_id: await this.nextDepositSlot(nextNoteId) };
             // Keep the durable secret and commitment, but rebase their unused
-            // note onto the latest append position before the wallet prompt.
+            // note onto the latest predicted slot before the wallet prompt.
             await this.commit({ ...this.runtime, pendingDeposit: refreshed });
             return refreshed;
         });
@@ -1906,7 +2218,7 @@ class BrowserWalletRuntime extends EventTarget {
         });
     }
 
-    async claimPendingDepositSubmission(expectedOperationId = null) {
+    async claimPendingDepositSubmission(expectedOperationId = null, { from = null } = {}) {
         await this.init();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
@@ -1950,6 +2262,19 @@ class BrowserWalletRuntime extends EventTarget {
             if (!['prepared', 'retry_exact'].includes(pending.phase)) {
                 throw new Error('This deposit is not ready for a wallet request.');
             }
+            if (this.depositRetryNonceUnknown(pending)) {
+                throw new BrowserWalletHttpError(
+                    'An earlier request for this deposit has an unknown result and no saved wallet nonce, so a retry could record the deposit twice. Check the deposit again later.',
+                    409,
+                    'deposit_retry_nonce_unknown'
+                );
+            }
+            // An explicit retry of an unknown send reuses its sender and
+            // nonce, so at most one of the two can execute.
+            const retryPin = this.depositRetryPin(pending);
+            if (retryPin && String(from || '').toLowerCase() !== retryPin.from) {
+                throw new Error(`Connect the MetaMask account ${retryPin.from} that sent the earlier request for this deposit.`);
+            }
             const submissionId = uuid();
             const next = {
                 ...pending,
@@ -1965,6 +2290,7 @@ class BrowserWalletRuntime extends EventTarget {
                 transactionHash: null,
                 operationId: next.operationId,
                 submissionId,
+                retryNonce: retryPin?.nonce ?? null,
                 noteId: Number(next.next_note_id),
                 amount: Number(next.amount),
                 commitment: next.commitment,
@@ -2059,6 +2385,10 @@ class BrowserWalletRuntime extends EventTarget {
             if (!this.depositSubmissionMatches(pending, submission)
                 || pending.submissionId !== submission.submissionId) {
                 throw new Error('The deposit wallet claim changed before its nonce was saved.');
+            }
+            const retryPin = this.depositRetryPin(pending);
+            if (retryPin && (from.toLowerCase() !== retryPin.from || nonce !== retryPin.nonce)) {
+                throw new Error(`This deposit retry must reuse nonce ${retryPin.nonce} of ${retryPin.from}.`);
             }
             const next = {
                 ...pending,
@@ -2228,6 +2558,24 @@ class BrowserWalletRuntime extends EventTarget {
         });
     }
 
+    /**
+     * Keep how far a search for the pending deposit's note read the vault's
+     * finalized records (noteSearchFrom): every id below it holds another
+     * note, so later searches start there. It only moves forward.
+     */
+    async rememberPendingDepositSearch(operationId, noteSearchFrom) {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const pending = this.runtime.pendingDeposit;
+            if (!pending || pending.operationId !== operationId || !Number.isSafeInteger(noteSearchFrom)
+                || noteSearchFrom <= Number(pending.noteSearchFrom || 0)) return pending ? { ...pending } : null;
+            const next = { ...pending, noteSearchFrom };
+            await this.commit({ ...this.runtime, pendingDeposit: next });
+            return { ...next };
+        });
+    }
+
     async markPendingDepositMissingReceipts(expectedTransactionHashes) {
         await this.init();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
@@ -2355,15 +2703,34 @@ class BrowserWalletRuntime extends EventTarget {
             const history = Array.isArray(pending.ambiguousSubmissions)
                 ? pending.ambiguousSubmissions
                 : [];
+            // The retry reuses the unknown send's sender and nonce, so both
+            // cannot execute (depositRetryPin). A send without a saved nonce
+            // never reached the wallet (sendContractTransaction saves it
+            // first), and this authorization revokes its claim.
+            const nonce = Number(pending.submissionNonce);
+            const sent = /^0x[0-9a-fA-F]{40}$/.test(pending.submissionFrom || '')
+                && pending.submissionNonce != null && Number.isSafeInteger(nonce) && nonce >= 0
+                ? { from: pending.submissionFrom.toLowerCase(), nonce }
+                : null;
+            const retryPin = this.depositRetryPin(pending) || sent;
+            const ambiguousSubmissions = [...history, {
+                submissionId: pending.submissionId,
+                startedAt: pending.submissionStartedAt,
+                authorizedAt: Date.now(),
+                ...(sent || {})
+            }].slice(-8);
+            const resolvedIds = [...(pending.resolvedAmbiguousSubmissionIds || []),
+                ...(sent ? [] : [pending.submissionId])];
             const next = {
                 ...pending,
                 phase: 'retry_exact',
                 fundingQuoteRetryAuthorized: forFundingQuote,
-                ambiguousSubmissions: [...history, {
-                    submissionId: pending.submissionId,
-                    startedAt: pending.submissionStartedAt,
-                    authorizedAt: Date.now()
-                }].slice(-8)
+                ambiguousSubmissions,
+                ...(retryPin ? { retryFrom: retryPin.from, retryNonce: retryPin.nonce } : {}),
+                ...(resolvedIds.length ? {
+                    resolvedAmbiguousSubmissionIds: [...new Set(resolvedIds)].filter(id =>
+                        ambiguousSubmissions.some(attempt => attempt.submissionId === id))
+                } : {})
             };
             delete next.submissionId;
             delete next.submissionOwner;
@@ -2379,54 +2746,36 @@ class BrowserWalletRuntime extends EventTarget {
         });
     }
 
-    async resolvePendingDepositSlotConflict(expected) {
+    /**
+     * Release the retry pin once recovery proved, at a finalized block, that
+     * its nonce went to another transaction while the vault recorded no note
+     * of this deposit (browserDepositNonceConsumed): no unknown send at that
+     * nonce can execute, so they are resolved and a retry needs no pin.
+     */
+    async resolvePendingDepositRetryNonce(operationId, retryPin) {
         await this.init();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const pending = this.runtime.pendingDeposit;
-            if (!pending) return null;
-            const normalizeHashes = value => [...new Set((Array.isArray(value)
-                ? value
-                : value ? [value] : [])
-                .map(hash => String(hash).toLowerCase()))].sort();
-            const pendingHashes = normalizeHashes(
-                pending.transactionHashes || pending.transactionHash
-            );
-            const expectedHashes = normalizeHashes(
-                expected?.transactionHashes || expected?.transactionHash
-            );
-            if (!expected?.operationId
-                || pending.operationId !== expected.operationId
-                || Number(pending.next_note_id) !== Number(expected.noteId)
-                || Number(pending.amount) !== Number(expected.amount)
-                || !sameFelt(pending.commitment, expected.commitment)
-                || (pending.phase || null) !== (expected.phase || null)
-                || (pending.submissionId || null) !== (expected.submissionId || null)
-                || JSON.stringify(pendingHashes) !== JSON.stringify(expectedHashes)) {
-                throw new Error('The pending deposit changed while its vault slot was being checked. Check it again before retrying.');
+            const current = this.depositRetryPin(pending);
+            if (!pending || pending.operationId !== operationId || pending.submissionId || !current
+                || current.from !== retryPin?.from || current.nonce !== retryPin?.nonce) {
+                return pending ? { ...pending } : null;
             }
             const next = {
                 ...pending,
-                phase: 'prepared',
-                previousSlot: Number(pending.next_note_id),
-                // Finalized occupation by another commitment proves every old
-                // ambiguous call for this append slot can no longer succeed.
-                // Retain those claims for late recovery, while recording exactly
-                // which ambiguity was resolved before allowing a fresh quote.
-                resolvedAmbiguousSubmissionIds: (pending.ambiguousSubmissions || []).map(attempt => attempt.submissionId),
-                legacyRecovery: false,
-                fundingQuoteRetryAuthorized: false
+                resolvedAmbiguousSubmissionIds: [...new Set([
+                    ...(pending.resolvedAmbiguousSubmissionIds || []),
+                    ...(pending.ambiguousSubmissions || []).filter(attempt =>
+                        String(attempt.from || '').toLowerCase() === current.from
+                        && attempt.nonce != null && Number(attempt.nonce) === current.nonce)
+                        .map(attempt => attempt.submissionId)
+                ])]
             };
-            delete next.submissionId;
-            delete next.submissionOwner;
-            delete next.submissionStartedAt;
-            delete next.submissionFrom;
-            delete next.submissionNonce;
-            delete next.transactionHash;
-            delete next.transactionHashes;
-            delete next.transactionAttempts;
+            delete next.retryFrom;
+            delete next.retryNonce;
             await this.commit({ ...this.runtime, pendingDeposit: next });
-            return next;
+            return { ...next };
         });
     }
 
@@ -2443,14 +2792,17 @@ class BrowserWalletRuntime extends EventTarget {
                 return this.completeConfirmedDeposit(confirmed, args);
             }
             const pending = this.runtime.pendingDeposit;
+            // The vault numbers a note when its deposit is included, so the
+            // caller's note id (from the receipt or the vault's record of
+            // this commitment) may follow the predicted slot.
             if (!pending || pending.secret !== args.secret
                 || (args.operationId && pending.operationId !== args.operationId)
-                || Number(pending.next_note_id) !== Number(args.note_id)
+                || !Number.isSafeInteger(Number(args.note_id)) || Number(args.note_id) < 0
                 || Number(pending.amount) !== Number(args.amount)
                 || (args.commitment && !sameFelt(pending.commitment, args.commitment))) {
                 throw new Error('The deposit secret does not match this browser’s durable pending deposit.');
             }
-            let state = await this.worker.call('confirmDeposit', {
+            const confirmed = await this.worker.call('confirmDeposit', {
                 config: this.config.wallet_core,
                 args: {
                     secret: args.secret,
@@ -2459,12 +2811,9 @@ class BrowserWalletRuntime extends EventTarget {
                     expiry_ts: Number(args.expiry_ts)
                 }
             });
-            // Amendment A1: the path the deposit used, at the root it set (the
-            // NoteDeposited newRoot), proves exits for the note's whole life:
-            // the vault accepts any root it ever held. Kept only if it leads
-            // from this note's leaf to that root.
-            const depositPath = await this.verifiedDepositPath(state, args.deposit_root, pending.zero_path);
-            if (depositPath) state = { ...state, deposit_path: depositPath };
+            // The registration commitment the vault recorded, which every
+            // exit proof of this note names (withRegistrationCommitment).
+            const state = { ...confirmed, registration_commitment: pending.commitment };
             await this.commit({
                 ...this.runtime,
                 state,
@@ -2522,12 +2871,9 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * Finish a confirmation whose note another path (the background vault
      * recovery) already committed: fill in the receipt-only fields that path
-     * could not know (the transaction hash and fee on the deposit record, and
-     * the note's deposit path of Amendment A1 from the receipt's
-     * NoteDeposited root and `args.zero_path`, the plan's siblings, since the
-     * pending deposit that held them is gone), then return what a fresh
-     * confirmation returns, so both orders of the race end in the same
-     * durable state. Called under the wallet lock.
+     * could not know (the transaction hash and fee on the deposit record),
+     * then return what a fresh confirmation returns, so both orders of the
+     * race end in the same durable state. Called under the wallet lock.
      */
     async completeConfirmedDeposit(record, args) {
         const metadata = args.receiptMetadata || {};
@@ -2536,21 +2882,16 @@ class BrowserWalletRuntime extends EventTarget {
         const missingFee = record.feeWei == null && metadata.feeWei != null
             && (!record.transactionHash || !transactionHash
                 || record.transactionHash === String(transactionHash).toLowerCase());
-        const state = this.runtime.state;
-        const depositPath = !state.deposit_path && args.deposit_root != null
-            ? await this.verifiedDepositPath(state, args.deposit_root, args.zero_path)
-            : null;
-        if (missingHash || missingFee || depositPath) {
-            await this.commit({ ...this.runtime, ...(depositPath ? { state: { ...state, deposit_path: depositPath } } : {}) },
-                missingHash || missingFee ? {
-                    depositConfirmation: {
-                        operationId: record.operationId,
-                        createdAt: record.createdAt,
-                        confirmedAt: record.confirmedAt,
-                        transactionHash,
-                        ...metadata
-                    }
-                } : undefined);
+        if (missingHash || missingFee) {
+            await this.commit({ ...this.runtime }, {
+                depositConfirmation: {
+                    operationId: record.operationId,
+                    createdAt: record.createdAt,
+                    confirmedAt: record.confirmedAt,
+                    transactionHash,
+                    ...metadata
+                }
+            });
         }
         return {
             status: 'confirmed',
@@ -2559,23 +2900,6 @@ class BrowserWalletRuntime extends EventTarget {
             amount: Number(args.amount),
             transactionHash: transactionHash || record.transactionHash || null
         };
-    }
-
-    /** The deposit-time Merkle path, when it leads from the note's leaf to `root`. */
-    async verifiedDepositPath(state, root, siblings) {
-        if (root == null || !Array.isArray(siblings) || siblings.length !== 32) return null;
-        let activeRoot;
-        try {
-            activeRoot = `0x${BigInt(root).toString(16).padStart(64, '0')}`;
-        } catch {
-            return null;
-        }
-        const path = { active_root: activeRoot, siblings: siblings.map(String) };
-        try {
-            return await this.worker.call('notePathMatches', { state, path }) === true ? path : null;
-        } catch {
-            return null;
-        }
     }
 
     async nativeBillingQuote(signal) {
@@ -2643,7 +2967,9 @@ class BrowserWalletRuntime extends EventTarget {
         }
         this.assertAnchorAcceptsRequest(this.runtime.state);
         onProgress('syncing', 'Checking your private balance…');
-        const path = await this.treePath(this.runtime.state.note_id, true, null, signal);
+        // A note proves requests only once activated (its leaf in the
+        // vault's tree): before that, note_not_activated, without proving.
+        const path = await this.treePath(Number(this.runtime.state.note_id), signal);
         throwIfAborted(signal);
         const now = Date.now();
         const quote = await this.nativeBillingQuote(signal);
@@ -2685,7 +3011,7 @@ class BrowserWalletRuntime extends EventTarget {
         // The state with its bound, the journal and its append-only archive
         // record land in ONE durable write before any POST can carry the
         // proof off this device (design §6.2).
-        await this.commit({ ...this.runtime, state: withDepositPath(prepared.state, this.runtime.state),
+        await this.commit({ ...this.runtime, state: withRegistrationCommitment(prepared.state, this.runtime.state),
             journal: prepared.journal }, { requestArchive: [record] });
         return prepared.request;
     }
@@ -3484,7 +3810,7 @@ class BrowserWalletRuntime extends EventTarget {
             : lock || null;
         await this.commit({
             ...this.runtime,
-            state: withDepositPath(next, state),
+            state: withRegistrationCommitment(next, state),
             stateSeq: Number(this.runtime.stateSeq || 0) + 1,
             exitLock,
             journal: null,
@@ -3813,6 +4139,12 @@ class BrowserWalletRuntime extends EventTarget {
     operatorCallTimeoutMs() {
         const value = Number(this.exitTimingOverrides?.operatorCallTimeoutMs);
         return Number.isSafeInteger(value) && value > 0 ? value : OPERATOR_CALL_TIMEOUT_MS;
+    }
+
+    /** The delays before each resend of a note_not_recorded clearance (overridable per instance, like E0's). */
+    clearanceRetryDelaysMs() {
+        const value = this.exitTimingOverrides?.clearanceRetryDelaysMs;
+        return Array.isArray(value) ? value : CLEARANCE_RETRY_DELAYS_MS;
     }
 
     /** The build-pinned settlement window W (E0, C4). */
@@ -4343,115 +4675,6 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * The vault's currentRoot for the indexer check of E4.1: through the
-     * user's exit RPC when one is set and on the vault's chain; when it is
-     * not, or fails, through the wallet provider when it is on the vault's
-     * chain, then the pinned RPC.
-     */
-    async exitCurrentRoot(signal = null, walletRequest = null) {
-        const call = { method: 'eth_call', params: [{ to: this.config.funding.contract_address,
-            data: VAULT_SELECTORS.currentRoot }, 'latest'] };
-        const sources = [['exit RPC', this.exitRpcOnVaultChain()], ['wallet provider', this.walletOnVaultChain(walletRequest)]];
-        for (const [source, request] of sources) {
-            if (!request) continue;
-            try {
-                const word = await abortable(request(call), signal);
-                if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) throw new Error(`The ${source} returned an invalid vault root.`);
-                return BigInt(word);
-            } catch (error) {
-                if (signal?.aborted) throw error;
-            }
-        }
-        return this.vaultWord(VAULT_SELECTORS.currentRoot, signal);
-    }
-
-    /**
-     * §6.6: the note's path rebuilt from the vault's logs, through the
-     * user's exit RPC when one is set and on the vault's chain, then (when
-     * it is not, or fails) through the wallet provider and the pinned RPC,
-     * all within one rebuild budget.
-     */
-    async rebuildExitPath(state, { signal = null, walletRequest = null } = {}) {
-        // The wallet provider's calls get E0's per-call bound too (the exit
-        // and pinned RPCs have their own), so a silent wallet leaves the
-        // pinned RPC time to answer.
-        const requests = [this.exitRpcOnVaultChain(), this.walletOnVaultChain(walletRequest), this.pinnedRpc()].filter(Boolean);
-        const deadline = Date.now() + this.exitTiming().rebuildBudgetMs;
-        const trusted = this.browserConfig?.trusted_deployment || {};
-        let failure = null;
-        for (const request of requests) {
-            try {
-                return await rebuildNotePath({
-                    request,
-                    vault: this.config.funding.contract_address,
-                    deployBlock: trusted.deploy_block,
-                    noteId: Number(state.note_id),
-                    chainId: Number(this.config.funding.chain_id),
-                    worker: this.worker,
-                    signal,
-                    deadline
-                });
-            } catch (error) {
-                if (signal?.aborted || error?.name === 'AbortError') throw error;
-                failure = error;
-                if (error?.code === 'tree_rebuild_timeout') break;
-            }
-        }
-        throw failure;
-    }
-
-    /**
-     * E4.1: a path at a root the vault holds. The deposit-time path first
-     * (Amendment A1), then the operator's indexer with its root checked
-     * against the vault's currentRoot (exitCurrentRoot), then the vault's
-     * own logs (§6.6). `sources` narrows the order; after an UnknownRoot
-     * refusal no source may return `refusedRoot`.
-     */
-    async exitPathLocked(state, { signal = null, sources = EXIT_PATH_SOURCES, refusedRoot = null, walletRequest = null,
-        currentRoot = null } = {}) {
-        const refused = root => refusedRoot != null && sameFelt(root, refusedRoot);
-        const saved = state?.deposit_path;
-        if (sources.includes('deposit') && saved?.active_root != null && Array.isArray(saved.siblings)
-            && saved.siblings.length === 32 && !refused(saved.active_root)) {
-            return { active_root: saved.active_root, note_id: Number(state.note_id), siblings: saved.siblings, source: 'deposit' };
-        }
-        if (sources.includes('indexer')) {
-            const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
-            const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-            try {
-                // A current root the caller read through the wallet provider,
-                // or the vault's currentRoot read here.
-                const root = currentRoot != null ? currentRoot
-                    : await abortable(this.exitCurrentRoot(callSignal, walletRequest), callSignal);
-                if (!refused(root)) {
-                    const path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
-                    if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
-                }
-            } catch (error) {
-                if (signal?.aborted) throw error;
-            }
-        }
-        let rebuilt;
-        try {
-            rebuilt = await this.rebuildExitPath(state, { signal, walletRequest });
-        } catch (error) {
-            if (signal?.aborted || error?.name === 'AbortError') throw error;
-            // The code of the rebuild's failure (tree_logs_unavailable,
-            // tree_rebuild_timeout, a worker's tree_root_mismatch, …), marked
-            // as a path failure: the caller decides whether a proof that
-            // already exists is submitted anyway.
-            const code = error?.code || /^(?:Error: )?([a-z_]+):/.exec(String(error?.message || ''))?.[1] || 'tree_rebuild_failed';
-            throw new BrowserWalletHttpError(error?.message || 'The Merkle path could not be rebuilt.', 503, code,
-                { exit_path_unavailable: true });
-        }
-        if (refused(rebuilt.active_root)) {
-            throw new BrowserWalletHttpError('The vault’s own logs end at the root its simulation refused.', 409,
-                'tree_root_refused', { exit_path_unavailable: true });
-        }
-        return { active_root: rebuilt.active_root, note_id: rebuilt.note_id, siblings: rebuilt.siblings, source: 'rebuild' };
-    }
-
-    /**
      * E4.2: the stale-device pre-check. Evidence the operator holds at N⁺
      * that verifies under the pinned request VK means another device spent
      * this state's successor: refuse with device_not_newest. Errors and
@@ -4673,19 +4896,16 @@ class BrowserWalletRuntime extends EventTarget {
      * user's choice for an escape forced before T (E3). Throws
      * request_settlement_pending (with escape_at) when a mutual request must
      * wait for T, and device_not_newest when another device spent this state.
+     * Exit proofs are bound to the note's vault record, not to a tree root,
+     * so no path is read and a note exits before its activation too.
      *
-     * `refusedRoot` is the root of a proof the vault (or the wallet's
-     * simulation) refused with UnknownRoot: the next proof takes its path
-     * from the indexer or the vault's logs at any other root (E4.1, §6.6).
      * `walletRequest` is the user's wallet provider (an EIP-1193 request
      * function); without an exit RPC it is read before the pinned RPC for
-     * the vault's root and logs.
+     * the note's vault status.
      */
     async prepareWithdrawal(mode, destination, {
-        expectedActiveRoot = null,
         reprove = false,
         earlyConcession = 'zero',
-        refusedRoot = null,
         walletRequest = null,
         signal = null,
         gasless = null,
@@ -4700,13 +4920,6 @@ class BrowserWalletRuntime extends EventTarget {
             || !/^0x[0-9a-fA-F]{40}$/.test(gasless.transit?.account || '')
             || gasless.transit.account.toLowerCase() !== String(destination || '').toLowerCase())) {
             throw new Error('A sponsored withdrawal names its payout address and its transit account as the destination.');
-        }
-        if (refusedRoot != null) {
-            try {
-                BigInt(refusedRoot);
-            } catch {
-                throw new Error('Choose a valid refused Merkle root.');
-            }
         }
         if (walletRequest != null && typeof walletRequest !== 'function') throw new Error('The wallet provider must be a request function.');
         if (!['zero', 'bound'].includes(earlyConcession)) {
@@ -4726,7 +4939,7 @@ class BrowserWalletRuntime extends EventTarget {
                 // there (E1, E3.2, E4.3, E6).
                 for (let pass = 0; pass < 4; pass += 1) {
                     const plan = await this.prepareExitLocked(mode, destination, {
-                        expectedActiveRoot, reprove, earlyConcession, refusedRoot, walletRequest, signal, gasless, onProgress
+                        reprove, earlyConcession, walletRequest, signal, gasless, onProgress
                     });
                     if (plan !== WITHDRAWAL_RESTART) return plan;
                 }
@@ -4757,8 +4970,7 @@ class BrowserWalletRuntime extends EventTarget {
             && withdrawalProofStillValid(inputs));
     }
 
-    async prepareExitLocked(requested, destination, { expectedActiveRoot, reprove, earlyConcession, refusedRoot = null,
-        walletRequest = null, signal, gasless = null,
+    async prepareExitLocked(requested, destination, { reprove, earlyConcession, walletRequest = null, signal, gasless = null,
         onProgress }) {
         await this.reload();
         const state = this.runtime.state;
@@ -4814,6 +5026,14 @@ class BrowserWalletRuntime extends EventTarget {
                     must_initiate_by: deadline
                 });
             }
+        }
+        // An attempt that ended while a note_not_recorded clearance waited to
+        // be sent again (requestClearanceLocked) left a lock that released
+        // only that ownership proof, answered without a decision. It is let
+        // go as a cancel would (E6); the marker's proof is sent again (C3).
+        if (ownershipNotRecorded(this.runtime.exitLock)) {
+            const release = await this.releaseExitLockLocked({ cancel: true, signal });
+            if (release.released) return WITHDRAWAL_RESTART;
         }
         const nullifier = await this.worker.call('withdrawalNullifier', { state });
         if (existing && preparedWithdrawalNullifier(existing) != null
@@ -4892,10 +5112,18 @@ class BrowserWalletRuntime extends EventTarget {
                 // Nothing was released yet (else the request is an escape).
                 await this.commit({ ...this.runtime, exitLock: switchExitLock(this.runtime.exitLock, 'mutual') });
             }
-            const outcome = await this.prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot,
-                refusedRoot, walletRequest, signal, gasless });
+            const outcome = await this.prepareMutualCloseLocked({ state, destination, nullifier, existing, signal, gasless });
             if (outcome === WITHDRAWAL_RESTART) return outcome;
             if (outcome.plan) return outcome.plan;
+            if (outcome.error?.code === 'note_not_recorded') {
+                // Not a refusal (E2.5): the server's RPC has not seen the
+                // deposit yet. The lock released only the ownership proof, so
+                // it is let go as a cancel would (E6); the withdrawal-only
+                // marker keeps that proof, and a retry sends it again (C3).
+                await this.releaseExitLockLocked({ cancel: true, signal });
+                throw new BrowserWalletHttpError('The server has not seen this balance’s deposit on chain yet. Try the withdrawal again shortly.',
+                    409, 'note_not_recorded', { retriable: true });
+            }
             const next = afterClearanceFailure(outcome.error);
             if (next.action === 'refuse') {
                 if (outcome.error?.code === 'ownership_proof_wait') {
@@ -4915,8 +5143,7 @@ class BrowserWalletRuntime extends EventTarget {
                 decision = { ...next, clearanceError: outcome.error?.code || null };
             }
         }
-        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, refusedRoot,
-            walletRequest,
+        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove,
             signal, gasless, onProgress });
     }
 
@@ -4963,29 +5190,10 @@ class BrowserWalletRuntime extends EventTarget {
      * the kind-1 close proof, journaled with its plan. Returns { plan },
      * WITHDRAWAL_RESTART, or { error } when the clearance failed.
      */
-    async prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, refusedRoot = null,
-        walletRequest = null, signal, gasless = null }) {
+    async prepareMutualCloseLocked({ state, destination, nullifier, existing, signal, gasless = null }) {
         let clearance = validClearance(existing, nullifier) ? existing.clearance : null;
-        let path;
-        // After UnknownRoot (with the clearance kept), the close proof takes
-        // a path at another root; a failure reaches the caller, which may
-        // still submit the existing proof (E4.5 is advisory).
-        if (refusedRoot != null && clearance) {
-            path = await this.exitPathLocked(state, { signal, sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot, walletRequest });
-        }
-        if (!path) {
-            try {
-                const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
-                const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-                const root = expectedActiveRoot ?? await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
-                path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
-            } catch (error) {
-                if (signal?.aborted) throw error;
-                return { error: { code: 'indexer_unavailable', message: error?.message || null } };
-            }
-        }
         if (!clearance) {
-            const result = await this.requestClearanceLocked({ state, destination, nullifier, path, existing, signal });
+            const result = await this.requestClearanceLocked({ state, destination, nullifier, existing, signal });
             if (result === WITHDRAWAL_RESTART || result.error) return result;
             clearance = result.clearance;
         }
@@ -4996,24 +5204,25 @@ class BrowserWalletRuntime extends EventTarget {
         const plan = await this.worker.call('prepareWithdrawal', {
             config: this.config.wallet_core,
             state,
-            args: { mode: 'mutual', destination, valid_until: validUntil, active_root: path.active_root,
-                merkle_siblings: path.siblings, clearance },
+            args: { mode: 'mutual', destination, valid_until: validUntil, clearance },
             provingKey: this.withdrawalProvingKey()
         });
         if (Number(plan?.public_inputs?.kind) !== WITHDRAWAL_KIND.mutual || Number(plan.public_inputs.conceded) !== 0) {
             throw new Error('The generated withdrawal proof is of another kind.');
         }
+        if (!boundToNote(plan.public_inputs, state)) throw new Error('The generated withdrawal proof is bound to another note.');
         const decorated = this.decoratePlan(plan, { mode: 'mutual', destination, state, nullifier, existing,
-            decision: { rule: 'E2', conceded: 0n }, clearance, validUntil, pathSource: path.source || 'indexer', gasless });
+            decision: { rule: 'E2', conceded: 0n }, clearance, validUntil, gasless });
         await this.commit({ ...this.runtime, preparedWithdrawal: decorated,
             exitLock: recordReleasedProof(this.runtime.exitLock, { kind: WITHDRAWAL_KIND.mutual, validUntil, nullifier, at: nowSeconds() }) });
         return { plan: decorated };
     }
 
     /**
-     * The clearance of a mutual close (G6): one kind-2 ownership proof at the
-     * current root, journaled in the exit lock and the withdrawal-only marker
-     * before it is sent (C5), then one bounded POST. C3: at most one live
+     * The clearance of a mutual close (G6): one kind-2 ownership proof of the
+     * note's record, journaled in the exit lock and the withdrawal-only marker
+     * before it is sent (C5), then one bounded POST (sent again while the
+     * server answers note_not_recorded). C3: at most one live
      * ownership proof per state, across exit locks (a cancel releases a lock
      * that released only an ownership proof). The marker keeps the state's
      * newest one: it is sent again while it stays valid, the client waits
@@ -5021,7 +5230,7 @@ class BrowserWalletRuntime extends EventTarget {
      * made only once it expired (ownershipProofAction, pinned by the shared
      * vectors).
      */
-    async requestClearanceLocked({ state, destination, nullifier, path, existing, signal }) {
+    async requestClearanceLocked({ state, destination, nullifier, existing, signal }) {
         const lock = this.runtime.exitLock;
         const refusal = exitLockRefusal(lock, { noteId: state.note_id, anchor: state.current_anchor, proof: 'ownership' });
         if (refusal) return { error: { code: refusal } };
@@ -5033,10 +5242,10 @@ class BrowserWalletRuntime extends EventTarget {
         }
         let ownership;
         if (action === 'resend') {
-            this.assertOwnershipProof({ mode: 'ownership', ...kept }, { state, nullifier, activeRoot: kept.public_inputs.active_root });
+            this.assertOwnershipProof({ mode: 'ownership', ...kept }, { state, nullifier });
             ownership = kept;
         } else {
-            ownership = await this.generateOwnershipProof({ state, nullifier, path });
+            ownership = await this.generateOwnershipProof({ state, nullifier });
         }
         await this.commit({
             ...this.runtime,
@@ -5050,9 +5259,26 @@ class BrowserWalletRuntime extends EventTarget {
                 createdAt: Number(existing?.createdAt || Date.now())
             }
         });
-        const answer = await this.exitCall(`${this.config.funding.protocol_server_url}/v2/withdraw/clearance`, {
-            method: 'POST', body: { withdrawal_nullifier: nullifier, ownership_proof: ownership }, signal
-        });
+        const url = `${this.config.funding.protocol_server_url}/v2/withdraw/clearance`;
+        const body = { withdrawal_nullifier: nullifier, ownership_proof: ownership };
+        const notRecorded = value => value.reachable && !value.ok && value.code === 'note_not_recorded';
+        let answer = await this.exitCall(url, { method: 'POST', body, signal });
+        // note_not_recorded is retried, never recorded as an answer: the
+        // server's RPC has not seen the deposit yet. A resend is made only
+        // while the proof stays valid past its delay and the resend margin.
+        for (const delayMs of this.clearanceRetryDelaysMs()) {
+            if (!notRecorded(answer) || Number(ownership.public_inputs.valid_until)
+                <= nowSeconds() + Math.ceil(delayMs / 1_000) + this.exitTiming().ownershipResendMarginSeconds) break;
+            // Kept before the wait: an attempt that ends in it (a closed tab,
+            // an abort) leaves no unanswered proof, and the next attempt lets
+            // the lock go instead of escaping (prepareExitLocked).
+            if (!ownershipNotRecorded(this.runtime.exitLock)) {
+                await this.commit({ ...this.runtime, exitLock: markOwnershipNotRecorded(this.runtime.exitLock, nowSeconds()) });
+            }
+            await delay(delayMs, signal);
+            answer = await this.exitCall(url, { method: 'POST', body, signal });
+        }
+        if (notRecorded(answer)) return { error: { code: answer.code, status: answer.status } };
         let result;
         let outcome;
         if (!answer.reachable) {
@@ -5098,14 +5324,14 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * E4: an escape conceding `decision.conceded` (at most bound_at_state):
-     * a path at a known root, the stale-device pre-check, E1 again, advisory
-     * reads, then the kind-0 proof, journaled in the exit lock with its plan
+     * the stale-device pre-check, E1 again, advisory reads, then the kind-0
+     * proof (bound to the note's record, no path), journaled in the exit lock with its plan
      * before the plan leaves this function. A live request journal moves to
      * the archive (abandoned_for_escape), where a later receipt can still
      * install once the lock is released.
      */
-    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, refusedRoot = null,
-        walletRequest = null, signal, gasless = null, onProgress }) {
+    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, signal, gasless = null,
+        onProgress }) {
         let lock = this.runtime.exitLock;
         if (lock.mode !== 'escape') {
             lock = switchExitLock(lock, 'escape');
@@ -5117,9 +5343,6 @@ class BrowserWalletRuntime extends EventTarget {
             conceded, boundAtState: bound });
         if (refusal) throw new BrowserWalletHttpError('This escape is not allowed at this balance state.', 409, refusal);
         if (!reprove && this.reusablePlan(existing, { mode: 'escape', destination, state, nullifier, conceded })) return existing;
-        onProgress('path', 'Finding this balance’s Merkle path…');
-        const path = await this.exitPathLocked(state, { signal, walletRequest,
-            ...(refusedRoot != null ? { sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot } : {}) });
         onProgress('checking', 'Checking that this device holds the newest balance state…');
         const { successor } = await this.staleDeviceCheckLocked(state, { signal });
         if (nowSeconds() < deadline) {
@@ -5133,13 +5356,12 @@ class BrowserWalletRuntime extends EventTarget {
         const plan = await this.worker.call('prepareWithdrawal', {
             config: this.config.wallet_core,
             state,
-            args: { mode: 'escape', destination, conceded: Number(conceded), valid_until: validUntil,
-                active_root: path.active_root, merkle_siblings: path.siblings },
+            args: { mode: 'escape', destination, conceded: Number(conceded), valid_until: validUntil },
             provingKey: this.withdrawalProvingKey()
         });
         const inputs = plan?.public_inputs;
         if (Number(inputs?.kind) !== WITHDRAWAL_KIND.escape || BigInt(inputs.conceded ?? 0) !== conceded
-            || BigInt(inputs.final_balance) + conceded !== BigInt(state.current_balance)) {
+            || BigInt(inputs.final_balance) + conceded !== BigInt(state.current_balance) || !boundToNote(inputs, state)) {
             throw new Error('The generated escape proof does not match its decision.');
         }
         await this.reload();
@@ -5148,7 +5370,7 @@ class BrowserWalletRuntime extends EventTarget {
         const marker = this.runtime.preparedWithdrawal;
         const base = marker && sameFelt(preparedWithdrawalNullifier(marker) ?? nullifier, nullifier) ? marker : existing;
         const decorated = this.decoratePlan(plan, { mode: 'escape', destination, state, nullifier, existing: base, decision,
-            validUntil, pathSource: path.source, warnings, gasless });
+            validUntil, warnings, gasless });
         const journal = this.runtime.journal;
         const abandoned = journal ? this.tryRequestJournalRecord(journal, state, { disposition: 'abandoned_for_escape' }) : null;
         if (journal && !abandoned) throw new Error('The unsettled private request journal is incomplete.');
@@ -5180,7 +5402,7 @@ class BrowserWalletRuntime extends EventTarget {
 
     /** A proof plan with the record fields the payout matchers need (E5). */
     decoratePlan(plan, { mode, destination, state, nullifier, existing, decision, clearance = null, validUntil,
-        pathSource = null, warnings = [], gasless = null }) {
+        warnings = [], gasless = null }) {
         const conceded = BigInt(decision.conceded ?? 0);
         // A sponsored plan (§3.2) carries its fee payer, payout address and
         // transit identity through every re-proof; a wallet-paid one none.
@@ -5209,7 +5431,6 @@ class BrowserWalletRuntime extends EventTarget {
             concededAtInit: conceded.toString(),
             boundAtState: String(state.bound_at_state || 0),
             validUntil,
-            ...(pathSource ? { pathSource } : {}),
             ...(warnings.length ? { warnings } : {}),
             ...(existing?.clearanceOutcome ? { clearanceOutcome: existing.clearanceOutcome } : {})
         };
@@ -5236,12 +5457,12 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * A kind-2 ownership proof of exactly this state, vault, keys, root and
-     * balance: no destination, no concession, no successor nullifier, and a
-     * fresh valid_until. Every vault entry point rejects kind 2, so it can
-     * never be submitted as an exit. Never a request proof.
+     * A kind-2 ownership proof of exactly this state, vault, keys, note
+     * record and balance: no destination, no concession, no successor
+     * nullifier, and a fresh valid_until. Every vault entry point rejects
+     * kind 2, so it can never be submitted as an exit. Never a request proof.
      */
-    assertOwnershipProof(plan, { state, nullifier, activeRoot }) {
+    assertOwnershipProof(plan, { state, nullifier }) {
         const inputs = plan?.public_inputs;
         const core = this.config.wallet_core || {};
         const funding = this.config.funding || {};
@@ -5264,27 +5485,25 @@ class BrowserWalletRuntime extends EventTarget {
             && sameFelt(inputs.clearance_signing_key_y, core.clearance_signing_key?.y)
             && Number(inputs.note_id) === Number(state.note_id)
             && sameFelt(inputs.withdrawal_nullifier, nullifier)
-            && sameFelt(inputs.active_root, activeRoot)
+            && boundToNote(inputs, state)
             && sameFelt(inputs.final_balance, state.current_balance)
             && withdrawalDestinationHex(inputs.destination) === `0x${'0'.repeat(40)}`
             && !REQUEST_PUBLIC_INPUT_FIELDS.some(field => field in inputs);
         if (!valid) throw new Error('The generated ownership proof does not match its saved balance and vault.');
     }
 
-    async generateOwnershipProof({ state, nullifier, path }) {
+    async generateOwnershipProof({ state, nullifier }) {
         const ownership = await this.worker.call('prepareWithdrawal', {
             config: this.config.wallet_core,
             state,
             args: {
                 mode: 'ownership',
                 valid_until: nowSeconds() + this.exitTiming().ownershipProofValiditySeconds
-                    - this.exitTiming().ownershipProofSkewMarginSeconds,
-                active_root: path.active_root,
-                merkle_siblings: path.siblings
+                    - this.exitTiming().ownershipProofSkewMarginSeconds
             },
             provingKey: this.withdrawalProvingKey()
         });
-        this.assertOwnershipProof(ownership, { state, nullifier, activeRoot: path.active_root });
+        this.assertOwnershipProof(ownership, { state, nullifier });
         // Only the public inputs and proof travel; nothing is persisted.
         return { public_inputs: ownership.public_inputs, proof: ownership.proof };
     }
@@ -5293,8 +5512,8 @@ class BrowserWalletRuntime extends EventTarget {
      * The clearance of a set-aside (background) mutual close: one ownership
      * proof and one bounded POST. Its record is withdrawal-only already.
      */
-    async backgroundClearance({ state, nullifier, path, signal = null }) {
-        const ownership = await this.generateOwnershipProof({ state, nullifier, path });
+    async backgroundClearance({ state, nullifier, signal = null }) {
+        const ownership = await this.generateOwnershipProof({ state, nullifier });
         const answer = await this.exitCall(`${this.config.funding.protocol_server_url}/v2/withdraw/clearance`, {
             method: 'POST', body: { withdrawal_nullifier: nullifier, ownership_proof: ownership }, signal
         });
@@ -5313,9 +5532,9 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * E7: an encrypted exit kit of the selected balance (zkapi-exit-kit-v1):
-     * the build-pinned deployment profile, the state an escape needs, its
-     * bound and its deposit-time Merkle path. Returns the kit as JSON for the
-     * host to save; it is never uploaded.
+     * the build-pinned deployment profile, the state an escape needs and its
+     * bound. Returns the kit as JSON for the host to save; it is never
+     * uploaded.
      */
     async exportExitKit({ passphrase } = {}) {
         await this.init();
@@ -5326,7 +5545,7 @@ class BrowserWalletRuntime extends EventTarget {
             if (!state) throw new Error('There is no private balance to export.');
             const stateSeq = Number(this.runtime.stateSeq || 0);
             const payload = buildExitKitPayload({ trustedDeployment: this.browserConfig?.trusted_deployment,
-                state, stateSeq, exportedAt: nowSeconds(), merklePath: state.deposit_path || null });
+                state, stateSeq, exportedAt: nowSeconds() });
             const kit = await sealExitKit(payload, passphrase);
             await this.commit({ ...this.runtime, exitKitExportedSeq: stateSeq });
             return JSON.stringify(kit);
@@ -6284,13 +6503,12 @@ class BrowserWalletRuntime extends EventTarget {
         return result;
     }
 
-    async prepareBackgroundWithdrawal(recordId, { expectedActiveRoot, refusedRoot = null, walletRequest = null } = {}) {
+    async prepareBackgroundWithdrawal(recordId) {
         await this.init();
         await this.reload();
         const record = structuredClone(this.withdrawals.find(entry => entry.recordId === recordId));
         const identity = this.backgroundWithdrawalIdentity(record);
         assertBrowserBackgroundWithdrawalAvailable(record, this.runtime, identity);
-        if (expectedActiveRoot == null) throw new Error('A current vault root is required to prepare this withdrawal.');
         const state = record.state;
         const config = this.config;
         if (Number(state.chain_id) !== identity.chainId || !sameFelt(state.contract_address, identity.contractAddress)) {
@@ -6302,31 +6520,19 @@ class BrowserWalletRuntime extends EventTarget {
         if (savedNullifiers.some(value => !sameFelt(value, nullifier))) {
             throw new Error('The saved withdrawal authorization does not match its private balance.');
         }
-        // Deliberately outside the global wallet lock: a proof or indexer wait
-        // must not stall unrelated deposits, requests, or settlement in another tab.
+        // Deliberately outside the global wallet lock: a proof wait must not
+        // stall unrelated deposits, requests, or settlement in another tab.
         // A persisted clearance for this exact nullifier needs no second
-        // ownership proof or server request when only the root moved.
-        let clearance = validClearance(record.preparedWithdrawal, nullifier)
+        // ownership proof or server request; a record set aside before its
+        // clearance (an earlier build) asks for one now.
+        const clearance = validClearance(record.preparedWithdrawal, nullifier)
             ? record.preparedWithdrawal.clearance
-            : null;
-        let path;
-        if (clearance) {
-            // The close proof needs only a root the vault ever held (A1):
-            // the deposit-time path first, then the indexer at the vault's
-            // current root, then the vault's logs; never the operator alone.
-            path = await this.exitPathLocked(state, { currentRoot: expectedActiveRoot, walletRequest,
-                ...(refusedRoot != null ? { sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot } : {}) });
-        } else {
-            // A record set aside before its clearance (an earlier build): the
-            // ownership proof needs a root within the server's window.
-            path = await this.treePath(identity.noteId, true, expectedActiveRoot);
-            clearance = await this.backgroundClearance({ state, nullifier, path });
-        }
+            : await this.backgroundClearance({ state, nullifier });
         const plan = await this.worker.call('prepareWithdrawal', {
             config: config.wallet_core, state,
             args: { mode: 'mutual', destination: identity.destination,
-                valid_until: nowSeconds() + this.exitTiming().exitProofValiditySeconds, active_root: path.active_root,
-                merkle_siblings: path.siblings, clearance }, provingKey: this.withdrawalProvingKey()
+                valid_until: nowSeconds() + this.exitTiming().exitProofValiditySeconds, clearance },
+            provingKey: this.withdrawalProvingKey()
         });
         const inputs = plan.public_inputs;
         const encodedDestination = Array.isArray(inputs?.destination)
@@ -6335,7 +6541,7 @@ class BrowserWalletRuntime extends EventTarget {
         if (!plan.proof || Number(inputs?.note_id) !== identity.noteId
             || Number(inputs?.chain_id) !== identity.chainId
             || !sameFelt(inputs?.contract_address, identity.contractAddress)
-            || !sameFelt(inputs?.active_root, path.active_root)
+            || !boundToNote(inputs, state)
             || !sameFelt(inputs?.withdrawal_nullifier, nullifier)
             || !sameFelt(inputs?.final_balance, state.current_balance)
             || String(encodedDestination || '').toLowerCase() !== identity.destination.toLowerCase()
@@ -6343,7 +6549,6 @@ class BrowserWalletRuntime extends EventTarget {
             throw new Error('The generated withdrawal proof does not match its saved balance and vault.');
         }
         Object.assign(plan, { destination: identity.destination, mode: 'mutual', phase: 'prepared',
-            ...(path.source ? { pathSource: path.source } : {}),
             operationId: uuid(), noteId: identity.noteId, withdrawalNullifier: nullifier,
             clearanceReserved: true, createdAt: Number(record.createdAt || Date.now()),
             ...(clearance?.signature ? { clearance } : {}) });
@@ -6733,5 +6938,5 @@ class BrowserWalletRuntime extends EventTarget {
 }
 
 const browserWalletRuntime = new BrowserWalletRuntime();
-export { BrowserWalletHttpError, BrowserWalletRuntime };
+export { BrowserWalletHttpError, BrowserWalletRuntime, pausedWithdrawalNotice };
 export default browserWalletRuntime;

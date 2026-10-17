@@ -1,7 +1,7 @@
 // The proof worker against the shipped WebAssembly and keys (no mocks of the
 // WASM): bundle identity, pinned key loading, one bound per state, the
-// successor nullifier, the log rebuild with per-event root checks and the
-// stale-device verifier.
+// successor nullifier, pathless exit proofs bound to the note's record,
+// request paths only for activated notes and the stale-device verifier.
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -57,13 +57,13 @@ async function genesisNote(noteId = 0) {
 
 test('the worker runs the shipped bundle of the manifest circuit and setup', async () => {
     assert.deepEqual(await execute('identity', {}),
-        { circuit_id: 'zkapi-v2-concession-v1', setup_id: manifest.setupId });
+        { circuit_id: 'zkapi-v2-concession-v2', setup_id: manifest.setupId });
     assert.ok(fetched.some(url => url.endsWith('/wasm/zkapi_browser_bg.wasm')));
 });
 
 test('every key is loaded only with its SHA-256 pin', async () => {
     const { state } = await genesisNote();
-    const args = { mode: 'ownership', valid_until: 1, active_root: '0x1', merkle_siblings: [] };
+    const args = { mode: 'ownership', valid_until: 1 };
     await assert.rejects(execute('prepareWithdrawal', { config, state, args, provingKey: { url: `${KEY_ORIGIN}withdrawal.pk` } }),
         /pinned SHA-256/);
     await assert.rejects(execute('verifyRequest', { publicInputs: {}, proof: '', verifyingKey: { ...key('request.vk'), sha256: '0'.repeat(64) } }),
@@ -86,35 +86,33 @@ test('the successor nullifier is the nullifier an escape publishes, not the curr
     assert.notEqual(await execute('withdrawalNullifier', { state: other }), nullifier);
 });
 
-test('the log rebuild checks the root after every event and yields the note path', async () => {
-    const notes = await Promise.all([0, 1, 2].map(() => execute('generateDeposit', {})));
-    const reference = new glue.BrowserNoteTree();
-    const events = notes.map((deposit, noteId) => {
-        const event = { event: 'note_deposited', note_id: noteId, commitment: deposit.registration_commitment,
-            amount: String(1_000_000 + noteId), expiry_ts: 4_000_000_000 };
-        return { ...event, root: JSON.parse(reference.apply(JSON.stringify(event))) };
-    });
-    const retired = { event: 'closed_leaf_retired', note_id: 1 };
-    events.push({ ...retired, root: JSON.parse(reference.apply(JSON.stringify(retired))) });
-    const path2 = await execute('rebuildTreePath', { events, noteId: 2 });
-    assert.deepEqual(path2, JSON.parse(reference.path(2)));
-    assert.equal(path2.siblings.length, 32);
-    reference.free();
-    // A log whose root disagrees with the rebuilt tree stops the rebuild.
-    const tampered = events.map((event, index) => index === 1 ? { ...event, root: '0x5' } : event);
-    await assert.rejects(execute('rebuildTreePath', { events: tampered, noteId: 2 }), /tree_root_mismatch: the vault log 1/);
-    // A retired note has no path, and an out-of-order deposit is refused.
-    await assert.rejects(execute('rebuildTreePath', { events, noteId: 1 }), /tree_event_invalid/);
-    await assert.rejects(execute('rebuildTreePath', { events: events.slice(1), noteId: 1 }), /tree_event_invalid/);
-    // The dense-leaves form agrees once the leaves are known.
-    await assert.rejects(execute('treePathFromLeaves', { leaves: ['0x0'], noteId: 0 }), /tree_event_invalid/);
+test('an exit proof takes no Merkle path and names the note by its vault record', async () => {
+    const { deposit, state } = await genesisNote(5);
+    const args = { mode: 'ownership', valid_until: Math.floor(Date.now() / 1000) + 3_000 };
+    const plan = await execute('prepareWithdrawal', { config, state, args, provingKey: key('withdrawal.pk') });
+    const inputs = plan.public_inputs;
+    assert.equal(inputs.kind, 2);
+    assert.equal(inputs.note_id, 5);
+    // C = notes[5].commitment and M's parts = notes[5].amount and expiryTs.
+    assert.equal(BigInt(inputs.registration_commitment), BigInt(deposit.registration_commitment));
+    assert.equal(BigInt(inputs.deposit_amount), 1_000_000n);
+    assert.equal(BigInt(inputs.expiry), 4_000_000_000n);
+    assert.equal('active_root' in inputs, false);
+    // The prover takes no path: a root or siblings are unknown arguments.
+    await assert.rejects(execute('prepareWithdrawal', { config, state, provingKey: key('withdrawal.pk'),
+        args: { ...args, active_root: '0x1', merkle_siblings: [] } }), /unknown field/);
 });
 
 test('a request proof fixes the state bound, and only a valid proof verifies under the pinned request.vk', async () => {
     const { deposit, state } = await genesisNote(0);
     const tree = new glue.BrowserNoteTree();
+    const emptyRoot = JSON.parse(tree.root());
     tree.apply(JSON.stringify({ event: 'note_deposited', note_id: 0, commitment: deposit.registration_commitment,
         amount: '1000000', expiry_ts: 4_000_000_000 }));
+    // A recorded note is not in the request tree until it is activated.
+    const unactivated = { root: emptyRoot, next_note_id: 1, leaves: ['0x0'], activation_cursor: 0 };
+    await assert.rejects(execute('treePath', { snapshot: unactivated, noteId: 0, requireExisting: true }), /note_not_activated/);
+    tree.apply(JSON.stringify({ event: 'notes_activated', first_note_id: 0, count: 1 }));
     const pathAt = JSON.parse(tree.path(0));
     tree.free();
     const args = id => ({ payload: '{"mode":"test"}', active_root: pathAt.active_root, merkle_siblings: pathAt.siblings,

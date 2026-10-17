@@ -299,7 +299,7 @@ export function fakeGaslessChain({ chainId, vault, gasless, noteId = 7, noteStat
             credits: new Map()
         },
         vaultState: {
-            paused: false, pausedAt: 0n, currentRoot: 0x77n,
+            paused: false, pausedAt: 0n,
             notes: new Map([[Number(noteId), { status: noteStatus, deposit: BigInt(finalBalance) }]]),
             pending: new Map(),
             escapePayoutCredits: new Map()
@@ -407,8 +407,9 @@ export function fakeGaslessChain({ chainId, vault, gasless, noteId = 7, noteStat
             }
             if (sel === 'a2f9f1ce') {
                 const pending = state.pending.get(Number(arg(0)));
-                if (!pending) return `0x${[0n, 0n, 0n, 0n, 0n, 0n].map(word).join('')}`;
-                return `0x${[1n, pending.activeRoot ?? 0x11n, pending.nullifier, pending.finalBalance, BigInt(pending.destination), pending.challengeDeadline].map(word).join('')}`;
+                // exists, withdrawalNullifier, finalBalance, destination, challengeDeadline.
+                if (!pending) return `0x${[0n, 0n, 0n, 0n, 0n].map(word).join('')}`;
+                return `0x${[1n, pending.nullifier, pending.finalBalance, BigInt(pending.destination), pending.challengeDeadline].map(word).join('')}`;
             }
             if (sel === 'f8ffe6e0') {
                 const pending = state.pending.get(Number(arg(0)));
@@ -416,7 +417,6 @@ export function fakeGaslessChain({ chainId, vault, gasless, noteId = 7, noteStat
             }
             if (sel === selector('paused')) return `0x${word(state.paused ? 1n : 0n)}`;
             if (sel === selector('pausedAt')) return `0x${word(state.pausedAt)}`;
-            if (sel === 'fdab463d') return `0x${word(state.currentRoot)}`;
             if (sel === '7cb4a03c') return `0x${word(2_000_000_000n)}`;
             if (sel === '6cda756a') return `0x${word(0n)}`;
             if (sel === 'aad24061') return `0x${word(0n)}`;

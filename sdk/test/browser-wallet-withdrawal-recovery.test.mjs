@@ -234,9 +234,8 @@ function baseRuntime(overrides = {}) {
             note_id: 7,
             current_balance: 1_000_000,
             current_anchor: '0x1234',
+            deposit_amount: 1_000_000,
             expiry_ts: 2_000_000_000,
-            // The deposit-time path: exits need no indexer (Amendment A1).
-            deposit_path: { active_root: '0x1', siblings: Array(32).fill('0x0') },
             ...(stateOverride || {})
         }
     };
@@ -899,7 +898,7 @@ test('browser withdrawal recovery invariants', async t => {
         attachDurableRuntime(browserWalletRuntime, durable);
         browserWalletRuntime.settleActiveLease = async () => null;
         browserWalletRuntime.recoverPending = async () => false;
-        browserWalletRuntime.treePath = async () => ({ active_root: '0x1', siblings: [] });
+        browserWalletRuntime.treePath = async () => assert.fail('a mutual close needs no path');
         browserWalletRuntime.remoteJson = async (url, init = {}) => {
             assert.match(url, /\/v2\/withdraw\/clearance$/);
             assert.equal(init.method, 'POST');
@@ -917,7 +916,8 @@ test('browser withdrawal recovery invariants', async t => {
                     mode: payload.args.mode,
                     proof: 'proof-before-wallet',
                     public_inputs: {
-                        active_root: payload.args.active_root,
+                        deposit_amount: payload.state.deposit_amount,
+                        expiry: payload.state.expiry_ts,
                         note_id: 7,
                         final_balance: 1_000_000,
                         withdrawal_nullifier: '0x777',
@@ -1011,7 +1011,7 @@ test('browser withdrawal recovery invariants', async t => {
         attachDurableRuntime(browserWalletRuntime, durable);
         browserWalletRuntime.settleActiveLease = async () => null;
         browserWalletRuntime.recoverPending = async () => false;
-        browserWalletRuntime.treePath = async () => assert.fail('an escape uses the saved deposit path');
+        browserWalletRuntime.treePath = async () => assert.fail('an escape needs no path');
         // The stale-device pre-check finds no evidence at N⁺.
         browserWalletRuntime.remoteJson = async url => {
             assert.match(url, /\/v2\/nullifiers\/0x5777\/evidence$/);
@@ -1027,7 +1027,8 @@ test('browser withdrawal recovery invariants', async t => {
                     mode: payload.args.mode,
                     proof: 'escape-proof-before-wallet',
                     public_inputs: {
-                        active_root: payload.args.active_root,
+                        deposit_amount: payload.state.deposit_amount,
+                        expiry: payload.state.expiry_ts,
                         note_id: 7,
                         final_balance: 1_000_000,
                         withdrawal_nullifier: '0x777',
@@ -1142,49 +1143,6 @@ test('browser withdrawal recovery invariants', async t => {
         assert.equal(durable.value.preparedWithdrawal.phase, 'submitted');
         assert.equal(durable.value.preparedWithdrawal.transactionHash, hashB);
         assert.deepEqual(durable.value.preparedWithdrawal.transactionHashes, [hashB]);
-    });
-
-    await t.test('a stale deposit-slot check cannot clear a newer MetaMask claim or hash', async () => {
-        const oldHash = `0x${'0b'.repeat(32)}`;
-        const newHash = `0x${'0c'.repeat(32)}`;
-        const oldPlan = {
-            phase: 'submitted',
-            operationId: 'old-deposit',
-            next_note_id: 8,
-            amount: 5_000_000,
-            commitment: '0x1234',
-            transactionHash: oldHash,
-            transactionHashes: [oldHash]
-        };
-        const newerPlan = {
-            phase: 'submitted',
-            operationId: 'new-deposit',
-            next_note_id: 9,
-            amount: 6_000_000,
-            commitment: '0x5678',
-            submissionId: 'new-wallet-prompt',
-            transactionHash: newHash,
-            transactionHashes: [newHash]
-        };
-        const durable = durableState(baseRuntime({
-            state: null,
-            pendingDeposit: newerPlan
-        }));
-        const runtime = attachDurableRuntime(new BrowserWalletRuntime(), durable);
-
-        await assert.rejects(
-            () => runtime.resolvePendingDepositSlotConflict({
-                operationId: oldPlan.operationId,
-                noteId: oldPlan.next_note_id,
-                amount: oldPlan.amount,
-                commitment: oldPlan.commitment,
-                phase: oldPlan.phase,
-                submissionId: null,
-                transactionHashes: oldPlan.transactionHashes
-            }),
-            /pending deposit changed/i
-        );
-        assert.deepEqual(durable.value.pendingDeposit, newerPlan);
     });
 
     await t.test('a detached pending escape remains visible without blocking a funded chat', () => {
@@ -1380,7 +1338,7 @@ test('browser withdrawal recovery invariants', async t => {
             clearanceReserved: true,
             proof: 'stale-proof',
             public_inputs: {
-                active_root: '0xold-root',
+                registration_commitment: '0xc0',
                 note_id: 7,
                 withdrawal_nullifier: '0x777'
             },
@@ -4534,8 +4492,6 @@ test('browser withdrawal recovery invariants', async t => {
                 secret: 'saved-deposit-secret',
                 commitment: '0x1',
                 next_note_id: 7,
-                active_root: '0x2',
-                zero_path: Array(32).fill('0x0'),
                 transactionHash: oldHash,
                 transactionHashes: [oldHash],
                 transactionAttempts: [{

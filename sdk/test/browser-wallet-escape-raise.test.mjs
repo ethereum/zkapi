@@ -102,7 +102,7 @@ function scriptedChain() {
                 const [{ data }] = params;
                 if (data.startsWith(SELECTOR.notes)) return `0x${[0, 0, 0, chain.noteStatus].map(word).join('')}`;
                 if (data.startsWith(SELECTOR.pending)) {
-                    return `0x${[1, 0x11, NULLIFIER, chain.pending.finalBalance, DESTINATION, CLOSE_BLOCK].map(word).join('')}`;
+                    return `0x${[1, NULLIFIER, chain.pending.finalBalance, DESTINATION, CLOSE_BLOCK].map(word).join('')}`;
                 }
                 if (data.startsWith(SELECTOR.concessions)) {
                     return `0x${[0x5099, chain.pending.finalBalance + chain.pending.conceded, chain.pending.conceded].map(word).join('')}`;
@@ -360,7 +360,7 @@ function deploymentChain({ code = CODE, getters = {}, balance = 0n } = {}) {
         [`${VAULT}:${ABI.stateSigningKeyY}`]: 0x112n, [`${VAULT}:${ABI.clearanceSigningKeyX}`]: 0x113n,
         [`${VAULT}:${ABI.clearanceSigningKeyY}`]: 0x114n, [`${VAULT}:${ABI.challengePeriod}`]: 172_800n,
         [`${VAULT}:${ABI.noteTtl}`]: 2_592_000n, [`${VAULT}:${ABI.maxPauseDuration}`]: 3_888_000n,
-        [`${VAULT}:${ABI.CONCESSION_ESCAPE_VERSION}`]: 1n, [`${VAULT}:${ABI.ROOT_HISTORY_WINDOW}`]: 86_400n,
+        [`${VAULT}:${ABI.CONCESSION_ESCAPE_VERSION}`]: 1n, [`${VAULT}:${ABI.NOTE_BOUND_EXIT_VERSION}`]: 1n,
         [`${ADAPTER}:${ABI.CIRCUIT_ID_HASH}`]: BigInt(CONCESSION_CIRCUIT_ID_HASH),
         [`${ADAPTER}:${ABI.REQUEST_VK_HASH}`]: BigInt(`0x${'4d'.repeat(32)}`),
         [`${ADAPTER}:${ABI.WITHDRAWAL_VK_HASH}`]: BigInt(`0x${'29'.repeat(32)}`),

@@ -25,7 +25,7 @@ const CURRENT_DEPLOYMENT = 'zkapi-test-sepolia-concession';
 const BUILDS = Object.freeze({
     legacy: { deploymentId: LEGACY_DEPLOYMENT, circuitId: 'zkapi-v2-note-bound-v1', publicPath: '/zkapi/',
         configUrl: '/zkapi/browser-config.json', workerUrl: '/zkapi/assets/zkapiWasmWorker.js' },
-    current: { deploymentId: CURRENT_DEPLOYMENT, circuitId: 'zkapi-v2-concession-v1', publicPath: '/zkapi/v2c/',
+    current: { deploymentId: CURRENT_DEPLOYMENT, circuitId: 'zkapi-v2-concession-v2', publicPath: '/zkapi/v2c/',
         configUrl: '/zkapi/v2c/browser-config.json', workerUrl: '/zkapi/v2c/assets/zkapiWasmWorker.js' }
 });
 const holding = (deploymentId, runtime, withdrawals = []) => ({ deploymentId, runtime, withdrawals });
@@ -135,7 +135,7 @@ test('the sample host builds both deployments side by side and its bundle loads 
         const assets = async relative => JSON.parse(await fs.readFile(path.join(out, relative), 'utf8'));
         assert.equal((await assets('zkapi/sdk-assets.json')).circuitId, 'zkapi-v2-note-bound-v1');
         const currentAssets = await assets('zkapi/v2c/sdk-assets.json');
-        assert.deepEqual([currentAssets.circuitId, currentAssets.publicPath], ['zkapi-v2-concession-v1', '/zkapi/v2c/']);
+        assert.deepEqual([currentAssets.circuitId, currentAssets.publicPath], ['zkapi-v2-concession-v2', '/zkapi/v2c/']);
         // Each worker bundles its own package's ../wasm/zkapi_browser.js glue.
         const legacyWorker = await fs.readFile(path.join(out, 'zkapi/assets/zkapiWasmWorker.js'), 'utf8');
         const currentWorker = await fs.readFile(path.join(out, 'zkapi/v2c/assets/zkapiWasmWorker.js'), 'utf8');

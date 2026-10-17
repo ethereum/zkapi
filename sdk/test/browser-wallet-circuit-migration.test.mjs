@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BrowserWalletRuntime } from '../services/browserWalletRuntime.js';
 
-const CIRCUIT_ID = 'zkapi-v2-concession-v1';
+const CIRCUIT_ID = 'zkapi-v2-concession-v2';
 
 function manifest() {
     return {
@@ -33,7 +33,8 @@ function manifest() {
 
 test('browser rejects missing, legacy, and unknown circuits with migration guidance', () => {
     const runtime = new BrowserWalletRuntime();
-    for (const circuitId of [undefined, '', 'legacy-unbound', 'zkapi-v2-note-bound-v1', 'unknown-future-circuit']) {
+    for (const circuitId of [undefined, '', 'legacy-unbound', 'zkapi-v2-note-bound-v1', 'zkapi-v2-concession-v1',
+        'unknown-future-circuit']) {
         const deployment = manifest();
         deployment.proof_setup.circuit_id = circuitId;
         assert.throws(() => runtime.validateManifest(deployment), error => {
@@ -59,7 +60,7 @@ test('browser requires its trusted configuration to pin the same circuit', () =>
         ...deployment.privacy_mode,
         setup_id: 'dev',
         exit_concession: 1,
-        vault_revision: 3,
+        vault_revision: 4,
         clearance_ownership_proof: 'required'
     } };
     runtime.validateManifestTrust(deployment);
@@ -72,7 +73,7 @@ test('browser requires its trusted configuration to pin the same circuit', () =>
 /** A build-pinned profile (browser-config.json's trusted_deployment) for a manifest. */
 function trustedFor(deployment, changes = {}) {
     return { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode, setup_id: 'dev',
-        exit_concession: 1, vault_revision: 3, clearance_ownership_proof: 'required', ...changes };
+        exit_concession: 1, vault_revision: 4, clearance_ownership_proof: 'required', ...changes };
 }
 
 // A build's own profile is checked before anything else: a profile that pins
@@ -141,7 +142,7 @@ test('a placeholder profile, a profile without the concession exit or an unknown
     const runtime = new BrowserWalletRuntime();
     const deployment = manifest();
     const trusted = { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode,
-        setup_id: 'dev', exit_concession: 1, vault_revision: 3, clearance_ownership_proof: 'required' };
+        setup_id: 'dev', exit_concession: 1, vault_revision: 4, clearance_ownership_proof: 'required' };
     runtime.browserConfig = { trusted_deployment: trusted };
     runtime.validateManifestTrust(deployment);
     runtime.browserConfig = { trusted_deployment: { ...trusted, deployment_status: 'not_deployed' } };
@@ -157,8 +158,11 @@ test('a placeholder profile, a profile without the concession exit or an unknown
         runtime.browserConfig = { trusted_deployment: { ...trusted, setup_id: setupId } };
         assert.throws(() => runtime.validateManifestTrust(deployment), /invalid trusted setup_id/);
     }
-    // Only vault revision 3 with required ownership proofs and a positive W.
-    for (const change of [{ vault_revision: 2 }, { vault_revision: undefined }, { clearance_ownership_proof: 'optional' },
+    // Only vault revision 4 (note-bound exits, activated requests) with
+    // required ownership proofs and a positive W: a revision-3 vault's
+    // root-bound exits would not land.
+    for (const change of [{ vault_revision: 2 }, { vault_revision: 3 }, { vault_revision: '4' }, { vault_revision: undefined },
+        { clearance_ownership_proof: 'optional' },
         { clearance_ownership_proof: undefined }, { settlement_window_seconds: 0 }, { settlement_window_seconds: '14705' }]) {
         runtime.browserConfig = { trusted_deployment: { ...trusted, ...change } };
         assert.throws(() => runtime.validateManifestTrust(deployment), /invalid trusted/, JSON.stringify(change));
@@ -174,5 +178,9 @@ test('the proof worker must run a bundle of the pinned circuit and setup', async
     runtime.browserConfig = { trusted_deployment: { circuit_id: CIRCUIT_ID, setup_id: 'mpc-1' } };
     await assert.rejects(runtime.assertWorkerBundle(), { code: 'setup_mismatch' });
     runtime.browserConfig = { trusted_deployment: { circuit_id: 'zkapi-v2-note-bound-v1', setup_id: 'dev' } };
+    await assert.rejects(runtime.assertWorkerBundle(), { code: 'setup_mismatch' });
+    // A bundle of the revision-3 circuit proves root-bound exits: refused.
+    runtime.worker = { call: async () => ({ circuit_id: 'zkapi-v2-concession-v1', setup_id: 'dev' }) };
+    runtime.browserConfig = { trusted_deployment: { circuit_id: 'zkapi-v2-concession-v1', setup_id: 'dev' } };
     await assert.rejects(runtime.assertWorkerBundle(), { code: 'setup_mismatch' });
 });

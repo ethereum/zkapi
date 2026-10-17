@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    DESTINATION, createHarness, depositPath, memoryIndexedDb, noteState, within
+    DESTINATION, createHarness, memoryIndexedDb, noteState, within
 } from './helpers/request-archive-harness.mjs';
 import { deployedProfile } from './helpers/deployed-profile.mjs';
 import { nativeFunding, nativeQuote } from './helpers/native-fixtures.mjs';
@@ -129,8 +129,8 @@ globalThis.Worker = class {
 };
 
 /**
- * A wallet of this deployment, as a tab left it: a note with its deposit-time
- * path, and (by default) one request sent from it whose journal is live.
+ * A wallet of this deployment, as a tab left it: a note, and (by default)
+ * one request sent from it whose journal is live.
  */
 async function savedWallet({ liveRequest = true } = {}) {
     indexedDB.clear();
@@ -151,7 +151,7 @@ async function savedWallet({ liveRequest = true } = {}) {
     proofWorker = seed.runtime.worker;
     proofLog = seed.worker;
     await store.writeBrowserWallet({ deploymentId: DEPLOYMENT_ID, billingAsset: 'native_eth',
-        state: noteState({ chain_id: Number(TRUSTED.chain_id), deposit_path: depositPath() }) });
+        state: noteState({ chain_id: Number(TRUSTED.chain_id) }) });
     await seed.runtime.reload();
     if (liveRequest) {
         seed.server.leasePost = body => seed.activeLease(body, { billing_quote: quote });
@@ -192,7 +192,8 @@ test('an operator holding every connection open cannot stall initialization or a
     // A request may be reserved: before T a forced escape concedes 0 (E3).
     assert.equal(plan.decision.rule, 'E3.forced');
     assert.equal(plan.public_inputs.conceded, 0);
-    assert.equal(plan.pathSource, 'deposit');
+    // No path, so nothing of the escape waits on the hanging indexer.
+    assert.equal('active_root' in lastWithdrawalProof().payload.args, false);
     assert.equal(await within(1_000, runtime.startupRecovery, 'the stopped startup recovery'), false);
     const saved = await store.readBrowserWallet();
     assert.deepEqual(saved.exitLock.released.map(entry => entry.kind), [0]);

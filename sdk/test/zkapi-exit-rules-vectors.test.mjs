@@ -230,6 +230,4 @@ test('E7: the shared exit kit opens with its passphrase only and holds the expec
     assert.equal(String(payload.bound_at_state), expected.bound_at_state);
     assert.equal(payload.state_seq, expected.state_seq);
     assert.equal(payload.exported_at, expected.exported_at);
-    assert.equal(BigInt(payload.merkle_path.active_root), BigInt(expected.merkle_path_root));
-    assert.equal(payload.merkle_path.siblings.length, expected.merkle_path_siblings);
 });

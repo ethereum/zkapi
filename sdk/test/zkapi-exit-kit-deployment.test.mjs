@@ -21,8 +21,8 @@ const STATE = {
 
 test('Keccak-256 matches the independent test implementation and known vectors', () => {
     assert.equal(keccak256(''), '0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470');
-    assert.equal(keccak256('zkapi-v2-concession-v1'), CONCESSION_CIRCUIT_ID_HASH);
-    for (const text of ['a', 'NoteDeposited(uint32,bytes32,uint128,uint64,uint256)', 'x'.repeat(135), 'y'.repeat(136), 'z'.repeat(300)]) {
+    assert.equal(keccak256('zkapi-v2-concession-v2'), CONCESSION_CIRCUIT_ID_HASH);
+    for (const text of ['a', 'NoteDeposited(uint32,bytes32,uint128,uint64)', 'x'.repeat(135), 'y'.repeat(136), 'z'.repeat(300)]) {
         assert.equal(keccak256(text), keccak256Hex(text), `${text.length} bytes`);
     }
     assert.equal(codehash('0x6001'), keccak256(Uint8Array.from([0x60, 0x01])));
@@ -37,9 +37,8 @@ test('an exit kit round-trips under its passphrase and nothing else', async () =
     const exported = await import(new URL(`../.${packageJson.exports['./exit-kit']}`, import.meta.url).href);
     assert.equal(exported.openExitKit, openExitKit);
     const trusted = { deployment_id: 'v2c', contract_address: STATE.contract_address, vault_runtime_codehash: `0x${'aa'.repeat(32)}` };
-    const merklePath = { active_root: '0x77', siblings: Array.from({ length: 32 }, (_, index) => `0x${index.toString(16)}`) };
     const payload = buildExitKitPayload({ trustedDeployment: trusted, state: { ...STATE, extra: 'not copied' }, stateSeq: 4,
-        exportedAt: 1_800_000_000, merklePath });
+        exportedAt: 1_800_000_000 });
     assert.equal(payload.format, EXIT_KIT_FORMAT);
     assert.deepEqual(payload.trusted_deployment, trusted);
     // s, note_id, D, expiry, B, r, τ, τ_prev and σ, plus the commitment.
@@ -50,7 +49,8 @@ test('an exit kit round-trips under its passphrase and nothing else', async () =
     assert.equal(payload.note.extra, undefined);
     assert.equal(payload.bound_at_state, '300');
     assert.equal(payload.state_seq, 4);
-    assert.deepEqual(payload.merkle_path, merklePath);
+    // An escape is bound to the note's vault record: the kit holds no path.
+    assert.equal('merkle_path' in payload, false);
 
     const sealed = await sealExitKit(payload, 'correct horse battery');
     assert.equal(sealed.format, EXIT_KIT_FORMAT);
@@ -105,7 +105,7 @@ function chain({ code = CODE, getters = {}, chainId = 1 } = {}) {
         [`${VAULT}:${ABI.stateSigningKeyY}`]: 0x112n, [`${VAULT}:${ABI.clearanceSigningKeyX}`]: 0x113n,
         [`${VAULT}:${ABI.clearanceSigningKeyY}`]: 0x114n, [`${VAULT}:${ABI.challengePeriod}`]: 172_800n,
         [`${VAULT}:${ABI.noteTtl}`]: 2_592_000n, [`${VAULT}:${ABI.maxPauseDuration}`]: 3_888_000n,
-        [`${VAULT}:${ABI.CONCESSION_ESCAPE_VERSION}`]: 1n, [`${VAULT}:${ABI.ROOT_HISTORY_WINDOW}`]: 86_400n,
+        [`${VAULT}:${ABI.CONCESSION_ESCAPE_VERSION}`]: 1n, [`${VAULT}:${ABI.NOTE_BOUND_EXIT_VERSION}`]: 1n,
         [`${ADAPTER}:${ABI.CIRCUIT_ID_HASH}`]: BigInt(CONCESSION_CIRCUIT_ID_HASH),
         [`${ADAPTER}:${ABI.REQUEST_VK_HASH}`]: BigInt(`0x${'4d'.repeat(32)}`),
         [`${ADAPTER}:${ABI.WITHDRAWAL_VK_HASH}`]: BigInt(`0x${'29'.repeat(32)}`),
@@ -141,7 +141,7 @@ test('the deployment pins are checked through a provider: codehashes, adapter, k
         [{ getters: { [`${VAULT}:${ABI.noteTtl}`]: 1n } }, 'noteTtl'],
         [{ getters: { [`${VAULT}:${ABI.maxPauseDuration}`]: 1n } }, 'maxPauseDuration'],
         [{ getters: { [`${VAULT}:${ABI.CONCESSION_ESCAPE_VERSION}`]: 0n } }, 'CONCESSION_ESCAPE_VERSION'],
-        [{ getters: { [`${VAULT}:${ABI.ROOT_HISTORY_WINDOW}`]: 3_600n } }, 'ROOT_HISTORY_WINDOW'],
+        [{ getters: { [`${VAULT}:${ABI.NOTE_BOUND_EXIT_VERSION}`]: 2n } }, 'NOTE_BOUND_EXIT_VERSION'],
         [{ getters: { [`${ADAPTER}:${ABI.CIRCUIT_ID_HASH}`]: 1n } }, 'CIRCUIT_ID_HASH'],
         [{ getters: { [`${ADAPTER}:${ABI.REQUEST_VK_HASH}`]: 1n } }, 'REQUEST_VK_HASH'],
         [{ getters: { [`${ADAPTER}:${ABI.WITHDRAWAL_VK_HASH}`]: null } }, 'WITHDRAWAL_VK_HASH']
@@ -157,6 +157,11 @@ test('the deployment pins are checked through a provider: codehashes, adapter, k
         ? Promise.reject(Object.assign(new Error('execution reverted'), { code: 3 })) : legacy.request(args);
     assert.deepEqual((await verifyDeployment({ request: reverting, trusted: trusted(), chainId: 1 })).mismatches
         .map(entry => entry.field), ['CONCESSION_ESCAPE_VERSION']);
+    // A revision-3 vault (root-bound exits, no activation) has no NOTE_BOUND_EXIT_VERSION().
+    const revision3 = async args => args.params?.[0]?.data === `0x${ABI.NOTE_BOUND_EXIT_VERSION}`
+        ? Promise.reject(Object.assign(new Error('execution reverted'), { code: 3 })) : legacy.request(args);
+    assert.deepEqual((await verifyDeployment({ request: revision3, trusted: trusted(), chainId: 1 })).mismatches
+        .map(entry => entry.field), ['NOTE_BOUND_EXIT_VERSION']);
     // Another chain stops the check at once.
     const wrong = await verifyDeployment({ request: chain({ chainId: 5 }).request, trusted: trusted(), chainId: 1 });
     assert.deepEqual(wrong.mismatches.map(entry => entry.field), ['chain_id']);

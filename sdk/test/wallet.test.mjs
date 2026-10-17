@@ -19,10 +19,7 @@ test("escape-period labels follow the deployed vault duration", () => {
 });
 
 test("deposit calldata uses the deployed vault signature: commitment and amount, no siblings", () => {
-  const plan = {
-    commitment: "0x2a",
-    zero_path: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`),
-  };
+  const plan = { commitment: "0x2a", next_note_id: 9 };
   const encoded = wallet.encodeDeposit(plan, 100_000n);
   assert.ok(encoded.startsWith("0x56d2e1ea"));
   assert.equal(encoded.length, 2 + 8 + (2 * 64));
@@ -30,13 +27,13 @@ test("deposit calldata uses the deployed vault signature: commitment and amount,
   assert.equal(encoded.slice(74, 138), wallet.abiWord(100_000n));
 });
 
-test("NoteDeposited receipt parsing returns canonical note id and expiry", () => {
+test("NoteDeposited receipt parsing returns canonical note id and expiry, and no root", () => {
   const vault = "0x590df9abbfb21074016daa486c771ae0af729ee2";
   const receipt = {
     logs: [{
       address: vault.toUpperCase().replace("0X", "0x"),
       topics: [wallet.ABI.noteDeposited, `0x${wallet.abiWord(21n)}`, `0x${wallet.abiWord(42n)}`],
-      data: `0x${wallet.abiWord(100_000n)}${wallet.abiWord(1_800_000_000n)}${wallet.abiWord(99n)}`,
+      data: `0x${wallet.abiWord(100_000n)}${wallet.abiWord(1_800_000_000n)}`,
     }],
   };
   assert.deepEqual(wallet.parseNoteDeposited(receipt, vault), {
@@ -44,8 +41,12 @@ test("NoteDeposited receipt parsing returns canonical note id and expiry", () =>
     commitment: `0x${wallet.abiWord(42n)}`,
     amount: 100_000n,
     expiryTs: 1_800_000_000n,
-    newRoot: 99n,
   });
+  // A log of the revision-3 NoteDeposited (with its root) is another event.
+  const legacy = { logs: [{ ...receipt.logs[0], topics: ["0x7c83dba8534bea9e30d6444f9ca6462dc906897f9938d220dbbe4358c1f7a063",
+    ...receipt.logs[0].topics.slice(1)] }] };
+  assert.equal(wallet.parseNoteDeposited(legacy, vault), null);
+  assert.equal(wallet.parseNoteDeposited({ logs: [{ ...receipt.logs[0], data: `0x${wallet.abiWord(100_000n)}` }] }, vault), null);
 });
 
 const GOLDEN = JSON.parse(readFileSync(new URL("./fixtures/vault-calldata-golden.json", import.meta.url), "utf8"));
@@ -53,8 +54,12 @@ const PROOF_BYTES = Buffer.from(Array.from({ length: 256 }, (_, index) => index)
 const SCALAR_MODULUS_MINUS_ONE = "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000";
 const SUCCESSOR = "0x2a5c6b0e9f1d3b7a8c4e2f6a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e1f2a3b4c";
 
+// The largest note record: deposit amount 2^128 - 1, expiry 2^64 - 1.
+const UINT128_MAX = ((1n << 128n) - 1n).toString();
+const UINT64_MAX = ((1n << 64n) - 1n).toString();
+
 // The statements of the golden vectors in sdk/test/fixtures/vault-calldata-golden.json
-// (generated with Foundry `cast calldata` from the vault revision 3 signatures).
+// (generated with Foundry `cast calldata` from the vault revision 4 signatures).
 function escapePlan(changes = {}) {
   return {
     mode: "escape",
@@ -62,7 +67,7 @@ function escapePlan(changes = {}) {
       protocol_version: 2,
       chain_id: 11_155_111,
       contract_address: "0x590df9abbfb21074016daa486c771ae0af729ee2",
-      active_root: SCALAR_MODULUS_MINUS_ONE,
+      registration_commitment: SCALAR_MODULUS_MINUS_ONE,
       state_signing_key_x: "0x12",
       state_signing_key_y: "0x13",
       clearance_signing_key_x: "0x14",
@@ -75,6 +80,8 @@ function escapePlan(changes = {}) {
       next_nullifier: SUCCESSOR,
       conceded: 100,
       valid_until: 1_800_010_800,
+      deposit_amount: UINT128_MAX,
+      expiry: UINT64_MAX,
       ...changes,
     },
     proof: { backend: "groth16_bn254", proof: PROOF_BYTES.toString("base64") },
@@ -88,7 +95,7 @@ function mutualPlan(changes = {}) {
       protocol_version: 2,
       chain_id: 1,
       contract_address: "0x4386fdbda35d995beb3bf8625118ec5982ec81fe",
-      active_root: "0x11",
+      registration_commitment: "0x11",
       state_signing_key_x: "0x12",
       state_signing_key_y: "0x13",
       clearance_signing_key_x: "0x14",
@@ -101,6 +108,8 @@ function mutualPlan(changes = {}) {
       next_nullifier: "0x0",
       conceded: 0,
       valid_until: "18446744073709551615",
+      deposit_amount: 2_000_000,
+      expiry: 1_800_000_000,
       ...changes,
     },
     proof: { backend: "groth16_bn254", proof: PROOF_BYTES.toString("base64") },
@@ -110,7 +119,7 @@ function mutualPlan(changes = {}) {
 const ESCAPE_DESTINATION = "0x2222222222222222222222222222222222222222";
 const MUTUAL_DESTINATION = "0x5615deb798bb3e4dfa0139dfa1b3d433cc23b72f";
 
-// The real revision-3 vault's selectors and event topics, from the compiled
+// The real revision-4 vault's selectors and event topics, from the compiled
 // protocol/contracts sources (crates/zkapi-serverd/tests/fixtures/
 // check-calldata-golden.sh keeps this file equal to them).
 const REAL_VAULT = JSON.parse(readFileSync(new URL("../../crates/zkapi-serverd/tests/fixtures/vault_calldata_golden.json", import.meta.url), "utf8"));
@@ -119,6 +128,7 @@ test("every selector and event topic is the real vault's", () => {
   const legacy = new Set(["legacyChallengePeriod"]);
   const events = {
     noteDeposited: "NoteDeposited",
+    notesActivatedEvent: "NotesActivated",
     mutualCloseEvent: "MutualClose",
     escapeInitiatedEvent: "EscapeWithdrawalInitiated",
     escapeFinalizedEvent: "EscapeWithdrawalFinalized",
@@ -147,11 +157,14 @@ test("every selector and event topic is the real vault's", () => {
     topics: REAL_VAULT.events[name].topics.slice(2).match(/.{64}/g).map(word => `0x${word}`) });
   // The tree and lifecycle events the SDK's strict decoder reads (others,
   // such as MutualClose, are matched by topic in the receipt matchers).
-  const decodable = ["NoteDeposited", "EscapeWithdrawalInitiated", "EscapeConcessionRecorded", "EscapeConcessionRaised",
-    "EscapeWithdrawalChallenged", "ClosedLeafRetired", "ExpiredClaimed"];
+  const decodable = ["NoteDeposited", "NotesActivated", "EscapeWithdrawalInitiated", "EscapeConcessionRecorded",
+    "EscapeConcessionRaised", "EscapeWithdrawalChallenged", "ClosedLeafRetired", "ExpiredClaimed"];
   const decoded = Object.fromEntries(decodable.map(name => [name, wallet.decodeVaultEvent(log(name), vault)]));
   assert.deepEqual(decoded.NoteDeposited, { event: "NoteDeposited", noteId: 7n, commitment: `0x${"0c0c".padStart(64, "0")}`,
-    amount: 1_000_000n, expiryTs: 2_000_000_000n, newRoot: 0x0a0an });
+    amount: 1_000_000n, expiryTs: 2_000_000_000n });
+  assert.deepEqual(decoded.NotesActivated, { event: "NotesActivated", firstNoteId: 4n, count: 4n, newRoot: 0x0d0dn, proved: true });
+  assert.deepEqual(wallet.parseNoteDeposited({ logs: [log("NoteDeposited")] }, vault), { noteId: 7n,
+    commitment: `0x${"0c0c".padStart(64, "0")}`, amount: 1_000_000n, expiryTs: 2_000_000_000n });
   assert.equal(decoded.EscapeWithdrawalInitiated.challengeDeadline, 2_000_086_400n);
   assert.equal(decoded.EscapeWithdrawalInitiated.destination.toLowerCase(), "0x1111111111111111111111111111111111111111");
   assert.deepEqual(wallet.escapeConcessionRecorded({ logs: [log("EscapeConcessionRecorded")] }, vault, 7),
@@ -163,7 +176,9 @@ test("every selector and event topic is the real vault's", () => {
     assert.equal(event.noteId ?? 7n, 7n, name);
   }
   assert.equal(REAL_VAULT.getter_words.pendingConcessions, 3);
-  assert.equal(REAL_VAULT.getter_words.pendingWithdrawals, 6);
+  assert.equal(REAL_VAULT.getter_words.pendingWithdrawals, 5);
+  assert.equal(REAL_VAULT.getter_words.notes, 4);
+  assert.equal(REAL_VAULT.getter_words.activationCursor, 1);
   assert.equal(wallet.decodePendingConcessions(`0x${"00".repeat(96)}`).nextNullifier, 0n);
 });
 
@@ -187,11 +202,11 @@ test("real proofs encode to the shared withdrawal golden vector", () => {
 test("every vault selector and event topic is the keccak of its signature", () => {
   const W = wallet.WITHDRAWAL_TUPLE;
   const Q = wallet.REQUEST_TUPLE;
-  assert.equal(W, "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)");
+  assert.equal(W, "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256)");
   assert.equal(Q, "(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256)");
   const selectors = {
-    initiateEscapeWithdrawal: [`initiateEscapeWithdrawal(${W},bytes)`, "a38d62aa"],
-    mutualClose: [`mutualClose(${W},bytes)`, "72cd2e44"],
+    initiateEscapeWithdrawal: [`initiateEscapeWithdrawal(${W},bytes)`, "8e110492"],
+    mutualClose: [`mutualClose(${W},bytes)`, "5acd3b15"],
     finalizeEscapeWithdrawal: ["finalizeEscapeWithdrawal(uint32)", "ff8f5585"],
     raiseEscapeConcession: [`raiseEscapeConcession(uint32,${Q},bytes,uint128)`, "dd0064ba"],
     challengeEscapeWithdrawal: [`challengeEscapeWithdrawal(uint32,${Q},bytes)`, "da0ce43d"],
@@ -201,11 +216,14 @@ test("every vault selector and event topic is the keccak of its signature", () =
     usedNullifiers: ["usedNullifiers(uint256)", "aad24061"],
     effectiveExpiry: ["effectiveExpiry(uint32)", "7cb4a03c"],
     currentRoot: ["currentRoot()", "fdab463d"],
+    nextNoteId: ["nextNoteId()", "7a2043a3"],
+    activationCursor: ["activationCursor()", "93e0ce4e"],
+    isActivated: ["isActivated(uint32)", "5b78fd86"],
     challengePeriod: ["challengePeriod()", "f3f480d9"],
     notes: ["notes(uint32)", "9f18e4ed"],
     CONCESSION_ESCAPE_VERSION: ["CONCESSION_ESCAPE_VERSION()", "5e00b426"],
+    NOTE_BOUND_EXIT_VERSION: ["NOTE_BOUND_EXIT_VERSION()", "56853816"],
     maxPauseDuration: ["maxPauseDuration()", "64433d27"],
-    ROOT_HISTORY_WINDOW: ["ROOT_HISTORY_WINDOW()", "1fe72de0"],
     noteTtl: ["noteTtl()", "225af2e7"],
     proofAdapter: ["proofAdapter()", "efc91e58"],
     stateSigningKeyX: ["stateSigningKeyX()", "15fa2a9a"],
@@ -233,8 +251,10 @@ test("every vault selector and event topic is the keccak of its signature", () =
       "0x3faf5608f821061643ff6fdfe6dd0f6d7fb074bb565f35e3537a86ac08f0897c"],
     closedLeafRetiredEvent: ["ClosedLeafRetired(uint32,uint256)",
       "0x64572cec8ef079a5baa4f2860f8b65efb52a96f64ee679d315fd2a0541ea28b3"],
-    noteDeposited: ["NoteDeposited(uint32,bytes32,uint128,uint64,uint256)",
-      "0x7c83dba8534bea9e30d6444f9ca6462dc906897f9938d220dbbe4358c1f7a063"],
+    noteDeposited: ["NoteDeposited(uint32,bytes32,uint128,uint64)",
+      "0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36"],
+    notesActivatedEvent: ["NotesActivated(uint32,uint32,uint256,bool)",
+      "0x2c5604373c15ade06913903b9f6fffb2f3b0a029d20dac56a6eeb7d8b1c11144"],
     expiredClaimedEvent: ["ExpiredClaimed(uint32,uint128,uint256)",
       "0x5534ce4a9fb7fe545375064cc186660ac10ba2152cb1592b29b244d2fe169ae4"],
   };
@@ -243,32 +263,39 @@ test("every vault selector and event topic is the keccak of its signature", () =
     assert.equal(wallet.ABI[name], pinned, name);
   }
   // The adapter's CIRCUIT_ID_HASH constant.
-  assert.equal(keccak256("zkapi-v2-concession-v1"),
-    "0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687");
-  // The retired note-bound selectors are gone.
-  assert.equal(Object.values(wallet.ABI).includes("9073639b"), false);
-  assert.equal(Object.values(wallet.ABI).includes("7fca9c82"), false);
+  assert.equal(keccak256("zkapi-v2-concession-v2"),
+    "0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1");
+  // The retired note-bound selectors, the 16-word exits of revision 3 and
+  // its root window are gone.
+  for (const retired of ["9073639b", "7fca9c82", "a38d62aa", "72cd2e44", "1fe72de0"]) {
+    assert.equal(Object.values(wallet.ABI).includes(retired), false, retired);
+  }
+  assert.equal("ROOT_HISTORY_WINDOW" in wallet.ABI, false);
 });
 
-test("escape calldata is the 16-word statement and the proof, byte for byte (836 bytes)", () => {
+test("escape calldata is the 17-word statement and the proof, byte for byte (868 bytes)", () => {
   const encoded = wallet.encodeWithdrawal(escapePlan(), "escape", ESCAPE_DESTINATION,
     "0x590DF9ABBFB21074016DAA486C771AE0AF729EE2", { conceded: 100n });
   assert.equal(encoded, GOLDEN.initiateEscapeWithdrawal);
-  assert.equal((encoded.length - 2) / 2, 836);
-  assert.equal(wallet.WITHDRAWAL_CALLDATA_BYTES, 836);
+  assert.equal((encoded.length - 2) / 2, 868);
+  assert.equal(wallet.WITHDRAWAL_CALLDATA_BYTES, 868);
   const word = (index) => encoded.slice(10 + index * 64, 10 + (index + 1) * 64);
+  assert.equal(word(3), wallet.abiWord(SCALAR_MODULUS_MINUS_ONE), "registration commitment");
   assert.equal(word(12), wallet.abiWord(0n), "kind");
   assert.equal(word(14), wallet.abiWord(100n), "conceded");
   assert.equal(word(15), wallet.abiWord(1_800_010_800n), "valid_until");
-  assert.equal(word(16), wallet.abiWord(0x220n), "bytes offset 17 * 32");
-  assert.equal(word(17), wallet.abiWord(256n), "proof length");
+  assert.equal(word(16), wallet.abiWord((1n << 192n) - 1n), "note metadata: amount | expiry << 128");
+  assert.equal(word(17), wallet.abiWord(0x240n), "bytes offset 18 * 32");
+  assert.equal(word(18), wallet.abiWord(256n), "proof length");
   assert.equal(encoded.slice(-64), PROOF_BYTES.subarray(224).toString("hex"));
 });
 
-test("mutual-close calldata is the 16-word statement and the proof, byte for byte", () => {
+test("mutual-close calldata is the 17-word statement and the proof, byte for byte", () => {
   const encoded = wallet.encodeWithdrawal(mutualPlan(), "mutual", MUTUAL_DESTINATION);
   assert.equal(encoded, GOLDEN.mutualClose);
-  assert.equal((encoded.length - 2) / 2, 836);
+  assert.equal((encoded.length - 2) / 2, 868);
+  assert.equal(encoded.slice(10 + 16 * 64, 10 + 17 * 64), wallet.abiWord(2_000_000n | (1_800_000_000n << 128n)),
+    "note metadata");
   assert.equal(wallet.encodeFinalizeEscape(21), `0x${wallet.ABI.finalizeEscapeWithdrawal}${wallet.abiWord(21)}`);
 });
 
@@ -292,8 +319,14 @@ test("the withdrawal encoder refuses another kind, destination, vault or concess
   assert.throws(() => encode(escapePlan({ valid_until: (2n ** 64n).toString() })), /uint64/);
   assert.throws(() => encode(escapePlan({ final_balance: 2 ** 60 })), /exact unsigned integer/);
   assert.throws(() => encode(escapePlan({ conceded: -1 })), /uint128/);
-  assert.throws(() => encode(escapePlan({ active_root: "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001" })),
-    /canonical field element/);
+  assert.throws(() => encode(escapePlan({ registration_commitment: "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001" })),
+    /registration commitment is not a canonical field element/);
+  assert.throws(() => encode(escapePlan({ registration_commitment: undefined, active_root: "0x11" })), /registration commitment/);
+  // The note metadata is the vault's packing of a uint128 amount and a uint64 expiry.
+  assert.throws(() => encode(escapePlan({ deposit_amount: (1n << 128n).toString() })), /deposit amount does not fit in uint128/);
+  assert.throws(() => encode(escapePlan({ expiry: (1n << 64n).toString() })), /note expiry does not fit in uint64/);
+  assert.throws(() => encode(escapePlan({ deposit_amount: undefined })), /deposit amount/);
+  assert.throws(() => encode(escapePlan({ expiry: -1 })), /note expiry/);
   assert.throws(() => encode(escapePlan({ withdrawal_tag: undefined, has_clearance: false, kind: undefined })), /kind-0/);
   const short = escapePlan();
   short.proof.proof = Buffer.alloc(255).toString("base64");
@@ -315,7 +348,7 @@ test("a vault address with leading zero nibbles matches its field-element form i
         ESCAPE_DESTINATION, vault, { conceded: 100n }));
     }
     const close = mutualPlan({ contract_address: feltHex(vault) });
-    assert.equal((wallet.encodeWithdrawal(close, "mutual", MUTUAL_DESTINATION, vault).length - 2) / 2, 836);
+    assert.equal((wallet.encodeWithdrawal(close, "mutual", MUTUAL_DESTINATION, vault).length - 2) / 2, 868);
   }
   // Another vault, or a vault that is not an address, is still refused.
   assert.throws(() => wallet.encodeWithdrawal(escapePlan({ contract_address: "0xf12345678901234567890123456789012345678" }),
@@ -333,16 +366,18 @@ test("pendingWithdrawals and pendingConcessions decode only their exact shapes",
   assert.throws(() => wallet.decodePendingConcessions(words(1n, 2n)), /exactly 3/);
   assert.throws(() => wallet.decodePendingConcessions(words(1n, 2n, 3n, 4n)), /exactly 3/);
   assert.throws(() => wallet.decodePendingConcessions(words(1n, 2n ** 128n, 3n)), /128 bits/);
-  assert.deepEqual(wallet.decodePendingWithdrawals(words(1n, 5n, 6n, 960n, MUTUAL_DESTINATION, 1_900_000_000n)), {
-    exists: true, activeRoot: 5n, withdrawalNullifier: 6n, finalBalance: 960n,
+  assert.deepEqual(wallet.decodePendingWithdrawals(words(1n, 6n, 960n, MUTUAL_DESTINATION, 1_900_000_000n)), {
+    exists: true, withdrawalNullifier: 6n, finalBalance: 960n,
     destination: MUTUAL_DESTINATION, challengeDeadline: 1_900_000_000n,
   });
-  assert.throws(() => wallet.decodePendingWithdrawals(words(2n, 5n, 6n, 960n, 0n, 1n)), /boolean/);
-  assert.throws(() => wallet.decodePendingWithdrawals(words(1n, 5n, 6n, 960n, 2n ** 160n, 1n)), /160 bits/);
-  assert.throws(() => wallet.decodePendingWithdrawals(words(1n, 5n, 6n, 960n, 0n)), /exactly 6/);
+  assert.throws(() => wallet.decodePendingWithdrawals(words(2n, 6n, 960n, 0n, 1n)), /boolean/);
+  assert.throws(() => wallet.decodePendingWithdrawals(words(1n, 6n, 960n, 2n ** 160n, 1n)), /160 bits/);
+  assert.throws(() => wallet.decodePendingWithdrawals(words(1n, 6n, 960n, 0n)), /exactly 5/);
+  // The revision-3 record (with the escape's root) is refused, not misread.
+  assert.throws(() => wallet.decodePendingWithdrawals(words(1n, 5n, 6n, 960n, 0n, 1n)), /exactly 5/);
 });
 
-test("vault revision 3 events decode strictly and escape receipts carry their concession", () => {
+test("vault revision 4 events decode strictly and escape receipts carry their concession", () => {
   const vault = "0x590df9abbfb21074016daa486c771ae0af729ee2";
   const topicWord = (value) => `0x${wallet.abiWord(value)}`;
   const data = (...values) => `0x${values.map((value) => wallet.abiWord(value)).join("")}`;
@@ -368,6 +403,19 @@ test("vault revision 3 events decode strictly and escape receipts carry their co
   assert.throws(() => wallet.decodeVaultEvent({ ...recorded, data: data(0x2an, 1_000n) }, vault), /exactly 3/);
   assert.throws(() => wallet.decodeVaultEvent({ ...recorded, topics: recorded.topics.slice(0, 1) }, vault), /topics/);
   assert.throws(() => wallet.decodeVaultEvent({ ...recorded, data: data(0x2an, 2n ** 128n, 0n) }, vault), /128 bits/);
+  // A deposit records the note only; a batch of activations inserts its leaves.
+  const deposited = { address: vault, topics: [wallet.ABI.noteDeposited, topicWord(9n), topicWord(0x2bn)],
+    data: data(5_000_000n, 1_800_000_000n) };
+  assert.deepEqual(wallet.decodeVaultEvent(deposited, vault), { event: "NoteDeposited", noteId: 9n,
+    commitment: topicWord(0x2bn), amount: 5_000_000n, expiryTs: 1_800_000_000n });
+  assert.throws(() => wallet.decodeVaultEvent({ ...deposited, data: data(5_000_000n, 1_800_000_000n, 0x77n) }, vault),
+    /exactly 2/);
+  const activated = { address: vault, topics: [wallet.ABI.notesActivatedEvent, topicWord(16n)], data: data(16n, 0x99n, 0n) };
+  assert.deepEqual(wallet.decodeVaultEvent(activated, vault),
+    { event: "NotesActivated", firstNoteId: 16n, count: 16n, newRoot: 0x99n, proved: false });
+  assert.throws(() => wallet.decodeVaultEvent({ ...activated, data: data(16n, 0x99n, 2n) }, vault), /proved is not a boolean/);
+  assert.throws(() => wallet.decodeVaultEvent({ ...activated, data: data(2n ** 32n, 0x99n, 1n) }, vault), /count does not fit/);
+  assert.throws(() => wallet.decodeVaultEvent({ ...activated, data: data(16n, 0x99n) }, vault), /exactly 3/);
 
   const receipt = { logs: [initiated, recorded] };
   assert.deepEqual(wallet.parseWithdrawalReceipt(receipt, vault, "escape"), {
@@ -637,7 +685,10 @@ test("the transit account, factory and paymaster calls encode their exact callda
   assert.equal(finalize.slice(74, 138), wallet.abiWord(36));
   assert.equal(finalize.slice(138, 138 + 72), wallet.encodeFinalizeEscape(21).slice(2));
   assert.equal(finalize.slice(138 + 72), "0".repeat(56), "padded to a word with zeros");
-  assert.throws(() => wallet.encodeTransitWithdraw("0x1234"), /empty, a finalization \(36 bytes\) or an exit \(836 bytes\)/);
+  assert.throws(() => wallet.encodeTransitWithdraw("0x1234"), /empty, a finalization \(36 bytes\) or an exit \(868 bytes\)/);
+  const exit = wallet.encodeWithdrawal(mutualPlan(), "mutual", MUTUAL_DESTINATION);
+  assert.equal(wallet.encodeTransitWithdraw(exit).slice(74, 138), wallet.abiWord(868), "an exit call is 868 bytes");
+  assert.throws(() => wallet.encodeTransitWithdraw(`0x${"00".repeat(836)}`), /exit \(868 bytes\)/);
   assert.throws(() => wallet.encodeTransitWithdraw("0x123"), /hex byte string/);
 });
 

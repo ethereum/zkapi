@@ -3,16 +3,32 @@ const CONTRACT_ERRORS = Object.freeze({
         code: 'invalid_proof',
         message: 'The vault rejected the withdrawal proof. Refresh the page and prepare the withdrawal again.'
     },
-    // StaleRoot(): a deposit's (or retirement's) siblings no longer match
-    // the live root. Exits do no Merkle work on vault revision 3.
+    // StaleRoot(): the siblings of a retirement or an on-chain activation no
+    // longer match the live root. Deposits and exits do no Merkle work.
     '0x607447de': {
         code: 'stale_root',
-        message: 'The vault changed while the deposit was being prepared. Its Merkle path must be refreshed.'
+        message: 'The vault’s note tree changed while this tree update was being prepared. Its Merkle path must be refreshed.'
     },
-    // UnknownRoot(): the vault never held the proof's root.
-    '0x8c520116': {
-        code: 'unknown_root',
-        message: 'The vault does not know this withdrawal proof’s Merkle root. The proof must be generated again.'
+    // NoteBindingMismatch(): the proof's registration commitment or note
+    // metadata differ from notes[noteId] (the vault's and the paymaster's).
+    '0x41c6633b': {
+        code: 'note_binding_mismatch',
+        message: 'The withdrawal proof does not match the vault’s record of this private note. Proving again from the same balance state cannot fix this.'
+    },
+    // NoteNotActivated(): the note's leaf is not in the tree yet.
+    '0x3d0439b5': {
+        code: 'note_not_activated',
+        message: 'This private note is not activated in the vault’s note tree yet.'
+    },
+    // StaleActivation(): the activation cursor or the root moved before the batch landed.
+    '0x9c9413a1': {
+        code: 'stale_activation',
+        message: 'The vault activated notes or changed its root meanwhile. The activation must be rebuilt from the current state.'
+    },
+    // InvalidActivation(): a batch size, alignment or range the vault does not accept.
+    '0xe72f8984': {
+        code: 'invalid_activation',
+        message: 'The vault refused this note activation batch.'
     },
     // ChallengedNullifier(): an escape from this state was defeated by
     // successor evidence: another device spent the next state.
@@ -63,7 +79,7 @@ const CONTRACT_ERRORS = Object.freeze({
     },
     '0xd9876be8': {
         code: 'invalid_siblings',
-        message: 'The vault rejected the withdrawal Merkle path. Prepare a fresh withdrawal and try again.'
+        message: 'The vault rejected the Merkle path of this tree update.'
     },
     '0x3be553f2': {
         code: 'not_pending_withdrawal',

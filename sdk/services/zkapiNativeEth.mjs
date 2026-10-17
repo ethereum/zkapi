@@ -186,7 +186,7 @@ export async function readVaultWord(funding, data, {
 /**
  * An EIP-1193-style `request({ method, params })` over the build-pinned RPC,
  * each call bounded by `timeoutMs`. Exit-mode reads (deployment pins, note
- * status, finality, the tree rebuild) use it or the user's exit RPC.
+ * status, finality, the activation cursor) use it or the user's exit RPC.
  */
 export function pinnedRpcRequest(funding, { timeoutMs = 20_000, signal = null } = {}) {
     validateNativeFunding(funding);

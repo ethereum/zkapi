@@ -12,10 +12,13 @@ import {
 
 export { gaslessPins };
 
-// keccak256("zkapi-v2-concession-v1"), the adapter's CIRCUIT_ID_HASH.
-export const CONCESSION_CIRCUIT_ID_HASH = '0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687';
+// keccak256("zkapi-v2-concession-v2"), the adapter's CIRCUIT_ID_HASH. The
+// adapter also holds the insertion verifiers of note activation, so its
+// pinned codehash pins them too.
+export const CONCESSION_CIRCUIT_ID_HASH = '0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1';
 export const CONCESSION_ESCAPE_VERSION = 1n;
-export const ROOT_HISTORY_WINDOW_SECONDS = 86_400n;
+// The vault's note-bound exits and activated request tree (revision 4).
+export const NOTE_BOUND_EXIT_VERSION = 1n;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const WORD = /^0x[0-9a-fA-F]{64}$/;
 
@@ -119,7 +122,7 @@ export async function verifyDeployment({ request, trusted, chainId, source = 'rp
     await call('noteTtl', vault, ABI.noteTtl, BigInt(pins.note_ttl));
     await call('maxPauseDuration', vault, ABI.maxPauseDuration, BigInt(pins.max_pause_duration));
     await call('CONCESSION_ESCAPE_VERSION', vault, ABI.CONCESSION_ESCAPE_VERSION, CONCESSION_ESCAPE_VERSION);
-    await call('ROOT_HISTORY_WINDOW', vault, ABI.ROOT_HISTORY_WINDOW, ROOT_HISTORY_WINDOW_SECONDS);
+    await call('NOTE_BOUND_EXIT_VERSION', vault, ABI.NOTE_BOUND_EXIT_VERSION, NOTE_BOUND_EXIT_VERSION);
     await call('CIRCUIT_ID_HASH', adapter, ABI.CIRCUIT_ID_HASH, BigInt(CONCESSION_CIRCUIT_ID_HASH));
     await call('REQUEST_VK_HASH', adapter, ABI.REQUEST_VK_HASH, BigInt(pins.request_vk_keccak256));
     await call('WITHDRAWAL_VK_HASH', adapter, ABI.WITHDRAWAL_VK_HASH, BigInt(pins.withdrawal_vk_keccak256));

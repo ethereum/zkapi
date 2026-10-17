@@ -1,7 +1,7 @@
-import walletCodec from '../wallet.js';
+import walletCodec, { WITHDRAWAL_CALLDATA_BYTES } from '../wallet.js';
 import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, nativeDepositValue, parseUnits, formatUnits, NATIVE_WEI_PER_UNIT } from './zkapiNativeEth.mjs';
 import { beginBrowserSdkInitialization } from '../configure.js';
-import browserWalletRuntime from './browserWalletRuntime.js';
+import browserWalletRuntime, { pausedWithdrawalNotice } from './browserWalletRuntime.js';
 import { ENTRY_POINT_ERRORS, contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
 import { EXIT_FALLBACK_GAS_LIMIT, bufferedGasLimit } from './zkapiGas.mjs';
 import { normalizeWalletError, walletErrorMessage } from './zkapiWalletError.mjs';
@@ -41,9 +41,9 @@ const GASLESS_PRIVACY_NOTE_SEPARATE_PAYOUT = `The connected account becomes the 
 // The record phases claimWithdrawalFinalization accepts (browserWalletStore's claimBrowserWithdrawalFinalization).
 const FINALIZATION_CLAIMABLE_PHASES = new Set(['pending', 'finalizing', 'awaiting_wallet', 'ambiguous']);
 // The vault call a close or escape is priced with before its proof exists:
-// 836 nonzero bytes (16 gas each in preVerificationGas, where a zero byte
+// 868 nonzero bytes (16 gas each in preVerificationGas, where a zero byte
 // costs 4), so the quoted maxCost bounds the signed operation's.
-const WORST_CASE_EXIT_CALL = `0x${'ff'.repeat(836)}`;
+const WORST_CASE_EXIT_CALL = `0x${'ff'.repeat(WITHDRAWAL_CALLDATA_BYTES)}`;
 const GASLESS_PAYOUT_CONTRACT_WARNING = 'The payout address is a contract. It must accept ETH within 100,000 gas, or the paymaster only credits the payout for a later claim (claimGaslessCredit).';
 // Ethereum's `finalized` block tag is authoritative when the wallet RPC
 // supports it. A confirmation-depth fallback keeps recovery moving on older
@@ -254,10 +254,11 @@ const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
     receipt_pending_install: 'A settled private request must be applied to this balance first. Select the balance and try again.',
     request_archive_limit: 'Too many unsettled private requests are recorded for this balance, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw the balance.',
     withdrawal_submission_pending: 'A withdrawal transaction for this balance is still unresolved. Check its status first.',
+    note_not_recorded: 'The server has not seen this balance’s deposit on chain yet, so it could not answer the mutual close. Nothing was refused: try again shortly.',
     challenged_nullifier: 'The vault already defeated an escape at this balance state: another device spent its next state. Restore the newest backup or exit kit.',
     superseded_state: 'The vault already defeated an escape from this balance’s next state: another device holds a newer state. Restore the newest backup or exit kit.',
     proof_expired: 'The withdrawal proof expired before it was included. Prepare the withdrawal again.',
-    unknown_root: 'The vault does not know this withdrawal proof’s Merkle root. Prepare the withdrawal again.',
+    note_binding_mismatch: 'The withdrawal proof does not match the vault’s record of this balance. Proving again from this state cannot fix it; restore the newest backup or exit kit of this balance.',
     invalid_destination: 'The vault rejected the withdrawal address. Choose a valid nonzero address.',
     vault_paused: 'The vault is paused by its owner. Withdrawals reopen at the latest when its pause limit ends.',
     testnet_password_required: 'Enter the Sepolia password to check this balance’s private request status.',
@@ -337,9 +338,121 @@ function startFinalBalance(record) {
     return BigInt(record.finalBalance);
 }
 
-// Refusals of an exit that a new proof can cure: valid_until passed (E4.7) or
-// the vault does not know the proof's root (E4.1).
-const REPROVABLE_EXIT_ERRORS = Object.freeze(['proof_expired', 'unknown_root']);
+// Refusals of an exit that a new proof can cure: valid_until passed (E4.7).
+// A proof not bound to the note's record (note_binding_mismatch) is not:
+// every proof from the same state names the same record.
+const REPROVABLE_EXIT_ERRORS = Object.freeze(['proof_expired']);
+
+/** Whether the vault's notes(noteId) record is `plan`'s deposit: recorded, with its commitment and amount. */
+function noteRecordsDeposit(note, plan) {
+    return note.status !== 0 && note.amount === BigInt(plan.amount) && BigInt(note.commitment) === BigInt(plan.commitment);
+}
+
+// One search for a deposit's note reads at most this many vault records; a
+// longer run of recorded notes is read over later passes, which resume where
+// the last finalized search stopped (noteSearchFrom).
+const DEPOSIT_SEARCH_LIMIT = 1_024;
+
+/**
+ * The sender and nonce an exact retry of `plan` reuses: its retry pin, or
+ * the journaled nonce of its unknown send. Null when neither is saved.
+ */
+function depositRetryIdentity(plan) {
+    const nonce = Number(plan?.submissionNonce);
+    return browserWalletRuntime.depositRetryPin(plan)
+        || (/^0x[0-9a-fA-F]{40}$/.test(plan?.submissionFrom || '') && plan.submissionNonce != null
+            && Number.isSafeInteger(nonce) && nonce >= 0
+            ? { from: plan.submissionFrom.toLowerCase(), nonce }
+            : null);
+}
+
+/**
+ * Whether a transaction of `plan` may have reached the chain, so that its
+ * note may be recorded: a saved hash or attempt, an open or unknown wallet
+ * submission, or a plan older than phases. A 'prepared' plan with none of
+ * these (never broadcast, or its transaction given up) records nothing.
+ */
+function depositMayBeRecorded(plan) {
+    return plan.phase !== 'prepared' || Boolean(plan.legacyRecovery || plan.submissionId
+        || plan.transactionHash || plan.transactionHashes?.length || plan.transactionAttempts?.length
+        || plan.ambiguousSubmissions?.length);
+}
+
+/**
+ * The first id a search for `plan`'s note reads: its predicted slot, or its
+ * noteSearchFrom, below which a finalized block showed every id to hold
+ * another note (a record never changes its commitment or amount).
+ */
+function depositSearchFrom(plan) {
+    return Math.max(Number(plan.next_note_id), Number(plan.noteSearchFrom) || 0);
+}
+
+/**
+ * A confirmed deposit's status line: ready once the note is activated (its
+ * leaf in the vault's tree); before that, chats wait for the activation
+ * queue, while withdrawals already work, unless the vault is paused: then
+ * neither activation nor withdrawals happen until it is unpaused.
+ */
+function depositConfirmedMessage(activation) {
+    if (activation?.status === 'activated') return 'Private balance is ready.';
+    if (activation?.vault_paused === true) {
+        return `Deposit confirmed. The vault is paused by its owner, so private chats start only once it is unpaused and activates this balance. ${pausedWithdrawalNotice(activation.exits_reopen_at)}`;
+    }
+    const position = activation?.queue_position;
+    const queue = position == null ? '' : position === 0 ? ' (next in the queue)'
+        : ` (${position} ${position === 1 ? 'deposit' : 'deposits'} ahead in the queue)`;
+    return `Deposit confirmed. Private chats start once the vault activates this balance${queue}; it can already be withdrawn.`;
+}
+
+// A chat from a note that is not activated yet waits for the operator's
+// activation worker, reading the vault's cursor every `pollMs`, before
+// note_not_activated reaches the host. The worker sends one batch at a time
+// (sizes 1, 4 or 16, aligned to the cursor; a batch waits up to about 30 s
+// to fill) and sends the next only once the last is `--confirmations` blocks
+// deep: about 36 s per batch on L1, so a note behind others can wait several
+// batches. The wait therefore lasts `waitMs` from the start and is extended
+// to `waitMs` from each advance of the cursor, so it goes on while the queue
+// moves, but never past `maxWaitMs` in all. A paused vault activates nothing
+// (and its refusal is not waited on). `activationTimingOverrides` shortens it.
+const ACTIVATION_TIMING = Object.freeze({ waitMs: 90_000, maxWaitMs: 300_000, pollMs: 5_000 });
+
+/** The host-facing refusal of a chat whose note stayed unactivated past the wait. */
+function activationRefusalMessage(error) {
+    const position = error?.data?.queue_position;
+    if (error?.data?.vault_paused === true) {
+        return `This balance is not activated for private chats yet: the vault is paused by its owner and activates it only once unpaused. ${pausedWithdrawalNotice(error.data.exits_reopen_at)}`;
+    }
+    const queue = position == null ? '' : position === 0 ? ' It is next in the activation queue.'
+        : ` ${position} ${position === 1 ? 'deposit is' : 'deposits are'} ahead of it.`;
+    return `This balance is not activated for private chats yet. Try again shortly; it can already be withdrawn.${queue}`;
+}
+
+/** The 'activating' progress line of a chat waiting for its note's activation. */
+function activationProgressMessage(activation) {
+    const position = activation?.queue_position;
+    return position == null || position === 0
+        ? 'Your deposit is confirmed and is being activated for private chats…'
+        : `Your deposit is confirmed and waits for activation (${position} ${position === 1 ? 'deposit' : 'deposits'} ahead)…`;
+}
+
+function abortableSleep(milliseconds, signal) {
+    return new Promise((resolve, reject) => {
+        const aborted = () => new DOMException('The operation was aborted.', 'AbortError');
+        if (signal?.aborted) {
+            reject(aborted());
+            return;
+        }
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(aborted());
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, milliseconds);
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+}
 
 /** The G1 warning (design §2.3) as a status message; amounts are gwei ledger units. */
 function exitCostMessage({ floor, cost }) {
@@ -383,6 +496,9 @@ class ZkapiClient extends EventTarget {
             await this.enableBrowserMode();
             await this.refresh();
             await this.reconcileBrowserWithdrawalsOnLoad();
+            // The note's activation shows from the first page, not only after
+            // the first background pass (it never holds the start).
+            if (this.note) void this.refreshNoteActivation();
             this.attachWalletEvents();
             this.refreshTimer = window.setInterval(
                 () => void this.reconcileBrowserWalletInBackground(),
@@ -488,10 +604,20 @@ class ZkapiClient extends EventTarget {
         if (this.backgroundReconciliationPromise) return this.backgroundReconciliationPromise;
         const operation = (async () => {
             await this.refresh({ quiet: true });
+            const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+            // A confirmed note proves chats only once activated: follow the
+            // vault's activation cursor (through the pinned RPC when the
+            // wallet is absent or on another chain) until it covers the note.
+            // An activation only the indexer reported is read again until
+            // the vault confirms it.
+            if (!hidden && this.note && (this.config?.activation?.status !== 'activated'
+                || this.config.activation.source !== 'vault')) {
+                await this.refreshNoteActivation();
+            }
             if (!this.ethereum || !this.config?.funding?.chain_id) {
                 return false;
             }
-            if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+            if (hidden) {
                 return false;
             }
             const currentChain = Number.parseInt(
@@ -852,8 +978,9 @@ class ZkapiClient extends EventTarget {
             throw new Error('Choose a smaller positive deposit amount.');
         }
         await assertNativeVault(funding);
-        const root = await this.readContractUint(funding.contract_address, `0x${ABI.currentRoot}`);
-        const plan = await browserWalletRuntime.prepareDepositQuote(Number(amount), root);
+        // The slot the deposit is predicted to take; the vault assigns it at inclusion.
+        const nextNoteId = await this.readContractUint(funding.contract_address, `0x${ABI.nextNoteId}`);
+        const plan = await browserWalletRuntime.prepareDepositQuote(Number(amount), nextNoteId);
         await this.assertFundingChain();
         const value = nativeDepositValue(amount, funding);
         // Never return the durable secret, note witness, or runtime object.
@@ -921,7 +1048,7 @@ class ZkapiClient extends EventTarget {
         };
         notifyProgress('checking', 'Checking your private balance…');
         try {
-            const access = await browserWalletRuntime.acquireEphemeralKey(
+            const access = await this.acquireActivatedEphemeralKey(
                 sessionId,
                 reportProgress,
                 { signal, spendingLimitUsd: options.spendingLimitUsd }
@@ -949,6 +1076,61 @@ class ZkapiClient extends EventTarget {
                 { failedPhase: lastProgressPhase }
             );
             throw error;
+        }
+    }
+
+    get activationTiming() {
+        return { ...ACTIVATION_TIMING, ...(this.activationTimingOverrides || {}) };
+    }
+
+    /**
+     * acquireEphemeralKey, waiting a bounded time for the note's activation
+     * (vault revision 4): while the runtime refuses with note_not_activated, the
+     * vault's activation cursor is polled (progress phase 'activating', with
+     * the queue position) and the key is asked for again once the note is
+     * activated; an indexer still catching up with it (indexer_root_lag) is
+     * retried the same way. The wait ends `activationTiming.waitMs` after the
+     * start or the cursor's last advance, and at most `maxWaitMs` after the
+     * start; then the refusal reaches the caller. A refusal while the vault
+     * is paused reaches it at once: no batch lands until the owner unpauses.
+     */
+    async acquireActivatedEphemeralKey(sessionId, reportProgress, options) {
+        const { waitMs, maxWaitMs, pollMs } = this.activationTiming;
+        const started = Date.now();
+        const limit = started + Math.max(waitMs, maxWaitMs ?? waitMs);
+        let deadline = started + waitMs;
+        let cursor = null;
+        // Each advance of the vault's cursor shows the worker's batches
+        // landing: the wait goes on for waitMs from then, within the limit.
+        const follow = activation => {
+            const reading = activation?.activation_cursor;
+            if (!Number.isSafeInteger(reading)) return;
+            if (cursor != null && reading > cursor) deadline = Math.min(limit, Math.max(deadline, Date.now() + waitMs));
+            if (cursor == null || reading > cursor) cursor = reading;
+        };
+        for (;;) {
+            try {
+                return await browserWalletRuntime.acquireEphemeralKey(sessionId, reportProgress, options);
+            } catch (error) {
+                const unactivated = error?.code === 'note_not_activated';
+                if (unactivated) follow(error.data);
+                if (!(unactivated || error?.code === 'indexer_root_lag') || (unactivated && error.data?.vault_paused === true)
+                    || Date.now() + pollMs > deadline) {
+                    if (unactivated) error.shortMessage = activationRefusalMessage(error);
+                    throw error;
+                }
+                let activation = unactivated ? error.data : { queue_position: 0 };
+                do {
+                    reportProgress('activating', error.code === 'indexer_root_lag'
+                        ? 'The private service is catching up with the vault’s activated balances…'
+                        : activationProgressMessage(activation));
+                    await abortableSleep(pollMs, options.signal);
+                    if (!unactivated) break;
+                    activation = await this.refreshNoteActivation({ signal: options.signal });
+                    follow(activation);
+                } while (activation?.status !== 'activated' && activation?.vault_paused !== true
+                    && Date.now() + pollMs <= deadline);
+            }
         }
     }
 
@@ -1354,16 +1536,19 @@ class ZkapiClient extends EventTarget {
         // the note out of its pending slot before the host supplies the hash.
         // A matching successful event may acknowledge that completed work;
         // it never creates a note or bypasses the normal confirmation path.
+        // The vault numbers a deposit at inclusion, so an overtaken deposit
+        // is confirmed at a later id than the context's predicted slot: the
+        // receipt must name the confirmed record's own id, with the context's
+        // amount and commitment.
         if (!known && context.kind === 'deposit') {
             const recovered = (browserWalletRuntime.deposits || []).find(record =>
                 record.status === 'confirmed' && record.operationId === context.operationId
-                && Number(record.noteId) === Number(context.noteId)
-                && Number(record.amount) === Number(context.amount));
+                && Number.isSafeInteger(record.noteId) && Number(record.amount) === Number(context.amount));
             if (recovered) {
                 const receipt = await this.ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
                 const event = receipt?.status === '0x1' && parseNoteDeposited(receipt, funding.contract_address);
                 known = Boolean(String(receipt?.transactionHash).toLowerCase() === hash.toLowerCase()
-                    && event?.noteId === BigInt(context.noteId) && event.amount === BigInt(context.amount)
+                    && event?.noteId === BigInt(recovered.noteId) && event.amount === BigInt(context.amount)
                     && BigInt(event.commitment) === BigInt(context.commitment));
             }
         }
@@ -1608,8 +1793,7 @@ class ZkapiClient extends EventTarget {
             const funding = this.config.funding;
             await this.assertFundingChain();
             const deposited = parseNoteDeposited(receipt, funding.contract_address);
-            if (!deposited || deposited.noteId !== BigInt(plan.next_note_id)
-                || deposited.amount !== BigInt(plan.amount)
+            if (!deposited || deposited.amount !== BigInt(plan.amount)
                 || BigInt(deposited.commitment) !== BigInt(plan.commitment)) return null;
             const transaction = await this.ethereum.request({ method: 'eth_getTransactionByHash',
                 params: [receipt.transactionHash] });
@@ -1660,10 +1844,23 @@ class ZkapiClient extends EventTarget {
         if (!deposited) {
             throw new Error('The transaction succeeded, but its NoteDeposited event was not found.');
         }
-        if (deposited.noteId !== BigInt(plan.next_note_id)
-            || deposited.amount !== BigInt(plan.amount)
+        if (deposited.amount !== BigInt(plan.amount)
             || BigInt(deposited.commitment) !== BigInt(plan.commitment)) {
             throw new Error('The mined deposit did not match this browser’s durable private note.');
+        }
+        // The vault numbers a note when its deposit is included: one that
+        // another deposit overtook is recorded after its predicted slot, under
+        // the id its NoteDeposited names. The vault's record of that id must
+        // be this note, with the expiry the receipt states.
+        const note = await this.readBrowserNote(Number(deposited.noteId));
+        if (note.status === 0) {
+            throw new Error('The deposit transaction mined, but the latest vault read has not caught up yet. Check again shortly.');
+        }
+        if (!noteRecordsDeposit(note, plan) || note.expiryTs !== Number(deposited.expiryTs)) {
+            throw new Error('The vault’s record of the mined deposit does not match this browser’s durable private note.');
+        }
+        if (note.status !== 1) {
+            throw new Error('The deposit is recorded, but its private note is no longer active.');
         }
         const receiptMetadata = await this.readDepositReceiptMetadata(plan, receipt);
         onStatus('Saving the private note securely in this browser…');
@@ -1675,18 +1872,13 @@ class ZkapiClient extends EventTarget {
             commitment: plan.commitment,
             transactionHash: receipt.transactionHash,
             receiptMetadata,
-            expiry_ts: Number(deposited.expiryTs),
-            // The root this deposit set: with its path, the note's exit path
-            // for life (Amendment A1). The plan's siblings come along for a
-            // note the background recovery committed first, whose pending
-            // deposit (and its zero_path) is gone by then.
-            deposit_root: `0x${deposited.newRoot.toString(16)}`,
-            zero_path: Array.isArray(plan.zero_path) ? plan.zero_path : null
+            expiry_ts: Number(deposited.expiryTs)
         });
         const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
+        const activation = await this.refreshNoteActivation();
         onStatus(balanceRefreshPending
             ? 'Deposit confirmed and saved. The balance display will refresh when available.'
-            : 'Private balance is ready.');
+            : depositConfirmedMessage(activation));
         // G1: a balance smaller than three escape fees is worth less than
         // its unilateral exit. The gas price read ends within E0's
         // CALL_TIMEOUT, so a silent wallet cannot hold the confirmation.
@@ -1698,8 +1890,99 @@ class ZkapiClient extends EventTarget {
             noteId: Number(deposited.noteId),
             amount: Number(plan.amount),
             receipt,
+            activation,
             ...(receiptMetadata || {})
         };
+    }
+
+    /**
+     * The NoteDeposited of `plan` in a successful receipt of one of its saved
+     * transactions, with the vault's record of the note it names. A deposit
+     * another one overtook is recorded after its predicted slot; only its
+     * receipt names its note id.
+     */
+    async depositReceiptNote(plan) {
+        const hashes = plan.transactionHashes || (plan.transactionHash ? [plan.transactionHash] : []);
+        for (const hash of hashes) {
+            try {
+                const receipt = await this.ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
+                if (String(receipt?.transactionHash).toLowerCase() !== String(hash).toLowerCase()
+                    || BigInt(receipt.status || '0x0') !== 1n) continue;
+                const deposited = parseNoteDeposited(receipt, this.config.funding.contract_address);
+                if (!deposited || deposited.amount !== BigInt(plan.amount)
+                    || BigInt(deposited.commitment) !== BigInt(plan.commitment)) continue;
+                const note = await this.readBrowserNote(Number(deposited.noteId));
+                if (!noteRecordsDeposit(note, plan)) continue;
+                return { noteId: Number(deposited.noteId), note, receipt,
+                    metadata: await this.readDepositReceiptMetadata(plan, receipt) };
+            } catch {
+                // An unavailable receipt leaves the predicted slot's checks.
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The vault's record of `plan`'s note at an id from `fromNoteId` on, read
+     * at `blockTag`: { note, end, complete }. Without a readable receipt (the
+     * transaction not seen yet, replaced by a wallet speed-up, or a failed
+     * read) a deposit another one overtook is found only by its commitment.
+     * Recorded notes fill ids 0..nextNoteId and never return to
+     * Uninitialized, so the search is complete at the first unrecorded id
+     * (`end`); after DEPOSIT_SEARCH_LIMIT other records it stops at `end`
+     * without an answer.
+     */
+    async findDepositNote(plan, fromNoteId, blockTag = 'latest') {
+        for (let noteId = fromNoteId; noteId < fromNoteId + DEPOSIT_SEARCH_LIMIT; noteId += 1) {
+            const note = await this.readBrowserNote(noteId, blockTag);
+            if (note.status === 0) return { note: null, end: noteId, complete: true };
+            if (noteRecordsDeposit(note, plan)) return { note, end: noteId, complete: true };
+        }
+        return { note: null, end: fromNoteId + DEPOSIT_SEARCH_LIMIT, complete: false };
+    }
+
+    /**
+     * `plan`'s note after its predicted slot, which another note holds, or
+     * null. The finalized records are read from where the last pass stopped
+     * (depositSearchFrom), and the plan keeps how far they showed other
+     * notes, so no pass reads them again; then the newer records at the
+     * latest block. A pass that has not reached the end of the finalized
+     * records answers null with `complete` false, and the next one goes on.
+     */
+    async searchDepositNote(plan) {
+        let from = depositSearchFrom(plan);
+        const checkpoint = await this.browserDepositCheckpoint();
+        if (checkpoint.blockTag) {
+            const finalized = await this.findDepositNote(plan, from, checkpoint.blockTag);
+            if (finalized.note) {
+                return { note: await this.readBrowserNote(finalized.note.noteId), complete: true, searchedFrom: from };
+            }
+            if (finalized.end > from) {
+                await browserWalletRuntime.rememberPendingDepositSearch(plan.operationId, finalized.end);
+            }
+            from = finalized.end;
+            if (!finalized.complete) return { note: null, complete: false, searchedFrom: from };
+        }
+        const latest = await this.findDepositNote(plan, Math.max(from, Number(plan.next_note_id) + 1));
+        return { note: latest.note, complete: latest.complete, searchedFrom: from };
+    }
+
+    /**
+     * The selected note's activation (vault revision 4): read from the vault's
+     * activationCursor() through the wallet provider, else the pinned RPC or
+     * the indexer, within E0's CALL_TIMEOUT. Best effort: null when nothing
+     * could be read.
+     */
+    async refreshNoteActivation({ signal = null } = {}) {
+        const timeout = AbortSignal.timeout(browserWalletRuntime.exitTiming().callTimeoutMs);
+        try {
+            return await browserWalletRuntime.refreshActivation({
+                walletRequest: this.ethereum ? request => this.ethereum.request(request) : null,
+                signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+            });
+        } catch {
+            return null;
+        }
     }
 
     async readBrowserNote(noteId, requestedBlock = 'latest') {
@@ -1728,24 +2011,38 @@ class ZkapiClient extends EventTarget {
 
     async recoverBrowserDeposit(onStatus = () => {}) {
 
-        const plan = await browserWalletRuntime.pendingDeposit();
+        let plan = await browserWalletRuntime.pendingDeposit();
         if (!plan) return null;
         onStatus('Checking the private-vault deposit…');
-        const note = await this.readBrowserNote(plan.next_note_id);
-        const matches = note.status !== 0
-            && note.amount === BigInt(plan.amount)
-            && BigInt(note.commitment) === BigInt(plan.commitment);
-        if (matches) {
+        let noteId = Number(plan.next_note_id);
+        let note = await this.readBrowserNote(noteId);
+        let receiptMetadata = null;
+        let confirmedReceipt = null;
+        if (!noteRecordsDeposit(note, plan)) {
+            const found = await this.depositReceiptNote(plan);
+            if (found) ({ noteId, note, receipt: confirmedReceipt, metadata: receiptMetadata } = found);
+        }
+        // A search behind the finalized records gives no transaction up.
+        let searchBehind = false;
+        if (!noteRecordsDeposit(note, plan) && note.status !== 0 && depositMayBeRecorded(plan)) {
+            // Another note holds the predicted slot, which says nothing about
+            // this deposit: the vault numbers a note when it is included.
+            const search = await this.searchDepositNote(plan);
+            if (search.note) {
+                noteId = search.note.noteId;
+                note = search.note;
+            }
+            searchBehind = !search.complete;
+            plan = { ...plan, noteSearchFrom: search.searchedFrom };
+        }
+        if (noteRecordsDeposit(note, plan)) {
             if (note.status !== 1) {
                 throw new Error('The recovered deposit exists, but its private note is no longer active.');
             }
-            // Wait for the privacy-preserving whole-tree mirror before making
-            // the recovered note available to chat requests.
-            await browserWalletRuntime.treePath(Number(plan.next_note_id), true);
-            let receiptMetadata = null;
-            let confirmedReceipt = null;
+            // No tree wait: a confirmed note exits at once and proves
+            // requests once activated (refreshNoteActivation).
             const hashes = plan.transactionHashes || (plan.transactionHash ? [plan.transactionHash] : []);
-            for (const hash of hashes) {
+            for (const hash of confirmedReceipt ? [] : hashes) {
                 try {
                     const candidate = await this.ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
                     if (String(candidate?.transactionHash).toLowerCase() !== String(hash).toLowerCase()) continue;
@@ -1753,58 +2050,34 @@ class ZkapiClient extends EventTarget {
                     if (receiptMetadata) { confirmedReceipt = candidate; break; }
                 } catch { /* Vault recovery remains available when fee evidence is temporarily unavailable. */ }
             }
-            const recoveredDeposit = confirmedReceipt
-                ? parseNoteDeposited(confirmedReceipt, this.config.funding.contract_address) : null;
             await browserWalletRuntime.confirmDeposit({
                 operationId: plan.operationId,
                 secret: plan.secret,
-                note_id: Number(plan.next_note_id),
+                note_id: noteId,
                 amount: Number(plan.amount),
                 commitment: plan.commitment,
                 transactionHash: receiptMetadata?.transactionHash || null,
                 receiptMetadata,
-                expiry_ts: note.expiryTs,
-                ...(recoveredDeposit && recoveredDeposit.noteId === BigInt(plan.next_note_id)
-                    ? { deposit_root: `0x${recoveredDeposit.newRoot.toString(16)}` } : {})
+                expiry_ts: note.expiryTs
             });
             const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
+            const activation = await this.refreshNoteActivation();
             onStatus(balanceRefreshPending
                 ? 'Deposit recovered and saved. The balance display will refresh when available.'
-                : 'Deposit recovered. Your private balance is ready.');
+                : `Deposit recovered. ${depositConfirmedMessage(activation)}`);
             return {
                 status: 'confirmed',
                 balanceRefreshPending,
-                noteId: Number(plan.next_note_id),
+                noteId,
                 amount: Number(plan.amount),
                 receipt: confirmedReceipt,
+                activation,
                 ...(receiptMetadata || {})
             };
         }
-        if (note.status !== 0) {
-            const conflictFinality = await this.browserDepositSlotConflictFinality(plan);
-            if (!conflictFinality.finalized) {
-                await this.refresh({ quiet: true });
-                onStatus('Another deposit currently occupies this slot. Waiting for chain finality before retrying safely.');
-                return { status: 'slot_conflict_unconfirmed' };
-            }
-            // The exact append slot was consumed by a different commitment;
-            // this plan can no longer succeed, so rebasing it is now safe.
-            await browserWalletRuntime.resolvePendingDepositSlotConflict({
-                operationId: plan.operationId,
-                noteId: Number(plan.next_note_id),
-                amount: Number(plan.amount),
-                commitment: plan.commitment,
-                phase: plan.phase || null,
-                submissionId: plan.submissionId || null,
-                transactionHashes: Array.isArray(plan.transactionHashes)
-                    ? plan.transactionHashes
-                    : plan.transactionHash ? [plan.transactionHash] : []
-            });
-            await this.refresh({ quiet: true });
-            onStatus('The old deposit slot was used by another transaction. The deposit is ready to retry safely.');
-            return { status: 'slot_consumed' };
-        }
-
+        // Not recorded yet: every saved transaction may still be included,
+        // at whatever id is next then, until its nonce went to another
+        // transaction (browserDepositNonceConsumed).
         const hashes = Array.isArray(plan.transactionHashes)
             ? plan.transactionHashes
             : plan.transactionHash ? [plan.transactionHash] : [];
@@ -1819,15 +2092,13 @@ class ZkapiClient extends EventTarget {
                 });
             } catch {
                 // A replacement/cancel can make the original hash disappear.
-                // Resolve it only from finalized nonce + empty-slot evidence.
+                // Resolve it only from finalized nonce + unrecorded-note evidence.
             }
             if (!receipt) {
                 const transactionAttempt = (plan.transactionAttempts || []).find(attempt =>
                     String(attempt.hash || '').toLowerCase() === String(hash).toLowerCase());
-                const nonceStatus = await this.browserDepositNonceConsumed(
-                    transactionAttempt,
-                    Number(plan.next_note_id)
-                );
+                const nonceStatus = searchBehind ? { consumed: false }
+                    : await this.browserDepositNonceConsumed(transactionAttempt, plan);
                 if (nonceStatus.consumed) {
                     await browserWalletRuntime.markPendingDepositRetryable(hash);
                 } else {
@@ -1848,13 +2119,15 @@ class ZkapiClient extends EventTarget {
                 throw new Error('The deposit transaction mined, but the latest vault read has not caught up yet. Check again shortly.');
             }
         }
-        if (!pendingHash && plan.submissionId && plan.submissionFrom
+        let consumedSubmission = null;
+        if (!pendingHash && !searchBehind && plan.submissionId && plan.submissionFrom
             && Number.isSafeInteger(Number(plan.submissionNonce))) {
             const nonceStatus = await this.browserDepositNonceConsumed({
                 from: plan.submissionFrom,
                 nonce: Number(plan.submissionNonce)
-            }, Number(plan.next_note_id));
+            }, plan);
             if (nonceStatus.consumed) {
+                consumedSubmission = { from: plan.submissionFrom.toLowerCase(), nonce: Number(plan.submissionNonce) };
                 await browserWalletRuntime.markPendingDepositRetryable(null, {
                     operationId: plan.operationId,
                     submissionId: plan.submissionId,
@@ -1866,6 +2139,16 @@ class ZkapiClient extends EventTarget {
                     contractAddress: this.config.funding.contract_address
                 });
             }
+        }
+        // An explicit retry reuses an unknown send's nonce (depositRetryPin).
+        // Once that nonce went to another transaction by finality without
+        // this deposit recorded, no send at it can execute: the pin is released.
+        const retryPin = browserWalletRuntime.depositRetryPin(plan);
+        if (!pendingHash && !searchBehind && retryPin) {
+            const consumed = plan.submissionId
+                ? consumedSubmission?.from === retryPin.from && consumedSubmission.nonce === retryPin.nonce
+                : (await this.browserDepositNonceConsumed(retryPin, plan)).consumed;
+            if (consumed) await browserWalletRuntime.resolvePendingDepositRetryNonce(plan.operationId, retryPin);
         }
         await this.refresh({ quiet: true });
         if (pendingHash) {
@@ -1925,6 +2208,7 @@ class ZkapiClient extends EventTarget {
             await this.refresh({ quiet: true });
             return { status: 'prepared', operationId: pending.operationId };
         }
+        await this.assertDepositRetryNonceFree(depositRetryIdentity(pending));
         const retry = await browserWalletRuntime.authorizePendingDepositRetry({ forFundingQuote: true });
         await this.refresh({ quiet: true });
         onStatus('Review the network fee for the saved deposit before continuing.');
@@ -1939,10 +2223,37 @@ class ZkapiClient extends EventTarget {
         if (pending?.phase !== 'ambiguous') {
             throw new Error('There is no unresolved deposit request to retry.');
         }
+        await this.assertDepositRetryNonceFree(depositRetryIdentity(pending));
         await browserWalletRuntime.authorizePendingDepositRetry();
         await this.refresh({ quiet: true });
         onStatus('Retry authorized. Opening the same deposit in MetaMask…');
         return this.deposit(this.formatBillingAmount(pending.amount), onStatus);
+    }
+
+    /**
+     * Refuse an exact retry of an unknown deposit send while the wallet has
+     * a transaction at the nonce the retry reuses (its 'pending' count is
+     * above it): the earlier send, a speed-up or a cancel is in flight or not
+     * final yet. A wallet that ignores the nonce the SDK passes then picks
+     * that same nonce, so the two still cannot both execute.
+     */
+    async assertDepositRetryNonceFree(identity) {
+        if (!identity) return;
+        let pendingNonce;
+        try {
+            pendingNonce = walletNonceNumber(await this.ethereum.request({
+                method: 'eth_getTransactionCount',
+                params: [identity.from, 'pending']
+            }));
+        } catch (error) {
+            throw tagTransactionError(error, 'nonce-check', false);
+        }
+        if (pendingNonce == null) {
+            throw tagTransactionError(new Error('MetaMask returned an invalid pending transaction nonce.'), 'nonce-check', false);
+        }
+        if (pendingNonce > identity.nonce) {
+            throw tagTransactionError(new Error(`The earlier request for this deposit (nonce ${identity.nonce} of ${identity.from}) may still be pending. Wait for it to confirm, or speed it up or cancel it in MetaMask, then check the deposit again.`), 'nonce-check', false);
+        }
     }
 
     async retryDroppedDeposit(onStatus = () => {}) {
@@ -2101,36 +2412,33 @@ class ZkapiClient extends EventTarget {
         onStatus('Generating the private note commitment locally…');
         let plan = await browserWalletRuntime.prepareDeposit(Number(amount), { preparedOperationId });
 
+        if (plan.phase !== 'retry_exact') {
+            // A deposit carries no Merkle path: only its predicted slot is
+            // rebased onto the vault's nextNoteId() before the prompt.
+            onStatus('Checking the latest private-vault state…');
+            const nextNoteId = await this.readContractUint(vaultAddress, `0x${ABI.nextNoteId}`);
+            plan = await browserWalletRuntime.refreshPendingDeposit(
+                Number(amount),
+                nextNoteId,
+                { expectedOperationId: plan.operationId }
+            );
+        }
         let receipt;
-        let submission = null;
         let submissionMetadata = null;
-        const attempts = 3;
-        for (let attempt = 0; attempt < attempts; attempt += 1) {
-            if (plan.phase !== 'retry_exact') {
-                onStatus(attempt === 0
-                    ? 'Checking the latest private-vault state…'
-                    : 'The vault changed. Refreshing the deposit before retrying…');
-                const expectedActiveRoot = await this.readContractUint(
-                    vaultAddress,
-                    `0x${ABI.currentRoot}`
-                );
-                plan = await browserWalletRuntime.refreshPendingDeposit(
-                    Number(amount),
-                    expectedActiveRoot,
-                    { expectedOperationId: plan.operationId }
-                );
-            }
-            submission = await browserWalletRuntime.claimPendingDepositSubmission(plan.operationId);
-            // Another read-only preparation can refresh the append path;
-            // send exactly the plan frozen by the atomic submission claim.
-            if (submission.plan) plan = submission.plan;
-            if (submission.transactionHash) {
-                onStatus(`Checking submitted deposit ${this.compact(submission.transactionHash)}…`);
-                receipt = await this.waitForReceipt(submission.transactionHash);
-                break;
-            }
+        const submission = await browserWalletRuntime.claimPendingDepositSubmission(plan.operationId, { from: address });
+        // Another read-only preparation can rebase the slot; send exactly
+        // the plan frozen by the atomic submission claim.
+        if (submission.plan) plan = submission.plan;
+        if (submission.transactionHash) {
+            onStatus(`Checking submitted deposit ${this.compact(submission.transactionHash)}…`);
+            receipt = await this.waitForReceipt(submission.transactionHash);
+        } else {
             onStatus('Depositing into the private-note vault… confirm in MetaMask.');
+            // An explicit retry of an unknown send reuses its nonce, so at
+            // most one of the two can execute.
+            const retryNonce = submission.retryNonce ?? null;
             try {
+                if (retryNonce != null) await this.assertDepositRetryNonceFree({ from: address, nonce: retryNonce });
                 receipt = await this.sendContractTransaction(
                     address,
                     vaultAddress,
@@ -2150,13 +2458,12 @@ class ZkapiClient extends EventTarget {
                                 metadata
                             );
                         },
-                    null,
+                    retryNonce,
                     { kind: 'deposit', submission },
                     nativeDepositValue(amount, funding)
                 );
-                break;
             } catch (error) {
-                if (!error?.transactionHash && submission) {
+                if (!error?.transactionHash) {
                     if (error?.broadcastPossible === false || isWalletRejection(error)) {
                         await browserWalletRuntime.markPendingDepositRetryable(null, submission);
                     } else if (error?.broadcastPossible === true) {
@@ -2166,7 +2473,7 @@ class ZkapiClient extends EventTarget {
                         );
                         error.shortMessage = 'MetaMask did not return a deposit transaction ID. Check the deposit status before retrying.';
                     }
-                } else if (error?.transactionHash) {
+                } else {
                     try {
                         await browserWalletRuntime.rememberPendingDepositTransaction(
                             error.transactionHash,
@@ -2178,12 +2485,7 @@ class ZkapiClient extends EventTarget {
                     }
                 }
                 await this.refresh({ quiet: true });
-                if (error?.code !== 'stale_root' || attempt + 1 >= attempts) throw error;
-                const recovery = await this.recoverBrowserDeposit(onStatus);
-                if (recovery?.status === 'confirmed') return recovery;
-                plan = await browserWalletRuntime.pendingDeposit();
-                submission = null;
-                submissionMetadata = null;
+                throw error;
             }
         }
         return this.confirmBrowserDepositReceipt(plan, receipt, vaultAddress, onStatus);
@@ -2339,16 +2641,12 @@ class ZkapiClient extends EventTarget {
         let submittedHash = prepared?.transaction_hash || null;
         let submission = null;
         let submissionMetadata = null;
-        // The vault accepts any root it ever held and exits carry no Merkle
-        // path, so a saved proof is reused until its valid_until (E4.7). An
-        // expired proof or UnknownRoot() re-proves.
+        // An exit proof is bound to the note's vault record, not to a tree
+        // root, so a saved proof is reused until its valid_until (E4.7); an
+        // expired proof re-proves. The wallet provider is read before the
+        // pinned RPC when no exit RPC is set.
         const withdrawalAttempts = 4;
         let reprove = false;
-        // After UnknownRoot the next proof takes its path at any other root:
-        // the indexer checked against the vault, or the vault's logs (E4.1,
-        // §6.6), never the refused one. The wallet provider is read before
-        // the pinned RPC when no exit RPC is set.
-        let refusedRoot = null;
         const walletRequest = request => this.ethereum.request(request);
         // A simulation refusal re-proves once per reason; after that it only
         // warns (E4.5).
@@ -2387,30 +2685,13 @@ class ZkapiClient extends EventTarget {
                     ? (mode === 'mutual'
                         ? 'Checking this balance and requesting a cooperative close…'
                         : 'Preparing a unilateral escape locally…')
-                    : 'The withdrawal proof expired or the vault refused its root. Proving again…');
-                const expectedActiveRoot = mode === 'mutual'
-                    ? await this.readContractUint(this.config.funding.contract_address, `0x${ABI.currentRoot}`)
-                    : null;
-                try {
-                    plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
-                        expectedActiveRoot,
-                        reprove,
-                        earlyConcession: concede,
-                        walletRequest,
-                        ...(refusedRoot != null ? { refusedRoot } : {}),
-                        onProgress: (_phase, message) => onStatus(message)
-                    });
-                } catch (error) {
-                    // E4.5 is advisory: when no path at another root can be
-                    // found after UnknownRoot, the proof that exists is
-                    // submitted anyway (its refusal then only warns).
-                    if (refusedRoot == null || error?.data?.exit_path_unavailable !== true
-                        || attempt + 1 >= withdrawalAttempts) throw error;
-                    onStatus(`No Merkle path at another root was found (${error.message}). The existing proof is submitted anyway; if the vault does not know its root, the transaction reverts and costs only gas.`);
-                    refusedRoot = null;
-                    reprove = false;
-                    continue;
-                }
+                    : 'The withdrawal proof expired. Proving again…');
+                plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
+                    reprove,
+                    earlyConcession: concede,
+                    walletRequest,
+                    onProgress: (_phase, message) => onStatus(message)
+                });
                 for (const warning of plan.warnings || []) {
                     if (warning?.message) onStatus(`${warning.message} It can still be submitted.`);
                 }
@@ -2518,12 +2799,11 @@ class ZkapiClient extends EventTarget {
                     );
                     break;
                 } catch (error) {
-                    // A proof past its valid_until (E4.7) or a root the vault
-                    // does not know is proved again: another release.
+                    // A proof past its valid_until (E4.7) is proved again:
+                    // another release.
                     const reprovable = REPROVABLE_EXIT_ERRORS.includes(error?.code);
                     if (!reprovable || attempt + 1 >= withdrawalAttempts) throw error;
                     reproved.add(error.code);
-                    if (error.code === 'unknown_root') refusedRoot = plan.public_inputs.active_root;
                     await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
                     submission = null;
                     submissionMetadata = null;
@@ -2618,10 +2898,6 @@ class ZkapiClient extends EventTarget {
             recordId: record.recordId,
             conceded: BigInt(plan.public_inputs.conceded),
             decision: plan.decision || null,
-            // Where the proof's Merkle path came from (E4.1): the saved
-            // deposit-time path, the indexer or the rebuild from the vault's
-            // logs.
-            pathSource: plan.pathSource || null,
             ...(destinationWarning ? { destinationWarning } : {})
         };
     }
@@ -3056,7 +3332,7 @@ class ZkapiClient extends EventTarget {
      * The prefund of a draft operation of `kind` from S at the current fees
      * (§3.1): selectFees within the ceilings (`gas_above_paymaster_ceiling`),
      * the gas fields from the pinned defaults with the live callCap, initCode
-     * when S has no code yet, the calldata sized as the real op's (an 836-byte
+     * when S has no code yet, the calldata sized as the real op's (an 868-byte
      * vault call for a close or escape, finalizeEscape(noteId), nothing for a
      * forward), then `maxCost` against the policy (`max_cost_above_policy`).
      * A refusal is returned, not thrown, so the pre-flight can rank it.
@@ -3951,7 +4227,7 @@ class ZkapiClient extends EventTarget {
                     ? (mode === 'mutual'
                         ? 'Checking this balance and requesting a cooperative close…'
                         : 'Preparing a unilateral escape locally…')
-                    : 'The withdrawal proof expired or the vault refused its root. Proving again…');
+                    : 'The withdrawal proof expired. Proving again…');
                 // A journaled operation whose proof is still valid is resumed
                 // as it is (identical bytes, no new proof); its claim, held by
                 // this or a crashed tab, is taken over below.
@@ -3962,11 +4238,7 @@ class ZkapiClient extends EventTarget {
                 if (resumable) {
                     plan = journaled;
                 } else {
-                    const expectedActiveRoot = mode === 'mutual'
-                        ? decodeWord(await this.gaslessCall(context.reader, vault, `0x${ABI.currentRoot}`), 'currentRoot')
-                        : null;
                     plan = await browserWalletRuntime.prepareWithdrawal(mode, S, {
-                        expectedActiveRoot,
                         reprove,
                         earlyConcession: concede,
                         walletRequest,
@@ -4038,9 +4310,8 @@ class ZkapiClient extends EventTarget {
                     hash = outcome.hash;
                     break;
                 } catch (error) {
-                    // A proof past its valid_until (the stop 60 s before it) or
-                    // a root the vault does not know is proved again; an
-                    // operation that reached a mempool is released with its
+                    // A proof past its valid_until (the stop 60 s before it) is
+                    // proved again; an operation that reached a mempool is released with its
                     // proof: a late inclusion fails on the nullifier and costs
                     // one attempt (§3.1).
                     if (error?.code === 'gasless_op_expired' && error.data?.releasedNonce != null) releasedNonce = error.data.releasedNonce;
@@ -4207,7 +4478,7 @@ class ZkapiClient extends EventTarget {
             { amounts: journalValue({ ...amounts, initiationDebtWei }) });
         return {
             status: 'pending_withdrawal', deadline, event, receipt, recordId: record.recordId, conceded: BigInt(plan.public_inputs.conceded),
-            decision: plan.decision || null, pathSource: plan.pathSource || null, userOpHash: hash, transactionHash, transitAccount: S,
+            decision: plan.decision || null, userOpHash: hash, transactionHash, transitAccount: S,
             payout: transit.payee, initiationDebtWei: initiationDebtWei == null ? null : initiationDebtWei.toString()
         };
     }
@@ -5248,11 +5519,6 @@ class ZkapiClient extends EventTarget {
         let receipt;
         let plan;
         let submittedHash = null;
-        // After UnknownRoot the next close proof takes a path at another root
-        // (E4.1); a path failure then falls back to the saved one, whose
-        // simulation refusal only warns on the last attempt (E4.5).
-        let refusedRoot = null;
-        const walletRequest = request => this.ethereum.request(request);
         for (let attempt = 0; attempt < 3; attempt += 1) {
             let submission = null;
             let metadata = null;
@@ -5265,19 +5531,8 @@ class ZkapiClient extends EventTarget {
                 }
                 onStatus(attempt === 0
                     ? 'Preparing the old balance’s withdrawal proof…'
-                    : 'The vault changed. Updating the old balance’s proof…', 'preparing');
-                const expectedActiveRoot = await this.readContractUint(
-                    this.config.funding.contract_address, `0x${ABI.currentRoot}`
-                );
-                try {
-                    plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot,
-                        walletRequest, ...(refusedRoot != null ? { refusedRoot } : {}) });
-                } catch (error) {
-                    if (refusedRoot == null || error?.data?.exit_path_unavailable !== true) throw error;
-                    onStatus(`No Merkle path at another root was found (${error.message}). The saved path is used again.`, 'preparing');
-                    refusedRoot = null;
-                    plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot, walletRequest });
-                }
+                    : 'The withdrawal proof expired. Proving the old balance’s withdrawal again…', 'preparing');
+                plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId);
                 if (plan.mode !== 'mutual' || Number(plan.public_inputs?.note_id) !== noteId
                     || plan.destination?.toLowerCase() !== destination?.toLowerCase()
                     || Number(plan.public_inputs?.final_balance) !== Number(record.finalBalance)) {
@@ -5301,10 +5556,10 @@ class ZkapiClient extends EventTarget {
                     { kind: 'background-withdrawal', submission },
                     0n,
                     {
-                        // A root refusal re-proves while attempts remain;
+                        // An expired proof re-proves while attempts remain;
                         // otherwise the simulation only warns (E4.5).
                         exitEstimate: {
-                            blocking: error => ['stale_root', 'unknown_root'].includes(error?.code) && attempt < 2,
+                            blocking: error => REPROVABLE_EXIT_ERRORS.includes(error?.code) && attempt < 2,
                             alternative: transaction => browserWalletRuntime.exitRpcEstimateGas(transaction),
                             onAdvisory: error => onStatus(`Your wallet’s simulation refused this withdrawal (${error.message}). It can still be submitted, with a fixed gas limit.`, 'wallet')
                         }
@@ -5327,12 +5582,8 @@ class ZkapiClient extends EventTarget {
                 } else if (submission && (error.broadcastPossible === false || isWalletRejection(error))) {
                     await browserWalletRuntime.releaseBackgroundWithdrawalSubmission(submission);
                     // The background flow always re-proves (reusing its
-                    // persisted clearance), so either root rejection retries,
-                    // and an UnknownRoot one at another root.
-                    if (['stale_root', 'unknown_root'].includes(error.code) && attempt < 2) {
-                        if (error.code === 'unknown_root') refusedRoot = plan?.public_inputs?.active_root ?? null;
-                        continue;
-                    }
+                    // persisted clearance), so an expired proof retries.
+                    if (REPROVABLE_EXIT_ERRORS.includes(error.code) && attempt < 2) continue;
                     if (isWalletRejection(error)) {
                         error.shortMessage = 'Canceled. The old balance is still set aside and can be withdrawn later.';
                     }
@@ -6701,112 +6952,71 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async browserDepositNonceConsumed(transactionAttempt, noteId) {
+    /**
+     * The block a deposit's chain evidence is read at: { blockTag,
+     * checkedBlock, source }, the finalized block, else a conservative
+     * confirmation checkpoint; blockTag is null when neither is known.
+     */
+    async browserDepositCheckpoint() {
+        try {
+            const finalizedBlock = await this.ethereum.request({
+                method: 'eth_getBlockByNumber',
+                params: ['finalized', false]
+            });
+            if (finalizedBlock?.number
+                && /^0x[0-9a-fA-F]+$/.test(String(finalizedBlock.number))) {
+                return { blockTag: finalizedBlock.number, checkedBlock: Number(BigInt(finalizedBlock.number)), source: 'finalized' };
+            }
+        } catch {
+            // Retain the deposit unless the conservative fallback below works.
+        }
+        let head = 0;
+        try {
+            const latest = await this.ethereum.request({ method: 'eth_blockNumber' });
+            if (/^0x[0-9a-fA-F]+$/.test(String(latest || ''))) {
+                head = Number(BigInt(latest));
+            }
+        } catch {
+            // Missing finality information keeps the WAL intact.
+        }
+        const checkpoint = head - CLOSE_FINALITY_FALLBACK_BLOCKS;
+        if (checkpoint <= 0) return { blockTag: null, checkedBlock: Math.max(0, checkpoint), source: 'confirmations' };
+        return { blockTag: `0x${checkpoint.toString(16)}`, checkedBlock: checkpoint, source: 'confirmations' };
+    }
+
+    /**
+     * Whether a saved deposit transaction can no longer be included: at a
+     * finalized block (else a conservative confirmation checkpoint) its
+     * sender's nonce is used, yet the vault had recorded no note of `plan`
+     * from its predicted slot on, so another transaction took the nonce.
+     * The search starts where earlier finalized ones stopped
+     * (depositSearchFrom); one that does not reach the first unrecorded id
+     * gives nothing up.
+     */
+    async browserDepositNonceConsumed(transactionAttempt, plan) {
         const from = transactionAttempt?.from;
         const nonce = Number(transactionAttempt?.nonce);
         if (!/^0x[0-9a-fA-F]{40}$/.test(from || '')
             || !Number.isSafeInteger(nonce) || nonce < 0) {
             return { consumed: false, checkedBlock: 0, source: 'missing_metadata' };
         }
-        let blockTag = null;
-        let source = 'finalized';
+        const { blockTag, checkedBlock, source } = await this.browserDepositCheckpoint();
+        if (!blockTag) return { consumed: false, checkedBlock, source };
         try {
-            const finalizedBlock = await this.ethereum.request({
-                method: 'eth_getBlockByNumber',
-                params: ['finalized', false]
-            });
-            if (finalizedBlock?.number
-                && /^0x[0-9a-fA-F]+$/.test(String(finalizedBlock.number))) {
-                blockTag = finalizedBlock.number;
-            }
-        } catch {
-            // Retain the deposit unless the conservative fallback below works.
-        }
-        if (!blockTag) {
-            source = 'confirmations';
-            let head = 0;
-            try {
-                const latest = await this.ethereum.request({ method: 'eth_blockNumber' });
-                if (/^0x[0-9a-fA-F]+$/.test(String(latest || ''))) {
-                    head = Number(BigInt(latest));
-                }
-            } catch {
-                // Missing finality information keeps the WAL intact.
-            }
-            const checkpoint = head - CLOSE_FINALITY_FALLBACK_BLOCKS;
-            if (checkpoint <= 0) {
-                return { consumed: false, checkedBlock: Math.max(0, checkpoint), source };
-            }
-            blockTag = `0x${checkpoint.toString(16)}`;
-        }
-        try {
-            const [transactionCount, note] = await Promise.all([
+            const [transactionCount, search] = await Promise.all([
                 this.ethereum.request({
                     method: 'eth_getTransactionCount',
                     params: [from, blockTag]
                 }),
-                this.readBrowserNote(noteId, blockTag)
+                this.findDepositNote(plan, depositSearchFrom(plan), blockTag)
             ]);
             const finalizedNonce = walletNonceNumber(transactionCount);
             const consumed = finalizedNonce != null
                 && finalizedNonce > nonce
-                && note.status === 0;
-            return {
-                consumed,
-                checkedBlock: Number(BigInt(blockTag)),
-                source,
-                note
-            };
+                && search.complete && !search.note;
+            return { consumed, checkedBlock, source };
         } catch {
-            return { consumed: false, checkedBlock: Number(BigInt(blockTag)), source };
-        }
-    }
-
-    async browserDepositSlotConflictFinality(plan) {
-        let blockTag = null;
-        let source = 'finalized';
-        try {
-            const finalizedBlock = await this.ethereum.request({
-                method: 'eth_getBlockByNumber',
-                params: ['finalized', false]
-            });
-            if (finalizedBlock?.number
-                && /^0x[0-9a-fA-F]+$/.test(String(finalizedBlock.number))) {
-                blockTag = finalizedBlock.number;
-            }
-        } catch {
-            // Use a conservative confirmation checkpoint below.
-        }
-        if (!blockTag) {
-            source = 'confirmations';
-            try {
-                const latest = await this.ethereum.request({ method: 'eth_blockNumber' });
-                if (/^0x[0-9a-fA-F]+$/.test(String(latest || ''))) {
-                    const checkpoint = Number(BigInt(latest)) - CLOSE_FINALITY_FALLBACK_BLOCKS;
-                    if (checkpoint > 0) blockTag = `0x${checkpoint.toString(16)}`;
-                }
-            } catch {
-                // Missing historical state keeps the original slot recoverable.
-            }
-        }
-        if (!blockTag) return { finalized: false, checkedBlock: 0, source };
-        try {
-            const note = await this.readBrowserNote(Number(plan.next_note_id), blockTag);
-            const sameCommitment = note.status !== 0
-                && note.amount === BigInt(plan.amount)
-                && BigInt(note.commitment) === BigInt(plan.commitment);
-            return {
-                finalized: note.status !== 0 && !sameCommitment,
-                checkedBlock: Number(BigInt(blockTag)),
-                source,
-                note
-            };
-        } catch {
-            return {
-                finalized: false,
-                checkedBlock: Number(BigInt(blockTag)),
-                source
-            };
+            return { consumed: false, checkedBlock, source };
         }
     }
 
@@ -8203,7 +8413,7 @@ class ZkapiClient extends EventTarget {
             }, blockTag]
         });
         if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) {
-            throw Object.assign(new Error('The vault did not return an escape payout credit. This build expects a concession vault (revision 3), which holds escape payouts.'), {
+            throw Object.assign(new Error('The vault did not return an escape payout credit. This build expects a concession vault (revision 4), which holds escape payouts.'), {
                 code: 'vault_value_invalid'
             });
         }
@@ -8556,11 +8766,13 @@ class ZkapiClient extends EventTarget {
                 data: `0xa2f9f1ce${abiWord(noteId)}`
             }, blockTag]
         });
+        // pendingWithdrawals: exists, withdrawalNullifier, finalBalance,
+        // destination, challengeDeadline (an escape records no root).
         const pendingWords = String(encodedPending || '').replace(/^0x/, '').match(/.{64}/g) || [];
-        if (pendingWords.length < 6 || BigInt(`0x${pendingWords[0]}`) !== 1n) {
+        if (pendingWords.length < 5 || BigInt(`0x${pendingWords[0]}`) !== 1n) {
             throw new Error('The vault pending-withdrawal record is missing.');
         }
-        // Vault revision 3: the escape's concession at the same block
+        // The escape's concession at the same block
         // (pendingWithdrawals.finalBalance + conceded == stateBalance).
         let concession = null;
         try {
@@ -8569,18 +8781,17 @@ class ZkapiClient extends EventTarget {
                 params: [{ to: this.config.funding.contract_address, data: `0x${ABI.pendingConcessions}${abiWord(noteId)}` }, blockTag]
             });
             concession = decodePendingConcessions(encodedConcession);
-            if (concession.stateBalance !== BigInt(`0x${pendingWords[3]}`) + concession.conceded) concession = null;
+            if (concession.stateBalance !== BigInt(`0x${pendingWords[2]}`) + concession.conceded) concession = null;
         } catch {
             concession = null;
         }
         return {
             status: 'pending_withdrawal',
             note_id: Number(noteId),
-            active_root: `0x${pendingWords[1]}`,
-            withdrawal_nullifier: `0x${pendingWords[2]}`,
-            final_balance: Number(BigInt(`0x${pendingWords[3]}`)),
-            destination: `0x${pendingWords[4].slice(-40)}`,
-            challenge_deadline: Number(BigInt(`0x${pendingWords[5]}`)),
+            withdrawal_nullifier: `0x${pendingWords[1]}`,
+            final_balance: Number(BigInt(`0x${pendingWords[2]}`)),
+            destination: `0x${pendingWords[3].slice(-40)}`,
+            challenge_deadline: Number(BigInt(`0x${pendingWords[4]}`)),
             ...(concession ? {
                 next_nullifier: `0x${concession.nextNullifier.toString(16)}`,
                 state_balance: Number(concession.stateBalance),

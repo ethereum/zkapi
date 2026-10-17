@@ -53,10 +53,11 @@ async function deriveKey(cryptoImpl, passphrase, salt, iterations) {
 /**
  * The kit's plaintext: the build-pinned trusted_deployment profile, the note
  * state an escape needs, bound_at_state, the state's sequence number and the
- * export time. `merklePath` is the deposit-time path at a root the vault
- * holds (Amendment A1), when the wallet saved one.
+ * export time. An escape is bound to the note's vault record, not to a tree
+ * root, so the kit carries no Merkle path (readers ignore a `merkle_path`
+ * that kits of earlier builds hold).
  */
-export function buildExitKitPayload({ trustedDeployment, state, stateSeq, exportedAt, merklePath = null }) {
+export function buildExitKitPayload({ trustedDeployment, state, stateSeq, exportedAt }) {
     if (!trustedDeployment || typeof trustedDeployment !== 'object') {
         throw kitError('An exit kit needs the build-pinned deployment profile.', 'exit_kit_invalid');
     }
@@ -71,10 +72,7 @@ export function buildExitKitPayload({ trustedDeployment, state, stateSeq, export
         note,
         bound_at_state: String(state.bound_at_state ?? 0),
         state_seq: Number(stateSeq) || 0,
-        exported_at: Number(exportedAt),
-        merkle_path: merklePath?.active_root != null && Array.isArray(merklePath.siblings)
-            ? { active_root: String(merklePath.active_root), siblings: merklePath.siblings.map(String) }
-            : null
+        exported_at: Number(exportedAt)
     };
 }
 

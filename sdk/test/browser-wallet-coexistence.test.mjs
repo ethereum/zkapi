@@ -46,7 +46,7 @@ const v2cState = (changes = {}) => ({
     deposit_amount: 5_000_000, expiry_ts: 2_000_000_000, current_balance: 4_975_000, balance_blinding: '0xb1',
     current_commitment_x: '0xc1', current_commitment_y: '0xc2', current_anchor: '0xa2', is_genesis: false,
     state_signature: { r_x: '0x1', r_y: '0x2', s: '0x3' }, prev_anchor: '0x1', bound_at_state: 1_000_000,
-    deposit_path: { active_root: '0x51', siblings: Array.from({ length: 32 }, (_, index) => `0x${index}`) },
+    registration_commitment: '0xc0ffee',
     ...changes
 });
 const legacyState = (changes = {}) => ({
@@ -108,8 +108,9 @@ async function writeV2cStore() {
                 { kind: 0, valid_until: 1_800_010_000, conceded: '1000000', at: 1_799_999_100 }] },
         preparedWithdrawal: { mode: 'escape', phase: 'prepared', noteId: 4, destination: DESTINATION, operationId: 'exit',
             withdrawalNullifier: '0x50a2', decision: { rule: 'E3.T', conceded: '1000000' }, stateBalance: '4975000',
-            concededAtInit: '1000000', boundAtState: '1000000', validUntil: 1_800_010_000, pathSource: 'deposit',
-            public_inputs: { kind: 0, note_id: 4, conceded: 1_000_000, final_balance: 3_975_000, valid_until: 1_800_010_000 },
+            concededAtInit: '1000000', boundAtState: '1000000', validUntil: 1_800_010_000,
+            public_inputs: { kind: 0, note_id: 4, conceded: 1_000_000, final_balance: 3_975_000, valid_until: 1_800_010_000,
+                registration_commitment: '0xc0ffee', deposit_amount: 5_000_000, expiry: 2_000_000_000 },
             proof: { backend: 'groth16_bn254', proof: 'escape' } }
     });
     await current.putBrowserRequestArchive([{ ...late, lateResponse: { client_request_id: 'late', charge_applied: 25_000 },

@@ -96,10 +96,11 @@ endpoints and provider inference never receive this password. A 401 clears
 the rejected credential without replaying a protocol operation; recovery
 journals remain authoritative. Mainnet does no password discovery or prompting.
 
-This SDK requires `proof_setup.circuit_id: "zkapi-v2-concession-v1"` in the
+This SDK requires `proof_setup.circuit_id: "zkapi-v2-concession-v2"` in the
 deployment manifest and matching `trusted_deployment.circuit_id` in the host
-config, a vault with the concession exit (`trusted_deployment.exit_concession:
-1`, vault revision 3), and a `trusted_deployment.setup_id` equal to the setup
+config, a vault with the concession exit and note-bound exits
+(`trusted_deployment.exit_concession: 1`, vault revision 4), and a
+`trusted_deployment.setup_id` equal to the setup
 the bundled WebAssembly is built for (`browser_setup_id()`, also
 `setupId` in `sdk/assets/manifest.json`). The vault's immutable verifier,
 proving keys, and signing-key pins must match this circuit. Configuration
@@ -167,8 +168,13 @@ same atomic journal methods. It does not confirm deposits or withdrawals by
 itself. Continue using `recoverBrowserDeposit()`, `syncWithdrawal()`, and
 `syncEscapeWithdrawals()` for the usual canonical-state and finality checks.
 Resumption is idempotent when a previous journal write succeeded but host
-acknowledgement was interrupted. The host owns the public pending-send record;
-private wallet material and all settlement and payout decisions stay in the SDK.
+acknowledgement was interrupted. A deposit hash that arrives after a read-only
+recovery already confirmed its note is acknowledged when its successful
+receipt's `NoteDeposited` names the confirmed note's id, the saved amount and
+commitment; that id can be after the context's `noteId` (the predicted slot)
+when another deposit was included first. The host owns the public
+pending-send record; private wallet material and all settlement and payout
+decisions stay in the SDK.
 
 A sponsored withdrawal (`fees: 'payout'`, [Paying the fee from the
 payout](#paying-the-fee-from-the-payout)) never calls `eth_sendTransaction`,
@@ -353,12 +359,90 @@ Two dispositions end a request without installing its successor:
   released (below), and then installs. For exit decisions it is settled
   (terminal, design §6.4): it never makes its state unresolved.
 
+## Deposits and activation
+
+A deposit (`deposit(bytes32 commitment, uint128 amount)`) only records the
+note in the vault, at the id `nextNoteId()` names when the deposit is
+included. The SDK predicts that slot from `nextNoteId()` (through the wallet
+that will sign, else the pinned RPC) and confirms the note at the id its
+receipt's `NoteDeposited` names, after checking the vault's `notes(noteId)`
+record (commitment, amount, expiry, status): a deposit another one overtook
+is recorded after its predicted slot. Recovery without the receipt in hand
+looks for it among the deposit's saved transactions the same way, and then
+by its commitment in the vault's records from the predicted slot on (a
+receipt can be unreadable while the transaction is pending, after a wallet
+speed-up replaced its hash, or when the read fails). Another deposit at the
+predicted slot settles nothing: the deposit stays pending, and a saved
+transaction is given up only when, at a finalized block, its sender's nonce
+is used and the vault recorded no note of this deposit. The search runs only
+for a deposit whose transaction or wallet prompt may have reached the chain
+(a never-sent plan is rebased instead). It reads at most 1,024 records per
+pass and keeps how far the finalized records showed other notes, so the next
+pass goes on from there; while it is behind them, nothing is given up.
+
+An explicit retry of a deposit whose wallet request has an unknown result
+(`retryUnknownDeposit`, or `prepareDepositRetry` and then `deposit`) sends the
+same commitment again, and the vault would record both transactions as notes.
+The retry therefore reuses the earlier request's sender and nonce, so at most
+one of them can execute. The connected account must be that sender, and the
+retry is refused while the wallet's pending transaction count is above that
+nonce (the earlier request, a speed-up or a cancel is still in flight or not
+final). Once the nonce is used at a finalized block and the vault recorded no
+note of the deposit, recovery releases it and the retry takes a fresh nonce.
+A request whose nonce was never saved never reached the wallet. An earlier
+request saved without its nonce is never retried (`409
+deposit_retry_nonce_unknown`); the deposit stays pending until recovery finds
+its note.
+
+A recorded note can exit at once ([Exits](#exits)) but proves chats only once
+the operator's batch worker activated it: `NotesActivated` inserts the leaves
+of notes `[firstNoteId, firstNoteId + count)` into the vault's tree, so the
+note is activated exactly when `noteId < activationCursor()`.
+
+- `snapshot().config.activation` reports it (`status` `"activating"` with a
+  `queue_position`, then `"activated"`), and while the note is not activated
+  whether the vault is paused (`vault_paused`). The client follows the
+  vault's cursor in its background reconcile until the vault shows the note
+  activated, and a deposit's confirmation message says whether chats can
+  start yet. The runtime's `refreshActivation({ walletRequest })` reads it on
+  demand. Within one source the cursor only advances (a lagging RPC or
+  indexer never undoes an activation it saw), and an indexer reading never
+  replaces an activation the vault showed; but a vault reading replaces a
+  higher cursor only the indexer reported: the indexer serves its head view,
+  which a reorg can drop. An activation only the indexer reported is read
+  again until the vault confirms it.
+- A chat from a note that is not activated is refused before anything is
+  proved or sent, with `note_not_activated` (`error.data`: `note_id`,
+  `activation_cursor`, `queue_position`, `vault_paused`, `exits_reopen_at`).
+  The request path is taken from the indexer's `/v1/tree/snapshot` only for a
+  note below its `activation_cursor`; otherwise the vault's fresh
+  `activationCursor()` reading decides, a note the vault activated but the
+  indexer has not mirrored yet is `indexer_root_lag`, and one neither can
+  tell about is `activation_unavailable`. The SDK asks for
+  `/v1/tree/snapshot?parts=tree` (the header and `leaves` only, the same
+  request whatever the note), and reads an older indexer's full snapshot the
+  same way.
+- While the vault is paused (`paused()`), no activation batch lands and exits
+  stay shut until the owner unpauses it, at the latest `pausedAt()` +
+  `maxPauseDuration` (`exits_reopen_at`, milliseconds, `null` when unknown).
+  The refusal and the deposit's confirmation message then say so instead of
+  offering a withdrawal.
+- `client.acquireInferenceAccess` waits for the activation, reading the
+  vault's cursor every 5 seconds and reporting the progress phase
+  `activating` with the queue position, then asks for the key again. The
+  operator's worker sends one batch at a time and holds the next until the
+  last is `--confirmations` blocks deep (about 36 seconds per batch on L1),
+  so a note behind others can wait several batches: the wait lasts 90
+  seconds from the start or from the cursor's last advance, and at most 5
+  minutes in all. A paused vault's refusal is not waited on. Past the bound
+  the refusal reaches the host with a `shortMessage`.
+
 ## Exits
 
 This SDK runs only against a concession vault. The build-pinned
 `trusted_deployment` must declare:
 
-- `vault_revision: 3`;
+- `vault_revision: 4`;
 - `exit_concession: 1`;
 - `clearance_ownership_proof: "required"`: the server takes an ownership
   proof with every mutual-close clearance.
@@ -418,6 +502,15 @@ exit waits past `must_initiate_by`. The decision then depends on the state:
      cancel, decides the same way and sends no second ownership proof.
    - Any other refusal, or an unreachable server, escapes with `c = 0`. A
      retry after such an answer escapes too: a lock sends one ownership proof.
+     `note_binding_mismatch` and `note_not_active` are refusals.
+   - `note_not_recorded` (the server's RPC has not seen the deposit yet) is
+     not: the wallet sends the same ownership proof again after 1, 2, 4 and 8
+     seconds, then refuses with the retriable `note_not_recorded`. The exit
+     lock, which released only that proof, is let go as a cancel would; the
+     withdrawal-only marker keeps the proof, and a retry sends it again. The
+     answer is kept with the lock before each wait, so an attempt that ends
+     during one (a closed tab, an abort) leaves no unanswered proof: the next
+     attempt lets that lock go the same way instead of escaping.
    - A state has at most one live ownership proof, across locks (C3): after a
      cancel, a new mutual close sends the state's live proof again; within 5
      seconds of its expiry it refuses with `ownership_proof_wait`
@@ -439,48 +532,43 @@ exit waits past `must_initiate_by`. The decision then depends on the state:
    once. A successor refused for its anchor (S4) is handled like a withheld
    one (2).
 
+Exit proofs (escape, close and ownership proof) need no Merkle path, no
+vault root and no indexer. Each statement names the note by what the vault
+records for it in `notes(noteId)`: its registration commitment and its
+deposit amount and expiry (packed into the statement's note metadata). The
+vault (`NoteBindingMismatch`) and the server compare both with that record.
+So a confirmed note exits at once, before its activation too
+([Deposits and activation](#deposits-and-activation)). The wallet checks
+every proof it makes against the note's amount and expiry, and against its
+registration commitment, which a confirmed deposit saves with the note.
+
+The user's exit RPC (`client.setExitRpcUrl(url)`, saved for this origin;
+`null` clears it) is read, when one is set, for the note's vault status,
+finality and simulation. Its first answer in each exit is `eth_chainId`: an
+exit RPC on another chain than the vault's is never read further, and the
+snapshot flags it (`exit_rpc_wrong_chain`). When no exit RPC is set, or it is
+on another chain or fails, the wallet provider is read when it is on the
+vault's chain (each call bounded by the 20-second call limit), and then the
+pinned RPC.
+
 Before proving an escape, the wallet does the following:
 
-1. It takes the Merkle path from the first source that works:
-   - the deposit, saved at deposit time and checked against the
-     `NoteDeposited` root, which the vault accepts for good;
-   - the indexer, checked against the vault's current root;
-   - a rebuild from the vault's logs, in adaptively sized chunks with every
-     event's root checked. Ranges halve on an RPC limit and double again after
-     four accepted ranges. The whole rebuild ends within 5 minutes
-     (`tree_rebuild_timeout`).
-
-   An escape's `withdraw` result names the source it used: `pathSource` is
-   `deposit`, `indexer` or `rebuild`.
-
-   The vault's root and logs are read through the user's exit RPC
-   (`client.setExitRpcUrl(url)`, saved for this origin; `null` clears it)
-   when one is set. Its first answer in each exit is `eth_chainId`: an exit
-   RPC on another chain than the vault's is never read further, and the
-   snapshot flags it (`exit_rpc_wrong_chain`). When no exit RPC is set, or
-   it is on another chain or fails, they are read through the wallet
-   provider, when it is on the vault's chain (each call bounded by the
-   20-second call limit), and then through the pinned RPC.
-
-   After the wallet's simulation refuses a proof's root (`unknown_root`), the
-   proof is made again from the indexer or the rebuild, at any root except
-   the refused one. If neither gives a path, the existing proof is submitted
-   anyway, as for any other simulation refusal.
-2. It asks the server for a request proof at the successor state
+1. It asks the server for a request proof at the successor state
    (`GET /v2/nullifiers/{successor}/evidence`). A proof that verifies locally
    refuses the escape with `device_not_newest`: another device is newer. Any
    other answer, or none, is ignored.
-3. It runs a last recovery pass. Advisory warnings never block the escape,
+2. It runs a last recovery pass. Advisory warnings never block the escape,
    for example when the RPC reports either nullifier as already challenged.
-4. It records the proof in the exit lock before the proof is broadcast.
-5. Just before the wallet sees the transaction, it runs one more recovery
+3. It records the proof in the exit lock before the proof is broadcast.
+4. Just before the wallet sees the transaction, it runs one more recovery
    pass. A successor that arrives now is kept as `late_successor`.
 
 The wallet provider's simulation (`eth_estimateGas`) of an escape or a close
 only warns. When it refuses, the exit RPC's estimate is used if one is set
 and on the vault's chain, otherwise a fixed limit of 1,000,000 gas, and the status message explains the
 refusal; the wallet still asks the user to confirm. A refusal that a new proof
-can cure (`proof_expired`, `unknown_root`) re-proves once first.
+can cure (`proof_expired`) re-proves once first; `note_binding_mismatch` is
+never re-proved, since every proof from the state names the same record.
 
 The **exit lock** starts with the first exit decision at a state and freezes
 that state:
@@ -512,7 +600,7 @@ that state:
 - Escape and close proofs are valid for 3 hours. Ownership proofs are valid
   for 55 minutes: the server accepts at most an hour, and the margin absorbs a
   client clock up to five minutes fast. The SDK proves again after
-  `proof_expired` or `unknown_root`.
+  `proof_expired`.
 
 #### Paying the fee from the payout
 
@@ -788,9 +876,8 @@ refused with `park_requires_clearance`. It must be withdrawn first, by the
 exit rules above, so that it never depends on the operator once set aside.
 
 `client.withdrawBackground(recordId)` later closes a set-aside balance with its
-kept clearance. The close proof takes the deposit-time path first, then the
-indexer at the vault's current root, then the vault's logs, and it re-proves
-at another root after `unknown_root` like any exit. Each set-aside record in
+kept clearance. Like any exit, the close proof needs no path, root or
+indexer, and an expired one is proved again. Each set-aside record in
 `snapshot().withdrawals` carries `expiry` and `must_initiate_by` (milliseconds,
 from the note's own `expiry_ts`) and `exit_deadline_near`, which is true within
 7 days of `must_initiate_by`. Show it: a set-aside close that is not finished
@@ -825,8 +912,10 @@ sync, and a finalization by a third party. The payout must equal
 
 - the trusted deployment pins;
 - the note's current state and secret;
-- `bound_at_state` and `state_seq`;
-- the deposit-time Merkle path.
+- `bound_at_state` and `state_seq`.
+
+An escape needs no Merkle path, so the kit carries none; readers ignore the
+`merkle_path` that kits of earlier builds hold.
 
 The kit is encrypted with AES-256-GCM under a PBKDF2-SHA256 key (600,000
 iterations, 16-byte salt). The passphrase needs at least 10 characters
@@ -855,8 +944,10 @@ through the pinned RPC. It checks:
 - the vault's `proofAdapter()`;
 - the signing keys;
 - `challengePeriod`, `noteTtl` and `maxPauseDuration`;
-- `CONCESSION_ESCAPE_VERSION` (1) and `ROOT_HISTORY_WINDOW` (86400);
-- the adapter's `CIRCUIT_ID_HASH` and verifying-key hashes.
+- `CONCESSION_ESCAPE_VERSION` (1) and `NOTE_BOUND_EXIT_VERSION` (1);
+- the adapter's `CIRCUIT_ID_HASH` and verifying-key hashes. The adapter also
+  holds the insertion verifiers that activate notes, so its pinned codehash
+  pins them too.
 
 A mismatch refuses the deposit with `deployment_mismatch`, and
 `error.data.mismatches` lists each `{ field, expected, actual, source }`. A
@@ -873,7 +964,15 @@ cannot be read.
 `snapshot().config` adds:
 
 - `service` ([Exit-only mode](#exit-only-mode));
-- `vault_revision` (3);
+- `vault_revision` (4);
+- `activation` ([Deposits and activation](#deposits-and-activation)), `null`
+  without a note: `note_id`, `status` (`"activated"`, `"activating"` or
+  `"unknown"` before a reading), `activated`, `activation_cursor`,
+  `queue_position` (notes ahead of this one; 0 when the next batch covers it;
+  `null` once activated), `source` (`"vault"` or `"indexer"`), `checked_at`
+  (milliseconds), and, for a note that is not activated, `vault_paused`
+  (`null` when unread) and `exits_reopen_at` (milliseconds; `null` when not
+  paused or unknown);
 - `exit`, with times in milliseconds:
   - `must_initiate_by`, `near_expiry`, `bound_at_state`, `state_fresh`,
     `escape_at` and `device_not_newest`;
@@ -889,14 +988,9 @@ cannot be read.
     within the 20-second call limit, a deposit waits for it at most that
     long, and a withdrawal does not wait for it at all (the warning appears
     when the read completes);
-  - `deposit_path_saved`, `exit_rpc_url`, `exit_rpc_wrong_chain` and
-    `exit_rpc_recommended`. `exit_rpc_wrong_chain` is true once the saved
-    exit RPC answered on another chain than the vault's; exits then ignore
-    it, so ask the user to correct it. `exit_rpc_recommended` is true when
-    no deposit-time path is saved and no exit RPC is set: an escape's path
-    would then come from the operator's indexer or the pinned RPC's logs, so
-    ask the user to set an exit RPC or keep an exit kit from the depositing
-    device;
+  - `exit_rpc_url` and `exit_rpc_wrong_chain`. `exit_rpc_wrong_chain` is
+    true once the saved exit RPC answered on another chain than the vault's;
+    exits then ignore it, so ask the user to correct it;
 - `unresolved_requests`, one entry per request at the selected state, with no
   proofs: `client_request_id`, `kind`, `disposition`, `class` (`terminal`,
   `resolved_unreserved`, `unresolved`), `created_at`, `server_status`,
@@ -934,12 +1028,12 @@ Each of these errors carries a `shortMessage` for display.
 
 | Group | Codes |
 | --- | --- |
-| Wallet | `request_settlement_pending`, `device_not_newest`, `exit_locked`, `exit_lock_mode`, `exit_lock_state`, `exit_release_pending`, `note_near_expiry`, `invalid_successor`, `receipt_unrecoverable`, `receipt_response_missing`, `receipt_pending_install`, `request_archive_limit`, `withdrawal_submission_pending`, `park_requires_clearance` |
+| Wallet | `request_settlement_pending`, `device_not_newest`, `exit_locked`, `exit_lock_mode`, `exit_lock_state`, `exit_release_pending`, `note_near_expiry`, `invalid_successor`, `receipt_unrecoverable`, `receipt_response_missing`, `receipt_pending_install`, `request_archive_limit`, `withdrawal_submission_pending`, `park_requires_clearance`, `note_not_recorded` (retriable) |
+| Activation (chats; retriable) | `note_not_activated` (`error.data`: `note_id`, `activation_cursor`, `queue_position`, `vault_paused`, `exits_reopen_at`), `indexer_root_lag`, `activation_unavailable` |
 | Deposits | `deployment_mismatch`, `deployment_unverifiable`, `canary_cap_exceeded`, `canary_cap_unverified` |
 | Exit-only mode (deposits and chats) | `deployment_manifest_unavailable`, `deployment_manifest_mismatch`, `deployment_manifest_untrusted`, `incompatible_proof_circuit`, `native_vault_unverified` |
-| Vault reverts | `unknown_root`, `challenged_nullifier`, `superseded_state`, `proof_expired`, `wrong_withdrawal_kind`, `invalid_destination`, `vault_paused` |
+| Vault reverts | `note_binding_mismatch`, `challenged_nullifier`, `superseded_state`, `proof_expired`, `wrong_withdrawal_kind`, `invalid_destination`, `vault_paused` |
 | Exit kit | `exit_kit_invalid`, `exit_kit_passphrase`, `exit_kit_passphrase_weak` |
-| Tree rebuild | `tree_logs_unavailable`, `tree_note_missing`, `tree_rebuild_timeout`, `tree_root_refused`, `wrong_network` (each with `error.data.exit_path_unavailable`) |
 | Exit RPC | `exit_rpc_invalid`, `exit_rpc_unsaved` |
 | Sponsored withdrawals (refused before any prompt) | `gasless_unavailable` (`error.data.reason`: `not_pinned`, `gasless_profile_invalid`, `gasless_deployment_mismatch`), `gasless_policy_mismatch`, `bundler_unavailable` (`error.data.fallbacks`), `bundler_wrong_chain`, `bundler_unsupported_entry_point`, `bundler_url_invalid`, `bundler_url_unsaved`, `sponsorship_paused`, `escapes_disabled`, `escape_already_sponsored`, `paymaster_underfunded`, `exits_paused` (`error.data.reopenAt`), `gas_above_paymaster_ceiling` (`error.data`, wei as bigints: `baseFeePerGas`, `maxPriorityFeePerGas`, `neededMaxFeePerGas` = base + tip, the amount compared with the ceiling, `wantedMaxFeePerGas` = 2 × base + tip, `maxFeeCeiling`), `max_cost_above_policy`, `payout_below_gas`, `gasless_uneconomic`, `gasless_attempts_exhausted`, `gasless_fee_above_cap`, `gasless_estimate_above_cap`, `gas_limit_out_of_range` (a gas field outside the paymaster's policy; `error.data`: `name`, `value`, `floor`, `cap`), `gasless_plan_mismatch`, `gasless_record_not_pinned` (`error.data.reason`: `not_pinned`, `pins_mismatch`; recover with `withdraw(mode, …, { fees: 'wallet' })` while the note has not left the vault, then with `sweepTransit`, `claimGaslessCredit` or `finalizeEscape(…, { fees: 'wallet' })`, as `error.data.alternatives` lists them), `wrong_owner_account` (`error.data.expected`), `entry_point_hash_mismatch` |
 | Sponsored withdrawals (after a submission) | `signature_rejected` (also a bundler's ERC-7769 `-32507`), `paymaster_underfunded` (also a bundler's `-32508`: the float cannot cover every pending operation; neither code is re-signed), `escape_not_due` (a sponsored finalization the latest block has not reached the deadline for within three minutes; `error.data.validAfter`, `blockTimestamp`), `bundler_hash_mismatch` (a status, the chain decides), `bundler_rejected` (the bundler refused the send with AA25 or AA10 although the chain disagrees; `error.data`: `method`, `aa`, `rpcCode`, `rpcMessage`), `gasless_op_expired` (proved again), `gasless_op_pending` (journaled, checked in the background), `user_op_pending` (`finalizeEscape(…, { fees: 'wallet' })` while a sponsored finalization sent before the profile stopped pinning its paymaster may still land; `error.data.userOpHash`, `retryAfterMs`), `gasless_fee_bump_exhausted`, `gasless_op_reverted` (`error.data.reason`, the vault error; the record may hold `fundsWaitingInTransit`), `transit_funds_waiting` (a forward is sponsored), `transit_sweep_needed` (a status after a wallet-paid exit to `S`, which leaves the paymaster no evidence: only `sweepTransit` collects it), `transit_not_stranded`, `transit_balance_empty`; the EntryPoint's `AA..` reasons map to `sender_already_constructed` and `nonce_rejected` (handled silently), `signature_rejected`, `paymaster_underfunded`, `paymaster_time_window`, `paymaster_rejected` and the paymaster's own errors above |
@@ -1151,7 +1245,8 @@ note secrets, connects a wallet, claims a submission, signs, or broadcasts.
 It stores the note secret in a separate durable `depositQuote` draft, which is
 not a pending deposit or payment-history entry. Read-only polling and reload
 cannot promote it. Same-amount refreshes retain the commitment and operation
-identity while updating the Merkle append path. Changing the amount replaces
+identity while rebasing the predicted note slot (the vault's `nextNoteId()`).
+Changing the amount replaces
 only the unused draft. An active note or unresolved deposit must be recovered
 before another quote is prepared. After a proven pre-broadcast rejection, an
 existing pending deposit can be requoted only when
@@ -1166,19 +1261,19 @@ For an ambiguous funding-address deposit, an explicit user action may call
 for a mined deposit first and returns `status: "confirmed"` if recovered.
 Otherwise it authorizes only an exact retry fee review, including a saved
 `retry_exact` operation. It does not sign or submit. The funding-quote flag
-then permits simulation of the saved calldata without
-refreshing its Merkle path. After the quote is shown, a separate explicit Next
-uses the same `preparedOperationId`. A pre-broadcast fee rejection keeps that
-exact path for the next quote. Only finalized consumed-slot recovery permits
-rebasing an uncertain old operation, and it records which ambiguity was
-resolved while retaining the original claims for late recovery. Ordinary
-MetaMask retry behavior remains unchanged.
+then permits simulation of the saved calldata without rebasing its slot.
+After the quote is shown, a separate explicit Next uses the same
+`preparedOperationId`. A pre-broadcast fee rejection keeps that exact
+operation for the next quote. Another deposit at the saved slot never
+resolves an uncertain old operation: the vault numbers a deposit when it is
+included, so the old send may still be recorded later. Ordinary MetaMask
+retry behavior remains unchanged.
 
 An explicit deposit with `preparedOperationId` atomically promotes that exact
 draft under the wallet's cross-tab lock. A stale operation or changed principal
 fails before any submission. An ordinary deposit without the option (including
-MetaMask) discards an unused draft. Refreshing a Merkle path never changes the
-principal or commitment. The host must bind its displayed fee authorization to
+MetaMask) discards an unused draft. Rebasing the predicted slot never changes
+the principal, the commitment or the calldata. The host must bind its displayed fee authorization to
 the returned operation and commitment and enforce that ceiling again on the
 actual transaction; a quote is not permission to sign. The actual transaction
 continues to simulate the current vault state and may need a new quote/top-up
@@ -1229,7 +1324,7 @@ placeholders until their concession vaults exist, and `buildBrowserSdkAssets`
 refuses them with `deployment_not_deployed`. A deployed profile pins:
 
 - its native ETH vault, signing keys, proof artifacts, circuit and setup;
-- `vault_revision: 3`, `exit_concession: 1` and
+- `vault_revision: 4`, `exit_concession: 1` and
   `clearance_ownership_proof: "required"`;
 - the deployment pins of [Deposit checks](#deposit-checks).
 
@@ -1259,8 +1354,7 @@ validated with it; any other value fails initialization. With `"closed"`:
   `retryDroppedDeposit`, `recoverBrowserDeposit`); only replacing it with a
   different amount is refused. Withdrawals, chats and recovery are unaffected.
 
-The SDK builds a deposit's Merkle path from `/v1/tree/snapshot`, which
-withdrawals also need, so a gateway that stops serving the deposit-only tree
-routes does not stop browser deposits. Set this flag in every browser profile
+A deposit needs no Merkle path and no indexer route, so a gateway that stops
+serving tree routes does not stop browser deposits. Set this flag in every browser profile
 of the drained deployment, legacy-exit builds included. Builds older than this
 release ignore it and keep offering deposits.

@@ -7,7 +7,7 @@ const sdkRoot = path.dirname(fileURLToPath(import.meta.url));
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 
 /** The proof statement this SDK revision supports. */
-export const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v1';
+export const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v2';
 /** sdk/assets/manifest.json schema: circuitId, setupId, sourceRevision, files. */
 export const ASSET_MANIFEST_SCHEMA = 2;
 /** Setups a bundle can be built for (scripts/build-browser-client.sh --setup). */

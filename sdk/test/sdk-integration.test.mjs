@@ -80,7 +80,7 @@ test('the shipped network profiles are placeholders that no host build accepts',
     try {
         const pinned = await verifyBrowserSdkAssets();
         assert.equal(pinned.schema, 2);
-        assert.equal(pinned.circuitId, 'zkapi-v2-concession-v1');
+        assert.equal(pinned.circuitId, 'zkapi-v2-concession-v2');
         for (const network of ['sepolia', 'mainnet']) {
             await assert.rejects(buildBrowserSdkAssets({ outDir: path.join(temp, network), network, build }),
                 { code: 'deployment_not_deployed' });
@@ -132,7 +132,7 @@ test('a deployed profile builds under the new publicPath with its pinned keys, r
         const sdkAssets = JSON.parse(await fs.readFile(path.join(temp, 'out/sdk-assets.json'), 'utf8'));
         assert.deepEqual({ schema: sdkAssets.schema, circuitId: sdkAssets.circuitId, setupId: sdkAssets.setupId,
             publicPath: sdkAssets.publicPath, sourceRevision: sdkAssets.sourceRevision },
-        { schema: 2, circuitId: 'zkapi-v2-concession-v1', setupId: pinned.setupId, publicPath: '/zkapi/v2c/',
+        { schema: 2, circuitId: 'zkapi-v2-concession-v2', setupId: pinned.setupId, publicPath: '/zkapi/v2c/',
             sourceRevision: pinned.sourceRevision });
         const worker = await fs.readFile(path.join(result.directory, 'assets/zkapiWasmWorker.js'), 'utf8');
         assert.match(worker, /\.\.\/wasm\/zkapi_browser_bg\.wasm/);

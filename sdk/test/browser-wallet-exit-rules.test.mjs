@@ -1,13 +1,13 @@
 // The client rules of the concession exit (design §6.1–§6.6) in the real
 // runtime and store, over a transactional IndexedDB: C1–C5, the write order,
-// E0–E7, the stale-device pre-check, the Merkle path without the operator and
-// the exit kit. Only the protocol server, the pinned vault RPC and the proof
+// E0–E7, the stale-device pre-check, exits bound to the note's vault record
+// (no Merkle path, before activation too) and the exit kit. Only the protocol server, the pinned vault RPC and the proof
 // worker are observed fakes (helpers/request-archive-harness.mjs).
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    DEPLOYMENT, DESTINATION, GENESIS_ANCHOR, HttpError, VAULT, createHarness, depositPath, derivedAnchor,
-    memoryIndexedDb, noteState, nullifierFor, successorFor, within
+    DEPLOYMENT, DESTINATION, GENESIS_ANCHOR, HttpError, createHarness, derivedAnchor,
+    memoryIndexedDb, noteState, nullifierFor, registrationCommitmentFor, successorFor, within
 } from './helpers/request-archive-harness.mjs';
 
 // A crash can be injected into the one write that persists a request: the
@@ -436,6 +436,124 @@ test('E2.5 on a retry: an ownership proof answered without a clearance escapes w
         assert.equal(plan.public_inputs.conceded, 0);
         assert.equal(proofsOf(h, 'ownership').length, 1, 'one ownership proof per lock');
     }
+});
+
+test('E2: note_not_recorded is no refusal: the same ownership proof is sent again, and a retry closes cooperatively', async () => {
+    // The server's RPC has not seen the deposit yet (a confirmed note may
+    // exit at once). Its retriable answer neither escapes nor is recorded.
+    const notRecorded = () => {
+        throw new HttpError('The operator has not observed this note yet.', 409, 'note_not_recorded', { retriable: true });
+    };
+    const granted = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
+    const resent = calls => new Set(calls.map(call => call.raw)).size === 1;
+    const wallet = async () => {
+        const h = await freshWallet();
+        h.runtime.exitTimingOverrides = { clearanceRetryDelaysMs: [1, 1, 1, 1] };
+        return h;
+    };
+
+    // The server catches up during the resends.
+    const h = await wallet();
+    let answers = 0;
+    h.server.clearance = body => (answers += 1) <= 2 ? notRecorded() : granted(body);
+    const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+    assert.equal(plan.mode, 'mutual');
+    assert.equal(plan.decision.rule, 'E2');
+    assert.equal(h.serverCalls('POST', '/v2/withdraw/clearance').length, 3);
+    assert.ok(resent(h.serverCalls('POST', '/v2/withdraw/clearance')), 'one ownership proof, sent again');
+    assert.equal(proofsOf(h, 'ownership').length, 1);
+    assert.deepEqual((await saved()).exitLock.released.map(entry => [entry.kind, entry.outcome]), [[2, 'granted'], [1, undefined]]);
+
+    // It does not: the attempt ends with the retriable code, without an
+    // escape. The lock, which released only the ownership proof, is let go;
+    // the withdrawal-only marker keeps the proof (C3, C5).
+    const later = await wallet();
+    later.server.clearance = notRecorded;
+    const retriable = error => {
+        assert.equal(error.code, 'note_not_recorded');
+        assert.equal(error.status, 409);
+        assert.equal(error.data.retriable, true);
+        return true;
+    };
+    await assert.rejects(later.runtime.prepareWithdrawal('mutual', DESTINATION), retriable);
+    assert.equal(later.serverCalls('POST', '/v2/withdraw/clearance').length, 5, 'sent, then again after each of four delays');
+    assert.equal(proofsOf(later, 'escape').length, 0);
+    const marker = await saved();
+    assert.equal(marker.exitLock, null);
+    assert.equal(marker.preparedWithdrawal.clearanceReserved, true);
+    assert.equal(marker.preparedWithdrawal.clearanceOutcome, undefined, 'no answer is recorded');
+    assert.ok(marker.preparedWithdrawal.ownershipProof);
+    await assert.rejects(later.runtime.issueLease('chat'), /Finish the prepared withdrawal/);
+
+    // A resend waits while the proof stays valid past its delay and the
+    // resend margin: six seconds before its valid_until it is sent once.
+    const validUntil = Number(marker.preparedWithdrawal.ownershipProof.public_inputs.valid_until);
+    const realNow = Date.now;
+    Date.now = () => (validUntil - 6) * 1_000;
+    try {
+        await assert.rejects(later.runtime.prepareWithdrawal('mutual', DESTINATION), retriable);
+    } finally {
+        Date.now = realNow;
+    }
+    assert.equal(later.serverCalls('POST', '/v2/withdraw/clearance').length, 6);
+
+    // The retry sends the same proof again and closes cooperatively.
+    later.server.clearance = granted;
+    const retried = await later.runtime.prepareWithdrawal('mutual', DESTINATION);
+    assert.equal(retried.mode, 'mutual');
+    assert.equal(proofsOf(later, 'ownership').length, 1, 'no second ownership proof');
+    assert.ok(resent(later.serverCalls('POST', '/v2/withdraw/clearance')));
+
+    // note_binding_mismatch and note_not_active stay refusals (E2.5).
+    for (const code of ['note_binding_mismatch', 'note_not_active']) {
+        const refused = await wallet();
+        refused.server.clearance = () => { throw new HttpError('Refused.', 409, code); };
+        const escape = await refused.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(escape.mode, 'escape', code);
+        assert.equal(escape.decision.rule, 'E2.fallback');
+        assert.equal(escape.public_inputs.conceded, 0);
+        assert.equal(refused.serverCalls('POST', '/v2/withdraw/clearance').length, 1, `${code} is not sent again`);
+    }
+});
+
+test('E2: an attempt that ends while a note_not_recorded clearance waits to be sent again leaves no unanswered proof', async () => {
+    // The server's last answer to the released proof is known to be no
+    // grant while the wallet waits: an attempt that ends then (a closed tab,
+    // an abort) must not leave the next one an unknown answer to escape on.
+    const h = await freshWallet();
+    h.runtime.exitTimingOverrides = { clearanceRetryDelaysMs: [60_000, 60_000, 60_000, 60_000] };
+    h.server.clearance = () => {
+        throw new HttpError('The operator has not observed this note yet.', 409, 'note_not_recorded', { retriable: true });
+    };
+    const controller = new AbortController();
+    const attempt = h.runtime.prepareWithdrawal('mutual', DESTINATION, { signal: controller.signal });
+    attempt.catch(() => null);
+    // The attempt ends during the first wait.
+    const tick = () => new Promise(resolve => setTimeout(resolve, 1));
+    while (!h.serverCalls('POST', '/v2/withdraw/clearance').length) await tick();
+    for (let i = 0; i < 100 && !(await saved()).exitLock?.released?.[0]?.notRecordedAt; i += 1) await tick();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    controller.abort();
+    await assert.rejects(attempt, { name: 'AbortError' });
+    assert.equal(h.serverCalls('POST', '/v2/withdraw/clearance').length, 1);
+    const ended = (await saved()).exitLock;
+    assert.deepEqual(ended.released.map(entry => [entry.kind, entry.outcome]), [[2, undefined]],
+        'the released proof has no recorded answer');
+    assert.ok(ended.released[0].notRecordedAt, 'the last answer, note_not_recorded, was kept before the wait');
+    assert.ok((await saved()).preparedWithdrawal.ownershipProof);
+
+    // The next attempt lets that lock go as a cancel would, sends the same
+    // proof again and closes cooperatively, with no escape.
+    h.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
+    const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+    assert.equal(plan.mode, 'mutual');
+    assert.equal(plan.decision.rule, 'E2');
+    assert.equal(proofsOf(h, 'ownership').length, 1, 'no second ownership proof');
+    assert.equal(proofsOf(h, 'escape').length, 0);
+    const calls = h.serverCalls('POST', '/v2/withdraw/clearance');
+    assert.equal(calls.length, 2);
+    assert.equal(new Set(calls.map(call => call.raw)).size, 1, 'the same ownership proof, sent again');
+    assert.deepEqual((await saved()).exitLock.released.map(entry => [entry.kind, entry.outcome]), [[2, 'granted'], [1, undefined]]);
 });
 
 test('E2: a fresh state closes cooperatively, journaling the close proof with its plan', async () => {
@@ -932,311 +1050,118 @@ test('E4.2: verified evidence at N⁺ refuses with device_not_newest; anything e
     }
 });
 
-test('E4.1: an exit uses the deposit-time path, then the indexer checked against the vault, then the vault logs', async () => {
-    const saved1 = await freshWallet({}, noteState({ deposit_path: depositPath('0x51') }));
-    saved1.runtime.treePath = () => assert.fail('no indexer with a saved deposit path');
-    const fromDeposit = await saved1.runtime.prepareWithdrawal('escape', DESTINATION);
-    assert.equal(fromDeposit.pathSource, 'deposit');
-    assert.equal(fromDeposit.public_inputs.active_root, '0x51');
-
-    const indexed = await freshWallet();
-    const fromIndexer = await indexed.runtime.prepareWithdrawal('escape', DESTINATION);
-    assert.equal(fromIndexer.pathSource, 'indexer');
-    assert.equal(fromIndexer.public_inputs.active_root, indexed.chain.root);
-
-    // An indexer that lies about the root (or is down) gives way to the
-    // vault's own logs, from the user's exit RPC when one is set.
-    for (const exitRpc of [false, true]) {
-        const rebuilt = await freshWallet();
-        rebuilt.runtime.treePath = async () => ({ active_root: '0xbad', note_id: 7, siblings: [] });
-        const calls = [];
-        const rpc = source => async ({ method, params }) => {
-            calls.push([source, method]);
-            if (method === 'eth_chainId') return '0xaa36a7';
-            if (method === 'eth_getBlockByNumber') return { number: '0x64' };
-            assert.equal(method, 'eth_getLogs');
-            return [{ address: VAULT, blockNumber: '0x10', logIndex: '0x0', removed: false,
-                topics: [ABI.noteDeposited, `0x${'0'.repeat(63)}7`, `0x${'ab'.repeat(32)}`],
-                data: `0x${[5_000_000, 2_000_000_000, 0x6161].map(value => BigInt(value).toString(16).padStart(64, '0')).join('')}` }];
-        };
-        rebuilt.runtime.pinnedRpc = () => rpc('pinned');
-        if (exitRpc) rebuilt.runtime.exitRpc = () => rpc('exit');
-        const plan = await rebuilt.runtime.prepareWithdrawal('escape', DESTINATION);
-        assert.equal(plan.pathSource, 'rebuild');
-        assert.equal(rebuilt.worker.rebuilds, 1);
-        const rebuildCalls = calls.filter(([, method]) => ['eth_getLogs', 'eth_getBlockByNumber'].includes(method));
-        assert.ok(rebuildCalls.length >= 2);
-        assert.ok(rebuildCalls.every(([source]) => source === (exitRpc ? 'exit' : 'pinned')));
-        assert.equal(BigInt(plan.public_inputs.active_root), 0x6161n);
+test('E4.1: exits need no path: an escape and a mutual close read neither the indexer nor a root, before activation too', async () => {
+    const secret = '0x51';
+    const h = await freshWallet({}, noteState({ secret_s: secret, registration_commitment: registrationCommitmentFor(secret) }));
+    // The note waits third in the activation queue: exits do not wait for it.
+    h.runtime.rememberActivation(7, 4, 'vault');
+    assert.equal(h.runtime.snapshot().config.activation.status, 'activating');
+    assert.equal(h.runtime.snapshot().config.activation.queue_position, 3);
+    h.runtime.treePath = () => assert.fail('an exit never asks the indexer for a path');
+    h.runtime.pinnedRpc = () => assert.fail('an exit never rebuilds the tree from logs');
+    const vaultWord = h.runtime.vaultWord;
+    h.runtime.vaultWord = async (data, signal) => {
+        assert.ok(!['0xfdab463d', '0x93e0ce4e'].includes(data), `an exit reads no root or activation cursor (${data})`);
+        return vaultWord(data, signal);
+    };
+    h.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
+    const close = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+    assert.equal(close.mode, 'mutual');
+    for (const mode of ['ownership', 'mutual']) {
+        const [call] = proofsOf(h, mode);
+        assert.deepEqual(Object.keys(call.payload.args).filter(key => ['active_root', 'merkle_siblings'].includes(key)), [], mode);
     }
+    // The statement names the note by its vault record: C and M's parts.
+    assert.equal(close.public_inputs.registration_commitment, registrationCommitmentFor(secret));
+    assert.equal(close.public_inputs.deposit_amount, 5_000_000);
+    assert.equal(close.public_inputs.expiry, 2_000_000_000);
+    assert.equal('pathSource' in close, false);
+    const escapeWallet = await freshWallet({}, noteState({ secret_s: secret }));
+    escapeWallet.runtime.treePath = () => assert.fail('an escape never asks the indexer for a path');
+    escapeWallet.runtime.pinnedRpc = () => assert.fail('an escape never rebuilds the tree from logs');
+    const escape = await escapeWallet.runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(escape.mode, 'escape');
+    assert.equal(escape.public_inputs.registration_commitment, registrationCommitmentFor(secret));
+    assert.equal(escapeWallet.chain.reads.filter(read => read === '0xfdab463d').length, 0);
+    // No path source is left to report in the exit summary.
+    const exit = escapeWallet.runtime.snapshot().config.exit;
+    assert.equal('deposit_path_saved' in exit, false);
+    assert.equal('exit_rpc_recommended' in exit, false);
 });
 
-test('E4.1: with an exit RPC the indexer root is checked against it, and after UnknownRoot any source but the refused root is used', async () => {
-    const logs = (h, calls, source) => async ({ method, params }) => {
-        calls.push([source, method, params?.[0]?.data ?? null]);
-        if (method === 'eth_chainId') return '0xaa36a7';
-        if (method === 'eth_getBlockByNumber') return { number: '0x64' };
-        if (method === 'eth_call') return `0x${BigInt(h.exitRoot).toString(16).padStart(64, '0')}`;
-        assert.equal(method, 'eth_getLogs');
-        return [{ address: VAULT, blockNumber: '0x10', logIndex: '0x0', removed: false,
-            topics: [ABI.noteDeposited, `0x${'0'.repeat(63)}7`, `0x${'ab'.repeat(32)}`],
-            data: `0x${[5_000_000, 2_000_000_000, 0x6161].map(value => BigInt(value).toString(16).padStart(64, '0')).join('')}` }];
-    };
-    // The indexer and the pinned RPC agree on a root the user's RPC does not
-    // report: the vault logs decide, through the exit RPC.
-    const lying = await freshWallet();
-    const lyingCalls = [];
-    lying.exitRoot = '0x88';
-    lying.runtime.exitRpc = () => logs(lying, lyingCalls, 'exit');
-    const fromLogs = await lying.runtime.prepareWithdrawal('escape', DESTINATION);
-    assert.equal(fromLogs.pathSource, 'rebuild');
-    assert.ok(lyingCalls.some(([, method, data]) => method === 'eth_call' && data === '0xfdab463d'),
-        'the indexer root was checked through the exit RPC');
-    // An indexer path at the exit RPC's root is used, whatever the pinned RPC says.
-    const agreeing = await freshWallet();
-    agreeing.exitRoot = '0x88';
-    agreeing.runtime.exitRpc = () => logs(agreeing, [], 'exit');
-    agreeing.runtime.treePath = async noteId => ({ active_root: '0x88', note_id: noteId,
-        siblings: Array.from({ length: 32 }, (_, index) => `0x88${index.toString(16)}`) });
-    const fromIndexer = await agreeing.runtime.prepareWithdrawal('escape', DESTINATION);
-    assert.equal(fromIndexer.pathSource, 'indexer');
-    assert.equal(fromIndexer.public_inputs.active_root, '0x88');
-
-    // After the vault refused a proof's root, the re-proof skips the saved
-    // deposit path: the indexer at the vault's current root first.
-    const refused = await freshWallet({}, noteState({ deposit_path: depositPath('0x51') }));
-    const calls = [];
-    refused.runtime.pinnedRpc = () => logs(refused, calls, 'pinned');
-    const first = await refused.runtime.prepareWithdrawal('escape', DESTINATION);
-    assert.equal(first.pathSource, 'deposit');
-    const again = await refused.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true, refusedRoot: '0x51' });
-    assert.equal(again.pathSource, 'indexer');
-    assert.equal(again.public_inputs.active_root, refused.chain.root);
-    // An indexer that is down, or whose root is the refused one, gives way
-    // to the vault's logs.
-    refused.runtime.treePath = () => { throw new Error('indexer down'); };
-    const fromRefusedLogs = await refused.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true, refusedRoot: '0x51' });
-    assert.equal(fromRefusedLogs.pathSource, 'rebuild');
-    assert.equal(BigInt(fromRefusedLogs.public_inputs.active_root), 0x6161n);
-    // Without a saved path the snapshot asks for an exit RPC.
-    assert.equal(refused.runtime.snapshot().config.exit.exit_rpc_recommended, false, 'a saved path');
-    const unsaved = await freshWallet();
-    assert.equal(unsaved.runtime.snapshot().config.exit.deposit_path_saved, false);
-    assert.equal(unsaved.runtime.snapshot().config.exit.exit_rpc_recommended, true);
-    unsaved.runtime.setExitRpcUrl('https://exit.example/rpc');
-    assert.equal(unsaved.runtime.snapshot().config.exit.exit_rpc_recommended, false, 'an exit RPC is set');
-    unsaved.runtime.setExitRpcUrl(null);
-    const sameRoot = await freshWallet({}, noteState({ deposit_path: depositPath('0x77') }));
-    sameRoot.runtime.pinnedRpc = () => logs(sameRoot, [], 'pinned');
-    sameRoot.runtime.treePath = () => assert.fail('no indexer path at the refused root');
-    const skipped = await sameRoot.runtime.prepareWithdrawal('escape', DESTINATION, { refusedRoot: '0x77' });
-    assert.equal(skipped.pathSource, 'rebuild');
-    // Logs that end at the refused root are a path failure the caller may
-    // answer by submitting the proof it has.
-    await assert.rejects(sameRoot.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true, refusedRoot: '0x6161' }),
-        error => error.code === 'tree_root_refused' && error.data.exit_path_unavailable === true);
-    await assert.rejects(refused.runtime.prepareWithdrawal('escape', DESTINATION, { refusedRoot: 'not-a-root' }), /refused Merkle root/);
-    // A mutual close re-proved after UnknownRoot also takes a path at another root.
-    const close = await freshWallet();
-    close.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
-    close.runtime.pinnedRpc = () => logs(close, [], 'pinned');
-    const closed = await close.runtime.prepareWithdrawal('mutual', DESTINATION);
-    assert.equal(closed.pathSource, 'indexer');
-    close.runtime.treePath = () => assert.fail('no indexer path at the refused root');
-    const reclosed = await close.runtime.prepareWithdrawal('mutual', DESTINATION, { reprove: true,
-        refusedRoot: closed.public_inputs.active_root });
-    assert.equal(reclosed.mode, 'mutual');
-    assert.equal(reclosed.pathSource, 'rebuild');
-    assert.equal(BigInt(reclosed.public_inputs.active_root), 0x6161n);
-    assert.equal(proofsOf(close, 'ownership').length, 1, 'the saved clearance is reused');
-});
-
-test('E4.1 and §6.6: without an exit RPC the wallet provider is read before the pinned RPC, and a stalled rebuild ends by its budget', async () => {
-    const logsVia = (calls, source, { refuseLogs = false } = {}) => async ({ method, params }) => {
-        calls.push([source, method]);
-        if (method === 'eth_chainId') return '0xaa36a7';
-        if (method === 'eth_getBlockByNumber') return { number: '0x64' };
-        if (method === 'eth_call') return `0x${(0x99).toString(16).padStart(64, '0')}`;
-        assert.equal(method, 'eth_getLogs');
-        if (refuseLogs) throw new Error('eth_getLogs is not supported');
-        return [{ address: VAULT, blockNumber: '0x10', logIndex: '0x0', removed: false,
-            topics: [ABI.noteDeposited, `0x${'0'.repeat(63)}7`, `0x${'ab'.repeat(32)}`],
-            data: `0x${[5_000_000, 2_000_000_000, 0x6161].map(value => BigInt(value).toString(16).padStart(64, '0')).join('')}` }];
-    };
-    // The indexer's root is checked through the wallet provider: the pinned
-    // RPC's root (0x77) is not asked.
-    const viaWallet = await freshWallet();
-    const calls = [];
-    viaWallet.runtime.treePath = async (noteId, _existing, root) => ({ active_root: `0x${BigInt(root).toString(16)}`, note_id: noteId,
-        siblings: Array.from({ length: 32 }, (_, index) => `0x99${index.toString(16)}`) });
-    const indexed = await viaWallet.runtime.prepareWithdrawal('escape', DESTINATION, { walletRequest: logsVia(calls, 'wallet') });
-    assert.equal(indexed.pathSource, 'indexer');
-    assert.equal(BigInt(indexed.public_inputs.active_root), 0x99n);
-    assert.equal(viaWallet.chain.reads.filter(read => read === '0xfdab463d').length, 0, 'the pinned RPC root is not read');
-    // The rebuild reads the wallet's logs, and the pinned RPC only when the
-    // wallet refuses them.
-    for (const refuseLogs of [false, true]) {
-        const h = await freshWallet();
-        h.runtime.treePath = () => { throw new Error('indexer down'); };
-        const seen = [];
-        h.runtime.pinnedRpc = () => logsVia(seen, 'pinned');
-        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { walletRequest: logsVia(seen, 'wallet', { refuseLogs }) });
-        assert.equal(plan.pathSource, 'rebuild');
-        const logReads = seen.filter(([, method]) => method === 'eth_getLogs').map(([source]) => source);
-        assert.equal(logReads[0], 'wallet');
-        assert.equal(logReads.includes('pinned'), refuseLogs, `pinned RPC read: ${refuseLogs}`);
-    }
-    // A wallet that never answers a log read gives way to the pinned RPC
-    // after E0's per-call bound, within the same rebuild budget.
-    const silent = await freshWallet();
-    silent.runtime.treePath = () => { throw new Error('indexer down'); };
-    silent.runtime.exitTimingOverrides = { callTimeoutMs: 30 };
-    const silentCalls = [];
-    silent.runtime.pinnedRpc = () => logsVia(silentCalls, 'pinned');
-    const fromPinned = await within(5_000, silent.runtime.prepareWithdrawal('escape', DESTINATION, {
-        walletRequest: async request => request.method === 'eth_getLogs' ? new Promise(() => {}) : logsVia([], 'wallet')(request)
-    }), 'a silent wallet');
-    assert.equal(fromPinned.pathSource, 'rebuild');
-    assert.ok(silentCalls.some(([, method]) => method === 'eth_getLogs'));
-    // A wallet on another chain is not used for either read.
-    const otherChain = await freshWallet();
-    otherChain.runtime.treePath = () => { throw new Error('indexer down'); };
-    const pinnedCalls = [];
-    otherChain.runtime.pinnedRpc = () => logsVia(pinnedCalls, 'pinned');
-    const walletCalls = [];
-    const plan = await otherChain.runtime.prepareWithdrawal('escape', DESTINATION, { walletRequest: async request => {
-        walletCalls.push(request.method);
-        if (request.method === 'eth_chainId') return '0x1';
-        throw new Error(`a wallet on another chain is never asked for ${request.method}`);
-    } });
-    assert.equal(plan.pathSource, 'rebuild');
-    assert.ok(pinnedCalls.some(([, method]) => method === 'eth_getLogs'));
-    assert.ok(walletCalls.every(method => method === 'eth_chainId'));
-
-    // A pinned RPC that answers every log range just inside the per-call
-    // timeout cannot stretch the rebuild past its budget.
-    const stalled = await freshWallet();
-    stalled.runtime.treePath = () => { throw new Error('indexer down'); };
-    stalled.runtime.browserConfig.trusted_deployment = { ...stalled.runtime.browserConfig.trusted_deployment, deploy_block: 0 };
-    stalled.runtime.exitTimingOverrides = { rebuildBudgetMs: 150 };
-    let ranges = 0;
-    stalled.runtime.pinnedRpc = () => async ({ method }) => {
-        if (method === 'eth_chainId') return '0xaa36a7';
-        if (method === 'eth_getBlockByNumber') return { number: '0x989680' };
-        ranges += 1;
-        await new Promise(resolve => setTimeout(resolve, 40));
-        return [];
-    };
-    const started = Date.now();
-    await within(2_000, assert.rejects(stalled.runtime.prepareWithdrawal('escape', DESTINATION),
-        error => error.code === 'tree_rebuild_timeout' && error.data.exit_path_unavailable === true), 'a stalled rebuild');
-    assert.ok(Date.now() - started < 3_000);
-    assert.ok(ranges >= 1 && ranges <= 6, `ranges ${ranges}`);
-    assert.equal((await saved()).exitLock, null, 'nothing was released');
-});
-
-test('E4.1 and §6.6: an exit RPC on another chain, or one that fails, gives way to the wallet provider and the pinned RPC for the root and the logs', async () => {
-    const logsVia = (calls, source) => async ({ method, params }) => {
-        calls.push([source, method]);
-        if (method === 'eth_chainId') return '0xaa36a7';
-        if (method === 'eth_getBlockByNumber') return { number: '0x64' };
-        if (method === 'eth_call') return `0x${(0x99).toString(16).padStart(64, '0')}`;
-        assert.equal(method, 'eth_getLogs');
-        return [{ address: VAULT, blockNumber: '0x10', logIndex: '0x0', removed: false,
-            topics: [ABI.noteDeposited, `0x${'0'.repeat(63)}7`, `0x${'ab'.repeat(32)}`],
-            data: `0x${[5_000_000, 2_000_000_000, 0x6161].map(value => BigInt(value).toString(16).padStart(64, '0')).join('')}` }];
-    };
-    for (const [label, exitRpc, exitAsked] of [
-        ['on another chain', calls => async ({ method }) => {
-            calls.push(method);
-            return method === 'eth_chainId' ? '0x1' : `0x${(0x88).toString(16).padStart(64, '0')}`;
-        }, ['eth_chainId']],
-        ['failing', calls => async ({ method }) => {
-            calls.push(method);
-            if (method === 'eth_chainId') return '0xaa36a7';
-            throw new Error('exit RPC down');
-        }, null]
+test('E4.1: an exit proof bound to another note record never leaves the wallet', async () => {
+    const secret = '0x51';
+    const state = noteState({ secret_s: secret, registration_commitment: registrationCommitmentFor(secret) });
+    for (const [label, mutate] of [
+        ['another registration commitment', plan => { plan.public_inputs.registration_commitment = '0xbad'; }],
+        ['another deposit amount', plan => { plan.public_inputs.deposit_amount = 4_999_999; }],
+        ['another expiry', plan => { plan.public_inputs.expiry = 2_000_000_001; }]
     ]) {
-        // The indexer's root is checked through the wallet provider.
-        const indexed = await freshWallet();
-        const exitCalls = [];
-        indexed.runtime.exitRpc = () => exitRpc(exitCalls);
-        indexed.runtime.treePath = async (noteId, _existing, root) => ({ active_root: `0x${BigInt(root).toString(16)}`, note_id: noteId,
-            siblings: Array.from({ length: 32 }, (_, index) => `0x99${index.toString(16)}`) });
-        const viaWallet = await indexed.runtime.prepareWithdrawal('escape', DESTINATION, { walletRequest: logsVia([], 'wallet') });
-        assert.equal(viaWallet.pathSource, 'indexer', label);
-        assert.equal(BigInt(viaWallet.public_inputs.active_root), 0x99n, `${label}: the wallet's root, not the exit RPC's`);
-        if (exitAsked) assert.deepEqual([...new Set(exitCalls)], exitAsked, `${label}: asked only for its chain`);
-        // The rebuild reads the logs through the wallet provider, then the
-        // pinned RPC.
-        const rebuilt = await freshWallet();
-        const exitLogCalls = [];
-        rebuilt.runtime.exitRpc = () => exitRpc(exitLogCalls);
-        rebuilt.runtime.treePath = () => { throw new Error('indexer down'); };
-        const seen = [];
-        rebuilt.runtime.pinnedRpc = () => logsVia(seen, 'pinned');
-        const plan = await rebuilt.runtime.prepareWithdrawal('escape', DESTINATION, { walletRequest: logsVia(seen, 'wallet') });
-        assert.equal(plan.pathSource, 'rebuild', label);
-        assert.equal(BigInt(plan.public_inputs.active_root), 0x6161n, label);
-        assert.equal(seen.find(([, method]) => method === 'eth_getLogs')?.[0], 'wallet', label);
-        if (exitAsked) assert.deepEqual([...new Set(exitLogCalls)], exitAsked, `${label}: no logs from another chain`);
-        const fromPinned = await freshWallet();
-        fromPinned.runtime.exitRpc = () => exitRpc([]);
-        fromPinned.runtime.treePath = () => { throw new Error('indexer down'); };
-        const pinnedSeen = [];
-        fromPinned.runtime.pinnedRpc = () => logsVia(pinnedSeen, 'pinned');
-        assert.equal((await fromPinned.runtime.prepareWithdrawal('escape', DESTINATION)).pathSource, 'rebuild', label);
-        assert.ok(pinnedSeen.some(([, method]) => method === 'eth_getLogs'), `${label}: the pinned RPC's logs without a wallet`);
+        const escape = await freshWallet({}, state);
+        escape.worker.mutate = mutate;
+        await assert.rejects(escape.runtime.prepareWithdrawal('escape', DESTINATION), /does not match its decision/, label);
+        assert.equal((await saved()).exitLock, null, `${label}: the escape released nothing`);
+        // An ownership proof that names another record is never sent.
+        const close = await freshWallet({}, state);
+        close.worker.mutate = (plan, payload) => { if (payload.args.mode === 'ownership') mutate(plan); };
+        close.server.clearance = () => assert.fail('a mismatched ownership proof is never sent');
+        await assert.rejects(close.runtime.prepareWithdrawal('mutual', DESTINATION), /does not match its saved balance and vault/, label);
+        const closeProof = await freshWallet({}, state);
+        closeProof.worker.mutate = (plan, payload) => { if (payload.args.mode === 'mutual') mutate(plan); };
+        closeProof.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
+        await assert.rejects(closeProof.runtime.prepareWithdrawal('mutual', DESTINATION), /bound to another note/, label);
     }
+    // A state that carries no commitment still exits: only its metadata is checked.
+    const legacy = await freshWallet({}, noteState({ secret_s: secret }));
+    legacy.worker.mutate = plan => { plan.public_inputs.registration_commitment = '0xbad'; };
+    assert.equal((await legacy.runtime.prepareWithdrawal('escape', DESTINATION)).mode, 'escape');
 });
 
-test('the deposit-time path is saved only when it leads to the root the deposit set (Amendment A1)', async () => {
-    for (const matches of [true, false]) {
-        indexedDB.clear();
-        const h = createHarness(BrowserWalletRuntime);
-        const pending = { operationId: 'deposit', phase: 'submitted', amount: 5_000_000, secret: '0x51',
-            commitment: '0x52', next_note_id: 7, zero_path: Array.from({ length: 32 }, (_, index) => `0x${index}`),
-            transactionHash: `0x${'aa'.repeat(32)}` };
-        await store.writeBrowserWallet({ deploymentId: DEPLOYMENT, billingAsset: 'native_eth', state: null, pendingDeposit: pending });
-        await h.runtime.reload();
-        h.worker.pathMatches = payload => {
-            assert.equal(payload.path.active_root, `0x${'0'.repeat(60)}6161`);
-            return matches;
-        };
-        const call = h.runtime.worker.call;
-        h.runtime.worker.call = async (operation, payload) => operation === 'confirmDeposit'
-            ? noteState({ note_id: 7 })
-            : call(operation, payload);
-        await h.runtime.confirmDeposit({ operationId: 'deposit', secret: '0x51', note_id: 7, amount: 5_000_000,
-            commitment: '0x52', expiry_ts: 2_000_000_000, deposit_root: '0x6161' });
-        const state = (await saved()).state;
-        assert.equal(Boolean(state.deposit_path), matches);
-        if (matches) assert.deepEqual(state.deposit_path.siblings, pending.zero_path);
-        assert.equal((await saved()).stateSeq, 1);
-        // Request proofs and installs keep it, although the WebAssembly's
-        // state drops every field it does not know (the harness's worker
-        // returns only BrowserNoteState's fields, as the real one does).
-        if (matches) {
-            h.server.leasePost = body => h.activeLease(body);
-            await h.runtime.issueLease('chat');
-            const requested = await saved();
-            assert.equal(h.workerOperations('prepareRequest')[0].payload.state.deposit_path != null, true);
-            assert.deepEqual(requested.state.deposit_path, state.deposit_path, 'after a request proof');
-            h.server.requests = () => ({ status: 'ok', request_response: h.receiptFor(requested.journal) });
-            assert.equal(await h.runtime.installRecoveredResponse(requested.journal.client_request_id), true);
-            const installed = (await saved()).state;
-            assert.equal(installed.current_anchor, '0x9999');
-            assert.deepEqual(installed.deposit_path, state.deposit_path, 'after an install');
-            // The escape from the installed successor uses the deposit-time
-            // path, with no indexer and no log rebuild.
-            h.runtime.treePath = () => assert.fail('no indexer with a saved deposit path');
-            h.runtime.pinnedRpc = () => assert.fail('no log rebuild with a saved deposit path');
-            const escape = await h.runtime.prepareWithdrawal('escape', DESTINATION);
-            assert.equal(escape.pathSource, 'deposit');
-            assert.equal(BigInt(escape.public_inputs.active_root), 0x6161n);
-            assert.equal(escape.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'));
-        }
-    }
+test('a confirmed deposit carries its registration commitment through request proofs and installs', async () => {
+    indexedDB.clear();
+    const h = createHarness(BrowserWalletRuntime);
+    const secret = '0x51';
+    const commitment = registrationCommitmentFor(secret);
+    // Recorded at note 9, after the predicted slot 7: the vault numbers a note at inclusion.
+    const pending = { operationId: 'deposit', phase: 'submitted', amount: 5_000_000, secret, commitment, next_note_id: 7,
+        transactionHash: `0x${'aa'.repeat(32)}` };
+    await store.writeBrowserWallet({ deploymentId: DEPLOYMENT, billingAsset: 'native_eth', state: null, pendingDeposit: pending });
+    await h.runtime.reload();
+    const call = h.runtime.worker.call;
+    h.runtime.worker.call = async (operation, payload) => operation === 'confirmDeposit'
+        ? noteState({ note_id: payload.args.note_id, secret_s: payload.args.secret })
+        : call(operation, payload);
+    await h.runtime.confirmDeposit({ operationId: 'deposit', secret, note_id: 9, amount: 5_000_000, commitment,
+        expiry_ts: 2_000_000_000 });
+    const state = (await saved()).state;
+    assert.equal(state.note_id, 9);
+    assert.equal(state.registration_commitment, commitment);
+    assert.equal('deposit_path' in state, false);
+    assert.equal((await saved()).stateSeq, 1);
+    // Request proofs and installs keep it, although the WebAssembly's state
+    // drops every field it does not know (the harness's worker returns only
+    // BrowserNoteState's fields, as the real one does).
+    h.server.leasePost = body => h.activeLease(body);
+    await h.runtime.issueLease('chat');
+    const requested = await saved();
+    assert.equal(requested.state.registration_commitment, commitment, 'after a request proof');
+    h.server.requests = () => ({ status: 'ok', request_response: h.receiptFor(requested.journal) });
+    assert.equal(await h.runtime.installRecoveredResponse(requested.journal.client_request_id), true);
+    const installed = (await saved()).state;
+    assert.equal(installed.current_anchor, '0x9999');
+    assert.equal(installed.registration_commitment, commitment, 'after an install');
+    // The escape from the installed successor is checked against it.
+    const escape = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(escape.public_inputs.registration_commitment, commitment);
+    assert.equal(escape.public_inputs.note_id, 9);
+    assert.equal(escape.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'));
+    // Another pending deposit's confirmation is refused.
+    indexedDB.clear();
+    const other = createHarness(BrowserWalletRuntime);
+    await store.writeBrowserWallet({ deploymentId: DEPLOYMENT, billingAsset: 'native_eth', state: null, pendingDeposit: pending });
+    await other.runtime.reload();
+    await assert.rejects(other.runtime.confirmDeposit({ operationId: 'deposit', secret, note_id: 9, amount: 5_000_000,
+        commitment: '0xbad', expiry_ts: 2_000_000_000 }), /does not match/);
 });
 
 test('G1: the snapshot warns when B − bound_at_state is below three escape fees at the wallet\'s gas price', async () => {
@@ -1277,7 +1202,7 @@ test('G1: the snapshot warns when B − bound_at_state is below three escape fee
 });
 
 test('E7: the exit kit holds the state an escape needs and goes out of date after an install', async () => {
-    const h = await walletWithLiveRequest({}, noteState({ secret_s: '0x5ec', deposit_path: depositPath('0x51') }));
+    const h = await walletWithLiveRequest({}, noteState({ secret_s: '0x5ec' }));
     h.runtime.browserConfig.trusted_deployment = { ...h.runtime.browserConfig.trusted_deployment, deployment_id: 'kit-test' };
     const kit = await h.runtime.exportExitKit({ passphrase: 'correct horse battery' });
     const payload = await openExitKit(kit, 'correct horse battery');
@@ -1285,7 +1210,8 @@ test('E7: the exit kit holds the state an escape needs and goes out of date afte
     assert.equal(payload.trusted_deployment.deployment_id, 'kit-test');
     assert.equal(payload.note.note_id, 7);
     assert.equal(payload.bound_at_state, String(BOUND));
-    assert.deepEqual(payload.merkle_path, depositPath('0x51'));
+    // An escape needs no path: the kit carries none.
+    assert.equal('merkle_path' in payload, false);
     assert.equal(h.runtime.snapshot().config.exit.exit_kit.out_of_date, false);
     // An install makes the kit stale.
     const journal = (await saved()).journal;

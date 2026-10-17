@@ -143,7 +143,7 @@ function scriptedChain() {
                     return `0x${[0, 0, 0, chain.noteStatus.get(noteId) ?? 3].map(word).join('')}`;
                 }
                 if (data.startsWith(SELECTOR.pending)) {
-                    return `0x${[1, 0x11, 0x99, FINAL_BALANCE, DESTINATION, CLOSE_BLOCK].map(word).join('')}`;
+                    return `0x${[1, 0x99, FINAL_BALANCE, DESTINATION, CLOSE_BLOCK].map(word).join('')}`;
                 }
                 if (data.startsWith(SELECTOR.credits)) {
                     assert.equal(data.length, 10 + 64);
