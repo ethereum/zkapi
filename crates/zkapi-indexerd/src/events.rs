@@ -1,10 +1,11 @@
-//! Contract event types for the indexer (vault revision 3, circuit
-//! `zkapi-v2-concession-v1`).
+//! Contract event types for the indexer (vault revision 4, circuit
+//! `zkapi-v2-concession-v2`).
 //!
-//! The note tree is append-only: only `NoteDeposited` (sets a leaf) and
-//! `ClosedLeafRetired` (zeroes a closed note's leaf) change leaves. Every
-//! other event that carries a root carries the vault's unchanged
-//! `currentRoot`.
+//! `NoteDeposited` records a note and leaves the request tree unchanged.
+//! Only `NotesActivated` (appends the leaves of the next recorded notes) and
+//! `ClosedLeafRetired` (zeroes an activated, closed note's leaf) change
+//! leaves. Every other event that carries a root carries the vault's
+//! unchanged `currentRoot`.
 
 use serde::{Deserialize, Serialize};
 use zkapi_types::Felt252;
@@ -13,13 +14,23 @@ use zkapi_types::Felt252;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VaultEvent {
     /// `NoteDeposited(uint32 indexed noteId, bytes32 indexed commitment,
-    /// uint128 amount, uint64 expiryTs, uint256 newRoot)`.
+    /// uint128 amount, uint64 expiryTs)`: the note is recorded; its leaf
+    /// enters the tree when it is activated.
     NoteDeposited {
         note_id: u32,
         commitment: Felt252,
         amount: u128,
         expiry_ts: u64,
+    },
+    /// `NotesActivated(uint32 indexed firstNoteId, uint32 count,
+    /// uint256 newRoot, bool proved)`: the leaves of notes
+    /// `first_note_id .. first_note_id + count` were appended, by a proved
+    /// batch (`activateNotes`) or on-chain (`activateNotesOnChain`).
+    NotesActivated {
+        first_note_id: u32,
+        count: u32,
         new_root: Felt252,
+        proved: bool,
     },
     /// `MutualClose(uint32 indexed noteId, uint256 nullifier,
     /// uint128 finalBalance, address destination)`. No leaf removal.
@@ -77,27 +88,12 @@ pub enum VaultEvent {
         deposit_amount: u128,
         current_root: Felt252,
     },
-    /// `ClosedLeafRetired(uint32 indexed noteId, uint256 newRoot)`: a closed
-    /// note's leaf was zeroed.
+    /// `ClosedLeafRetired(uint32 indexed noteId, uint256 newRoot)`: an
+    /// activated, closed note's leaf was zeroed.
     ClosedLeafRetired { note_id: u32, new_root: Felt252 },
 }
 
 impl VaultEvent {
-    /// The note the event is about.
-    pub fn note_id(&self) -> u32 {
-        match self {
-            Self::NoteDeposited { note_id, .. }
-            | Self::MutualClose { note_id, .. }
-            | Self::EscapeWithdrawalInitiated { note_id, .. }
-            | Self::EscapeConcessionRecorded { note_id, .. }
-            | Self::EscapeConcessionRaised { note_id, .. }
-            | Self::EscapeWithdrawalChallenged { note_id, .. }
-            | Self::EscapeWithdrawalFinalized { note_id, .. }
-            | Self::ExpiredClaimed { note_id, .. }
-            | Self::ClosedLeafRetired { note_id, .. } => *note_id,
-        }
-    }
-
     /// The nullifiers the event makes public: a `withdrawalNullifier` or a
     /// `nextNullifier` (§5.2). The server never serves request data or
     /// evidence for one.
@@ -110,6 +106,7 @@ impl VaultEvent {
             | Self::EscapeWithdrawalFinalized { nullifier, .. } => vec![*nullifier],
             Self::EscapeConcessionRecorded { next_nullifier, .. } => vec![*next_nullifier],
             Self::NoteDeposited { .. }
+            | Self::NotesActivated { .. }
             | Self::ExpiredClaimed { .. }
             | Self::ClosedLeafRetired { .. } => Vec::new(),
         }

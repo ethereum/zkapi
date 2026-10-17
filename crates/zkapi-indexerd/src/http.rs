@@ -3,7 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -12,10 +13,10 @@ use zkapi_types::Felt252;
 
 use crate::poller::{normalize_address, spawn_json_rpc_log_poller, JsonRpcLogPoller, PollerConfig};
 use crate::service::{
-    IndexerService, KnownRootResponse, NextNoteIdResponse, PendingEscapesResponse,
-    PublishedNullifierResponse, ServiceSettings, SyncStatus, TreePathResponse, TreeRootResponse,
-    TreeSnapshotResponse, TreeView,
+    IndexerService, NextNoteIdResponse, PendingEscapesResponse, PublishedNullifierResponse,
+    ServiceSettings, SyncStatus, TreePathResponse, TreeRootResponse, TreeView,
 };
+use crate::tree_mirror::NoteRecord;
 
 /// Seconds a client should wait before retrying an unavailable indexer.
 const RETRY_AFTER_SECONDS: u64 = 5;
@@ -145,8 +146,6 @@ pub fn create_router(service: Arc<IndexerService>) -> Router {
         .route("/v1/tree/next-note-id", get(handle_next_note_id))
         .route("/v1/tree/snapshot", get(handle_snapshot))
         .route("/v1/tree/notes/{note_id}/path", get(handle_note_path))
-        .route("/v1/tree/notes/{note_id}/zero-path", get(handle_zero_path))
-        .route("/v1/tree/roots/{root}", get(handle_known_root))
         .route(
             "/v1/nullifiers/{nullifier}/published",
             get(handle_published_nullifier),
@@ -207,24 +206,102 @@ async fn handle_root(
     Ok(Json(TreeRootResponse {
         root: view.root,
         next_note_id: view.next_note_id,
+        activation_cursor: view.activation_cursor,
         block_number: view.block_number,
         block_hash: view.block_hash.clone(),
     }))
 }
 
+/// What `GET /v1/tree/snapshot` serves, from its `parts` query parameter.
+/// A part depends only on the view, never on which note a client cares about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotParts {
+    /// No `parts`: the header, `leaves`, `note_leaves` and `notes`.
+    All,
+    /// `parts=tree`: the header and `leaves`, from which a prover derives
+    /// its path.
+    Tree,
+    /// `parts=records`: the header, `note_leaves` and `notes`, with which a
+    /// client corroborates a deposit.
+    Records,
+}
+
+impl SnapshotParts {
+    /// `None` unless `parts` is absent or is exactly one `tree` or
+    /// `records`. Other parameters are ignored.
+    fn parse(query: &[(String, String)]) -> Option<Self> {
+        let mut values = query
+            .iter()
+            .filter(|(key, _)| key == "parts")
+            .map(|(_, value)| value.as_str());
+        match (values.next(), values.next()) {
+            (None, _) => Some(Self::All),
+            (Some("tree"), None) => Some(Self::Tree),
+            (Some("records"), None) => Some(Self::Records),
+            _ => None,
+        }
+    }
+
+    fn leaves(self) -> bool {
+        self != Self::Records
+    }
+
+    fn records(self) -> bool {
+        self != Self::Tree
+    }
+}
+
+/// The snapshot body, borrowed from the view. Its fields and their order are
+/// those of [`TreeSnapshotResponse`](crate::service::TreeSnapshotResponse),
+/// so the full payload serializes exactly as that type does; a part omits
+/// the fields it does not carry.
+#[derive(serde::Serialize)]
+struct SnapshotBody<'a> {
+    root: Felt252,
+    next_note_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaves: Option<Vec<Felt252>>,
+    block_number: u64,
+    block_hash: &'a str,
+    activation_cursor: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note_leaves: Option<&'a [Felt252]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<&'a [NoteRecord]>,
+}
+
 /// Privacy-safe whole-tree snapshot. The same payload is returned regardless of
 /// which note the caller cares about, so the untrusted indexer never learns it.
+/// `parts=tree` keeps the header and `leaves` (the request path's need),
+/// `parts=records` the header, `note_leaves` and `notes`; without `parts`,
+/// everything. Each response is cut from one verified view, so the header of
+/// every part describes the same block.
 async fn handle_snapshot(
     State(service): State<AppState>,
-) -> Result<Json<TreeSnapshotResponse>, IndexerUnavailable> {
-    let view = served_view(&service)?;
-    Ok(Json(TreeSnapshotResponse {
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+) -> Response {
+    let Some(parts) = query
+        .ok()
+        .and_then(|Query(query)| SnapshotParts::parse(&query))
+    else {
+        return invalid_request("parts must be tree or records".to_string());
+    };
+    let view = match served_view(&service) {
+        Ok(view) => view,
+        Err(unavailable) => return unavailable.into_response(),
+    };
+    let records = parts.records();
+    Json(SnapshotBody {
         root: view.root,
         next_note_id: view.next_note_id,
-        leaves: view.mirror.current_leaves(),
+        leaves: parts.leaves().then(|| view.mirror.current_leaves()),
         block_number: view.block_number,
-        block_hash: view.block_hash.clone(),
-    }))
+        block_hash: &view.block_hash,
+        activation_cursor: view.activation_cursor,
+        note_leaves: records.then(|| view.mirror.note_leaves()),
+        notes: records.then(|| view.mirror.notes()),
+    })
+    .into_response()
 }
 
 async fn handle_next_note_id(
@@ -251,63 +328,28 @@ async fn handle_note_path(
         root: view.root,
         block_number: view.block_number,
         block_hash: view.block_hash.clone(),
+        activated: view.mirror.is_activated(note_id),
+        activation_cursor: view.activation_cursor,
     }))
 }
 
-/// Deprecated (§5.5): exits and defeats no longer need a zero-slot path.
-/// The siblings are the slot's current siblings; with a zero leaf they hash
-/// to the view's root only for an unused or retired slot.
-async fn handle_zero_path(
-    State(service): State<AppState>,
-    Path(note_id): Path<u32>,
-) -> Result<Response, IndexerUnavailable> {
-    let view = served_view(&service)?;
-    Ok((
-        [(header::HeaderName::from_static("deprecation"), "true")],
-        Json(TreePathResponse {
-            note_id,
-            leaf: Felt252::ZERO,
-            siblings: view.mirror.get_zero_path(note_id).to_vec(),
-            root: view.root,
-            block_number: view.block_number,
-            block_hash: view.block_hash.clone(),
-        }),
-    )
-        .into_response())
-}
-
-/// 400 for a path parameter that is not a canonical field element.
-fn invalid_felt(name: &str) -> Response {
+/// 400 in the indexer's error shape.
+fn invalid_request(message: String) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({
             "status": "error",
             "error_code": "invalid_request",
-            "error_message": format!("{name} must be a hex BN254 field element"),
+            "error_message": message,
             "retriable": false,
         })),
     )
         .into_response()
 }
 
-/// Whether the vault ever set `root` (Amendment A1): the vault accepts a
-/// proof at any of them, so a client keeps its deposit-time path.
-async fn handle_known_root(State(service): State<AppState>, Path(root): Path<String>) -> Response {
-    let Ok(root) = Felt252::from_hex(&root) else {
-        return invalid_felt("root");
-    };
-    let view = match served_view(&service) {
-        Ok(view) => view,
-        Err(unavailable) => return unavailable.into_response(),
-    };
-    Json(KnownRootResponse {
-        root,
-        known: view.mirror.is_known_root(&root),
-        current_root: view.root,
-        block_number: view.block_number,
-        block_hash: view.block_hash.clone(),
-    })
-    .into_response()
+/// 400 for a path parameter that is not a canonical field element.
+fn invalid_felt(name: &str) -> Response {
+    invalid_request(format!("{name} must be a hex BN254 field element"))
 }
 
 /// The published-nullifier table (§5.2): whether a vault event in the
@@ -359,20 +401,25 @@ mod tests {
     use zkapi_types::MERKLE_DEPTH;
 
     use crate::events::VaultEvent;
+    use crate::service::TreeSnapshotResponse;
+    use crate::tree_mirror::tests::{apply_all, Reference};
     use crate::tree_mirror::{EscapeClose, TreeMirror};
 
-    fn mirror_with_deposits(count: u32) -> TreeMirror {
+    /// `recorded` deposits, the first `activated` of them activated one by
+    /// one, with event roots checked.
+    fn mirror_with_notes(recorded: u32, activated: u32) -> TreeMirror {
+        let mut reference = Reference::new();
+        let mut events: Vec<VaultEvent> = (0..recorded)
+            .map(|note_id| reference.deposit(100 + u64::from(note_id)))
+            .collect();
+        events.extend((0..activated).map(|_| reference.activate(1)));
         let mut mirror = TreeMirror::new();
-        for note_id in 0..count {
-            mirror.process_event(&VaultEvent::NoteDeposited {
-                note_id,
-                commitment: Felt252::from_u64(100 + note_id as u64),
-                amount: 100,
-                expiry_ts: 1_700_000_000,
-                new_root: Felt252::from_u64(1),
-            });
-        }
+        apply_all(&mut mirror, &events);
         mirror
+    }
+
+    fn mirror_with_deposits(count: u32) -> TreeMirror {
+        mirror_with_notes(count, count)
     }
 
     fn block_hash(byte: &str) -> String {
@@ -389,13 +436,11 @@ mod tests {
         format!("http://{addr}")
     }
 
-    const SERVED_ROUTES: [&str; 8] = [
+    const SERVED_ROUTES: [&str; 6] = [
         "/v1/tree/root",
         "/v1/tree/next-note-id",
         "/v1/tree/snapshot",
         "/v1/tree/notes/0/path",
-        "/v1/tree/notes/0/zero-path",
-        "/v1/tree/roots/0x1",
         "/v1/nullifiers/0x1/published",
         "/v1/escapes/pending",
     ];
@@ -431,25 +476,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_deprecated_zero_path_endpoint_still_answers() {
+    async fn the_zero_path_and_known_root_routes_are_gone() {
+        // Deposits take no path and the vault keeps no root history.
         let service = Arc::new(IndexerService::new_ready(mirror_with_deposits(1)));
         let base = serve(service).await;
-
-        let response = reqwest::get(format!("{base}/v1/tree/notes/0/zero-path"))
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
-        assert_eq!(response.headers()["deprecation"], "true");
-        let response = response.json::<TreePathResponse>().await.unwrap();
-        assert_eq!(response.note_id, 0);
-        assert_eq!(response.leaf, Felt252::ZERO);
+        for route in ["/v1/tree/notes/0/zero-path", "/v1/tree/roots/0x1"] {
+            let response = reqwest::get(format!("{base}{route}")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{route}");
+        }
     }
 
     /// Two deposits, an escape of note 0 (N = 0x900, N+ = 0x901) and a
     /// mutual close of note 1 (N = 0x7001), with event roots checked.
     fn mirror_with_exits() -> TreeMirror {
-        use crate::tree_mirror::tests::{apply_all, Reference};
         let mut reference = Reference::new();
         let mut events = vec![reference.deposit(100), reference.deposit(101)];
         events.extend(reference.escape(0, 0x900));
@@ -515,44 +554,28 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[tokio::test]
-    async fn known_roots_include_every_root_the_vault_set() {
-        use crate::tree_mirror::tests::Reference;
+    /// Six recorded notes, four activated, note 1 closed and retired.
+    fn mirror_with_retired_note() -> TreeMirror {
         let mut reference = Reference::new();
+        let mut events: Vec<VaultEvent> = (0..6).map(|n| reference.deposit(100 + n)).collect();
+        events.push(reference.activate(4));
+        events.push(reference.close(1));
+        events.push(reference.retire(1));
         let mut mirror = TreeMirror::new();
-        mirror.apply_event(&reference.deposit(100)).unwrap();
-        let first = mirror.root();
-        mirror.apply_event(&reference.deposit(101)).unwrap();
-        let service = Arc::new(IndexerService::new_ready(mirror));
-        let base = serve(service.clone()).await;
-        let known = |root: Felt252| {
-            let base = base.clone();
-            async move {
-                reqwest::get(format!("{base}/v1/tree/roots/{}", root.to_hex()))
-                    .await
-                    .unwrap()
-                    .json::<KnownRootResponse>()
-                    .await
-                    .unwrap()
-            }
-        };
-        let current = service.view().unwrap().root;
-        for root in [TreeMirror::empty_root(), first, current] {
-            let response = known(root).await;
-            assert!(response.known, "{root}");
-            assert_eq!(response.root, root);
-            assert_eq!(response.current_root, current);
-        }
-        assert!(!known(Felt252::from_u64(77)).await.known);
-        let invalid = reqwest::get(format!("{base}/v1/tree/roots/not-hex"))
+        apply_all(&mut mirror, &events);
+        mirror
+    }
+
+    async fn get_snapshot(base: &str, query: &str) -> (StatusCode, String) {
+        let response = reqwest::get(format!("{base}/v1/tree/snapshot{query}"))
             .await
             .unwrap();
-        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        (response.status(), response.text().await.unwrap())
     }
 
     #[tokio::test]
     async fn snapshot_lets_a_client_rebuild_paths_locally() {
-        let service = Arc::new(IndexerService::new_ready(mirror_with_deposits(3)));
+        let service = Arc::new(IndexerService::new_ready(mirror_with_retired_note()));
         let base = serve(service.clone()).await;
 
         let snapshot = reqwest::get(format!("{base}/v1/tree/snapshot"))
@@ -565,9 +588,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.leaves.len() as u32, snapshot.next_note_id);
+        assert_eq!(snapshot.next_note_id, 6);
+        assert_eq!(snapshot.activation_cursor, 4);
         let view = service.view().unwrap();
         assert_eq!(snapshot.block_number, view.block_number);
         assert_eq!(snapshot.block_hash, view.block_hash);
+        // The tree leaves are zero for the retired note and the two notes
+        // not yet activated; the recorded leaves and records cover all six.
+        let zero: Vec<bool> = snapshot.leaves.iter().map(Felt252::is_zero).collect();
+        assert_eq!(zero, [false, true, false, false, true, true]);
+        assert_eq!(snapshot.note_leaves, view.mirror.note_leaves());
+        assert_eq!(snapshot.notes.len(), 6);
+        for (note_id, note) in snapshot.notes.iter().enumerate() {
+            assert_eq!(
+                *note,
+                NoteRecord {
+                    note_id: note_id as u32,
+                    commitment: Felt252::from_u64(100 + note_id as u64),
+                    amount: 1_000,
+                    expiry_ts: 1_700_000_000,
+                }
+            );
+            assert_eq!(note.leaf(), snapshot.note_leaves[note_id]);
+        }
+        let body: serde_json::Value = reqwest::get(format!("{base}/v1/tree/snapshot"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["notes"][2],
+            serde_json::json!({
+                "note_id": 2,
+                "commitment": "0x66",
+                "amount": 1_000,
+                "expiry_ts": 1_700_000_000u64,
+            })
+        );
 
         // A client rebuilds the whole tree from the snapshot alone — no per-slot
         // request — and recovers the root plus any sibling path locally.
@@ -576,11 +634,111 @@ mod tests {
             local.insert(*leaf);
         }
         assert_eq!(local.root(), snapshot.root);
-        assert_eq!(
-            local.get_siblings(1).to_vec(),
-            view.mirror.get_path(1).to_vec(),
-            "locally derived path must match the indexer's per-slot path"
-        );
+        for slot in [0, 2, 4] {
+            assert_eq!(
+                local.get_siblings(slot).to_vec(),
+                view.mirror.get_path(slot).to_vec(),
+                "locally derived path must match the indexer's per-slot path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_parts_are_cut_from_one_view() {
+        let service = Arc::new(IndexerService::new_syncing(ServiceSettings::default()));
+        service.publish_head(TreeView::new(
+            Arc::new(mirror_with_retired_note()),
+            42,
+            block_hash("42"),
+        ));
+        service.record_success();
+        let base = serve(service.clone()).await;
+        let view = service.view().unwrap();
+
+        // Without `parts`, the body is byte for byte the full snapshot.
+        let (status, full) = get_snapshot(&base, "").await;
+        assert_eq!(status, StatusCode::OK);
+        let expected = serde_json::to_string(&TreeSnapshotResponse {
+            root: view.root,
+            next_note_id: view.next_note_id,
+            leaves: view.mirror.current_leaves(),
+            block_number: view.block_number,
+            block_hash: view.block_hash.clone(),
+            activation_cursor: view.activation_cursor,
+            note_leaves: view.mirror.note_leaves().to_vec(),
+            notes: view.mirror.notes().to_vec(),
+        })
+        .unwrap();
+        assert_eq!(full, expected);
+        let full: serde_json::Value = serde_json::from_str(&full).unwrap();
+
+        // Each part is the full body less the other part's fields, so its
+        // header is the same view's.
+        for (query, dropped) in [
+            ("?parts=tree", &["note_leaves", "notes"][..]),
+            ("?parts=records", &["leaves"][..]),
+            // Other parameters, such as a cache buster, are ignored.
+            ("?_=1&parts=tree", &["note_leaves", "notes"][..]),
+        ] {
+            let (status, body) = get_snapshot(&base, query).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let mut expected = full.clone();
+            for field in dropped {
+                assert!(expected.as_object_mut().unwrap().remove(*field).is_some());
+            }
+            assert_eq!(body, expected, "{query}");
+        }
+
+        // The tree part alone rebuilds the root, and parses as the full type.
+        let (_, tree) = get_snapshot(&base, "?parts=tree").await;
+        let tree: TreeSnapshotResponse = serde_json::from_str(&tree).unwrap();
+        let mut local = MerkleTree::new();
+        for leaf in &tree.leaves {
+            local.insert(*leaf);
+        }
+        assert_eq!(local.root(), view.root);
+        assert_eq!(tree.activation_cursor, 4);
+        assert!(tree.note_leaves.is_empty() && tree.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_refuses_unknown_parts() {
+        let service = Arc::new(IndexerService::new_ready(mirror_with_deposits(2)));
+        let base = serve(service.clone()).await;
+        let refused = serde_json::json!({
+            "status": "error",
+            "error_code": "invalid_request",
+            "error_message": "parts must be tree or records",
+            "retriable": false,
+        });
+        for query in [
+            "?parts=",
+            "?parts",
+            "?parts=all",
+            "?parts=Tree",
+            "?parts=leaves",
+            "?parts=tree,records",
+            "?parts=tree&parts=records",
+            "?parts=tree&parts=tree",
+        ] {
+            let (status, body) = get_snapshot(&base, query).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body, refused, "{query}");
+        }
+
+        // Without a verified view every part is unavailable; a malformed
+        // request is still refused as malformed.
+        service.set_phase(SyncStatus::Diverged, Some("test".into()));
+        for query in ["?parts=tree", "?parts=records"] {
+            let (status, body) = get_snapshot(&base, query).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{query}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error_code"], "indexer_unavailable", "{query}");
+        }
+        let (status, _) = get_snapshot(&base, "?parts=all").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -681,10 +839,10 @@ mod tests {
             stale_after: Duration::from_secs(120),
             max_head_age: Some(Duration::from_secs(180)),
         }));
-        let mirror = Arc::new(mirror_with_deposits(2));
+        let mirror = Arc::new(mirror_with_notes(3, 2));
         let now = crate::service::unix_ms() / 1_000;
         assert!(service.observe_head(100, now));
-        service.set_confirmed(88, block_hash("88"), mirror.root(), 2);
+        service.set_confirmed(88, block_hash("88"), &mirror);
         service.set_sync_block(89);
         service.publish_head(TreeView::new(mirror.clone(), 99, block_hash("99")));
         service.record_success();
@@ -704,7 +862,8 @@ mod tests {
         assert_eq!(health["served_block"], 99);
         assert_eq!(health["served_block_hash"], block_hash("99"));
         assert_eq!(health["root"], serde_json::to_value(mirror.root()).unwrap());
-        assert_eq!(health["next_note_id"], 2);
+        assert_eq!(health["next_note_id"], 3);
+        assert_eq!(health["activation_cursor"], 2);
         assert_eq!(health["lag_blocks"], 1);
         assert_eq!(health["confirmed_block"], 88);
         assert_eq!(health["confirmed_block_hash"], block_hash("88"));
@@ -712,6 +871,8 @@ mod tests {
             health["confirmed_root"],
             serde_json::to_value(mirror.root()).unwrap()
         );
+        assert_eq!(health["confirmed_next_note_id"], 3);
+        assert_eq!(health["confirmed_activation_cursor"], 2);
         assert_eq!(health["sync_block"], 89);
         assert!(health["last_success_unix_ms"].as_u64().is_some());
         assert!(health["last_verified_unix_ms"].as_u64().is_some());
@@ -721,7 +882,7 @@ mod tests {
         assert_eq!(health["rebuild_count"], 0);
         assert_eq!(health["missed_re_escape_count"], 0);
         assert_eq!(health["missed_re_escape_finalized_count"], 0);
-        assert_eq!(health["known_root_count"], 3);
+        assert!(health.get("known_root_count").is_none());
         assert_eq!(health["published_nullifier_count"], 0);
         assert!(serde_json::from_value::<crate::service::HealthResponse>(health).is_ok());
 
@@ -734,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn tree_responses_include_root_and_block() {
-        let mirror = mirror_with_deposits(3);
+        let mirror = mirror_with_notes(4, 3);
         let service = Arc::new(IndexerService::new_syncing(ServiceSettings::default()));
         service.publish_head(TreeView::new(Arc::new(mirror), 42, block_hash("42")));
         service.record_success();
@@ -749,19 +910,27 @@ mod tests {
             .unwrap();
         let siblings: [Felt252; MERKLE_DEPTH] = path.siblings.clone().try_into().unwrap();
         assert_eq!(compute_root(1, &path.leaf, &siblings), path.root);
+        assert_eq!(path.leaf, view.mirror.note_leaves()[1]);
         assert_eq!(path.root, view.root);
         assert_eq!(path.block_number, 42);
         assert_eq!(path.block_hash, block_hash("42"));
+        assert!(path.activated);
+        assert_eq!(path.activation_cursor, 3);
 
-        let zero = reqwest::get(format!("{base}/v1/tree/notes/3/zero-path"))
+        // Note 3 is recorded but not activated: its slot is empty, and its
+        // siblings are the path above the next batch.
+        let pending = reqwest::get(format!("{base}/v1/tree/notes/3/path"))
             .await
             .unwrap()
             .json::<TreePathResponse>()
             .await
             .unwrap();
-        let siblings: [Felt252; MERKLE_DEPTH] = zero.siblings.clone().try_into().unwrap();
-        assert_eq!(compute_root(3, &Felt252::ZERO, &siblings), zero.root);
-        assert_eq!(zero.block_number, 42);
+        let siblings: [Felt252; MERKLE_DEPTH] = pending.siblings.clone().try_into().unwrap();
+        assert_eq!(pending.leaf, Felt252::ZERO);
+        assert_eq!(compute_root(3, &Felt252::ZERO, &siblings), pending.root);
+        assert!(!pending.activated);
+        assert_eq!(pending.activation_cursor, 3);
+        assert_eq!(pending.block_number, 42);
 
         let root = reqwest::get(format!("{base}/v1/tree/root"))
             .await
@@ -770,7 +939,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(root.root, view.root);
-        assert_eq!(root.next_note_id, 3);
+        assert_eq!(root.next_note_id, 4);
+        assert_eq!(root.activation_cursor, 3);
         assert_eq!(root.block_number, 42);
         assert_eq!(root.block_hash, block_hash("42"));
 
@@ -780,17 +950,19 @@ mod tests {
             .json::<NextNoteIdResponse>()
             .await
             .unwrap();
-        assert_eq!(next.next_note_id, 3);
+        assert_eq!(next.next_note_id, 4);
         assert_eq!(next.root, view.root);
         assert_eq!(next.block_number, 42);
 
-        // Consumers that only know the original fields still parse responses.
+        // The root response has exactly these fields; consumers that only
+        // know the root still parse it.
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         #[allow(dead_code)]
-        struct LegacyRoot {
+        struct RootFields {
             root: Felt252,
             next_note_id: u32,
+            activation_cursor: u32,
             block_number: u64,
             block_hash: String,
         }
@@ -804,7 +976,7 @@ mod tests {
             .text()
             .await
             .unwrap();
-        assert!(serde_json::from_str::<LegacyRoot>(&body).is_ok());
+        assert!(serde_json::from_str::<RootFields>(&body).is_ok());
         assert_eq!(
             serde_json::from_str::<MinimalRoot>(&body).unwrap().root,
             view.root
@@ -812,6 +984,7 @@ mod tests {
         let old_snapshot: TreeSnapshotResponse =
             serde_json::from_str(r#"{"root":"0x1","next_note_id":0,"leaves":[]}"#).unwrap();
         assert_eq!(old_snapshot.block_number, 0);
+        assert!(old_snapshot.notes.is_empty());
     }
 
     #[tokio::test]
@@ -865,12 +1038,9 @@ mod tests {
         let service = Arc::new(IndexerService::new_syncing(ServiceSettings::default()));
         let now = crate::service::unix_ms() / 1_000;
         service.observe_head(100, now);
-        service.set_confirmed(88, block_hash("88"), Felt252::from_u64(1), 0);
-        service.publish_head(TreeView::new(
-            Arc::new(mirror_with_deposits(1)),
-            99,
-            block_hash("99"),
-        ));
+        let mirror = mirror_with_notes(5, 4);
+        service.set_confirmed(88, block_hash("88"), &mirror);
+        service.publish_head(TreeView::new(Arc::new(mirror), 99, block_hash("99")));
         service.record_success();
         service.bump_divergences();
         service.bump_missed_re_escapes(EscapeClose::Challenged);
@@ -901,6 +1071,8 @@ mod tests {
             "zkapi_indexer_served_block 99",
             "zkapi_indexer_confirmed_block 88",
             "zkapi_indexer_lag_blocks 1",
+            "zkapi_indexer_activation_cursor 4",
+            "zkapi_indexer_pending_activations 1",
             "zkapi_indexer_consecutive_failures 0",
             "zkapi_indexer_divergences_total 1",
             "zkapi_indexer_rebuilds_total 0",

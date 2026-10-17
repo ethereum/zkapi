@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use zkapi_types::Felt252;
 
-use crate::tree_mirror::{EscapeClose, PendingEscape, TreeMirror};
+use crate::tree_mirror::{EscapeClose, NoteRecord, PendingEscape, TreeMirror};
 
 /// Indexer status as reported on `/health` and `/metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,10 +45,11 @@ impl SyncStatus {
 }
 
 /// A mirror state the vault had at a recorded block hash, as verified by
-/// `currentRoot()` and `nextNoteId()` read at that block. That check covers
-/// the tree (deposits and retirements); note statuses, open escapes and
-/// published nullifiers come from the same logs but are not covered by it
-/// (see `PendingEscape`).
+/// `currentRoot()`, `nextNoteId()` and `activationCursor()` read at that
+/// block. That check covers the tree (activations and retirements) and the
+/// number of recorded notes; the records above the activation cursor, note
+/// statuses, open escapes and published nullifiers come from the same logs
+/// but are not covered by it (see `PendingEscape`).
 #[derive(Clone)]
 pub struct TreeView {
     pub mirror: Arc<TreeMirror>,
@@ -56,6 +57,7 @@ pub struct TreeView {
     pub block_hash: String,
     pub root: Felt252,
     pub next_note_id: u32,
+    pub activation_cursor: u32,
     pub verified_at_ms: u64,
 }
 
@@ -64,6 +66,7 @@ impl TreeView {
         Self {
             root: mirror.root(),
             next_note_id: mirror.next_note_id(),
+            activation_cursor: mirror.activation_cursor(),
             mirror,
             block_number,
             block_hash,
@@ -110,6 +113,7 @@ struct Confirmed {
     hash: String,
     root: Felt252,
     next_note_id: u32,
+    activation_cursor: u32,
 }
 
 struct State {
@@ -239,6 +243,7 @@ impl IndexerService {
             served_block_hash: view.map(|view| view.block_hash.clone()),
             root: view.map(|view| view.root),
             next_note_id: view.map(|view| view.next_note_id),
+            activation_cursor: view.map(|view| view.activation_cursor),
             lag_blocks: match (state.head_block, view) {
                 (Some(head), Some(view)) => Some(head.saturating_sub(view.block_number)),
                 _ => None,
@@ -247,6 +252,7 @@ impl IndexerService {
             confirmed_block_hash: state.confirmed.as_ref().map(|c| c.hash.clone()),
             confirmed_root: state.confirmed.as_ref().map(|c| c.root),
             confirmed_next_note_id: state.confirmed.as_ref().map(|c| c.next_note_id),
+            confirmed_activation_cursor: state.confirmed.as_ref().map(|c| c.activation_cursor),
             sync_block: state.sync_block,
             last_success_unix_ms: state.last_success_unix_ms,
             last_verified_unix_ms: state.last_verified_unix_ms,
@@ -260,7 +266,6 @@ impl IndexerService {
                 .saturating_add(state.missed_re_escapes_raised),
             missed_re_escape_finalized_count: state.missed_re_escapes_finalized,
             missed_re_escape_raised_count: state.missed_re_escapes_raised,
-            known_root_count: view.map(|view| view.mirror.known_root_count() as u64),
             published_nullifier_count: view.map(|view| view.mirror.published_count() as u64),
         }
     }
@@ -332,12 +337,14 @@ impl IndexerService {
         self.state.write().unwrap().head = Some(Arc::new(view));
     }
 
-    pub(crate) fn set_confirmed(&self, block: u64, hash: String, root: Felt252, next_note_id: u32) {
+    /// Record the durable checkpoint: `mirror` verified at `block`.
+    pub(crate) fn set_confirmed(&self, block: u64, hash: String, mirror: &TreeMirror) {
         self.state.write().unwrap().confirmed = Some(Confirmed {
             block,
             hash,
-            root,
-            next_note_id,
+            root: mirror.root(),
+            next_note_id: mirror.next_note_id(),
+            activation_cursor: mirror.activation_cursor(),
         });
     }
 
@@ -447,7 +454,7 @@ impl IndexerService {
                 u8::from(status == health.status)
             ));
         }
-        let gauges: [(&str, &str, Option<u64>); 9] = [
+        let gauges: [(&str, &str, Option<u64>); 11] = [
             (
                 "zkapi_indexer_head_block",
                 "Latest block reported by the RPC.",
@@ -492,6 +499,19 @@ impl IndexerService {
                 "zkapi_indexer_sync_block",
                 "Next block the indexer will read.",
                 health.sync_block,
+            ),
+            (
+                "zkapi_indexer_activation_cursor",
+                "Notes activated (in the request tree) in the verified head view.",
+                health.activation_cursor.map(u64::from),
+            ),
+            (
+                "zkapi_indexer_pending_activations",
+                "Recorded notes waiting for activation in the verified head view.",
+                health
+                    .next_note_id
+                    .zip(health.activation_cursor)
+                    .map(|(next, cursor)| u64::from(next.saturating_sub(cursor))),
             ),
         ];
         for (name, help, value) in gauges {
@@ -569,11 +589,17 @@ pub struct HealthResponse {
     pub served_block_hash: Option<String>,
     pub root: Option<Felt252>,
     pub next_note_id: Option<u32>,
+    /// The served view's `activationCursor()`: notes below it can make
+    /// requests.
+    #[serde(default)]
+    pub activation_cursor: Option<u32>,
     pub lag_blocks: Option<u64>,
     pub confirmed_block: Option<u64>,
     pub confirmed_block_hash: Option<String>,
     pub confirmed_root: Option<Felt252>,
     pub confirmed_next_note_id: Option<u32>,
+    #[serde(default)]
+    pub confirmed_activation_cursor: Option<u32>,
     pub sync_block: Option<u64>,
     pub last_success_unix_ms: Option<u64>,
     pub last_verified_unix_ms: Option<u64>,
@@ -594,28 +620,31 @@ pub struct HealthResponse {
     /// Of those, raises of an escape the pending list never showed.
     #[serde(default)]
     pub missed_re_escape_raised_count: u64,
-    /// Roots the vault ever set, in the served view (Amendment A1).
-    #[serde(default)]
-    pub known_root_count: Option<u64>,
     /// Nullifiers vault events made public, in the served view (§5.2).
     #[serde(default)]
     pub published_nullifier_count: Option<u64>,
 }
 
-/// Response type for tree endpoints.
+/// `GET /v1/tree/root`: the request tree's root, the number of recorded
+/// notes and the activation cursor (notes below it are in the tree), at the
+/// served block.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TreeRootResponse {
     pub root: Felt252,
     #[serde(default)]
     pub next_note_id: u32,
     #[serde(default)]
+    pub activation_cursor: u32,
+    #[serde(default)]
     pub block_number: u64,
     #[serde(default)]
     pub block_hash: String,
 }
 
-/// A sibling path. `root` is the view's root: the siblings hash to it with
-/// `leaf` (and, for a zero-path, with the empty leaf of an unused slot).
+/// `GET /v1/tree/notes/{id}/path`: the 32 siblings of slot `note_id` in the
+/// current tree, which hash to `root` with `leaf`, the slot's tree leaf
+/// (zero for a note not yet activated or retired). Any slot is valid: for
+/// the activation cursor's slot they are the path above the next batch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TreePathResponse {
     pub note_id: u32,
@@ -627,6 +656,11 @@ pub struct TreePathResponse {
     pub block_number: u64,
     #[serde(default)]
     pub block_hash: String,
+    /// Whether the note's leaf was appended (`note_id < activation_cursor`).
+    #[serde(default)]
+    pub activated: bool,
+    #[serde(default)]
+    pub activation_cursor: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -642,6 +676,10 @@ pub struct NextNoteIdResponse {
 
 /// Whole-tree snapshot: clients rebuild the tree and derive any sibling path
 /// locally, so the untrusted indexer never learns which note a client queries.
+/// `leaves` are the tree leaves of slots `0..next_note_id`, exactly the leaves
+/// under `root` (zero for a note not yet activated or retired). `note_leaves`
+/// and `notes` are every recorded note's leaf and record, activated or not;
+/// above the activation cursor the root does not cover them yet.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TreeSnapshotResponse {
     pub root: Felt252,
@@ -651,6 +689,12 @@ pub struct TreeSnapshotResponse {
     pub block_number: u64,
     #[serde(default)]
     pub block_hash: String,
+    #[serde(default)]
+    pub activation_cursor: u32,
+    #[serde(default)]
+    pub note_leaves: Vec<Felt252>,
+    #[serde(default)]
+    pub notes: Vec<NoteRecord>,
 }
 
 /// Escape withdrawals open in the verified view (internal), with their
@@ -674,18 +718,6 @@ pub struct PendingEscapesResponse {
 pub struct PublishedNullifierResponse {
     pub nullifier: Felt252,
     pub published: bool,
-    pub block_number: u64,
-    pub block_hash: String,
-}
-
-/// `GET /v1/tree/roots/{root}`: whether the vault ever set `root`, so that
-/// it accepts proofs made at it (`knownRoots`, Amendment A1).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct KnownRootResponse {
-    pub root: Felt252,
-    pub known: bool,
-    /// The current root of the served view.
-    pub current_root: Felt252,
     pub block_number: u64,
     pub block_hash: String,
 }

@@ -1,18 +1,24 @@
-//! Local mirror of the vault's note tree and note lifecycle, maintained from
-//! contract events.
+//! Local mirror of the vault's notes, request tree and note lifecycle,
+//! maintained from contract events.
 //!
-//! Vault revision 3 keeps an append-only note tree (§4, §5.5): a deposit
-//! inserts its note's leaf, and only `retireClosedLeaf` removes one, of a
-//! Closed note. Escapes, defeats, raises, mutual closes, finalizations and
-//! expiry claims change a note's status but never the tree, and every root
-//! such an event carries must equal the mirrored root. The mirror also keeps
+//! Vault revision 4 records each deposit as a note (`NoteDeposited`: its
+//! commitment, amount and expiry) without touching the request tree. The
+//! tree is append-only and grows by activation (`NotesActivated`): the next
+//! `count` recorded notes (1, 4 or 16, an aligned batch starting at the
+//! activation cursor) have their recorded leaves appended, whatever their
+//! status, and the root must become the event's `newRoot`. Only
+//! `retireClosedLeaf` removes a leaf, of a Closed, activated note. Escapes,
+//! defeats, raises, mutual closes, finalizations and expiry claims change a
+//! note's status but never the tree, and every root such an event carries
+//! must equal the mirrored root. The mirror also keeps
 //!
-//! * every root the vault ever set (`knownRoots`, Amendment A1): the empty
-//!   root and the root after each deposit and retirement, any of which a
-//!   proof may use;
 //! * the published-nullifier table (§5.2): every `withdrawalNullifier` and
 //!   `nextNullifier` a vault event made public;
 //! * the open escapes with their concession (`PendingEscape`).
+//!
+//! The root covers recorded notes only once they are activated: a record
+//! above the activation cursor is a hint until its activation's root checks
+//! it.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
@@ -116,13 +122,33 @@ impl std::fmt::Display for MissedReEscape {
     }
 }
 
+/// A note as `NoteDeposited` recorded it: what the vault's `notes(noteId)`
+/// stores besides the status, from which activation computes its leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NoteRecord {
+    pub note_id: u32,
+    /// The registration commitment `C`.
+    pub commitment: Felt252,
+    pub amount: u128,
+    pub expiry_ts: u64,
+}
+
+impl NoteRecord {
+    /// The leaf activation appends for this note.
+    pub fn leaf(&self) -> Felt252 {
+        compute_note_leaf(self.note_id, &self.commitment, self.amount, self.expiry_ts)
+    }
+}
+
 /// Serializable mirror state, paired atomically with the indexer's block
 /// cursor in its checkpoint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TreeMirrorSnapshot {
     pub next_note_id: u32,
-    /// The leaf each note was deposited with, by note id.
-    pub deposited_leaves: Vec<Felt252>,
+    /// Notes `0 .. activation_cursor` have their leaves in the tree.
+    pub activation_cursor: u32,
+    /// Each recorded note, by note id.
+    pub notes: Vec<NoteRecord>,
     /// Each note's status, by note id.
     pub statuses: Vec<NoteStatus>,
     /// Closed notes whose leaf `ClosedLeafRetired` zeroed, ascending.
@@ -130,8 +156,6 @@ pub struct TreeMirrorSnapshot {
     pub pending_escapes: Vec<PendingEscape>,
     /// The published-nullifier table, ascending.
     pub published_nullifiers: Vec<Felt252>,
-    /// Every root the vault set, ascending.
-    pub known_roots: Vec<Felt252>,
 }
 
 /// A vault event that cannot follow the mirror's current state. The caller
@@ -150,6 +174,20 @@ pub enum MirrorError {
     NoteNotClosed { note_id: u32 },
     #[error("the leaf of note {note_id} is already retired")]
     LeafAlreadyRetired { note_id: u32 },
+    #[error("note {note_id} is not activated")]
+    NoteNotActivated { note_id: u32 },
+    #[error("activation of {count} notes: a batch is 1, 4 or 16 notes")]
+    InvalidActivationSize { count: u32 },
+    #[error("activation from note {got} does not follow activation cursor {expected}")]
+    ActivationOutOfOrder { expected: u32, got: u32 },
+    #[error("activation of {count} notes from note {first_note_id} is not aligned to its size")]
+    MisalignedActivation { first_note_id: u32, count: u32 },
+    #[error("activation of {count} notes from note {first_note_id} goes beyond next note id {next_note_id}")]
+    ActivationBeyondDeposits {
+        first_note_id: u32,
+        count: u32,
+        next_note_id: u32,
+    },
     #[error("the concession of note {note_id} does not follow its escape's initiation")]
     ConcessionOutOfOrder { note_id: u32 },
     #[error("inconsistent concession for note {note_id}: {detail}")]
@@ -160,34 +198,36 @@ pub enum MirrorError {
     NoteIdOverflow,
 }
 
-/// A mirror of the vault's note tree and note lifecycle.
+/// A mirror of the vault's notes, request tree and note lifecycle.
 #[derive(Clone)]
 pub struct TreeMirror {
     tree: MerkleTree,
-    /// The leaf each note was deposited with, by note id.
-    deposited: Vec<Felt252>,
+    /// Each recorded note, by note id.
+    notes: Vec<NoteRecord>,
+    /// Each recorded note's leaf, by note id (in the tree once activated).
+    note_leaves: Vec<Felt252>,
+    activation_cursor: u32,
     statuses: Vec<NoteStatus>,
     retired: BTreeSet<u32>,
     pending_escapes: BTreeMap<u32, PendingEscape>,
     published: HashSet<Felt252>,
-    known_roots: HashSet<Felt252>,
 }
 
 impl TreeMirror {
     pub fn new() -> Self {
         Self {
             tree: MerkleTree::new(),
-            deposited: Vec::new(),
+            notes: Vec::new(),
+            note_leaves: Vec::new(),
+            activation_cursor: 0,
             statuses: Vec::new(),
             retired: BTreeSet::new(),
             pending_escapes: BTreeMap::new(),
             published: HashSet::new(),
-            known_roots: HashSet::from([Self::empty_root()]),
         }
     }
 
-    /// Root of the empty tree, which the vault sets (and records as known)
-    /// in its constructor.
+    /// Root of the empty tree, which the vault sets in its constructor.
     pub fn empty_root() -> Felt252 {
         static EMPTY_ROOT: OnceLock<Felt252> = OnceLock::new();
         *EMPTY_ROOT.get_or_init(|| MerkleTree::new().root())
@@ -195,7 +235,7 @@ impl TreeMirror {
 
     /// True before the first deposit.
     pub fn is_empty(&self) -> bool {
-        self.deposited.is_empty()
+        self.notes.is_empty()
     }
 
     /// The current root.
@@ -205,10 +245,21 @@ impl TreeMirror {
 
     /// The next note id the vault assigns.
     pub fn next_note_id(&self) -> u32 {
-        self.deposited.len() as u32
+        self.notes.len() as u32
     }
 
-    /// All current leaves, indexed 0..next_note_id (zero for a retired leaf).
+    /// The vault's `activationCursor()`: notes below it are in the tree.
+    pub fn activation_cursor(&self) -> u32 {
+        self.activation_cursor
+    }
+
+    /// Whether `note_id`'s leaf was appended to the tree.
+    pub fn is_activated(&self, note_id: u32) -> bool {
+        note_id < self.activation_cursor
+    }
+
+    /// The tree leaves of slots 0..next_note_id: exactly the leaves under
+    /// the root, zero for a note not yet activated or retired.
     ///
     /// This backs the privacy-safe snapshot endpoint: a client fetches the same
     /// full leaf vector regardless of which note it cares about, rebuilds the
@@ -218,6 +269,16 @@ impl TreeMirror {
         (0..self.next_note_id())
             .map(|i| self.tree.get_leaf(i))
             .collect()
+    }
+
+    /// The recorded leaf of every note 0..next_note_id, activated or not.
+    pub fn note_leaves(&self) -> &[Felt252] {
+        &self.note_leaves
+    }
+
+    /// Every recorded note 0..next_note_id.
+    pub fn notes(&self) -> &[NoteRecord] {
+        &self.notes
     }
 
     /// The status of `note_id`, if it was deposited.
@@ -239,48 +300,50 @@ impl TreeMirror {
         self.published.len()
     }
 
-    /// Whether the vault ever set `root` (A1: the vault accepts any of them).
-    pub fn is_known_root(&self, root: &Felt252) -> bool {
-        self.known_roots.contains(root)
-    }
-
-    pub fn known_root_count(&self) -> usize {
-        self.known_roots.len()
-    }
-
     /// Capture the mirror for a checkpoint.
     pub fn snapshot(&self) -> TreeMirrorSnapshot {
         let mut published: Vec<_> = self.published.iter().copied().collect();
         published.sort_unstable_by_key(|felt| felt.0);
-        let mut known_roots: Vec<_> = self.known_roots.iter().copied().collect();
-        known_roots.sort_unstable_by_key(|felt| felt.0);
         TreeMirrorSnapshot {
             next_note_id: self.next_note_id(),
-            deposited_leaves: self.deposited.clone(),
+            activation_cursor: self.activation_cursor,
+            notes: self.notes.clone(),
             statuses: self.statuses.clone(),
             retired: self.retired.iter().copied().collect(),
             pending_escapes: self.pending_escapes(),
             published_nullifiers: published,
-            known_roots,
         }
     }
 
     /// Restore a mirror from a checkpoint, checking that it is consistent.
     pub fn from_snapshot(snapshot: TreeMirrorSnapshot) -> Result<Self, String> {
         let notes = snapshot.next_note_id as usize;
-        if snapshot.deposited_leaves.len() != notes || snapshot.statuses.len() != notes {
+        if snapshot.notes.len() != notes || snapshot.statuses.len() != notes {
             return Err(format!(
-                "snapshot has {} deposited leaves and {} statuses but next_note_id is {}",
-                snapshot.deposited_leaves.len(),
+                "snapshot has {} notes and {} statuses but next_note_id is {}",
+                snapshot.notes.len(),
                 snapshot.statuses.len(),
                 snapshot.next_note_id
             ));
         }
-        if let Some(note_id) = snapshot.deposited_leaves.iter().position(Felt252::is_zero) {
+        if let Some((index, note)) = snapshot
+            .notes
+            .iter()
+            .enumerate()
+            .find(|(index, note)| note.note_id as usize != *index)
+        {
             return Err(format!(
-                "snapshot has an empty deposited leaf for note {note_id}"
+                "snapshot records note {} at index {index}",
+                note.note_id
             ));
         }
+        if snapshot.activation_cursor > snapshot.next_note_id {
+            return Err(format!(
+                "snapshot activation cursor {} is beyond next_note_id {}",
+                snapshot.activation_cursor, snapshot.next_note_id
+            ));
+        }
+        let note_leaves: Vec<Felt252> = snapshot.notes.iter().map(NoteRecord::leaf).collect();
         let mut retired = BTreeSet::new();
         for note_id in snapshot.retired {
             match snapshot.statuses.get(note_id as usize) {
@@ -291,6 +354,11 @@ impl TreeMirror {
                         "snapshot retires the leaf of note {note_id}, which is not closed"
                     ))
                 }
+            }
+            if note_id >= snapshot.activation_cursor {
+                return Err(format!(
+                    "snapshot retires the leaf of note {note_id}, which is not activated"
+                ));
             }
             if !retired.insert(note_id) {
                 return Err(format!("snapshot retires note {note_id} twice"));
@@ -333,41 +401,34 @@ impl TreeMirror {
         }
 
         let mut tree = MerkleTree::new();
-        for (note_id, leaf) in snapshot.deposited_leaves.iter().enumerate() {
+        for (note_id, leaf) in note_leaves
+            .iter()
+            .enumerate()
+            .take(snapshot.activation_cursor as usize)
+        {
             if !retired.contains(&(note_id as u32)) {
                 tree.set_leaf(note_id as u32, *leaf);
             }
         }
-        let known_roots: HashSet<Felt252> = snapshot.known_roots.iter().copied().collect();
-        if known_roots.len() != snapshot.known_roots.len() {
-            return Err("snapshot repeats a known root".to_string());
-        }
-        if !known_roots.contains(&Self::empty_root()) || !known_roots.contains(&tree.root()) {
-            return Err("snapshot's known roots lack the empty or the current root".to_string());
-        }
         Ok(Self {
             tree,
-            deposited: snapshot.deposited_leaves,
+            notes: snapshot.notes,
+            note_leaves,
+            activation_cursor: snapshot.activation_cursor,
             statuses: snapshot.statuses,
             retired,
             pending_escapes,
             published,
-            known_roots,
         })
     }
 
-    /// The sibling path of a note's slot in the current tree.
+    /// The sibling path of a slot in the current tree. For the activation
+    /// cursor's slot, the path above an empty aligned batch of any size.
     pub fn get_path(&self, note_id: u32) -> [Felt252; MERKLE_DEPTH] {
         self.tree.get_siblings(note_id)
     }
 
-    /// Deprecated alias of `get_path`: the siblings of a slot do not depend
-    /// on its leaf. Exits no longer need a zero-slot path.
-    pub fn get_zero_path(&self, note_id: u32) -> [Felt252; MERKLE_DEPTH] {
-        self.tree.get_siblings(note_id)
-    }
-
-    /// The current leaf of a slot (zero if unused or retired).
+    /// The current tree leaf of a slot (zero if not activated or retired).
     pub fn get_leaf(&self, note_id: u32) -> Felt252 {
         self.tree.get_leaf(note_id)
     }
@@ -387,7 +448,7 @@ impl TreeMirror {
         let missed = self.check(event)?;
         self.transition(event);
         match event {
-            VaultEvent::NoteDeposited { new_root: root, .. }
+            VaultEvent::NotesActivated { new_root: root, .. }
             | VaultEvent::ClosedLeafRetired { new_root: root, .. }
             | VaultEvent::EscapeWithdrawalInitiated {
                 current_root: root, ..
@@ -398,7 +459,8 @@ impl TreeMirror {
             | VaultEvent::ExpiredClaimed {
                 current_root: root, ..
             } => self.require_root(root)?,
-            VaultEvent::MutualClose { .. }
+            VaultEvent::NoteDeposited { .. }
+            | VaultEvent::MutualClose { .. }
             | VaultEvent::EscapeConcessionRecorded { .. }
             | VaultEvent::EscapeConcessionRaised { .. }
             | VaultEvent::EscapeWithdrawalFinalized { .. } => {}
@@ -427,6 +489,37 @@ impl TreeMirror {
                     });
                 }
                 note_id.checked_add(1).ok_or(MirrorError::NoteIdOverflow)?;
+                Ok(None)
+            }
+            VaultEvent::NotesActivated {
+                first_note_id,
+                count,
+                ..
+            } => {
+                // The vault's activation range checks: a supported batch size,
+                // starting at the cursor, aligned to its size, and recorded.
+                if !matches!(count, 1 | 4 | 16) {
+                    return Err(MirrorError::InvalidActivationSize { count: *count });
+                }
+                if *first_note_id != self.activation_cursor {
+                    return Err(MirrorError::ActivationOutOfOrder {
+                        expected: self.activation_cursor,
+                        got: *first_note_id,
+                    });
+                }
+                if !first_note_id.is_multiple_of(*count) {
+                    return Err(MirrorError::MisalignedActivation {
+                        first_note_id: *first_note_id,
+                        count: *count,
+                    });
+                }
+                if u64::from(*first_note_id) + u64::from(*count) > u64::from(self.next_note_id()) {
+                    return Err(MirrorError::ActivationBeyondDeposits {
+                        first_note_id: *first_note_id,
+                        count: *count,
+                        next_note_id: self.next_note_id(),
+                    });
+                }
                 Ok(None)
             }
             VaultEvent::MutualClose { note_id, .. }
@@ -500,6 +593,9 @@ impl TreeMirror {
                 if self.status(*note_id)? != NoteStatus::Closed {
                     return Err(MirrorError::NoteNotClosed { note_id: *note_id });
                 }
+                if !self.is_activated(*note_id) {
+                    return Err(MirrorError::NoteNotActivated { note_id: *note_id });
+                }
                 if self.retired.contains(note_id) {
                     return Err(MirrorError::LeafAlreadyRetired { note_id: *note_id });
                 }
@@ -524,13 +620,32 @@ impl TreeMirror {
                 commitment,
                 amount,
                 expiry_ts,
+            } => {
+                let note = NoteRecord {
+                    note_id: *note_id,
+                    commitment: *commitment,
+                    amount: *amount,
+                    expiry_ts: *expiry_ts,
+                };
+                self.note_leaves.push(note.leaf());
+                self.notes.push(note);
+                self.statuses.push(NoteStatus::Active);
+            }
+            VaultEvent::NotesActivated {
+                first_note_id,
+                count,
                 ..
             } => {
-                let leaf = compute_note_leaf(*note_id, commitment, *amount, *expiry_ts);
-                self.tree.set_leaf(*note_id, leaf);
-                self.deposited.push(leaf);
-                self.statuses.push(NoteStatus::Active);
-                self.known_roots.insert(self.tree.root());
+                // Each note's original leaf, whatever its status: a note that
+                // closed before activation is appended too.
+                let end = first_note_id
+                    .saturating_add(*count)
+                    .min(self.next_note_id());
+                for note_id in *first_note_id..end {
+                    self.tree
+                        .set_leaf(note_id, self.note_leaves[note_id as usize]);
+                }
+                self.activation_cursor = end;
             }
             VaultEvent::MutualClose { note_id, .. }
             | VaultEvent::ExpiredClaimed { note_id, .. } => {
@@ -596,10 +711,9 @@ impl TreeMirror {
                 self.pending_escapes.remove(note_id);
             }
             VaultEvent::ClosedLeafRetired { note_id, .. } => {
-                if (*note_id as usize) < self.deposited.len() {
+                if (*note_id as usize) < self.notes.len() {
                     self.tree.set_leaf(*note_id, Felt252::ZERO);
                     self.retired.insert(*note_id);
-                    self.known_roots.insert(self.tree.root());
                 }
             }
         }
@@ -673,18 +787,32 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn deposit(&mut self, commitment: u64) -> VaultEvent {
-            let mut event = VaultEvent::NoteDeposited {
+            let event = VaultEvent::NoteDeposited {
                 note_id: self.0.next_note_id(),
                 commitment: Felt252::from_u64(commitment),
                 amount: 1_000,
                 expiry_ts: 1_700_000_000,
-                new_root: Felt252::ZERO,
             };
             self.0.process_event(&event);
-            if let VaultEvent::NoteDeposited { new_root, .. } = &mut event {
-                *new_root = self.0.root();
-            }
             event
+        }
+
+        /// The activation of the next `count` recorded notes, with the root
+        /// the vault emits.
+        pub(crate) fn activate(&mut self, count: u32) -> VaultEvent {
+            let first_note_id = self.0.activation_cursor();
+            self.0.process_event(&VaultEvent::NotesActivated {
+                first_note_id,
+                count,
+                new_root: Felt252::ZERO,
+                proved: true,
+            });
+            VaultEvent::NotesActivated {
+                first_note_id,
+                count,
+                new_root: self.0.root(),
+                proved: true,
+            }
         }
 
         pub(crate) fn close(&mut self, note_id: u32) -> VaultEvent {
@@ -788,6 +916,9 @@ pub(crate) mod tests {
             reference.deposit(100),
             reference.deposit(101),
             reference.deposit(102),
+            reference.activate(1),
+            reference.activate(1),
+            reference.activate(1),
         ];
         let deposited_root = reference.0.root();
         let mut events = Vec::new();
@@ -826,30 +957,244 @@ pub(crate) mod tests {
         );
     }
 
+    /// The root the vault computes for an activation: the batch's subtree
+    /// hashed up the path above it (`siblings`, the path of the batch's first
+    /// slot, whose entries below the subtree height are ignored), as
+    /// `appendSubtree` and the insertion statement do.
+    fn appended_root(
+        first_note_id: u32,
+        leaves: &[Felt252],
+        siblings: &[Felt252; MERKLE_DEPTH],
+    ) -> (Felt252, Felt252) {
+        use zkapi_core::v2::{merkle_node, zero_hashes};
+        let height = leaves.len().trailing_zeros() as usize;
+        let mut level = leaves.to_vec();
+        while level.len() > 1 {
+            level = level
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[left, right]| merkle_node(left, right))
+                .collect();
+        }
+        let mut old = zero_hashes()[height];
+        let mut new = level[0];
+        for (height, sibling) in siblings.iter().enumerate().skip(height) {
+            if (first_note_id >> height) & 1 == 0 {
+                old = merkle_node(&old, sibling);
+                new = merkle_node(&new, sibling);
+            } else {
+                old = merkle_node(sibling, &old);
+                new = merkle_node(sibling, &new);
+            }
+        }
+        (old, new)
+    }
+
+    /// Activate the next `count` notes of `mirror` from the path its cursor
+    /// slot serves, checking that the path proves the empty batch at the
+    /// current root and that the appended root is the mirror's afterwards.
+    fn activate_from_served_path(mirror: &mut TreeMirror, reference: &mut Reference, count: u32) {
+        let first = mirror.activation_cursor();
+        let siblings = mirror.get_path(first);
+        let leaves = &mirror.note_leaves()[first as usize..(first + count) as usize];
+        let (old, new) = appended_root(first, leaves, &siblings);
+        assert_eq!(old, mirror.root(), "the served path proves an empty batch");
+        let event = reference.activate(count);
+        assert_eq!(
+            event,
+            VaultEvent::NotesActivated {
+                first_note_id: first,
+                count,
+                new_root: new,
+                proved: true,
+            }
+        );
+        mirror.apply_event(&event).unwrap();
+        assert_eq!(mirror.root(), new);
+        assert_eq!(mirror.activation_cursor(), first + count);
+    }
+
     #[test]
-    fn every_root_the_vault_set_stays_known() {
+    fn deposits_record_notes_and_activations_append_aligned_batches() {
         let mut reference = Reference::new();
         let mut mirror = TreeMirror::new();
-        assert!(mirror.is_known_root(&TreeMirror::empty_root()));
-        let mut roots = vec![TreeMirror::empty_root()];
-        for commitment in 100..103 {
+        for commitment in 100..140 {
             mirror.apply_event(&reference.deposit(commitment)).unwrap();
-            roots.push(mirror.root());
         }
-        apply_all(&mut mirror, &[reference.close(0)]);
-        mirror.apply_event(&reference.retire(0)).unwrap();
-        roots.push(mirror.root());
-        // A1: the deposit-time roots stay valid after later deposits and a
-        // retirement; nothing else is a known root.
-        for root in &roots {
-            assert!(mirror.is_known_root(root), "{root}");
+        // A deposit records the note and leaves the tree empty.
+        assert_eq!(mirror.next_note_id(), 40);
+        assert_eq!(mirror.activation_cursor(), 0);
+        assert_eq!(mirror.root(), TreeMirror::empty_root());
+        assert!(mirror.current_leaves().iter().all(Felt252::is_zero));
+        assert_eq!(mirror.notes()[3].commitment, Felt252::from_u64(103));
+        assert_eq!(
+            mirror.note_leaves()[3],
+            compute_note_leaf(3, &Felt252::from_u64(103), 1_000, 1_700_000_000)
+        );
+
+        // K = 1, then K = 1 up to an aligned slot for K = 4, K = 4 up to 16,
+        // K = 16, then a mixed tail.
+        for count in [1, 1, 1, 1, 4, 4, 4, 16, 1, 1, 1, 1, 4] {
+            activate_from_served_path(&mut mirror, &mut reference, count);
         }
-        assert_eq!(mirror.known_root_count(), roots.len());
-        assert!(!mirror.is_known_root(&Felt252::from_u64(5)));
+        assert_eq!(mirror.activation_cursor(), 40);
+        assert_eq!(mirror.current_leaves(), mirror.note_leaves());
+        assert_eq!(mirror.root(), reference.0.root());
+    }
+
+    #[test]
+    fn a_closed_note_is_activated_with_its_original_leaf() {
+        let mut reference = Reference::new();
+        let mut events = vec![reference.deposit(100), reference.deposit(101)];
+        events.push(reference.close(1));
+        events.extend(reference.escape(0, 900));
+        let mut mirror = TreeMirror::new();
+        apply_all(&mut mirror, &events);
+        // Notes exit before activation; their status does not hold the batch
+        // back and activation does not change it.
+        activate_from_served_path(&mut mirror, &mut reference, 1);
+        activate_from_served_path(&mut mirror, &mut reference, 1);
+        assert_eq!(mirror.note_status(0), Some(NoteStatus::PendingWithdrawal));
+        assert_eq!(mirror.note_status(1), Some(NoteStatus::Closed));
+        assert_eq!(mirror.current_leaves(), mirror.note_leaves());
+    }
+
+    #[test]
+    fn an_activation_outside_the_vaults_range_is_refused() {
+        let mut reference = Reference::new();
+        let mut mirror = TreeMirror::new();
+        for commitment in 100..106 {
+            mirror.apply_event(&reference.deposit(commitment)).unwrap();
+        }
+        let activation = |first_note_id, count| VaultEvent::NotesActivated {
+            first_note_id,
+            count,
+            new_root: Felt252::from_u64(1),
+            proved: false,
+        };
+        for (event, error) in [
+            (
+                activation(0, 2),
+                MirrorError::InvalidActivationSize { count: 2 },
+            ),
+            (
+                activation(0, 0),
+                MirrorError::InvalidActivationSize { count: 0 },
+            ),
+            (
+                activation(0, 16),
+                MirrorError::ActivationBeyondDeposits {
+                    first_note_id: 0,
+                    count: 16,
+                    next_note_id: 6,
+                },
+            ),
+            (
+                activation(1, 1),
+                MirrorError::ActivationOutOfOrder {
+                    expected: 0,
+                    got: 1,
+                },
+            ),
+        ] {
+            assert_eq!(mirror.clone().apply_event(&event), Err(error));
+        }
+        activate_from_served_path(&mut mirror, &mut reference, 1);
+        for (event, error) in [
+            (
+                activation(1, 4),
+                MirrorError::MisalignedActivation {
+                    first_note_id: 1,
+                    count: 4,
+                },
+            ),
+            (
+                activation(0, 1),
+                MirrorError::ActivationOutOfOrder {
+                    expected: 1,
+                    got: 0,
+                },
+            ),
+            (
+                activation(u32::MAX, 1),
+                MirrorError::ActivationOutOfOrder {
+                    expected: 1,
+                    got: u32::MAX,
+                },
+            ),
+        ] {
+            assert_eq!(mirror.clone().apply_event(&event), Err(error));
+        }
+        for _ in 1..4 {
+            activate_from_served_path(&mut mirror, &mut reference, 1);
+        }
+        // Notes 4 and 5 are recorded, a batch of four is not.
+        assert_eq!(
+            mirror.clone().apply_event(&activation(4, 4)),
+            Err(MirrorError::ActivationBeyondDeposits {
+                first_note_id: 4,
+                count: 4,
+                next_note_id: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn an_activation_root_that_is_not_the_appended_leaves_is_refused() {
+        // The mirror applied deposits 100..104, but the vault recorded note
+        // 2 with another commitment (a record above the cursor is a hint the
+        // root does not cover yet): the batch's root exposes it.
+        let mut reference = Reference::new();
+        let mut vault = Reference::new();
+        let mut mirror = TreeMirror::new();
+        for commitment in 100..104 {
+            mirror.apply_event(&reference.deposit(commitment)).unwrap();
+            vault.deposit(if commitment == 102 { 0xbad } else { commitment });
+        }
+        assert!(matches!(
+            mirror.clone().apply_event(&vault.activate(4)),
+            Err(MirrorError::RootMismatch { .. })
+        ));
+        // The batch sizes the vault checks are independent of the records:
+        // singletons up to note 2 match, note 2 does not.
+        let mut vault = Reference::new();
+        for commitment in 100..104 {
+            vault.deposit(if commitment == 102 { 0xbad } else { commitment });
+        }
+        for _ in 0..2 {
+            let event = vault.activate(1);
+            assert_eq!(event, reference.activate(1));
+            mirror.apply_event(&event).unwrap();
+        }
+        assert!(matches!(
+            mirror.clone().apply_event(&vault.activate(1)),
+            Err(MirrorError::RootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn retirement_holes_survive_later_activations() {
+        let mut reference = Reference::new();
+        let mut mirror = TreeMirror::new();
+        for commitment in 100..108 {
+            mirror.apply_event(&reference.deposit(commitment)).unwrap();
+        }
+        activate_from_served_path(&mut mirror, &mut reference, 4);
+        apply_all(&mut mirror, &[reference.close(1), reference.close(2)]);
+        mirror.apply_event(&reference.retire(1)).unwrap();
+        mirror.apply_event(&reference.retire(2)).unwrap();
+        // The next batch is appended above the holes, which it preserves.
+        activate_from_served_path(&mut mirror, &mut reference, 4);
+        let leaves = mirror.current_leaves();
+        assert_eq!(leaves.len(), 8);
+        for (note_id, leaf) in leaves.iter().enumerate() {
+            assert_eq!(leaf.is_zero(), note_id == 1 || note_id == 2, "{note_id}");
+        }
+        assert!(mirror.note_leaves().iter().all(|leaf| !leaf.is_zero()));
         let restored = TreeMirror::from_snapshot(mirror.snapshot()).unwrap();
-        for root in &roots {
-            assert!(restored.is_known_root(root));
-        }
+        assert_eq!(restored.root(), mirror.root());
+        assert_eq!(restored.current_leaves(), leaves);
     }
 
     #[test]
@@ -978,35 +1323,34 @@ pub(crate) mod tests {
 
     #[test]
     fn every_event_root_must_be_the_mirrored_root() {
+        let mut reference = Reference::new();
+        let deposit = reference.deposit(100);
         let mut mirror = TreeMirror::new();
+        mirror.apply_event(&deposit).unwrap();
         let error = mirror
-            .apply_event(&VaultEvent::NoteDeposited {
-                note_id: 0,
-                commitment: Felt252::from_u64(100),
-                amount: 1_000,
-                expiry_ts: 1_700_000_000,
+            .clone()
+            .apply_event(&VaultEvent::NotesActivated {
+                first_note_id: 0,
+                count: 1,
                 new_root: Felt252::from_u64(1),
+                proved: true,
             })
             .unwrap_err();
         assert!(matches!(error, MirrorError::RootMismatch { .. }));
 
-        let mut reference = Reference::new();
-        let deposit = reference.deposit(100);
+        let activation = reference.activate(1);
         let [mut escape, _] = reference.escape(0, 900);
         if let VaultEvent::EscapeWithdrawalInitiated { current_root, .. } = &mut escape {
             *current_root = Felt252::from_u64(5);
         }
-        let mut mirror = TreeMirror::new();
-        mirror.apply_event(&deposit).unwrap();
+        mirror.apply_event(&activation).unwrap();
         assert!(matches!(
             mirror.clone().apply_event(&escape),
             Err(MirrorError::RootMismatch { .. })
         ));
         // An escape's root is the unchanged current root, not a root with the
         // leaf removed.
-        let mut removed = TreeMirror::new();
-        removed.process_event(&deposit);
-        let mut zeroed = removed.clone();
+        let mut zeroed = mirror.clone();
         zeroed.tree.set_leaf(0, Felt252::ZERO);
         if let VaultEvent::EscapeWithdrawalInitiated { current_root, .. } = &mut escape {
             *current_root = zeroed.root();
@@ -1094,14 +1438,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn only_a_closed_note_has_its_leaf_retired() {
+    fn only_a_closed_activated_note_has_its_leaf_retired() {
         let mut reference = Reference::new();
-        let deposit = reference.deposit(100);
         let mut mirror = TreeMirror::new();
-        mirror.apply_event(&deposit).unwrap();
+        apply_all(
+            &mut mirror,
+            &[reference.deposit(100), reference.deposit(101)],
+        );
+        // A missed defeat of a note not yet activated: it is retired only
+        // once activation has put its leaf in the tree.
+        apply_all(&mut mirror, &[reference.close(1)]);
+        let early = VaultEvent::ClosedLeafRetired {
+            note_id: 1,
+            new_root: mirror.root(),
+        };
+        assert_eq!(
+            mirror.clone().apply_event(&early),
+            Err(MirrorError::NoteNotActivated { note_id: 1 })
+        );
+        activate_from_served_path(&mut mirror, &mut reference, 1);
+        assert_eq!(
+            mirror.clone().apply_event(&early),
+            Err(MirrorError::NoteNotActivated { note_id: 1 })
+        );
+        activate_from_served_path(&mut mirror, &mut reference, 1);
+        let activated = mirror.root();
+        mirror.apply_event(&reference.retire(1)).unwrap();
+        assert_ne!(mirror.root(), activated);
+        assert!(mirror.get_leaf(1).is_zero());
+
         let retire = VaultEvent::ClosedLeafRetired {
             note_id: 0,
-            new_root: TreeMirror::empty_root(),
+            new_root: mirror.root(),
         };
         assert_eq!(
             mirror.clone().apply_event(&retire),
@@ -1119,6 +1487,7 @@ pub(crate) mod tests {
         apply_all(&mut mirror, &[reference.finalize(0, 900)]);
         mirror.apply_event(&reference.retire(0)).unwrap();
         assert_eq!(mirror.root(), TreeMirror::empty_root());
+        assert_eq!(mirror.activation_cursor(), 2);
     }
 
     #[test]
@@ -1247,6 +1616,9 @@ pub(crate) mod tests {
             reference.deposit(100),
             reference.deposit(101),
             reference.deposit(102),
+            reference.deposit(103),
+            reference.deposit(104),
+            reference.activate(4),
         ];
         events.extend(reference.escape(1, 900));
         events.push(reference.close(2));
@@ -1256,10 +1628,15 @@ pub(crate) mod tests {
 
         let restored = TreeMirror::from_snapshot(mirror.snapshot()).unwrap();
         assert_eq!(restored.root(), mirror.root());
-        assert_eq!(restored.next_note_id(), 3);
+        assert_eq!(restored.next_note_id(), 5);
+        assert_eq!(restored.activation_cursor(), 4);
         assert_eq!(restored.get_path(0), mirror.get_path(0));
+        assert_eq!(restored.get_path(4), mirror.get_path(4));
         assert_eq!(restored.pending_escapes(), mirror.pending_escapes());
         assert_eq!(restored.current_leaves(), mirror.current_leaves());
+        assert_eq!(restored.note_leaves(), mirror.note_leaves());
+        assert_eq!(restored.notes(), mirror.notes());
+        assert!(restored.get_leaf(4).is_zero());
         assert_eq!(restored.snapshot(), mirror.snapshot());
         for note_id in 0..3 {
             assert_eq!(restored.note_status(note_id), mirror.note_status(note_id));
@@ -1269,12 +1646,26 @@ pub(crate) mod tests {
         let mut restored = restored;
         restored.apply_event(&reference.challenge(1, 900)).unwrap();
         assert_eq!(restored.note_status(1), Some(NoteStatus::Active));
+        for commitment in 105..108 {
+            restored
+                .apply_event(&reference.deposit(commitment))
+                .unwrap();
+        }
+        restored.apply_event(&reference.activate(4)).unwrap();
+        assert_eq!(restored.root(), reference.0.root());
     }
 
     #[test]
     fn from_snapshot_rejects_inconsistent_state() {
         let mut reference = Reference::new();
-        let mut events = vec![reference.deposit(100), reference.deposit(101)];
+        let mut events = vec![
+            reference.deposit(100),
+            reference.deposit(101),
+            reference.deposit(102),
+            reference.activate(1),
+            reference.close(0),
+            reference.retire(0),
+        ];
         events.extend(reference.escape(1, 900));
         let mut mirror = TreeMirror::new();
         apply_all(&mut mirror, &events);
@@ -1284,15 +1675,24 @@ pub(crate) mod tests {
         let rejection = |snapshot: TreeMirrorSnapshot| TreeMirror::from_snapshot(snapshot).err();
 
         let mut missing = snapshot.clone();
-        missing.deposited_leaves.pop();
+        missing.notes.pop();
         assert!(rejection(missing).unwrap().contains("next_note_id"));
 
-        let mut empty_leaf = snapshot.clone();
-        empty_leaf.deposited_leaves[0] = Felt252::ZERO;
-        assert!(rejection(empty_leaf).is_some());
+        let mut misnumbered = snapshot.clone();
+        misnumbered.notes.swap(1, 2);
+        assert!(rejection(misnumbered).unwrap().contains("index 1"));
+
+        let mut beyond = snapshot.clone();
+        beyond.activation_cursor = 4;
+        assert!(rejection(beyond).unwrap().contains("activation cursor"));
+
+        let mut unactivated = snapshot.clone();
+        unactivated.statuses[2] = NoteStatus::Closed;
+        unactivated.retired.push(2);
+        assert!(rejection(unactivated).unwrap().contains("not activated"));
 
         let mut active_escape = snapshot.clone();
-        active_escape.pending_escapes[0].note_id = 0;
+        active_escape.pending_escapes[0].note_id = 2;
         assert!(rejection(active_escape).unwrap().contains("not pending"));
 
         let mut orphan_escape = snapshot.clone();
@@ -1304,14 +1704,12 @@ pub(crate) mod tests {
         assert!(rejection(dropped_escape).is_some());
 
         let mut retired_active = snapshot.clone();
-        retired_active.retired.push(0);
+        retired_active.retired.push(2);
         assert!(rejection(retired_active).unwrap().contains("not closed"));
 
-        let mut unknown_root = snapshot.clone();
-        unknown_root
-            .known_roots
-            .retain(|root| *root != mirror.root());
-        assert!(rejection(unknown_root).unwrap().contains("current root"));
+        let mut retired_twice = snapshot.clone();
+        retired_twice.retired.push(0);
+        assert!(rejection(retired_twice).unwrap().contains("twice"));
 
         let mut repeated = snapshot;
         let first = repeated.published_nullifiers[0];

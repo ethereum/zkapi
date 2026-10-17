@@ -5,9 +5,10 @@
 //!
 //! - The committed tier is a durable checkpoint at a block at least
 //!   `confirmations` below the head. A batch of logs is committed only after
-//!   it applied cleanly and the vault's `currentRoot()` and `nextNoteId()`,
-//!   read by `eth_call` pinned to the batch's last block hash (EIP-1898),
-//!   equal the staged mirror. Only this tier is persisted.
+//!   it applied cleanly and the vault's `currentRoot()`, `nextNoteId()` and
+//!   `activationCursor()`, read by `eth_call` pinned to the batch's last
+//!   block hash (EIP-1898), equal the staged mirror. Only this tier is
+//!   persisted.
 //! - The served tier is a head view: the committed mirror plus the logs above
 //!   it, re-derived whenever the head changes, verified the same way at the
 //!   head block hash, and published atomically. It is never persisted.
@@ -37,18 +38,24 @@ use crate::events::VaultEvent;
 use crate::service::{unix_ms, IndexerService, SyncStatus, TreeView};
 use crate::tree_mirror::{EscapeClose, MissedReEscape, TreeMirror, TreeMirrorSnapshot};
 
-/// Version 3: the append-only tree of vault revision 3, with note statuses,
-/// known roots and the published-nullifier table. Earlier checkpoints mirror
-/// a tree whose exits removed leaves; they are archived and replayed.
-const CHECKPOINT_VERSION: u32 = 3;
+/// Version 4: the recorded notes and activated request tree of vault
+/// revision 4, with note statuses and the published-nullifier table. Earlier
+/// checkpoints mirror a tree whose deposits inserted leaves; they are
+/// archived and replayed.
+const CHECKPOINT_VERSION: u32 = 4;
 /// The statement of the vaults this indexer mirrors. A checkpoint records it.
-pub const CIRCUIT_ID: &str = "zkapi-v2-concession-v1";
+pub const CIRCUIT_ID: &str = "zkapi-v2-concession-v2";
 /// `currentRoot()`
 const CURRENT_ROOT: &str = "0xfdab463d";
 /// `nextNoteId()`
 const NEXT_NOTE_ID: &str = "0x7a2043a3";
-/// `CONCESSION_ESCAPE_VERSION()`, 1 on a revision-3 vault and absent before.
+/// `activationCursor()`
+const ACTIVATION_CURSOR: &str = "0x93e0ce4e";
+/// `CONCESSION_ESCAPE_VERSION()`, 1 from vault revision 3 and absent before.
 const CONCESSION_ESCAPE_VERSION: &str = "0x5e00b426";
+/// `NOTE_BOUND_EXIT_VERSION()`, 1 from vault revision 4 (note-bound exits,
+/// activated request tree) and absent before.
+const NOTE_BOUND_EXIT_VERSION: &str = "0x56853816";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest parent-hash walk used to confirm that a reorganized checkpoint
 /// block is an ancestor of the head. Beyond it two sightings suffice.
@@ -152,9 +159,10 @@ impl Header {
 struct Committed {
     mirror: Arc<TreeMirror>,
     anchor: Option<BlockRef>,
-    /// Block of the latest committed lifecycle event (any event but a
-    /// deposit or a leaf retirement). Lifecycle events change no root, so a
-    /// reorg below the checkpoint near one is rebuilt, never re-anchored.
+    /// Block of the latest committed lifecycle event (any event but an
+    /// activation or a leaf retirement). Lifecycle events change no root (a
+    /// deposit's record is covered only once activated), so a reorg below
+    /// the checkpoint near one is rebuilt, never re-anchored.
     last_lifecycle_block: Option<u64>,
 }
 
@@ -197,7 +205,8 @@ pub struct JsonRpcLogPoller {
     chain_id: Option<u64>,
     chain_verified: bool,
     chain_mismatch_reported: bool,
-    /// The vault reported `CONCESSION_ESCAPE_VERSION() == 1` in this process.
+    /// The vault reported `CONCESSION_ESCAPE_VERSION() == 1` and
+    /// `NOTE_BOUND_EXIT_VERSION() == 1` in this process.
     vault_verified: bool,
     vault_mismatch_reported: bool,
     published: Option<BlockRef>,
@@ -307,14 +316,10 @@ impl JsonRpcLogPoller {
             block = anchor.number,
             root = %checkpoint.mirror.root(),
             next_note_id = checkpoint.mirror.next_note_id(),
+            activation_cursor = checkpoint.mirror.activation_cursor(),
             "restored indexer checkpoint; verifying against the vault before serving"
         );
-        service.set_confirmed(
-            anchor.number,
-            anchor.hash.clone(),
-            checkpoint.mirror.root(),
-            checkpoint.mirror.next_note_id(),
-        );
+        service.set_confirmed(anchor.number, anchor.hash.clone(), &checkpoint.mirror);
         service.set_chain_id(checkpoint.chain_id);
         self.next_block = anchor.number.saturating_add(1);
         self.committed = Committed {
@@ -386,7 +391,8 @@ impl JsonRpcLogPoller {
             return Ok(PollOutcome::Idle);
         }
         // S2b. The vault's revision, once per process: this mirror's rules
-        // (an append-only tree, concession events) are revision 3's.
+        // (recorded notes, activated batches, concession events) are
+        // revision 4's.
         if !self.vault_verified && !self.verify_vault_revision(service, &head_ref).await? {
             return Ok(PollOutcome::Idle);
         }
@@ -459,42 +465,53 @@ impl JsonRpcLogPoller {
         Ok(true)
     }
 
-    /// Fail closed on a vault that is not revision 3 (`CONCESSION_ESCAPE_VERSION()`
-    /// is not 1, or the getter does not exist): its exits remove leaves, which
-    /// this mirror never does, so every view would be wrong.
+    /// Fail closed on a vault that is not revision 4: `CONCESSION_ESCAPE_VERSION()`
+    /// and `NOTE_BOUND_EXIT_VERSION()` must both be 1. An earlier vault's
+    /// deposits insert leaves (and its exits, before revision 3, remove
+    /// them), which this mirror never does, so every view would be wrong.
     async fn verify_vault_revision(
         &mut self,
         service: &IndexerService,
         head: &BlockRef,
     ) -> anyhow::Result<bool> {
-        let version = match self.call_word(CONCESSION_ESCAPE_VERSION, head).await {
-            Ok(Some(word)) => Some(word),
-            Ok(None) => bail!(
-                "vault has no code at head block {} {}; waiting",
-                head.number,
-                head.hash
-            ),
-            Err(err) if is_revert(&err) => None,
-            Err(err) => return Err(err.context("cannot read CONCESSION_ESCAPE_VERSION()")),
-        };
         let one = {
             let mut word = [0u8; 32];
             word[31] = 1;
             word
         };
-        if version == Some(one) {
+        let mut refusal = None;
+        for (selector, getter, revision) in [
+            (CONCESSION_ESCAPE_VERSION, "CONCESSION_ESCAPE_VERSION()", 3),
+            (NOTE_BOUND_EXIT_VERSION, "NOTE_BOUND_EXIT_VERSION()", 4),
+        ] {
+            let version = match self.call_word(selector, head).await {
+                Ok(Some(word)) => Some(word),
+                Ok(None) => bail!(
+                    "vault has no code at head block {} {}; waiting",
+                    head.number,
+                    head.hash
+                ),
+                Err(err) if is_revert(&err) => None,
+                Err(err) => return Err(err.context(format!("cannot read {getter}"))),
+            };
+            if version == Some(one) {
+                continue;
+            }
+            refusal = Some(match version {
+                Some(word) => format!(
+                    "vault {getter} is 0x{}, not 1: not a revision-{revision} vault, which this indexer ({CIRCUIT_ID}) needs",
+                    hex::encode(word)
+                ),
+                None => format!(
+                    "vault has no {getter}: a vault before revision {revision}, which this indexer ({CIRCUIT_ID}) cannot mirror"
+                ),
+            });
+            break;
+        }
+        let Some(reason) = refusal else {
             self.vault_verified = true;
             self.vault_mismatch_reported = false;
             return Ok(true);
-        }
-        let reason = match version {
-            Some(word) => format!(
-                "vault CONCESSION_ESCAPE_VERSION() is 0x{}, not 1: not a revision-3 vault ({CIRCUIT_ID})",
-                hex::encode(word)
-            ),
-            None => format!(
-                "vault has no CONCESSION_ESCAPE_VERSION(): a vault before revision 3, which this indexer ({CIRCUIT_ID}) cannot mirror"
-            ),
         };
         if !self.vault_mismatch_reported {
             self.vault_mismatch_reported = true;
@@ -616,13 +633,14 @@ impl JsonRpcLogPoller {
                     block.saturating_add(MAX_ANCESTRY_WALK) >= anchor.number
                 }) =>
             {
-                // The tree is unchanged, but exits, defeats and raises change
-                // no root: the reorg may have removed one the mirror holds.
+                // The tree is unchanged, but deposits above the activation
+                // cursor, exits, defeats and raises change no root: the reorg
+                // may have replaced one the mirror holds.
                 self.anchor_candidate = None;
                 Ok(Some(self.request_rebuild(
                     service,
                     format!(
-                        "reorg below checkpoint at block {} near a committed exit or defeat (block {}); its replacement cannot be verified by the root",
+                        "reorg below checkpoint at block {} near a committed deposit, exit or defeat (block {}); its replacement cannot be verified by the root",
                         anchor.number,
                         self.committed.last_lifecycle_block.unwrap_or_default()
                     ),
@@ -637,12 +655,7 @@ impl JsonRpcLogPoller {
                 self.committed.anchor = Some(canonical.block_ref());
                 self.anchor_checked_at = Some(head.block_ref());
                 self.persist_committed();
-                service.set_confirmed(
-                    canonical.number,
-                    canonical.hash.clone(),
-                    mirror.root(),
-                    mirror.next_note_id(),
-                );
+                service.set_confirmed(canonical.number, canonical.hash.clone(), &mirror);
                 tracing::warn!(
                     block = canonical.number,
                     hash = %canonical.hash,
@@ -787,12 +800,7 @@ impl JsonRpcLogPoller {
         at: BlockRef,
         last_lifecycle_block: Option<u64>,
     ) {
-        service.set_confirmed(
-            at.number,
-            at.hash.clone(),
-            mirror.root(),
-            mirror.next_note_id(),
-        );
+        service.set_confirmed(at.number, at.hash.clone(), &mirror);
         self.next_block = at.number.saturating_add(1);
         self.provisional = None;
         self.anchor_candidate = None;
@@ -1073,9 +1081,9 @@ impl JsonRpcLogPoller {
         service.set_sync_block(self.next_block);
     }
 
-    /// Compare a mirror with `currentRoot()` and `nextNoteId()` read at the
-    /// block hash. A lagging or forked replica yields `Unavailable`, never a
-    /// false match.
+    /// Compare a mirror with `currentRoot()`, `nextNoteId()` and
+    /// `activationCursor()` read at the block hash. A lagging or forked
+    /// replica yields `Unavailable`, never a false match.
     async fn verify_state(
         &mut self,
         mirror: &TreeMirror,
@@ -1107,25 +1115,44 @@ impl JsonRpcLogPoller {
             Ok(root) => root,
             Err(err) => return Verdict::Unavailable(anyhow!("invalid currentRoot word: {err}")),
         };
-        let next_note_id = match self.call_word(NEXT_NOTE_ID, at).await {
-            Ok(Some(word)) if word[..28].iter().all(|byte| *byte == 0) => {
-                u32::from_be_bytes([word[28], word[29], word[30], word[31]])
-            }
-            Ok(_) => return Verdict::Unavailable(anyhow!("invalid nextNoteId result")),
+        let next_note_id = match self.call_u32(NEXT_NOTE_ID, "nextNoteId", at).await {
+            Ok(value) => value,
             Err(err) => return Verdict::Unavailable(err),
         };
-        if root == mirror.root() && next_note_id == mirror.next_note_id() {
+        let cursor = match self
+            .call_u32(ACTIVATION_CURSOR, "activationCursor", at)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => return Verdict::Unavailable(err),
+        };
+        if root == mirror.root()
+            && next_note_id == mirror.next_note_id()
+            && cursor == mirror.activation_cursor()
+        {
             return Verdict::Match;
         }
         Verdict::Mismatch(format!(
-            "block {} {}: vault root {} nextNoteId {}; mirror root {} next_note_id {}",
+            "block {} {}: vault root {} nextNoteId {} activationCursor {}; mirror root {} next_note_id {} activation_cursor {}",
             at.number,
             at.hash,
             root,
             next_note_id,
+            cursor,
             mirror.root(),
-            mirror.next_note_id()
+            mirror.next_note_id(),
+            mirror.activation_cursor()
         ))
+    }
+
+    /// A `uint32` getter read by block hash.
+    async fn call_u32(&mut self, selector: &str, name: &str, at: &BlockRef) -> anyhow::Result<u32> {
+        match self.call_word(selector, at).await? {
+            Some(word) if word[..28].iter().all(|byte| *byte == 0) => {
+                Ok(u32::from_be_bytes([word[28], word[29], word[30], word[31]]))
+            }
+            _ => Err(anyhow!("invalid {name} result")),
+        }
     }
 
     /// `eth_call` by EIP-1898 block hash. `None` when the vault has no code.
@@ -1270,6 +1297,7 @@ impl JsonRpcLogPoller {
             last_processed_block_hash: anchor.hash.clone(),
             root: mirror.root(),
             next_note_id: mirror.next_note_id(),
+            activation_cursor: mirror.activation_cursor(),
             last_lifecycle_block: self.committed.last_lifecycle_block,
             mirror: mirror.snapshot(),
         };
@@ -1382,6 +1410,7 @@ struct IndexerCheckpoint {
     last_processed_block_hash: String,
     root: Felt252,
     next_note_id: u32,
+    activation_cursor: u32,
     #[serde(default)]
     last_lifecycle_block: Option<u64>,
     mirror: TreeMirrorSnapshot,
@@ -1539,7 +1568,7 @@ struct Applied {
     mirror: Arc<TreeMirror>,
     /// Block of the last vault event.
     last_event_block: Option<u64>,
-    /// Block of the last lifecycle event (not a deposit or retirement).
+    /// Block of the last lifecycle event (not an activation or retirement).
     last_lifecycle_block: Option<u64>,
     /// Events that ended or raised an escape the mirror never saw initiated.
     missed_re_escapes: Vec<MissedReEscapeAt>,
@@ -1569,9 +1598,12 @@ fn apply_logs(base: &Arc<TreeMirror>, logs: &[ChainLog]) -> Result<Applied, Stri
             });
         }
         last_event_block = Some(log.block);
+        // The vault's root and cursor cover activations and retirements. A
+        // deposit's record is covered only by its activation's root, so a
+        // reorg can swap it for another note at the same id unnoticed.
         if !matches!(
             event,
-            VaultEvent::NoteDeposited { .. } | VaultEvent::ClosedLeafRetired { .. }
+            VaultEvent::NotesActivated { .. } | VaultEvent::ClosedLeafRetired { .. }
         ) {
             last_lifecycle_block = Some(log.block);
         }
@@ -1700,11 +1732,21 @@ fn load_checkpoint(
         }
         2 => {
             // Revision-2 mirrors removed leaves on exits and lack note
-            // statuses, known roots and published nullifiers.
+            // statuses and published nullifiers.
             let archived = archive(path, "v2")?;
             tracing::warn!(
                 archived = %archived.display(),
                 "v2 indexer checkpoint mirrors a tree whose exits removed leaves; archived and replaying from --from-block"
+            );
+            return Ok(None);
+        }
+        3 => {
+            // Revision-3 mirrors inserted each leaf at deposit and lack the
+            // note records and the activation cursor.
+            let archived = archive(path, "v3")?;
+            tracing::warn!(
+                archived = %archived.display(),
+                "v3 indexer checkpoint mirrors a tree whose deposits inserted leaves; archived and replaying from --from-block"
             );
             return Ok(None);
         }
@@ -1717,7 +1759,7 @@ fn load_checkpoint(
 
     let checkpoint: IndexerCheckpoint = match serde_json::from_slice(&raw) {
         Ok(checkpoint) => checkpoint,
-        Err(err) => return corrupt(format!("invalid v3 checkpoint: {err}")),
+        Err(err) => return corrupt(format!("invalid v4 checkpoint: {err}")),
     };
     let bound_address = normalize_address(&checkpoint.contract_address).ok();
     if checkpoint.circuit_id != CIRCUIT_ID {
@@ -1745,8 +1787,14 @@ fn load_checkpoint(
         Ok(mirror) => mirror,
         Err(err) => return corrupt(format!("invalid checkpoint mirror: {err}")),
     };
-    if mirror.root() != checkpoint.root || mirror.next_note_id() != checkpoint.next_note_id {
-        return corrupt("checkpoint root or next_note_id does not match its mirror".to_string());
+    if mirror.root() != checkpoint.root
+        || mirror.next_note_id() != checkpoint.next_note_id
+        || mirror.activation_cursor() != checkpoint.activation_cursor
+    {
+        return corrupt(
+            "checkpoint root, next_note_id or activation_cursor does not match its mirror"
+                .to_string(),
+        );
     }
     Ok(Some(LoadedCheckpoint {
         chain_id: checkpoint.chain_id,
@@ -1788,8 +1836,9 @@ fn hex_quantity(value: u64) -> String {
     format!("0x{value:x}")
 }
 
-/// Event signatures of vault revision 3 (topic0 is their keccak256).
-pub(crate) const NOTE_DEPOSITED: &str = "NoteDeposited(uint32,bytes32,uint128,uint64,uint256)";
+/// Event signatures of vault revision 4 (topic0 is their keccak256).
+pub(crate) const NOTE_DEPOSITED: &str = "NoteDeposited(uint32,bytes32,uint128,uint64)";
+pub(crate) const NOTES_ACTIVATED: &str = "NotesActivated(uint32,uint32,uint256,bool)";
 pub(crate) const MUTUAL_CLOSE: &str = "MutualClose(uint32,uint256,uint128,address)";
 pub(crate) const ESCAPE_INITIATED: &str =
     "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)";
@@ -1804,6 +1853,7 @@ pub(crate) const CLOSED_LEAF_RETIRED: &str = "ClosedLeafRetired(uint32,uint256)"
 
 struct EventTopics {
     note_deposited: String,
+    notes_activated: String,
     mutual_close: String,
     escape_initiated: String,
     concession_recorded: String,
@@ -1818,6 +1868,7 @@ fn event_topics() -> &'static EventTopics {
     static TOPICS: OnceLock<EventTopics> = OnceLock::new();
     TOPICS.get_or_init(|| EventTopics {
         note_deposited: event_topic(NOTE_DEPOSITED),
+        notes_activated: event_topic(NOTES_ACTIVATED),
         mutual_close: event_topic(MUTUAL_CLOSE),
         escape_initiated: event_topic(ESCAPE_INITIATED),
         concession_recorded: event_topic(CONCESSION_RECORDED),
@@ -1848,7 +1899,7 @@ fn event_words(
     Ok((topic_to_u32(&log.topics[1])?, data))
 }
 
-/// Decode one of the nine tree and lifecycle events, strictly: exact topic
+/// Decode one of the ten tree and lifecycle events, strictly: exact topic
 /// and word counts, canonical uint widths and field elements. Any other
 /// topic (treasury, pause, ownership, payout credits and future events) is
 /// ignored without parsing its data.
@@ -1860,13 +1911,20 @@ fn decode_log(log: &RpcLog) -> anyhow::Result<Option<VaultEvent>> {
     let is = |topic: &String| topic0.eq_ignore_ascii_case(topic);
 
     let event = if is(&topics.note_deposited) {
-        let (note_id, words) = event_words(log, "NoteDeposited", 3, 3)?;
+        let (note_id, words) = event_words(log, "NoteDeposited", 3, 2)?;
         VaultEvent::NoteDeposited {
             note_id,
             commitment: topic_to_felt(&log.topics[2])?,
             amount: word_to_u128(&words[0])?,
             expiry_ts: word_to_u64(&words[1])?,
-            new_root: word_to_felt(&words[2])?,
+        }
+    } else if is(&topics.notes_activated) {
+        let (first_note_id, words) = event_words(log, "NotesActivated", 2, 3)?;
+        VaultEvent::NotesActivated {
+            first_note_id,
+            count: u32::from_be_bytes(narrow::<4>(&words[0], "uint32")?),
+            new_root: word_to_felt(&words[1])?,
+            proved: word_to_bool(&words[2])?,
         }
     } else if is(&topics.mutual_close) {
         let (note_id, words) = event_words(log, "MutualClose", 2, 3)?;
@@ -2005,6 +2063,14 @@ fn word_to_address(word: &[u8; 32]) -> anyhow::Result<[u8; 20]> {
     narrow::<20>(word, "address")
 }
 
+fn word_to_bool(word: &[u8; 32]) -> anyhow::Result<bool> {
+    match narrow::<1>(word, "bool")? {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => bail!("log word 0x{} is not a canonical bool", hex::encode(word)),
+    }
+}
+
 /// A uint256 the vault emits as a BN254 field element (a nullifier or root).
 fn word_to_felt(word: &[u8; 32]) -> anyhow::Result<Felt252> {
     Felt252::try_from_bytes_be(*word)
@@ -2052,41 +2118,67 @@ mod tests {
 
     #[test]
     fn test_decode_note_deposited_log() {
-        let new_root = Felt252::from_u64(999);
-        let log = RpcLog {
+        let mut log = RpcLog {
             block_number: "0x1".to_string(),
             block_hash: format!("0x{}", "ab".repeat(32)),
             log_index: "0x0".to_string(),
             address: None,
             removed: None,
             topics: vec![
-                event_topic("NoteDeposited(uint32,bytes32,uint128,uint64,uint256)"),
+                event_topic("NoteDeposited(uint32,bytes32,uint128,uint64)"),
                 Felt252::from_u64(7).to_hex(),
                 Felt252::from_u64(1234).to_hex(),
             ],
-            data: format!(
-                "0x{}{}{}",
-                encode_u128(55),
-                encode_u64(1_700_000_000),
-                encode_word(new_root),
-            ),
+            data: format!("0x{}{}", encode_u128(55), encode_u64(1_700_000_000)),
         };
+        assert_eq!(
+            decode_log(&log).unwrap(),
+            Some(VaultEvent::NoteDeposited {
+                note_id: 7,
+                commitment: Felt252::from_u64(1234),
+                amount: 55,
+                expiry_ts: 1_700_000_000,
+            })
+        );
+        // A revision-3 deposit carried the new root as a third word.
+        log.data.push_str(&encode_word(Felt252::from_u64(999)));
+        assert!(decode_log(&log).is_err());
+    }
 
-        match decode_log(&log).unwrap().unwrap() {
-            VaultEvent::NoteDeposited {
-                note_id,
-                commitment,
-                amount,
-                expiry_ts,
-                new_root: event_root,
-            } => {
-                assert_eq!(note_id, 7);
-                assert_eq!(commitment, Felt252::from_u64(1234));
-                assert_eq!(amount, 55);
-                assert_eq!(expiry_ts, 1_700_000_000);
-                assert_eq!(event_root, new_root);
-            }
-            other => panic!("unexpected event: {other:?}"),
+    #[test]
+    fn notes_activated_decodes_strictly() {
+        let first = format!("0x{:064x}", 16);
+        let activated =
+            |words: &[String]| log_of(vec![event_topic(NOTES_ACTIVATED), first.clone()], words);
+        let root = encode_word(Felt252::from_u64(0x77));
+        for (proved, flag) in [(true, "1"), (false, "0")] {
+            assert_eq!(
+                decode_log(&activated(&[
+                    format!("{:064x}", 4),
+                    root.clone(),
+                    format!("{flag:0>64}"),
+                ]))
+                .unwrap(),
+                Some(VaultEvent::NotesActivated {
+                    first_note_id: 16,
+                    count: 4,
+                    new_root: Felt252::from_u64(0x77),
+                    proved,
+                })
+            );
+        }
+        // A count wider than uint32, a bool other than 0 or 1, a root
+        // outside the field, a missing word and an extra topic are refused.
+        let mut extra_topic = activated(&[format!("{:064x}", 4), root.clone(), encode_u64(1)]);
+        extra_topic.topics.push(first.clone());
+        for log in [
+            activated(&[format!("{:064x}", 1u64 << 32), root.clone(), encode_u64(1)]),
+            activated(&[format!("{:064x}", 4), root.clone(), encode_u64(2)]),
+            activated(&[format!("{:064x}", 4), "f".repeat(64), encode_u64(1)]),
+            activated(&[format!("{:064x}", 4), root.clone()]),
+            extra_topic,
+        ] {
+            assert!(decode_log(&log).is_err(), "{log:?}");
         }
     }
 
@@ -2173,7 +2265,7 @@ mod tests {
         assert!(path.exists());
     }
 
-    pub(super) fn write_v3_checkpoint(
+    pub(super) fn write_v4_checkpoint(
         path: &Path,
         contract_address: &str,
         chain_id: u64,
@@ -2192,6 +2284,7 @@ mod tests {
                 last_processed_block_hash: anchor.hash.clone(),
                 root: mirror.root(),
                 next_note_id: mirror.next_note_id(),
+                activation_cursor: mirror.activation_cursor(),
                 last_lifecycle_block: None,
                 mirror: mirror.snapshot(),
             },
@@ -2203,25 +2296,19 @@ mod tests {
     fn checkpoint_round_trip_restores_tree_and_cursor_together() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint.json");
-        let mut reference = TreeMirror::new();
-        let mut deposit = VaultEvent::NoteDeposited {
-            note_id: 0,
-            commitment: Felt252::from_u64(1234),
-            amount: 55,
-            expiry_ts: 1_700_000_000,
-            new_root: Felt252::ZERO,
-        };
-        reference.process_event(&deposit);
-        if let VaultEvent::NoteDeposited { new_root, .. } = &mut deposit {
-            *new_root = reference.root();
-        }
+        let mut reference = crate::tree_mirror::tests::Reference::new();
+        let events = [
+            reference.deposit(1234),
+            reference.deposit(1235),
+            reference.activate(1),
+        ];
         let mut mirror = TreeMirror::new();
-        mirror.apply_event(&deposit).unwrap();
+        crate::tree_mirror::tests::apply_all(&mut mirror, &events);
         let anchor = BlockRef {
             number: 17,
             hash: format!("0x{}", "17".repeat(32)),
         };
-        write_v3_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &mirror);
+        write_v4_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &mirror);
 
         let restored = service();
         let poller = JsonRpcLogPoller::new(
@@ -2237,12 +2324,14 @@ mod tests {
         .unwrap();
         assert_eq!(poller.next_block(), 18);
         assert_eq!(poller.committed.mirror.root(), mirror.root());
+        assert_eq!(poller.committed.mirror.notes(), mirror.notes());
         assert_eq!(poller.committed.anchor, Some(anchor.clone()));
         let health = restored.health();
         assert_eq!(health.confirmed_block, Some(17));
         assert_eq!(health.confirmed_block_hash, Some(anchor.hash));
         assert_eq!(health.confirmed_root, Some(mirror.root()));
-        assert_eq!(health.confirmed_next_note_id, Some(1));
+        assert_eq!(health.confirmed_next_note_id, Some(2));
+        assert_eq!(health.confirmed_activation_cursor, Some(1));
         // Intentionally inverted from the v1 behaviour: nothing is served
         // until the restored state verifies against the vault.
         assert_eq!(restored.status(), SyncStatus::Syncing);
@@ -2394,6 +2483,7 @@ mod tests {
         };
         for (name, signature) in [
             ("NoteDeposited", NOTE_DEPOSITED),
+            ("NotesActivated", NOTES_ACTIVATED),
             ("MutualClose", MUTUAL_CLOSE),
             ("EscapeWithdrawalInitiated", ESCAPE_INITIATED),
             ("EscapeConcessionRecorded", CONCESSION_RECORDED),
@@ -2418,7 +2508,15 @@ mod tests {
                     commitment: n(0x0c0c),
                     amount: 1_000_000,
                     expiry_ts: 2_000_000_000,
-                    new_root: n(0x0a0a),
+                },
+            ),
+            (
+                "NotesActivated",
+                VaultEvent::NotesActivated {
+                    first_note_id: 4,
+                    count: 4,
+                    new_root: n(0x0d0d),
+                    proved: true,
                 },
             ),
             (
@@ -2498,7 +2596,16 @@ mod tests {
     }
 
     #[test]
-    fn revision_three_event_topics_are_pinned() {
+    fn vault_event_topics_are_pinned() {
+        // Revision 4 (design C, section 1).
+        assert_eq!(
+            event_topic(NOTE_DEPOSITED),
+            "0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36"
+        );
+        assert_eq!(
+            event_topic(NOTES_ACTIVATED),
+            "0x2c5604373c15ade06913903b9f6fffb2f3b0a029d20dac56a6eeb7d8b1c11144"
+        );
         // topic0 values pinned in the concession-exit spec (section 4.1).
         assert_eq!(
             event_topic(CONCESSION_RECORDED),
@@ -2616,6 +2723,25 @@ mod tests {
     }
 
     #[test]
+    fn v3_checkpoint_of_a_deposit_inserted_tree_is_archived_and_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.json");
+        fs::write(
+            &path,
+            r#"{"version":3,"circuit_id":"zkapi-v2-concession-v1","chain_id":31337,"mirror":{"known_roots":[]}}"#,
+        )
+        .unwrap();
+        assert!(load_checkpoint(&path, VAULT, None).unwrap().is_none());
+        assert!(!path.exists());
+        let archived: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".v3-"))
+            .collect();
+        assert_eq!(archived.len(), 1, "{archived:?}");
+    }
+
+    #[test]
     fn checkpoint_of_another_circuit_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cursor.json");
@@ -2623,21 +2749,54 @@ mod tests {
             number: 3,
             hash: format!("0x{}", "03".repeat(32)),
         };
-        write_v3_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+        write_v4_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
         let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        raw["circuit_id"] = "zkapi-v2-note-bound-v1".into();
+        raw["circuit_id"] = "zkapi-v2-concession-v1".into();
         fs::write(&path, raw.to_string()).unwrap();
         let error = load_checkpoint(&path, VAULT, None).err().unwrap();
-        assert!(format!("{error:#}").contains("zkapi-v2-note-bound-v1"));
+        assert!(format!("{error:#}").contains("zkapi-v2-concession-v1"));
         assert!(path.exists(), "a refused checkpoint is left in place");
     }
 
+    #[test]
+    fn checkpoint_whose_cursor_disagrees_with_its_mirror_is_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.json");
+        let anchor = BlockRef {
+            number: 3,
+            hash: format!("0x{}", "03".repeat(32)),
+        };
+        let mut reference = crate::tree_mirror::tests::Reference::new();
+        let mut mirror = TreeMirror::new();
+        crate::tree_mirror::tests::apply_all(
+            &mut mirror,
+            &[reference.deposit(1), reference.activate(1)],
+        );
+        write_v4_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &mirror);
+        let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        raw["activation_cursor"] = 0.into();
+        fs::write(&path, raw.to_string()).unwrap();
+        assert!(load_checkpoint(&path, VAULT, None).unwrap().is_none());
+        assert!(!path.exists());
+    }
+
     #[tokio::test]
-    async fn a_vault_before_revision_three_is_never_served() {
-        for version in [None, Some(0), Some(2)] {
+    async fn a_vault_before_revision_four_is_never_served() {
+        // A vault without concession escapes (before revision 3), or with
+        // them but without note-bound exits (revision 3).
+        for (escape, note_bound) in [
+            (None, None),
+            (Some(0), Some(1)),
+            (Some(2), Some(1)),
+            (Some(1), None),
+            (Some(1), Some(0)),
+            (Some(1), Some(2)),
+        ] {
+            let version = (escape, note_bound);
             let chain = MockChain::start().await;
             chain.mine(vec![crate::test_chain::Tx::Deposit { commitment: 0xa }]);
-            chain.set_escape_version(version);
+            chain.set_escape_version(escape);
+            chain.set_note_bound_version(note_bound);
             let service = service();
             let mut poller = JsonRpcLogPoller::new(
                 PollerConfig {
@@ -2657,12 +2816,20 @@ mod tests {
                 assert_eq!(service.status(), SyncStatus::Diverged, "{version:?}");
                 assert!(service.view().is_err());
             }
-            assert!(service.health().reason.unwrap().contains("revision"));
+            let reason = service.health().reason.unwrap();
+            assert!(reason.contains("revision"), "{reason}");
+            let getter = if escape == Some(1) {
+                "NOTE_BOUND_EXIT_VERSION()"
+            } else {
+                "CONCESSION_ESCAPE_VERSION()"
+            };
+            assert!(reason.contains(getter), "{reason}");
             assert!(chain.calls("eth_getLogs").is_empty());
 
-            // Once the vault reports version 1 (a misread corrected), it is
-            // mirrored.
+            // Once the vault reports both versions 1 (a misread corrected),
+            // it is mirrored.
             chain.set_escape_version(Some(1));
+            chain.set_note_bound_version(Some(1));
             assert_eq!(poller.poll_once(&service).await.unwrap(), PollOutcome::Idle);
             assert!(service.is_ready());
         }

@@ -24,7 +24,8 @@ use zkapi_types::Felt252;
 use crate::events::VaultEvent;
 use crate::poller::{
     event_topic, CLOSED_LEAF_RETIRED, CONCESSION_RAISED, CONCESSION_RECORDED, ESCAPE_CHALLENGED,
-    ESCAPE_FINALIZED, ESCAPE_INITIATED, EXPIRED_CLAIMED, MUTUAL_CLOSE, NOTE_DEPOSITED,
+    ESCAPE_FINALIZED, ESCAPE_INITIATED, EXPIRED_CLAIMED, MUTUAL_CLOSE, NOTES_ACTIVATED,
+    NOTE_DEPOSITED,
 };
 use crate::tree_mirror::TreeMirror;
 
@@ -40,6 +41,12 @@ pub(crate) const EXPIRY_TS: u64 = 1_900_000_000;
 pub(crate) enum Tx {
     Deposit {
         commitment: u64,
+    },
+    /// `activateNotes` (`proved`) or `activateNotesOnChain` of the next
+    /// `count` recorded notes.
+    Activate {
+        count: u32,
+        proved: bool,
     },
     Close {
         note_id: u32,
@@ -59,7 +66,7 @@ pub(crate) enum Tx {
     Challenge {
         note_id: u32,
     },
-    /// `retireClosedLeaf` of a closed note.
+    /// `retireClosedLeaf` of a closed, activated note.
     Retire {
         note_id: u32,
     },
@@ -110,6 +117,9 @@ struct Faults {
     /// The vault answers CONCESSION_ESCAPE_VERSION() with this value; `None`
     /// reverts, as a vault before revision 3 does.
     escape_version: Option<u64>,
+    /// The vault answers NOTE_BOUND_EXIT_VERSION() with this value; `None`
+    /// reverts, as a vault before revision 4 does.
+    note_bound_version: Option<u64>,
     fail: HashMap<String, u32>,
     rate_limit: HashMap<String, u32>,
 }
@@ -234,7 +244,12 @@ impl Chain {
         match params[0]["data"].as_str().unwrap_or_default() {
             "0xfdab463d" => Ok(json!(felt_word(state.root()))),
             "0x7a2043a3" => Ok(json!(format!("0x{:064x}", state.next_note_id()))),
+            "0x93e0ce4e" => Ok(json!(format!("0x{:064x}", state.activation_cursor()))),
             "0x5e00b426" => match self.faults.escape_version {
+                Some(version) => Ok(json!(format!("0x{version:064x}"))),
+                None => Err((-32000, "execution reverted".to_string())),
+            },
+            "0x56853816" => match self.faults.note_bound_version {
                 Some(version) => Ok(json!(format!("0x{version:064x}"))),
                 None => Err((-32000, "execution reverted".to_string())),
             },
@@ -255,7 +270,6 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
                 commitment: Felt252::from_u64(commitment),
                 amount: DEPOSIT_AMOUNT,
                 expiry_ts: EXPIRY_TS,
-                new_root: Felt252::ZERO,
             });
             vec![MockLog {
                 topics: vec![
@@ -266,7 +280,29 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
                 data: words(&[
                     format!("{DEPOSIT_AMOUNT:064x}"),
                     format!("{EXPIRY_TS:064x}"),
+                ]),
+            }]
+        }
+        Tx::Activate { count, proved } => {
+            let first_note_id = mirror.activation_cursor();
+            assert!(
+                matches!(count, 1 | 4 | 16)
+                    && first_note_id.is_multiple_of(count)
+                    && first_note_id + count <= mirror.next_note_id(),
+                "mock vault: activation of {count} notes from {first_note_id} reverts"
+            );
+            mirror.process_event(&VaultEvent::NotesActivated {
+                first_note_id,
+                count,
+                new_root: Felt252::ZERO,
+                proved,
+            });
+            vec![MockLog {
+                topics: vec![event_topic(NOTES_ACTIVATED), note_topic(first_note_id)],
+                data: words(&[
+                    format!("{count:064x}"),
                     felt_hex(mirror.root()),
+                    format!("{:064x}", u8::from(proved)),
                 ]),
             }]
         }
@@ -384,6 +420,10 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
             }]
         }
         Tx::Retire { note_id } => {
+            assert!(
+                mirror.is_activated(note_id),
+                "mock vault: retireClosedLeaf of unactivated note {note_id} reverts"
+            );
             mirror.process_event(&VaultEvent::ClosedLeafRetired {
                 note_id,
                 new_root: Felt252::ZERO,
@@ -429,6 +469,7 @@ impl MockChain {
             hashes: HashMap::new(),
             faults: Faults {
                 escape_version: Some(1),
+                note_bound_version: Some(1),
                 ..Faults::default()
             },
             calls: Vec::new(),
@@ -511,6 +552,10 @@ impl MockChain {
         self.state_at(number).next_note_id()
     }
 
+    pub(crate) fn cursor_at(&self, number: u64) -> u32 {
+        self.state_at(number).activation_cursor()
+    }
+
     pub(crate) fn is_canonical(&self, hash: &str) -> bool {
         self.with(|chain| chain.hashes.contains_key(hash))
     }
@@ -561,6 +606,11 @@ impl MockChain {
     /// The vault's CONCESSION_ESCAPE_VERSION() (`None`: the getter reverts).
     pub(crate) fn set_escape_version(&self, version: Option<u64>) {
         self.with(|chain| chain.faults.escape_version = version);
+    }
+
+    /// The vault's NOTE_BOUND_EXIT_VERSION() (`None`: the getter reverts).
+    pub(crate) fn set_note_bound_version(&self, version: Option<u64>) {
+        self.with(|chain| chain.faults.note_bound_version = version);
     }
 
     /// Timestamp for blocks mined from now on (`None`: wall clock).

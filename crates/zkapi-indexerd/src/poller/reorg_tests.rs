@@ -139,6 +139,7 @@ fn assert_canonical(chain: &MockChain, service: &IndexerService) {
         );
         assert_eq!(view.root, chain.root_at(view.block_number));
         assert_eq!(view.next_note_id, chain.next_note_id_at(view.block_number));
+        assert_eq!(view.activation_cursor, chain.cursor_at(view.block_number));
     }
 }
 
@@ -149,10 +150,11 @@ fn assert_serves_head(chain: &MockChain, indexer: &Indexer) {
     assert_eq!(view.block_hash, chain.hash_at(head));
     assert_eq!(view.root, chain.root_at(head));
     assert_eq!(view.next_note_id, chain.next_note_id_at(head));
-    assert_eq!(
-        view.mirror.pending_escapes(),
-        chain.state_at(head).pending_escapes()
-    );
+    assert_eq!(view.activation_cursor, chain.cursor_at(head));
+    let state = chain.state_at(head);
+    assert_eq!(view.mirror.notes(), state.notes());
+    assert_eq!(view.mirror.current_leaves(), state.current_leaves());
+    assert_eq!(view.mirror.pending_escapes(), state.pending_escapes());
 }
 
 async fn serve(service: Arc<IndexerService>) -> String {
@@ -170,16 +172,22 @@ async fn get(base: &str, path: &str) -> (u16, Value) {
     (status, response.json().await.unwrap())
 }
 
-const SERVED_ROUTES: [&str; 8] = [
+const SERVED_ROUTES: [&str; 6] = [
     "/v1/tree/root",
     "/v1/tree/next-note-id",
     "/v1/tree/snapshot",
     "/v1/tree/notes/0/path",
-    "/v1/tree/notes/0/zero-path",
-    "/v1/tree/roots/0x1",
     "/v1/nullifiers/0x1/published",
     "/v1/escapes/pending",
 ];
+
+/// `activateNotes` of the next `count` recorded notes.
+fn activate(count: u32) -> Tx {
+    Tx::Activate {
+        count,
+        proved: true,
+    }
+}
 
 /// The pending-escapes entry of the mock vault's escape at `nullifier`
 /// (successor `nullifier + 1`, state balance 15, conceded 5).
@@ -320,25 +328,80 @@ async fn reorg_below_checkpoint_without_vault_change_reanchors() {
     let dir = tempfile::tempdir().unwrap();
     let cursor = dir.path().join("indexer.cursor");
     let chain = MockChain::start().await;
+    // A deposit is a lifecycle event (its record is not root-covered), so
+    // it lies beyond the ancestry walk of the reorganized checkpoint; the
+    // activation near it is covered by the root.
     chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
-    chain.mine_empty(4);
+    chain.mine_empty(MAX_ANCESTRY_WALK);
+    chain.mine(vec![activate(1)]);
+    let anchor = chain.mine_empty(4) - 1;
     let mut indexer = Indexer::new(config(&chain, 1, Some(&cursor)));
     indexer.poll_to_idle().await;
     let before = indexer.view();
+    assert_eq!(before.activation_cursor, 1);
     let stored = read_checkpoint(&cursor).unwrap();
-    assert_eq!(stored.last_processed_block, 5);
+    assert_eq!(stored.last_processed_block, anchor);
 
     // Empty blocks, including the checkpoint block, are replaced.
     chain.reorg(3, vec![vec![], vec![], vec![]]);
-    assert_ne!(chain.hash_at(5), stored.last_processed_block_hash);
+    assert_ne!(chain.hash_at(anchor), stored.last_processed_block_hash);
     assert!(indexer.poll().await.is_err());
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
     assert_eq!(indexer.view().root, before.root);
     assert_eq!(indexer.service.health().rebuild_count, 0);
     let checkpoint = read_checkpoint(&cursor).unwrap();
-    assert_eq!(checkpoint.last_processed_block, 5);
-    assert_eq!(checkpoint.last_processed_block_hash, chain.hash_at(5));
+    assert_eq!(checkpoint.last_processed_block, anchor);
+    assert_eq!(checkpoint.last_processed_block_hash, chain.hash_at(anchor));
+}
+
+#[tokio::test]
+async fn reorg_below_checkpoint_replacing_a_pending_deposit_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = dir.path().join("indexer.cursor");
+    let chain = MockChain::start().await;
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }, activate(1)]);
+    chain.mine(vec![Tx::Deposit { commitment: 0xb }]);
+    chain.mine_empty(2);
+    let mut indexer = Indexer::new(config(&chain, 1, Some(&cursor)));
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    let root = indexer.view().root;
+    assert_eq!(
+        read_checkpoint(&cursor).unwrap().mirror.notes[1].commitment,
+        Felt252::from_u64(0xb)
+    );
+
+    // The committed deposit above the cursor is replaced by another note at
+    // the same id: root, nextNoteId and activationCursor are unchanged, so
+    // only the lifecycle rule tells it from an empty reorg.
+    chain.reorg(
+        3,
+        vec![vec![Tx::Deposit { commitment: 0xc }], vec![], vec![]],
+    );
+    assert_eq!(chain.root_at(chain.head()), root);
+    assert_eq!(chain.next_note_id_at(chain.head()), 2);
+    assert_eq!(chain.cursor_at(chain.head()), 1);
+    let base = serve(indexer.service.clone()).await;
+    assert!(indexer.poll().await.is_err());
+    assert_eq!(indexer.poll().await.unwrap(), PollOutcome::MoreWork);
+    assert_unavailable(&base, "rebuilding").await;
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert_eq!(indexer.service.health().rebuild_count, 1);
+    let (_, snapshot) = get(&base, "/v1/tree/snapshot").await;
+    assert_eq!(snapshot["notes"][1]["commitment"], "0xc");
+    assert_eq!(
+        read_checkpoint(&cursor).unwrap().mirror.notes[1].commitment,
+        Felt252::from_u64(0xc)
+    );
+
+    // Its activation then verifies with the replacement's leaf.
+    chain.mine(vec![activate(1)]);
+    chain.mine_empty(2);
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert_eq!(indexer.view().activation_cursor, 2);
 }
 
 async fn lagging_get_logs_replica_case(confirmations: u64) {
@@ -409,7 +472,7 @@ async fn lagging_get_logs_replica_is_absorbed_below_the_confirmation_depth() {
 #[tokio::test]
 async fn reorged_mutual_close_reopens_the_note_and_unpublishes_its_nullifier() {
     let chain = MockChain::start().await;
-    chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }, activate(1)]);
     chain.mine_empty(4);
     let mut indexer = Indexer::new(config(&chain, 3, None));
     indexer.poll_to_idle().await;
@@ -449,7 +512,7 @@ async fn reorged_mutual_close_reopens_the_note_and_unpublishes_its_nullifier() {
 #[tokio::test]
 async fn reorged_escape_initiation_clears_the_pending_list_and_publications() {
     let chain = MockChain::start().await;
-    chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }, activate(1)]);
     chain.mine_empty(4);
     let mut indexer = Indexer::new(config(&chain, 3, None));
     indexer.poll_to_idle().await;
@@ -549,7 +612,11 @@ async fn reorged_committed_mutual_close_rebuilds() {
 async fn reorged_challenge_and_expired_claim_are_undone() {
     let chain = MockChain::start().await;
     chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
-    chain.mine(vec![Tx::Deposit { commitment: 0xb }]);
+    chain.mine(vec![
+        Tx::Deposit { commitment: 0xb },
+        activate(1),
+        activate(1),
+    ]);
     chain.mine(vec![Tx::Escape {
         note_id: 0,
         nullifier: 900,
@@ -603,7 +670,7 @@ async fn reorged_challenge_and_expired_claim_are_undone() {
 /// until the indexer diverges.
 async fn diverge_on_dropped_retirement() -> (MockChain, Indexer, String, u64) {
     let chain = MockChain::start().await;
-    chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }, activate(1)]);
     chain.mine(vec![Tx::Close { note_id: 0 }]);
     chain.mine_empty(3);
     let mut indexer = Indexer::new(config(&chain, 2, None));
@@ -620,22 +687,24 @@ async fn diverge_on_dropped_retirement() -> (MockChain, Indexer, String, u64) {
     (chain, indexer, base, served)
 }
 
-/// A deposit and the close and leaf retirement of that note all missing from
-/// the logs leave the mirror at the vault's root (the note's leaf is zero
-/// again) with a stale next_note_id. Only the nextNoteId comparison of the
-/// verified-head check catches it, and such a view is never served.
+/// A deposit and the activation, close and leaf retirement of that note all
+/// missing from the logs leave the mirror at the vault's root (the note's
+/// leaf is zero again) with a stale next_note_id and activation cursor. Only
+/// those comparisons of the verified-head check catch it, and such a view is
+/// never served.
 #[tokio::test]
 async fn missed_deposit_close_and_retirement_at_the_vaults_root_are_never_served() {
     let chain = MockChain::start().await;
-    chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }, activate(1)]);
     chain.mine_empty(3);
     let mut indexer = Indexer::new(config(&chain, 2, None));
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
-    let deposit = chain.mine(vec![Tx::Deposit { commitment: 0xb }]);
+    let deposit = chain.mine(vec![Tx::Deposit { commitment: 0xb }, activate(1)]);
     let close = chain.mine(vec![Tx::Close { note_id: 1 }]);
     let retire = chain.mine(vec![Tx::Retire { note_id: 1 }]);
     chain.drop_log(deposit, 0);
+    chain.drop_log(deposit, 1);
     chain.drop_log(close, 0);
     chain.drop_log(retire, 0);
     let head = chain.mine_empty(3);
@@ -647,8 +716,11 @@ async fn missed_deposit_close_and_retirement_at_the_vaults_root_are_never_served
         assert_canonical(&chain, &indexer.service);
     }
     assert_unavailable(&base, "diverged").await;
-    let health = indexer.service.health();
-    assert!(health.reason.unwrap().contains("nextNoteId 2"));
+    let reason = indexer.service.health().reason.unwrap();
+    assert!(
+        reason.contains("nextNoteId 2 activationCursor 2"),
+        "{reason}"
+    );
 }
 
 #[tokio::test]
@@ -725,7 +797,7 @@ async fn corrupted_checkpoint_is_never_served_and_is_rebuilt() {
         number: 4,
         hash: chain.hash_at(4),
     };
-    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &chain.state_at(2));
+    super::tests::write_v4_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &chain.state_at(2));
 
     let mut indexer = Indexer::new(config(&chain, 2, Some(&cursor)));
     let base = serve(indexer.service.clone()).await;
@@ -746,7 +818,7 @@ fn restart_at_head_checkpoint(chain: &MockChain, cursor: &Path, mirror: &TreeMir
         number: head,
         hash: chain.hash_at(head),
     };
-    super::tests::write_v3_checkpoint(cursor, VAULT, CHAIN_ID, &anchor, mirror);
+    super::tests::write_v4_checkpoint(cursor, VAULT, CHAIN_ID, &anchor, mirror);
     Indexer::new(config(chain, 0, Some(cursor)))
 }
 
@@ -834,13 +906,13 @@ fn checkpoint_for_another_vault_is_refused() {
     let service = IndexerService::new_syncing(settings(12));
 
     let other_vault = "0x00000000000000000000000000000000000000bb";
-    super::tests::write_v3_checkpoint(&cursor, other_vault, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v4_checkpoint(&cursor, other_vault, CHAIN_ID, &anchor, &TreeMirror::new());
     let Err(error) = JsonRpcLogPoller::new(offline_config(&cursor), &service) else {
         panic!("a checkpoint for another vault must be refused");
     };
     assert!(format!("{error:#}").contains("--resync"));
 
-    super::tests::write_v3_checkpoint(&cursor, VAULT, 1, &anchor, &TreeMirror::new());
+    super::tests::write_v4_checkpoint(&cursor, VAULT, 1, &anchor, &TreeMirror::new());
     let Err(error) = JsonRpcLogPoller::new(offline_config(&cursor), &service) else {
         panic!("a checkpoint for another chain must be refused");
     };
@@ -849,7 +921,7 @@ fn checkpoint_for_another_vault_is_refused() {
     assert!(cursor.exists());
 
     // A newer binary's checkpoint is never replaced.
-    std::fs::write(&cursor, r#"{"version":4}"#).unwrap();
+    std::fs::write(&cursor, r#"{"version":5}"#).unwrap();
     assert!(JsonRpcLogPoller::new(offline_config(&cursor), &service).is_err());
     assert!(cursor.exists());
 }
@@ -876,7 +948,7 @@ fn resync_flag_and_sentinel_archive_checkpoint() {
     };
     let service = IndexerService::new_syncing(settings(12));
 
-    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v4_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
     let mut config = offline_config(&cursor);
     config.resync = true;
     let poller = JsonRpcLogPoller::new(config.clone(), &service).unwrap();
@@ -885,7 +957,7 @@ fn resync_flag_and_sentinel_archive_checkpoint() {
     assert_eq!(archives(dir.path(), "resync").len(), 1);
     drop(poller);
 
-    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v4_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
     let sentinel = dir.path().join("indexer.cursor.resync");
     std::fs::write(&sentinel, b"").unwrap();
     config.resync = false;
@@ -1660,4 +1732,225 @@ async fn rebuild_replay_does_not_report_a_missed_re_escape_again() {
         logs.lines_with("missed re-escape already reported").len(),
         1
     );
+}
+
+#[tokio::test]
+async fn activation_batches_of_every_size_are_mirrored_and_served() {
+    let chain = MockChain::start().await;
+    let mut indexer = Indexer::new(config(&chain, 2, None));
+    let base = serve(indexer.service.clone()).await;
+    let deposits = |chain: &MockChain, count: u64| {
+        chain.mine(
+            (0..count)
+                .map(|index| Tx::Deposit {
+                    commitment: 0x1000 + chain.next_note_id_at(chain.head()) as u64 + index,
+                })
+                .collect(),
+        )
+    };
+    deposits(&chain, 5);
+    chain.mine_empty(2);
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    let (_, root) = get(&base, "/v1/tree/root").await;
+    assert_eq!(root["next_note_id"], 5);
+    assert_eq!(root["activation_cursor"], 0);
+    assert_eq!(root["root"], json_of(TreeMirror::empty_root()));
+
+    // K = 1 (proved), then K = 1 on-chain up to an aligned slot for K = 4,
+    // K = 4 up to 16, K = 16, and a K = 1 batch next to pending deposits.
+    for (batch, proved) in [
+        (1, true),
+        (1, false),
+        (1, true),
+        (1, true),
+        (4, true),
+        (4, false),
+        (4, true),
+        (16, true),
+        (1, false),
+    ] {
+        let cursor = chain.cursor_at(chain.head());
+        let pending = chain.next_note_id_at(chain.head()) - cursor;
+        if pending < batch {
+            deposits(&chain, u64::from(batch - pending) + 1);
+        }
+        // The worker's witness: the served path of the cursor's slot.
+        let (status, path) = get(&base, &format!("/v1/tree/notes/{cursor}/path")).await;
+        assert_eq!(status, 200);
+        assert_eq!(path["activated"], false);
+        assert_eq!(path["activation_cursor"], cursor);
+        assert_eq!(path["leaf"], json_of(Felt252::ZERO));
+        chain.mine(vec![Tx::Activate {
+            count: batch,
+            proved,
+        }]);
+        chain.mine_empty(1);
+        indexer.poll_to_idle().await;
+        assert_serves_head(&chain, &indexer);
+        assert_eq!(indexer.view().activation_cursor, cursor + batch);
+    }
+    assert_eq!(indexer.view().activation_cursor, 33);
+    deposits(&chain, 2);
+    chain.mine_empty(2);
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    let (_, snapshot) = get(&base, "/v1/tree/snapshot").await;
+    let next = snapshot["next_note_id"].as_u64().unwrap() as usize;
+    assert_eq!(next, 35);
+    assert_eq!(snapshot["activation_cursor"], 33);
+    assert_eq!(snapshot["leaves"].as_array().unwrap().len(), next);
+    assert_eq!(snapshot["note_leaves"].as_array().unwrap().len(), next);
+    assert_eq!(snapshot["notes"].as_array().unwrap().len(), next);
+    for slot in 0..next {
+        let leaf = &snapshot["leaves"][slot];
+        if slot < 33 {
+            assert_eq!(leaf, &snapshot["note_leaves"][slot], "{slot}");
+        } else {
+            assert_eq!(leaf, &json_of(Felt252::ZERO), "{slot}");
+        }
+    }
+    let (_, path) = get(&base, "/v1/tree/notes/20/path").await;
+    assert_eq!(path["activated"], true);
+    assert_eq!(path["leaf"], snapshot["note_leaves"][20]);
+    let (_, health) = get(&base, "/health").await;
+    assert_eq!(health["activation_cursor"], 33);
+    assert_eq!(indexer.service.health().rebuild_count, 0);
+}
+
+#[tokio::test]
+async fn a_dropped_activation_log_is_never_served() {
+    let chain = MockChain::start().await;
+    chain.mine(vec![
+        Tx::Deposit { commitment: 0xa },
+        Tx::Deposit { commitment: 0xb },
+    ]);
+    chain.mine_empty(2);
+    let mut indexer = Indexer::new(config(&chain, 1, None));
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    let activation = chain.mine(vec![activate(1)]);
+    chain.drop_log(activation, 0);
+    chain.mine_empty(2);
+    let base = serve(indexer.service.clone()).await;
+    for _ in 0..3 {
+        indexer.cycle().await;
+        assert_canonical(&chain, &indexer.service);
+    }
+    assert_unavailable(&base, "diverged").await;
+    let reason = indexer.service.health().reason.unwrap();
+    assert!(reason.contains("activationCursor 1"), "{reason}");
+
+    chain.restore_logs();
+    indexer.cycle().await;
+    assert_serves_head(&chain, &indexer);
+}
+
+/// The logs show note 1 with another commitment than the vault recorded.
+/// Above the activation cursor the root does not cover the record, so the
+/// view verifies and serves it as a hint, but the activation's root does
+/// not follow from it: that view is never served.
+#[tokio::test]
+async fn a_wrong_pending_record_is_caught_by_its_activation_root() {
+    let chain = MockChain::start().await;
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }, activate(1)]);
+    let swapped = chain.mine(vec![
+        Tx::Deposit { commitment: 0xb },
+        Tx::Raw {
+            topics: vec![
+                event_topic(NOTE_DEPOSITED),
+                format!("0x{:064x}", 1),
+                format!("0x{:064x}", 0xbad),
+            ],
+            data: format!(
+                "0x{:064x}{:064x}",
+                crate::test_chain::DEPOSIT_AMOUNT,
+                crate::test_chain::EXPIRY_TS
+            ),
+        },
+    ]);
+    chain.drop_log(swapped, 0);
+    chain.mine_empty(2);
+    let mut indexer = Indexer::new(config(&chain, 1, None));
+    indexer.poll_to_idle().await;
+    let view = indexer.view();
+    assert_eq!(view.root, chain.root_at(chain.head()));
+    assert_eq!(view.mirror.notes()[1].commitment, Felt252::from_u64(0xbad));
+    let served = view.block_number;
+
+    chain.mine(vec![activate(1)]);
+    chain.mine_empty(2);
+    let base = serve(indexer.service.clone()).await;
+    for _ in 0..3 {
+        indexer.cycle().await;
+        if let Ok(view) = indexer.service.view() {
+            assert_eq!(view.block_number, served, "the activation is never served");
+        }
+    }
+    assert_unavailable(&base, "diverged").await;
+    let reason = indexer.service.health().reason.unwrap();
+    assert!(reason.contains("does not match mirror root"), "{reason}");
+}
+
+#[tokio::test]
+async fn a_competing_activation_reorged_in_is_followed() {
+    let chain = MockChain::start().await;
+    chain.mine(
+        (0..4)
+            .map(|index| Tx::Deposit {
+                commitment: 0xa0 + index,
+            })
+            .collect(),
+    );
+    chain.mine_empty(4);
+    let mut indexer = Indexer::new(config(&chain, 3, None));
+    indexer.poll_to_idle().await;
+
+    // A batch of four lands at the head, then a reorg replaces it with the
+    // on-chain fallback of a single note.
+    chain.mine(vec![activate(4)]);
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert_eq!(indexer.view().activation_cursor, 4);
+    chain.reorg(
+        1,
+        vec![vec![Tx::Activate {
+            count: 1,
+            proved: false,
+        }]],
+    );
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert_eq!(indexer.view().activation_cursor, 1);
+    assert!(indexer.view().mirror.get_leaf(1).is_zero());
+    assert_eq!(indexer.service.health().rebuild_count, 0);
+}
+
+#[tokio::test]
+async fn a_note_closed_before_activation_is_retired_after_it() {
+    let chain = MockChain::start().await;
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    chain.mine(vec![Tx::Escape {
+        note_id: 0,
+        nullifier: 900,
+    }]);
+    chain.mine(vec![Tx::Finalize { note_id: 0 }]);
+    chain.mine_empty(2);
+    let mut indexer = Indexer::new(config(&chain, 1, None));
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert_eq!(indexer.view().root, TreeMirror::empty_root());
+
+    // The closed note's leaf enters the tree on activation, and only then
+    // can the missed defeat be retired.
+    chain.mine(vec![activate(1)]);
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert!(!indexer.view().mirror.get_leaf(0).is_zero());
+    chain.mine(vec![Tx::Retire { note_id: 0 }]);
+    chain.mine_empty(2);
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert_eq!(indexer.view().root, TreeMirror::empty_root());
+    assert_eq!(indexer.view().activation_cursor, 1);
 }
