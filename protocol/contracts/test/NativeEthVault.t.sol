@@ -96,6 +96,7 @@ contract NativeEthVaultTest is Test {
     bytes32 constant ESCAPE_PAYOUT_DEFERRED_TOPIC = 0x1bd006afb1f419c06bdcfcba16d47a9c4c8569f843228da165bdaec644bfa942;
     address user = address(0x1234);
     address treasury = address(0x5678);
+    address activator = address(0xACC);
     ZkApiVault vault;
     NativeProofFixture adapter;
     uint256[32] siblings;
@@ -108,7 +109,7 @@ contract NativeEthVaultTest is Test {
         }
         adapter = new NativeProofFixture();
         vault = new ZkApiVault(
-            treasury, 30 days, 24 hours, 100_000, address(adapter), 11, 12, 13, 14, address(this), 7 days
+            treasury, 30 days, 24 hours, 100_000, address(adapter), 11, 12, 13, 14, address(this), 7 days, activator
         );
         vm.deal(user, 1 ether);
     }
@@ -181,9 +182,13 @@ contract NativeEthVaultTest is Test {
     function test_nativeRejectsInvalidRequestChargeCap() public {
         uint128 unsafeCap = vault.MAX_NATIVE_UNITS() + 1;
         vm.expectRevert(Errors.InvalidBalance.selector);
-        new ZkApiVault(treasury, 30 days, 24 hours, 0, address(adapter), 11, 12, 13, 14, address(this), 7 days);
+        new ZkApiVault(
+            treasury, 30 days, 24 hours, 0, address(adapter), 11, 12, 13, 14, address(this), 7 days, activator
+        );
         vm.expectRevert(Errors.InvalidBalance.selector);
-        new ZkApiVault(treasury, 30 days, 24 hours, unsafeCap, address(adapter), 11, 12, 13, 14, address(this), 7 days);
+        new ZkApiVault(
+            treasury, 30 days, 24 hours, unsafeCap, address(adapter), 11, 12, 13, 14, address(this), 7 days, activator
+        );
     }
 
     function test_rejectedPayoutPreservesNoteAndFunds() public {
@@ -369,6 +374,10 @@ contract NativeEthVaultTest is Test {
         assertEq(vault.retireClosedLeaf.selector, bytes4(0xe41f4c31));
         assertEq(vault.activateNotes.selector, bytes4(0xa2b2c715));
         assertEq(vault.activateNotesOnChain.selector, bytes4(0x027e21e9));
+        assertEq(vault.activator.selector, bytes4(0x4ecea992));
+        assertEq(vault.setActivator.selector, bytes4(0x7c0cc0be));
+        assertEq(vault.activationFallbackOpensAt.selector, bytes4(0x3a02aa08));
+        assertEq(vault.ACTIVATION_FALLBACK_DELAY.selector, bytes4(0x4c81d3cd));
         assertEq(vault.claimEscapePayout.selector, bytes4(0x88c10aee));
         assertEq(vault.pendingWithdrawals.selector, bytes4(0xa2f9f1ce));
         assertEq(vault.pendingConcessions.selector, bytes4(0xf8ffe6e0));
@@ -401,8 +410,11 @@ contract NativeEthVaultTest is Test {
         assertEq(Errors.InvalidActivation.selector, bytes4(0xe72f8984));
         assertEq(Errors.NoteNotActivated.selector, bytes4(0x3d0439b5));
         assertEq(Errors.StaleRoot.selector, bytes4(0x607447de));
+        assertEq(Errors.NotActivator.selector, bytes4(0xb2df0af0));
+        assertEq(Errors.ActivationFallbackClosed.selector, bytes4(0x67df368d));
         assertEq(Events.NoteDeposited.selector, 0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36);
         assertEq(Events.NotesActivated.selector, 0x2c5604373c15ade06913903b9f6fffb2f3b0a029d20dac56a6eeb7d8b1c11144);
+        assertEq(Events.ActivatorChanged.selector, 0xbd0aa56c02389240616a23c1d092ae6238c0e2847610bc4d302628e56cfee2e4);
         assertEq(Events.MutualClose.selector, 0x1f43fa4711ca18e1d26398f26bf598bd3a62992cdd0e84f055f2bb506e9d7031);
         assertEq(
             Events.EscapeWithdrawalInitiated.selector,
@@ -435,6 +447,7 @@ contract NativeEthVaultTest is Test {
         vm.recordLogs();
         deposit();
         (,, uint64 expiryTs,) = vault.notes(0);
+        vm.warp(vault.activationFallbackOpensAt());
         vault.activateNotesOnChain(0, 1, siblings);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         assertEq(logs.length, 2);

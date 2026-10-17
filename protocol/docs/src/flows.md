@@ -10,7 +10,9 @@ the request tree in deposit order: it picks the largest of 16, 4 and 1 that
 the activation cursor is aligned to and the recorded notes fill, waiting a
 bounded time for a fuller batch, reads the notes from the vault, takes the
 cursor slot's siblings from its indexer, proves the insertion and sends
-`activateNotes`. Anyone can instead activate with `activateNotesOnChain`.
+`activateNotes` from the vault's activator, the only sender the vault accepts
+it from. If the worker stops, anyone can activate with `activateNotesOnChain`
+once an hour has passed since its last proved batch.
 Until its note is activated (`noteId < activationCursor`) a wallet refuses
 to prepare a request (`note_not_activated`) and reports the note as
 activating.

@@ -105,8 +105,9 @@ withdrawal encoders' calldata to an Anvil vault.
   activations, retirements) and request-tree paths from a view verified
   against the vault.
 - `zkapi-activated`: the activation worker; appends recorded notes to the
-  request tree in proved batches of 1, 4 or 16 (`activateNotes`), so deposits
-  become request-capable ([activation worker](docs/activation-worker.md)).
+  request tree in proved batches of 1, 4 or 16 (`activateNotes`, from the
+  vault's activator), so deposits become request-capable
+  ([activation worker](docs/activation-worker.md)).
 - `zkapi db init`: create the server database with its append-only request
   evidence and bind it to the deployment manifest, before any daemon starts.
 - `zkapi-challenged`: durable escape monitoring; defeats escapes from spent

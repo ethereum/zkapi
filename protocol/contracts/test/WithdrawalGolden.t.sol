@@ -26,6 +26,7 @@ contract WithdrawalGoldenTest is Test {
     uint64 constant CHALLENGE_PERIOD = 24 hours;
     uint128 constant REQUEST_CHARGE_CAP = 100_000;
     uint64 constant MAX_PAUSE_DURATION = 7 days;
+    address constant ACTIVATOR = address(0xACC);
     string constant ESCAPE = "escape_a2_concede";
     string constant CLOSE = "close_b0";
 
@@ -56,7 +57,8 @@ contract WithdrawalGoldenTest is Test {
             escape.clearanceSigningKeyX,
             escape.clearanceSigningKeyY,
             OWNER,
-            MAX_PAUSE_DURATION
+            MAX_PAUSE_DURATION,
+            ACTIVATOR
         );
         assertEq(address(vault), escape.contractAddress);
         vm.deal(USER, 10 * uint256(DEPOSIT) * 1 gwei);
@@ -99,6 +101,7 @@ contract WithdrawalGoldenTest is Test {
             assertEq(vm.parseJsonBytes(golden, ".escape.proof_hex"), escapeProof, "escape proof");
             assertEq(vm.parseJsonBytes(golden, ".close.proof_hex"), closeProof, "close proof");
             assertEq(vm.parseJsonAddress(golden, ".deployment.vault"), address(vault), "vault");
+            assertEq(vm.parseJsonAddress(golden, ".deployment.activator"), vault.activator(), "activator");
         }
 
         uint256 destinationBefore = USER.balance;

@@ -199,7 +199,7 @@ with `eth_call`. It never rewrites a historical public root: request evidence
 is valid at any root. A defeat's gas limit is 600,000 and a raise's 450,000,
 each raised to the estimate plus 20% when that is higher; a leaf retirement's
 is its estimate plus 20%, about 2.0M (CI's Forge measures the call at
-1,648,631 gas).
+1,648,719 gas).
 
 A leaf retirement needs the indexer's path for the note at the vault's live
 root. A path whose siblings do not hash to it is `indexer_path_behind` (a
@@ -281,8 +281,9 @@ A leaf retirement reverts `StaleRoot()` (`0x607447de`) when an activation or
 another retirement changes the root first (deposits no longer do); it is
 blocked as `indexer_path_behind` and rebuilt from a fresh path. The
 operator's activation worker moves the root with every batch it lands, and
-anyone can activate or race at their own gas cost; a reverted retirement still
-pays most of its gas, so fund the sender for reverted attempts. A retirement
+once no proved activation has landed for an hour anyone can activate on chain
+at their own gas cost; a reverted retirement still pays most of its gas, so
+fund the sender for reverted attempts. A retirement
 of a note that is not activated yet reverts `NoteNotActivated()`
 (`0x3d0439b5`); the daemon checks the activation cursor first and waits for
 the activation instead of sending it (`awaiting_activation`, below), and a
@@ -472,11 +473,15 @@ after `--blocked-warning-seconds` and turns critical after
 blocked. The activation worker normally activates a note within
 `--max-activation-wait-seconds` (30 by default) plus a proof and a block, so
 an obligation still waiting at the warning threshold points at the worker:
-check its `/status` and, if it cannot recover, activate with
-`activateNotesOnChain` from `activationCursor()` up to and including the note,
-one aligned batch at a time: the vault accepts only the batch at the cursor
+check its `/status` (`not_activator` means the vault's `activator()` is not
+its sender, which the owner fixes with `setActivator`). Only the activator
+can prove the note's batch; if the worker cannot recover, activate with
+`activateNotesOnChain` once its fallback opens (`activationFallbackOpensAt()`,
+an hour after the latest proved activation), from `activationCursor()` up to
+and including the note, one aligned batch at a time: the vault accepts only
+the batch at the cursor
 ([the permissionless fallback](activation-worker.md#the-permissionless-fallback)'s
-loop, with `TARGET` set to the note).
+loop, with `TARGET` set to the note, waits for the opening).
 
 ### The signer's retirement budget
 

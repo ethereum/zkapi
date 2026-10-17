@@ -17,10 +17,11 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 /// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v2, vault revision 4).
 /// @notice Links (or deploys) the Bn254Poseidon library, deploys the circuit-specific Groth16
 ///         verifier (one adapter for the request, withdrawal and 1-, 4- and 16-note insertion
-///         statements) and the native ETH ZkApiVault with its 11 constructor arguments, checks the
+///         statements) and the native ETH ZkApiVault with its 12 constructor arguments, checks the
 ///         adapter's circuit and five verifying-key hashes against the setup manifest and the vault's
 ///         getters against the inputs (a fresh vault: the empty request tree, no note recorded or
-///         activated), then (unless GASLESS=0) deploys the gasless-withdrawal
+///         activated, the activator set and the on-chain fallback closed for
+///         ACTIVATION_FALLBACK_DELAY), then (unless GASLESS=0) deploys the gasless-withdrawal
 ///         paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same broadcast, stakes
 ///         it and its transit-account factory, funds its deposit and checks its getters, and writes
 ///         the provisional deployment manifest, including the linked addresses and every runtime
@@ -33,12 +34,12 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///           node scripts/expected-codehashes.mjs --deployment $OUTPUT_PATH.pending \
 ///             --rpc $RPC_URL --finalize $OUTPUT_PATH
 ///         It reads the creation receipts from forge's broadcast log, requires each creation to
-///         have succeeded at the manifest's address and the runtime codehashes, owner and treasury
-///         on chain to be the expected ones (and, with the paymaster, its deposit, both stakes, its
-///         policy and gas policy), and only then writes $OUTPUT_PATH with deployBlock (the block
-///         that created the vault) and deploymentStatus "deployed". Profiles take their pins and
-///         deploy_block from $OUTPUT_PATH only. A dry run (no --broadcast) writes deploymentStatus
-///         "simulated", which finalize refuses.
+///         have succeeded at the manifest's address and the runtime codehashes, owner, treasury and
+///         activator on chain to be the expected ones (and, with the paymaster, its deposit, both
+///         stakes, its policy and gas policy), and only then writes $OUTPUT_PATH with deployBlock
+///         (the block that created the vault) and deploymentStatus "deployed". Profiles take their
+///         pins and deploy_block from $OUTPUT_PATH only. A dry run (no --broadcast) writes
+///         deploymentStatus "simulated", which finalize refuses.
 ///         The script links the vault itself (creation code from out/ZkApiVault.sol/ZkApiVault.json
 ///         with the library placeholder replaced), so forge never links it.
 ///         The gasless block needs the canonical EntryPoint v0.7.0 runtime at ENTRY_POINT and the
@@ -59,6 +60,12 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///                         directly; later transfers are two-step (transferOwnership
 ///                         nominates, the new owner calls acceptOwnership).
 ///           TREASURY    – operator payout address.
+///           ACTIVATOR   – the only address that may call activateNotes: the sender of the
+///                         operator's activation worker (zkapi-activated). Required except on
+///                         local chains (default: the deployer). The owner may replace it
+///                         (setActivator); anyone may activate without a proof
+///                         (activateNotesOnChain) once ACTIVATION_FALLBACK_DELAY passes without a
+///                         proved activation.
 ///           OUTPUT_PATH – absolute path of the final deployment manifest JSON; the
 ///                         script writes the provisional one to OUTPUT_PATH.pending.
 ///           STATE_SIGNING_KEY_X/Y – deployment-pinned Baby-JubJub key (`zkapi signing-keys`).
@@ -157,6 +164,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         address deployer;
         address owner;
         address treasury;
+        address activator;
         uint64 noteTtl;
         uint64 challengePeriod;
         uint64 maxPauseDuration;
@@ -244,7 +252,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
                         p.clearanceKeyX,
                         p.clearanceKeyY,
                         p.owner,
-                        p.maxPauseDuration
+                        p.maxPauseDuration,
+                        p.activator
                     )
                 )
             )
@@ -264,6 +273,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         console2.log("vault        ", address(d.vault));
         console2.log("treasury     ", p.treasury);
         console2.log("owner        ", p.owner);
+        console2.log("activator    ", p.activator);
         if (block.chainid == 1 && p.owner.code.length == 0) {
             console2.log("WARNING: OWNER has no code; use a multisig or timelock contract on mainnet");
         }
@@ -309,6 +319,10 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             ? vm.envOr("TREASURY", address(0x70997970C51812dc3A010C7d01b50e0d17dc79C8))
             : vm.envAddress("TREASURY");
         require(p.treasury != address(0), "TREASURY must be nonzero");
+        // activateNotes is the activator's alone; a public deployment names its activation worker's
+        // sender explicitly.
+        p.activator = local ? vm.envOr("ACTIVATOR", deployer) : vm.envAddress("ACTIVATOR");
+        require(p.activator != address(0), "ACTIVATOR must be nonzero");
         p.stateKeyX = vm.envUint("STATE_SIGNING_KEY_X");
         p.stateKeyY = vm.envUint("STATE_SIGNING_KEY_Y");
         p.clearanceKeyX = vm.envUint("CLEARANCE_SIGNING_KEY_X");
@@ -485,7 +499,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     }
 
     /// Post-deploy checks: the vault's getters equal the inputs and the expected constants, and it
-    /// starts empty (the empty request tree's root, no note recorded or activated).
+    /// starts empty (the empty request tree's root, no note recorded or activated), with its
+    /// activator and the on-chain fallback closed for ACTIVATION_FALLBACK_DELAY.
     function _checkVault(Deployed memory d, Params memory p) internal view {
         ZkApiVault vault = d.vault;
         require(vault.PROTOCOL_VERSION() == 2, "PROTOCOL_VERSION");
@@ -505,6 +520,11 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         );
         require(vault.currentRoot() == MerkleUpdateLib.EMPTY_ROOT, "currentRoot is not the empty tree's root");
         require(vault.nextNoteId() == 0 && vault.activationCursor() == 0, "nextNoteId or activationCursor");
+        require(vault.activator() == p.activator, "activator");
+        require(
+            vault.activationFallbackOpensAt() == block.timestamp + vault.ACTIVATION_FALLBACK_DELAY(),
+            "activationFallbackOpensAt"
+        );
     }
 
     /// Post-deploy checks of the gasless block: the paymaster's and the factory's pins equal the
@@ -602,6 +622,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeBytes32(m, "insertion4VkKeccak256", d.adapter.INSERTION4_VK_HASH());
         vm.serializeBytes32(m, "insertion16VkKeccak256", d.adapter.INSERTION16_VK_HASH());
         vm.serializeAddress(m, "owner", p.owner);
+        vm.serializeAddress(m, "activator", p.activator);
         vm.serializeAddress(m, "vault", address(vault));
         vm.serializeAddress(m, "billingToken", vault.billingToken());
         vm.serializeAddress(m, "proofAdapter", address(d.adapter));

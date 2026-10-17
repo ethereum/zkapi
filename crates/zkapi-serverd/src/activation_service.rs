@@ -5,8 +5,18 @@
 //! anonymous requests only once it is activated: appended to the request
 //! tree, whose root the request statement proves membership under. Each poll
 //! reads, at one block, the vault's `nextNoteId()`, `activationCursor()`,
-//! `currentRoot()` and `paused()`; the notes from the cursor up to
+//! `currentRoot()`, `paused()`, `activator()` and
+//! `activationFallbackOpensAt()`; the notes from the cursor up to
 //! `nextNoteId` are recorded and wait.
+//!
+//! **Activator.** The vault accepts `activateNotes` only from its
+//! `activator()`, which its owner sets (`setActivator`). While that is not
+//! the worker's sender, the worker sends nothing and reports `not_activator`:
+//! a pending transaction is left on its nonce (it reverts `NotActivator()` if
+//! mined), and the worker resumes once the owner names its sender. It never
+//! calls `activateNotesOnChain`, which anyone may from
+//! `activationFallbackOpensAt()` (an hour after the latest proved
+//! activation, the deployment or an unpause).
 //!
 //! **Batch size.** The largest of 16, 4 and 1 that is aligned at the cursor
 //! (`cursor % K == 0`) and recorded. While a larger aligned batch is still
@@ -26,8 +36,9 @@
 //! `activateNotes(cursor, K, root, newRoot, proof)`.
 //!
 //! **Races.** The vault accepts the call only at its cursor and root:
-//! another activation (another worker, or anyone's `activateNotesOnChain`) or
-//! a leaf retirement landing first makes it revert `StaleActivation()` before
+//! another activation (anyone's `activateNotesOnChain` once the fallback is
+//! open) or a leaf retirement landing first makes it revert
+//! `StaleActivation()` before
 //! any verification, while deposits landing meanwhile change nothing (the
 //! batch is a prefix of the recorded notes). A batch whose cursor or root
 //! moved while it was proved is never sent: it is rebuilt from fresh state.
@@ -97,16 +108,18 @@ pub const ACTIVATE_CALLDATA_LEN: usize = 452;
 /// How long the worker waits for a larger aligned batch to fill.
 pub const DEFAULT_MAX_ACTIVATION_WAIT_SECONDS: u64 = 30;
 /// Gas assumed before any estimate, for the balance alarm and replacement
-/// planning: the gas limit of a 16-note activation (about 600,000 gas on the
-/// revision-4 vault, plus 20%).
-pub const DEFAULT_ACTIVATION_GAS: u64 = 720_000;
+/// planning: the gas limit of a 16-note activation (about 605,000 gas on the
+/// revision-4 vault, the activationFallbackOpensAt write included, plus 20%),
+/// with headroom for a node's estimate running a little above the gas used.
+pub const DEFAULT_ACTIVATION_GAS: u64 = 750_000;
 const NOTES_ACTIVATED_EVENT: &str = "NotesActivated(uint32,uint32,uint256,bool)";
 /// The vault's reverts an activation simulation is classified by.
-const ACTIVATION_REVERTS: [&str; 4] = [
+const ACTIVATION_REVERTS: [&str; 5] = [
     "StaleActivation()",
     "InvalidActivation()",
     "InvalidProof()",
     "Paused()",
+    "NotActivator()",
 ];
 const INDEXER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Sender balance and signer fee cap observations run at most this often.
@@ -391,6 +404,10 @@ struct VaultState {
     cursor: u32,
     next_note_id: u32,
     paused: bool,
+    /// The only sender whose `activateNotes` the vault accepts.
+    activator: [u8; 20],
+    /// From then on anyone may call `activateNotesOnChain`.
+    fallback_opens_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -451,6 +468,8 @@ pub struct ActivationService {
     /// The head block hash and notes digest the pending call's notes were
     /// last found unchanged at.
     notes_checked: Option<(String, String)>,
+    /// Whether the vault's activator was the sender at the latest read.
+    sender_is_activator: Option<bool>,
 }
 
 impl ActivationService {
@@ -562,6 +581,7 @@ impl ActivationService {
             observed_fees: None,
             dry_run_call: None,
             notes_checked: None,
+            sender_is_activator: None,
             config,
         };
         service.publish();
@@ -581,9 +601,12 @@ impl ActivationService {
     /// The startup checks: the manifest is this vault's, the RPC serves its
     /// chain, the vault and adapter pass the startup probes (revision 4, the
     /// adapter's circuit and request and withdrawal verifying keys equal to
-    /// the setup's, the three runtime codehashes the manifest pins), and the
+    /// the setup's, the three runtime codehashes the manifest pins), the
     /// adapter's `INSERTION{K}_VK_HASH` is the verifying key of each proving
-    /// key, of the manifest's setup.
+    /// key, of the manifest's setup, and the vault's `activator()` is the
+    /// manifest's activator when it records one. A sender other than the
+    /// activator is logged and reported, not refused: the owner may still
+    /// name it.
     pub async fn verify_deployment(
         &mut self,
         manifest: &DeploymentManifest,
@@ -664,6 +687,30 @@ impl ActivationService {
                 )));
             }
         }
+        let activator = self
+            .call_at("activator()", json!("latest"))
+            .await
+            .and_then(|words| activator_word(&words))
+            .map_err(|error| {
+                DeploymentCheckError::Unavailable(anyhow!(
+                    "vault activator() at {vault} (a vault with the activator role has it): \
+                     {error:#}"
+                ))
+            })?;
+        let activator_hex = format!("0x{}", hex::encode(activator));
+        if let Some(expected) = manifest
+            .activator
+            .as_ref()
+            .filter(|expected| **expected != activator_hex)
+        {
+            return Err(DeploymentCheckError::Mismatch(format!(
+                "the deployment manifest records activator {expected}, but the vault's \
+                 activator() is {activator_hex}: if the owner changed it with setActivator, \
+                 record the new activator in the manifest"
+            )));
+        }
+        self.snapshot.chain.activator = Some(activator_hex);
+        self.observe_activator(&activator);
         Ok(())
     }
 
@@ -746,6 +793,11 @@ impl ActivationService {
                     self.config.confirmations
                 ),
             );
+            return Ok(());
+        }
+        // Reported even while paused: the owner may name the sender then.
+        if !self.is_activator(&state.activator) {
+            self.not_activator(&state);
             return Ok(());
         }
         if state.paused {
@@ -1510,6 +1562,22 @@ impl ActivationService {
                 );
                 Ok(())
             }
+            // The owner named another activator after the poll's read; the
+            // call stays valid if it names the sender again.
+            Some("NotActivator()") => {
+                self.block(
+                    ActivationBlocked::NotActivator,
+                    format!(
+                        "simulation of the activation of notes {}..{} reverted NotActivator(): \
+                         the vault's activator is no longer the worker's sender {}; nothing is \
+                         sent until the owner calls setActivator with it",
+                        call.first_note_id,
+                        call.first_note_id + call.count,
+                        self.config.sender
+                    ),
+                );
+                Ok(())
+            }
             Some("InvalidProof()") if persisted => {
                 self.stale(format!(
                     "simulation of the persisted activation of notes {}..{} reverted \
@@ -1556,6 +1624,55 @@ impl ActivationService {
             )),
             _ => Err(self.blocked(ActivationBlocked::RpcError, error)),
         }
+    }
+
+    /// Whether `activator` is the worker's sender.
+    fn is_activator(&self, activator: &[u8; 20]) -> bool {
+        self.config
+            .sender
+            .eq_ignore_ascii_case(&format!("0x{}", hex::encode(activator)))
+    }
+
+    /// Record whether the vault's `activator` is the sender, logging the
+    /// first observation (at startup) and every change.
+    fn observe_activator(&mut self, activator: &[u8; 20]) {
+        let is_activator = self.is_activator(activator);
+        if self.sender_is_activator == Some(is_activator) {
+            return;
+        }
+        self.sender_is_activator = Some(is_activator);
+        let activator = format!("0x{}", hex::encode(activator));
+        if is_activator {
+            tracing::info!(activator = %activator, "the worker's sender is the vault's activator");
+        } else {
+            tracing::warn!(
+                activator = %activator,
+                sender = %self.config.sender,
+                "the vault's activator is not the worker's sender: nothing is sent until the owner calls setActivator with the sender"
+            );
+        }
+    }
+
+    /// The vault refuses the sender's `activateNotes`: nothing is sent (a
+    /// pending attempt stays on its nonce) until the owner names the sender.
+    fn not_activator(&mut self, state: &VaultState) {
+        let mut detail = format!(
+            "the vault's activator() is 0x{}, not the worker's sender {}: nothing is sent until \
+             the owner calls setActivator with it; anyone may activate with \
+             activateNotesOnChain from {}",
+            hex::encode(state.activator),
+            self.config.sender,
+            state.fallback_opens_at
+        );
+        if let Some(pending) = &self.checkpoint.pending {
+            detail.push_str(&format!(
+                "; the activation of notes {}..{} on nonce {} reverts NotActivator() if mined",
+                pending.call.first_note_id,
+                pending.call.first_note_id + pending.call.count,
+                pending.nonce
+            ));
+        }
+        self.block(ActivationBlocked::NotActivator, detail);
     }
 
     /// A prepared batch was overtaken: counted, and rebuilt from fresh state
@@ -1719,7 +1836,7 @@ impl ActivationService {
                 first_note_id = record.first_note_id,
                 batch_size = record.size,
                 gas_used = record.gas_used,
-                "the worker's activation mined and reverted: another activation or a retirement landed first"
+                "the worker's activation mined and reverted: another activation or a retirement landed first, or the sender was no longer the activator"
             ),
             BatchOutcome::Unknown => tracing::warn!(
                 nonce = pending.nonce,
@@ -1773,8 +1890,8 @@ impl ActivationService {
         Ok(head)
     }
 
-    /// `currentRoot()`, `activationCursor()`, `nextNoteId()` and `paused()`
-    /// at `block`.
+    /// `currentRoot()`, `activationCursor()`, `nextNoteId()`, `paused()`,
+    /// `activator()` and `activationFallbackOpensAt()` at `block`.
     async fn vault_state(&mut self, block: Value) -> anyhow::Result<VaultState> {
         let word = |words: Vec<Felt252>, name: &str| -> anyhow::Result<Felt252> {
             ensure!(words.len() == 1, "malformed {name} response");
@@ -1792,16 +1909,26 @@ impl ActivationService {
             self.call_at("nextNoteId()", block.clone()).await?,
             "nextNoteId",
         )?)?;
-        let paused = match felt_u64(&word(self.call_at("paused()", block).await?, "paused")?)? {
+        let paused = match felt_u64(&word(
+            self.call_at("paused()", block.clone()).await?,
+            "paused",
+        )?)? {
             0 => false,
             1 => true,
             _ => bail!("malformed paused response"),
         };
+        let activator = activator_word(&self.call_at("activator()", block.clone()).await?)?;
+        let fallback_opens_at = felt_u64(&word(
+            self.call_at("activationFallbackOpensAt()", block).await?,
+            "activationFallbackOpensAt",
+        )?)?;
         let state = VaultState {
             root,
             cursor: u32::try_from(cursor).context("activation cursor exceeds uint32")?,
             next_note_id: u32::try_from(next).context("next note ID exceeds uint32")?,
             paused,
+            activator,
+            fallback_opens_at,
         };
         ensure!(
             state.cursor <= state.next_note_id,
@@ -1809,8 +1936,12 @@ impl ActivationService {
             state.cursor,
             state.next_note_id
         );
-        self.snapshot.chain.current_root = Some(state.root);
-        self.snapshot.chain.paused = Some(state.paused);
+        let chain = &mut self.snapshot.chain;
+        chain.current_root = Some(state.root);
+        chain.paused = Some(state.paused);
+        chain.activator = Some(format!("0x{}", hex::encode(state.activator)));
+        chain.activation_fallback_opens_at = Some(state.fallback_opens_at);
+        self.observe_activator(&state.activator);
         Ok(state)
     }
 
@@ -2023,6 +2154,16 @@ impl ActivationService {
     }
 }
 
+/// The address an `activator()` response holds.
+fn activator_word(words: &[Felt252]) -> anyhow::Result<[u8; 20]> {
+    match words {
+        [word] if word.as_bytes()[..12].iter().all(|byte| *byte == 0) => {
+            Ok(word.as_bytes()[12..].try_into().expect("20 bytes"))
+        }
+        _ => bail!("malformed activator response"),
+    }
+}
+
 /// The batch a receipt's `NotesActivated` log of `vault` activated.
 fn notes_activated(receipt: &Value, vault: &str) -> Option<(u32, u32)> {
     let topic0 = format!(
@@ -2065,7 +2206,11 @@ mod tests {
     use zkapi_proof::compact::InsertionVerifier;
 
     const SENDER: &str = "0x00000000000000000000000000000000000000a1";
+    /// An activator the owner names instead of the worker's sender.
+    const OTHER_ACTIVATOR: &str = "0x00000000000000000000000000000000000000b2";
     const VAULT: u64 = 0xdead;
+    /// The vault's `ACTIVATION_FALLBACK_DELAY`.
+    const FALLBACK_DELAY: u64 = 3_600;
 
     #[test]
     fn batches_are_the_largest_aligned_recorded_size_with_a_bounded_wait() {
@@ -2177,6 +2322,9 @@ mod tests {
             ("currentRoot", "currentRoot()"),
             ("paused", "paused()"),
             ("notes", "notes(uint32)"),
+            ("activator", "activator()"),
+            ("activationFallbackOpensAt", "activationFallbackOpensAt()"),
+            ("NotActivator", "NotActivator()"),
         ] {
             assert_eq!(
                 crate::test_support::real_selector(name),
@@ -2202,6 +2350,7 @@ mod tests {
             ("InvalidActivation()", "e72f8984"),
             ("InvalidProof()", "09bde339"),
             ("Paused()", "9e87fac8"),
+            ("NotActivator()", "b2df0af0"),
         ] {
             assert_eq!(
                 hex::encode(selector(signature)),
@@ -2227,6 +2376,8 @@ mod tests {
         /// A shallow reorganization re-includes these two recorded deposits
         /// in the other order: cursor, root and nextNoteId are unchanged.
         Reorder(u32, u32),
+        /// The owner's `setActivator`.
+        SetActivator(&'static str),
     }
 
     #[derive(Clone)]
@@ -2240,6 +2391,7 @@ mod tests {
     #[derive(Clone)]
     struct PoolTx {
         hash: String,
+        from: String,
         data: String,
         max_fee: u128,
         tip: u128,
@@ -2255,6 +2407,7 @@ mod tests {
         head: u64,
         timestamp: u64,
         mined: usize,
+        fallback_opens_at: u64,
     }
 
     struct MockVault {
@@ -2262,6 +2415,11 @@ mod tests {
         tree: MerkleTree,
         cursor: u32,
         paused: bool,
+        /// The only sender whose `activateNotes` lands.
+        activator: String,
+        /// `activationFallbackOpensAt()`: `FALLBACK_DELAY` after the latest
+        /// proved activation (or the deployment).
+        fallback_opens_at: u64,
         head: u64,
         timestamp: u64,
         base_fee: u128,
@@ -2290,13 +2448,16 @@ mod tests {
 
     impl MockVault {
         fn new() -> Self {
+            let timestamp = unix_now();
             Self {
                 notes: Vec::new(),
                 tree: MerkleTree::new(),
                 cursor: 0,
                 paused: false,
+                activator: SENDER.into(),
+                fallback_opens_at: timestamp + FALLBACK_DELAY,
                 head: 10,
-                timestamp: unix_now(),
+                timestamp,
                 base_fee: GWEI,
                 reorgs: 0,
                 fork: 0,
@@ -2340,10 +2501,21 @@ mod tests {
             self.cursor += count;
         }
 
-        /// Someone else's `activateNotesOnChain` lands in a new block.
+        /// Someone else's `activateNotesOnChain` lands in a new block, which
+        /// the vault accepts only from `activationFallbackOpensAt()` on.
         fn activate_on_chain(&mut self, count: u32) {
+            assert!(
+                self.timestamp >= self.fallback_opens_at,
+                "activateNotesOnChain reverts ActivationFallbackClosed()"
+            );
             self.activate(count);
             self.head += 1;
+        }
+
+        /// Time passes (Anvil's `evm_increaseTime`) until the on-chain
+        /// fallback opens, as if the worker stopped proving.
+        fn open_fallback(&mut self) {
+            self.timestamp = self.timestamp.max(self.fallback_opens_at);
         }
 
         /// The challenger's `retireClosedLeaf` of an activated closed note.
@@ -2365,6 +2537,7 @@ mod tests {
                 head: self.head,
                 timestamp: self.timestamp,
                 mined: self.mined.len(),
+                fallback_opens_at: self.fallback_opens_at,
             }
         }
 
@@ -2385,6 +2558,7 @@ mod tests {
             self.cursor = snapshot.cursor;
             self.head = snapshot.head;
             self.timestamp = snapshot.timestamp;
+            self.fallback_opens_at = snapshot.fallback_opens_at;
             self.reorgs += 1;
         }
 
@@ -2395,8 +2569,13 @@ mod tests {
             self.timestamp += 12 * blocks;
         }
 
-        /// Why `activateNotes` reverts at the current state, if it does.
-        fn check_activation(&self, data: &str) -> Result<(u32, u32, Felt252), &'static str> {
+        /// Why `activateNotes` from `from` reverts at the current state, if
+        /// it does.
+        fn check_activation(
+            &self,
+            from: &str,
+            data: &str,
+        ) -> Result<(u32, u32, Felt252), &'static str> {
             let bytes = hex::decode(data.trim_start_matches("0x")).unwrap();
             assert_eq!(&bytes[..4], &ACTIVATE_SELECTOR, "only activations are sent");
             let word =
@@ -2406,6 +2585,9 @@ mod tests {
             let (expected, new_root) = (word(2), word(3));
             if self.paused {
                 return Err("9e87fac8");
+            }
+            if !from.eq_ignore_ascii_case(&self.activator) {
+                return Err("b2df0af0");
             }
             if !is_insertion_size(count as usize) {
                 return Err("e72f8984");
@@ -2454,9 +2636,10 @@ mod tests {
             let Some(tx) = self.pool.remove(&nonce) else {
                 return;
             };
-            let (status, logs) = match self.check_activation(&tx.data) {
+            let (status, logs) = match self.check_activation(&tx.from, &tx.data) {
                 Ok((first, count, new_root)) => {
                     self.activate(count);
+                    self.fallback_opens_at = self.timestamp + FALLBACK_DELAY;
                     assert_eq!(
                         self.tree.root(),
                         new_root,
@@ -2565,7 +2748,10 @@ mod tests {
                 .cloned()
                 .unwrap_or(Value::Null)),
             "eth_estimateGas" => {
-                match vault.check_activation(params[0]["data"].as_str().unwrap()) {
+                match vault.check_activation(
+                    params[0]["from"].as_str().unwrap(),
+                    params[0]["data"].as_str().unwrap(),
+                ) {
                     Ok((_, count, _)) => Ok(json!(format!(
                         "0x{:x}",
                         250_000 + 20_000 * u64::from(count)
@@ -2589,6 +2775,13 @@ mod tests {
                     Ok(json!(word_hex(vault.notes.len() as u64)))
                 } else if data == call("paused()") {
                     Ok(json!(word_hex(vault.paused as u64)))
+                } else if data == call("activator()") {
+                    Ok(json!(format!(
+                        "0x{:0>64}",
+                        vault.activator.trim_start_matches("0x")
+                    )))
+                } else if data == call("activationFallbackOpensAt()") {
+                    Ok(json!(word_hex(vault.fallback_opens_at)))
                 } else if let Some(id) = data.strip_prefix(&call("notes(uint32)")) {
                     let id = u32::from_str_radix(id, 16).unwrap() as usize;
                     Ok(json!(match vault.notes.get(id) {
@@ -2602,7 +2795,7 @@ mod tests {
                         None => format!("0x{}", "0".repeat(256)),
                     }))
                 } else {
-                    match vault.check_activation(&data) {
+                    match vault.check_activation(params[0]["from"].as_str().unwrap(), &data) {
                         Ok(_) => Ok(json!("0x")),
                         Err(selector_hex) => Err(revert(selector_hex)),
                     }
@@ -2635,6 +2828,7 @@ mod tests {
                         nonce,
                         PoolTx {
                             hash: hash.clone(),
+                            from: tx["from"].as_str().unwrap().into(),
                             data: tx["data"].as_str().unwrap().into(),
                             max_fee: quantity("maxFeePerGas"),
                             tip: quantity("maxPriorityFeePerGas"),
@@ -2661,6 +2855,7 @@ mod tests {
                 vault.notes.swap(a as usize, b as usize);
                 vault.reorgs += 1;
             }
+            Some(Hook::SetActivator(activator)) => vault.activator = activator.into(),
             None => {}
         }
         let tree = vault
@@ -2865,13 +3060,15 @@ mod tests {
         assert_eq!(service.status().totals.stale_rebuilds_total, 0);
     }
 
-    /// A competing activation (anyone's activateNotesOnChain) lands while
-    /// the worker proves: the batch is never sent, and the next poll
-    /// rebuilds it from fresh state.
+    /// A competing activation (anyone's activateNotesOnChain, open since no
+    /// proved activation landed for an hour) lands while the worker proves:
+    /// the batch is never sent, and the next poll rebuilds it from fresh
+    /// state.
     #[tokio::test]
     async fn a_competing_activation_while_proving_discards_the_batch() {
         let fixture = Fixture::new(0).await;
         fixture.vault().deposit(2);
+        fixture.vault().open_fallback();
         fixture.vault().hook = Some(Hook::CompetingActivation(1));
         let mut service = fixture.service();
         service.poll_once().await.unwrap();
@@ -2938,9 +3135,10 @@ mod tests {
         assert!(fixture.vault().sends.is_empty());
     }
 
-    /// A competing activation lands while the worker's is pending: the
-    /// obsolete transaction is replaced on its nonce by the fresh batch
-    /// (outbidding it), so it never mines to revert.
+    /// A competing activation lands while the worker's is pending (not
+    /// included until the fallback opened): the obsolete transaction is
+    /// replaced on its nonce by the fresh batch (outbidding it), so it never
+    /// mines to revert.
     #[tokio::test]
     async fn a_competing_activation_makes_the_pending_one_obsolete_and_it_is_replaced() {
         let fixture = Fixture::new(0).await;
@@ -2948,6 +3146,7 @@ mod tests {
         let mut service = fixture.service();
         service.poll_once().await.unwrap();
         assert_eq!(fixture.sent_batches(), [(0, 1)]);
+        fixture.vault().open_fallback();
         fixture.vault().activate_on_chain(1);
         service.poll_once().await.unwrap();
         assert_eq!(fixture.sent_batches(), [(0, 1), (1, 1)]);
@@ -2977,6 +3176,7 @@ mod tests {
         fixture.vault().deposit(1);
         let mut service = fixture.service();
         service.poll_once().await.unwrap();
+        fixture.vault().open_fallback();
         fixture.vault().activate_on_chain(1);
         service.poll_once().await.unwrap();
         let status = service.status();
@@ -3418,6 +3618,140 @@ mod tests {
         assert_eq!(service.status().state, WorkerState::Paused);
     }
 
+    /// The vault accepts activateNotes only from its activator: while that
+    /// is another address the worker proves and sends nothing
+    /// (`not_activator`, escalating with time like the other reasons), and
+    /// it proceeds once the owner names its sender. Its proved activation
+    /// closes the on-chain fallback for another delay.
+    #[tokio::test]
+    async fn a_sender_that_is_not_the_activator_sends_nothing_until_set_activator() {
+        let fixture = Fixture::new(0).await;
+        fixture.vault().activator = OTHER_ACTIVATOR.into();
+        fixture.vault().deposit(1);
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        assert_eq!(status.state, WorkerState::Blocked);
+        assert_eq!(status.blocked_reason, Some(ActivationBlocked::NotActivator));
+        assert!(status.detail.unwrap().contains("setActivator"));
+        assert_eq!(status.chain.activator.as_deref(), Some(OTHER_ACTIVATOR));
+        let opens_at = fixture.vault().fallback_opens_at;
+        assert_eq!(status.chain.activation_fallback_opens_at, Some(opens_at));
+        assert_eq!(status.totals.proofs_total, 0);
+        assert!(fixture.vault().sends.is_empty());
+        let since = status.blocked_since.unwrap();
+        let alarms = ActivationAlarmPolicy::default();
+        let evaluated = crate::activation_status::evaluate(&service.snapshot, &alarms, since + 121);
+        assert_eq!(evaluated.status, crate::challenge_status::Severity::Warning);
+        assert!(
+            evaluated.alarms[0].contains("blocked (not_activator)"),
+            "{:?}",
+            evaluated.alarms
+        );
+        // The owner's setActivator names the worker's sender.
+        fixture.vault().activator = SENDER.into();
+        service.poll_once().await.unwrap();
+        assert_eq!(service.status().state, WorkerState::Submitted);
+        assert_eq!(fixture.sent_batches(), [(0, 1)]);
+        fixture.mine_and_confirm(&mut service).await;
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        assert_eq!(status.state, WorkerState::Idle);
+        assert_eq!(status.chain.activator.as_deref(), Some(SENDER));
+        let vault = fixture.vault();
+        assert_eq!(vault.cursor, 1);
+        assert!(vault.fallback_opens_at > opens_at);
+        assert_eq!(
+            status.chain.activation_fallback_opens_at,
+            Some(vault.fallback_opens_at)
+        );
+    }
+
+    /// The owner names another activator while the worker's activation is
+    /// pending: nothing is sent, not even a due replacement, and the
+    /// checkpoint keeps the nonce and its call. The transaction mines and
+    /// reverts NotActivator(); once the owner names the sender again, the
+    /// batch goes on the next nonce.
+    #[tokio::test]
+    async fn a_new_activator_while_pending_keeps_the_nonce_and_sends_nothing() {
+        let fixture = Fixture::new(0).await;
+        fixture.vault().deposit(1);
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sent_batches(), [(0, 1)]);
+        let pending = service.checkpoint.pending.clone().unwrap();
+        fixture.vault().activator = OTHER_ACTIVATOR.into();
+        // A replacement would be due.
+        let bump_after = service.config.fee.bump_after_blocks;
+        fixture.vault().advance(bump_after);
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        assert_eq!(status.blocked_reason, Some(ActivationBlocked::NotActivator));
+        assert!(status
+            .detail
+            .unwrap()
+            .contains("on nonce 0 reverts NotActivator() if mined"));
+        assert_eq!(fixture.vault().sends.len(), 1);
+        let held = service.checkpoint.pending.clone().unwrap();
+        assert_eq!(
+            (held.nonce, held.attempts, held.obsolete),
+            (pending.nonce, 1, false)
+        );
+        assert_eq!(held.transaction_hash, pending.transaction_hash);
+        assert_eq!(held.call, pending.call);
+        // It mines and reverts; the nonce is released at confirmation depth.
+        fixture.vault().mine();
+        service.poll_once().await.unwrap();
+        assert_eq!(service.status().state, WorkerState::Confirming);
+        fixture.vault().mine();
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        assert_eq!(status.blocked_reason, Some(ActivationBlocked::NotActivator));
+        assert_eq!(status.totals.reverted_total, 1);
+        assert_eq!(status.last_batch.unwrap().outcome, BatchOutcome::Reverted);
+        assert!(service.checkpoint.pending.is_none());
+        assert_eq!(fixture.vault().sends.len(), 1);
+        fixture.vault().activator = SENDER.into();
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sent_batches(), [(0, 1), (0, 1)]);
+        assert_eq!(fixture.nonces(), [0, 1]);
+        fixture.mine_and_confirm(&mut service).await;
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        assert_eq!(fixture.vault().cursor, 1);
+        assert_eq!(status.state, WorkerState::Idle);
+        assert_eq!(status.totals.batches_activated_total, 1);
+    }
+
+    /// The owner names another activator while the worker proves: the
+    /// simulation reverts NotActivator(), reported as `not_activator` too
+    /// (not a stale batch), and nothing is sent until the owner names the
+    /// sender again.
+    #[tokio::test]
+    async fn a_not_activator_simulation_revert_is_not_activator() {
+        let fixture = Fixture::new(0).await;
+        fixture.vault().deposit(1);
+        fixture.vault().hook = Some(Hook::SetActivator(OTHER_ACTIVATOR));
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        assert_eq!(status.state, WorkerState::Blocked);
+        assert_eq!(status.blocked_reason, Some(ActivationBlocked::NotActivator));
+        assert!(status.detail.unwrap().contains("reverted NotActivator()"));
+        assert_eq!(status.totals.stale_rebuilds_total, 0);
+        assert!(fixture.vault().sends.is_empty());
+        assert!(service.checkpoint.pending.is_none());
+        service.poll_once().await.unwrap();
+        assert!(fixture.vault().sends.is_empty());
+        fixture.vault().activator = SENDER.into();
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sent_batches(), [(0, 1)]);
+        fixture.mine_and_confirm(&mut service).await;
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.vault().cursor, 1);
+    }
+
     /// Startup: the deployment probes, then each insertion proving key's
     /// verifying key against the adapter's INSERTION{K}_VK_HASH.
     #[tokio::test]
@@ -3483,6 +3817,23 @@ mod tests {
             }
         }
         service.verify_deployment(&manifest).await.unwrap();
+        assert_eq!(service.status().chain.activator.as_deref(), Some(SENDER));
+        // The manifest's activator, when it records one, must be the vault's;
+        // a sender other than the activator only blocks the polls.
+        let mut pinned = manifest.clone();
+        pinned.activator = Some(SENDER.into());
+        service.verify_deployment(&pinned).await.unwrap();
+        fixture.vault().activator = OTHER_ACTIVATOR.into();
+        service.verify_deployment(&manifest).await.unwrap();
+        assert_eq!(
+            service.status().chain.activator.as_deref(),
+            Some(OTHER_ACTIVATOR)
+        );
+        let error = service.verify_deployment(&pinned).await.unwrap_err();
+        assert!(
+            matches!(&error, DeploymentCheckError::Mismatch(message) if message.contains("activator")),
+            "{error}"
+        );
         // The adapter pins another 4-note verifying key.
         fixture
             .vault()

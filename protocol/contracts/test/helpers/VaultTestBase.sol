@@ -13,9 +13,10 @@ import {MockProofAdapter} from "../mocks/MockProofAdapters.sol";
 ///      verifies once registered) and builders for its statements. Withdrawals name their note as
 ///      the vault stores it. The request tree is mirrored from storage (activated notes' recorded
 ///      leaves, retired ones zero), which gives activations their new roots and retirements and
-///      on-chain activations their paths. Nullifiers are arbitrary nonzero numbers: the mock does
-///      not relate them to states. Times come from vm.getBlockTimestamp(): via-IR may reuse a
-///      block.timestamp read from before a warp.
+///      on-chain activations their paths. `activator` (the operator's activation worker) submits
+///      proved activations; on-chain ones first wait for the fallback to open. Nullifiers are
+///      arbitrary nonzero numbers: the mock does not relate them to states. Times come from
+///      vm.getBlockTimestamp(): via-IR may reuse a block.timestamp read from before a warp.
 abstract contract VaultTestBase is Test {
     uint256 internal constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465; // "zkapi.v2.node"
     uint256 internal constant SCALAR_MODULUS =
@@ -38,6 +39,7 @@ abstract contract VaultTestBase is Test {
     address internal user = address(0x1234);
     address internal treasury = address(0x5678);
     address internal challenger = address(0xBEEF);
+    address internal activator = address(0xACC);
     uint256[32] internal emptySiblings;
 
     function _setUpVault() internal {
@@ -50,6 +52,13 @@ abstract contract VaultTestBase is Test {
     }
 
     function _newVault(uint64 challengePeriod, uint64 maxPauseDuration) internal returns (ZkApiVault) {
+        return _newVault(challengePeriod, maxPauseDuration, activator);
+    }
+
+    function _newVault(uint64 challengePeriod, uint64 maxPauseDuration, address activator_)
+        internal
+        returns (ZkApiVault)
+    {
         return new ZkApiVault(
             treasury,
             30 days,
@@ -61,7 +70,8 @@ abstract contract VaultTestBase is Test {
             CLEAR_X,
             CLEAR_Y,
             address(this),
-            maxPauseDuration
+            maxPauseDuration,
+            activator_
         );
     }
 
@@ -172,15 +182,25 @@ abstract contract VaultTestBase is Test {
         adapter.acceptInsertion(count, _insertionInputs(first, count, oldRoot, newRoot), PROOF);
     }
 
-    /// Activates the next `count` notes with a (mock) insertion proof; returns the new root.
+    /// Activates the next `count` notes with a (mock) insertion proof from the activator; returns
+    /// the new root.
     function _activate(uint256 count) internal returns (uint256 newRoot) {
         (uint32 first, uint256 oldRoot, uint256 root) = _prepareActivation(count);
+        vm.prank(activator);
         vault.activateNotes(first, count, oldRoot, root, PROOF);
         return root;
     }
 
-    /// Activates the next `count` notes on-chain, with the mirrored siblings of the first slot.
+    /// Warps to activationFallbackOpensAt if the on-chain fallback is not open yet.
+    function _openFallback() internal {
+        uint64 opensAt = vault.activationFallbackOpensAt();
+        if (vm.getBlockTimestamp() < opensAt) vm.warp(opensAt);
+    }
+
+    /// Activates the next `count` notes on-chain, with the mirrored siblings of the first slot,
+    /// once the fallback is open (up to ACTIVATION_FALLBACK_DELAY later).
     function _activateOnChain(uint256 count) internal {
+        _openFallback();
         uint32 first = vault.activationCursor();
         uint256[32] memory siblings = _path(first);
         vault.activateNotesOnChain(first, count, siblings);

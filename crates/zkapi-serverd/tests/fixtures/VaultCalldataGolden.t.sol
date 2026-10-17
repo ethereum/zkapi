@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-// Golden calldata, getter selectors and layouts, and event layouts of the
-// revision-4 vault, taken from the real contracts (protocol/contracts/src:
-// ZkApiVault, Types, Events and IZkApiProofAdapter), never from a copy of
+// Golden calldata, getter selectors and layouts, error selectors and event
+// layouts of the revision-4 vault, taken from the real contracts
+// (protocol/contracts/src: ZkApiVault, Types, Errors, Events and
+// IZkApiProofAdapter), never from a copy of
 // their declarations: vault_calldata_golden.json is this test's output.
 // check-calldata-golden.sh runs it with forge and compares (CI), or rewrites
 // the JSON with --update. zkapi-serverd's watcher and native_billing tests and
@@ -13,6 +14,7 @@ pragma solidity ^0.8.28;
 import {Test, Vm, console} from "forge-std/Test.sol";
 import {ZkApiVault} from "zkapi/ZkApiVault.sol";
 import {Types} from "zkapi/libraries/Types.sol";
+import {Errors} from "zkapi/libraries/Errors.sol";
 import {Events} from "zkapi/libraries/Events.sol";
 import {IZkApiProofAdapter} from "zkapi/interfaces/IZkApiProofAdapter.sol";
 
@@ -22,6 +24,9 @@ contract VaultEvents is Events {
     function emitAll() external {
         emit NoteDeposited(7, bytes32(uint256(0x0c0c)), 1_000_000, 2_000_000_000);
         emit NotesActivated(4, 4, 0x0d0d, true);
+        emit ActivatorChanged(
+            address(0x2222222222222222222222222222222222222222), address(0x3333333333333333333333333333333333333333)
+        );
         emit MutualClose(7, 0x0101, 900_000, address(0x1111111111111111111111111111111111111111));
         emit EscapeWithdrawalInitiated(
             7, 0x0101, 900_000, address(0x1111111111111111111111111111111111111111), 2_000_086_400, 0x0a0a
@@ -133,7 +138,18 @@ contract GoldenTest is Test {
         // signer and clients call or decode. Public getters have selectors
         // only on an instance, so a vault is deployed.
         ZkApiVault vault = new ZkApiVault(
-            address(0xbeef), 30 days, 1 days, 100_000, address(0xada), 11, 12, 13, 14, address(this), 2 days
+            address(0xbeef),
+            30 days,
+            1 days,
+            100_000,
+            address(0xada),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            2 days,
+            address(0xacc)
         );
         IZkApiProofAdapter adapter = IZkApiProofAdapter(address(0xada));
         selector("challengeEscapeWithdrawal", vault.challengeEscapeWithdrawal.selector);
@@ -147,6 +163,10 @@ contract GoldenTest is Test {
         selector("claimExpired", vault.claimExpired.selector);
         selector("activateNotes", vault.activateNotes.selector);
         selector("activateNotesOnChain", vault.activateNotesOnChain.selector);
+        selector("activator", vault.activator.selector);
+        selector("setActivator", vault.setActivator.selector);
+        selector("activationFallbackOpensAt", vault.activationFallbackOpensAt.selector);
+        selector("ACTIVATION_FALLBACK_DELAY", vault.ACTIVATION_FALLBACK_DELAY.selector);
         selector("activationCursor", vault.activationCursor.selector);
         selector("isActivated", vault.isActivated.selector);
         selector("paused", vault.paused.selector);
@@ -176,6 +196,9 @@ contract GoldenTest is Test {
         selector("INSERTION4_VK_HASH", adapter.INSERTION4_VK_HASH.selector);
         selector("INSERTION16_VK_HASH", adapter.INSERTION16_VK_HASH.selector);
         selector("assertValidInsertion", adapter.assertValidInsertion.selector);
+        // The errors of the activator role and of the on-chain fallback's delay.
+        selector("NotActivator", Errors.NotActivator.selector);
+        selector("ActivationFallbackClosed", Errors.ActivationFallbackClosed.selector);
 
         // The words each struct getter returns (the adapter is never called
         // by these reads).
@@ -187,9 +210,10 @@ contract GoldenTest is Test {
         // topic0, every topic (32-byte words, topic0 first) and the data of
         // each event as the vault emits it.
         VaultEvents events = new VaultEvents();
-        string[12] memory names = [
+        string[13] memory names = [
             "NoteDeposited",
             "NotesActivated",
+            "ActivatorChanged",
             "MutualClose",
             "EscapeWithdrawalInitiated",
             "EscapeConcessionRecorded",

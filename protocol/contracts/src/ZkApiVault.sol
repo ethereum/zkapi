@@ -24,8 +24,9 @@ import {IZkApiProofAdapter} from "./interfaces/IZkApiProofAdapter.sol";
 ///      public inputs compared with notes[noteId]), so a note can exit as soon as it is recorded and
 ///      no exit reads the tree. The request tree, whose root anonymous API requests prove
 ///      membership under, gets the recorded notes appended in order, in aligned batches of 1, 4 or
-///      16 (activateNotes with an insertion proof, or activateNotesOnChain, which anyone may call
-///      and which hashes on-chain): activationCursor counts the notes appended. retireClosedLeaf
+///      16 (activateNotes with an insertion proof, which only the activator may call, or
+///      activateNotesOnChain, which anyone may call from activationFallbackOpensAt on and which
+///      hashes on-chain): activationCursor counts the notes appended. retireClosedLeaf
 ///      sets a Closed note's leaf back to zero; no other leaf ever changes.
 ///      Ownership transfers are two-step and stay open while paused, for incident key rotation:
 ///      transferOwnership only nominates pendingOwner, and the current owner keeps every power
@@ -41,6 +42,10 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     /// @notice Capability marker of note-bound withdrawals and activated request trees (vault
     ///         revision 4).
     uint16 public constant NOTE_BOUND_EXIT_VERSION = 1;
+    /// @notice How long activateNotes must have made no progress before activateNotesOnChain opens:
+    ///         while the activator proves batches, nobody else can activate notes (which would break
+    ///         the batches' alignment), and if it stops, anyone can activate after this delay.
+    uint64 public constant ACTIVATION_FALLBACK_DELAY = 1 hours;
     uint64 public constant EXPIRY_BUCKET = 1 days;
     uint256 public constant MERKLE_DEPTH = 32;
     /// @notice Lower bound of the treasury timelock; the delay is max(this, challengePeriod).
@@ -102,6 +107,14 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     /// @notice Active-clock time (wall clock minus all paused time) from which acceptTreasury may
     ///         apply pendingTreasury; paused time never counts toward the delay.
     uint64 public pendingTreasuryReadyAt;
+    /// @notice The only address that may call activateNotes (the operator's activation worker); the
+    ///         owner sets it with setActivator.
+    address public activator;
+    /// @notice Time from which activateNotesOnChain is open: ACTIVATION_FALLBACK_DELAY after the
+    ///         latest proved activation, the deployment or the latest unpause, whichever is last.
+    ///         On-chain activations do not move it, so once open it stays open until a proved one.
+    /// @dev Shares activator's slot, which activateNotes reads anyway.
+    uint64 public activationFallbackOpensAt;
     /// @notice Time of the latest unpause; zero if the vault was never unpaused.
     uint64 public lastUnpausedAt;
 
@@ -141,10 +154,11 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         uint256 clearanceSigningKeyX_,
         uint256 clearanceSigningKeyY_,
         address owner_,
-        uint64 maxPauseDuration_
+        uint64 maxPauseDuration_,
+        address activator_
     ) Ownable(owner_) {
         if (
-            treasury_ == address(0) || proofAdapter_ == address(0) || challengePeriod_ == 0
+            treasury_ == address(0) || proofAdapter_ == address(0) || activator_ == address(0) || challengePeriod_ == 0
                 || maxPauseDuration_ < 2 * uint256(challengePeriod_)
         ) {
             revert Errors.Unauthorized();
@@ -175,6 +189,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         clearanceSigningKeyY = clearanceSigningKeyY_;
         maxPauseDuration = maxPauseDuration_;
         currentRoot = MerkleUpdateLib.EMPTY_ROOT;
+        activator = activator_;
+        activationFallbackOpensAt = uint64(block.timestamp) + ACTIVATION_FALLBACK_DELAY;
+        emit ActivatorChanged(address(0), activator_);
     }
 
     /// @notice Deposits `amount` gwei units under `commitment` as the next note. The note can exit
@@ -205,7 +222,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     ///         count - 1 appended as one aligned subtree is the tree at `newRoot`. The statement's
     ///         notes are read from storage here (commitment and packed amount and expiry, whatever the
     ///         note's status), so a proof can neither skip, reorder nor alter a recorded note.
-    ///         Anyone may call it; the operator's activation worker does.
+    ///         Only the activator (the operator's activation worker) may call it.
     /// @dev firstNoteId and expectedRoot must equal activationCursor and currentRoot: an activation
     ///      or a retirement landing first makes a prepared one revert StaleActivation before any
     ///      verification. Deposits landing meanwhile do not.
@@ -216,6 +233,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         uint256 newRoot,
         bytes calldata proof
     ) external nonReentrant whenNotPaused {
+        if (msg.sender != activator) revert Errors.NotActivator();
         _requireActivationRange(firstNoteId, count);
         if (expectedRoot != currentRoot) revert Errors.StaleActivation();
         uint256[] memory inputs = new uint256[](3 + 2 * count);
@@ -231,18 +249,21 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
             }
         }
         proofAdapter.assertValidInsertion(count, inputs, proof);
+        activationFallbackOpensAt = uint64(block.timestamp) + ACTIVATION_FALLBACK_DELAY;
         _activate(firstNoteId, count, newRoot, true);
     }
 
     /// @notice Activates the next `count` recorded notes (count 1, 4 or 16) without a proof: hashes
     ///         their leaves and the path above them on-chain. `siblings` is the path of their (empty)
     ///         subtree at currentRoot, which an indexer serves or any client rebuilds from events.
-    ///         Anyone may call it, so activation never depends on a prover; it costs far more gas.
+    ///         Anyone may call it from activationFallbackOpensAt on (ACTIVATION_FALLBACK_DELAY without
+    ///         a proved activation), so activation never depends on a prover; it costs far more gas.
     function activateNotesOnChain(uint32 firstNoteId, uint256 count, uint256[32] calldata siblings)
         external
         nonReentrant
         whenNotPaused
     {
+        if (block.timestamp < activationFallbackOpensAt) revert Errors.ActivationFallbackClosed();
         _requireActivationRange(firstNoteId, count);
         uint256[] memory leaves = new uint256[](count);
         for (uint256 j = 0; j < count;) {
@@ -485,7 +506,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     ///         even while paused. Stay open while paused: challengeEscapeWithdrawal,
     ///         raiseEscapeConcession, finalizeEscapeWithdrawal and claimEscapePayout, so escapes in
     ///         flight resolve and credited payouts can be delivered, retireClosedLeaf, and
-    ///         cancelTreasuryChange, transferOwnership and acceptOwnership. A pause needs
+    ///         cancelTreasuryChange, setActivator, transferOwnership and acceptOwnership. A pause needs
     ///         PAUSE_COOLDOWN since the latest unpause.
     function pause() external onlyOwner whenNotPaused {
         uint64 unpausedAt = lastUnpausedAt;
@@ -497,12 +518,23 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         emit Paused(msg.sender);
     }
 
+    /// @notice Sets the only address that may call activateNotes. Open while paused, so a
+    ///         compromised or lost worker key can be replaced at any time; an activator can only
+    ///         append recorded notes in order.
+    function setActivator(address newActivator) external onlyOwner {
+        if (newActivator == address(0)) revert Errors.Unauthorized();
+        emit ActivatorChanged(activator, newActivator);
+        activator = newActivator;
+    }
+
     function unpause() external onlyOwner {
         if (!paused) revert Errors.NotPaused();
         totalPausedDuration += uint64(block.timestamp) - pausedAt;
         paused = false;
         pausedAt = 0;
         lastUnpausedAt = uint64(block.timestamp);
+        // The prover gets the full delay after a pause before anyone may front-run it.
+        activationFallbackOpensAt = uint64(block.timestamp) + ACTIVATION_FALLBACK_DELAY;
         emit Unpaused(msg.sender);
     }
 

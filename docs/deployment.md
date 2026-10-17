@@ -104,16 +104,17 @@ its vault's, treat it as compromised and follow
 `demo/contracts/script/Deploy.s.sol` links (or deploys) the `Bn254Poseidon`
 library, deploys the circuit's Groth16 adapter (one contract for the request,
 withdrawal and 1-, 4- and 16-note insertion verifying keys) and the
-native-only vault with its 11 constructor arguments, and checks the adapter's
+native-only vault with its 12 constructor arguments, and checks the adapter's
 circuit and five verifying-key hashes against the setup manifest and the
 vault's getters against the inputs: `PROTOCOL_VERSION` 2,
 `CONCESSION_ESCAPE_VERSION` and `NOTE_BOUND_EXIT_VERSION` 1, the empty tree's
-`currentRoot()`, and `nextNoteId()` and `activationCursor()` 0. The manifest
-records `vaultRevision` 4, `noteBoundExitVersion` and the five
-`*VkKeccak256` hashes. Unless `GASLESS=0`, the same broadcast then deploys the
-gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint
-v0.7.0, stakes it and its transit-account factory, funds its deposit and
-checks its getters ([below](#gasless-withdrawals)). Its header lists the
+`currentRoot()`, `nextNoteId()` and `activationCursor()` 0, `activator()` the
+`ACTIVATOR`, and `activationFallbackOpensAt()` an hour after the deployment.
+The manifest records `vaultRevision` 4, `noteBoundExitVersion`, `activator`
+and the five `*VkKeccak256` hashes. Unless `GASLESS=0`, the same broadcast
+then deploys the gasless-withdrawal paymaster against the canonical ERC-4337
+EntryPoint v0.7.0, stakes it and its transit-account factory, funds its
+deposit and checks its getters ([below](#gasless-withdrawals)). Its header lists the
 environment it reads, and `demo/contracts/foundry.toml` notes how to run it
 with `forge script`. The script links the library itself; no
 `FOUNDRY_REMAPPINGS` override is needed.
@@ -123,6 +124,7 @@ with `forge script`. The script links the library itself; no
 | `PRIVATE_KEY` | Pays for the deployment |
 | `OWNER` | Vault owner; required except on local chains (31337, 1337), where it defaults to the deployer. Use a multisig or timelock; the script warns on Mainnet when it has no code |
 | `TREASURY` | Payout address of spent balances and expired deposits; required off local chains |
+| `ACTIVATOR` | The only address that may call `activateNotes`: the activation worker's sender, the address of the activation signer's key. Required except on local chains, where it defaults to the deployer. The owner can replace it later with `setActivator` ([the activator](activation-worker.md#the-activator)) |
 | `OUTPUT_PATH` | Absolute path of the final deployment manifest; the script writes `$OUTPUT_PATH.pending` |
 | `STATE_SIGNING_KEY_X/Y`, `CLEARANCE_SIGNING_KEY_X/Y` | The public keys `zkapi signing-keys` prints; points of Baby-JubJub's prime-order subgroup, distinct, and off local chains not the published development keys |
 | `CHALLENGE_PERIOD_SECONDS` | Escape window; default 24 hours. Immutable; it bounds the challenger's whole response time. Plan 172,800 on Mainnet and 43,200 on Sepolia |
@@ -176,8 +178,8 @@ the vault's creation block. The deployment is final only after
 `--broadcast-log FILE`), requires each creation to have succeeded at the
 manifest's address, every runtime code hash on chain to be the expected one
 (the vault's three, and the paymaster deployment's five more), the vault's
-owner and treasury to be the manifest's and, with the paymaster, its deposit,
-stakes, policy and owner too, and only then writes `$OUTPUT_PATH` with
+owner, treasury and activator to be the manifest's and, with the paymaster,
+its deposit, stakes, policy and owner too, and only then writes `$OUTPUT_PATH` with
 `deploymentStatus: "deployed"`, `deployBlock` (the block that created the
 vault) and `deployTransactions`. A mismatch exits 1 and any other failure 2,
 and neither writes the output. Finalize after finality, for example
@@ -215,8 +217,9 @@ ideally behind a timelock, never a single deployer key:
   `raiseEscapeConcession`, `finalizeEscapeWithdrawal`, `claimEscapePayout`
   and `retireClosedLeaf` stay open, so escapes in flight still resolve and
   credited escape payouts can be delivered, and `cancelTreasuryChange`,
-  `transferOwnership` and `acceptOwnership` stay open. A new pause needs
-  `PAUSE_COOLDOWN()` (one day) since the latest unpause (`PauseCooldown()`).
+  `setActivator`, `transferOwnership` and `acceptOwnership` stay open. A new
+  pause needs `PAUSE_COOLDOWN()` (one day) since the latest unpause
+  (`PauseCooldown()`).
   The NatSpec of `pause()` in `ZkApiVault.sol` lists these sets. `pause()` and
   `unpause()` emit `Paused(address)` and `Unpaused(address)` and revert when
   redundant.
@@ -237,6 +240,14 @@ ideally behind a timelock, never a single deployer key:
   passed to `Deploy.s.sol` takes effect at deployment without an acceptance
   step, so verify it before deploying. See
   [the owner key rotation runbook](migration-concession-vault.md#owner-key-rotation).
+- `setActivator(address)` names the only address that may call
+  `activateNotes`, the activation worker's sender (event
+  `ActivatorChanged(previousActivator, newActivator)`). It takes a nonzero
+  address and works while paused, so a lost or compromised worker key can be
+  replaced at once; rotate as in
+  [the activator](activation-worker.md#the-activator). Alert on any
+  `ActivatorChanged` you did not send: the worker then sends nothing
+  (`not_activator`) and deposits wait for the fallback.
 - Paused time extends every note's claim time, and after any unpause
   `claimExpired` waits at least `unpauseClaimGrace()`, the larger of
   `challengePeriod()` and one day. `effectiveExpiry(noteId)` returns the
@@ -258,10 +269,11 @@ ideally behind a timelock, never a single deployer key:
   the zero address or the vault itself revert `InvalidDestination()`.
 
 A deposit only records its note; the note can exit at once and makes requests
-once activated (`activateNotes` with an insertion proof, or the
-permissionless `activateNotesOnChain`; `NotesActivated` events,
-`activationCursor()`, `isActivated(noteId)`). A withdrawal proof names its
-note by the registration commitment and the packed amount and expiry the vault
+once activated (`activateNotes` with an insertion proof, which only the
+activator may send, or `activateNotesOnChain`, open to anyone an hour after
+the latest proved activation, the deployment or an unpause; `NotesActivated`
+events, `activationCursor()`, `isActivated(noteId)`). A withdrawal proof names
+its note by the registration commitment and the packed amount and expiry the vault
 stores, which the vault compares before the proof (`NoteBindingMismatch()`);
 no withdrawal needs a root or Merkle siblings. `retireClosedLeaf` needs the
 note activated (`NoteNotActivated()`). An escape consumes its nullifier and its successor's; a request proof at the
@@ -416,9 +428,10 @@ request evidence and binds it to the deployment manifest), the challenger,
 the activation worker, then the API server; the challenger must be healthy
 before the first deposit, and deposits wait for the activation worker before
 they can make requests. The worker proves insertions with the setup's
-insertion keys from a funded account of its own and needs the indexer's paths
-([activation worker](activation-worker.md)); without it, anyone can still
-activate with `activateNotesOnChain`, at far higher gas.
+insertion keys from a funded account of its own, the vault's activator, and
+needs the indexer's paths ([activation worker](activation-worker.md));
+without it, anyone can still activate with `activateNotesOnChain`, at far
+higher gas, once an hour has passed since the latest proved activation.
 The challenger needs a funded exclusive account, EIP-1559 fee caps whose bids
 fit the transaction fee cap of the node behind its signer
 (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, default 1 ETH, which allows about 1,666 gwei
@@ -474,9 +487,11 @@ for. It then:
    `--proof-setup-dir`), then serverd (`--deployment`).
 
 It runs the activation worker (`zkapi-activated`, from an Anvil account of its
-own) after the challenger and waits for it before each note's first request;
-one drill stops it and activates with `activateNotesOnChain` and the siblings
-the indexer serves for the activation cursor.
+own, which it deploys as the vault's `ACTIVATOR`) after the challenger and
+waits for it before each note's first request; one drill stops it, skips
+block time past the fallback's hour, and activates with
+`activateNotesOnChain` and the siblings the indexer serves for the activation
+cursor.
 
 Its native billing RPC is a loopback mock price feed that forwards every other
 read to Anvil. Use [`scripts/v2-acceptance.mjs`](../scripts/v2-acceptance.mjs)
@@ -600,26 +615,26 @@ are too high raise that griefing exposure linearly.
 initiation that is defeated, unless a later payout to the same `S` repays
 it, which an attacker avoids. Per defeated escape the operator pays, in gas:
 
-- the sponsored initiation, about 1.19M: `handleOpsEscape` (594,222,
+- the sponsored initiation, about 1.19M: `handleOpsEscape` (594,763,
   measured with a mock adapter) plus two real proof verifications, the
   paymaster's and the vault's, of about 297,800 each
-  (`paymasterValidationEscapeCold` 397,336 − `validationEscapeMockCold`
-  99,511, in `protocol/contracts/snapshots/gasless-gas.json`);
-- the defeat, 357,330 (`challengeEscapeWithdrawal`);
+  (`paymasterValidationEscapeCold` 397,798 − `validationEscapeMockCold`
+  99,973, in `protocol/contracts/snapshots/gasless-gas.json`);
+- the defeat, 357,418 (`challengeEscapeWithdrawal`);
 - the note's activation, which every deposit costs and a defeat presupposes
   (the request at the escape's successor needs an activated note): about
-  37,500 in a batch of 16 (599,900 / 16) up to 276,800 for a note activated
+  37,800 in a batch of 16 (605,200 / 16) up to 286,100 for a note activated
   alone.
 
-That is about 1.58M to 1.82M gas against the 77,140 of the attacker's
+That is about 1.59M to 1.83M gas against the 77,206 of the attacker's
 deposit (an Anvil receipt): about 21:1 to 24:1 against the operator. The
 note must hold the payout the paymaster requires (the operation, a gasless
 finalization, `minEscapeNetWei` and both flat fees), which the attacker gets
 back by a later exit, so a dust note cannot start a sponsored escape. Dust
 still costs activation: the vault has no minimum deposit (one unit, 1 gwei)
 and the worker activates every recorded note, so each deposit costs the
-operator 37,500 to 276,800 gas against the depositor's 77,140, up to about
-3.6:1 at low volume, where every deposit is activated alone. Enable it on the
+operator 37,800 to 286,100 gas against the depositor's 77,206, up to about
+3.7:1 at low volume, where every deposit is activated alone. Enable it on the
 Sepolia drill, and decide for mainnet from the `EscapeInitiationOwed` and
 `owedPaid` data. Keep `minEscapeNetWei` at least 10 × a typical initiation
 plus finalization cost. While it is disabled, escapes are sponsored only at

@@ -2589,8 +2589,13 @@ mod tests {
         ] {
             assert_eq!(decode_log(&log(name)).unwrap(), Some(expected), "{name}");
         }
-        // Payout-credit events are not tree events: ignored, not parsed.
-        for name in ["EscapePayoutDeferred", "EscapePayoutClaimed"] {
+        // Payout-credit events and activator changes are not tree events:
+        // ignored, not parsed.
+        for name in [
+            "EscapePayoutDeferred",
+            "EscapePayoutClaimed",
+            "ActivatorChanged",
+        ] {
             assert_eq!(decode_log(&log(name)).unwrap(), None, "{name}");
         }
     }

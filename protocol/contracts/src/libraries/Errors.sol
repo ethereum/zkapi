@@ -120,4 +120,11 @@ library Errors {
 
     /// @notice A retirement named a note that is not in the request tree yet.
     error NoteNotActivated();
+
+    /// @notice activateNotes from an address other than the vault's activator.
+    error NotActivator();
+
+    /// @notice activateNotesOnChain before activationFallbackOpensAt: a proved activation, the
+    ///         deployment or an unpause happened less than ACTIVATION_FALLBACK_DELAY ago.
+    error ActivationFallbackClosed();
 }

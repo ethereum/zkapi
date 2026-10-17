@@ -60,8 +60,11 @@ async function main() {
   const { rpcUrl, listenHost, port, ...options } = parseSignerConfig(process.env);
   const signer = createSigner({ ...options, rpc: createUpstream(rpcUrl) });
   delete process.env[`${SIGNER_ENV_PREFIX[signer.profile]}_PRIVATE_KEY`];
-  // Fails on a wrong chain or a block without a base fee. A low balance or a
-  // base fee above the cap only warns: the daemon waits for a healthy signer.
+  // Fails on a wrong chain or a block without a base fee. A low balance, a
+  // base fee above the cap or (activation signer) a sender that is not the
+  // vault's activator, or an activator the upstream refuses to read, only
+  // warns: the daemon waits for a healthy signer, and the owner may still make
+  // the sender the activator.
   const status = await signer.status();
   const server = createHttpServer(signer);
   server.requestTimeout = 30_000;
@@ -79,6 +82,9 @@ async function main() {
         max_retirements_per_day: status.max_retirements_per_day, retire_on_miss: status.retire_on_miss,
         retirement_lookback_blocks: status.retirement_lookback_blocks,
       }),
+      // The vault's activator, or null; sender_not_activator warns when it is not this
+      // signer's sender, activator_unreadable when the upstream refused to read it.
+      ...(signer.profile === 'activation' && { activator: status.activator }),
       base_fee_per_gas_wei: decimal(status.base_fee_per_gas), warnings: status.warnings,
     }));
   });

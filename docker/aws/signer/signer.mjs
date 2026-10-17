@@ -28,14 +28,21 @@ export const vaultInterface = new Interface([CHALLENGE_ABI, RAISE_ABI, RETIRE_AB
 // The one call of the activation worker: a proved insertion batch of 1, 4 or
 // 16 notes aligned at the vault's activation cursor. The vault builds the
 // statement from its own storage, so the call carries no deployment binding.
-// The permissionless on-chain fallback (activateNotesOnChain, 0x027e21e9),
-// which the worker never sends, is refused like every other call.
+// The no-prover fallback (activateNotesOnChain, 0x027e21e9), which anyone may
+// call once an hour passes without a proved activation and the worker never
+// sends, is refused like every other call.
 export const ACTIVATE_ABI = 'function activateNotes(uint32 firstNoteId,uint256 count,uint256 expectedRoot,uint256 newRoot,bytes proof)';
 export const activationInterface = new Interface([ACTIVATE_ABI]);
 export const ACTIVATION_BATCH_SIZES = Object.freeze([1n, 4n, 16n]);
+// The vault takes activateNotes only from its activator() (0x4ecea992), which
+// the owner may change at any time (setActivator, refused by both profiles
+// like every other call). The activation signer reports it and warns when it
+// is not the signer's sender, as the vault would refuse every batch
+// (NotActivator), and, separately, when the upstream refuses to read it.
+export const ACTIVATOR_SELECTOR = '0x4ecea992';
 // Gas limit caps, above the largest call of each profile: a leaf retirement
-// takes about 2.0M (its 1,648,631 measured plus the challenger's 20%), a
-// 16-note activation about 720,000 (its 600,000 measured plus the worker's
+// takes about 2.0M (its 1,648,719 measured plus the challenger's 20%), a
+// 16-note activation about 726,000 (its 605,000 measured plus the worker's
 // 20%).
 export const DEFAULT_MAX_GAS = Object.freeze({ challenge: 12_000_000n, activation: 1_000_000n });
 const PROFILE_CALLS = Object.freeze({
@@ -416,9 +423,23 @@ export function createSigner({ profile = 'challenge', privateKey, vault, rpc, ch
   async function senderBalance() {
     return upstreamQuantity(await rpc('eth_getBalance', [sender, 'latest']), 'Upstream RPC returned an invalid balance');
   }
+  // The vault's activator: null when the vault answers with no address
+  // (another contract at the address), undefined when the upstream rejects the
+  // read. A JSON-RPC error may be a revert or a provider's refusal (a rate
+  // limit, a missing block), which the signer cannot tell apart, so it is
+  // reported as unreadable, not as another activator.
+  async function vaultActivator() {
+    let answer;
+    try { answer = await rpc('eth_call', [{ to: destination, data: ACTIVATOR_SELECTOR }, 'latest']); }
+    catch (error) {
+      if (error instanceof RpcError && error.data?.reason === 'upstream_rejected') return undefined;
+      throw error;
+    }
+    return typeof answer === 'string' && /^0x0{24}[0-9a-fA-F]{40}$/.test(answer) ? `0x${answer.slice(26).toLowerCase()}` : null;
+  }
   async function status() {
     await checkChain();
-    const [{ number, baseFee }, balance] = await Promise.all([latestBaseFee(), senderBalance()]);
+    const [{ number, baseFee }, balance, activator] = await Promise.all([latestBaseFee(), senderBalance(), challenger ? undefined : vaultActivator()]);
     const warnings = [];
     if (baseFee > maxFeePerGas) warnings.push('base_fee_above_cap');
     // The next base fee may be 12.5% higher; the cap must still leave the default tip.
@@ -426,10 +447,17 @@ export function createSigner({ profile = 'challenge', privateKey, vault, rpc, ch
     if (balance < maxGas * maxFeePerGas) warnings.push('balance_below_required');
     // Bids near the fee cap at a gas limit near MAX_GAS would be refused.
     if (maxGas * maxFeePerGas > txFeeCap) warnings.push('tx_fee_cap_below_fee_cap');
+    if (!challenger) {
+      if (activator === undefined) warnings.push('activator_unreadable');
+      else if (activator !== sender) warnings.push('sender_not_activator');
+    }
     const { refused_recently: refusedRecently, ...retirement } = retirementStatus();
     // A retirement after a real missed defeat waits for the budget.
     if (refusedRecently) warnings.push('retirement_budget_exhausted');
-    return { chain_id: hex(chainId), ...policy, ...retirement, block_number: hex(number), base_fee_per_gas: hex(baseFee), balance: hex(balance), warnings };
+    return {
+      chain_id: hex(chainId), ...policy, ...(!challenger && { activator: activator ?? null }), ...retirement,
+      block_number: hex(number), base_fee_per_gas: hex(baseFee), balance: hex(balance), warnings,
+    };
   }
 
   // Both fee fields or neither. Absent fields bid (cap, default tip), which

@@ -175,6 +175,8 @@ test("every selector and event topic is the real vault's", () => {
     assert.equal(event?.event, name, name);
     assert.equal(event.noteId ?? 7n, 7n, name);
   }
+  // Any other vault event, such as an activator change, decodes to null.
+  assert.equal(wallet.decodeVaultEvent(log("ActivatorChanged"), vault), null);
   assert.equal(REAL_VAULT.getter_words.pendingConcessions, 3);
   assert.equal(REAL_VAULT.getter_words.pendingWithdrawals, 5);
   assert.equal(REAL_VAULT.getter_words.notes, 4);

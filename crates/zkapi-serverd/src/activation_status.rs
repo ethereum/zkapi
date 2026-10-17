@@ -72,6 +72,10 @@ pub enum ActivationBlocked {
     /// The vault's reads disagree (a recorded note below nextNoteId reads
     /// Uninitialized): a reorganization under the read, retried.
     VaultInconsistent,
+    /// The vault's `activator()` is not the worker's sender, so it refuses
+    /// the worker's `activateNotes` (`NotActivator()`): nothing is sent until
+    /// the owner calls `setActivator` with the sender.
+    NotActivator,
     ProvingFailed,
     /// The adapter refused the worker's insertion proof (`InvalidProof()`).
     ProofRejected,
@@ -130,7 +134,8 @@ pub struct ActivationAlarmPolicy {
     /// The oldest pending note has waited this long: a warning...
     pub pending_warning_seconds: u64,
     /// ...and this long: critical (the worker is not keeping up; consider
-    /// the permissionless `activateNotesOnChain` fallback).
+    /// the `activateNotesOnChain` fallback, open to anyone from
+    /// `chain.activation_fallback_opens_at`).
     pub pending_critical_seconds: u64,
     pub blocked_warning_seconds: u64,
     pub critical_blocked_seconds: u64,
@@ -204,6 +209,13 @@ pub struct ActivationChainStatus {
     pub confirmations: u64,
     pub current_root: Option<Felt252>,
     pub paused: Option<bool>,
+    /// The vault's `activator()`: the only sender whose `activateNotes` it
+    /// accepts.
+    pub activator: Option<String>,
+    /// The vault's `activationFallbackOpensAt()`: from then on anyone may
+    /// activate with `activateNotesOnChain`, until the next proved activation
+    /// (an hour after it).
+    pub activation_fallback_opens_at: Option<u64>,
 }
 
 /// The recorded notes that wait for activation.
@@ -249,7 +261,8 @@ pub enum BatchOutcome {
     /// It activated the batch (`NotesActivated` from the vault).
     Activated,
     /// It mined and reverted (another activation or a retirement landed
-    /// first): nothing was activated by it.
+    /// first, or its sender was no longer the activator): nothing was
+    /// activated by it.
     Reverted,
     /// The nonce was consumed by an attempt whose receipt the worker does
     /// not know (an ambiguous send without a hash).
@@ -608,6 +621,12 @@ mod tests {
         );
         assert!(ActivationBlocked::SignerRefused.is_immediately_critical());
         assert!(!ActivationBlocked::FeeCapReached.is_immediately_critical());
+        // The owner's setActivator resolves it: it escalates with time.
+        assert!(!ActivationBlocked::NotActivator.is_immediately_critical());
+        assert_eq!(
+            serde_json::to_value(ActivationBlocked::NotActivator).unwrap(),
+            "not_activator"
+        );
         assert!(ActivationAlarmPolicy {
             pending_critical_seconds: 1,
             pending_warning_seconds: 2,

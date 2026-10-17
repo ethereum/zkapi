@@ -92,6 +92,12 @@ pub struct DeploymentManifest {
     pub exit_concession: Option<u64>,
     #[serde(default)]
     pub vault_revision: Option<u64>,
+    /// The vault's activator at deployment: the only sender whose
+    /// `activateNotes` it accepts, which the owner can change
+    /// (`setActivator`). When the manifest records it, the activation worker
+    /// refuses to start unless the vault's `activator()` is this address.
+    #[serde(default)]
+    pub activator: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +187,11 @@ impl DeploymentManifest {
             &manifest.poseidon_library_address,
             "poseidon_library_address",
         )?;
+        manifest.activator = manifest
+            .activator
+            .as_deref()
+            .map(|activator| address(activator, "activator"))
+            .transpose()?;
         for (field, value) in [
             ("request_vk_keccak256", &mut manifest.request_vk_keccak256),
             (
@@ -701,6 +712,21 @@ pub(crate) mod tests {
         let mut capability = bare.clone();
         capability["exit_concession"] = 0.into();
         assert!(DeploymentManifest::parse(&capability.to_string()).is_err());
+        // The activator is optional, an address when present.
+        assert_eq!(manifest.activator, None);
+        let mut activator = bare.clone();
+        activator["activator"] = "0x00000000000000000000000000000000000000AC".into();
+        assert_eq!(
+            DeploymentManifest::parse(&activator.to_string())
+                .unwrap()
+                .activator
+                .as_deref(),
+            Some("0x00000000000000000000000000000000000000ac")
+        );
+        for invalid in ["0x0000000000000000000000000000000000000000", "0xac"] {
+            activator["activator"] = invalid.into();
+            assert!(DeploymentManifest::parse(&activator.to_string()).is_err());
+        }
         let mut zero = bare;
         zero["proof_adapter_address"] = "0x0000000000000000000000000000000000000000".into();
         assert!(DeploymentManifest::parse(&zero.to_string()).is_err());

@@ -186,7 +186,7 @@ that default, are:
 | --- | --- | --- |
 | Defeat | 600,000, or the estimate plus 20% when higher (estimated 0.33-0.40M) | about 1,666 gwei |
 | Raise | 450,000, or the estimate plus 20% when higher (estimated about 0.33M) | about 2,222 gwei |
-| Leaf retirement | the estimate plus 20%, about 2.0M (1,648,631 measured) | about 500 gwei |
+| Leaf retirement | the estimate plus 20%, about 2.0M (1,648,719 measured) | about 500 gwei |
 
 The defeat and raise figures are the design estimates, the retirement's CI's
 Forge measurement (`protocol/contracts/snapshots/activation-gas.json`);
@@ -466,9 +466,11 @@ vault, with zero ETH value:
 
 Everything else is refused before any upstream call with `-32602` (`Only
 canonical activateNotes calls are authorized`): the challenger's three calls,
-every other vault call, and the vault's permissionless fallback
-`activateNotesOnChain(uint32, uint256, uint256[32])` (`0x027e21e9`), which the
-worker never sends and which costs far more gas. A batch must hold 1, 4 or 16
+every other vault call (the owner's `setActivator` included), and the vault's
+no-prover fallback `activateNotesOnChain(uint32, uint256, uint256[32])`
+(`0x027e21e9`), which anyone may call once an hour passes without a proved
+activation, which the worker never sends, and which costs far more gas (about
+1.66M for 1 note, 1.89M for 4 and 3.08M for 16). A batch must hold 1, 4 or 16
 notes and start at a multiple of its size, and carry a 256-byte Groth16 proof;
 the vault builds the statement from its own storage, so the call names no
 deployment beyond its destination. The signer then simulates it again: a batch
@@ -478,13 +480,34 @@ answers by rebuilding. Gas, fee, transaction fee and balance bounds, the fee
 model, nonce handling, refusal reasons and the no-broadcast guarantee are the
 challenge signer's, above.
 
+The vault takes `activateNotes` only from its activator: `activator()`
+(`0x4ecea992`), set by `Deploy.s.sol`'s `ACTIVATOR` and replaced by the owner's
+`setActivator`. From any other sender every batch reverts `NotActivator()`,
+refused here as `simulation_failed`. `zkapi_signerStatus` and the startup line
+therefore read and report the vault's `activator` (null when the vault answers
+with no address or the read is refused), and `warnings` adds:
+
+- `sender_not_activator` when the vault names another address, or answers
+  with no address;
+- `activator_unreadable` when the upstream refuses the read with a JSON-RPC
+  error. That may be a revert (a vault without `activator()`) as well as a
+  provider's refusal (a rate limit, a block it does not have), which the
+  signer cannot tell apart; alert on it only when it persists. An unreachable
+  upstream fails the status instead, as it does for the balance.
+
+Both only warn, as a low balance does: the signer starts and serves, so that
+the owner can still name its sender.
+
 It reads only `ZKAPI_ACTIVATION_` variables, with the meanings and defaults of
 the `ZKAPI_CHALLENGE_` ones in [Configuration](#configuration), except:
 
 - `ZKAPI_ACTIVATION_MAX_GAS` defaults to 1,000,000: an activation takes about
-  277,000 gas for 1 note, 343,000 for 4 and 600,000 for 16, and the worker's gas
-  limit is its estimate plus 20% (720,000 for 16 notes). `required_balance` is
-  therefore 0.01 ETH at a 10 gwei fee cap.
+  286,000 gas for 1 note, 348,000 for 4 and 605,000 for 16 (on Anvil, intrinsic
+  gas and calldata included; CI's Forge measurement in
+  `protocol/contracts/snapshots/activation-gas.json`, with cold contracts, is
+  275,635, 337,933 and 594,662), and the worker's gas limit is its estimate plus 20%
+  (726,000 for 16 notes). `required_balance` is therefore 0.01 ETH at a 10
+  gwei fee cap.
 - There are no retirement settings: leaf retirements are the challenger's.
   Passing a `ZKAPI_CHALLENGE_` variable, including
   `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI`, refuses startup.
@@ -506,11 +529,13 @@ activation per batch can succeed, and a copy that mines after it reverts
 `StaleActivation()` before any proof verification, for little gas. Activation
 has no deadline: a base fee above the cap only delays it, and the worker's
 status warns while notes wait. Fund the sender for one pending transaction
-(gas limit x fee cap, 0.072 ETH for a 16-note activation at 100 gwei) plus the
+(gas limit x fee cap, about 0.075 ETH for a 16-note activation at 100 gwei, the
+worker's default low-balance warning) plus the
 activations expected until the next top-up.
 
 `GET /health`, `zkapi_signerStatus` and the startup line report `profile:
-"activation"` and omit the retirement fields; the audit lines are
+"activation"` and omit the retirement fields; `zkapi_signerStatus` and the
+startup line add `activator`. The audit lines are
 `activation_signed` and `activation_refused`, and startup failures are printed
 as `Activation signer startup failed: ...`. The read-only passthrough is the
 same.
@@ -522,8 +547,9 @@ fixture key and mock RPC responses. They decode the actual ethers signatures and
 cover the three allowed calls by their pinned selectors and calldata sizes, the
 refusal of the revision-2 challenge, other vault calls and non-canonical
 encodings, the activation profile (aligned `activateNotes` batches only, the
-refusal of the on-chain fallback and of the challenger's calls, its
-configuration, status and process, and one profile per environment), the fee
+refusal of the on-chain fallback, of `setActivator` and of the challenger's
+calls, its configuration, status (the vault's activator, `sender_not_activator`
+and `activator_unreadable`) and process, and one profile per environment), the fee
 bounds, the Mainnet cap rule, strict configuration, refusal
 reasons, the transaction fee cap and a node's fee-cap refusal, the retirement
 budget (nonces per rolling day, free same-nonce replacements, one pending nonce
@@ -532,9 +558,10 @@ guarantee, candidate hashes, idempotent re-sends, status warnings, mismatched
 deployment bindings, forbidden methods, durable nonce retries and sanitized
 HTTP errors. `npm run test:anvil` runs a disposable anvil (`--chain-id
 11155111`, automine off). It checks the price actually charged, the base-fee and
-balance refusals, same-nonce replacement, and an activation signer whose
-`activateNotes` mines while the fallback and the challenger's calls never reach
-the node. Anvil has no `--rpc.txfeecap`, so
+balance refusals, same-nonce replacement, and an activation signer that reports
+the vault's activator (a reverting read as `activator_unreadable`) and whose
+`activateNotes` mines while the fallback, `setActivator` and the challenger's
+calls never reach the node. Anvil has no `--rpc.txfeecap`, so
 the fee-cap test puts a JSON-RPC proxy in front of it that refuses broadcasts
 above 1 ETH with geth's exact error. Without anvil those tests are skipped
 unless `ZKAPI_REQUIRE_ANVIL=1`, which makes a missing anvil a failure. No test

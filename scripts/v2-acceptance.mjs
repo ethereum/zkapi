@@ -18,9 +18,11 @@
 // Activation: a deposit only records its note, which can exit at once but
 // makes anonymous requests only once activated (appended to the request
 // tree). The operator's activation worker (zkapi-activated) runs in the
-// stack and proves every batch (activateNotes with an insertion proof); one
-// drill stops it and activates with the permissionless no-prover
-// activateNotesOnChain and the siblings the indexer serves.
+// stack and proves every batch (activateNotes with an insertion proof, which
+// the vault takes only from its activator, the worker's sender); one drill
+// stops it, waits out the fallback's delay (an hour without a proved
+// activation) and activates with the no-prover activateNotesOnChain, which
+// anyone may then call, and the siblings the indexer serves.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -71,13 +73,17 @@ export const TIMING = Object.freeze({
 // Skipping a challenge period moves only block time; the daemons' and
 // clients' clocks stay on the wall clock. The chain starts this far behind
 // it, so that block time and the wall clock meet when the bounded pause ends
-// (two skipped periods), before the missed-defeat drill: the challenger
+// (after the on-chain activation drill skips the fallback's delay and the
+// pause drill two periods), before the missed-defeat drill: the challenger
 // counts a miss only for server evidence written (wall clock) before the
 // escape's deadline (block time). From there block time runs at most one
 // challenge period ahead, well within the 3 h validity of every exit proof
 // (which clients bound by the wall clock); an SDK judging a deadline then
 // gets its device clock moved to block time.
-const CHAIN_LAG_SECONDS = 2 * TIMING.challengePeriod;
+// The vault's ACTIVATION_FALLBACK_DELAY: activateNotesOnChain opens this
+// long after the latest proved activation.
+const ACTIVATION_FALLBACK_DELAY_SECONDS = 3_600;
+const CHAIN_LAG_SECONDS = ACTIVATION_FALLBACK_DELAY_SECONDS + 2 * TIMING.challengePeriod;
 const MAX_CHAIN_LEAD_SECONDS = 2 * TIMING.challengePeriod;
 const INDEXER_CONFIRMATIONS = 2;
 // Challenger fee policy: the daemon proposes both EIP-1559 fees within these
@@ -343,6 +349,8 @@ export function trustedDeployment(finalized, services) {
     assert.equal(finalized.vaultRevision, 4, 'profiles are for a revision-4 vault');
     assert.equal(finalized.concessionEscapeVersion, 1);
     assert.equal(finalized.noteBoundExitVersion, 1, 'the vault has no note-bound exits (NOTE_BOUND_EXIT_VERSION)');
+    assert.ok(typeof finalized.activator === 'string' && /^0x[0-9a-fA-F]{40}$/.test(finalized.activator) && BigInt(finalized.activator) !== 0n,
+        'the finalized manifest names no activator (the vault predates its activator role)');
     const key = (x, y) => ({ x: felt(x), y: felt(y) });
     return {
         deployment_status: 'deployed',
@@ -374,6 +382,10 @@ export function trustedDeployment(finalized, services) {
         insertion1_vk_keccak256: finalized.insertion1VkKeccak256,
         insertion4_vk_keccak256: finalized.insertion4VkKeccak256,
         insertion16_vk_keccak256: finalized.insertion16VkKeccak256,
+        // The vault's activator, the only address that may call activateNotes
+        // (the activation worker's sender): the deployment's, until the owner
+        // replaces it with setActivator and the profile names the new one.
+        activator: finalized.activator.toLowerCase(),
         vault_runtime_codehash: finalized.vaultRuntimeCodehash,
         proof_adapter_address: finalized.proofAdapter.toLowerCase(),
         adapter_runtime_codehash: finalized.adapterRuntimeCodehash,
@@ -825,6 +837,9 @@ async function main() {
         const deployEnv = {
             ...toolEnv(), FOUNDRY_BROADCAST: broadcastDir,
             PRIVATE_KEY: ANVIL_KEYS[0], OWNER: owner, TREASURY: treasury, CHAIN_ID: String(CHAIN_ID),
+            // The only address the vault takes activateNotes from: the
+            // activation worker's sender.
+            ACTIVATOR: account.activator,
             OUTPUT_PATH: path.join(deployDir, 'deployment.json'), SETUP_MANIFEST: path.join(SETUP_DIR, 'manifest.json'),
             STATE_SIGNING_KEY_X: signingKeys.state_signing_key.x, STATE_SIGNING_KEY_Y: signingKeys.state_signing_key.y,
             CLEARANCE_SIGNING_KEY_X: signingKeys.clearance_signing_key.x, CLEARANCE_SIGNING_KEY_Y: signingKeys.clearance_signing_key.y,
@@ -901,9 +916,15 @@ async function main() {
         assert.equal(await vaultRead('challengePeriod'), BigInt(TIMING.challengePeriod));
         assert.equal(await vaultRead('maxPauseDuration'), BigInt(TIMING.maxPauseDuration));
         assert.equal((await vaultRead('owner')).toLowerCase(), owner.toLowerCase());
+        assert.equal((await vaultRead('activator')).toLowerCase(), account.activator.toLowerCase(), 'the worker\'s sender is the vault\'s activator');
+        assert.equal(finalized.activator.toLowerCase(), account.activator.toLowerCase(), 'the manifest records the activator');
+        assert.equal(await vaultRead('ACTIVATION_FALLBACK_DELAY'), BigInt(ACTIVATION_FALLBACK_DELAY_SECONDS));
+        const fallbackOpensAt = Number(await vaultRead('activationFallbackOpensAt'));
+        assert.ok(fallbackOpensAt > await chainNow(), 'the on-chain fallback is closed for an hour after the deployment');
         evidence.deployment = { script: 'demo/contracts/script/Deploy.s.sol', finalized_by: 'scripts/expected-codehashes.mjs --finalize',
             vault: vaultAddress, deploy_block: deployBlock, deploy_block_lower_bound: pending.deployBlockLowerBound,
             setup_id: finalized.setupId, allow_dev_setup: finalized.allowDevSetup, circuit_id: finalized.circuitId,
+            activator: finalized.activator.toLowerCase(), activation_fallback_opens_at: fallbackOpensAt,
             codehashes: { vault: finalized.vaultRuntimeCodehash, adapter: finalized.adapterRuntimeCodehash,
                 poseidon: finalized.poseidonRuntimeCodehash, entry_point: finalized.entryPointRuntimeCodehash,
                 sender_creator: finalized.senderCreatorRuntimeCodehash, paymaster: finalized.paymasterRuntimeCodehash,
@@ -1006,6 +1027,7 @@ async function main() {
         assert.deepEqual(trusted.state_signing_key, { x: felt(signingKeys.state_signing_key.x), y: felt(signingKeys.state_signing_key.y) });
         assert.equal(trusted.gasless?.bundler_url, bundler.url, 'every profile names the operator\'s bundler');
         assert.equal(trusted.gasless.policy.escapes_enabled, true, 'the drill sponsors escape initiations');
+        assert.equal(trusted.activator, account.activator.toLowerCase(), 'the profile names the worker\'s sender as the activator');
         const manifestPath = path.join(runDir, 'trusted-deployment.json');
         await save('trusted-deployment.json', { trusted_deployment: trusted });
 
@@ -1056,7 +1078,8 @@ async function main() {
             await synchronizedTree();
             return recordActivations();
         }
-        // The no-prover fallback anyone can use: activates the recorded notes up
+        // The no-prover fallback anyone can use once it opens (an hour after the
+        // latest proved activation): activates the recorded notes up
         // to `noteId` with activateNotesOnChain from a third party, in the batch
         // sizes the worker picks (the largest of 16, 4 and 1 that the cursor is
         // aligned to and the recorded notes fill), with the siblings of the
@@ -1158,8 +1181,9 @@ async function main() {
         assert.equal(challengerReady.schema, 'zkapi-challenged-status/v2');
         const challengerStatus = () => get(`${challengerStatusUrl}/status`);
 
-        // The activation worker, from an Anvil account of its own (Anvil signs
-        // for it; the signer sidecar signs only the challenger's calls). Every
+        // The activation worker, from an Anvil account of its own, the vault's
+        // activator (Anvil signs for it; the signer sidecar signs only the
+        // challenger's calls). Every
         // call it sends passes this recorder, which requires a proved
         // activateNotes to the vault within the fee caps.
         const activationSends = [];
@@ -1521,14 +1545,33 @@ async function main() {
         });
         stopAfter('honest');
 
-        await scenario('activation without the worker: a third party activates a note with activateNotesOnChain and the indexer\'s siblings; the restarted worker resumes from the chain', async () => {
+        await scenario('activation without the worker: a third party\'s proof is refused (only the activator proves); after an hour without a proved activation it activates a note with activateNotesOnChain and the indexer\'s siblings; the restarted worker resumes from the chain', async () => {
             await stopActivator();
             const client = await wallet('on-chain-activation');
             const note = await driverDeposit(client, { activate: false });
             assert.equal(await vaultRead('isActivated', [note.noteId]), false);
+            // A proved batch from anyone but the activator is refused before
+            // its proof is looked at; the activator's own reaches the proof.
+            const cursor = Number(await vaultRead('activationCursor'));
+            const proved = vault.encodeFunctionData('activateNotes', [cursor, 1, await vaultRead('currentRoot'), 0n, `0x${'00'.repeat(256)}`]);
+            const refusals = { proved_by_third_party: await revertName(proved, account.thirdParty),
+                proved_by_activator: await revertName(proved, account.activator) };
+            assert.equal(refusals.proved_by_third_party, 'NotActivator');
+            assert.notEqual(refusals.proved_by_activator, 'NotActivator', 'the activator\'s call reaches the proof check');
+            // The worker's latest proved activation keeps the fallback closed
+            // for an hour (checked before the range and the siblings).
+            const opensAt = Number(await vaultRead('activationFallbackOpensAt'));
+            assert.ok(opensAt > await chainNow(), 'a proved activation closed the fallback');
+            refusals.on_chain_before_the_delay = await revertName(vault.encodeFunctionData('activateNotesOnChain', [cursor, 1, Array(32).fill(0n)]));
+            assert.equal(refusals.on_chain_before_the_delay, 'ActivationFallbackClosed');
+            // The chain started this much further behind the wall clock
+            // (CHAIN_LAG_SECONDS), so every later drill keeps its timing.
+            const opened = await skipChain(ACTIVATION_FALLBACK_DELAY_SECONDS, 'the on-chain activation fallback\'s delay');
+            assert.ok(opened >= opensAt, 'the fallback is open');
             const batches = await activateOnChain(note.noteId);
             assert.ok(batches.some(batch => !batch.proved && batch.first_note_id <= note.noteId && note.noteId < batch.first_note_id + batch.count),
                 `an unproved batch activated the note: ${json(batches)}`);
+            assert.equal(Number(await vaultRead('activationFallbackOpensAt')), opensAt, 'an on-chain activation leaves the fallback open');
             const served = await honestRequest(client, note.noteId, 'on-chain-activation');
             const close = await driverMutualClose(client, note.noteId);
             assert.equal(eventOf(close.receipt, 'MutualClose').args.finalBalance, BigInt(DEPOSIT - INFERENCE_CHARGE));
@@ -1539,7 +1582,8 @@ async function main() {
                 return status.queue?.pending_notes === 0 && status.queue?.activation_cursor === note.noteId + 1 && status;
             }, 60_000, 500);
             assert.equal(activationSends.length, sendsBefore, 'the worker sent nothing for notes activated without it');
-            return { note_id: note.noteId, on_chain_batches: batches, request: served.id, close: close.receipt.transactionHash,
+            return { note_id: note.noteId, refusals, fallback: { opens_at: opensAt, opened_at_block_time: opened },
+                on_chain_batches: batches, request: served.id, close: close.receipt.transactionHash,
                 worker_after_restart: { state: idle.state, activation_cursor: idle.queue.activation_cursor, started: resumed.started_at } };
         });
         stopAfter('activation-fallback');

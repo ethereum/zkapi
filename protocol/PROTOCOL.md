@@ -89,7 +89,7 @@ into the smart contract.
 
 4. The contract records the note: its commitment $C$, deposit amount $D$ and expiry $T_{\text{exp}}$ at the next note ID. The note can exit at once.
 
-5. **Activation.** Recorded notes are appended, in deposit order, to the on-chain request tree, whose leaf at the note ID is the full note leaf $L = H_{\text{leaf}}(\text{noteId}, C, D, T_{\text{exp}})$: in aligned batches of 1, 4 or 16 notes, either with a proof $\pi_{\text{ins}}$ that the batch's empty subtree under the old root becomes the subtree of exactly the recorded leaves under the new root, or hashed on chain from the batch's siblings. Anyone may activate; the operator does it in batches. A note can make requests only once it is activated.
+5. **Activation.** Recorded notes are appended, in deposit order, to the on-chain request tree, whose leaf at the note ID is the full note leaf $L = H_{\text{leaf}}(\text{noteId}, C, D, T_{\text{exp}})$: in aligned batches of 1, 4 or 16 notes, either with a proof $\pi_{\text{ins}}$ that the batch's empty subtree under the old root becomes the subtree of exactly the recorded leaves under the new root, or hashed on chain from the batch's siblings. Only the operator's activator, an address the contract's owner sets, may submit a proved batch: the insertion proving keys are public, and a stranger's proof of a single note landing ahead of the operator's batch would break its alignment and cost the operator extra, smaller batches. Anyone may activate on chain once an hour has passed since the latest proved activation (or the deployment, or an unpause), so activation never depends on the operator. A note can make requests only once it is activated.
 
 ## Request Generation
 

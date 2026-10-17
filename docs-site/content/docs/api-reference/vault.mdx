@@ -6,8 +6,9 @@ description: Native ETH settlement with note-bound Groth16 verification and the 
 The wallet calls `ZkApiVault` for native ETH deposits and withdrawals. It
 accounts in whole gwei, with maximum amount `2^53 - 1`. The vault pins its
 Groth16 proof adapter, state-signing key, clearance-signing key, challenge
-period, note lifetime and maximum pause as immutable constructor parameters
-(11 in all). It has no upgrade path.
+period, note lifetime and maximum pause as immutable constructor parameters;
+its twelfth and last parameter, the activator, is the one address that may
+prove activations, which the owner can replace. It has no upgrade path.
 
 This page describes vault revision 4 (`CONCESSION_ESCAPE_VERSION() == 1`,
 `NOTE_BOUND_EXIT_VERSION() == 1`), circuit `zkapi-v2-concession-v2`, which
@@ -52,14 +53,14 @@ bucket. The wallet confirms its note from the receipt's `NoteDeposited` and
 | Field | Value |
 |---|---|
 | Method | `activateNotes(uint32 firstNoteId, uint256 count, uint256 expectedRoot, uint256 newRoot, bytes proof)` (`0xa2b2c715`) |
-| Caller | Anyone, while not paused; the operator's activation worker |
-| Effect | Verifies an insertion proof of size `count` through the adapter's `assertValidInsertion`, against inputs the vault builds from its own state; sets `currentRoot` to `newRoot`, advances `activationCursor` by `count`, and emits `NotesActivated(firstNoteId, count, newRoot, true)` |
+| Caller | Only `activator()` (else `NotActivator()`, checked first), while not paused: the operator's activation worker |
+| Effect | Verifies an insertion proof of size `count` through the adapter's `assertValidInsertion`, against inputs the vault builds from its own state; sets `currentRoot` to `newRoot`, advances `activationCursor` by `count`, sets `activationFallbackOpensAt` to now + `ACTIVATION_FALLBACK_DELAY`, and emits `NotesActivated(firstNoteId, count, newRoot, true)` |
 
 | Field | Value |
 |---|---|
 | Method | `activateNotesOnChain(uint32 firstNoteId, uint256 count, uint256[32] siblings)` (`0x027e21e9`) |
-| Caller | Anyone, while not paused; the no-prover fallback |
-| Effect | Hashes the batch's leaves, its subtree and the path above it on chain, from `siblings`, the 32 siblings of slot `firstNoteId` at `currentRoot` (entries below the batch's height are ignored); then as above, with `proved = false` |
+| Caller | Anyone, while not paused, from `activationFallbackOpensAt()` on (else `ActivationFallbackClosed()`, checked first); the no-prover fallback |
+| Effect | Hashes the batch's leaves, its subtree and the path above it on chain, from `siblings`, the 32 siblings of slot `firstNoteId` at `currentRoot` (entries below the batch's height are ignored); then as above, with `proved = false` and `activationFallbackOpensAt` unchanged |
 
 Both take the next `count` recorded notes, `count` 1, 4 or 16, as one aligned
 subtree: `firstNoteId` must be `activationCursor()` (else
@@ -73,6 +74,16 @@ with each note's commitment `C_j` and packed amount and expiry
 neither skip, reorder nor alter a recorded note; a proof that does not verify
 reverts `InvalidProof()`. `activateNotesOnChain` reverts `StaleRoot()` when
 the siblings do not reproduce `currentRoot`.
+
+The fallback opens `ACTIVATION_FALLBACK_DELAY` (1 hour) after the latest
+proved activation, the deployment or the latest unpause, whichever is last,
+and stays open until the next proved activation. Batches must be aligned and
+the insertion proving keys are public, so while the activator proves nobody
+else may activate: a stranger's proved singleton (about 276,000 gas) or
+on-chain activation landing just ahead of a batch of 16 would force the other
+15 notes through batches of 1 and 4, more than 1.2M gas of extra activations
+for the operator. If the activator stops, anyone can activate an hour later.
+Exits never depend on activation.
 
 Activation appends each note's original leaf whatever its status: a note that
 closed before its activation still gets its leaf, and its status does not
@@ -251,7 +262,8 @@ revert `StaleRoot()`: an activation or another retirement changes the root.
 | Method | Caller | Effect |
 |---|---|---|
 | `pause()` | Owner, while not paused, at least `PAUSE_COOLDOWN` (1 day) after the latest unpause (else `PauseCooldown()`) | Blocks `deposit`, `activateNotes`, `activateNotesOnChain`, `claimExpired`, `setTreasury`, `acceptTreasury`, `withdrawTreasuryArrears` and `renounceOwnership`; blocks `mutualClose` and `initiateEscapeWithdrawal` until `pausedAt() + maxPauseDuration()`; emits `Paused(account)` |
-| `unpause()` | Owner, while paused (else `NotPaused()`) | Adds the pause to `totalPausedDuration`, sets `lastUnpausedAt`, and emits `Unpaused(account)` |
+| `unpause()` | Owner, while paused (else `NotPaused()`) | Adds the pause to `totalPausedDuration`, sets `lastUnpausedAt`, sets `activationFallbackOpensAt` to now + `ACTIVATION_FALLBACK_DELAY` (the activator gets the full delay before anyone else may activate), and emits `Unpaused(account)` |
+| `setActivator(address)` | Owner, at any time | Replaces `activator()` with a nonzero address (else `Unauthorized()`), leaving `activationFallbackOpensAt` alone; emits `ActivatorChanged(previousActivator, newActivator)` |
 | `setTreasury(address)` | Owner, while not paused | Schedules a nonzero `pendingTreasury` other than the vault, ready at `pendingTreasuryReadyAt`; emits `TreasuryChangeScheduled(newTreasury, readyAt)` |
 | `acceptTreasury()` | Owner, while not paused | Applies the scheduled treasury once ready; emits `TreasurySet(newTreasury)` |
 | `cancelTreasuryChange()` | Owner, at any time | Clears the scheduled change; emits `TreasuryChangeCancelled(cancelledTreasury)` |
@@ -262,8 +274,10 @@ revert `StaleRoot()`: an activation or another retirement changes the root.
 
 A pause blocks new escapes and closes for at most `maxPauseDuration`, which
 the constructor requires to be at least twice `challengePeriod`. Defeats,
-raises, finalizations, payout claims, leaf retirements, `cancelTreasuryChange`
-and ownership transfers stay open while paused, so escapes in flight resolve.
+raises, finalizations, payout claims, leaf retirements, `cancelTreasuryChange`,
+`setActivator` and ownership transfers stay open while paused, so escapes in
+flight resolve and a lost or compromised activation key can be replaced at
+once.
 `readyAt` and `pendingTreasuryReadyAt` count on the vault's active clock (wall
 clock minus all paused time), so a change waits `treasuryChangeDelay` of
 unpaused time. `acceptTreasury()` reverts `NoPendingTreasuryChange()` without
@@ -293,6 +307,9 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `nextNoteId()` | `0x7a2043a3` | The ID the next deposit records |
 | `activationCursor()` | `0x93e0ce4e` | Notes below it are activated; notes from it to `nextNoteId() - 1` are recorded and wait |
 | `isActivated(uint32)` | `0x5b78fd86` | `noteId < activationCursor()`: whether the note can make requests (it can exit either way) |
+| `activator()` | `0x4ecea992` | The only address `activateNotes` accepts: the operator's activation worker's sender |
+| `activationFallbackOpensAt()` | `0x3a02aa08` | Time from which anyone may call `activateNotesOnChain`: `ACTIVATION_FALLBACK_DELAY` after the latest proved activation, the deployment or the latest unpause |
+| `ACTIVATION_FALLBACK_DELAY()` | `0x4c81d3cd` | `3600` |
 | `notes(uint32)` | `0x9f18e4ed` | `commitment, depositAmount, expiryTs, status` (0 none, 1 active, 2 pending withdrawal, 3 closed); a recorded note is active whether or not it is activated |
 | `pendingWithdrawals(uint32)` | `0xa2f9f1ce` | `exists, withdrawalNullifier, finalBalance, destination, challengeDeadline`; `finalBalance` is the current payout |
 | `pendingConcessions(uint32)` | `0xf8ffe6e0` | `nextNullifier, stateBalance, conceded` |
@@ -338,6 +355,8 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `NoteNotActivated()` | `0x3d0439b5` | `retireClosedLeaf` for a note that is not activated yet |
 | `StaleActivation()` | `0x9c9413a1` | An activation's `firstNoteId` is not `activationCursor()` or its `expectedRoot` not `currentRoot()`; rebuild it from fresh state |
 | `InvalidActivation()` | `0xe72f8984` | An activation's `count` is not 1, 4 or 16, its `firstNoteId` is not aligned to it, or it names notes not recorded yet |
+| `NotActivator()` | `0xb2df0af0` | `activateNotes` from an address other than `activator()` |
+| `ActivationFallbackClosed()` | `0x67df368d` | `activateNotesOnChain` before `activationFallbackOpensAt()`: a proved activation, the deployment or an unpause happened less than an hour ago |
 | `StaleRoot()` | `0x607447de` | The siblings of `activateNotesOnChain` or of a retirement do not reproduce the current root |
 | `InvalidDeploymentBinding()` | `0x9722445b` | Another protocol version, chain, vault or key, or an invalid `nextNullifier` |
 | `InvalidProof()` | `0x09bde339` | The Groth16 proof does not verify |
@@ -358,6 +377,7 @@ that deferral by limiting gas; the whole transaction reverts instead.
 |---|---|
 | `NoteDeposited(uint32,bytes32,uint128,uint64)` | `0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36` (`noteId` and `commitment` indexed; `amount, expiryTs`) |
 | `NotesActivated(uint32,uint32,uint256,bool)` | `0x2c5604373c15ade06913903b9f6fffb2f3b0a029d20dac56a6eeb7d8b1c11144` (`firstNoteId` indexed; `count, newRoot, proved`) |
+| `ActivatorChanged(address,address)` | `0xbd0aa56c02389240616a23c1d092ae6238c0e2847610bc4d302628e56cfee2e4` (`previousActivator` and `newActivator` indexed; from the zero address at deployment) |
 | `MutualClose(uint32,uint256,uint128,address)` | `0x1f43fa4711ca18e1d26398f26bf598bd3a62992cdd0e84f055f2bb506e9d7031` |
 | `EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)` | `0xb0d1eb7131bcf3c6dd53517f6fa90bf7cc94178eb0eb5e0a1f204abe3b839cdf` (the last word is the current root, which an escape does not change) |
 | `EscapeConcessionRecorded(uint32,uint256,uint128,uint128)` | `0x2254ee827bce198564720fe77733ebfab1a49361cd4f050f107445241b560b4d` (`nextNullifier, stateBalance, conceded`) |
@@ -382,12 +402,12 @@ that deferral by limiting gas; the whole transaction reverts instead.
 
 Measured transaction gas (21,000, calldata and execution, with cold
 contracts) with the development setup and the CI-pinned Forge: escape
-481,688; defeat 357,330; raise 319,928; mutual close 395,591; finalization
-80,412; expiry claim 72,747; `activateNotes` 270,403 for 1 note, 332,701 for
-4 and 589,430 for 16 (about 36,800 per note); `activateNotesOnChain` 1,654,441
-for 1 note, 1,888,530 for 4 and 3,075,015 for 16. A deposit costs about
-77,100 gas on Anvil once the vault holds notes. The runtime code is 20,260
-bytes.
+481,776; defeat 357,418; raise 320,016; mutual close 395,657; finalization
+80,500; expiry claim 72,835; `activateNotes` 275,635 for 1 note, 337,933 for
+4 and 594,662 for 16 (about 37,200 per note), its write of
+`activationFallbackOpensAt` included; `activateNotesOnChain` 1,656,574 for 1
+note, 1,890,663 for 4 and 3,077,148 for 16. A deposit costs about 77,200 gas
+on Anvil once the vault holds notes. The runtime code is 20,940 bytes.
 
 ## Deployment compatibility
 
@@ -399,8 +419,8 @@ vault's adapter, keys and parameters are immutable. The server, frontend,
 deployment manifest and proof assets must match these deployed values, and
 clients pin the runtime code hashes of the vault, adapter and Poseidon library
 and check them on chain. `Deploy.s.sol` requires an explicit `OWNER`,
-`TREASURY`, setup manifest and `MAX_PAUSE_DURATION_SECONDS` outside local
-chains, deploys a single-party setup there only with `ALLOW_DEV_SETUP=1`
-(mainnet included), and writes a provisional
-manifest that `scripts/expected-codehashes.mjs --finalize` checks on chain
-before it records the deployment.
+`TREASURY`, `ACTIVATOR` (the activation worker's sender), setup manifest and
+`MAX_PAUSE_DURATION_SECONDS` outside local chains, deploys a single-party
+setup there only with `ALLOW_DEV_SETUP=1` (mainnet included), and writes a
+provisional manifest that `scripts/expected-codehashes.mjs --finalize`
+checks on chain before it records the deployment.

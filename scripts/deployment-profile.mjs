@@ -18,10 +18,13 @@
 //   (zkapi-clientd/internal/zkapi/deployments/<network>.json) under clientd's
 //   own field names.
 //
-// It refuses a pending or simulated manifest, a missing or legacy
-// deployment ID, and a setup whose verifying keys are not the vault's; it
-// writes the signing-key coordinates (decimal strings in the manifest) as
-// 0x hex, as every consumer parses them. A manifest deployed with the gasless
+// It refuses a pending or simulated manifest, one without the vault's
+// activator, a missing or legacy deployment ID, and a setup whose verifying
+// keys are not the vault's; it writes the signing-key coordinates (decimal
+// strings in the manifest) as 0x hex, as every consumer parses them. The
+// trusted and sdk profiles carry the activator the vault was deployed with
+// (`activator`, the activation worker's sender); clientd's does not,
+// as clients never activate. A manifest deployed with the gasless
 // withdrawal paymaster gives every profile its `gasless` object (the pins,
 // the creation code, the gas policy and `bundler_url`, the operator's bundler
 // from --bundler-url, null when none is published); one deployed with

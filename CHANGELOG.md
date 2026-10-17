@@ -33,7 +33,10 @@ Folded into 0.2.0's notes at release.
   environment holds a variable of the other profile's prefix
   (`ZKAPI_ACTIVATION_` for a challenge signer, `ZKAPI_CHALLENGE_` for an
   activation signer). `GET /health`, `zkapi_signerStatus` and the startup
-  line report `profile` (an activation signer omits the retirement fields).
+  line report `profile` (an activation signer omits the retirement fields;
+  its `zkapi_signerStatus` and startup line add the vault's `activator`, and
+  its status warns `sender_not_activator` while that is not its sender, or
+  `activator_unreadable` while the read fails).
   `docker/aws/compose.yml` adds, under the Compose profile `activation`, the
   services `activator` (the launcher's new `zkapi-run activator` role, which
   runs `zkapi-activated` with `deployment.env` and `activation.env`) and
@@ -57,15 +60,15 @@ Folded into 0.2.0's notes at release.
 - **Note-bound exits and a request tree updated by proved batches (design C:
   vault revision 4, circuit `zkapi-v2-concession-v2`, every setup
   regenerated).** Measured with CI's pinned Forge against revision 3:
-  `deposit` ~1,000,000 gas → 77,140 (on Anvil, in steady state: it only
-  records the note); `mutualClose` 387,321 → 395,591;
-  `initiateEscapeWithdrawal` 495,463 → 481,688; `retireClosedLeaf`
-  1,648,631 (newly pinned; the challenger's gas limit, its estimate plus 20%,
+  `deposit` ~1,000,000 gas → 77,206 (on Anvil, in steady state: it only
+  records the note); `mutualClose` 387,321 → 395,657;
+  `initiateEscapeWithdrawal` 495,463 → 481,776; `retireClosedLeaf`
+  1,648,719 (newly pinned; the challenger's gas limit, its estimate plus 20%,
   is about 2.0M, not the 7.2M the operator docs gave);
-  `activateNotes` 270,403 (1 note), 332,701 (4 notes), 589,430 (16 notes),
-  that is about 36,839 per note at 16 (end to end on Anvil, intrinsic gas and
-  calldata included, about 276,800, 343,200 and 599,900);
-  `activateNotesOnChain` 1,654,441 (1 note); the paymaster's floors
+  `activateNotes` 275,635 (1 note), 337,933 (4 notes), 594,662 (16 notes),
+  that is about 37,166 per note at 16 (end to end on Anvil, intrinsic gas
+  and calldata included, about 286,100, 348,400 and 605,200);
+  `activateNotesOnChain` 1,656,574 (1 note); the paymaster's floors
   `callFloor` 550,000 for a close (escape, finalization and forward
   unchanged) and `pmVerificationFloor` 410,000 (the profile defaults and
   `finalizeReserveGas`, now 1,000,000, follow). What changed:
@@ -91,11 +94,39 @@ Folded into 0.2.0's notes at release.
     `isActivated(noteId)`, `NOTE_BOUND_EXIT_VERSION()` (1), the errors
     `StaleActivation()`, `InvalidActivation()` and `NoteNotActivated()`.
     Activations are paused with deposits.
+  - Only the vault's activator proves batches: `activateNotes` reverts
+    `NotActivator()` (`0xb2df0af0`) for any other sender while the vault is
+    unpaused, before any other check (the range, the root, the proof). The
+    activator is the constructor's new 12th and last argument (nonzero),
+    read with `activator()` (`0x4ecea992`) and replaced by the owner with
+    `setActivator(address)` (`0x7c0cc0be`, open while paused); both emit
+    `ActivatorChanged(previousActivator, newActivator)` (topic
+    `0xbd0aa56c02389240616a23c1d092ae6238c0e2847610bc4d302628e56cfee2e4`, from
+    `address(0)` at deployment). `activateNotesOnChain` stays open to anyone,
+    but only from `activationFallbackOpensAt()` (`0x3a02aa08`):
+    `ACTIVATION_FALLBACK_DELAY()` (`0x4c81d3cd`, 1 hour) after the latest
+    proved activation, the deployment or the latest unpause. Before then it
+    reverts `ActivationFallbackClosed()` (`0x67df368d`), checked first;
+    on-chain activations do not move the opening. Why: batches must be
+    aligned and the insertion proving keys are public, so anyone could land
+    a proved singleton (about 276,000 gas) just ahead of the worker's batch
+    of 16 and force more than 1.2M gas of smaller, realigning batches on the
+    operator, and an early `activateNotesOnChain` (about 1.66M) would do
+    the same. Funds are never at risk: exits do not depend on activation.
+    If the worker stops, anyone can activate an hour after its last proved
+    batch. Gas, against the same vault without these rules: a proved
+    activation reads the activator and writes `activationFallbackOpensAt`
+    in the same slot, 5,232 gas more; an on-chain activation 2,133 more
+    for its check; an escape's initiation, defeat, raise and finalization,
+    an expiry claim and a retirement 88 more, and a mutual close and a
+    deposit 66 more, for the larger dispatch. The runtime code is 20,940
+    bytes (20,260 without them).
   - The operator runs an activation worker, the new `zkapi-activated` binary
     of zkapi-serverd, that proves the batches: the largest size the recorded
     notes fill at an aligned cursor, after a bounded wait for a fuller one
     (`--max-activation-wait-seconds`, 30 by default), sent from a dedicated
-    sender with a signer of its own
+    sender with a signer of its own, the vault's activator; while it is
+    not, the worker sends nothing (`not_activator`)
     ([activation worker](docs/activation-worker.md)).
     Requests are unchanged (12 inputs, the exact current root) and need an
     activated note: the SDK, the companion and zkapi-clientd report
@@ -180,10 +211,23 @@ Folded into 0.2.0's notes at release.
   (`NoteBindingMismatch`, `0x41c6633b`, instead).
 - **Deposits make requests only once activated.** Run the activation worker,
   `zkapi-activated`, with its own sender, signer and insertion proving keys
-  (or activate with `activateNotesOnChain`), or no deposit ever becomes
-  request-capable; exits are unaffected. With Docker, start the Compose
-  profile `activation` (`activator` and `activation-signer`) with
-  `/etc/zkapi/activation.env` and `/etc/zkapi/activation-signer.env`.
+  (or, an hour after the last proved activation, activate with
+  `activateNotesOnChain`), or no deposit ever becomes request-capable; exits
+  are unaffected. With Docker, start the Compose profile `activation`
+  (`activator` and `activation-signer`) with `/etc/zkapi/activation.env` and
+  `/etc/zkapi/activation-signer.env`.
+- **The vault's activator.** `ZkApiVault`'s constructor takes a 12th and
+  last argument, the activator, and `Deploy.s.sol` a new variable
+  `ACTIVATOR`, required off local chains (the deployer by default on them):
+  the activation worker's sender, the address of the activation signer's
+  key. The deployment manifest records it (`activator`) and
+  `expected-codehashes.mjs --finalize` checks it on chain. Only the
+  activator may call `activateNotes`, so run the worker with `--sender` set
+  to it; the owner moves the role with `setActivator`, after which the
+  manifest must name the new activator before the worker starts
+  ([the activator](docs/activation-worker.md#the-activator)). Anyone else
+  activates only through `activateNotesOnChain`, from
+  `activationFallbackOpensAt()`.
 - **No deposit paths.** Clients no longer save a deposit-time path, the
   companion's `/oa/v1/deposit/path` is removed, its deposit plan drops
   `zero_path` and `active_root`, and its confirmation ignores

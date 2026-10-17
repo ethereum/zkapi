@@ -41,6 +41,7 @@ const DEPLOYMENT = Object.freeze({
   deployer: '0x000000000000000000000000000000000000f00d', deployer_nonce: 0,
   treasury: '0x000000000000000000000000000000000000beef', owner: '0x0000000000000000000000000000000000000d0d',
   note_ttl: 30 * 86_400, challenge_period: 86_400, request_charge_cap: 100_000, max_pause_duration: 7 * 86_400,
+  activator: '0x0000000000000000000000000000000000000acc',
 });
 const DEPOSITOR = '0x1111111111111111111111111111111111111111';
 const DEPOSIT_WEI = 1_000_000n * 1_000_000_000n;
@@ -195,11 +196,13 @@ async function deploy(rpc, golden) {
   assert.equal(BigInt(await rpc('eth_getTransactionCount', [d.deployer, 'latest'])), BigInt(d.deployer_nonce));
   const args = [addressWord(d.treasury), word(d.note_ttl), word(d.challenge_period), word(d.request_charge_cap),
     addressWord(adapter.contractAddress), word(d.state_signing_key.x), word(d.state_signing_key.y),
-    word(d.clearance_signing_key.x), word(d.clearance_signing_key.y), addressWord(d.owner), word(d.max_pause_duration)];
+    word(d.clearance_signing_key.x), word(d.clearance_signing_key.y), addressWord(d.owner), word(d.max_pause_duration),
+    addressWord(d.activator)];
   const vault = await send(rpc, { from: d.deployer,
     data: linked(artifact('ZkApiVault'), { 'src/libraries/Bn254Poseidon.sol:Bn254Poseidon': poseidon.contractAddress }) + args.join('') });
   assert.equal(vault.status, '0x1');
   assert.equal(vault.contractAddress.toLowerCase(), d.vault.toLowerCase(), 'the vault is at the address the proofs bind');
+  assert.equal(await rpc('eth_call', [{ to: d.vault, data: '0x4ecea992' }, 'latest']), `0x${addressWord(d.activator)}`, 'activator()');
   // The deposits, at the fixture's time (the notes record the bucketed expiry).
   await rpc('anvil_impersonateAccount', [golden.depositor]);
   await rpc('anvil_setBalance', [golden.depositor, hex(10n ** 20n)]);

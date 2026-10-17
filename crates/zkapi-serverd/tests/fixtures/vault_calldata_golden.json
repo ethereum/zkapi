@@ -12,6 +12,10 @@
     "claimExpired": "0xa940507e",
     "activateNotes": "0xa2b2c715",
     "activateNotesOnChain": "0x027e21e9",
+    "activator": "0x4ecea992",
+    "setActivator": "0x7c0cc0be",
+    "activationFallbackOpensAt": "0x3a02aa08",
+    "ACTIVATION_FALLBACK_DELAY": "0x4c81d3cd",
     "activationCursor": "0x93e0ce4e",
     "isActivated": "0x5b78fd86",
     "paused": "0x5c975abb",
@@ -40,7 +44,9 @@
     "INSERTION1_VK_HASH": "0x1c0bd503",
     "INSERTION4_VK_HASH": "0x85925b1a",
     "INSERTION16_VK_HASH": "0xc2b2d1a6",
-    "assertValidInsertion": "0x116aef96"
+    "assertValidInsertion": "0x116aef96",
+    "NotActivator": "0xb2df0af0",
+    "ActivationFallbackClosed": "0x67df368d"
   },
   "getter_words": {
     "pendingWithdrawals": 5,
@@ -58,6 +64,11 @@
       "topic0": "0x2c5604373c15ade06913903b9f6fffb2f3b0a029d20dac56a6eeb7d8b1c11144",
       "topics": "0x2c5604373c15ade06913903b9f6fffb2f3b0a029d20dac56a6eeb7d8b1c111440000000000000000000000000000000000000000000000000000000000000004",
       "data": "0x00000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000d0d0000000000000000000000000000000000000000000000000000000000000001"
+    },
+    "ActivatorChanged": {
+      "topic0": "0xbd0aa56c02389240616a23c1d092ae6238c0e2847610bc4d302628e56cfee2e4",
+      "topics": "0xbd0aa56c02389240616a23c1d092ae6238c0e2847610bc4d302628e56cfee2e400000000000000000000000022222222222222222222222222222222222222220000000000000000000000003333333333333333333333333333333333333333",
+      "data": "0x"
     },
     "MutualClose": {
       "topic0": "0x1f43fa4711ca18e1d26398f26bf598bd3a62992cdd0e84f055f2bb506e9d7031",

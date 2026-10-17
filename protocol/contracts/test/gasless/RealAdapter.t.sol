@@ -119,7 +119,8 @@ contract RealAdapterTest is GaslessTestBase {
             escape.clearanceSigningKeyX,
             escape.clearanceSigningKeyY,
             GOLDEN_OWNER,
-            7 days
+            7 days,
+            activator
         );
         assertEq(address(vault), escape.contractAddress, "golden vault");
         vm.deal(GOLDEN_USER, 10 ether);

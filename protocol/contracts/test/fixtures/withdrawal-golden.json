@@ -19,6 +19,7 @@
     "challenge_period": 86400,
     "request_charge_cap": 100000,
     "max_pause_duration": 604800,
+    "activator": "0x0000000000000000000000000000000000000acc",
     "state_signing_key": {
       "x": "0x2b8cfd91b905cae31d41e7dedf4a927ee3bc429aad7e344d59d2810d82876c32",
       "y": "0x2aaa6c24a758209e90aced1f10277b762a7c1115dbc0e16ac276fc2c671a861f"

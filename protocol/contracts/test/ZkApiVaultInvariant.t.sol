@@ -10,11 +10,13 @@ import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 import {MockProofAdapter} from "./mocks/MockProofAdapters.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
 
-/// @dev Drives a vault (mock adapter) through random deposits, proved and on-chain activations,
-///      escapes with concessions, raises, defeats, finalizations, closes, expiry claims, payout
-///      claims, retirements, pauses, time and attempts to exit Closed notes again, and keeps the
-///      ghost accounting and the ghost request tree the invariants check. Note n's states have
-///      nullifiers N(n, i) = 1 + n * 1000 + i; an escape from S_i names N(n, i + 1) as its successor.
+/// @dev Drives a vault (mock adapter) through random deposits, proved and on-chain activations
+///      (and refused ones: proofs from a non-activator, the fallback before it opens), escapes with
+///      concessions, raises, defeats, finalizations, closes, expiry claims, payout claims,
+///      retirements, pauses, time and attempts to exit Closed notes again, and keeps the ghost
+///      accounting and the ghost request tree the invariants check. The handler is the vault's
+///      owner and its activator. Note n's states have nullifiers N(n, i) = 1 + n * 1000 + i; an
+///      escape from S_i names N(n, i + 1) as its successor.
 contract VaultHandler is Test {
     uint256 constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465;
     uint32 public constant MAX_NOTES = 8;
@@ -35,8 +37,9 @@ contract VaultHandler is Test {
     uint256 public calls;
     /// Successful operations, by kind: deposit, escape, raise, defeat, finalize, close, claim
     /// expired, claim payout, retire, refused exits of a Closed note, proved activation, on-chain
-    /// activation, and refused stale activations or retirements of unactivated notes.
-    uint256[13] public done;
+    /// activation, refused stale activations or retirements of unactivated notes, refused
+    /// on-chain activations before the fallback opens, and refused proofs from a non-activator.
+    uint256[15] public done;
     /// Notes the handler activated: the ghost tree holds their recorded leaves, minus retired ones.
     uint32 public ghostCursor;
 
@@ -224,8 +227,10 @@ contract VaultHandler is Test {
 
     /// Activates the next 1, 4 or 16 recorded notes (by `countSeed`, among the aligned counts that
     /// fit), with a mock proof of the statement built from storage and the ghost tree's new root,
-    /// or on-chain with the ghost tree's path. Refused with Paused while paused.
-    function activate(uint256 countSeed, bool onChain) external {
+    /// or on-chain with the ghost tree's path, first waiting for the fallback to open if `wait`.
+    /// Refused with Paused while paused, and on-chain with ActivationFallbackClosed before
+    /// activationFallbackOpensAt.
+    function activate(uint256 countSeed, bool onChain, bool wait) external {
         uint32 first = vault.activationCursor();
         uint256 pending = vault.nextNoteId() - first;
         uint256[3] memory sizes = [uint256(1), 4, 16];
@@ -238,14 +243,37 @@ contract VaultHandler is Test {
         (uint256 newRoot,) = ghostTree(uint256(first) + count, 0);
         uint256[32] memory siblings = _path(first);
         if (!onChain) adapter.acceptInsertion(count, _insertionInputs(first, count, oldRoot, newRoot), "");
+        uint64 opensAt = vault.activationFallbackOpensAt();
+        if (onChain && wait && vm.getBlockTimestamp() < opensAt) vm.warp(opensAt);
         bool paused = vault.paused();
+        bool closed = onChain && vm.getBlockTimestamp() < opensAt;
         if (paused) vm.expectRevert(Errors.Paused.selector);
+        else if (closed) vm.expectRevert(Errors.ActivationFallbackClosed.selector);
         if (onChain) vault.activateNotesOnChain(first, count, siblings);
         else vault.activateNotes(first, count, oldRoot, newRoot, "");
         if (paused) return;
+        if (closed) {
+            ++done[13];
+            return;
+        }
         ghostCursor = uint32(first + count);
         assertEq(vault.currentRoot(), newRoot);
         ++done[onChain ? 11 : 10];
+    }
+
+    /// A proof of the next note's activation that the adapter accepts, from anyone but the
+    /// activator: NotActivator (Paused while paused).
+    function activateAsOther(uint8 callerSeed) external {
+        uint32 first = vault.activationCursor();
+        if (vault.nextNoteId() == first) return;
+        uint256 oldRoot = vault.currentRoot();
+        (uint256 newRoot,) = ghostTree(uint256(first) + 1, 0);
+        adapter.acceptInsertion(1, _insertionInputs(first, 1, oldRoot, newRoot), "");
+        bool paused = vault.paused();
+        vm.expectRevert(paused ? Errors.Paused.selector : Errors.NotActivator.selector);
+        vm.prank(destinations[callerSeed % destinations.length]);
+        vault.activateNotes(first, 1, oldRoot, newRoot, "");
+        if (!paused) ++done[14];
     }
 
     /// An activation prepared against another root (a competing activation or a retirement landed
@@ -433,10 +461,22 @@ contract ZkApiVaultInvariantTest is Test {
         treasury.setAccepting(true);
         ToggleableDestination wallet = new ToggleableDestination();
         vault = new ZkApiVault(
-            address(treasury), 30 days, 24 hours, 100_000, address(adapter), 11, 12, 13, 14, address(this), 7 days
+            address(treasury),
+            30 days,
+            24 hours,
+            100_000,
+            address(adapter),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            7 days,
+            address(this)
         );
         handler = new VaultHandler(vault, adapter, treasury, wallet);
-        // The handler is the owner, so it can pause and unpause.
+        // The handler is the activator, and the owner, so it can pause and unpause.
+        vault.setActivator(address(handler));
         vault.transferOwnership(address(handler));
         vm.prank(address(handler));
         vault.acceptOwnership();
@@ -448,12 +488,15 @@ contract ZkApiVaultInvariantTest is Test {
     }
 
     /// The handler does reach every activation path: a proved batch of four, an on-chain
-    /// singleton, a stale proved activation, the refused retirement of a Closed note not yet
+    /// singleton refused before the fallback opens and landing once it has, a proof from a
+    /// non-activator, a stale proved activation, the refused retirement of a Closed note not yet
     /// activated, a retirement and a tampered exit of a Closed note, and the invariants hold.
     function test_theHandlerReachesEveryActivationPath() public {
-        handler.activate(1, false);
+        handler.activate(1, false, false);
         handler.deposit(500_000);
-        handler.activate(0, true);
+        handler.activate(0, true, false);
+        handler.activateAsOther(0);
+        handler.activate(0, true, true);
         handler.deposit(600_000);
         handler.activateStale(7);
         handler.close(5, 0, 100_000, 0);
@@ -464,6 +507,8 @@ contract ZkApiVaultInvariantTest is Test {
         assertEq(handler.done(10), 1, "proved activation");
         assertEq(handler.done(11), 1, "on-chain activation");
         assertEq(handler.done(12), 2, "stale activation and unactivated retirement refused");
+        assertEq(handler.done(13), 1, "on-chain activation before the fallback opens refused");
+        assertEq(handler.done(14), 1, "proof from a non-activator refused");
         assertEq(handler.done(8), 1, "retirement");
         assertEq(handler.done(9), 1, "tampered exit of a closed note refused");
         assertEq(vault.activationCursor(), 5);

@@ -49,9 +49,11 @@ the note ID, so two notes with the same secret never share a nullifier.
 5. **Activation.** Recorded notes are appended in deposit order to the vault's
    depth-32 Poseidon request tree, as aligned batches of 1, 4 or 16 leaves `L`:
    with an insertion proof whose inputs the vault reads from its own records
-   (`activateNotes`), or hashed on chain without a proof by anyone
-   (`activateNotesOnChain`). The operator's activation worker proves the
-   batches, waiting a bounded time (30 seconds by default) for a fuller one.
+   (`activateNotes`, which the vault takes only from its activator), or
+   hashed on chain without a proof (`activateNotesOnChain`), which anyone may
+   do once an hour has passed since the latest proved activation. The
+   operator's activation worker is the activator and proves the batches,
+   waiting a bounded time (30 seconds by default) for a fuller one.
    The note can make requests once it is activated
    (`noteId < activationCursor()`); until then the wallet reports it as
    activating, with its queue position `noteId − activationCursor()`.
@@ -294,10 +296,11 @@ available while paused, and `transferOwnership` takes effect at once. See the
 
 ### Owner and operator powers
 
-One owner address controls the vault's pause switch and treasury. The proof
-adapter, signing keys, challenge period, note lifetime and maximum pause are
-immutable, and the vault has no upgrade path. The deployment script requires
-an explicit `OWNER` outside local chains; use a multisig or timelock.
+One owner address controls the vault's pause switch, treasury and activator.
+The proof adapter, signing keys, challenge period, note lifetime and maximum
+pause are immutable, and the vault has no upgrade path. The deployment script
+requires an explicit `OWNER` and `ACTIVATOR` outside local chains; use a
+multisig or timelock as the owner.
 
 - **Pause.** `pause()` stops deposits, activations, `claimExpired`,
   scheduling or accepting a treasury change, `withdrawTreasuryArrears` and
@@ -334,13 +337,25 @@ an explicit `OWNER` outside local chains; use a multisig or timelock.
   acceptance is a pre-signed `execTransaction` calling `acceptOwnership()`
   (see the [owner key rotation runbook](https://github.com/ethereum/zkapi/blob/main/docs/migration-concession-vault.md#owner-key-rotation)).
   `renounceOwnership` reverts while paused and clears any nomination.
+- **Activator.** Only `activator()`, the operator's activation worker, may
+  submit a proved activation (`activateNotes`). The insertion proving keys
+  are public and batches must be aligned, so a stranger's single-note proof
+  landing just ahead of a 16-note batch would otherwise force the operator
+  through extra, smaller batches; for the same reason `activateNotesOnChain`
+  opens only an hour after the latest proved activation, the deployment or an
+  unpause. `setActivator(address)` replaces the activator and works while
+  paused, so a lost or compromised worker key can be replaced at once. An
+  activator can only activate the recorded notes in order.
 
 The operator runs the API server, indexer, activation worker and challenge
 service. It signs every successor state and every clearance, so it can refuse
 service or a mutual close, but it cannot block an exit: an escape needs no
 operator call and no path. It can delay a note's activation, and so its first
-request, but anyone can activate with `activateNotesOnChain` at their own gas
-cost. The
+request: an hour after its latest proved activation anyone can activate with
+`activateNotesOnChain` at their own gas cost, but each proved activation
+closes that fallback for another hour, so an operator that proves rarely
+slows activation without stopping it. It can neither skip nor reorder a note,
+and it can refuse service anyway. The
 operator must keep its challenger running through every challenge window to
 be paid for service an escaping owner used. The server refuses to start unless
 its signing seeds derive the vault's immutable keys and are not the published

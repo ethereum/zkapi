@@ -47,6 +47,7 @@ contract ZkApiVaultPauseTest is Test {
     uint256 constant DOCUMENTED_PAYOUT_GAS = 100_000;
     address user = address(0x1234);
     address treasury = address(0x5678);
+    address activator = address(0xACC);
     ZkApiVault vault;
     uint256[32] emptySiblings;
 
@@ -68,7 +69,8 @@ contract ZkApiVaultPauseTest is Test {
             13,
             14,
             address(this),
-            MAX_PAUSE
+            MAX_PAUSE,
+            activator
         );
         vm.deal(user, 100 ether);
     }
@@ -461,7 +463,7 @@ contract ZkApiVaultPauseTest is Test {
 
     /// Activation is blocked for the whole pause (a recorded note cannot become request-capable
     /// while paused, though it can exit once exits reopen) and resumes after the unpause from
-    /// the same cursor and root.
+    /// the same cursor and root, on-chain once ACTIVATION_FALLBACK_DELAY has passed since it.
     function test_activationBlockedWhilePaused() public {
         uint32 first = _deposit(42);
         uint32 second = _deposit(43);
@@ -479,6 +481,8 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(vault.activationCursor(), 0);
         assertEq(vault.currentRoot(), root);
         vault.unpause();
+        vm.expectRevert(Errors.ActivationFallbackClosed.selector);
+        vault.activateNotesOnChain(first, 1, siblings);
         _activateOnChain();
         _activateOnChain();
         assertEq(vault.activationCursor(), 2);
@@ -689,12 +693,34 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(vault.treasuryChangeDelay(), vault.MIN_TREASURY_CHANGE_DELAY());
         assertEq(vault.unpauseClaimGrace(), 1 days);
         ZkApiVault slow = new ZkApiVault(
-            treasury, 30 days, 5 days, 100_000, address(new AcceptAllProofs()), 11, 12, 13, 14, address(this), 10 days
+            treasury,
+            30 days,
+            5 days,
+            100_000,
+            address(new AcceptAllProofs()),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            10 days,
+            activator
         );
         assertEq(slow.treasuryChangeDelay(), 5 days);
         assertEq(slow.unpauseClaimGrace(), 5 days);
         ZkApiVault fast = new ZkApiVault(
-            treasury, 30 days, 1 hours, 100_000, address(new AcceptAllProofs()), 11, 12, 13, 14, address(this), 2 hours
+            treasury,
+            30 days,
+            1 hours,
+            100_000,
+            address(new AcceptAllProofs()),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            2 hours,
+            activator
         );
         assertEq(fast.treasuryChangeDelay(), 2 days);
         assertEq(fast.unpauseClaimGrace(), 1 days);
@@ -897,7 +923,7 @@ contract ZkApiVaultPauseTest is Test {
     /// Every state-changing external function must be classified. Guarded ones revert Paused()
     /// for the whole pause; bounded ones (the exits) revert Paused() until pausedAt +
     /// maxPauseDuration and not after; exempt ones (in-flight escape resolution, credited payout
-    /// claims, leaf retirement and owner-recovery actions) stay open.
+    /// claims, leaf retirement, the activator's replacement and owner-recovery actions) stay open.
     function test_pauseGuardCoverage() public {
         string[9] memory guarded = [
             "deposit",
@@ -911,7 +937,7 @@ contract ZkApiVaultPauseTest is Test {
             "pause"
         ];
         string[2] memory bounded = ["initiateEscapeWithdrawal", "mutualClose"];
-        string[9] memory exempt = [
+        string[10] memory exempt = [
             "challengeEscapeWithdrawal",
             "raiseEscapeConcession",
             "finalizeEscapeWithdrawal",
@@ -919,6 +945,7 @@ contract ZkApiVaultPauseTest is Test {
             "retireClosedLeaf",
             "unpause",
             "cancelTreasuryChange",
+            "setActivator",
             "transferOwnership",
             "acceptOwnership"
         ];
@@ -1139,8 +1166,10 @@ contract ZkApiVaultPauseTest is Test {
     }
 
     /// Activates the next recorded note with the on-chain fallback (the vault's adapter accepts any
-    /// insertion proof, so a proved activation could set any root).
+    /// insertion proof, so a proved activation could set any root), once the fallback is open.
     function _activateOnChain() private {
+        uint64 opensAt = vault.activationFallbackOpensAt();
+        if (vm.getBlockTimestamp() < opensAt) vm.warp(opensAt);
         uint32 first = vault.activationCursor();
         uint256[32] memory siblings = _path(first);
         vault.activateNotesOnChain(first, 1, siblings);

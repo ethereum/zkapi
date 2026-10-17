@@ -31,7 +31,8 @@ service reads the server's append-only request evidence and the vault's
 pending escapes, and submits defeats, raises and leaf retirements through a
 restricted signer. The activation worker reads recorded notes from the vault
 and the activation cursor's siblings from the indexer, and submits proved
-`activateNotes` batches from a sender of its own.
+`activateNotes` batches from a sender of its own, the only one the vault
+accepts them from (its activator).
 
 ## Proof and field encoding
 

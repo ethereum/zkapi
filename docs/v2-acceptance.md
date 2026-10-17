@@ -88,9 +88,10 @@ any saved file contains one.
 
 Anvil runs with Sepolia's chain ID, 11155111, because the signer sidecar signs
 only for mainnet or Sepolia. `Deploy.s.sol` therefore treats it as a public
-chain. It requires `OWNER`, `TREASURY`, `SETUP_MANIFEST`,
-`MAX_PAUSE_DURATION_SECONDS` and `ALLOW_DEV_SETUP=1`, and it records
-`allowDevSetup: true`, exactly as for the Sepolia drill vault.
+chain. It requires `OWNER`, `TREASURY`, `ACTIVATOR` (the activation
+worker's Anvil account), `SETUP_MANIFEST`, `MAX_PAUSE_DURATION_SECONDS` and
+`ALLOW_DEV_SETUP=1`, and it records `allowDevSetup: true`, exactly as for the
+Sepolia drill vault.
 
 Before the deployment the harness etches the canonical EntryPoint v0.7.0
 (`0x0000000071727De22E5E9d8BAf0edAc6f37da032`) and its SenderCreator
@@ -126,8 +127,9 @@ with `evm_increaseTime`. Both daemons' startup checks hold for them
 
 A time skip moves only block time. The daemons and clients keep the wall
 clock, and clients bound exit proofs by it (valid for 3 hours). The chain
-therefore starts two challenge periods behind the wall clock, so that block
-time meets it when the bounded pause ends. That is just before the
+therefore starts the activation fallback's delay (an hour, which row 1b
+skips) plus two challenge periods behind the wall clock, so that block time
+meets it when the bounded pause ends. That is just before the
 missed-defeat drill: the challenger counts a miss only for evidence written
 (wall clock) before the escape's deadline (block time).
 
@@ -145,13 +147,13 @@ The daemons start in the production order: indexer, `zkapi db init`, signer,
 challenger, activation worker, serverd. The challenger and its signer are
 healthy before the first deposit.
 
-The activation worker runs from an Anvil account of its own, behind a
-recorder that requires every transaction it sends to be a proved
-`activateNotes` to the vault within its fee cap; it waits at most 2 seconds
-for a fuller batch. Before a note's first request the harness waits until the
-worker has activated every recorded note (so no activation moves the root
-under that request) and the indexer serves the new root. Each batch that
-lands is recorded (`activate_<K>`, or `activate_on_chain_<K>` without a
+The activation worker runs from an Anvil account of its own, the vault's
+activator, behind a recorder that requires every transaction it sends to be
+a proved `activateNotes` to the vault within its fee cap; it waits at most 2
+seconds for a fuller batch. Before a note's first request the harness waits
+until the worker has activated every recorded note (so no activation moves
+the root under that request) and the indexer serves the new root. Each batch
+that lands is recorded (`activate_<K>`, or `activate_on_chain_<K>` without a
 proof). Drills that show a note before its activation (4, 7, 18) stop the
 worker first and restart it from its checkpoint afterwards; row 1b activates
 with no worker at all.
@@ -166,7 +168,7 @@ Before the scenarios, serverd must refuse to start with:
 | # | Scenario (design §10.7 Phase B) | Client | What is asserted |
 | --- | --- | --- | --- |
 | 1 | Honest flow | wallet core | The deposit emits only `NoteDeposited` (no tree work), and the wallet checks it against `notes(noteId)`; the worker activates the note with a proved batch. Two requests settle at the measured charge and install (S1–S6). A kind-2 ownership proof reverts `WrongWithdrawalKind` as an escape or a close. The clearance reserves the nullifier. Every withdrawal statement names the stored note (input 3, the commitment, and input 16, amount and expiry); the close tampered at either reverts `NoteBindingMismatch`, and the 868-byte close lands. Payout `D − 800`, treasury 800, the wallet's balance equals the payout. |
-| 1b | Activation without the worker | wallet core | With the worker stopped, a deposit stays unactivated; a third party activates it with `activateNotesOnChain` and the siblings the indexer serves for the cursor's slot (`NotesActivated`, not proved). A request is served at the new root and the note closes. The restarted worker finds nothing to activate and sends nothing. |
+| 1b | Activation without the worker | wallet core | With the worker stopped, a deposit stays unactivated. A third party's `activateNotes` reverts `NotActivator` (the activator's own call gets past that check), and its `activateNotesOnChain` reverts `ActivationFallbackClosed` while the worker's last proved activation is under an hour old. After block time skips the hour, the third party activates the note with `activateNotesOnChain` and the siblings the indexer serves for the cursor's slot (`NotesActivated`, not proved), which leaves `activationFallbackOpensAt` unchanged. A request is served at the new root and the note closes. The restarted worker finds nothing to activate and sends nothing. |
 | 2 | Stale exit after spending, defeat, `SupersededState`, re-escape from an older state, defeat | wallet core | The operator serves the evidence at `S2⁺` and it verifies. The escape from `S2` is defeated through the signer with the request at `N3`. `S1` reverts `SupersededState`. `S0` is recorded and defeated with the request at `N1`. `S2` again reverts `ChallengedNullifier`. Defeats move no funds, and the newest state closes. |
 | 3 | Codehash-mismatch profile refuses deposits | SDK | `deposit` fails `deployment_mismatch` on `vault_runtime_codehash`, read through the wallet and the pinned RPC. Nothing is signed. |
 | 4 | Activation, then indexer down and an exit with no path | SDK | Deposit (deployment checks pass). Before the activation a chat waits for it (its bounded wait shortened to 3 s), then refuses with `note_not_activated` before proving anything; after the activation, request and settle. Another deposit is recorded (never activated), the indexer stops, and the SDK escapes (`E2.escape`, `c = 0`); the escape names the stored commitment and packed amount and expiry, and `pendingWithdrawals` has 5 words. The indexer restarts from its checkpoint. |
@@ -270,7 +272,7 @@ It also carries the committed Forge snapshot (`protocol/contracts/snapshots/conc
 | Component | Execution |
 | --- | --- |
 | Vault, adapter, Poseidon library | Actual contracts from `Deploy.s.sol` on Anvil, finalized and codehash-checked |
-| Activation | Actual `zkapi-activated`: proved single-note `activateNotes` batches with the dev setup's insertion1 key (it loads and pins all three insertion keys at startup), siblings from the indexer; row 1b's `activateNotesOnChain` from a third party |
+| Activation | Actual `zkapi-activated`, the vault's activator: proved single-note `activateNotes` batches with the dev setup's insertion1 key (it loads and pins all three insertion keys at startup), siblings from the indexer; row 1b's `activateNotesOnChain` from a third party, after the fallback's hour |
 | Proofs | Actual Groth16 proofs of the single-party dev setup (drill vault only; not the ceremony keys) |
 | Server | Actual `zkapi serverd` drill build: honest, `withhold`, `born-spent`, `reuse-anchor`, `random-anchor`, `overcharge` and `lie-expired`, restarted between modes behind one loopback endpoint |
 | Indexer | Actual `zkapi-indexerd`, stopped and restarted from its checkpoint |

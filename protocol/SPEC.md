@@ -195,16 +195,26 @@ commitment, amount, expiryTs)`) and does no tree work.
 
 Activation appends the recorded notes `activationCursor ..
 activationCursor + count - 1` to the request tree, for `count` 1, 4 or 16 with
-`activationCursor` a multiple of `count` and the notes recorded; it is
-permissionless. `activateNotes` verifies an insertion proof against the
-adapter's `INSERTION{count}_VK_HASH`; `activateNotesOnChain(firstNoteId,
-count, siblings)` hashes the leaves, the subtree and both paths itself (about
-1.7M gas for one note), so activation never depends on a prover. Both advance
-`activationCursor`, set `currentRoot` and emit `NotesActivated(firstNoteId,
-count, newRoot, proved)`. An activation prepared against an older cursor or
-root reverts `StaleActivation()`, a malformed range `InvalidActivation()`.
-Activation takes effect on inclusion; `isActivated(noteId)` is `noteId <
-activationCursor`. The operator's activation worker proves batches, picking
+`activationCursor` a multiple of `count` and the notes recorded.
+`activateNotes` verifies an insertion proof against the adapter's
+`INSERTION{count}_VK_HASH`, and only the vault's `activator` may call it
+(`NotActivator()`), an address set at deployment (the last constructor
+argument) and replaced by the owner with `setActivator`.
+`activateNotesOnChain(firstNoteId, count, siblings)` hashes the leaves, the
+subtree and both paths itself (about 1.7M gas for one note); anyone may call
+it from `activationFallbackOpensAt`, `ACTIVATION_FALLBACK_DELAY` (1 hour)
+after the latest proved activation, the deployment or the latest unpause
+(before then `ActivationFallbackClosed()`), so activation never depends on a
+prover. On-chain activations leave `activationFallbackOpensAt` alone. The
+insertion proving keys are public, so without the activator rule a third
+party could land a single-note proof just ahead of the operator's 16-note
+batch and force the rest through smaller aligned batches at the operator's
+expense; the delay keeps the fallback from doing the same while the activator
+works. Both advance `activationCursor`, set `currentRoot` and emit
+`NotesActivated(firstNoteId, count, newRoot, proved)`. An activation prepared
+against an older cursor or root reverts `StaleActivation()`, a malformed range
+`InvalidActivation()`. Activation takes effect on inclusion;
+`isActivated(noteId)` is `noteId < activationCursor`. The operator's activation worker proves batches, picking
 the largest aligned size the recorded notes fill and waiting a bounded time
 for a fuller batch.
 
@@ -232,7 +242,8 @@ The owner can pause deposits, activations and expiry claims until it
 unpauses, and escapes and mutual closes for at most `maxPauseDuration` (at
 least twice the challenge period); a new pause needs a day since the last
 unpause. Defeats, raises,
-escape finalization, `claimEscapePayout` and `retireClosedLeaf` stay open. Treasury
+escape finalization, `claimEscapePayout`, `retireClosedLeaf` and the owner's
+`setActivator` stay open. Treasury
 changes are scheduled, then accepted after `treasuryChangeDelay` of unpaused
 time, and failed treasury payments accrue `treasuryArrears` instead of
 reverting payouts. An escape payout that its destination rejects, or that

@@ -9,7 +9,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Interface, Transaction, Wallet, keccak256 } from 'ethers';
 import {
-  ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_TX_FEE_CAP, ESCAPE_FINALIZED_TOPIC, GWEI, RpcError, UPSTREAM_TIMEOUT_MS,
+  ABSOLUTE_FEE_CEILING, ACTIVATOR_SELECTOR, ConfigError, DEFAULT_TX_FEE_CAP, ESCAPE_FINALIZED_TOPIC, GWEI, RpcError, UPSTREAM_TIMEOUT_MS,
   activationInterface, createSigner, createUpstream, parseChainId, parseSignerConfig, parseSignerProfile, vaultInterface,
 } from './signer.mjs';
 import { createHttpServer } from './server.mjs';
@@ -29,11 +29,15 @@ const validTx = { from: sender, to: vault, data, gas: '0x7a1200', nonce: '0x4' }
 const legacyChallenge = new Interface([
   'function challengeEscapeWithdrawal(uint32 noteId,(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256) inputs,bytes proof,uint256[32] siblings)',
 ]).encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, proof, Array(32).fill(0)]);
-// The activation worker's proved batch, and the vault's permissionless
+// The activation worker's proved batch, and the vault's no-prover
 // on-chain fallback, which the worker never sends.
 const activation = (firstNoteId = 4, count = 4, batchProof = proof) => activationInterface.encodeFunctionData('activateNotes', [firstNoteId, count, 11, 12, batchProof]);
 const onChainActivation = new Interface(['function activateNotesOnChain(uint32 firstNoteId,uint256 count,uint256[32] siblings)'])
   .encodeFunctionData('activateNotesOnChain', [4, 4, Array(32).fill(0)]);
+// The owner's call that replaces the vault's activator, which neither signer signs.
+const setActivator = new Interface(['function setActivator(address newActivator)']).encodeFunctionData('setActivator', [sender]);
+// activator()'s answer: `address` as a 32-byte word.
+const addressWord = address => `0x${address.slice(2).toLowerCase().padStart(64, '0')}`;
 const ONE_ETH = '0xde0b6b3a7640000';
 const wei = value => `0x${value.toString(16)}`;
 const fees = (maxFee, tip) => ({ maxFeePerGas: wei(maxFee), maxPriorityFeePerGas: wei(tip) });
@@ -125,8 +129,8 @@ test('rejects unauthorized transaction changes before any RPC or signature', asy
     { data: legacyChallenge },
     { data: new Interface(['function finalizeEscapeWithdrawal(uint32)']).encodeFunctionData('finalizeEscapeWithdrawal', [0]) },
     { data: new Interface(['function claimExpired(uint32)']).encodeFunctionData('claimExpired', [0]) },
-    // The activation worker's calls belong to the activation signer.
-    { data: activation() }, { data: onChainActivation },
+    // The activation worker's calls belong to the activation signer, and the owner's to neither.
+    { data: activation() }, { data: onChainActivation }, { data: setActivator },
   ];
   for (const modification of modifications) {
     const { signer, calls } = fixture();
@@ -1008,7 +1012,9 @@ async function startSignerProcess(t, env) {
     let body = '';
     for await (const chunk of request) body += chunk;
     const { id, method } = JSON.parse(body);
-    const results = { eth_chainId: '0xaa36a7', eth_getBlockByNumber: { number: '0x10', baseFeePerGas: wei(9n * GWEI) }, eth_getBalance: '0x1' };
+    // activator() names the sender (only the activation signer asks).
+    const results = { eth_chainId: '0xaa36a7', eth_getBlockByNumber: { number: '0x10', baseFeePerGas: wei(9n * GWEI) }, eth_getBalance: '0x1',
+      eth_call: addressWord(sender) };
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify(Object.hasOwn(results, method) ? { jsonrpc: '2.0', id, result: results[method] } : { jsonrpc: '2.0', id, error: { code: -32601, message: 'not found' } }));
   }).listen(0, '127.0.0.1');
@@ -1086,7 +1092,10 @@ test('refusals and signatures are logged once per transition without provider de
 // for zkapi-activated, with its own key, sender and caps, that signs the
 // worker's activateNotes and nothing else.
 const activateTx = { from: sender, to: vault, data: activation(), gas: wei(720_000n), nonce: '0x4' };
-const activationFixture = (overrides = {}, options = {}) => fixture({ eth_estimateGas: wei(600_000n), ...overrides }, { profile: 'activation', ...options });
+// The vault's activator() is the signer's sender; every other eth_call (the simulation) succeeds.
+const activationFixture = (overrides = {}, options = {}) => fixture({
+  eth_estimateGas: wei(600_000n), eth_call: call => (call.data === ACTIVATOR_SELECTOR ? addressWord(sender) : '0x'), ...overrides,
+}, { profile: 'activation', ...options });
 
 test('the activation signer signs aligned activateNotes batches by their pinned selector, as EIP-1559 within its own caps', async () => {
   assert.equal(activationInterface.getFunction('activateNotes').selector, '0xa2b2c715');
@@ -1123,6 +1132,7 @@ test('the activation signer refuses the challenger\'s calls, the on-chain fallba
     [vaultInterface.encodeFunctionData('retireClosedLeaf', [9, Array(32).fill(0)]), refusal],
     [legacyChallenge, refusal],
     [onChainActivation, refusal],
+    [setActivator, refusal],
     [new Interface(['function deposit(bytes32,uint128)']).encodeFunctionData('deposit', [`0x${'11'.repeat(32)}`, 1]), refusal],
     [new Interface(['function finalizeEscapeWithdrawal(uint32)']).encodeFunctionData('finalizeEscapeWithdrawal', [0]), refusal],
     ['0xdeadbeef', refusal],
@@ -1176,7 +1186,8 @@ test('the activation signer simulates again: a stale batch is simulation_failed,
 });
 
 test('activation signer status and health report its profile and caps, without retirement fields', async t => {
-  const { signer } = activationFixture();
+  assert.equal(new Interface(['function activator() view returns (address)']).getFunction('activator').selector, ACTIVATOR_SELECTOR);
+  const { signer, calls } = activationFixture();
   const policy = {
     profile: 'activation', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
@@ -1184,11 +1195,31 @@ test('activation signer status and health report its profile and caps, without r
   };
   assert.deepEqual(signer.policy, policy);
   assert.deepEqual(await signer.handle('zkapi_signerStatus', []), {
-    chain_id: '0xaa36a7', ...policy, block_number: '0x10', base_fee_per_gas: '0x3b9aca00', balance: ONE_ETH, warnings: [],
+    chain_id: '0xaa36a7', ...policy, activator: sender.toLowerCase(), block_number: '0x10', base_fee_per_gas: '0x3b9aca00', balance: ONE_ETH, warnings: [],
   });
+  assert.deepEqual(calls.find(call => call.method === 'eth_call').params, [{ to: vault, data: ACTIVATOR_SELECTOR }, 'latest']);
   // The 1M gas cap at the 10 gwei fee cap needs 0.01 ETH.
   const low = await activationFixture({ eth_getBalance: wei(1_000_000n * 10n * GWEI - 1n) }).signer.handle('zkapi_signerStatus', []);
   assert.deepEqual(low.warnings, ['balance_below_required']);
+  // Another activator (the owner replaced it, or the signer holds the wrong
+  // key), or a vault that names none, only warns: the vault would refuse
+  // every batch, and the owner may still name this sender. A read the
+  // upstream rejects (a revert, or a provider's refusal such as a rate limit,
+  // which the signer cannot tell apart) warns apart: it names no activator.
+  const other = '0x000000000000000000000000000000000000acc1';
+  for (const [answer, activator, warning] of [
+    [addressWord(other), other, 'sender_not_activator'], ['0x', null, 'sender_not_activator'],
+    [`0x${'ff'.repeat(32)}`, null, 'sender_not_activator'],
+    [new RpcError(-32000, 'Upstream RPC rejected the request', 'upstream_rejected'), null, 'activator_unreadable'],
+  ]) {
+    const status = await activationFixture({ eth_call: answer }).signer.handle('zkapi_signerStatus', []);
+    assert.deepEqual([status.activator, status.warnings], [activator, [warning]], String(answer));
+  }
+  await assert.rejects(activationFixture({ eth_call: new RpcError(-32000, 'Upstream RPC request failed', 'upstream_unavailable') }).signer.handle('zkapi_signerStatus', []),
+    { code: -32000, data: { reason: 'upstream_unavailable' } });
+  // The challenge signer never reads it.
+  const challenge = fixture({ eth_call: () => assert.fail('the challenge signer reads no activator') });
+  assert.ok(!Object.hasOwn(await challenge.signer.handle('zkapi_signerStatus', []), 'activator'));
   const server = createHttpServer(signer).listen(0, '127.0.0.1');
   await once(server, 'listening'); t.after(() => server.close());
   const health = await fetch(`http://127.0.0.1:${server.address().port}/health`).then(r => r.json());
@@ -1259,7 +1290,7 @@ test('the activation signer process starts from its own environment, prints its 
     status: 'listening', profile: 'activation', chain_id: 11155111, sender: sender.toLowerCase(), vault, fee_model: 'eip1559', fee_cap_source: 'explicit',
     max_fee_per_gas_wei: '20000000000', priority_fee_per_gas_wei: '1000000000', max_priority_fee_per_gas_wei: '10000000000',
     fee_ceiling_wei: '10000000000000', tx_fee_cap_wei: '1000000000000000000', max_fee_per_gas_allowed_at_max_gas_wei: '1000000000000',
-    max_gas: '1000000', required_balance_wei: '20000000000000000', balance_wei: '1',
+    max_gas: '1000000', required_balance_wei: '20000000000000000', balance_wei: '1', activator: sender.toLowerCase(),
     base_fee_per_gas_wei: '9000000000', warnings: ['balance_below_required'],
   });
   const health = await fetch(`http://127.0.0.1:${port}/health`).then(r => r.json());

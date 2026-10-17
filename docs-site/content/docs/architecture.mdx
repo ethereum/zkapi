@@ -94,7 +94,7 @@ manifest. Each fails closed.
 | Lease service | Issue a spending-limited runtime key, settle measured usage after retirement, and fix every lease's charge by a write-once deadline |
 | Schnorr signer | Sign the updated commitment at the derived successor anchor, only while the request's nullifier is unspent on chain; sign clearance separately |
 | Groth16ProofAdapter | Verify request evidence, withdrawal proofs and insertion proofs directly on-chain |
-| Activation worker | Read recorded notes from the vault and the cursor slot's siblings from the indexer, prove an aligned batch of 1, 4 or 16 notes after a bounded wait for a fuller one, and send `activateNotes` |
+| Activation worker | Read recorded notes from the vault and the cursor slot's siblings from the indexer, prove an aligned batch of 1, 4 or 16 notes after a bounded wait for a fuller one, and send `activateNotes` as the vault's activator |
 | Challenge service | Read pending escapes and their concessions, defeat with a verified request proof at the successor nullifier, raise to what the escaped state owes, retire a closed note's leaf after a missed defeat, and report each obligation's status |
 
 ## Deposit flow

@@ -269,14 +269,30 @@ test('a leaf retirement is signed only for a note whose EscapeWithdrawalFinalize
   assert.equal((await signer.handle('zkapi_signerStatus', [])).retirements_last_24h, 1);
 });
 
-test('an activation signer signs only activateNotes, which mines; the on-chain fallback and the challenger\'s calls never reach the node', { skip }, async t => {
+test('an activation signer reports the vault\'s activator, signs only activateNotes, which mines; the on-chain fallback, setActivator and the challenger\'s calls never reach the node', { skip }, async t => {
   const rpc = await startAnvil(t);
   const activator = signerFor(rpc, { profile: 'activation', maxFeePerGas: 10n * GWEI });
+  // The STOP stand-in answers activator() with nothing: the status warns.
+  const named = async () => {
+    const status = await activator.handle('zkapi_signerStatus', []);
+    return [status.activator, status.warnings.includes('sender_not_activator')];
+  };
+  assert.deepEqual(await named(), [null, true]);
+  // A vault whose activator() reverts: unreadable, not a mismatch.
+  await rpc('anvil_setCode', [vault, '0x60006000fd']);
+  const reverted = await activator.handle('zkapi_signerStatus', []);
+  assert.deepEqual([reverted.activator, reverted.warnings.includes('activator_unreadable'),
+      reverted.warnings.includes('sender_not_activator')], [null, true, false]);
+  // A stand-in that answers every call with the sender as one word: activator()
+  // names the signer's sender, and the batch below still simulates.
+  await rpc('anvil_setCode', [vault, `0x73${sender.slice(2).toLowerCase()}60005260206000f3`]);
+  assert.deepEqual(await named(), [sender.toLowerCase(), false]);
   const batch = activationInterface.encodeFunctionData('activateNotes', [0, 1, 11, 12, `0x${'00'.repeat(256)}`]);
   const fallback = new Interface(['function activateNotesOnChain(uint32 firstNoteId,uint256 count,uint256[32] siblings)'])
     .encodeFunctionData('activateNotesOnChain', [0, 1, Array(32).fill(0)]);
   const retirement = vaultInterface.encodeFunctionData('retireClosedLeaf', [0, Array(32).fill(0)]);
-  for (const call of [fallback, data, retirement]) {
+  const setActivator = new Interface(['function setActivator(address newActivator)']).encodeFunctionData('setActivator', [sender]);
+  for (const call of [fallback, setActivator, data, retirement]) {
     await assert.rejects(activator.handle('eth_sendTransaction', [tx(0, { data: call })]),
       { code: -32602, message: 'Only canonical activateNotes calls are authorized' });
   }

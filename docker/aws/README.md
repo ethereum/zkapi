@@ -30,7 +30,7 @@ Create these root-owned, mode `0600` files without printing their contents:
 | File | Contents |
 | --- | --- |
 | `/etc/zkapi/deployment.env` | Copy `deployment.env.example`, then supply vault address, chain, deployment block, gwei request cap, `ZKAPI_NATIVE_BILLING_RPC_URL`, `ZKAPI_NATIVE_PRICE_FEED_ADDRESS`, feed decimals and freshness policy. It also sets the lease settlement deadline, the indexer's confirmation depth and head-age limit, and the challenger's transaction fee cap (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, below). |
-| `/etc/zkapi/deployment.json` | Mode `0644`. The deployment manifest: the `trusted_deployment` profile (chain, vault, signing keys, `challenge_period`, `circuit_id`, `setup_id`, both verifying-key hashes, the adapter and Poseidon library addresses, the three runtime codehashes, `settlement_window_seconds`), written from the manifest that `scripts/expected-codehashes.mjs --finalize` produced from `Deploy.s.sol`'s provisional one, never from the `.pending` file (see [Contracts](../../docs/deployment.md#contracts)). Compose mounts it read-only into `db-init`, `server` and `challenger`. A `"deployment_status"` other than absent or `"deployed"` (a `not_deployed` placeholder, or a provisional `pending` or `simulated` manifest) is refused. |
+| `/etc/zkapi/deployment.json` | Mode `0644`. The deployment manifest: the `trusted_deployment` profile (chain, vault, signing keys, `challenge_period`, `circuit_id`, `setup_id`, both verifying-key hashes, the adapter and Poseidon library addresses, the three runtime codehashes, `settlement_window_seconds`, the vault's `activator`), written from the manifest that `scripts/expected-codehashes.mjs --finalize` produced from `Deploy.s.sol`'s provisional one, never from the `.pending` file (see [Contracts](../../docs/deployment.md#contracts)). Compose mounts it read-only into `db-init`, `server`, `challenger` and `activator`. A `"deployment_status"` other than absent or `"deployed"` (a `not_deployed` placeholder, or a provisional `pending` or `simulated` manifest) is refused. |
 | `/etc/zkapi/indexer.env` | `RPC_URL`, the chain's read RPC endpoint (requirements below). |
 | `/etc/zkapi/server.env` | `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` (required, below), and `ZKAPI_OPENROUTER_MANAGEMENT_KEY` for direct leases; alternatively set `OA_ORG_URL` in deployment metadata and `ZKAPI_OA_ORG_SHARED_SECRET` here. To switch an existing database between these key sources, follow [Changing the key source](../../docs/native-eth-billing.md#changing-the-key-source): the server refuses to start while leases or key deletions of the other source still need its credential (`ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true` starts anyway and strands them). For private Sepolia access, also set `ZKAPI_TESTNET_PASSWORD` here only. |
 | `/etc/zkapi/challenge.env` | `ZKAPI_CHALLENGE_RPC_URL=http://signer:8547`, `ZKAPI_CHALLENGE_SENDER` (the exclusive funded sender managed by the private sidecar), and the daemon's fee caps (below). |
@@ -230,7 +230,7 @@ for the signer and in `deployment.env` for the daemon (the signer reads only
 (`tx_fee_above_cap`). The daemon bids within the lower of its own value and the
 signer's, which `zkapi_signerStatus` reports, and its `/status` warns when the
 two differ. The challenger sends three calls; their gas limits (from the
-design estimates and, for the retirement, CI's Forge measurement of 1,648,631;
+design estimates and, for the retirement, CI's Forge measurement of 1,648,719;
 re-measure on the deployed vault) and the highest bid each allows at the
 default 1 ETH are:
 
@@ -311,26 +311,36 @@ request tree); until then clients report `note_not_activated` and retry. The
 `activator` service runs `zkapi-activated`, which activates the recorded notes
 in proved batches of 16, 4 or 1 with the setup's insertion proving keys; see
 [operating the activation worker](../../docs/activation-worker.md). Without it,
-deposits wait until someone pays for the vault's permissionless
-`activateNotesOnChain` (about 1.7M gas for one note).
+deposits wait until someone pays for the vault's no-prover
+`activateNotesOnChain` (about 1.7M gas for one note), which anyone may call
+once an hour passes without a proved activation (`ACTIVATION_FALLBACK_DELAY`).
 
 The worker sends `activateNotes` from a sender of its own through a signer of
 its own, the `activation-signer` service: the signer image with
 `ZKAPI_SIGNER_PROFILE=activation`, which signs only `activateNotes` calls to
 the vault and refuses everything else, the challenger's calls and
 `activateNotesOnChain` included (see
-[Activation profile](signer/README.md#activation-profile)). Never reuse the
-challenger's key or sender: each daemon assumes nobody else sends from its
-account, and a pending activation must never hold up a defeat. The activation
-signer reads only `activation-signer.env`: the variables of `signer.env` under
-the `ZKAPI_ACTIVATION_` prefix, without the retirement settings and with a
-1,000,000 gas cap (`ZKAPI_ACTIVATION_MAX_GAS`). It refuses to start while a
-`ZKAPI_CHALLENGE_` variable is present, and the challenge signer while a
-`ZKAPI_ACTIVATION_` one is. An activation takes about 277,000 gas for 1 note,
-343,000 for 4 and 600,000 for 16; the worker's gas limit is its estimate plus
-20%. Fund the sender for one pending transaction (0.072 ETH for 16 notes at a
-100 gwei cap) plus the activations expected until the next top-up: at low
-volume every deposit is activated alone.
+[Activation profile](signer/README.md#activation-profile)). The vault takes
+`activateNotes` only from its activator: deploy with the worker's sender as
+`Deploy.s.sol`'s `ACTIVATOR`, or have the owner call `setActivator` with it;
+until then the activation signer's status warns `sender_not_activator`. After a
+`setActivator`, record the new sender as `activator` in `deployment.json` and
+in the finalized manifest the profiles are generated from: the worker refuses
+to start while `deployment.json` names another activator (see
+[the activator](../../docs/activation-worker.md#the-activator)). Never reuse
+the challenger's key or sender: each daemon assumes nobody else sends from
+its account, and a pending activation must never hold up a defeat. The
+activation signer reads only `activation-signer.env`: the variables of
+`signer.env` under the `ZKAPI_ACTIVATION_` prefix, without the retirement
+settings and with a 1,000,000 gas cap (`ZKAPI_ACTIVATION_MAX_GAS`). It
+refuses to start while a `ZKAPI_CHALLENGE_` variable is present, and the
+challenge signer while a `ZKAPI_ACTIVATION_` one is. An activation takes
+about 286,000 gas for 1 note, 348,000 for 4 and 605,000 for 16; the worker's
+gas limit is its estimate plus 20%. Fund the sender for one pending
+transaction (about 0.075 ETH for 16 notes at a 100 gwei cap, the worker's
+default low-balance warning) plus the activations
+expected until the next top-up: at low volume every deposit is activated
+alone.
 
 `activation.env` holds the worker's own bounds, which it proposes to its
 signer:
@@ -342,7 +352,7 @@ signer:
 | `ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI` | Required. At most the activation signer's `ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI`. |
 | `ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the activation signer's tip cap and this fee cap, and at least twice the priority fee. |
 | `ZKAPI_ACTIVATION_PRIORITY_FEE_PER_GAS_WEI` | Optional tip of a first attempt; default 2 gwei. |
-| `ZKAPI_ACTIVATION_TX_FEE_CAP_WEI` | Optional; default 1 ETH. The node's `--rpc.txfeecap`, as for the challenger; bids also stay within the activation signer's `tx_fee_cap_wei`. At 1 ETH a 720,000-gas activation can bid about 1,388 gwei. |
+| `ZKAPI_ACTIVATION_TX_FEE_CAP_WEI` | Optional; default 1 ETH. The node's `--rpc.txfeecap`, as for the challenger; bids also stay within the activation signer's `tx_fee_cap_wei`. At 1 ETH a 726,000-gas activation can bid about 1,377 gwei. |
 
 From `deployment.env` it reads `ACTIVATION_CONFIRMATIONS` (default 2: its
 nonce is held until its transaction is that deep) and
@@ -407,7 +417,8 @@ evidence, and users recover their signed state from it after a challenge.
 
 The activation profile is explicit likewise: without it, `up` never starts the
 activator or its signer, and deposits stay unactivated (they can still exit)
-until someone calls `activateNotesOnChain`. Its signer image is the challenge
+until someone calls `activateNotesOnChain`, which opens an hour after the
+latest proved activation. Its signer image is the challenge
 signer's, so building `signer` builds both.
 
 The default HTTP origin binds `127.0.0.1:8080`. For an EC2 origin behind
@@ -614,9 +625,14 @@ Alert on:
   adapter), `signer_refused`, `upstream_tx_fee_cap` or
   `indexer_invalid_response`, or by any other reason for 1800 seconds; and on
   stale polls. Also alert on a growing `queue.pending_notes`, on
-  `zkapi_signerStatus` warnings of the activation signer, and on its
-  `"event":"activation_refused"` lines. If the worker cannot recover in time,
-  activate with [the permissionless fallback](../../docs/activation-worker.md#the-permissionless-fallback);
+  `zkapi_signerStatus` warnings of the activation signer
+  (`sender_not_activator`: the vault's activator is not its sender, so the
+  vault refuses every batch; `activator_unreadable`: the upstream refused the
+  `activator()` read, a revert or a provider refusal, so alert only if it
+  persists), and on its `"event":"activation_refused"` lines.
+  If the worker cannot recover in time,
+  activate with [the permissionless fallback](../../docs/activation-worker.md#the-permissionless-fallback)
+  once it opens, an hour after the worker's last proved activation;
 - sustained `root_unavailable` refusals, or the server log line `the indexer
   root and the vault's currentRoot() disagree`: the indexer lags or diverges, or
   the RPC fails, and no request is admitted;

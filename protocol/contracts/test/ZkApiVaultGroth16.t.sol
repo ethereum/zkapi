@@ -20,7 +20,8 @@ import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 ///      at genesis. Withdrawal proofs name their note as recorded (registration commitment and
 ///      packed amount and expiry), so they need no activation; request proofs are at the root
 ///      holding A and B. Every proof is valid until the fixture's valid_until (7 days after the
-///      deposits).
+///      deposits). OPERATOR is the vault's activator; on-chain activations first wait for the
+///      fallback to open (up to an hour), which keeps every test well inside valid_until.
 contract ZkApiVaultGroth16Test is Test {
     uint256 constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465;
     uint128 constant DEPOSIT = 1_000_000;
@@ -64,7 +65,8 @@ contract ZkApiVaultGroth16Test is Test {
             parameters.clearanceSigningKeyX,
             parameters.clearanceSigningKeyY,
             address(this),
-            7 days
+            7 days,
+            OPERATOR
         );
         assertEq(address(vault), parameters.contractAddress);
         vm.deal(USER, 10 * uint256(DEPOSIT) * 1 gwei);
@@ -551,10 +553,15 @@ contract ZkApiVaultGroth16Test is Test {
 
     /// The fixture's insertion proofs activate A, B, C and D one at a time: the vault hands the
     /// real adapter exactly the fixture's statement, built from its records, and reaches root_a,
-    /// root_ab (the root of every request proof) and root_abcd.
+    /// root_ab (the root of every request proof) and root_abcd. Submitted by anyone but the
+    /// activator, the same valid proof is refused (NotActivator).
     function test_realProvedActivations() public {
         _depositNotes(4);
         assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".empty_root"));
+        (uint32 first, uint256 count, uint256 oldRoot, uint256 newRoot,, bytes memory proof) = _activation("activate_a");
+        vm.prank(USER);
+        vm.expectRevert(Errors.NotActivator.selector);
+        vault.activateNotes(first, count, oldRoot, newRoot, proof);
         _activateProved("activate_a");
         assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_a"));
         _activateProved("activate_b");
@@ -646,9 +653,12 @@ contract ZkApiVaultGroth16Test is Test {
     // ================================================================ gas snapshot
 
     /// Transaction gas of a proved activation of each batch size with the real adapter (cold
-    /// vault and adapter), under the ceilings and pinned in snapshots/activation-gas.json.
+    /// vault and adapter), under the ceilings and pinned in snapshots/activation-gas.json. Each
+    /// lands a block after the deployment, so its write of activationFallbackOpensAt changes the
+    /// slot as in every real activation (in the deployment's second it rewrites the stored value).
     function test_realActivationGasSnapshot() public {
         _depositNotes(16);
+        vm.warp(vm.getBlockTimestamp() + 12);
         uint256 deposited = vm.snapshotState();
         string[3] memory names = ["activate_a", "activate_batch4", "activate_batch16"];
         string[3] memory labels = ["activateNotes1", "activateNotes4", "activateNotes16"];
@@ -799,7 +809,7 @@ contract ZkApiVaultGroth16Test is Test {
         proof = vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"));
     }
 
-    /// Submits fixture activation `name` from a third party; the vault must hand the adapter the
+    /// Submits fixture activation `name` from the activator; the vault must hand the adapter the
     /// fixture's exact statement and reach its new root.
     function _activateProved(string memory name) private {
         (uint32 first, uint256 count, uint256 oldRoot, uint256 newRoot, uint256[] memory inputs, bytes memory proof) =
@@ -864,11 +874,14 @@ contract ZkApiVaultGroth16Test is Test {
         }
     }
 
-    /// Activates the next `count` recorded notes with the on-chain fallback, from a third party.
+    /// Activates the next `count` recorded notes with the on-chain fallback, from the depositor
+    /// (anyone may), once the fallback is open.
     function _activateOnChain(uint256 count) private {
+        uint64 opensAt = vault.activationFallbackOpensAt();
+        if (vm.getBlockTimestamp() < opensAt) vm.warp(opensAt);
         uint32 first = vault.activationCursor();
         uint256[32] memory siblings = _path(first);
-        vm.prank(OPERATOR);
+        vm.prank(USER);
         vault.activateNotesOnChain(first, count, siblings);
     }
 

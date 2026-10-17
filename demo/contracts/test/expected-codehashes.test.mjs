@@ -101,6 +101,7 @@ const ADAPTER = '0xe7f1725e7734ce288f8367e1bb143e90bb3f0512';
 const VAULT = '0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0';
 const OWNER = '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266';
 const TREASURY = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8';
+const ACTIVATOR = '0x000000000000000000000000000000000000acc1';
 const TX = { poseidon: `0x${'a1'.repeat(32)}`, adapter: `0x${'a2'.repeat(32)}`, vault: `0x${'a3'.repeat(32)}`, paymaster: `0x${'a4'.repeat(32)}` };
 const selector = signature => keccak256(new TextEncoder().encode(signature)).slice(0, 10);
 const word = addr => `0x${addr.slice(2).padStart(64, '0')}`;
@@ -119,6 +120,7 @@ function pendingManifest() {
         vault: VAULT,
         owner: OWNER,
         treasury: TREASURY,
+        activator: ACTIVATOR,
         poseidonLibraryReused: false,
         ...inputs,
         vaultRuntimeCodehash: hashes.vault_runtime_codehash,
@@ -141,7 +143,7 @@ function chain(deployment, latest = 7) {
             [TX.adapter]: { transactionHash: TX.adapter, status: '0x1', blockNumber: '0x6', contractAddress: ADAPTER },
             [TX.vault]: { transactionHash: TX.vault, status: '0x1', blockNumber: '0x7', contractAddress: VAULT },
         },
-        storage: { [selector('owner()')]: word(OWNER), [selector('treasury()')]: word(TREASURY) },
+        storage: { [selector('owner()')]: word(OWNER), [selector('treasury()')]: word(TREASURY), [selector('activator()')]: word(ACTIVATOR) },
         chainId: '0x7a69',
         latest,
     };
@@ -179,6 +181,7 @@ test('finalize records the block that created the vault, not the simulated head'
     // Matched through the receipts, not the log's transactions entries.
     assert.deepEqual(final.deployTransactions, { vault: TX.vault, proofAdapter: TX.adapter, poseidonLibrary: TX.poseidon });
     assert.equal(final.vaultRuntimeCodehash, deployment.vaultRuntimeCodehash);
+    assert.equal(final.activator, ACTIVATOR);
     // A reused library has no creation to look for.
     const reused = { ...pendingManifest(), poseidonLibraryReused: true };
     const fake = chain(reused);
@@ -239,6 +242,16 @@ test('finalize reports code and storage on chain that are not the manifest\'s, a
     const swapped = await finalize(deployment, fake);
     assert.equal(swapped.manifest, undefined);
     assert.deepEqual(swapped.mismatches.map(m => m.field), ['owner', 'treasury']);
+    // So is the activator, the only address that may call activateNotes.
+    const replaced = chain(deployment);
+    replaced.state.storage[selector('activator()')] = word(TREASURY);
+    const activator = await finalize(deployment, replaced);
+    assert.equal(activator.manifest, undefined);
+    assert.deepEqual(activator.mismatches, [{ source: 'rpc', field: 'activator', expected: ACTIVATOR, actual: word(TREASURY) }]);
+    // A provisional manifest without one predates the vault's activator role.
+    const legacy = { ...deployment };
+    delete legacy.activator;
+    await assert.rejects(finalize(legacy, chain(legacy)), /activator: not an address/);
 });
 
 // ------------------------------------------------------- the gasless-withdrawal paymaster

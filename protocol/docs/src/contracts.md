@@ -24,12 +24,20 @@ setup's copy. A deposit only records its note. Only activations and
   the recorded notes `activationCursor .. activationCursor + count - 1`
   (`count` 1, 4 or 16, aligned) with an insertion proof whose inputs the vault
   builds from `currentRoot`, the cursor and the stored notes, whatever their
-  status; it does no hashing.
+  status; it does no hashing. Only `activator` may call it (`NotActivator()`):
+  the operator's activation worker, set at deployment and replaced by the
+  owner with `setActivator` (`ActivatorChanged`).
 - `activateNotesOnChain(firstNoteId, count, siblings)` is the permissionless
   no-prover fallback: it authenticates the batch's empty subtree at
   `currentRoot` with the slot's siblings (`compressPairPath`), hashes the
   leaves (`NoteLeafLib`) and the subtree (`compressSubtree`), and computes the
-  new root (about 1.7M gas for one note).
+  new root (about 1.7M gas for one note). It opens at
+  `activationFallbackOpensAt`, `ACTIVATION_FALLBACK_DELAY` (1 hour) after the
+  latest proved activation, the deployment or the latest unpause
+  (`ActivationFallbackClosed()` before), and does not move it. While the
+  activator proves, nobody else can activate a note ahead of its aligned
+  batches: with public insertion keys, a stranger's single-note activation
+  would otherwise force the operator through extra, smaller batches.
 - `retireClosedLeaf(noteId, siblings)` replaces the leaf of a closed,
   activated note by zero, after checking the siblings at `currentRoot`.
 
@@ -73,8 +81,8 @@ the pending records and the proof statements.
 The owner can pause deposits, activations, expiry claims and treasury changes until it
 unpauses, but escapes and closes only for `maxPauseDuration` (at least twice
 the challenge period), and a new pause needs a day since the last unpause.
-Defeats, raises, escape finalization, `claimEscapePayout` and
-`retireClosedLeaf` stay open while paused. Treasury changes are scheduled with
+Defeats, raises, escape finalization, `claimEscapePayout`, `retireClosedLeaf`
+and `setActivator` stay open while paused. Treasury changes are scheduled with
 `setTreasury`, applied with `acceptTreasury` after `treasuryChangeDelay` of
 unpaused time, and cancellable. A treasury that rejects a payment accrues
 `treasuryArrears` instead of blocking payouts; anyone can pay them with

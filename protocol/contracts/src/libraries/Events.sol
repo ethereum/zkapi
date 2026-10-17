@@ -11,6 +11,9 @@ abstract contract Events {
     ///         root is now newRoot. `proved` tells a proved batch from the on-chain fallback.
     event NotesActivated(uint32 indexed firstNoteId, uint32 count, uint256 newRoot, bool proved);
 
+    /// @notice The address allowed to call activateNotes changed (from address(0) at deployment).
+    event ActivatorChanged(address indexed previousActivator, address indexed newActivator);
+
     event MutualClose(uint32 indexed noteId, uint256 nullifier, uint128 finalBalance, address destination);
 
     /// @notice An escape started. Escapes do no Merkle work, so `currentRoot` is the unchanged root.

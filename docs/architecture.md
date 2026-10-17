@@ -28,10 +28,12 @@ saved quote. Exact retries preserve the original proof and quote. See
 A deposit only records its note on chain, and the note can exit at once. It
 can make anonymous requests once it is activated: the operator's activation
 worker appends the recorded notes to the request tree in deposit order, in
-aligned batches of 1, 4 or 16 with an insertion proof (`activateNotes`),
-picking the largest batch the recorded notes fill and waiting a bounded time
-for a fuller one; anyone can activate without a prover
-(`activateNotesOnChain`). See [the activation worker](activation-worker.md).
+aligned batches of 1, 4 or 16 with an insertion proof (`activateNotes`,
+which the vault takes only from its activator, the worker's sender), picking
+the largest batch the recorded notes fill and waiting a bounded time for a
+fuller one. Once an hour has passed since the latest proved activation,
+anyone can activate without a prover (`activateNotesOnChain`). See
+[the activation worker](activation-worker.md).
 
 The indexer mirrors the recorded notes, activations and leaf retirements (the
 tree is append-only otherwise) and every published nullifier, and serves only

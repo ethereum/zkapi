@@ -80,10 +80,12 @@ The root workspace builds the server and indexer runtime libraries,
 and the `zkapi` operator CLI. Start the indexer, then create the database
 with `zkapi db init`, then start the challenger and the activation worker,
 and finally `zkapi serverd`; use `--help` for current configuration flags.
-Without the activation worker, deposits can exit but never make requests
-unless someone activates them with `activateNotesOnChain`. The server, the
-activation worker and the browser must use the same deployment, keys, setup
-and `zkapi-v2-concession-v2` circuit.
+The worker's sender must be the vault's activator (`ACTIVATOR` at
+deployment). Without the activation worker, deposits can exit but never make
+requests unless someone activates them with `activateNotesOnChain`, which
+opens an hour after the latest proved activation. The server, the activation
+worker and the browser must use the same deployment, keys, setup and
+`zkapi-v2-concession-v2` circuit.
 
 `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` are required, with no defaults, even
 on a local chain. Generate each one independently, for example with

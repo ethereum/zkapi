@@ -1,13 +1,17 @@
 //! The activation worker against the real vault and generated adapter on
-//! Anvil (design C §5): the startup probes and insertion verifying-key pins
-//! pass against the deployed contracts; proved batches of 1, 4 and 16 notes
-//! verify in `assertValidInsertion` and move the vault's root to the tree of
-//! the recorded notes; a competing `activateNotesOnChain` landing first makes
-//! the worker's transaction revert and the batch is rebuilt; a dropped
+//! Anvil (design C §5), deployed with the worker's sender as its activator:
+//! the startup probes, insertion verifying-key pins and the manifest's
+//! activator pass against the deployed contracts; proved batches of 1, 4 and
+//! 16 notes verify in `assertValidInsertion` and move the vault's root to the
+//! tree of the recorded notes; a competing `activateNotesOnChain`, open once
+//! no proved activation landed for `ACTIVATION_FALLBACK_DELAY`, landing first
+//! makes the worker's transaction revert and the batch is rebuilt; a dropped
 //! transaction is re-sent on its nonce; a restart resumes a pending call;
 //! after a reorganization (`evm_revert`) undoes a mined activation, its call
 //! is re-sent on its nonce, or, when the batch's deposit was replaced, a
-//! fresh batch is proved and sent on it.
+//! fresh batch is proved and sent on it; while the owner names another
+//! activator, the vault refuses the worker's `activateNotes` and the worker
+//! sends nothing (`not_activator`) until the owner names its sender again.
 //!
 //! Needs `forge` and `anvil` on PATH; without them it reports a skip, and
 //! with `ZKAPI_REQUIRE_ANVIL=1` it fails instead.
@@ -24,9 +28,13 @@ use axum::{
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 use zkapi_core::MerkleTree;
-use zkapi_serverd::activation_service::{ActivationService, ActivationServiceConfig};
-use zkapi_serverd::activation_status::{ActivationAlarmPolicy, BatchOutcome, WorkerState};
-use zkapi_serverd::challenge_service::FeePolicy;
+use zkapi_serverd::activation_service::{
+    activate_calldata, ActivationService, ActivationServiceConfig,
+};
+use zkapi_serverd::activation_status::{
+    ActivationAlarmPolicy, ActivationBlocked, BatchOutcome, WorkerState,
+};
+use zkapi_serverd::challenge_service::{DeploymentCheckError, FeePolicy};
 use zkapi_serverd::deployment::DeploymentManifest;
 use zkapi_serverd::nullifier_store::StatementIdentity;
 use zkapi_types::Felt252;
@@ -36,8 +44,9 @@ const SETUP_DIR: &str = concat!(
     "/../../protocol/setup/v2-concession-dev"
 );
 const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
-/// Anvil's default accounts: the deployer and depositor, the worker's
-/// sender, and a competitor using the on-chain fallback.
+/// Anvil's default accounts: the deployer, owner and depositor, the worker's
+/// sender (the vault's activator), and a competitor using the on-chain
+/// fallback.
 const DEPLOYER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const DEPOSITOR: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 const WORKER: &str = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
@@ -55,8 +64,10 @@ contract Deploy is Script {
     function run() external {
         vm.startBroadcast();
         Groth16ProofAdapter adapter = new Groth16ProofAdapter();
+        // The activator is WORKER.
         ZkApiVault vault = new ZkApiVault(
-            address(0xbeef), 30 days, 1 days, 100_000, address(adapter), 11, 12, 13, 14, msg.sender, 2 days
+            address(0xbeef), 30 days, 1 days, 100_000, address(adapter), 11, 12, 13, 14, msg.sender, 2 days,
+            0x70997970C51812dc3A010C7d01b50e0d17dc79C8
         );
         vm.stopBroadcast();
         console.log(string.concat("vault=", vm.toString(address(vault))));
@@ -203,7 +214,8 @@ async fn path(State((rpc, vault)): State<(Rpc, String)>, UrlPath(id): UrlPath<u3
     }))
 }
 
-/// `activateNotesOnChain(uint32,uint256,uint256[32])`, as anyone may call it.
+/// `activateNotesOnChain(uint32,uint256,uint256[32])`, as anyone may call it
+/// once the fallback is open.
 fn activate_on_chain_calldata(first: u32, count: u32, siblings: &[Felt252]) -> String {
     let mut data = selector("activateNotesOnChain(uint32,uint256,uint256[32])");
     data.push_str(&format!("{first:064x}{count:064x}"));
@@ -213,8 +225,9 @@ fn activate_on_chain_calldata(first: u32, count: u32, siblings: &[Felt252]) -> S
     data
 }
 
-/// The fallback's encoding is the real vault's (vault_calldata_golden.json,
-/// from the compiled protocol/contracts sources).
+/// The fallback's encoding, and the activator role's selectors this test
+/// uses, are the real vault's (vault_calldata_golden.json, from the compiled
+/// protocol/contracts sources).
 #[test]
 fn activate_on_chain_calldata_matches_forge_abi_encode() {
     let golden: Value =
@@ -226,12 +239,22 @@ fn activate_on_chain_calldata_matches_forge_abi_encode() {
         activate_on_chain_calldata(16, 16, &siblings),
         golden["activate_on_chain"].as_str().unwrap()
     );
-    assert_eq!(
-        selector("activateNotesOnChain(uint32,uint256,uint256[32])"),
-        golden["selectors"]["activateNotesOnChain"]
-            .as_str()
-            .unwrap()
-    );
+    for (name, signature) in [
+        (
+            "activateNotesOnChain",
+            "activateNotesOnChain(uint32,uint256,uint256[32])",
+        ),
+        ("setActivator", "setActivator(address)"),
+        ("activationFallbackOpensAt", "activationFallbackOpensAt()"),
+        ("NotActivator", "NotActivator()"),
+        ("ActivationFallbackClosed", "ActivationFallbackClosed()"),
+    ] {
+        assert_eq!(
+            selector(signature),
+            golden["selectors"][name].as_str().unwrap(),
+            "{name}"
+        );
+    }
 }
 
 struct Harness {
@@ -279,6 +302,29 @@ impl Harness {
         self.rpc.number(&self.vault, "activationCursor()").await as u32
     }
 
+    /// The latest block's timestamp.
+    async fn now(&self) -> u64 {
+        let block = self
+            .rpc
+            .ok("eth_getBlockByNumber", json!(["latest", false]))
+            .await;
+        u64::from_str_radix(&block["timestamp"].as_str().unwrap()[2..], 16).unwrap()
+    }
+
+    /// The owner's `setActivator(activator)`, mined.
+    async fn set_activator(&self, activator: &str) {
+        let data = format!(
+            "{}{:0>64}",
+            selector("setActivator(address)"),
+            &activator[2..]
+        );
+        let hash = self.rpc.send(DEPOSITOR, &self.vault, data, 0).await;
+        if !self.automine {
+            self.rpc.mine().await;
+        }
+        self.rpc.receipt(&hash).await;
+    }
+
     /// The vault's root is the tree of the recorded notes below its cursor.
     async fn assert_tree(&self) {
         let (tree, _) = vault_tree(&self.rpc, &self.vault).await;
@@ -294,6 +340,17 @@ impl Harness {
         for _ in 0..6 {
             service.poll_once().await.unwrap();
             let status = service.status();
+            // Automine mines a send after eth_sendTransaction returned, and
+            // while it does, Anvil serves reads at the head block's number
+            // from the state being mined: the next poll waits for the block.
+            if let Some(hash) = status
+                .pending_call
+                .as_ref()
+                .and_then(|call| call.transaction_hash.as_deref())
+                .filter(|_| self.automine)
+            {
+                self.rpc.receipt(hash).await;
+            }
             if let Some(last) = status
                 .last_batch
                 .as_ref()
@@ -443,6 +500,7 @@ via_ir = true
             "poseidon_runtime_codehash": rpc.code_hash(&poseidon).await,
             "exit_concession": 1,
             "vault_revision": 4,
+            "activator": WORKER,
         })
         .to_string(),
     )
@@ -470,8 +528,18 @@ via_ir = true
     };
     let mut service = ActivationService::new(harness.config.clone()).unwrap();
     // The deployed adapter is this build's circuit and setup, its insertion
-    // verifying keys are the setup's, and the vault is revision 4.
+    // verifying keys are the setup's, the vault is revision 4, and its
+    // activator is the manifest's (the worker's sender). A manifest naming
+    // another activator is refused.
     service.verify_deployment(&manifest).await.unwrap();
+    assert_eq!(service.status().chain.activator.as_deref(), Some(WORKER));
+    let mut other = manifest.clone();
+    other.activator = Some(COMPETITOR.into());
+    let error = service.verify_deployment(&other).await.unwrap_err();
+    assert!(
+        matches!(&error, DeploymentCheckError::Mismatch(message) if message.contains("activator")),
+        "{error}"
+    );
 
     // Low volume: singletons, each proved, verified on chain and confirmed
     // (one deposit at a 16-aligned cursor, then cursors aligned to 1 only).
@@ -501,13 +569,33 @@ via_ir = true
 
     // A competing on-chain activation outbids the worker's in the same
     // block: the worker's reverts StaleActivation(), and the next batch is
-    // rebuilt from fresh state.
+    // rebuilt from fresh state. The fallback opens only once no proved
+    // activation landed for ACTIVATION_FALLBACK_DELAY (the worker's stays
+    // pending meanwhile), which the status reports.
     harness.set_automine(false).await;
     harness.deposit(2).await;
     service.poll_once().await.unwrap();
-    assert_eq!(service.status().state, WorkerState::Submitted);
+    let status = service.status();
+    assert_eq!(status.state, WorkerState::Submitted);
+    let opens_at = rpc.number(&vault, "activationFallbackOpensAt()").await;
+    assert_eq!(status.chain.activation_fallback_opens_at, Some(opens_at));
     let (tree, _) = vault_tree(&rpc, &vault).await;
     let competing = activate_on_chain_calldata(32, 1, &tree.get_siblings(32));
+    let closed = rpc
+        .call(
+            "eth_call",
+            json!([{ "from": COMPETITOR, "to": vault, "data": competing }, "latest"]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        closed
+            .to_string()
+            .contains(&selector("ActivationFallbackClosed()")[2..]),
+        "{closed}"
+    );
+    let now = harness.now().await;
+    rpc.ok("evm_increaseTime", json!([opens_at - now])).await;
     rpc.ok(
         "eth_sendTransaction",
         json!([{
@@ -658,4 +746,62 @@ via_ir = true
         .ok("eth_getTransactionCount", json!([WORKER, "latest"]))
         .await;
     assert_eq!(nonce, json!("0xe"));
+
+    // The owner names another activator: the vault refuses the worker's
+    // activateNotes (NotActivator(), before anything else), and the worker
+    // proves and sends nothing, reporting not_activator, until the owner
+    // names its sender again.
+    harness.set_activator(COMPETITOR).await;
+    harness.deposit(1).await;
+    let proofs = service.status().totals.proofs_total;
+    service.poll_once().await.unwrap();
+    service.poll_once().await.unwrap();
+    let status = service.status();
+    assert_eq!(status.state, WorkerState::Blocked);
+    assert_eq!(status.blocked_reason, Some(ActivationBlocked::NotActivator));
+    assert_eq!(status.chain.activator.as_deref(), Some(COMPETITOR));
+    assert!(status.pending_call.is_none());
+    assert_eq!(status.totals.proofs_total, proofs);
+    for tag in ["latest", "pending"] {
+        let nonce = rpc
+            .ok("eth_getTransactionCount", json!([WORKER, tag]))
+            .await;
+        assert_eq!(nonce, json!("0xe"), "{tag}");
+    }
+    let root = Felt252(
+        rpc.word(&vault, selector("currentRoot()"))
+            .await
+            .try_into()
+            .unwrap(),
+    );
+    let refused = activate_calldata(38, 1, &root, &root, &[0; 256]).unwrap();
+    let refused = rpc
+        .call(
+            "eth_call",
+            json!([{ "from": WORKER, "to": vault, "data": format!("0x{}", hex::encode(refused)) }, "latest"]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&selector("NotActivator()")[2..]),
+        "{refused}"
+    );
+    harness.set_activator(WORKER).await;
+    service.poll_once().await.unwrap();
+    assert_eq!(service.status().state, WorkerState::Submitted);
+    rpc.mine().await;
+    service.poll_once().await.unwrap();
+    rpc.mine().await;
+    service.poll_once().await.unwrap();
+    let status = service.status();
+    assert_eq!(status.state, WorkerState::Idle);
+    assert_eq!(status.chain.activator.as_deref(), Some(WORKER));
+    assert_eq!(harness.cursor().await, 39);
+    harness.assert_tree().await;
+    let nonce = rpc
+        .ok("eth_getTransactionCount", json!([WORKER, "latest"]))
+        .await;
+    assert_eq!(nonce, json!("0xf"));
 }

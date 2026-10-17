@@ -28,11 +28,15 @@ struct Args {
     #[arg(long, env = "ZKAPI_ACTIVATION_INDEXER_URL")]
     indexer_url: String,
     /// Dedicated gas-paying account managed by the configured signer RPC.
-    /// Never the challenger's sender: each daemon owns its nonces.
+    /// Never the challenger's sender: each daemon owns its nonces. It must be
+    /// the vault's activator() (the owner's setActivator): until it is, the
+    /// worker sends nothing and reports not_activator.
     #[arg(long, env = "ZKAPI_ACTIVATION_SENDER")]
     sender: String,
     /// The deployment manifest (`trusted_deployment` profile): the vault,
-    /// adapter and Poseidon codehashes, setup and verifying-key hashes.
+    /// adapter and Poseidon codehashes, setup and verifying-key hashes, and
+    /// optionally the activator (startup refuses a vault whose activator()
+    /// differs).
     #[arg(long, env = "ZKAPI_DEPLOYMENT_MANIFEST")]
     deployment: PathBuf,
     /// Must equal the manifest's; defaults to it.
@@ -112,7 +116,7 @@ struct Args {
     stale_poll_seconds: u64,
     #[arg(long, default_value_t = 300)]
     startup_grace_seconds: u64,
-    /// Default: 0.72M gas (a 16-note activation) times --max-fee-per-gas-wei,
+    /// Default: 0.75M gas (a 16-note activation) times --max-fee-per-gas-wei,
     /// at most --tx-fee-cap-wei.
     #[arg(long)]
     min_sender_balance_wei: Option<u128>,

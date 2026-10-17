@@ -495,9 +495,11 @@ The drill vault tests the adversarial cases with short timings. It uses the
 `dev` setup, so it is a drill only: its toxic waste is public.
 
 1. Deploy with the drill parameters (table below), `SETUP_MANIFEST` pointing
-   at `protocol/setup/v2-concession-dev/manifest.json` and `ALLOW_DEV_SETUP=1`
+   at `protocol/setup/v2-concession-dev/manifest.json`, `ALLOW_DEV_SETUP=1`
    (recorded as `allowDevSetup: true`; a profile built from it is a drill
-   profile only). Deploy the gasless-withdrawal paymaster with it as in
+   profile only) and `ACTIVATOR` the address of the drill activation
+   signer's key (step 2, "Running the drill stack"). Deploy the
+   gasless-withdrawal paymaster with it as in
    [B2, step 2](#b2-production-sepolia), with `PAYMASTER_ESCAPES=1`: the
    drill sponsors escape initiations, which no published profile does.
    Finalize the manifest as in [B2, step 3](#b2-production-sepolia).
@@ -557,8 +559,9 @@ The drill vault tests the adversarial cases with short timings. It uses the
    `--raise-lead-seconds 1800`; the activation signer (a second
    `node docker/aws/signer/server.mjs`, with `ZKAPI_SIGNER_PROFILE=activation`
    and only the variables of `docker/aws/activation-signer.env.example`: a key
-   and funded sender of its own, `ZKAPI_ACTIVATION_VAULT` set to the drill
-   vault and `ZKAPI_ACTIVATION_PORT` other than the challenge signer's);
+   of its own, whose funded address is the drill vault's `ACTIVATOR`,
+   `ZKAPI_ACTIVATION_VAULT` set to the drill vault and
+   `ZKAPI_ACTIVATION_PORT` other than the challenge signer's);
    `zkapi-activated` with `--deployment`, `--rpc-url` at the activation signer,
    `--sender` its sender, `--indexer-url`, `--checkpoint`,
    `--max-fee-per-gas-wei` and `--max-priority-fee-per-gas-wei` (within the
@@ -669,15 +672,18 @@ worker's) and data directory. Prefer a separate VM; to share one, see
 1. **Keys.** Generate fresh state and clearance seeds into the new
    `server.env` and print the public keys
    ([Signing seeds](../docker/aws/README.md#signing-seeds)). Never reuse the
-   legacy deployment's seeds.
+   legacy deployment's seeds. Generate the activation signer's new private key
+   too (step 6), and note its address: the vault takes `activateNotes` only
+   from it.
 2. **Deploy.** From `demo/contracts`, run `Deploy.s.sol` with `OWNER` (a
-   multisig, ideally behind a timelock), `TREASURY`, the four key
-   coordinates, the Sepolia production parameters,
+   multisig, ideally behind a timelock), `TREASURY`, `ACTIVATOR` (the
+   activation signer's address from step 1), the four key coordinates, the
+   Sepolia production parameters,
    `SETUP_MANIFEST=../../protocol/setup/v2-concession/manifest.json`,
    optionally `POSEIDON_ADDRESS` (an existing library with the compiled
    codehash) and `CHAIN_ID=11155111`; see [the contract notes](deployment.md#contracts).
    The script checks the keys, links the library, deploys the adapter and
-   the vault with 11 constructor arguments, checks the adapter's
+   the vault with 12 constructor arguments, checks the adapter's
    `CIRCUIT_ID_HASH()` and verifying-key hashes against the setup manifest,
    and writes only the provisional manifest `$OUTPUT_PATH.pending`.
 
@@ -710,9 +716,9 @@ worker's) and data directory. Prefer a separate VM; to share one, see
    It reads the creation receipts from forge's broadcast log
    (`demo/contracts/broadcast/Deploy.s.sol/<chainId>/run-latest.json`, or
    `--broadcast-log`), checks every creation, the three runtime codehashes,
-   the owner and the treasury on chain (with the paymaster: the eight
-   codehashes, its deposit, both stakes, its policy, ceilings, gas policy and
-   owner), and only then writes `$OUTPUT_PATH`
+   the owner, the treasury and the activator on chain (with the paymaster:
+   the eight codehashes, its deposit, both stakes, its policy, ceilings, gas
+   policy and owner), and only then writes `$OUTPUT_PATH`
    with `deploymentStatus: "deployed"`, `deployBlock` (the vault's creation
    block) and `deployTransactions`. Keep the broadcast log until then: there
    is no fallback without it. Re-audit later with
@@ -724,7 +730,8 @@ worker's) and data directory. Prefer a separate VM; to share one, see
        'challengePeriod()(uint64)' 'noteTtl()(uint64)' 'maxPauseDuration()(uint64)' \
        'requestChargeCap()(uint128)' 'PROTOCOL_VERSION()(uint16)' 'CONCESSION_ESCAPE_VERSION()(uint16)' \
        'NOTE_BOUND_EXIT_VERSION()(uint16)' 'PAUSE_COOLDOWN()(uint64)' 'ESCAPE_PAYOUT_GAS()(uint256)' \
-       'currentRoot()(uint256)' 'nextNoteId()(uint32)' 'activationCursor()(uint32)' 'proofAdapter()(address)'; do
+       'currentRoot()(uint256)' 'nextNoteId()(uint32)' 'activationCursor()(uint32)' 'proofAdapter()(address)' \
+       'activator()(address)' 'ACTIVATION_FALLBACK_DELAY()(uint64)' 'activationFallbackOpensAt()(uint64)'; do
      printf '%s ' "$getter"; cast call "$NEW_VAULT" "$getter" --rpc-url "$RPC_URL"
    done
    ADAPTER=$(cast call "$NEW_VAULT" 'proofAdapter()(address)' --rpc-url "$RPC_URL")
@@ -739,7 +746,10 @@ worker's) and data directory. Prefer a separate VM; to share one, see
    `NOTE_BOUND_EXIT_VERSION` 1, `PAUSE_COOLDOWN` 86400,
    `ESCAPE_PAYOUT_GAS` 100000, `currentRoot()` the empty tree's root
    (`0x1eb94e909bac5b6e3331993876bdde00f84b31e0103a29af6617fc021318b81e`),
-   `nextNoteId()` and `activationCursor()` 0, `CIRCUIT_ID_HASH`
+   `nextNoteId()` and `activationCursor()` 0, `activator()` the activation
+   signer's address, `ACTIVATION_FALLBACK_DELAY` 3600 and
+   `activationFallbackOpensAt()` the vault's creation block's timestamp plus
+   3600, `CIRCUIT_ID_HASH`
    `0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1`
    (keccak256 of `zkapi-v2-concession-v2`), and the five VK hashes of
    `protocol/setup/v2-concession/manifest.json`. Compare the four key getters
@@ -810,18 +820,19 @@ worker's) and data directory. Prefer a separate VM; to share one, see
    [Activation worker and its signer](../docker/aws/README.md#activation-worker-and-its-signer):
    `activation-signer.env` from
    [`activation-signer.env.example`](../docker/aws/activation-signer.env.example)
-   with another new private key (never the challenge signer's), its
+   with the private key of step 1 (never the challenge signer's), its
    upstream RPC, `ZKAPI_ACTIVATION_VAULT` set to the new vault and its fee
    cap, and `activation.env` with
    `ZKAPI_ACTIVATION_RPC_URL=http://activation-signer:8547`,
-   `ZKAPI_ACTIVATION_SENDER` (the activation signer's sender) and the
-   worker's fee caps, at most the activation signer's. Fund that sender,
-   apart from the challenger's, for one pending activation (0.072 ETH for 16
-   notes at a 100 gwei cap) plus the activations expected until the next
-   top-up (about 277,000 gas each at low volume, where every deposit is
-   activated alone). Run the operator's ERC-4337 bundler at `BUNDLER_HOST`
-   with the paymaster and the factory whitelisted, as
-   [Operating gasless withdrawals](deployment.md#operating-gasless-withdrawals)
+   `ZKAPI_ACTIVATION_SENDER` (the activation signer's sender, the vault's
+   `activator()`) and the worker's fee caps, at most the activation
+   signer's. Fund that sender, apart from the challenger's, for one pending
+   activation (about 0.075 ETH for 16 notes at a 100 gwei cap, the worker's
+   default low-balance warning) plus the activations
+   expected until the next top-up (about 286,000 gas each at low volume,
+   where every deposit is activated alone). Run the operator's ERC-4337
+   bundler at `BUNDLER_HOST` with the paymaster and the factory whitelisted,
+   as [Operating gasless withdrawals](deployment.md#operating-gasless-withdrawals)
    describes.
 7. **Start in this order:** the indexer from `DEPLOY_BLOCK`, `zkapi db init`
    (the `db-init` service), the challenger, the activation worker (the
@@ -1151,14 +1162,16 @@ the same calls as Safe transactions.
 
 ### Pause
 
-`pause()` blocks `deposit`, `claimExpired`, `setTreasury`, `acceptTreasury`,
-`withdrawTreasuryArrears` and `renounceOwnership` until `unpause()`. It blocks
-`initiateEscapeWithdrawal` and `mutualClose` for at most `maxPauseDuration()`:
-from `pausedAt() + maxPauseDuration()` they reopen while still paused.
-Defeats, raises, `finalizeEscapeWithdrawal`, `claimEscapePayout`,
-`retireClosedLeaf`, `cancelTreasuryChange`, `transferOwnership` and
-`acceptOwnership` stay open. A new pause needs `PAUSE_COOLDOWN()` (one day)
-since the latest unpause (`PauseCooldown()` otherwise). Paused time extends
+`pause()` blocks `deposit`, both activations, `claimExpired`, `setTreasury`,
+`acceptTreasury`, `withdrawTreasuryArrears` and `renounceOwnership` until
+`unpause()`, which closes the on-chain activation fallback for another hour.
+It blocks `initiateEscapeWithdrawal` and `mutualClose` for at most
+`maxPauseDuration()`: from `pausedAt() + maxPauseDuration()` they reopen while
+still paused. Defeats, raises, `finalizeEscapeWithdrawal`, `claimEscapePayout`,
+`retireClosedLeaf`, `cancelTreasuryChange`, `setActivator`,
+`transferOwnership` and `acceptOwnership` stay open. A new pause needs
+`PAUSE_COOLDOWN()` (one day) since the latest unpause (`PauseCooldown()`
+otherwise). Paused time extends
 every note's claim time, and after any unpause `claimExpired` waits at least
 `unpauseClaimGrace()`. A pause does not move pending escapes' deadlines: the
 challenger must still act in each window, which it can while paused. Alert on
@@ -1209,6 +1222,36 @@ cast send "$NEW_VAULT" 'acceptOwnership()' --rpc-url "$RPC_URL" --account "$NEW_
 cast call "$NEW_VAULT" 'owner()(address)' --rpc-url "$RPC_URL"          # the new owner
 cast call "$NEW_VAULT" 'pendingOwner()(address)' --rpc-url "$RPC_URL"   # zero
 ```
+
+### Activator rotation
+
+`setActivator(address)` (owner only, open while paused) names the only sender
+whose `activateNotes` the vault accepts, the activation worker's
+(`ActivatorChanged(previousActivator, newActivator)`); it leaves the
+fallback's opening alone. To move the worker to a new key, follow
+[the activator](activation-worker.md#the-activator): fund the new sender,
+wait until the worker's status shows no `pending_call`, and stop it (with
+B2 step 7's `dc`):
+
+```sh
+dc stop activator
+cast send "$NEW_VAULT" 'setActivator(address)' "$NEW_ACTIVATION_SENDER" --rpc-url "$RPC_URL" --account "$OWNER_ACCOUNT"
+cast call "$NEW_VAULT" 'activator()(address)' --rpc-url "$RPC_URL"   # the new sender
+```
+
+Then put the new key in `activation-signer.env` and the new sender in
+`activation.env` (`ZKAPI_ACTIVATION_SENDER`), record the new activator as
+`activator` in `/etc/zkapi/deployment.json` and in the finalized manifest
+`$OUTPUT_PATH` that `scripts/deployment-profile.mjs` reads (the worker
+refuses to start while the manifest names another one, and a profile
+regenerated from `$OUTPUT_PATH` would otherwise name the old activator
+again), move `/var/lib/zkapi/activation.json` aside (a checkpoint belongs to
+one sender), and start both again:
+`dc up -d --wait --force-recreate activation-signer`, then
+`dc up -d --wait activator`. If the old key may be compromised, call
+`setActivator` first, without waiting: the old key can then only send
+transactions that revert `NotActivator()`. Alert on any `ActivatorChanged`
+you did not send.
 
 ### Treasury arrears
 
@@ -1407,9 +1450,9 @@ addresses for new proofs.
 
 **Escape exposure.** Sponsored escape initiations stay disabled in every
 published profile. Each defeated sponsored escape costs the float the
-initiation (about 1.19M gas) on top of the operator's defeat (357,330 gas)
-and the note's activation (about 37,500 gas in a batch of 16, 276,800
-alone), against the attacker's deposit gas (77,140; the deposit itself comes
+initiation (about 1.19M gas) on top of the operator's defeat (357,418 gas)
+and the note's activation (about 37,800 gas in a batch of 16, 286,100
+alone), against the attacker's deposit gas (77,206; the deposit itself comes
 back by a later exit): about 21:1 to 24:1 against the operator (the
 arithmetic is in [Operating gasless withdrawals](deployment.md#operating-gasless-withdrawals)).
 A dust note cannot start a sponsored escape, whose payout must cover its
@@ -1505,13 +1548,18 @@ refuses them everywhere.
   was not activated when its escape paid out is retired once an activation
   appends its leaf, and serves no request before that.
 - **The retirement budget.** The signer bounds leaf retirements per rolling
-  day, counted per nonce. Anyone who forces root races by front-running
-  activations can spend it and delay a retirement after a missed defeat; the
-  miss itself is already critical.
+  day, counted per nonce. Root races with activations can spend it and delay
+  a retirement after a missed defeat; only the activator proves activations,
+  so a third party can race only with `activateNotesOnChain` (about 1.66M gas
+  each) once no proved activation has landed for an hour. The miss itself is
+  already critical.
 - **Activation liveness.** A deposit makes requests only once activated. If
-  the operator's activation worker stops, deposits wait (anyone can still
-  activate with `activateNotesOnChain`, at far higher gas); exits never wait.
-  A pause also stops activations.
+  the operator's activation worker stops, deposits wait (an hour after its
+  last proved activation anyone can activate with `activateNotesOnChain`, at
+  far higher gas); exits never wait. A pause also stops activations, and an
+  unpause closes the fallback for another hour. An activator that proves
+  rarely keeps the fallback closed while it slows activation; it can neither
+  skip nor reorder a note.
 - **Insertion keys.** Whoever can forge an insertion proof can set the request
   tree's root: requests without a deposit, and a root nobody else can extend
   or retire under. Exits do not depend on these keys, so funds stay safe; the

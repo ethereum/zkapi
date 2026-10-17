@@ -181,6 +181,8 @@ test('profiles come only from a finalized Deploy.s.sol manifest', () => {
         insertion4VkKeccak256: `0x${'a4'.repeat(32)}`, insertion16VkKeccak256: `0x${'a6'.repeat(32)}`,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
         challengePeriod: 3_600, noteTtl: 2_592_000, maxPauseDuration: 7_200,
+        // Deploy.s.sol writes addresses checksummed.
+        activator: '0xAbCd00000000000000000000000000000000Acc1',
         // Deploy.s.sol writes the key coordinates as decimal strings.
         stateSigningKeyX: '1', stateSigningKeyY: '2', clearanceSigningKeyX: '3', clearanceSigningKeyY: '18446744073709551617',
     };
@@ -197,6 +199,8 @@ test('profiles come only from a finalized Deploy.s.sol manifest', () => {
     assert.equal(profile.vault_revision, 4);
     assert.equal(profile.settlement_window_seconds, 962);
     assert.equal(profile.allow_dev_setup, true);
+    // The activation worker's sender, the only address the vault takes activateNotes from.
+    assert.equal(profile.activator, '0xabcd00000000000000000000000000000000acc1');
     // The server stack's profile pins all five verifying keys of the adapter.
     assert.deepEqual([profile.request_vk_keccak256, profile.withdrawal_vk_keccak256, profile.insertion1_vk_keccak256,
         profile.insertion4_vk_keccak256, profile.insertion16_vk_keccak256],
@@ -211,6 +215,12 @@ test('profiles come only from a finalized Deploy.s.sol manifest', () => {
     const withoutNoteBoundExits = { ...finalized };
     delete withoutNoteBoundExits.noteBoundExitVersion;
     assert.throws(() => trustedDeployment(withoutNoteBoundExits, services), /no note-bound exits/);
+    // A vault without an activator role (a manifest from before it) is not this deployment.
+    const withoutActivator = { ...finalized };
+    delete withoutActivator.activator;
+    for (const manifest of [withoutActivator, { ...finalized, activator: `0x${'0'.repeat(40)}` }, { ...finalized, activator: '0x1234' }]) {
+        assert.throws(() => trustedDeployment(manifest, services), /names no activator/);
+    }
 });
 
 test('the companion\'s proxy admits only its own basic credentials', () => {
@@ -288,7 +298,7 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
         insertion1VkKeccak256: setup.vk_keccak256.insertion1, insertion4VkKeccak256: setup.vk_keccak256.insertion4,
         insertion16VkKeccak256: setup.vk_keccak256.insertion16,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
-        challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800,
+        challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800, activator: '0xAbCd00000000000000000000000000000000Acc1',
         // Deploy.s.sol writes decimal coordinates; a 77-digit one would not
         // parse as the hex every consumer reads.
         stateSigningKeyX: (2n ** 252n + 7n).toString(), stateSigningKeyY: '2', clearanceSigningKeyX: '3', clearanceSigningKeyY: '4',
@@ -394,7 +404,7 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
         insertion1VkKeccak256: setup.vk_keccak256.insertion1, insertion4VkKeccak256: setup.vk_keccak256.insertion4,
         insertion16VkKeccak256: setup.vk_keccak256.insertion16,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
-        challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800,
+        challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800, activator: '0xAbCd00000000000000000000000000000000Acc1',
         stateSigningKeyX: '1', stateSigningKeyY: '2', clearanceSigningKeyX: '3', clearanceSigningKeyY: '4',
         // The gasless block, as Deploy.s.sol writes it (checksummed addresses, wei as decimal strings).
         entryPoint: '0x0000000071727De22E5E9d8BAf0edAc6f37da032', entryPointRuntimeCodehash: ENTRY_POINT_V070_CODEHASH,

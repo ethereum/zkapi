@@ -18,10 +18,12 @@ The vault activates in deposit order, in aligned batches of 1, 4 or 16 notes:
 - `activateNotes(firstNoteId, count, expectedRoot, newRoot, proof)` checks an
   insertion proof against inputs it builds from its own state
   (`[expectedRoot, newRoot, firstNoteId, C_0, M_0, …]`, with each note's
-  commitment and packed amount and expiry read from storage). This is what the
-  worker sends.
+  commitment and packed amount and expiry read from storage). Only the
+  vault's `activator()` may call it (else `NotActivator()`): this is what the
+  worker sends, from that address.
 - `activateNotesOnChain(firstNoteId, count, siblings)` hashes the batch and
-  its path on chain instead. Anyone may call it; see
+  its path on chain instead. Anyone may call it once no proved activation has
+  landed for an hour; see
   [the permissionless fallback](#the-permissionless-fallback).
 
 Both require `firstNoteId == activationCursor()`, `firstNoteId % count == 0`,
@@ -29,6 +31,14 @@ recorded notes, and an unpaused vault; `activateNotes` also requires
 `expectedRoot == currentRoot()`. Activation inserts each note's original leaf
 whatever its status, so a note that closed before its activation still gets
 its leaf (the challenger retires it afterwards when it has to).
+
+Proofs are the activator's alone because every batch must be aligned and the
+insertion proving keys are public. If anyone could prove, a third party could
+land a proved singleton (about 276,000 gas) just ahead of the worker's batch
+of 16 and force the other 15 notes through batches of 1 and 4, costing the
+operator more than 1.2M gas beyond that one batch; an early
+`activateNotesOnChain` would do the same, hence its delay (below). Exits never
+depend on activation, so this is about the operator's gas, never about funds.
 
 ## Running it
 
@@ -50,7 +60,8 @@ RUST_LOG=info target/release/zkapi-activated \
 Start it after the indexer and the challenger, before the API server takes
 deposits. It needs no server database and holds no signing key of the
 protocol: it proves with the setup's insertion proving keys and sends from an
-account of its own.
+account of its own, which must be the vault's activator
+([below](#the-activator)).
 
 The RPC must implement `eth_sendTransaction` with an operator-controlled
 signer for the dedicated, funded sender. Give the worker **its own signer
@@ -76,7 +87,7 @@ signer as the `activation-signer` service (with `activation-signer.env`, from
 | --- | --- | --- | --- |
 | `--rpc-url` | `ZKAPI_ACTIVATION_RPC_URL` | required | Signer RPC for `--sender`. |
 | `--indexer-url` | `ZKAPI_ACTIVATION_INDEXER_URL` | required | The indexer whose `/v1/tree/notes/{id}/path` serves the siblings of the cursor's slot. |
-| `--sender` | `ZKAPI_ACTIVATION_SENDER` | required | Dedicated gas-paying account. |
+| `--sender` | `ZKAPI_ACTIVATION_SENDER` | required | Dedicated gas-paying account: the vault's `activator()`. |
 | `--deployment` | `ZKAPI_DEPLOYMENT_MANIFEST` | required | The deployment manifest (`trusted_deployment` profile). |
 | `--chain-id`, `--contract-address` | | the manifest's | Optional; must equal the manifest. |
 | `--checkpoint` | `ZKAPI_ACTIVATION_CHECKPOINT` | required | The worker's durable state (its pending transaction and counters). |
@@ -94,12 +105,53 @@ signer as the `activation-signer` service (with `activation-signer.env`, from
 | `--pending-warning-seconds`, `--pending-critical-seconds` | | 600, 3600 | Wait of the oldest pending note at which the status warns, then is critical. |
 | `--blocked-warning-seconds`, `--critical-blocked-seconds` | | 120, 1800 | Blocked time at which the status warns, then is critical. |
 | `--stale-poll-seconds`, `--startup-grace-seconds` | | 300, 300 | Poll staleness alarm; warning-only time before the first successful poll. |
-| `--min-sender-balance-wei` | | 0.72M gas x max fee | Balance below which the status warns (one 16-note activation). |
+| `--min-sender-balance-wei` | | 0.75M gas x max fee, at most `--tx-fee-cap-wei` | Balance below which the status warns (one 16-note activation, with headroom). |
+
+## The activator
+
+The vault accepts `activateNotes` from one address, `activator()`
+(`0x4ecea992`), and reverts `NotActivator()` (`0xb2df0af0`) for any other
+sender while the vault is unpaused, before any other check (the range, the
+root, the proof); a paused vault reverts `Paused()` first. The worker's
+`--sender` must be that address: deploy the vault with `ACTIVATOR` set to it,
+the address of the activation signer's key
+([the contract notes](deployment.md#contracts)), and check
+`cast call "$VAULT" 'activator()(address)'` before starting the worker. The
+constructor emits `ActivatorChanged(address(0), activator)`.
+
+The owner moves the role with `setActivator(address)` (`0x7c0cc0be`), which
+takes a nonzero address, works while the vault is paused too, emits
+`ActivatorChanged(previousActivator, newActivator)` (topic
+`0xbd0aa56c02389240616a23c1d092ae6238c0e2847610bc4d302628e56cfee2e4`), and
+leaves the fallback's opening alone. To move the worker to a new key or
+sender:
+
+1. Fund the new sender, whose key the activation signer will hold.
+2. Wait until the worker's status shows no `pending_call`, then stop it, so
+   that no transaction from the old sender is in flight.
+3. From the owner, call `setActivator(newSender)`, and check `activator()`.
+4. Restart the activation signer with the new key, and record the new
+   activator in the deployment manifest (`activator`): the worker refuses to
+   start while the manifest names another one. Record it too in the
+   finalized manifest that `scripts/deployment-profile.mjs --finalized`
+   reads, or a profile regenerated from it names the old activator again.
+   Then start the worker with the new `--sender` and a new `--checkpoint`:
+   a checkpoint belongs to one sender (with Docker, move
+   `/var/lib/zkapi/activation.json` aside).
+
+Deposits wait from step 2 to step 4, and if that lasts an hour past the last
+proved batch, anyone can activate with the fallback meanwhile. If the worker's
+key may be compromised, skip the wait and call `setActivator` at once: the
+old key's transactions then revert `NotActivator()`. An activator can do no
+more than activate the recorded notes in order (it can neither skip, reorder
+nor alter one), so a stolen activator key risks only its account's balance
+and the pace of activations.
 
 ## What it does
 
 Every poll reads, at one block, `nextNoteId()`, `activationCursor()`,
-`currentRoot()` and `paused()`.
+`currentRoot()`, `paused()`, `activator()` and
+`activationFallbackOpensAt()`.
 
 **Batch size.** The largest of 16, 4 and 1 that is aligned at the cursor
 (`cursor % K == 0`) and filled by recorded notes. When that is also the
@@ -139,8 +191,11 @@ revision 4, `NOTE_BOUND_EXIT_VERSION() == 1`, the adapter's circuit and
 request and withdrawal verifying keys equal to the setup's, and the three
 runtime codehashes), and requires each proving key's verifying key to equal
 the adapter's `INSERTION1_VK_HASH()`, `INSERTION4_VK_HASH()` and
-`INSERTION16_VK_HASH()`, and to be of the manifest's setup. A mismatch exits;
-an unreadable RPC is retried.
+`INSERTION16_VK_HASH()`, and to be of the manifest's setup. When the manifest
+records an `activator`, the vault's `activator()` must be it. A mismatch
+exits; an unreadable RPC is retried. A `--sender` that is not the vault's
+activator does not stop the worker: it is reported (below), since the owner
+may still name it.
 
 **Sending.** Before every send the worker simulates the call (`eth_call`),
 estimates its gas (plus 20%), and writes the nonce, call, proof and fees to the
@@ -161,10 +216,15 @@ Otherwise it is obsolete, and replaced on its nonce by a fresh batch.
 
 Measured on Anvil against the revision-4 vault and the generated adapter
 (`tests/activation_anvil.rs`), an `activateNotes` receipt (intrinsic gas and
-calldata included) shows about 276,800 gas for 1 note, 343,200 for 4 and
-599,900 for 16 (a few dozen gas more or less with the calldata's bytes), so
-about 37,500 per note at 16. CI's pinned Forge measures 270,403, 332,701 and
-589,430 with cold contracts (`protocol/contracts/snapshots/activation-gas.json`).
+calldata included) shows about 286,100 gas for 1 note, 348,400 for 4 and
+605,200 for 16 (a few dozen gas more or less with the calldata's bytes), so
+about 37,800 per note at 16. CI's pinned Forge measurement, with cold
+contracts, is 275,635, 337,933 and 594,662
+(`protocol/contracts/snapshots/activation-gas.json`). Both include the write
+of `activationFallbackOpensAt()`, which costs about 2,800 gas less when the
+activation lands in the same second as the previous write (a proved
+activation, the deployment or an unpause), as some of the Anvil test's
+batches do (about 283,300, 345,600 and 602,400).
 
 ## Races and failure modes
 
@@ -174,9 +234,9 @@ rebuilding from fresh state.
 
 - **Deposits while proving.** They change neither the cursor nor the root:
   the batch is a prefix of the recorded notes and stays valid.
-- **A competing activation** (anyone's `activateNotesOnChain`, or another
-  worker) **or a leaf retirement** (the challenger's `retireClosedLeaf`, which
-  moves the root) landing first:
+- **A competing activation** (an `activateNotesOnChain` once the fallback is
+  open, or another worker sending as the activator) **or a leaf retirement**
+  (the challenger's `retireClosedLeaf`, which moves the root) landing first:
   - while proving: the worker re-reads the cursor and root after proving and
     discards the batch (`rebuilding`, counted in `stale_rebuilds_total`);
   - in simulation: `StaleActivation()` (`0x9c9413a1`) or `InvalidActivation()`
@@ -213,6 +273,12 @@ rebuilding from fresh state.
   unsendable (`InvalidActivation()` or `InvalidProof()`): it is replaced on
   its nonce by a fresh batch. A batch undone after confirmation depth is
   activated again from the chain's state (the counters are not rewound).
+- **Not the activator**: while the vault's `activator()` is not `--sender`
+  (a vault deployed with another `ACTIVATOR`, or after a `setActivator`), the
+  vault refuses every batch (`NotActivator()`, `0xb2df0af0`). The worker
+  sends nothing and reports `not_activator`; a transaction already pending
+  stays on its nonce and reverts if it mines. It resumes once the owner
+  names its sender. Meanwhile deposits wait for the fallback.
 - **A paused vault**: activation reverts while paused; the worker reports
   `paused` and waits.
 - **`InvalidProof()`** (`proof_rejected`, critical at once): the adapter
@@ -232,40 +298,57 @@ rebuilding from fresh state.
 - `state`: `starting`, `idle`, `waiting` (a larger batch is filling; see
   `next_batch.activate_by`), `proving`, `submitted`, `confirming`,
   `rebuilding`, `paused`, `dry_run` or `blocked` (with `blocked_reason` and
-  `blocked_since`);
+  `blocked_since`; `not_activator` while the vault's `activator()` is not
+  `--sender`, which escalates with time like the other reasons until the
+  owner names the sender);
 - `queue`: `activation_cursor`, `next_note_id`, `pending_notes` and the age of
   the oldest pending note;
 - `next_batch`, `pending_call` (nonce, batch, hash, attempts, fees) and
   `last_batch` (batch, outcome, proving time, gas used, hash, block);
 - `totals`: batches by size, notes activated, reverted transactions, stale
   rebuilds, proofs and proving time, gas used;
-- `sender` (balance and fee caps), `chain`, `poll`, and `alarms`.
+- `sender` (balance and fee caps), `chain` (with the vault's `activator` and
+  `activation_fallback_opens_at`, read every poll), `poll`, and `alarms`.
 
 The status warns when the oldest pending note waits past
 `--pending-warning-seconds` and is critical past `--pending-critical-seconds`:
 deposits then cannot make requests. If the worker cannot recover in time,
-activate with the fallback below.
+activate with the fallback below, which opens an hour after the last proved
+activation (`chain.activation_fallback_opens_at`).
 
 ## The permissionless fallback
 
 Activation never depends on the operator's prover:
 `activateNotesOnChain(firstNoteId, count, siblings)` (`0x027e21e9`) is open to
-anyone while the vault is unpaused. It takes the same aligned batch at the
-cursor and the 32 siblings of slot `firstNoteId` in the current tree (entries
-below the batch's height are ignored), which the indexer serves or any client
-rebuilds from the vault's events; it hashes the leaves and both paths on chain
-and emits `NotesActivated` with `proved = false`. It costs far more gas (about
-1.66M for one note, 1.89M for 4 and 3.08M for 16).
+anyone while the vault is unpaused, from `activationFallbackOpensAt()`
+(`0x3a02aa08`) on: `ACTIVATION_FALLBACK_DELAY()` (`0x4c81d3cd`, 1 hour) after
+the latest proved activation, the deployment or the latest unpause, whichever
+is last. Before then it reverts `ActivationFallbackClosed()` (`0x67df368d`),
+checked before anything else. On-chain activations do not move the opening,
+so once the activator has been idle for an hour the fallback stays open until
+its next proved batch. While the worker proves, then, nobody can activate a
+note ahead of it and break its batches' alignment, and if it stops, anyone can
+activate an hour later.
+
+The call takes the same aligned batch at the cursor and the 32 siblings of
+slot `firstNoteId` in the current tree (entries below the batch's height are
+ignored), which the indexer serves or any client rebuilds from the vault's
+events; it hashes the leaves and both paths on chain and emits
+`NotesActivated` with `proved = false`. It costs far more gas (about 1.66M for
+one note, 1.89M for 4 and 3.08M for 16).
 
 The vault accepts only the batch at the cursor, so a given note is reached one
 aligned batch at a time, from `activationCursor()` up to the batch holding it.
-This loop does that: each round re-reads the cursor, `nextNoteId()` and the
-root, takes the cursor slot's path from the indexer only once the indexer's
-view has the vault's cursor and root, and sends the largest batch of 16, 4 or
-1 that is aligned at the cursor and recorded. Set `TARGET` to the note to
-reach; by default it activates every recorded note. It stops at the first
-failed send (a paused vault, or another activation landing first): run it
-again, since it reads everything afresh.
+This loop does that: each round re-reads the cursor and `nextNoteId()`, then
+waits while the latest block's timestamp is before
+`activationFallbackOpensAt()` (the vault compares `block.timestamp`; a proved
+activation landing meanwhile moves the opening, and a note the worker reaches
+meanwhile ends the loop), then reads the root, takes the cursor slot's path
+from the indexer only once the indexer's view has the vault's cursor and root,
+and sends the largest batch of 16, 4 or 1 that is aligned at the cursor and
+recorded. Set `TARGET` to the note to reach; by default it activates every
+recorded note. It stops at the first failed send (a paused vault, or another
+activation landing first): run it again, since it reads everything afresh.
 
 ```sh
 TARGET=${TARGET:-$(( $(cast call --json "$VAULT" 'nextNoteId()(uint32)' --rpc-url "$RPC" | jq -r '.[0]') - 1 ))}
@@ -273,6 +356,11 @@ while :; do
   CURSOR=$(cast call --json "$VAULT" 'activationCursor()(uint32)' --rpc-url "$RPC" | jq -r '.[0]')
   NEXT=$(cast call --json "$VAULT" 'nextNoteId()(uint32)' --rpc-url "$RPC" | jq -r '.[0]')
   [ "$CURSOR" -le "$TARGET" ] && [ "$CURSOR" -lt "$NEXT" ] || break
+  OPENS=$(cast call --json "$VAULT" 'activationFallbackOpensAt()(uint64)' --rpc-url "$RPC" | jq -r '.[0]')
+  NOW=$(cast block latest --field timestamp --rpc-url "$RPC")
+  if [ "$NOW" -lt "$OPENS" ]; then
+    echo "the fallback opens in $((OPENS - NOW)) s"; sleep $((OPENS - NOW < 60 ? OPENS - NOW : 60)); continue
+  fi
   ROOT=$(cast call --json "$VAULT" 'currentRoot()(uint256)' --rpc-url "$RPC" | jq -r '.[0]')
   SLOT=$(curl -fsS --max-time 30 "$INDEXER/v1/tree/notes/$CURSOR/path")
   if [ "$(echo "$SLOT" | jq -r .activation_cursor)" != "$CURSOR" ] ||
@@ -290,10 +378,11 @@ done
 ```
 
 Numbers come from `cast call --json`: plain `cast call` annotates numbers of
-10,000 or more (`12345 [1.234e4]`). The indexer serves each sibling as a
-quoted hex string, and cast parses a `uint256[32]` argument only unquoted
-(`[0x0,0x3b56…,…]`), hence the `join`. A running worker treats such an
-activation like any other competing one.
+10,000 or more (`12345 [1.234e4]`); `cast block --field timestamp` prints a
+plain decimal. The indexer serves each sibling as a quoted hex string, and
+cast parses a `uint256[32]` argument only unquoted (`[0x0,0x3b56…,…]`), hence
+the `join`. A running worker treats such an activation like any other
+competing one.
 
 ## Revision-4 changes elsewhere in the server stack
 
@@ -322,8 +411,11 @@ a pending call, a dropped transaction, reorganizations (of a mined activation
 before and after confirmation depth, of a batch's deposit dropped or replaced
 under a pending or mined call, and across a restart), a persisted call failing
 simulation, an ambiguous send that never left, the replacement reserve spent at
-the critical threshold, a lagging indexer, `--dry-run` and the startup key
-pins. `cargo test --release -p zkapi-serverd --test activation_anvil` deploys
-the real vault and adapter on Anvil and runs the worker end to end, including
-two reorganizations by `evm_snapshot`/`evm_revert` (it skips without `forge`
-and `anvil`, and fails instead with `ZKAPI_REQUIRE_ANVIL=1`).
+the critical threshold, a lagging indexer, a sender that is not (or stops
+being) the activator, `--dry-run` and the startup key pins.
+`cargo test --release -p zkapi-serverd --test activation_anvil` deploys the
+real vault and adapter on Anvil, with the worker's sender as the activator,
+and runs the worker end to end, including a competing `activateNotesOnChain`
+once the fallback opens, an owner's `setActivator` away from the worker and
+back, and two reorganizations by `evm_snapshot`/`evm_revert` (it skips
+without `forge` and `anvil`, and fails instead with `ZKAPI_REQUIRE_ANVIL=1`).

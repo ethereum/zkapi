@@ -34,7 +34,7 @@
 // demo/contracts/broadcast/Deploy.s.sol/<chainId>/run-latest.json), and requires, through the RPC:
 // the manifest's chain; each receipt on chain, successful and creating the manifest's address; at
 // least --confirmations (default 1) blocks on the newest creation; every runtime codehash (the
-// manifest's, and on chain); and the vault's owner and treasury. With the paymaster it also
+// manifest's, and on chain); and the vault's owner, treasury and activator. With the paymaster it also
 // requires its creation receipt (the factory and the account logic are created by constructors
 // and are checked by their code), its EntryPoint deposit of at least the manifest's initial
 // deposit, its stake and the factory's, and its policy, fee ceilings, gas policy, fee keeper and
@@ -705,8 +705,8 @@ export async function finalizeDeployment({ artifacts, deployment, broadcastLog, 
     }
 
     const { expected, mismatches } = await auditDeployment({ artifacts, deployment, check: true, rpc });
-    // The codehashes cover the code and every immutable; owner and treasury are storage.
-    for (const field of ['owner', 'treasury']) {
+    // The codehashes cover the code and every immutable; owner, treasury and activator are storage.
+    for (const field of ['owner', 'treasury', 'activator']) {
         const word = await rpc('eth_call', [{ to: address(deployment.vault, 'vault'), data: selector(`${field}()`) }, 'latest']);
         if (typeof word !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(word)) fail(`${field}(): unexpected return ${word}`);
         const actual = `0x${word.slice(-40)}`.toLowerCase();
