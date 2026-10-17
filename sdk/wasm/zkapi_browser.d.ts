@@ -2,12 +2,14 @@
 /* eslint-disable */
 
 /**
- * The note tree rebuilt from vault logs (§6.6): `apply` one event, in log
- * order, and compare the returned root with the event's.
+ * The request tree rebuilt from vault logs (§6.6): `apply` one event, in
+ * log order, and compare the returned root with the root an activation
+ * or retirement reports (a deposit reports none).
  */
 export class BrowserNoteTree {
     free(): void;
     [Symbol.dispose](): void;
+    activation_cursor(): number;
     /**
      * Apply one `TreeEvent` (JSON) and return the new root (JSON felt).
      */
@@ -38,6 +40,18 @@ export function browser_complete_response(config_json: string, args_json: string
 export function browser_confirm_deposit(config_json: string, args_json: string): string;
 
 export function browser_generate_deposit(): string;
+
+/**
+ * `{note_id, activation_cursor, activated, queue_position}` (JSON) under
+ * the vault's `activationCursor()`.
+ */
+export function browser_note_activation(note_id: number, activation_cursor: number): string;
+
+/**
+ * `{registration_commitment, note_metadata, note_leaf}` (JSON) of the
+ * state's note: compare the first two with the vault's `notes(noteId)`.
+ */
+export function browser_note_binding(state_json: string): string;
 
 /**
  * Whether `{active_root, siblings}` (JSON) is a path of the state's note.
@@ -82,6 +96,8 @@ export interface InitOutput {
     readonly browser_complete_response: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly browser_confirm_deposit: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly browser_generate_deposit: () => [number, number, number, number];
+    readonly browser_note_activation: (a: number, b: number) => [number, number, number, number];
+    readonly browser_note_binding: (a: number, b: number) => [number, number, number, number];
     readonly browser_note_path_matches: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly browser_prepare_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
     readonly browser_prepare_withdrawal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
@@ -92,6 +108,7 @@ export interface InitOutput {
     readonly browser_verify_request: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
     readonly browser_wallet_status: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly browser_withdrawal_nullifier: (a: number, b: number) => [number, number, number, number];
+    readonly browsernotetree_activation_cursor: (a: number) => number;
     readonly browsernotetree_apply: (a: number, b: number, c: number) => [number, number, number, number];
     readonly browsernotetree_new: () => number;
     readonly browsernotetree_next_note_id: (a: number) => number;

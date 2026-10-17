@@ -1,8 +1,9 @@
 /* @ts-self-types="./zkapi_browser.d.ts" */
 
 /**
- * The note tree rebuilt from vault logs (§6.6): `apply` one event, in log
- * order, and compare the returned root with the event's.
+ * The request tree rebuilt from vault logs (§6.6): `apply` one event, in
+ * log order, and compare the returned root with the root an activation
+ * or retirement reports (a deposit reports none).
  */
 export class BrowserNoteTree {
     __destroy_into_raw() {
@@ -14,6 +15,13 @@ export class BrowserNoteTree {
     free() {
         const ptr = this.__destroy_into_raw();
         wasm.__wbg_browsernotetree_free(ptr, 0);
+    }
+    /**
+     * @returns {number}
+     */
+    activation_cursor() {
+        const ret = wasm.browsernotetree_activation_cursor(this.__wbg_ptr);
+        return ret >>> 0;
     }
     /**
      * Apply one `TreeEvent` (JSON) and return the new root (JSON felt).
@@ -281,6 +289,59 @@ export function browser_generate_deposit() {
         return getStringFromWasm0(ptr1, len1);
     } finally {
         wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * `{note_id, activation_cursor, activated, queue_position}` (JSON) under
+ * the vault's `activationCursor()`.
+ * @param {number} note_id
+ * @param {number} activation_cursor
+ * @returns {string}
+ */
+export function browser_note_activation(note_id, activation_cursor) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ret = wasm.browser_note_activation(note_id, activation_cursor);
+        var ptr1 = ret[0];
+        var len1 = ret[1];
+        if (ret[3]) {
+            ptr1 = 0; len1 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred2_0 = ptr1;
+        deferred2_1 = len1;
+        return getStringFromWasm0(ptr1, len1);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * `{registration_commitment, note_metadata, note_leaf}` (JSON) of the
+ * state's note: compare the first two with the vault's `notes(noteId)`.
+ * @param {string} state_json
+ * @returns {string}
+ */
+export function browser_note_binding(state_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.browser_note_binding(ptr0, len0);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
     }
 }
 

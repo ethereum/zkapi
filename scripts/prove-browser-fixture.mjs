@@ -10,7 +10,7 @@ const fixture = JSON.parse(fs.readFileSync(0, 'utf8'));
 const manifest = JSON.parse(fs.readFileSync(path.join(sdk, 'assets/manifest.json'), 'utf8'));
 const wasm = await import(pathToFileURL(path.join(sdk, 'wasm/zkapi_browser.js')));
 await wasm.default({ module_or_path: fs.readFileSync(path.join(sdk, 'wasm/zkapi_browser_bg.wasm')) });
-assert.equal(wasm.browser_circuit_id(), 'zkapi-v2-concession-v1');
+assert.equal(wasm.browser_circuit_id(), 'zkapi-v2-concession-v2');
 assert.equal(wasm.browser_circuit_id(), fixture.circuit_id);
 assert.equal(wasm.browser_setup_id(), manifest.setupId);
 const config = JSON.stringify(fixture.config);
