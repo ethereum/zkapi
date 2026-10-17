@@ -111,7 +111,7 @@ func TestGuidedFundingShowsVerifyingStageAndStopsOnConflict(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "deposit needs attention") || !strings.Contains(err.Error(), "config --menu, then choose repair") {
 		t.Fatalf("verification conflict did not stop guided funding with repair guidance: %v", err)
 	}
-	if !strings.Contains(ui.String(), "waiting for the zkAPI indexer to confirm it before activation") {
+	if !strings.Contains(ui.String(), "waiting for the zkAPI indexer to record it before saving the private note") {
 		t.Fatalf("verifying stage was not shown: %s", ui.String())
 	}
 	if f.resumeCalls != 2 || f.approveCalls != 0 || f.quoteCalls != 0 {
@@ -206,7 +206,7 @@ func TestGuidedFundingReportsClearedConflictWithoutSavedDeposit(t *testing.T) {
 	}
 	f.ready = func(int) zkapi.WalletReadiness { return zkapi.WalletReadiness{} }
 	err := guidedFunding(context.Background(), f, "", &fundingWizardUI{}, immediateWizardPoll)
-	if err == nil || !strings.Contains(err.Error(), "no longer shows the earlier deposit") || strings.Contains(err.Error(), "preserve recovery files") {
+	if err == nil || !strings.Contains(err.Error(), "no longer records the earlier deposit") || strings.Contains(err.Error(), "preserve recovery files") {
 		t.Fatalf("a cleared conflict was not reported plainly: %v", err)
 	}
 	if f.resumeCalls != 1 || f.quoteCalls != 0 || f.approveCalls != 0 {

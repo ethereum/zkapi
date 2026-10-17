@@ -28,11 +28,7 @@ func TestPreparePersistsSecretAndReturnsOnlyPublicFields(t *testing.T) {
 			_, _ = io.WriteString(w, `{"has_note":false}`)
 		case "/funding/api/deposit/prepare":
 			generated.Add(1)
-			path := make([]string, 32)
-			for i := range path {
-				path[i] = "0x0"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"amount": 100000, "secret": "0xabcdef", "commitment": "0x1234", "zero_path": path})
+			_ = json.NewEncoder(w).Encode(map[string]any{"amount": 100000, "secret": "0xabcdef", "commitment": "0x1234"})
 		default:
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
@@ -141,7 +137,7 @@ func TestDemoMintEnabledOnlyForAdvertisedSepoliaDeployment(t *testing.T) {
 }
 
 func sampleReceipt(record depositRecord) ethReceipt {
-	raw := fmt.Sprintf(`{"status":"0x1","to":%q,"logs":[{"address":%q,"topics":[%q,"0x%064x","0x%064x"],"data":"0x%064x%064x%064x"}]}`, record.Contract, record.Contract, depositEventTopic, 12, 0x1234, record.Amount, time.Now().Unix()+3600, 0)
+	raw := fmt.Sprintf(`{"status":"0x1","to":%q,"logs":[{"address":%q,"topics":[%q,"0x%064x","0x%064x"],"data":"0x%064x%064x"}]}`, record.Contract, record.Contract, depositEventTopic, 12, 0x1234, record.Amount, time.Now().Unix()+3600)
 	var receipt ethReceipt
 	_ = json.Unmarshal([]byte(raw), &receipt)
 	return receipt
@@ -174,11 +170,11 @@ func TestDepositReceiptRequiresMatchingVaultCommitmentAmountAndSuccess(t *testin
 		case "commitment":
 			receipt.Logs[0].Topics[2] = fmt.Sprintf("0x%064x", 9)
 		case "amount":
-			receipt.Logs[0].Data = fmt.Sprintf("0x%064x%064x%064x", 1, time.Now().Unix()+3600, 0)
+			receipt.Logs[0].Data = fmt.Sprintf("0x%064x%064x", 1, time.Now().Unix()+3600)
 		case "note overflow":
 			receipt.Logs[0].Topics[1] = fmt.Sprintf("0x%064x", uint64(1)<<32)
 		case "expired":
-			receipt.Logs[0].Data = fmt.Sprintf("0x%064x%064x%064x", record.Amount, time.Now().Unix()-1, 0)
+			receipt.Logs[0].Data = fmt.Sprintf("0x%064x%064x", record.Amount, time.Now().Unix()-1)
 		case "no event":
 			receipt.Logs = nil
 		case "malformed":
@@ -230,15 +226,15 @@ func TestWrappedDepositReceiptRetainsTransactionHashBinding(t *testing.T) {
 func legacyChainServer(t *testing.T, record depositRecord, base ethReceipt, receipt func(hash string, base ethReceipt) any) *httptest.Server {
 	t.Helper()
 	expiry, _ := new(big.Int).SetString(base.Logs[0].Data[66:130], 16)
-	leaves := make([]*big.Int, 13)
-	for i := range leaves {
-		leaves[i] = big.NewInt(int64(0x1000 + i))
+	notes := make([]fixtureNote, 13)
+	for i := range notes {
+		notes[i] = fixtureNote{commitment: fmt.Sprintf("0x%x", 0x1000+i), amount: 1, expiry: 2_000_000_000}
 	}
-	leaves[12] = noteLeaf(12, fieldValue(record.Commitment), record.Amount, expiry.Uint64())
-	note := encodeVaultNote(fixtureNote{commitment: record.Commitment, amount: record.Amount, expiry: expiry.Uint64(), status: noteActive})
+	notes[12] = fixtureNote{commitment: record.Commitment, amount: record.Amount, expiry: expiry.Uint64(), status: noteActive}
+	note := encodeVaultNote(notes[12])
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/tree/snapshot" {
-			_ = json.NewEncoder(w).Encode(snapshotBody(leaves, 0x20, addressTestBlock))
+			_ = json.NewEncoder(w).Encode(snapshotBody(notes, 0x20, addressTestBlock))
 			return
 		}
 		var request struct {
@@ -379,11 +375,7 @@ func TestCompletedDepositIsArchivedBeforeNewNote(t *testing.T) {
 		case "/wallet/status":
 			_, _ = io.WriteString(w, `{"has_note":false}`)
 		case "/funding/api/deposit/prepare":
-			path := make([]string, 32)
-			for i := range path {
-				path[i] = "0x0"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"amount": 200000, "secret": "0x2222", "commitment": "0x3333", "zero_path": path})
+			_ = json.NewEncoder(w).Encode(map[string]any{"amount": 200000, "secret": "0x2222", "commitment": "0x3333"})
 		}
 	}, upstream)
 	handler, _ := NewFundingHandler(client, "http://127.0.0.1:8787", t.TempDir())
@@ -406,37 +398,5 @@ func TestCompletedDepositIsArchivedBeforeNewNote(t *testing.T) {
 	data, _ = os.ReadFile(archives[0])
 	if !strings.Contains(string(data), "0x1111") {
 		t.Fatal("prior recovery note lost")
-	}
-}
-
-func TestDepositPathRefreshDoesNotExposeSecrets(t *testing.T) {
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
-	var invalid atomic.Bool
-	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/oa/v1/deposit/path" {
-			t.Fatal("unexpected path")
-		}
-		path := make([]string, 32)
-		for i := range path {
-			path[i] = "0xa"
-		}
-		if invalid.Load() {
-			path[0] = "0x-1"
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"zero_path": path, "secret": "must-be-discarded"})
-	}, upstream)
-	handler, _ := NewFundingHandler(client, "http://127.0.0.1:8787", t.TempDir())
-	result, err := handler.depositPath(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := json.Marshal(result)
-	if strings.Contains(string(raw), "secret") {
-		t.Fatal("secret exposed while refreshing path")
-	}
-	invalid.Store(true)
-	if _, err = handler.depositPath(context.Background()); err == nil {
-		t.Fatal("invalid field accepted")
 	}
 }

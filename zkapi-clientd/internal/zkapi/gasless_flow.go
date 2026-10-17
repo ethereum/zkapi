@@ -1083,6 +1083,8 @@ func refusalOfFailure(f aaFailure) error {
 		return refuse("escapes_disabled", "the paymaster will not sponsor this escape (%s); initiate it with --fees wallet", f.Inner)
 	case "NoteNotActive", "NullifierUsed", "NotPendingEscape":
 		return refuse("note_closed", "the vault no longer accepts this exit (%s): the note may have been closed by another transaction, with the payout in the transit account; run withdraw --collect", f.Inner)
+	case "NoteBindingMismatch":
+		return refuse("note_binding_mismatch", "the exit's note commitment or metadata differ from the vault's record of the note, so neither path can pay it; preserve recovery files")
 	}
 	return refuse("gasless_refused", "the sponsored operation would fail: %s; use --fees wallet", f.String())
 }
@@ -1098,14 +1100,16 @@ func (h *FundingHandler) gaslessPayout(ctx context.Context, env *gaslessEnvironm
 	case gaslessKindClose, gaslessKindEscape:
 		return new(big.Int).Mul(new(big.Int).SetUint64(w.Amount), big.NewInt(1_000_000_000)), nil
 	case gaslessKindFinalize:
-		pending, err := h.gaslessWords(ctx, env, env.vault, "0x"+selectorPendingWithdrawals+uintWord(w.NoteID), 6)
+		// pendingWithdrawals(noteId) of vault revision 4: (exists,
+		// withdrawalNullifier, finalBalance, destination, challengeDeadline).
+		pending, err := h.gaslessWords(ctx, env, env.vault, "0x"+selectorPendingWithdrawals+uintWord(w.NoteID), 5)
 		if err != nil {
 			return nil, err
 		}
-		if pending[0].Sign() == 0 || !strings.EqualFold(common.BigToAddress(pending[4]).Hex(), env.account.Hex()) {
+		if pending[0].Sign() == 0 || !strings.EqualFold(common.BigToAddress(pending[3]).Hex(), env.account.Hex()) {
 			return nil, refuse("note_closed", "the vault shows no pending escape of this note paying the transit account; it may have been finalized by someone else (run withdraw --escape --to %s again to collect)", w.Destination)
 		}
-		return new(big.Int).Mul(pending[3], big.NewInt(1_000_000_000)), nil
+		return new(big.Int).Mul(pending[2], big.NewInt(1_000_000_000)), nil
 	}
 	return h.addressQuantity(ctx, env.config, "eth_getBalance", []any{env.account.Hex(), "latest"})
 }
@@ -1341,7 +1345,7 @@ func (h *FundingHandler) submitUserOperation(ctx context.Context, config funding
 	return h.sendUserOperation(ctx, env, record)
 }
 
-// validUntilOfVaultCall is word 15 of an 836-byte exit call, 0 otherwise.
+// validUntilOfVaultCall is word 15 of an 868-byte exit call, 0 otherwise.
 func validUntilOfVaultCall(vaultCall []byte) uint64 {
 	if len(vaultCall) != withdrawalCalldataLength {
 		return 0
@@ -2439,7 +2443,7 @@ func (h *FundingHandler) resumeGaslessClose(ctx context.Context, config fundingC
 	if err := h.corroborateWithdrawalClosed(ctx, config, w.NoteID, outcome.Receipt); err != nil {
 		if errors.Is(err, errWithdrawalVerificationPending) {
 			next := update()
-			next.Message = withdrawalVerifyingMessage
+			markWithdrawalPending(&next, err)
 			return next, nil
 		}
 		return update(), err
@@ -2569,7 +2573,7 @@ func (h *FundingHandler) transitAction(ctx context.Context, config fundingConfig
 		if err := h.adoptVaultExit(ctx, config, record); err != nil {
 			if errors.Is(err, errWithdrawalVerificationPending) {
 				next := update()
-				next.Message = withdrawalVerifyingMessage
+				markWithdrawalPending(&next, err)
 				return next, nil
 			}
 			return update(), err

@@ -190,14 +190,18 @@ func TestDepositIncludedStageActivatesBeforeFinalityWithoutRebroadcast(t *testin
 		return upstream.RoundTrip(r)
 	})
 	progress, err := f.h.FundAddress(context.Background(), 100000)
-	if err != nil || progress.Phase != "active" || progress.DepositStage != "active" || progress.TransactionHash != first.TransactionHash || f.activated != 1 || len(f.submitted) != 1 {
-		t.Fatalf("mined deposit did not activate or repeated broadcast: %+v %v", progress, err)
+	if err != nil || progress.Phase != "active" || progress.DepositStage != "awaiting_activation" || progress.TransactionHash != first.TransactionHash || f.activated != 1 || len(f.submitted) != 1 {
+		t.Fatalf("mined deposit was not saved or repeated broadcast: %+v %v", progress, err)
 	}
 
+	// The operator's batch activates the recorded note.
 	f.finalized = "0x20"
+	f.mu.Lock()
+	f.activate(1)
+	f.mu.Unlock()
 	active, err := f.h.FundAddress(context.Background(), 100000)
-	if err != nil || active.Phase != "active" || active.DepositStage != "active" || f.activated != 1 || len(f.accepted) != 1 {
-		t.Fatalf("final deposit was not activated once: %+v %v", active, err)
+	if err != nil || active.Phase != "active" || active.DepositStage != "active" || active.Activated == nil || !*active.Activated || f.activated != 1 || len(f.accepted) != 1 {
+		t.Fatalf("final deposit was not saved once, then reported activated: %+v %v", active, err)
 	}
 }
 
@@ -227,7 +231,7 @@ func TestDepositActivationFailureHasSeparateStageAndSafeRecovery(t *testing.T) {
 	}
 	f.h.client.local.Transport = upstream
 	active, err := f.h.FundAddress(context.Background(), 100000)
-	if err != nil || active.DepositStage != "active" || active.TransactionHash != first.TransactionHash || f.activated != 1 || len(f.submitted) != 1 || len(f.accepted) != 1 {
+	if err != nil || active.DepositStage != "awaiting_activation" || active.TransactionHash != first.TransactionHash || f.activated != 1 || len(f.submitted) != 1 || len(f.accepted) != 1 {
 		t.Fatalf("activation retry changed the transaction or initialized twice: %+v %v", active, err)
 	}
 }

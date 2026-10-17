@@ -25,7 +25,7 @@
   "challenge_period_seconds": 172800,
   "max_pause_duration_seconds": 3888000,
   "settlement_window_seconds": 21905,
-  "vault_revision": 3,
+  "vault_revision": 4,
   "exit_concession": 1,
   "clearance_ownership_proof": "required",
   "auth_scheme": "state-anchor",
@@ -36,14 +36,14 @@
   "proof_backend": "groth16_bn254",
   "proof_setup": {
     "repository_path": "protocol/setup/v2-concession",
-    "circuit_id": "zkapi-v2-concession-v1",
+    "circuit_id": "zkapi-v2-concession-v2",
     "setup_id": "dev",
-    "request_proving_key_sha256": "7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba",
-    "request_verifying_key_sha256": "11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf",
-    "withdrawal_proving_key_sha256": "43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1",
-    "withdrawal_verifying_key_sha256": "d816b9937021361381c52e17d554d975b8ecedeee7edbcecf1bb3393e0f0edb9",
-    "request_vk_keccak256": "0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790",
-    "withdrawal_vk_keccak256": "0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1"
+    "request_proving_key_sha256": "a265fdbf2f19a7208bda87d8a7ca6e5c3b8423207eaa13198bc7fafda5b03b9f",
+    "request_verifying_key_sha256": "45befacf21c0a369132538eebf054077c1bf2d3089e6189f6786c52d34f1f7ee",
+    "withdrawal_proving_key_sha256": "cf5b86c0a77fd7b277bb5644e86497e69905992c90a5a03f061b8c8415f3ffd0",
+    "withdrawal_verifying_key_sha256": "9a32bcd30ff2863717af5a19867e269abb0b9b2a0bf4e0d5d2e927d1729fa2c3",
+    "request_vk_keccak256": "0x78ee5bb1fd0d0eeedfc36e769a24e36b9df6e6464154344e57824f4812fd4496",
+    "withdrawal_vk_keccak256": "0x8ea30a21c1727fdc919a895dcd76c968f869055539e9212066988f1678d0ac30"
   },
   "clearance_signing_key": null,
   "state_signing_key": null,
@@ -62,7 +62,7 @@
   "gasless": null,
   "models": [],
   "limitations": [
-    "Placeholder: the concession-exit vault (revision 3, circuit zkapi-v2-concession-v1) is not deployed on this network yet. The proof pins name the development setup until the ceremony keys (setup mpc-1) replace them.",
+    "Placeholder: the concession-exit vault (revision 4, circuit zkapi-v2-concession-v2) is not deployed on this network yet. The proof pins name the development setup until the ceremony keys (setup mpc-1) replace them.",
     "Placeholder: the gasless withdrawal paymaster (ERC-4337, EntryPoint v0.7.0) is not deployed on this network yet; a withdrawal pays its own network fee from the signing address.",
     "Deposits are permissionless and no application-enforced deposit or TVL cap exists.",
     "ETH balances fluctuate in USD value; the latest finalized ETH/USD oracle round may lag the market."

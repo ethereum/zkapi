@@ -16,6 +16,9 @@ const (
 	SettlementWaiting
 	SettlementStarted
 	SettlementFinished
+	// ActivationWaiting: the private note is recorded but not activated by
+	// the operator's batch yet; the request waits a bounded time.
+	ActivationWaiting
 )
 
 type Event struct {

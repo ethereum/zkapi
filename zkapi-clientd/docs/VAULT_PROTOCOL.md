@@ -45,7 +45,7 @@ in legacy mode requires its valid profile.
 
 ## This selects a stack, not an address
 
-Concession uses circuit `zkapi-v2-concession-v1`, vault revision 3, and its current
+Concession uses circuit `zkapi-v2-concession-v2`, vault revision 4, and its current
 compiled manifests. Legacy uses `zkapi-v2-note-bound-v1` and the historical
 compiled manifests, client, companion and verified proving setup. A new prover
 cannot operate an old vault by replacing a contract address.

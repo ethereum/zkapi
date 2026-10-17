@@ -6,17 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
 
-// minedNativeDeposit signs a native deposit and includes it at note 12 in
-// both corroboration sources, leaving activation to the caller.
+// minedNativeDeposit signs a native deposit and records it at note 12 in
+// both corroboration sources, leaving its confirmation to the caller. No
+// operator batch has activated it.
 func minedNativeDeposit(t *testing.T) (*addressFixture, string) {
 	t.Helper()
 	f := newAddressFixture(t, true)
@@ -55,9 +58,17 @@ func (f *addressFixture) savedAddress(t *testing.T) addressFundingRecord {
 	return record
 }
 
+// testExpiryBucket is the vault's expiry rounding: ceil((t + noteTtl) / 1 day).
+const testExpiryBucket = 24 * 60 * 60
+
 // bucketedExpiry is the expiry the vault assigns to a deposit mined now.
 func bucketedExpiry() uint64 {
-	return (uint64(time.Now().Unix()) + 2592000 + vaultExpiryBucket - 1) / vaultExpiryBucket * vaultExpiryBucket
+	return expiryAt(time.Now().Unix())
+}
+
+// expiryAt is the expiry the vault assigns to a deposit mined at chain time at.
+func expiryAt(at int64) uint64 {
+	return (uint64(at) + 2592000 + testExpiryBucket - 1) / testExpiryBucket * testExpiryBucket
 }
 
 func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
@@ -75,8 +86,11 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 			note.status = notePendingWithdrawal
 			f.vaultNotes[12] = note
 		},
-		"vault closed":   func(f *addressFixture) { note := f.vaultNotes[12]; note.status = noteClosed; f.vaultNotes[12] = note },
-		"indexer absent": func(f *addressFixture) { f.leaves = f.leaves[:12]; f.leafVersion++ },
+		"vault closed": func(f *addressFixture) { note := f.vaultNotes[12]; note.status = noteClosed; f.vaultNotes[12] = note },
+		"indexer absent": func(f *addressFixture) {
+			f.leaves, f.records = f.leaves[:12], f.records[:12]
+			f.leafVersion++
+		},
 		"indexer other leaf": func(f *addressFixture) {
 			f.setLeaf(12, noteLeaf(12, fieldValue("0x5678"), 100000, f.vaultNotes[12].expiry))
 		},
@@ -86,7 +100,7 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 		"indexer other expiry": func(f *addressFixture) {
 			f.setLeaf(12, noteLeaf(12, fieldValue("0x1234"), 100000, f.vaultNotes[12].expiry+1))
 		},
-		"indexer closed": func(f *addressFixture) { f.setLeaf(12, new(big.Int)) },
+		"indexer zero leaf": func(f *addressFixture) { f.setLeaf(12, new(big.Int)) },
 	}
 	for name, mutate := range conflicts {
 		t.Run("conflict/"+name, func(t *testing.T) {
@@ -117,6 +131,7 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 		"indexer 404":           func(f *addressFixture) { f.indexerStatus = http.StatusNotFound },
 		"indexer down":          func(f *addressFixture) { f.indexer.Close() },
 		"indexer without block": func(f *addressFixture) { f.indexerWithoutBlock = true },
+		"indexer without notes": func(f *addressFixture) { f.indexerWithoutNotes = true },
 		"indexer behind":        func(f *addressFixture) { f.indexerBlock = 0xf },
 		"indexer forked":        func(f *addressFixture) { f.indexerHash = "0x" + strings.Repeat("c", 64) },
 		"indexer malformed":     func(f *addressFixture) { f.leaves[3] = new(big.Int).Set(bn254ScalarModulus); f.leafVersion++ },
@@ -153,11 +168,16 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 			t.Fatalf("vault read failure activated or leaked: %+v %v", status, err)
 		}
 	})
-	t.Run("agreement activates with the binding", func(t *testing.T) {
+	t.Run("agreement saves the recorded note with the binding", func(t *testing.T) {
 		f, hash := minedNativeDeposit(t)
 		status, err := f.h.FundAddress(context.Background(), 100000)
 		if err != nil || status.Phase != "active" || f.activated != 1 {
-			t.Fatalf("agreeing sources did not activate: %+v %v", status, err)
+			t.Fatalf("agreeing sources did not save the note: %+v %v", status, err)
+		}
+		// Recorded, not yet activated: the note is saved and exits, and the
+		// status says requests wait for the operator's batch.
+		if status.DepositStage != "awaiting_activation" || status.Activated == nil || *status.Activated || status.ActivationCursor == nil || *status.ActivationCursor != 12 || status.ActivationQueuePosition == nil || *status.ActivationQueuePosition != 0 || !strings.Contains(status.Message, "withdrawn now") {
+			t.Fatalf("the unactivated note was not reported as awaiting activation: %+v", status)
 		}
 		binding := f.savedDeposit(t).Binding
 		if binding == nil || binding.NoteID != 12 || binding.ExpiryTs != f.vaultNotes[12].expiry || binding.BlockNumber != 0x10 || binding.BlockHash != addressTestBlock || binding.IndexerBlock != 0x20 {
@@ -173,6 +193,16 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 		}
 		if !strings.EqualFold(f.vaultNotes[12].commitment, commitment) {
 			t.Fatal("fixture registered the wrong commitment")
+		}
+		f.mu.Lock()
+		f.activate(1)
+		f.mu.Unlock()
+		status, err = f.h.Address(context.Background())
+		if err != nil || status.Phase != "active" || status.DepositStage != "active" || status.Activated == nil || !*status.Activated || status.ActivationQueuePosition != nil || status.Message != "Your private balance is ready." {
+			t.Fatalf("the activated note was not reported ready: %+v %v", status, err)
+		}
+		if f.activated != 1 {
+			t.Fatal("activation reinitialized the companion")
 		}
 	})
 	t.Run("conflict is re-checked on resume", func(t *testing.T) {
@@ -298,33 +328,17 @@ func TestForgedReceiptForUnrelayedDepositNeverActivates(t *testing.T) {
 	}
 }
 
-// The companion's refreshed empty-leaf path must prove the indexer's next
-// slot before a deposit is signed; the slot is journaled with the note.
-func TestDepositPathMustMatchIndexerTree(t *testing.T) {
+// A deposit's slot is the indexer's next_note_id, the deposit counter, not
+// its activation cursor: a deposit is recorded behind every earlier one,
+// activated or not. No path is asked of the companion; the slot is journaled
+// with the note before signing.
+func TestDepositSlotIsTheIndexersNextNoteID(t *testing.T) {
 	f := newAddressFixture(t, true)
+	f.mu.Lock()
+	f.registerDeposit(12, "0x5678", 7, bucketedExpiry())
+	f.registerDeposit(13, "0x5679", 7, bucketedExpiry())
+	f.mu.Unlock()
 	quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	upstream := f.h.client.local.Transport
-	f.h.client.local.Transport = withdrawalRoundTripper(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/oa/v1/deposit/path" {
-			path := make([]string, 32)
-			for i := range path {
-				path[i] = "0xa"
-			}
-			return withdrawalJSONResponse(r, 200, map[string]any{"zero_path": path}), nil
-		}
-		return upstream.RoundTrip(r)
-	})
-	if _, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err == nil || !strings.Contains(err.Error(), "witness does not match") {
-		t.Fatalf("an unbound deposit witness was accepted: %v", err)
-	}
-	if len(f.accepted) != 0 || f.savedDeposit(t).Slot != nil {
-		t.Fatal("deposit signed or slot recorded without a matching witness")
-	}
-	f.h.client.local.Transport = upstream
-	quote, err = f.h.QuoteAddressDeposit(context.Background(), 100000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,13 +346,17 @@ func TestDepositPathMustMatchIndexerTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	slot := f.savedDeposit(t).Slot
-	if len(f.accepted) != 1 || slot == nil || slot.NoteID != 12 || slot.PreparedAt == 0 {
-		t.Fatalf("matching witness did not sign with its slot: %+v", slot)
+	if len(f.accepted) != 1 || slot == nil || slot.NoteID != 14 || slot.PreparedAt == 0 || slot.PreparedChainAt == 0 {
+		t.Fatalf("the deposit was not signed with its slot at the deposit counter: %+v", slot)
 	}
 	for _, tx := range f.accepted {
 		if depositPathDigest(tx.Data()) != slot.PathSHA256 {
 			t.Fatal("recorded slot does not describe the signed calldata")
 		}
+	}
+	f.mine(t, f.savedAddress(t).Pending.Hash, false)
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "active" || f.confirmBodies[0]["note_id"] != float64(14) || status.Activated == nil || *status.Activated || *status.ActivationQueuePosition != 2 {
+		t.Fatalf("the deposit recorded behind two unactivated notes was not saved with its queue position: %+v %v", status, err)
 	}
 }
 
@@ -388,7 +406,7 @@ func TestMalformedSignedSlotIsPreserved(t *testing.T) {
 	for name, slot := range map[string]depositSlot{
 		"path":        {NoteID: 12, PathSHA256: "0x12", PreparedAt: 1},
 		"preparation": {NoteID: 12, PathSHA256: "0x" + strings.Repeat("f", 64)},
-		"empty run":   {NoteID: 12, PathSHA256: "0x" + strings.Repeat("f", 64), PreparedAt: 1, EmptyBefore: 13},
+		"chain time":  {NoteID: 12, PathSHA256: "0x" + strings.Repeat("f", 64), PreparedAt: 1, PreparedChainAt: -1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newAddressFixture(t, true)
@@ -410,73 +428,33 @@ func TestMalformedSignedSlotIsPreserved(t *testing.T) {
 	}
 }
 
-// Calldata built for a slot can land later only where every slot in between
-// is empty. The search skips emptied slots without counting them and
-// compares at most depositRevertScanSlots occupied ones.
-func TestDepositLeafSearchSkipsEmptiedSlots(t *testing.T) {
-	commitment, expiry := fieldValue("0x1234"), bucketedExpiry()
-	slot := &depositSlot{NoteID: 12, PathSHA256: "0x" + strings.Repeat("f", 64), PreparedAt: time.Now().Unix()}
-	search := func(fill string, between int) (uint32, bool) {
-		leaves := make([]string, 0, 12+between+1)
-		for i := range 12 {
-			leaves = append(leaves, fmt.Sprintf("0x%x", 0x1000+i))
+// A withheld deposit can land any number of notes after its slot, and one
+// prepared from a short fork's view below it. Note records are never
+// removed, whatever the tree shows, so every recorded note is compared:
+// activated, recorded only, and retired alike. A note with the public
+// commitment but another amount is not this deposit.
+func TestDepositNoteSearchCoversEveryRecordedNote(t *testing.T) {
+	commitment := fieldValue("0x1234")
+	snapshot := func(ours int, amount uint64) *treeSnapshot {
+		notes := make([]recordedNote, 300)
+		for id := range notes {
+			notes[id] = recordedNote{Commitment: big.NewInt(int64(0x5000 + id)), Amount: big.NewInt(7), ExpiryTs: 1}
 		}
-		for range between {
-			leaves = append(leaves, fill)
+		if ours >= 0 {
+			notes[ours] = recordedNote{Commitment: commitment, Amount: new(big.Int).SetUint64(amount), ExpiryTs: 1}
 		}
-		id := uint32(len(leaves))
-		leaves = append(leaves, fmt.Sprintf("0x%x", noteLeaf(id, commitment, 100000, expiry)))
-		return findDepositLeaf(&treeSnapshot{NextNoteID: uint32(len(leaves)), Leaves: leaves}, slot, commitment, 100000, 2592000, time.Now().Unix())
+		return &treeSnapshot{NextNoteID: uint32(len(notes)), Notes: notes}
 	}
-	if id, found := search("0x0", 200); !found || id != 212 {
-		t.Fatalf("our leaf after emptied slots was not found: %d %v", id, found)
-	}
-	if id, found := search("0x5", depositRevertScanSlots-1); !found || id != 12+depositRevertScanSlots-1 {
-		t.Fatalf("our leaf within the occupied-slot bound was not found: %d %v", id, found)
-	}
-	if _, found := search("0x5", depositRevertScanSlots); found {
-		t.Fatal("the search compared more occupied slots than its bound")
-	}
-}
-
-// Calldata lands below its slot only in the run of slots that were empty
-// right below it when it was built. That run is searched under its own
-// bound, so leaves restored in it never hide a landing at or after the slot.
-// A record without a run (written before runs were kept) searches only from
-// its slot.
-func TestDepositLeafSearchCoversTheEmptyRunBelowItsSlot(t *testing.T) {
-	commitment, expiry := fieldValue("0x1234"), bucketedExpiry()
-	const run = depositRevertScanSlots + 6 // Slots [12, 82) were empty below slot 82.
-	search := func(landing uint32, restored int, emptyBefore uint32) (uint32, bool) {
-		leaves := make([]string, 0, 12+run+depositRevertScanSlots+1)
-		for i := range 12 {
-			leaves = append(leaves, fmt.Sprintf("0x%x", 0x1000+i))
+	for _, ours := range []int{0, 12, 150, 299} {
+		if id, found := findDepositNote(snapshot(ours, 100000), commitment, 100000); !found || id != uint32(ours) {
+			t.Fatalf("our deposit at note %d was not found: %d %v", ours, id, found)
 		}
-		for i := range run + depositRevertScanSlots {
-			leaf := "0x0"
-			if id := 12 + i; id >= 12+run || i < restored {
-				leaf = fmt.Sprintf("0x%x", 0x5000+id) // Restored in the run, or later deposits.
-			}
-			leaves = append(leaves, leaf)
-		}
-		leaves[landing] = fmt.Sprintf("0x%x", noteLeaf(landing, commitment, 100000, expiry))
-		slot := &depositSlot{NoteID: 12 + run, PathSHA256: "0x" + strings.Repeat("f", 64), PreparedAt: time.Now().Unix(), EmptyBefore: emptyBefore}
-		return findDepositLeaf(&treeSnapshot{NextNoteID: uint32(len(leaves)), Leaves: leaves}, slot, commitment, 100000, 2592000, time.Now().Unix())
 	}
-	if id, found := search(12, 0, run); !found || id != 12 {
-		t.Fatalf("a landing at the start of the run was not found: %d %v", id, found)
+	if _, found := findDepositNote(snapshot(150, 1), commitment, 100000); found {
+		t.Fatal("a foreign deposit of the public commitment matched")
 	}
-	if id, found := search(12+run, run, run); !found || id != 12+run {
-		t.Fatalf("leaves restored in the run hid a landing at the slot: %d %v", id, found)
-	}
-	if id, found := search(12+depositRevertScanSlots-1, depositRevertScanSlots-1, run); !found || id != 12+depositRevertScanSlots-1 {
-		t.Fatalf("a landing within the run's bound was not found: %d %v", id, found)
-	}
-	if _, found := search(12+depositRevertScanSlots, depositRevertScanSlots, run); found {
-		t.Fatal("the run's search compared more occupied slots than its bound")
-	}
-	if _, found := search(12, 0, 0); found {
-		t.Fatal("a slot recorded without a run was searched below itself")
+	if _, found := findDepositNote(snapshot(-1, 0), commitment, 100000); found {
+		t.Fatal("a deposit was found where none is recorded")
 	}
 }
 
@@ -517,7 +495,7 @@ func TestRevertedDepositRetryRequiresIndexerToShowNoDeposit(t *testing.T) {
 	}
 	// While the indexer is behind the receipt block, the retry waits.
 	f.mu.Lock()
-	f.setLeaf(12, noteLeaf(12, fieldValue("0x9999"), 5, 1))
+	f.registerDeposit(12, "0x9999", 5, 1)
 	f.indexerBlock = 0xf
 	f.mu.Unlock()
 	status, err = f.h.FundAddress(context.Background(), 100000)
@@ -781,7 +759,7 @@ func TestLandedDepositConflictClearsWhenIndexerNoLongerShowsIt(t *testing.T) {
 	}
 	f.mu.Lock()
 	f.indexerStatus = 0
-	f.leaves = f.leaves[:12]
+	f.leaves, f.records = f.leaves[:12], f.records[:12]
 	f.leafVersion++
 	delete(f.vaultNotes, 12)
 	f.mu.Unlock()
@@ -860,26 +838,26 @@ func TestRetryOfWithheldDepositTargetsItsEmptySlot(t *testing.T) {
 	}
 }
 
-// The indexer serves a head view, which can be a short fork. A deposit built
-// on a fork whose slot 12 was deposited and emptied again targets slot 13,
-// and its calldata is just as valid at slot 12 of the canonical tree once
-// that fork is orphaned. Its slot is saved with the run of empty slots below
-// it, which every search covers too, so the revert check, quotes and repair
-// find it there, and no second deposit of the note is signed.
+// The indexer serves a head view, which can be a short fork. A deposit
+// prepared on a fork that recorded note 12 targets slot 13, and lands at
+// note 12 of the canonical chain once that fork is orphaned. Every search
+// compares every recorded note, so the revert check, quotes and repair find
+// it there, and no second deposit of the note is signed.
 func TestDepositBuiltOnForkedViewIsFoundBelowItsSlot(t *testing.T) {
 	f := newAddressFixture(t, true)
 	f.mu.Lock()
-	f.setLeaf(12, new(big.Int)) // The fork's slot 12, deposited and emptied.
+	f.registerDeposit(12, "0x5678", 7, bucketedExpiry()) // The fork's note 12.
 	f.mu.Unlock()
 	first, err := f.fundNative(t, 100000)
 	if err != nil || first.Phase != "deposit_pending" {
 		t.Fatalf("deposit was not signed: %+v %v", first, err)
 	}
+	if slot := f.savedDeposit(t).Slot; slot == nil || slot.NoteID != 13 {
+		t.Fatalf("the deposit was not prepared for the fork's next note: %+v", slot)
+	}
 	f.mu.Lock()
-	f.leaves = f.leaves[:12] // The fork is orphaned: the canonical next slot is 12.
+	f.leaves, f.records = f.leaves[:12], f.records[:12] // The fork is orphaned: the canonical next note is 12.
 	f.leafVersion++
-	root, _ := f.tree()
-	_ = root
 	data := f.accepted[first.TransactionHash].Data()
 	commitment := "0x" + hex.EncodeToString(data[4:36])
 	f.mu.Unlock()
@@ -907,10 +885,11 @@ func TestDepositBuiltOnForkedViewIsFoundBelowItsSlot(t *testing.T) {
 }
 
 // Guided setup quotes again every five seconds while it waits for funds. A
-// retry quote searches the indexer's tree for the note's earlier deposits,
-// but downloads a tree it already searched only once; later quotes read its
-// root. A deposit that lands changes the root, so the next quote searches
-// the new tree and refuses.
+// retry quote searches the indexer's note records for the note's earlier
+// deposits, but downloads a view it already searched only once; later
+// quotes read its root and next_note_id. A deposit that lands only records
+// a note, which moves next_note_id, so the next quote searches the new view
+// and refuses.
 func TestRetryQuotesDownloadAnUnchangedTreeOnce(t *testing.T) {
 	f, hash, commitment := retiredWithheldDeposit(t)
 	reads := func() (int, int) {
@@ -942,7 +921,7 @@ func TestRetryQuotesDownloadAnUnchangedTreeOnce(t *testing.T) {
 	f.repairBindsNote(t, 12, hash)
 }
 
-// The quote-time search is advisory: approval searches the tree it signs
+// The quote-time search is advisory: approval searches the snapshot it signs
 // from and fails closed. So an indexer outage does not refuse a retry quote,
 // which would end guided setup at its first quote, and approval signs
 // nothing until the indexer answers again.
@@ -972,7 +951,7 @@ func TestRetryQuoteIsNotRefusedWhileIndexerIsUnavailable(t *testing.T) {
 		t.Fatalf("an indexer outage refused the retry quote: %v", err)
 	}
 	if status, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err == nil || !strings.Contains(err.Error(), "no deposit was signed") || len(f.accepted) != 1 {
-		t.Fatalf("approval signed without searching the indexer's tree: %+v %v", status, err)
+		t.Fatalf("approval signed without searching the indexer's note records: %+v %v", status, err)
 	}
 	f.mu.Lock()
 	f.indexerStatus = 0
@@ -1000,7 +979,7 @@ func TestQuoteKeepsSavedConflictWhileIndexerIsUnavailable(t *testing.T) {
 	f.indexerStatus = http.StatusServiceUnavailable
 	f.mu.Unlock()
 	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil {
-		t.Fatal("a quote cleared the saved conflict without searching the indexer's tree")
+		t.Fatal("a quote cleared the saved conflict without searching the indexer's note records")
 	}
 	if record := f.savedAddress(t); record.Phase != "verification_conflict" || record.Quote != nil || len(f.accepted) != 1 {
 		t.Fatalf("the saved conflict was not kept: %+v", record)
@@ -1130,23 +1109,19 @@ func TestRebindRequiresFinalizedVaultAndIndexerAgreement(t *testing.T) {
 	}
 }
 
-// expiryAt is the expiry the vault assigns to a deposit mined at chain time at.
-func expiryAt(at int64) uint64 {
-	return (uint64(at) + 2592000 + vaultExpiryBucket - 1) / vaultExpiryBucket * vaultExpiryBucket
-}
-
-// Closure regression (unpinned-rpc #1): the search for an earlier deposit
-// follows the block time of the indexer view it searches, never the device
-// clock. Here the device clock runs days behind the chain while the payment
-// RPC fakes its head time to match it (the fixture's "latest" block carries
-// the device time), withholds the first deposit and relays it after its
-// forged revert was retired. A retry is never signed: approval refuses the
-// clock before the deposit lands, and its leaf is found after.
-func TestDepositSearchFollowsChainTimeNotTheDeviceClock(t *testing.T) {
+// Closure regression (unpinned-rpc #1): no deposit is signed while the
+// device clock is days off the block time of the indexer view it is
+// prepared from, and the search for an earlier deposit does not depend on
+// time at all. Here the device clock runs days behind the chain while the
+// payment RPC fakes its head time to match it (the fixture's "latest" block
+// carries the device time), withholds the first deposit and relays it after
+// its forged revert was retired. A retry is never signed: approval refuses
+// the clock before the deposit lands, and its note is found after.
+func TestNoRetryIsSignedWhileTheDeviceClockIsOff(t *testing.T) {
 	for _, days := range []int64{2, 3, 10} {
 		t.Run(fmt.Sprintf("device clock %d days behind", days), func(t *testing.T) {
 			f, _, commitment := retiredWithheldDeposit(t)
-			chainNow := time.Now().Unix() + days*vaultExpiryBucket
+			chainNow := time.Now().Unix() + days*testExpiryBucket
 			f.setChainTime(chainNow)
 			quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
 			if err != nil {
@@ -1172,15 +1147,15 @@ func TestDepositSearchFollowsChainTimeNotTheDeviceClock(t *testing.T) {
 	}
 }
 
-// The search is refused rather than run at an unverified time: a header the
-// RPC withholds or that does not hash to the indexer view's block signs
+// A deposit is signed only from a view whose block time verifies: a header
+// the RPC withholds or that does not hash to the indexer view's block signs
 // nothing.
-func TestDepositSearchRequiresTheIndexerViewsVerifiedBlockTime(t *testing.T) {
+func TestDepositSigningRequiresTheIndexerViewsVerifiedBlockTime(t *testing.T) {
 	for name, tamper := range map[string]func(f *addressFixture){
 		"withheld": func(f *addressFixture) { delete(f.headers, strings.ToLower(f.indexerHash)) },
 		"forged time": func(f *addressFixture) {
 			forged := *f.headers[strings.ToLower(f.indexerHash)]
-			forged.Time -= 3 * vaultExpiryBucket
+			forged.Time -= 3 * testExpiryBucket
 			f.headers[strings.ToLower(f.indexerHash)] = &forged
 		},
 	} {
@@ -1200,120 +1175,33 @@ func TestDepositSearchRequiresTheIndexerViewsVerifiedBlockTime(t *testing.T) {
 	}
 }
 
-// A reported revert is not retired, and no retry quoted, while the device
-// clock is days off chain time. (retiredWithheldDeposit retires one when
-// the clocks agree.)
-func TestRevertIsNotRetiredWhileTheDeviceClockIsOff(t *testing.T) {
+// A reported revert whose deposit the indexer does not record is retired
+// whatever the device clock says: the search does not depend on time. The
+// retry is quoted, but approval signs nothing while the clock is days off
+// chain time.
+func TestRevertIsRetiredButNoRetrySignedWhileTheDeviceClockIsOff(t *testing.T) {
 	f := newAddressFixture(t, true)
 	first, err := f.fundNative(t, 100000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.setChainTime(time.Now().Unix() - 2*vaultExpiryBucket)
+	f.setChainTime(time.Now().Unix() - 2*testExpiryBucket)
 	f.mine(t, first.TransactionHash, true)
 	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
 		t.Fatalf("revert not recorded: %+v %v", status, err)
 	}
-	for range 2 {
-		if _, err := f.h.FundAddress(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "clock") {
-			t.Fatalf("the revert was retired with the device clock off: %v", err)
-		}
+	quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
+	if err != nil || quote.RetryHash != first.TransactionHash {
+		t.Fatalf("the retry was not quoted: %+v %v", quote, err)
 	}
-	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "clock") {
-		t.Fatalf("a retry was quoted with the device clock off: %v", err)
-	}
-	if record := f.savedAddress(t); record.Pending == nil || record.Pending.Hash != first.TransactionHash || len(record.History) != 0 || len(f.accepted) != 1 {
-		t.Fatal("the revert was retired with the device clock off")
-	}
-}
-
-// seam:tests-ci #4: a block mined just before a UTC day boundary has the
-// earlier expiry bucket even when the deposit's preparation, by chain or by
-// device clock, falls just after it. A slot from an earlier build has only
-// the device's preparation time, which can be days off chain time.
-func TestDepositLeafSearchToleratesTheDayBoundaryAndOldDeviceTimes(t *testing.T) {
-	commitment := fieldValue("0x1234")
-	boundary := (time.Now().Unix()/vaultExpiryBucket + 1) * vaultExpiryBucket
-	prepared, mined := boundary+30, boundary-30
-	leaves := make([]string, 0, 13)
-	for i := range 12 {
-		leaves = append(leaves, fmt.Sprintf("0x%x", 0x1000+i))
-	}
-	leaves = append(leaves, fmt.Sprintf("0x%x", noteLeaf(12, commitment, 100000, expiryAt(mined))))
-	snapshot := &treeSnapshot{NextNoteID: 13, Leaves: leaves}
-	path := "0x" + strings.Repeat("f", 64)
-	for name, search := range map[string]struct {
-		slot depositSlot
-		now  int64
-	}{
-		"chain time":  {depositSlot{NoteID: 12, PathSHA256: path, PreparedAt: prepared, PreparedChainAt: prepared}, boundary + 120},
-		"device time": {depositSlot{NoteID: 12, PathSHA256: path, PreparedAt: prepared}, boundary + 120},
-		// Saved by an earlier build on a device clock 6 days fast, and
-		// searched 10 days later.
-		"device 6 days ahead": {depositSlot{NoteID: 12, PathSHA256: path, PreparedAt: prepared + 6*vaultExpiryBucket}, boundary + 10*vaultExpiryBucket},
-	} {
-		if id, found := findDepositLeaf(snapshot, &search.slot, commitment, 100000, 2592000, search.now); !found || id != 12 {
-			t.Fatalf("%s: a deposit mined just before the day boundary was not found: %d %v", name, id, found)
-		}
-	}
-	if expiryAt(mined) == expiryAt(prepared) {
-		t.Fatal("the fixture does not cross a bucket boundary")
-	}
-}
-
-// seam:tests-ci #3: every signed slot is searched, not only the earliest,
-// and two signings for the same note ID from different empty runs are both
-// searched.
-func TestSignedDepositSearchCoversEverySlotAndEmptyRun(t *testing.T) {
-	commitment, now := fieldValue("0x1234"), time.Now().Unix()
-	path := "0x" + strings.Repeat("f", 64)
-	search := func(leaves []string, slots ...depositSlot) (uint32, bool) {
-		return findSignedDepositLeaf(&treeSnapshot{NextNoteID: uint32(len(leaves)), Leaves: leaves}, slots, commitment, 100000, 2592000, now)
-	}
-	ours := func(id int) string {
-		return fmt.Sprintf("0x%x", noteLeaf(uint32(id), commitment, 100000, expiryAt(now)))
-	}
-
-	// A later slot's landing, 150 occupied leaves past the earliest slot.
-	leaves := make([]string, 200)
-	for i := range leaves {
-		leaves[i] = fmt.Sprintf("0x%x", 0x5000+i)
-	}
-	leaves[150] = ours(150)
-	for _, slots := range [][]depositSlot{
-		{{NoteID: 0, PathSHA256: path, PreparedAt: now, PreparedChainAt: now}, {NoteID: 100, PathSHA256: path, PreparedAt: now, PreparedChainAt: now}},
-		{{NoteID: 100, PathSHA256: path, PreparedAt: now, PreparedChainAt: now}, {NoteID: 0, PathSHA256: path, PreparedAt: now - 60, PreparedChainAt: now - 60}},
-	} {
-		if id, found := search(leaves, slots...); !found || id != 150 {
-			t.Fatalf("the later signed slot was not searched: %d %v", id, found)
-		}
-	}
-
-	// Slot 100 signed twice: once from a view with no empty run, once from a
-	// view in which slots [20, 100) were empty. The second lands at 30.
-	leaves = make([]string, 0, 100+depositRevertScanSlots)
-	for i := range 100 + depositRevertScanSlots {
-		leaf := fmt.Sprintf("0x%x", 0x5000+i)
-		if i >= 20 && i < 100 {
-			leaf = "0x0"
-		}
-		leaves = append(leaves, leaf)
-	}
-	leaves[30] = ours(30)
-	for _, slots := range [][]depositSlot{
-		{{NoteID: 100, PathSHA256: path, PreparedAt: now - 60, PreparedChainAt: now - 60}, {NoteID: 100, PathSHA256: path, PreparedAt: now, PreparedChainAt: now, EmptyBefore: 80}},
-		{{NoteID: 100, PathSHA256: path, PreparedAt: now, PreparedChainAt: now, EmptyBefore: 80}, {NoteID: 100, PathSHA256: path, PreparedAt: now - 60, PreparedChainAt: now - 60}},
-	} {
-		if id, found := search(leaves, slots...); !found || id != 30 {
-			t.Fatalf("the same note ID's other empty run was not searched: %d %v", id, found)
-		}
+	if _, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err == nil || !strings.Contains(err.Error(), "clock") || len(f.accepted) != 1 {
+		t.Fatalf("a retry was signed with the device clock off: %v", err)
 	}
 }
 
 // seam:tests-ci #3, approval path: after two forged reverts, the second
-// deposit is relayed and lands at its own slot, far more than
-// depositRevertScanSlots occupied leaves after the first deposit's slot. No
-// third deposit of the note is quoted or signed.
+// deposit is relayed and lands at its own slot, 100 recorded notes after the
+// first deposit's slot. No third deposit of the note is quoted or signed.
 func TestRetryAfterTwoForgedRevertsSearchesTheLaterSlot(t *testing.T) {
 	f, _, commitment := retiredWithheldDeposit(t)
 	f.mu.Lock()
@@ -1347,5 +1235,348 @@ func TestRetryAfterTwoForgedRevertsSearchesTheLaterSlot(t *testing.T) {
 	}
 	if len(f.accepted) != 2 {
 		t.Fatal("a third deposit was signed for the same note")
+	}
+}
+
+// Review finding (clientd-flows 0): the operator's indexer is the one source
+// a fresh deposit's note waits for that the operator controls. While it
+// withholds, lags or misreports the note, the owner's exit RPC stands in for
+// it once the deposit is final there, so the note reaches the companion and
+// can be escaped; requests still wait for its activation.
+func TestWithheldDepositIsSavedThroughTheExitRPCOnceFinal(t *testing.T) {
+	for name, withhold := range map[string]func(f *addressFixture){
+		"indexer absent": func(f *addressFixture) {
+			f.leaves, f.records = f.leaves[:12], f.records[:12]
+			f.leafVersion++
+		},
+		"indexer down":       func(f *addressFixture) { f.indexerStatus = http.StatusServiceUnavailable },
+		"indexer behind":     func(f *addressFixture) { f.indexerBlock = 0xf },
+		"indexer other leaf": func(f *addressFixture) { f.setLeaf(12, big.NewInt(77)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, hash := minedNativeDeposit(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			f.mu.Lock()
+			withhold(f)
+			f.mu.Unlock()
+			// Not final on the exit RPC yet: the indexer's verdict stands,
+			// and the exit RPC is asked nothing about the deposit (only its
+			// chain ID and finalized block).
+			status, err := f.h.FundAddress(context.Background(), 100000)
+			if err != nil || status.Phase == "active" || !strings.Contains(status.Message, "final on your exit RPC") || f.activated != 0 {
+				t.Fatalf("the deposit was saved before it was final on the exit RPC: %+v %v", status, err)
+			}
+			f.mu.Lock()
+			early := slices.Clone(f.exitCalls)
+			f.mu.Unlock()
+			if slices.ContainsFunc(early, namesATransaction) {
+				t.Fatalf("the exit RPC was asked about a deposit not final there: %v", early)
+			}
+			// Only the exit RPC reports the deposit final.
+			f.mu.Lock()
+			f.exitFinalized, f.exitCalls = "0x20", nil
+			f.mu.Unlock()
+			status, err = f.h.FundAddress(context.Background(), 100000)
+			if err != nil || status.Phase != "active" || f.activated != 1 || f.confirmBodies[0]["note_id"] != float64(12) {
+				t.Fatalf("the exit RPC did not stand in for the indexer: %+v %v", status, err)
+			}
+			if status.DepositStage != "awaiting_activation" || !strings.Contains(status.Message, "withdraw it by escape") {
+				t.Fatalf("the status does not say the note can be escaped: %+v", status)
+			}
+			binding := f.savedDeposit(t).Binding
+			if binding == nil || !binding.ExitRPC || binding.IndexerBlock != 0 || binding.NoteID != 12 || binding.BlockHash != addressTestBlock || f.savedDeposit(t).TransactionHash != hash {
+				t.Fatalf("the binding does not record the exit RPC's corroboration: %+v", binding)
+			}
+			f.mu.Lock()
+			calls := strings.Join(f.exitCalls, " ")
+			f.mu.Unlock()
+			if !strings.Contains(calls, "eth_getTransactionReceipt") || !strings.Contains(calls, "eth_call") {
+				t.Fatalf("the exit RPC was not asked for the receipt and the vault state: %s", calls)
+			}
+			if read, err := f.h.Address(context.Background()); err != nil || read.Phase != "active" || !strings.Contains(read.Message, "withdraw it by escape") {
+				t.Fatalf("durable status lost the escape hint: %+v %v", read, err)
+			}
+		})
+	}
+}
+
+// The exit RPC stands in for the indexer, which leaves the note out of its
+// records, only when it agrees with the payment RPC: the same final receipt,
+// and the vault holding exactly this deposit. Without an exit RPC the
+// deposit keeps waiting, and the status says how to set one.
+func TestExitRPCSavesAWithheldDepositOnlyWhenItAgrees(t *testing.T) {
+	for name, scenario := range map[string]struct {
+		mutate      func(f *addressFixture)
+		phase, hint string
+	}{
+		"exit vault other commitment": {func(f *addressFixture) {
+			f.exitVaultNotes = maps.Clone(f.vaultNotes)
+			note := f.exitVaultNotes[12]
+			note.commitment = "0x" + addressABIWord("0x5678")
+			f.exitVaultNotes[12] = note
+		}, "verification_conflict", "exit RPC's vault state"},
+		"exit vault uninitialized": {func(f *addressFixture) {
+			f.exitVaultNotes = maps.Clone(f.vaultNotes)
+			delete(f.exitVaultNotes, 12)
+		}, "verification_conflict", "exit RPC's vault state"},
+		"exit receipt missing": {func(f *addressFixture) { f.exitHidesReceipts = true }, "verification_conflict", "final on your exit RPC"},
+		"exit not final":       {func(f *addressFixture) { f.exitFinalized = "0x1" }, "verification_conflict", "final on your exit RPC"},
+		// The exit RPC's receipt must be the payment RPC's: in the same
+		// block, by number and by hash. Another block is a reorganization one
+		// of them has not followed, so the indexer's verdict stands.
+		"exit receipt in another block": {func(f *addressFixture) {
+			f.exitReceipt = func(receipt map[string]any) { receipt["blockNumber"] = "0x11" }
+		}, "verification_conflict", "final on your exit RPC"},
+		"exit RPC on another fork": {func(f *addressFixture) {
+			// Its vault state at the payment RPC's block is refused, but at
+			// its own finalized block it holds the deposit.
+			fork := "0x" + strings.Repeat("f", 64)
+			f.exitCanonical = fork
+			f.exitReceipt = func(receipt map[string]any) { receipt["blockHash"] = fork }
+		}, "verification_conflict", "final on your exit RPC"},
+		// It must record this deposit's event at this note, with this
+		// expiry, in a successful receipt.
+		"exit receipt at another note": {func(f *addressFixture) {
+			note := f.vaultNotes[12]
+			f.exitReceipt = func(receipt map[string]any) {
+				receipt["logs"] = depositEventReceipt(addressTestVault, 13, "0x1234", note.amount, note.expiry).Logs
+			}
+		}, "verification_conflict", "exit RPC's receipt"},
+		"exit receipt with another expiry": {func(f *addressFixture) {
+			note := f.vaultNotes[12]
+			f.exitReceipt = func(receipt map[string]any) {
+				receipt["logs"] = depositEventReceipt(addressTestVault, 12, "0x1234", note.amount, note.expiry+testExpiryBucket).Logs
+			}
+		}, "verification_conflict", "exit RPC's receipt"},
+		"exit receipt reverted": {func(f *addressFixture) {
+			f.exitReceipt = func(receipt map[string]any) { receipt["status"] = "0x0" }
+		}, "verification_conflict", "exit RPC's receipt"},
+		"no exit RPC": {func(f *addressFixture) { f.exitRPC = "" }, "verification_conflict", "config --exit-rpc-url URL"},
+		"no exit RPC, indexer behind": {func(f *addressFixture) {
+			f.exitRPC = ""
+			f.registerDeposit(12, "0x1234", 100000, f.vaultNotes[12].expiry)
+			f.indexerBlock = 0xf
+		}, "confirming", "config --exit-rpc-url URL"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, _ := minedNativeDeposit(t)
+			f.mu.Lock()
+			f.leaves, f.records = f.leaves[:12], f.records[:12]
+			f.leafVersion++
+			f.finalized, f.exitFinalized = "0x20", "0x20"
+			scenario.mutate(f)
+			f.mu.Unlock()
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			for range 2 {
+				status, err := f.h.FundAddress(context.Background(), 100000)
+				if err != nil || status.Phase != scenario.phase || !strings.Contains(status.Message, scenario.hint) {
+					t.Fatalf("the withheld deposit was not held as %s: %+v %v", scenario.phase, status, err)
+				}
+			}
+			if f.activated != 0 || len(f.confirmBodies) != 0 || f.savedDeposit(t).Active || f.savedDeposit(t).Binding != nil {
+				t.Fatal("the note secret reached the companion without the exit RPC's agreement")
+			}
+		})
+	}
+}
+
+// namesATransaction reports whether an exit RPC call can name a deposit: any
+// but its chain ID and its finalized block.
+func namesATransaction(method string) bool {
+	return method != "eth_chainId" && method != "eth_getBlockByNumber"
+}
+
+// Review finding (privacy): the indexer lags every deposit for a few seconds
+// after mining. The owner's exit RPC learns nothing about the deposit during
+// that lag: until the deposit's block is final there, only its chain ID and
+// its finalized block, which name no transaction, are read. A deposit the
+// indexer then confirms is never disclosed to it.
+func TestExitRPCIsAskedAboutADepositOnlyOnceFinalThere(t *testing.T) {
+	f, _ := minedNativeDeposit(t)
+	f.h.client.config.ExitRPCURL = f.exitRPC
+	f.mu.Lock()
+	f.indexerBlock = 0xf // The indexer has not reached the receipt block yet.
+	f.mu.Unlock()
+	for range 2 {
+		status, err := f.h.FundAddress(context.Background(), 100000)
+		if err != nil || status.Phase != "confirming" || status.DepositStage != "verifying" || f.activated != 0 {
+			t.Fatalf("the lagging indexer's deposit was not held as verifying: %+v %v", status, err)
+		}
+	}
+	f.mu.Lock()
+	lagging := slices.Clone(f.exitCalls)
+	f.indexerBlock = 0x20
+	f.mu.Unlock()
+	if !slices.Contains(lagging, "eth_getBlockByNumber") || slices.ContainsFunc(lagging, namesATransaction) {
+		t.Fatalf("the exit RPC was asked more than its chain ID and finalized block during the indexer's lag: %v", lagging)
+	}
+	status, err := f.h.FundAddress(context.Background(), 100000)
+	if err != nil || status.Phase != "active" || f.activated != 1 {
+		t.Fatalf("the indexer's confirmation did not save the note: %+v %v", status, err)
+	}
+	if binding := f.savedDeposit(t).Binding; binding == nil || binding.ExitRPC || binding.IndexerBlock != 0x20 {
+		t.Fatalf("the note was not bound by the indexer: %+v", binding)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if slices.Contains(f.exitCalls, "eth_getTransactionReceipt") || slices.Contains(f.exitCalls, "eth_call") {
+		t.Fatalf("the exit RPC learned of a deposit the indexer confirmed: %v", f.exitCalls)
+	}
+}
+
+// Review finding (clientd-fixes 0, follow-up): an exit RPC that cannot stand
+// in for the indexer at all (it does not answer, serves another network, or
+// refuses reads at a block hash, EIP-1898, once the deposit is final there)
+// is named in the deposit's status, with a structured flag, instead of the
+// promise that it will save the note. The indexer's pending or conflict
+// stands, nothing is saved, and the note is saved once the exit RPC works.
+func TestDepositNamesAnExitRPCThatCannotCheckIt(t *testing.T) {
+	down := httptest.NewTLSServer(http.NotFoundHandler())
+	down.Close()
+	for name, broken := range map[string]func(f *addressFixture){
+		"unreachable":              func(f *addressFixture) { f.h.client.config.ExitRPCURL = down.URL },
+		"another network":          func(f *addressFixture) { f.exitChain = "0xaa36a7" },
+		"refuses block-hash reads": func(f *addressFixture) { f.exitRefusesBlockHash = true },
+		"rate-limits receipts": func(f *addressFixture) {
+			f.exitUnavailable = map[string]bool{"eth_getTransactionReceipt": true}
+		},
+		"rate-limits blocks": func(f *addressFixture) {
+			f.exitUnavailable = map[string]bool{"eth_getBlockByNumber": true}
+		},
+	} {
+		for indexer, withhold := range map[string]struct {
+			mutate func(f *addressFixture)
+			phase  string
+		}{
+			"indexer down":   {func(f *addressFixture) { f.indexerStatus = http.StatusServiceUnavailable }, "confirming"},
+			"indexer absent": {func(f *addressFixture) { f.leaves, f.records = f.leaves[:12], f.records[:12]; f.leafVersion++ }, "verification_conflict"},
+		} {
+			t.Run(name+", "+indexer, func(t *testing.T) {
+				f, _ := minedNativeDeposit(t)
+				f.h.client.config.ExitRPCURL = f.exitRPC
+				f.mu.Lock()
+				f.exitFinalized = "0x20"
+				withhold.mutate(f)
+				broken(f)
+				f.mu.Unlock()
+				for range 2 {
+					status, err := f.h.FundAddress(context.Background(), 100000)
+					if err != nil || status.Phase != withhold.phase || !status.ExitRPCUnusable || strings.Contains(status.Message, "final on your exit RPC") || !strings.Contains(status.Message, "config --exit-rpc-url URL") {
+						t.Fatalf("the unusable exit RPC was not named: %+v %v", status, err)
+					}
+					if withhold.phase == "confirming" && (status.DepositStage != "verifying" || status.Message != depositExitRPCUnusableMessage) {
+						t.Fatalf("the pending deposit does not say its exit RPC cannot check it: %+v", status)
+					}
+				}
+				if f.activated != 0 || len(f.confirmBodies) != 0 || f.savedDeposit(t).Active || f.savedDeposit(t).Binding != nil {
+					t.Fatal("the note secret reached the companion without a working exit RPC's agreement")
+				}
+				f.mu.Lock()
+				f.exitChain, f.exitRefusesBlockHash, f.exitUnavailable = "", false, nil
+				f.mu.Unlock()
+				f.h.client.config.ExitRPCURL = f.exitRPC
+				status, err := f.h.FundAddress(context.Background(), 100000)
+				if err != nil || status.Phase != "active" || status.ExitRPCUnusable || f.activated != 1 || !f.savedDeposit(t).Binding.ExitRPC {
+					t.Fatalf("the deposit was not saved once the exit RPC worked: %+v %v", status, err)
+				}
+			})
+		}
+	}
+}
+
+// Repair has the same way out: when the indexer does not record the note,
+// finalized vault state read through the owner's exit RPC binds it.
+func TestRebindConfirmsThroughTheExitRPCWhenTheIndexerWithholds(t *testing.T) {
+	f, _ := minedNativeDeposit(t)
+	f.mu.Lock()
+	f.leaves, f.records = f.leaves[:12], f.records[:12]
+	f.leafVersion++
+	f.finalized = "0x20"
+	f.mu.Unlock()
+	note := uint64(12)
+	if _, err := f.h.RebindDeposit(context.Background(), &note, nil); err == nil || !strings.Contains(err.Error(), "config --exit-rpc-url URL") {
+		t.Fatalf("repair without the indexer did not point to an exit RPC: %v", err)
+	}
+	f.h.client.config.ExitRPCURL = f.exitRPC
+	f.mu.Lock()
+	f.exitVaultNotes = maps.Clone(f.vaultNotes)
+	delete(f.exitVaultNotes, 12)
+	f.mu.Unlock()
+	if _, err := f.h.RebindDeposit(context.Background(), &note, nil); err == nil || !strings.Contains(err.Error(), "exit RPC's finalized vault state") {
+		t.Fatalf("repair bound a note the exit RPC does not hold: %v", err)
+	}
+	if f.activated != 0 || f.resetCalls != 0 || f.savedDeposit(t).Active || f.savedDeposit(t).Binding != nil {
+		t.Fatal("refused repair changed state")
+	}
+	f.mu.Lock()
+	f.exitVaultNotes = nil
+	f.mu.Unlock()
+	status, err := f.h.RebindDeposit(context.Background(), &note, nil)
+	if err != nil || status.Phase != "active" || f.activated != 1 || f.confirmBodies[0]["note_id"] != float64(12) {
+		t.Fatalf("repair did not bind through the exit RPC: %+v %v", status, err)
+	}
+	if binding := f.savedDeposit(t).Binding; binding == nil || !binding.ExitRPC || binding.IndexerBlock != 0 || binding.NoteID != 12 {
+		t.Fatalf("repair saved another binding: %+v", binding)
+	}
+}
+
+// Review finding (clientd-fixes5, low): repair through an exit RPC that
+// cannot read its finalized vault state at all (no answer, another network,
+// no EIP-1898 reads) names that RPC and its remedy; it never reports the
+// failed read as vault state that disagrees.
+func TestRebindNamesAnExitRPCThatCannotReadTheVault(t *testing.T) {
+	down := httptest.NewTLSServer(http.NotFoundHandler())
+	down.Close()
+	for name, broken := range map[string]func(f *addressFixture){
+		"unreachable":              func(f *addressFixture) { f.h.client.config.ExitRPCURL = down.URL },
+		"another network":          func(f *addressFixture) { f.exitChain = "0xaa36a7" },
+		"refuses block-hash reads": func(f *addressFixture) { f.exitRefusesBlockHash = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, _ := minedNativeDeposit(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			f.mu.Lock()
+			f.leaves, f.records = f.leaves[:12], f.records[:12]
+			f.leafVersion++
+			f.finalized = "0x20"
+			broken(f)
+			f.mu.Unlock()
+			note := uint64(12)
+			_, err := f.h.RebindDeposit(context.Background(), &note, nil)
+			if err == nil || !strings.Contains(err.Error(), "your exit RPC could not read its finalized vault state") || !strings.Contains(err.Error(), "config --exit-rpc-url URL") || strings.Contains(err.Error(), "does not confirm it either") {
+				t.Fatalf("the failed exit RPC read was not named: %v", err)
+			}
+			if f.activated != 0 || f.resetCalls != 0 || f.savedDeposit(t).Active || f.savedDeposit(t).Binding != nil {
+				t.Fatal("refused repair changed state")
+			}
+		})
+	}
+}
+
+// Review finding (clientd-flows 2): only the note records are read, so the
+// snapshot is asked for without its tree leaves; an older indexer that
+// ignores the request and serves the whole snapshot is still read.
+func TestDepositSnapshotAsksForTheRecordsPartOnly(t *testing.T) {
+	for _, ignores := range []bool{false, true} {
+		t.Run(map[bool]string{false: "records part", true: "whole snapshot"}[ignores], func(t *testing.T) {
+			f, _ := minedNativeDeposit(t)
+			f.mu.Lock()
+			f.indexerIgnoresParts = ignores
+			f.mu.Unlock()
+			status, err := f.h.FundAddress(context.Background(), 100000)
+			if err != nil || status.Phase != "active" || f.activated != 1 {
+				t.Fatalf("the snapshot's note records did not corroborate the deposit: %+v %v", status, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if len(f.snapshotQueries) == 0 {
+				t.Fatal("no snapshot was read")
+			}
+			for _, query := range f.snapshotQueries {
+				if query != "parts=records" {
+					t.Fatalf("the snapshot was requested with query %q", query)
+				}
+			}
+		})
 	}
 }

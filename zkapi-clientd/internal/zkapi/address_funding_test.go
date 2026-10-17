@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -41,27 +41,38 @@ type addressFixture struct {
 	submitted                                                      []string
 	ambiguous                                                      bool
 	active                                                         bool
-	prepared, activated, paths                                     int
+	prepared, activated                                            int
 	rpcCalls                                                       []string
 	// Independent corroboration sources. The RPC answers vault notes() from
-	// vaultNotes; the separate indexer server serves leaves. mine registers
-	// a deposit in both, and tests make them disagree deliberately.
-	vaultNotes                 map[uint32]fixtureNote
-	vaultReadsAt               []string
-	leaves                     []*big.Int
+	// vaultNotes; the separate indexer server serves its own note records
+	// (records, with their recorded leaves in leaves) and the tree of the
+	// notes below its activation cursor. mine registers a deposit in both,
+	// and tests make them disagree deliberately. A deposit only records its
+	// note: activate inserts it into the tree, as an operator batch does,
+	// and the companion reports the same cursor.
+	vaultNotes   map[uint32]fixtureNote
+	vaultReadsAt []string
+	records      []fixtureNote
+	leaves       []*big.Int
+	cursor       uint32
+	// retired are tree leaves zeroed by retireClosedLeaf.
+	retired                    map[uint32]bool
 	indexer                    *httptest.Server
 	indexerBlock               uint64
 	indexerHash                string
 	indexerStatus              int // >0: HTTP error, <0: inconsistent snapshot
 	indexerWithoutBlock        bool
+	indexerWithoutNotes        bool
 	snapshotReads, rootReads   int
 	cachedRoot                 *big.Int
-	cachedPath                 []*big.Int
 	cachedVersion, leafVersion int
 	mined                      map[string]uint32
 	minedExpiry                map[uint32]uint64
-	// minedRoot is NoteDeposited.newRoot of each mined deposit, by hash.
-	minedRoot map[string]*big.Int
+	// indexerIgnoresParts makes the indexer serve the whole snapshot, tree
+	// leaves included, whatever parts the request names (an older indexer);
+	// snapshotQueries lists the query of every snapshot request.
+	indexerIgnoresParts bool
+	snapshotQueries     []string
 	// Block headers served by eth_getBlockByHash, by lowercase hash.
 	headers map[string]*types.Header
 	// Companion wallet state for activation and rebind.
@@ -87,6 +98,24 @@ type addressFixture struct {
 	pinnedDown bool
 	exitRPC    string
 	exitCalls  []string
+	// exitVaultNotes, when set, is the vault state the exit RPC alone
+	// answers notes() from; exitFinalized, when set, is its finalized block
+	// number; exitHidesReceipts makes it serve no receipt. They make the
+	// owner's exit RPC disagree with the pinned RPC.
+	exitVaultNotes    map[uint32]fixtureNote
+	exitFinalized     string
+	exitHidesReceipts bool
+	// exitReceipt, when set, edits a copy of every receipt the exit RPC
+	// serves. exitCanonical, when set, is the hash of the exit RPC's
+	// canonical blocks (it followed another fork), the only hash its
+	// EIP-1898 reads accept. exitChain, when set, is its chain ID,
+	// exitRefusesBlockHash makes it refuse every EIP-1898 read, and
+	// exitUnavailable lists methods it answers with HTTP 503 (a rate limit).
+	exitReceipt          func(receipt map[string]any)
+	exitCanonical        string
+	exitChain            string
+	exitRefusesBlockHash bool
+	exitUnavailable      map[string]bool
 	// refuseSimulation makes the RPCs refuse the eth_call simulation and the
 	// gas estimate of a signed vault call.
 	refuseSimulation bool
@@ -107,48 +136,110 @@ type addressFixture struct {
 }
 
 // addressTestFirstNote is the first fixture deposit's note: the indexer
-// starts with this many unrelated leaves.
+// starts with this many unrelated, activated notes.
 const addressTestFirstNote = 12
 
+// setLeaf makes the indexer record leaf as note id's recorded leaf,
+// recording empty notes up to id.
 func (f *addressFixture) setLeaf(id uint32, leaf *big.Int) {
 	for uint32(len(f.leaves)) <= id {
 		f.leaves = append(f.leaves, new(big.Int))
+		f.records = append(f.records, fixtureNote{})
 	}
 	f.leaves[id] = leaf
 	f.leafVersion++
 }
 
+// registerDeposit records a deposit in the vault and the indexer, without
+// activating it.
 func (f *addressFixture) registerDeposit(id uint32, commitment string, amount, expiry uint64) {
-	f.vaultNotes[id] = fixtureNote{commitment: "0x" + addressABIWord(commitment), amount: amount, expiry: expiry, status: noteActive}
+	note := fixtureNote{commitment: "0x" + addressABIWord(commitment), amount: amount, expiry: expiry, status: noteActive}
+	f.vaultNotes[id] = note
 	f.setLeaf(id, noteLeaf(id, fieldValue(commitment), amount, expiry))
+	f.records[id] = note
 }
 
+// activate moves the activation cursor over count more recorded notes, as
+// an operator batch does. Callers hold f.mu.
+func (f *addressFixture) activate(count uint32) {
+	f.cursor = min(f.cursor+count, uint32(len(f.leaves)))
+	f.leafVersion++
+}
+
+// closeNote closes a note in the vault. A close changes no tree leaf.
 func (f *addressFixture) closeNote(id uint32) {
 	note := f.vaultNotes[id]
 	note.status = noteClosed
 	f.vaultNotes[id] = note
-	f.setLeaf(id, new(big.Int))
 }
 
-// tree returns the root and the empty-slot path at next_note_id, cached
-// until a leaf changes. Callers hold f.mu.
-func (f *addressFixture) tree() (*big.Int, []*big.Int) {
+// treeLeaves are the leaves of the indexer's tree: the recorded leaf of
+// every activated note, zero above the cursor and for a retired note.
+func (f *addressFixture) treeLeaves() []*big.Int {
+	leaves := make([]*big.Int, len(f.leaves))
+	for id := range leaves {
+		leaves[id] = new(big.Int)
+		if uint32(id) < f.cursor && !f.retired[uint32(id)] {
+			leaves[id] = f.leaves[id]
+		}
+	}
+	return leaves
+}
+
+// tree returns the indexer tree's root, cached until a leaf or the cursor
+// changes. Callers hold f.mu.
+func (f *addressFixture) tree() *big.Int {
 	if f.cachedRoot == nil || f.cachedVersion != f.leafVersion {
-		f.cachedRoot, f.cachedPath = testTree(f.leaves, uint32(len(f.leaves)))
+		f.cachedRoot, _ = testTree(f.treeLeaves(), 0)
 		f.cachedVersion = f.leafVersion
 	}
-	return f.cachedRoot, f.cachedPath
+	return f.cachedRoot
+}
+
+// walletStatus is the companion's /wallet/status: with a note, its
+// activation as the vault's activation cursor shows it. Callers hold f.mu.
+func (f *addressFixture) walletStatus() map[string]any {
+	status := map[string]any{"has_note": f.active, "pending_request": f.walletPending, "note": f.walletNote}
+	if f.active {
+		var id uint64
+		switch value := f.walletNote["note_id"].(type) {
+		case int:
+			id = uint64(value)
+		case uint32:
+			id = uint64(value)
+		case uint64:
+			id = value
+		case float64:
+			id = uint64(value)
+		}
+		status["activated"], status["activation_cursor"] = id < uint64(f.cursor), f.cursor
+	}
+	return status
+}
+
+// fixtureNoteRecords is the indexer snapshot's notes view of records.
+func fixtureNoteRecords(records []fixtureNote) []map[string]any {
+	notes := make([]map[string]any, len(records))
+	for id, note := range records {
+		commitment := note.commitment
+		if commitment == "" {
+			commitment = "0x0"
+		}
+		notes[id] = map[string]any{"note_id": id, "commitment": commitment, "amount": note.amount, "expiry_ts": note.expiry}
+	}
+	return notes
 }
 
 func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 	t.Helper()
 	f := &addressFixture{chain: "0x1", decimals: "0x6", gas: "0x10000", gasPrice: "0x3b9aca00", balance: "0xf4240", eth: "0xde0b6b3a7640000", allowance: "0x0", nonce: "0x0", finalized: "0x20", canonical: addressTestBlock, accepted: map[string]*types.Transaction{}, receipts: map[string]map[string]any{}}
 	f.native = len(native) > 0 && native[0]
-	f.vaultNotes, f.mined, f.minedExpiry = map[uint32]fixtureNote{}, map[string]uint32{}, map[uint32]uint64{}
+	f.vaultNotes, f.mined, f.minedExpiry, f.retired = map[uint32]fixtureNote{}, map[string]uint32{}, map[uint32]uint64{}, map[uint32]bool{}
 	f.headers = map[string]*types.Header{strings.ToLower(addressTestBlock): addressTestHeader}
 	for i := range addressTestFirstNote {
-		f.setLeaf(uint32(i), big.NewInt(int64(0x1000+i)))
+		f.registerDeposit(uint32(i), fmt.Sprintf("0x%x", 0x1000+i), 1, 2_000_000_000)
 	}
+	f.activate(addressTestFirstNote)
 	f.indexerBlock, f.indexerHash = 0x20, addressTestBlock
 	f.walletNote = map[string]any{"note_id": addressTestFirstNote, "current_balance": 99999}
 	f.indexer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -165,6 +256,7 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		snapshot := r.URL.Path == "/v1/tree/snapshot"
 		if snapshot {
 			f.snapshotReads++
+			f.snapshotQueries = append(f.snapshotQueries, r.URL.RawQuery)
 		} else {
 			f.rootReads++
 		}
@@ -173,10 +265,23 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			_, _ = io.WriteString(w, `{"status":"unavailable","error_code":"indexer_unavailable"}`)
 			return
 		}
-		root, _ := f.tree()
-		body := map[string]any{"root": fmt.Sprintf("0x%x", root), "next_note_id": len(f.leaves)}
+		body := map[string]any{"root": fmt.Sprintf("0x%x", f.tree()), "next_note_id": len(f.leaves), "activation_cursor": f.cursor}
+		parts := r.URL.Query().Get("parts")
+		if f.indexerIgnoresParts {
+			parts = ""
+		}
+		if snapshot && parts != "" && parts != "tree" && parts != "records" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"status":"error","error_code":"invalid_parts"}`)
+			return
+		}
 		if snapshot {
-			body["leaves"] = fieldHexes(f.leaves)
+			if parts != "records" {
+				body["leaves"] = fieldHexes(f.treeLeaves())
+			}
+			if !f.indexerWithoutNotes && parts != "tree" {
+				body["note_leaves"], body["notes"] = fieldHexes(f.leaves), fixtureNoteRecords(f.records)
+			}
 		}
 		if f.indexerStatus < 0 && snapshot { // An internally inconsistent snapshot.
 			body["next_note_id"] = len(f.leaves) + 1
@@ -211,6 +316,10 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		}
 		if exit {
 			f.exitCalls = append(f.exitCalls, request.Method)
+			if f.exitUnavailable[request.Method] {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
 		} else {
 			f.rpcCalls = append(f.rpcCalls, request.Method)
 		}
@@ -239,6 +348,9 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		switch request.Method {
 		case "eth_chainId":
 			result = f.chain
+			if exit && f.exitChain != "" {
+				result = f.exitChain
+			}
 		case "eth_getBalance":
 			result = f.eth
 		case "eth_getTransactionCount":
@@ -336,7 +448,15 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				}
 				if len(request.Params) == 2 && json.Unmarshal(request.Params[1], &block) == nil {
 					f.vaultReadsAt = append(f.vaultReadsAt, block.BlockHash)
-					if !block.RequireCanonical || !strings.EqualFold(block.BlockHash, f.canonical) {
+					canonical := f.canonical
+					if exit && f.exitCanonical != "" {
+						canonical = f.exitCanonical
+					}
+					if exit && f.exitRefusesBlockHash {
+						_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32602, "message": "invalid argument 1: hex string without 0x prefix"}})
+						return
+					}
+					if !block.RequireCanonical || !strings.EqualFold(block.BlockHash, canonical) {
 						_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32000, "message": "header not found"}})
 						return
 					}
@@ -344,7 +464,11 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 					f.vaultReadsAt = append(f.vaultReadsAt, string(request.Params[1]))
 				}
 				id, _ := new(big.Int).SetString(call.Data[10:], 16)
-				result = encodeVaultNote(f.vaultNotes[uint32(id.Uint64())])
+				notes := f.vaultNotes
+				if exit && f.exitVaultNotes != nil {
+					notes = f.exitVaultNotes
+				}
+				result = encodeVaultNote(notes[uint32(id.Uint64())])
 				break
 			}
 			if !strings.EqualFold(call.To, addressTestToken) {
@@ -363,8 +487,13 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		case "eth_getTransactionReceipt":
 			var hash string
 			_ = json.Unmarshal(request.Params[0], &hash)
-			if found, ok := f.receipts[hash]; ok && f.hideReceipts == 0 {
+			if found, ok := f.receipts[hash]; ok && f.hideReceipts == 0 && !(exit && f.exitHidesReceipts) {
 				result = found
+				if exit && f.exitReceipt != nil {
+					edited := maps.Clone(found)
+					f.exitReceipt(edited)
+					result = edited
+				}
 			}
 			if f.hideReceipts > 0 {
 				f.hideReceipts--
@@ -374,6 +503,9 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			_ = json.Unmarshal(request.Params[0], &number)
 			if number == "finalized" {
 				number = f.finalized
+				if exit && f.exitFinalized != "" {
+					number = f.exitFinalized
+				}
 			}
 			if number == "latest" {
 				number = "0x20"
@@ -382,7 +514,11 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			if f.latestTime != 0 {
 				timestamp = f.latestTime
 			}
-			result = map[string]string{"number": number, "hash": f.canonical, "timestamp": fmt.Sprintf("0x%x", timestamp), "baseFeePerGas": f.gasPrice}
+			hash := f.canonical
+			if exit && f.exitCanonical != "" {
+				hash = f.exitCanonical
+			}
+			result = map[string]string{"number": number, "hash": hash, "timestamp": fmt.Sprintf("0x%x", timestamp), "baseFeePerGas": f.gasPrice}
 		case "eth_getBlockByHash":
 			var hash string
 			_ = json.Unmarshal(request.Params[0], &hash)
@@ -455,22 +591,14 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			}
 			_ = json.NewEncoder(w).Encode(config)
 		case "/wallet/status":
-			_ = json.NewEncoder(w).Encode(map[string]any{"has_note": f.active, "pending_request": f.walletPending, "note": f.walletNote})
+			_ = json.NewEncoder(w).Encode(f.walletStatus())
 		case "/funding/api/deposit/prepare":
 			f.prepared++
 			var input struct {
 				Amount uint64 `json:"amount"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&input)
-			path := make([]string, 32)
-			for i := range path {
-				path[i] = "0x0"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"amount": input.Amount, "secret": "0xabcdef", "commitment": "0x1234", "zero_path": path})
-		case "/oa/v1/deposit/path":
-			f.paths++
-			_, path := f.tree()
-			_ = json.NewEncoder(w).Encode(map[string]any{"zero_path": fieldHexes(path)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"amount": input.Amount, "secret": "0xabcdef", "commitment": "0x1234"})
 		case "/funding/api/deposit/confirm":
 			var body map[string]any
 			if json.NewDecoder(r.Body).Decode(&body) != nil {
@@ -560,12 +688,8 @@ func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 				id = uint32(len(f.leaves))
 				f.mined[hash], f.minedExpiry[id] = id, uint64(time.Now().Unix())+3600
 				f.registerDeposit(id, commitment, amount.Uint64(), f.minedExpiry[id])
-				if f.minedRoot == nil {
-					f.minedRoot = map[string]*big.Int{}
-				}
-				f.minedRoot[hash], _ = f.tree()
 			}
-			receipt["logs"] = depositEventReceiptAt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id], f.minedRoot[hash]).Logs
+			receipt["logs"] = depositEventReceipt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id]).Logs
 			f.allowance = "0x0"
 		}
 	}
@@ -689,7 +813,7 @@ func TestAddressFundingAmbiguousApprovalReplaysExactBytesAcrossRestart(t *testin
 	}
 }
 
-func TestAddressFundingApprovesExactAmountRefreshesPathAndDepositsOnce(t *testing.T) {
+func TestAddressFundingApprovesExactAmountRecordsSlotAndDepositsOnce(t *testing.T) {
 	f := newAddressFixture(t)
 	approval, err := f.h.FundAddress(context.Background(), 100000)
 	if err != nil {
@@ -705,24 +829,20 @@ func TestAddressFundingApprovesExactAmountRefreshesPathAndDepositsOnce(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deposit.Phase != "deposit_pending" || f.paths != 1 || f.prepared != 1 {
-		t.Fatalf("deposit did not use refreshed saved note: %+v", deposit)
+	if deposit.Phase != "deposit_pending" || f.prepared != 1 {
+		t.Fatalf("deposit did not use the saved note: %+v", deposit)
 	}
 	tx = f.accepted[deposit.TransactionHash]
 	if tx == nil || tx.Nonce() != 1 || !strings.EqualFold(tx.To().Hex(), addressTestVault) {
 		t.Fatal("invalid deposit transaction")
 	}
-	// The prepared "0x0" path was replaced by the refreshed empty-slot path,
-	// bound to the indexer slot the deposit targets; the calldata carries
-	// only the commitment and the amount (vault revision 3).
-	f.mu.Lock()
-	_, path := f.tree()
-	f.mu.Unlock()
+	// The calldata carries only the commitment and the amount, and the
+	// recovery record no Merkle path: a recorded note exits without one.
 	if data := hex.EncodeToString(tx.Data()); len(data) != 8+64*2 || !strings.HasPrefix(data, depositSelector) {
 		t.Fatal("deposit calldata is not deposit(bytes32,uint128)")
 	}
-	if refreshed := f.savedDeposit(t).ZeroPath; !slices.Equal(refreshed, fieldHexes(path)) || slices.Equal(refreshed, slices.Repeat([]string{"0x0"}, 32)) {
-		t.Fatal("deposit witness was not refreshed")
+	if raw, err := os.ReadFile(f.h.statePath); err != nil || strings.Contains(string(raw), "zero_path") {
+		t.Fatal("the deposit recovery record keeps a Merkle path")
 	}
 	if saved, err := f.h.readAddressDeposit(fundingConfig{ChainID: 1, Contract: addressTestVault, Token: addressTestToken}); err != nil || saved.Slot == nil || saved.Slot.NoteID != addressTestFirstNote {
 		t.Fatalf("deposit slot was not recorded before signing: %+v %v", saved, err)
@@ -956,8 +1076,8 @@ func TestAddressFundingAmbiguousDepositNeverChoosesNewNonce(t *testing.T) {
 			t.Fatal("ambiguous deposit changed identity")
 		}
 	}
-	if len(f.accepted) != 1 || f.prepared != 1 || f.paths != 1 {
-		t.Fatal("ambiguous deposit regenerated note/path/transaction")
+	if len(f.accepted) != 1 || f.prepared != 1 {
+		t.Fatal("ambiguous deposit regenerated note/transaction")
 	}
 	for _, raw := range f.submitted {
 		if raw != f.submitted[0] {
@@ -1016,7 +1136,7 @@ func TestAddressFundingRevertedDepositRetainsNoteAndRefreshesWitnessOnExplicitRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Phase != "deposit_pending" || second.TransactionHash == first.TransactionHash || f.prepared != 1 || f.paths != 2 || len(f.accepted) != 2 {
+	if second.Phase != "deposit_pending" || second.TransactionHash == first.TransactionHash || f.prepared != 1 || len(f.accepted) != 2 {
 		t.Fatalf("safe retry did not retain note: %+v", second)
 	}
 	raw, _ := os.ReadFile(f.h.statePath)

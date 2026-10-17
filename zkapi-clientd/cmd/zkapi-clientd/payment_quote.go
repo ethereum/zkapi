@@ -48,10 +48,16 @@ func fundingNetwork(chain uint64) string {
 
 // managementError is the daemon's message for a failed management request,
 // with the machine-readable code it forwards for refusals a guided flow acts
-// on (for example unsettled_request_state).
-type managementError struct{ message, code string }
+// on (for example unsettled_request_state). scope prefixes the message;
+// empty is "wallet".
+type managementError struct{ message, code, scope string }
 
-func (e *managementError) Error() string { return "wallet: " + e.message }
+func (e *managementError) Error() string {
+	if e.scope != "" {
+		return e.scope + ": " + e.message
+	}
+	return "wallet: " + e.message
+}
 
 func managementErrorCode(err error) string {
 	var failed *managementError

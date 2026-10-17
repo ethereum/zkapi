@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,12 @@ type configureOptions struct {
 	fields                                    map[string]bool
 }
 
+// exitRPCHelp states everything the exit RPC is used for, and so what its
+// provider sees. The wallet companion reads an escape's chain state through
+// it too, but only through the configured transport, which carries HTTPS
+// alone, so a plain-HTTP RPC on this machine cannot serve an escape yet.
+const exitRPCHelp = "your own Ethereum RPC: escapes read the chain and send their transactions only through it; deployment checks, every withdrawal's completion, and deposit recording and repair when the zkAPI indexer does not confirm a deposit also read through it, so its provider sees those transactions and note IDs, with your IP address under direct HTTPS (HTTPS goes through the configured transport; http:// to this machine is dialed directly but cannot serve escapes yet, which need an HTTPS exit RPC; 'none' clears it)"
+
 func parseConfigureOptions(args []string, out io.Writer) (configureOptions, error) {
 	var o configureOptions
 	f := flag.NewFlagSet("config", flag.ContinueOnError)
@@ -35,7 +42,7 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.StringVar(&o.relay, "relay-url", "", "Wisp, socks5://IP:PORT, or conversation-isolated tor://IP:PORT; empty selects direct HTTPS")
 	f.StringVar(&o.binary, "zkapi-binary", "", "path to the installed zkAPI companion")
 	f.StringVar(&o.proofs, "proof-setup-dir", "", "path to the installed proving assets")
-	f.StringVar(&o.exitRPC, "exit-rpc-url", "", "your own Ethereum RPC for exits: deployment checks also use it and exit transactions are sent through it (HTTPS, or http:// to this machine; 'none' clears it)")
+	f.StringVar(&o.exitRPC, "exit-rpc-url", "", exitRPCHelp)
 	f.StringVar(&o.bundlerURL, "bundler-url", "", "your own ERC-4337 bundler for gasless withdrawals (--fees payout): HTTPS, or http:// to this machine; 'none' clears it and the deployment's published bundler is used")
 	f.StringVar(&o.withdrawalFees, "withdrawal-fees", "", "how withdrawals pay the network fee by default: wallet (the local signing address) or payout (a sponsored operation paid from the payout, no ETH needed)")
 	f.StringVar(&o.usd, "usd", "", "skip the new-deposit USD amount prompt (prompt default: 20; network fees are extra)")
@@ -303,7 +310,11 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 	}
 	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", c.ZKAPI.Network, transport)
 	if c.ZKAPI.ExitRPCURL != "" {
-		ui.Printf("Exit RPC: %s (deployment checks and exit transactions)\n", c.ZKAPI.ExitRPCURL)
+		ui.Printf("Exit RPC: %s (deployment checks, deposit and withdrawal confirmation, exit transactions; it sees those transactions and note IDs)\n", c.ZKAPI.ExitRPCURL)
+		// The scheme is case-insensitive: HTTP://127.0.0.1 is plain HTTP too.
+		if u, err := url.Parse(c.ZKAPI.ExitRPCURL); err == nil && u.Scheme == "http" {
+			ui.Printf("Escapes cannot use a plain-HTTP exit RPC yet; set an HTTPS exit RPC before you escape.\n")
+		}
 	}
 	if c.ZKAPI.BundlerURL != "" {
 		ui.Printf("Bundler: %s (gasless withdrawals)\n", c.ZKAPI.BundlerURL)

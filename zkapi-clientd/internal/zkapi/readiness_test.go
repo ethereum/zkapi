@@ -28,6 +28,11 @@ func TestReadinessUsesAuthenticatedReadOnlyStateAndChecksWithdrawalReservations(
 				{"reserved_missing_note", `{"has_note":false,"pending_request":false}`, `{"phase":"reserved","note_id":7,"final_balance":"123456"}`, WalletReadiness{WithdrawalPending: true}},
 				{"withdrawn", `{"has_note":false,"pending_request":false}`, `{"phase":"complete","note_id":7,"final_balance":"123456"}`, WalletReadiness{}},
 				{"historical_withdrawal", `{"has_note":true,"pending_request":false,"note":{"note_id":8,"current_balance":123456}}`, `{"phase":"complete","note_id":7,"final_balance":"654321"}`, WalletReadiness{HasNote: true, Balance: 123456}},
+				{"awaiting_activation", `{"has_note":true,"pending_request":false,"activated":false,"activation_cursor":5,"note":{"note_id":7,"current_balance":123456}}`, `{"phase":"none"}`, WalletReadiness{HasNote: true, Balance: 123456, Activation: NoteActivation{Known: true, Cursor: 5, Ahead: 2}}},
+				{"activated", `{"has_note":true,"pending_request":false,"activated":true,"activation_cursor":8,"note":{"note_id":7,"current_balance":123456}}`, `{"phase":"none"}`, WalletReadiness{HasNote: true, Balance: 123456, Activation: NoteActivation{Known: true, Activated: true, Cursor: 8}}},
+				// Activation is public chain state for display: a reading that
+				// contradicts the note ID is unknown, not a refusal.
+				{"contradictory_activation", `{"has_note":true,"pending_request":false,"activated":true,"activation_cursor":5,"note":{"note_id":7,"current_balance":123456}}`, `{"phase":"none"}`, WalletReadiness{HasNote: true, Balance: 123456}},
 			} {
 				t.Run(test.name, func(t *testing.T) {
 					var paths []string

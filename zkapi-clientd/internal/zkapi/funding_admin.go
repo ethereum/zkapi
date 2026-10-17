@@ -215,6 +215,12 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 		if code := GaslessRefusalCode(err); code != "" {
 			failure["code"] = code
 		}
+		// An exit RPC that a request read through alone (exitConfig) and
+		// could not use is named by code too, so a guided flow can show
+		// its fixed label.
+		if exitRPCUnusable(err) {
+			failure["code"] = "exit_rpc_unusable"
+		}
 		_ = json.NewEncoder(w).Encode(failure)
 		return
 	}

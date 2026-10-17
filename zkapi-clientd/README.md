@@ -145,10 +145,14 @@ payout that is waiting in the transit account or the paymaster. See
 [gasless withdrawals](docs/CLI_ZKAPI.md#paying-the-fee-from-the-payout-gasless-withdrawals).
 
 For chain and protocol access the client uses only the RPC, zkAPI indexer and
-protocol server packaged with the release. A deposit activates only after the
-vault, read at the deposit's block, and the indexer's whole-tree snapshot both
-show it at the same note; a withdrawal finishes only after both show the note
-closed. A withdrawal first proves note ownership to the protocol server, which
+protocol server packaged with the release. A deposit's note is saved only
+after the vault, read at the deposit's block, and the indexer's snapshot both
+record it at the same note; with your own exit RPC set (`config
+--exit-rpc-url URL`), once the deposit is final there, it stands in for an
+indexer that does not. The operator's batch then activates the note for
+requests, while withdrawals are available at once. A withdrawal finishes only
+after the vault shows the note closed, through your exit RPC too when one is
+set. A withdrawal first proves note ownership to the protocol server, which
 then clears the cooperative close. When the operator cannot or will not
 clear it, `zkapi-clientd withdraw --escape --to ADDRESS` exits through the
 vault alone, after its challenge period. See

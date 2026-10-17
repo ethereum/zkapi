@@ -4,9 +4,14 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -59,25 +64,23 @@ func TestWithdrawalRequiresClearanceOwnershipCapability(t *testing.T) {
 	}
 }
 
-// Review root cause on the withdrawal side: one RPC must not decide that the
-// note closed. A forged MutualClose receipt never deletes the companion's
-// note state or archives the deposit recovery file.
+// Review root cause on the withdrawal side: a receipt alone must not decide
+// that the note closed. A forged MutualClose receipt never deletes the
+// companion's note state or archives the deposit recovery file while the
+// vault, read at the receipt's canonical block, shows the note open.
 func TestForgedMutualCloseReceiptNeverClosesNote(t *testing.T) {
-	for _, vault := range []string{"forged closed", "honest active"} {
+	for _, vault := range []string{"active", "pending withdrawal"} {
 		t.Run(vault, func(t *testing.T) {
 			f := newWithdrawalFixture(t)
 			hash := f.withdraw(t)
-			f.mu.Lock()
-			leaf := new(big.Int).Set(f.leaves[12])
-			f.mu.Unlock()
 			f.mineWithdrawal(t, hash, withdrawalTestDestination, false)
 			f.mu.Lock()
-			f.setLeaf(12, leaf) // The indexer never saw a close.
-			if vault == "honest active" {
-				note := f.vaultNotes[12]
-				note.status = noteActive
-				f.vaultNotes[12] = note
+			note := f.vaultNotes[12]
+			note.status = noteActive
+			if vault == "pending withdrawal" {
+				note.status = notePendingWithdrawal
 			}
+			f.vaultNotes[12] = note
 			f.mu.Unlock()
 			for range 2 {
 				status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
@@ -100,6 +103,447 @@ func TestForgedMutualCloseReceiptNeverClosesNote(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A close changes no tree leaf, so the vault's Closed status at the payout
+// block is the closing evidence and the indexer's tree is not read. A note
+// closed after its activation keeps its leaf in the tree, and one closed
+// before it is inserted later by its batch; neither waits for an operator.
+func TestClosedNoteCompletesWhateverItsTreeLeaf(t *testing.T) {
+	for name, activated := range map[string]bool{"activated": true, "recorded only": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newWithdrawalFixture(t)
+			if activated {
+				f.mu.Lock()
+				f.activate(1)
+				f.mu.Unlock()
+			}
+			hash := f.withdraw(t)
+			f.mineWithdrawal(t, hash, withdrawalTestDestination, false)
+			f.mu.Lock()
+			inTree, snapshots := f.treeLeaves()[12].Sign() != 0, f.snapshotReads
+			f.mu.Unlock()
+			if inTree != activated {
+				t.Fatal("the fixture's tree does not match the note's activation")
+			}
+			status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+			if err != nil || status.Phase != "complete" || f.confirmCalls != 1 {
+				t.Fatalf("the closed note did not complete: %+v %v", status, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.snapshotReads != snapshots {
+				t.Fatal("completing the withdrawal read the indexer's tree")
+			}
+		})
+	}
+}
+
+// Review finding (clientd-flows 1): with an exit RPC configured, the
+// payment RPC alone never completes a withdrawal. The owner's exit RPC must
+// also show the same final payout receipt and the note closed at its block.
+func TestWithdrawalCompletionNeedsTheExitRPCsAgreement(t *testing.T) {
+	for name, disagree := range map[string]func(f *withdrawalFixture){
+		"exit vault shows the note open": func(f *withdrawalFixture) {
+			f.exitVaultNotes = maps.Clone(f.vaultNotes)
+			note := f.exitVaultNotes[12]
+			note.status = notePendingWithdrawal
+			f.exitVaultNotes[12] = note
+		},
+		"exit RPC has no receipt": func(f *withdrawalFixture) { f.exitHidesReceipts = true },
+		"exit RPC not final":      func(f *withdrawalFixture) { f.exitFinalized = "0xf" },
+		// The exit RPC's receipt must be the payment RPC's: the same block,
+		// by number and by hash, the same status and the same logs.
+		"exit receipt in another block": func(f *withdrawalFixture) {
+			f.exitReceipt = func(receipt map[string]any) { receipt["blockNumber"] = "0x11" }
+		},
+		"exit RPC on another fork": func(f *withdrawalFixture) {
+			// Its vault state at the payment RPC's block is refused, but at
+			// its own finalized block it shows the note closed.
+			fork := "0x" + strings.Repeat("f", 64)
+			f.exitCanonical = fork
+			f.exitReceipt = func(receipt map[string]any) { receipt["blockHash"] = fork }
+		},
+		"exit receipt reverted": func(f *withdrawalFixture) {
+			f.exitReceipt = func(receipt map[string]any) { receipt["status"] = "0x0" }
+		},
+		"exit receipt pays another destination": func(f *withdrawalFixture) {
+			data := "0x" + addressABIWord(f.reservedNullifier) + fmt.Sprintf("%064x", f.reservedBalance) + addressABIWord(addressTestToken)
+			f.exitReceipt = func(receipt map[string]any) {
+				log := maps.Clone(receipt["logs"].([]map[string]any)[0])
+				log["data"] = data
+				receipt["logs"] = []map[string]any{log}
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWithdrawalFixture(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			hash := f.withdraw(t)
+			f.mineWithdrawal(t, hash, withdrawalTestDestination, false)
+			f.mu.Lock()
+			disagree(f)
+			f.mu.Unlock()
+			for range 2 {
+				status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+				if err != nil || status.Phase != "withdrawal_pending" || status.Message != withdrawalVerifyingMessage || status.ExitRPCUnusable {
+					t.Fatalf("the payment RPC alone completed the withdrawal: %+v %v", status, err)
+				}
+			}
+			if f.confirmCalls != 0 || !f.active || f.journal(t).Pending == nil {
+				t.Fatal("an uncorroborated close reached the companion or retired the signed withdrawal")
+			}
+			if _, err := os.Stat(f.h.statePath); err != nil {
+				t.Fatal("an uncorroborated close archived the deposit recovery file")
+			}
+			f.mu.Lock()
+			f.exitVaultNotes, f.exitHidesReceipts, f.exitFinalized = nil, false, ""
+			f.exitReceipt, f.exitCanonical = nil, ""
+			f.mu.Unlock()
+			status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+			if err != nil || status.Phase != "complete" || f.confirmCalls != 1 {
+				t.Fatalf("the close both RPCs show did not complete: %+v %v", status, err)
+			}
+		})
+	}
+}
+
+// Two receipts of one payout carry the same logs only when every field of
+// every log agrees; hex case alone may differ between RPCs.
+func TestSameReceiptLogsComparesEveryLogField(t *testing.T) {
+	receipt := func(edit func(log map[string]any), extra ...map[string]any) *addressReceipt {
+		log := map[string]any{"address": addressTestVault, "topics": []string{"0x" + strings.Repeat("ab", 32), fmt.Sprintf("0x%064x", 12)}, "data": "0x" + strings.Repeat("cd", 32), "removed": false}
+		if edit != nil {
+			edit(log)
+		}
+		raw, _ := json.Marshal(map[string]any{"logs": append([]map[string]any{log}, extra...)})
+		var decoded addressReceipt
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return &decoded
+	}
+	upper := func(hex string) string { return "0x" + strings.ToUpper(hex[2:]) }
+	base := receipt(nil)
+	if !sameReceiptLogs(base, receipt(func(log map[string]any) {
+		log["address"], log["data"] = upper(addressTestVault), upper(log["data"].(string))
+		log["topics"] = []string{upper(log["topics"].([]string)[0]), log["topics"].([]string)[1]}
+	})) {
+		t.Fatal("logs differing only in hex case were not the same")
+	}
+	for name, other := range map[string]*addressReceipt{
+		"another log count": receipt(nil, map[string]any{"address": addressTestVault, "topics": []string{}, "data": "0x"}),
+		"removed":           receipt(func(log map[string]any) { log["removed"] = true }),
+		"another emitter":   receipt(func(log map[string]any) { log["address"] = addressTestToken }),
+		"other data":        receipt(func(log map[string]any) { log["data"] = "0x" + strings.Repeat("ce", 32) }),
+		"another topic": receipt(func(log map[string]any) {
+			log["topics"] = []string{"0x" + strings.Repeat("ab", 32), fmt.Sprintf("0x%064x", 13)}
+		}),
+		"fewer topics": receipt(func(log map[string]any) { log["topics"] = []string{"0x" + strings.Repeat("ab", 32)} }),
+	} {
+		if sameReceiptLogs(base, other) || sameReceiptLogs(other, base) {
+			t.Errorf("%s: the logs were the same", name)
+		}
+	}
+}
+
+// Review finding (clientd-flows 1, follow-up): an exit RPC that cannot check
+// the close at all (it does not answer, serves another network, or refuses
+// reads at a block hash, EIP-1898) is named in the status, so the owner can
+// fix the configuration instead of waiting for a vault state that never
+// comes. The withdrawal still waits, and completes once the exit RPC works.
+func TestWithdrawalNamesAnExitRPCThatCannotCheckTheClose(t *testing.T) {
+	down := httptest.NewTLSServer(http.NotFoundHandler())
+	down.Close()
+	for name, broken := range map[string]func(f *withdrawalFixture){
+		"unreachable":              func(f *withdrawalFixture) { f.h.client.config.ExitRPCURL = down.URL },
+		"another network":          func(f *withdrawalFixture) { f.exitChain = "0xaa36a7" },
+		"refuses block-hash reads": func(f *withdrawalFixture) { f.exitRefusesBlockHash = true },
+		"rate-limits receipts": func(f *withdrawalFixture) {
+			f.exitUnavailable = map[string]bool{"eth_getTransactionReceipt": true}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWithdrawalFixture(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			hash := f.withdraw(t)
+			f.mineWithdrawal(t, hash, withdrawalTestDestination, false)
+			f.mu.Lock()
+			broken(f)
+			f.mu.Unlock()
+			for range 2 {
+				status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+				if err != nil || status.Phase != "withdrawal_pending" || status.Message != withdrawalExitRPCUnusableMessage || !status.ExitRPCUnusable {
+					t.Fatalf("the unusable exit RPC was not named: %+v %v", status, err)
+				}
+			}
+			if f.confirmCalls != 0 || !f.active || f.journal(t).Pending == nil {
+				t.Fatal("a close the exit RPC could not check reached the companion or retired the signed withdrawal")
+			}
+			f.mu.Lock()
+			f.exitChain, f.exitRefusesBlockHash, f.exitUnavailable = "", false, nil
+			f.mu.Unlock()
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+			if err != nil || status.Phase != "complete" || f.confirmCalls != 1 {
+				t.Fatalf("the close did not complete once the exit RPC worked: %+v %v", status, err)
+			}
+		})
+	}
+}
+
+// Review finding (clientd-fixes, sponsored close): a gasless close reads the
+// payout and the vault through the exit RPC alone (exitOnly). An exit RPC
+// that cannot read the vault once the payout is final there (it refuses
+// reads at a block hash, EIP-1898, or does not answer them) is named the
+// same way, not left at the plain wait for the vault state.
+func TestSponsoredWithdrawalNamesAnExitRPCThatCannotCheckTheClose(t *testing.T) {
+	for name, broken := range map[string]func(f *withdrawalFixture){
+		"refuses block-hash reads": func(f *withdrawalFixture) { f.exitRefusesBlockHash = true },
+		"rate-limits vault reads":  func(f *withdrawalFixture) { f.exitUnavailable = map[string]bool{"eth_call": true} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, g := newGaslessWithdrawalFixture(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			ctx := payoutContext(payoutFees)
+			hash := f.sponsoredClose(t)
+			charged := big.NewInt(2_000_000_000_000_000)
+			bundle := g.mineUserOp(t, hash, true, fixtureSettlement{Received: gaslessPayoutWei, Charged: charged, PaidOut: new(big.Int).Sub(gaslessPayoutWei, charged)})
+			f.mu.Lock()
+			f.finalized, f.rpcCalls, f.exitCalls = "0x20", nil, nil
+			broken(f)
+			f.mu.Unlock()
+			for range 2 {
+				status, err := f.h.WithdrawAddress(ctx, withdrawalTestDestination, f.noteID)
+				if err != nil || status.Phase != "withdrawal_pending" || status.TransactionHash != bundle || status.Message != withdrawalExitRPCUnusableMessage || !status.ExitRPCUnusable {
+					t.Fatalf("the unusable exit RPC was not named for the sponsored close: %+v %v", status, err)
+				}
+			}
+			f.mu.Lock()
+			pinned, exit := len(f.rpcCalls), strings.Join(f.exitCalls, " ")
+			f.exitRefusesBlockHash, f.exitUnavailable = false, nil
+			f.mu.Unlock()
+			if pinned != 0 || !strings.Contains(exit, "eth_call") || f.confirmCalls != 0 || !f.active {
+				t.Fatalf("the close was not checked through the exit RPC alone, or completed unchecked: pinned %d, exit %s", pinned, exit)
+			}
+			status, err := f.h.WithdrawAddress(ctx, withdrawalTestDestination, f.noteID)
+			if err != nil || status.Phase != "complete" || status.ExitRPCUnusable || f.confirmCalls != 1 {
+				t.Fatalf("the sponsored close did not complete once the exit RPC worked: %+v %v", status, err)
+			}
+		})
+	}
+}
+
+// The exit RPC as the only source cannot check a close either when it does
+// not answer or serves another network.
+func TestExitOnlyCloseCheckNamesAnUnusableExitRPC(t *testing.T) {
+	down := httptest.NewTLSServer(http.NotFoundHandler())
+	down.Close()
+	for name, broken := range map[string]func(f *withdrawalFixture){
+		"unreachable":     func(f *withdrawalFixture) { f.h.client.config.ExitRPCURL = down.URL },
+		"another network": func(f *withdrawalFixture) { f.exitChain = "0xaa36a7" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWithdrawalFixture(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			f.mu.Lock()
+			broken(f)
+			f.mu.Unlock()
+			config, err := f.h.config(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = f.h.corroborateWithdrawalClosed(context.Background(), config.exitConfig(), f.noteID, &addressReceipt{BlockNumber: "0x10", BlockHash: addressTestBlock})
+			if !errors.Is(err, errWithdrawalVerificationPending) || !errors.Is(err, errExitRPCCloseCheckUnusable) {
+				t.Fatalf("the unusable exit RPC was not named: %v", err)
+			}
+		})
+	}
+}
+
+// Review finding (clientd-fixes5, test gaps): the exit RPC as the only
+// source, not answering a vault read after its retries, is named even when
+// its finalized block reads below the payout's (a node behind a load
+// balancer can lag the one that served the payout as final). A vault read
+// it refuses before the payout is final there stays the plain wait: that is
+// the chain, not the RPC.
+func TestExitOnlyCloseCheckNamesAVaultReadFailureByWhetherThePayoutIsFinal(t *testing.T) {
+	for name, test := range map[string]struct {
+		broken   func(f *withdrawalFixture)
+		unusable bool
+	}{
+		"vault read unanswered":              {func(f *withdrawalFixture) { f.exitUnavailable = map[string]bool{"eth_call": true} }, true},
+		"vault read refused before finality": {func(f *withdrawalFixture) { f.exitRefusesBlockHash = true }, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWithdrawalFixture(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			f.mu.Lock()
+			f.exitFinalized = "0x5"
+			test.broken(f)
+			f.mu.Unlock()
+			config, err := f.h.config(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = f.h.corroborateWithdrawalClosed(context.Background(), config.exitConfig(), f.noteID, &addressReceipt{BlockNumber: "0x10", BlockHash: addressTestBlock})
+			if !errors.Is(err, errWithdrawalVerificationPending) || errors.Is(err, errExitRPCCloseCheckUnusable) != test.unusable {
+				t.Fatalf("the vault read failure was reported as unusable %v, want %v: %v", errors.Is(err, errExitRPCCloseCheckUnusable), test.unusable, err)
+			}
+		})
+	}
+}
+
+// Review finding (clientd-fixes5, low): an exit RPC that does not answer or
+// serves another network while a sponsored withdrawal is followed through
+// it alone fails before its close check. It is named as the exit RPC, never
+// as the payment RPC, and its management refusal carries exit_rpc_unusable,
+// for which the guided session shows its fixed label. Nothing completes.
+func TestSponsoredWithdrawalNamesAnUnusableExitRPCBeforeItsCloseCheck(t *testing.T) {
+	down := httptest.NewTLSServer(http.NotFoundHandler())
+	down.Close()
+	for name, broken := range map[string]func(f *withdrawalFixture){
+		"another network": func(f *withdrawalFixture) { f.exitChain = "0xaa36a7" },
+		"unreachable":     func(f *withdrawalFixture) { f.h.client.config.ExitRPCURL = down.URL },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, g := newGaslessWithdrawalFixture(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			ctx := payoutContext(payoutFees)
+			hash := f.sponsoredClose(t)
+			charged := big.NewInt(2_000_000_000_000_000)
+			g.mineUserOp(t, hash, true, fixtureSettlement{Received: gaslessPayoutWei, Charged: charged, PaidOut: new(big.Int).Sub(gaslessPayoutWei, charged)})
+			f.mu.Lock()
+			f.finalized = "0x20"
+			broken(f)
+			f.mu.Unlock()
+			_, err := f.h.WithdrawAddress(ctx, withdrawalTestDestination, f.noteID)
+			if !exitRPCUnusable(err) || !strings.Contains(err.Error(), "exit RPC (--exit-rpc-url)") || strings.Contains(err.Error(), "payment RPC") {
+				t.Fatalf("the unusable exit RPC was not named: %v", err)
+			}
+			for _, method := range []string{"GET", "POST"} {
+				r := httptest.NewRequest(method, "http://127.0.0.1:8787/admin/withdrawal", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d}`, withdrawalTestDestination, f.noteID)))
+				r.Header.Set("Content-Type", "application/json")
+				recorder := httptest.NewRecorder()
+				f.h.ServeAdminHTTP(recorder, r)
+				var failure struct{ Error, Code string }
+				if json.Unmarshal(recorder.Body.Bytes(), &failure) != nil || failure.Code != "exit_rpc_unusable" || !strings.Contains(failure.Error, "exit RPC (--exit-rpc-url)") {
+					t.Fatalf("%s: the management refusal does not name the exit RPC: %d %s", method, recorder.Code, recorder.Body.String())
+				}
+			}
+			if f.confirmCalls != 0 || !f.active || f.journal(t).Withdrawal.Phase == "complete" {
+				t.Fatal("the close completed while the exit RPC could not be used")
+			}
+		})
+	}
+}
+
+// Review finding (clientd-fixes5, privacy): a deposit after a completed
+// sponsored withdrawal is no exit. Its quote and its approval, and funding
+// without a quote, read and simulate it through the payment RPC: the owner's
+// exit RPC is never asked for the funding address's balance or nonce, nor
+// to estimate or send the deposit. While the withdrawal is still under way,
+// funding is refused after reading through the exit RPC as before.
+func TestADepositAfterASponsoredWithdrawalIsNotNamedToTheExitRPC(t *testing.T) {
+	deposit := map[string]bool{"eth_getBalance": true, "eth_getTransactionCount": true, "eth_estimateGas": true, "eth_feeHistory": true, "eth_sendRawTransaction": true}
+	named := func(calls []string) (found []string) {
+		for _, call := range calls {
+			if deposit[call] {
+				found = append(found, call)
+			}
+		}
+		return found
+	}
+	for _, quoted := range []bool{true, false} {
+		t.Run(map[bool]string{true: "quote and approval", false: "funding without a quote"}[quoted], func(t *testing.T) {
+			f, g := newGaslessWithdrawalFixture(t)
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			hash := f.sponsoredClose(t)
+			f.mu.Lock()
+			f.exitCalls, f.rpcCalls = nil, nil
+			f.mu.Unlock()
+			if _, err := f.h.FundAddress(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "a withdrawal is saved") {
+				t.Fatalf("funding was not refused while the withdrawal is under way: %v", err)
+			}
+			f.mu.Lock()
+			exit, pinned := named(f.exitCalls), named(f.rpcCalls)
+			f.mu.Unlock()
+			if len(exit) == 0 || len(pinned) != 0 {
+				t.Fatalf("funding under way was not read through the exit RPC alone: exit %v, pinned %v", exit, pinned)
+			}
+			charged := big.NewInt(2_000_000_000_000_000)
+			g.mineUserOp(t, hash, true, fixtureSettlement{Received: gaslessPayoutWei, Charged: charged, PaidOut: new(big.Int).Sub(gaslessPayoutWei, charged)})
+			f.mu.Lock()
+			f.finalized = "0x20"
+			f.mu.Unlock()
+			if status, err := f.h.WithdrawAddress(payoutContext(payoutFees), withdrawalTestDestination, f.noteID); err != nil || status.Phase != "complete" {
+				t.Fatalf("the sponsored withdrawal did not complete: %+v %v", status, err)
+			}
+			f.mu.Lock()
+			f.exitCalls, f.rpcCalls = nil, nil
+			f.mu.Unlock()
+			if quoted {
+				quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err != nil || status.Phase != "deposit_pending" {
+					t.Fatalf("the deposit was not sent: %+v %v", status, err)
+				}
+			} else if _, err := f.h.FundAddress(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "approve a current payment quote") {
+				t.Fatalf("funding without a quote was not refused at signing: %v", err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			exit, pinned = named(f.exitCalls), named(f.rpcCalls)
+			if len(exit) != 0 || !slices.Contains(pinned, "eth_getBalance") || !slices.Contains(pinned, "eth_getTransactionCount") {
+				t.Fatalf("the deposit was named to the exit RPC: exit %v, pinned %v", exit, pinned)
+			}
+			if quoted && (!slices.Contains(pinned, "eth_estimateGas") || !slices.Contains(pinned, "eth_sendRawTransaction")) {
+				t.Fatalf("the deposit was not simulated and sent through the payment RPC: %v", pinned)
+			}
+		})
+	}
+}
+
+// A complete exit that is not done yet keeps funding on the exit RPC: a
+// sponsored withdrawal whose payout the paymaster credited, and an escape
+// whose payout claim is pending (with the pinned RPC down). Funding is
+// refused as before, after reading through the exit RPC alone.
+func TestFundingIsRefusedThroughTheExitRPCWhileACompleteExitIsNotDone(t *testing.T) {
+	t.Run("paymaster credit", func(t *testing.T) {
+		f, g := newGaslessWithdrawalFixture(t)
+		f.h.client.config.ExitRPCURL = f.exitRPC
+		hash := f.sponsoredClose(t)
+		charged := big.NewInt(11)
+		g.mineUserOp(t, hash, true, fixtureSettlement{Received: gaslessPayoutWei, Charged: charged, Credited: new(big.Int).Sub(gaslessPayoutWei, charged)})
+		f.mu.Lock()
+		f.finalized = "0x20"
+		f.mu.Unlock()
+		if status, err := f.h.WithdrawAddress(payoutContext(payoutFees), withdrawalTestDestination, f.noteID); err != nil || status.Phase != "complete" || !status.PaymasterCredited {
+			t.Fatalf("the credited withdrawal did not complete: %+v %v", status, err)
+		}
+		f.mu.Lock()
+		f.exitCalls, f.rpcCalls = nil, nil
+		f.mu.Unlock()
+		if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); !errors.Is(err, errWithdrawalPayoutWaiting) {
+			t.Fatalf("a deposit was quoted while the credit waits: %v", err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if !slices.Contains(f.exitCalls, "eth_getBalance") || slices.Contains(f.rpcCalls, "eth_getBalance") {
+			t.Fatalf("the refused quote was not read through the exit RPC: exit %v, pinned %v", f.exitCalls, f.rpcCalls)
+		}
+	})
+	t.Run("escape claim pending", func(t *testing.T) {
+		f := escapeEndToEnd(t, true)
+		if record := f.journal(t); record.Pending == nil || record.Pending.Kind != "escape_claim" || record.Withdrawal.Phase != "complete" {
+			t.Fatalf("no pending claim: %+v", record)
+		}
+		if _, err := f.h.FundAddress(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "a different public transaction is saved") {
+			t.Fatalf("funding was not refused through the exit RPC while the claim is pending: %v", err)
+		}
+	})
 }
 
 // An ownership proof sent for clearance is a valid escape proof. If anyone

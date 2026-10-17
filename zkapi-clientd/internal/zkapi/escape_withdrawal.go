@@ -99,8 +99,9 @@ func parseUnits(value string) (uint64, error) {
 }
 
 // escapeCalldata builds initiateEscapeWithdrawal calldata from the
-// companion's plan and checks it against the owner's confirmation in saved.
-func escapeCalldata(plan escapePlan, config fundingConfig, saved *addressWithdrawalRecord, now time.Time) (string, *addressWithdrawalRecord, error) {
+// companion's plan and checks it against the owner's confirmation in saved
+// and the vault's record of the note.
+func escapeCalldata(plan escapePlan, config fundingConfig, saved *addressWithdrawalRecord, note exitNote, now time.Time) (string, *addressWithdrawalRecord, error) {
 	p := plan.PublicInputs
 	invalid := errors.New("escape proof does not match the confirmed note, destination, balance, concession or deployment")
 	if plan.Status != "prepared" || p.Kind != 0 || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.proofDestination()) || plan.Proof.Backend != "groth16_bn254" {
@@ -110,7 +111,7 @@ func escapeCalldata(plan escapePlan, config fundingConfig, saved *addressWithdra
 	if err != nil || stateBalance != saved.StateBalance || p.Conceded != saved.Conceded || p.FinalBalance+p.Conceded != stateBalance || p.FinalBalance > stateBalance {
 		return "", nil, invalid
 	}
-	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.proofDestination())
+	words, proof, err := withdrawalWords(p, note, plan.Proof.Proof, saved.proofDestination())
 	if err != nil {
 		return "", nil, invalid
 	}
@@ -118,7 +119,7 @@ func escapeCalldata(plan escapePlan, config fundingConfig, saved *addressWithdra
 	if saved.Binding != "" && (saved.Binding != binding || !strings.EqualFold(addressABIWord(saved.Nullifier), addressABIWord(p.Nullifier))) {
 		return "", nil, invalid
 	}
-	data := "0x" + escapeSelector + strings.Join(words, "") + fmt.Sprintf("%064x%064x", 17*32, len(proof)) + hex.EncodeToString(proof)
+	data := "0x" + escapeSelector + strings.Join(words, "") + fmt.Sprintf("%064x%064x", withdrawalProofOffset, len(proof)) + hex.EncodeToString(proof)
 	raw, _ := hex.DecodeString(data[2:])
 	expected := *saved
 	expected.Amount, expected.Nullifier, expected.NextNullifier, expected.Binding = p.FinalBalance, "0x"+addressABIWord(p.Nullifier), "0x"+addressABIWord(p.NextNullifier), binding
@@ -130,12 +131,13 @@ func escapeCalldata(plan escapePlan, config fundingConfig, saved *addressWithdra
 }
 
 // validateSignedEscape checks signed initiateEscapeWithdrawal calldata
-// against the saved, owner-confirmed escape: 836 bytes; the fixed words 0,
+// against the saved, owner-confirmed escape: 868 bytes; the fixed words 0,
 // 1, 2, 8, 9, 10 and 11; kind 0 (word 12); a successor nullifier (word 13)
 // that is set, differs from the nullifier and is the saved one; the
 // confirmed concession (word 14), at most the bound unless zero; payout plus
 // concession equal to the state balance; the bytes offset and length; and
-// the binding over the 16 tuple words with the root and valid_until blanked.
+// the binding over the 17 tuple words with valid_until blanked, which fixes
+// the note's commitment and metadata (words 3 and 16).
 // With a nonzero now (before signing), valid_until must lie in
 // [now, now + 10,800 + 300].
 func validateSignedEscape(data []byte, config fundingConfig, saved *addressWithdrawalRecord, now time.Time) error {
@@ -143,11 +145,11 @@ func validateSignedEscape(data []byte, config fundingConfig, saved *addressWithd
 	if saved == nil || saved.Mode != "escape" || len(data) != withdrawalCalldataLength || hex.EncodeToString(data[:4]) != escapeSelector || saved.Binding == "" || !isHex(saved.Nullifier, 32) || !isHex(saved.NextNullifier, 32) {
 		return invalid
 	}
-	words := make([]string, 18)
+	words := make([]string, 19)
 	for i := range words {
 		words[i] = hex.EncodeToString(data[4+i*32 : 4+(i+1)*32])
 	}
-	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: strings.Repeat("0", 64), 13: addressABIWord(saved.NextNullifier), 14: fmt.Sprintf("%064x", saved.Conceded), 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
+	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: strings.Repeat("0", 64), 13: addressABIWord(saved.NextNullifier), 14: fmt.Sprintf("%064x", saved.Conceded), 17: fmt.Sprintf("%064x", withdrawalProofOffset), 18: fmt.Sprintf("%064x", 256)}
 	for index, value := range expected {
 		if !strings.EqualFold(words[index], value) {
 			return invalid
@@ -527,7 +529,11 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		}
 		return update(), nil
 	}
-	data, expected, err := escapeCalldata(plan, config, w, time.Now())
+	note, err := h.exitNote(ctx, config, record, w.NoteID)
+	if err != nil {
+		return update(), err
+	}
+	data, expected, err := escapeCalldata(plan, config, w, note, time.Now())
 	if err != nil {
 		return update(), err
 	}

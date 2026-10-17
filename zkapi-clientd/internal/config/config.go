@@ -65,9 +65,11 @@ type ZKAPI struct {
 	// Retained only to load older configurations. Each new request chooses its
 	// budget from the selected model; a saved fixed limit has no effect.
 	RequestLimitMicroUSD uint64 `json:"request_limit_micro_usd,omitempty"`
-	// ExitRPCURL is the owner's own Ethereum RPC for exits (--exit-rpc-url):
-	// deployment checks also run through it, the companion reads expiry,
-	// roots and logs through it, and exit transactions are sent through it.
+	// ExitRPCURL is the owner's own Ethereum RPC (--exit-rpc-url): deployment
+	// checks, withdrawal completion, and deposit recording or repair when the
+	// indexer does not confirm also read through it, the companion reads
+	// expiry, roots and logs through it, and exit transactions are sent
+	// through it.
 	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
 	// WithdrawalFees is how a withdrawal pays its network fee by default:
 	// "wallet" (the local signing address; the default) or "payout" (a

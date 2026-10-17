@@ -117,7 +117,7 @@ func runFunding(ctx context.Context, c config.Config, args []string, out io.Writ
 		}
 		printFundingProgress(out, state)
 		if state.Phase != "active" {
-			return errors.New("rebind did not activate the private balance; follow the status message")
+			return errors.New("rebind did not restore the private note; follow the status message")
 		}
 		return nil
 	}

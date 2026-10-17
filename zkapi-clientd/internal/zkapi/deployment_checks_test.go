@@ -56,7 +56,7 @@ func deploymentCheckAnswer(network, method string, params []json.RawMessage) (re
 			selectorNoteTTL:                 number(d.NoteTTL),
 			selectorMaxPauseDuration:        number(d.MaxPauseDuration),
 			selectorConcessionEscapeVersion: number(1),
-			selectorRootHistoryWindow:       number(86400),
+			selectorNoteBoundExitVersion:    number(1),
 		}
 		adapter := map[string]string{
 			selectorCircuitIDHash:    crypto.Keccak256Hash([]byte(d.Proof.Circuit)).Hex(),
@@ -138,7 +138,7 @@ func TestDeploymentChecksUseThePinnedAndTheExitRPC(t *testing.T) {
 		"another note ttl":         {selectorNoteTTL: "0x" + uintWord(60)},
 		"another pause bound":      {selectorMaxPauseDuration: "0x" + uintWord(60)},
 		"no concession exit":       {selectorConcessionEscapeVersion: "0x" + uintWord(0)},
-		"another root window":      {selectorRootHistoryWindow: "0x" + uintWord(3600)},
+		"no note-bound exit":       {selectorNoteBoundExitVersion: "0x" + uintWord(0)},
 		"another circuit":          {selectorCircuitIDHash: crypto.Keccak256Hash([]byte("zkapi-v2-note-bound-v1")).Hex()},
 		"another request key":      {selectorRequestVKHash: "0x" + uintWord(1)},
 		"another withdrawal key":   {selectorWithdrawalVKHash: "0x" + uintWord(1)},

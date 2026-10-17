@@ -666,6 +666,20 @@ func TestManagementErrorsKeepTheirForwardedCode(t *testing.T) {
 	}
 }
 
+// So does the withdrawal client, keeping its own prefix: the guided
+// withdrawal names an unusable exit RPC by its exit_rpc_unusable code.
+func TestWithdrawalRequestErrorsKeepTheirForwardedCode(t *testing.T) {
+	s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "the exit RPC (--exit-rpc-url) did not answer", "code": "exit_rpc_unusable"})
+	}))
+	defer s.Close()
+	_, err := requestWithdrawal(context.Background(), fundingTestConfig(s), http.MethodGet, nil)
+	if managementErrorCode(err) != "exit_rpc_unusable" || err.Error() != "withdrawal: the exit RPC (--exit-rpc-url) did not answer" {
+		t.Fatalf("withdrawal refusal: %v", err)
+	}
+}
+
 // A state the server already holds a clearance for can never be settled by a
 // chat request, before expiry too: the guided withdrawal explains that and
 // asks for the acknowledgement without waiting for expiry.

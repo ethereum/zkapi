@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
@@ -44,7 +45,10 @@ type Config struct {
 	KeyReuseWindow   time.Duration   `json:"-"` // fixed, in-memory window; zero disables reuse
 	TorMode          bool            `json:"-"` // HTTPClient must use relay's tor:// transport
 	// ExitRPCURL is the user's own Ethereum RPC (--exit-rpc-url): deployment
-	// checks also run through it, and exit transactions are sent through it.
+	// checks, withdrawal completion, and deposit recording or repair when
+	// the indexer does not confirm also read through it, and exit
+	// transactions are sent through it. Plain HTTP to this machine is
+	// dialed directly (rpcHTTP).
 	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
 	// BundlerURL is the user's ERC-4337 bundler for gasless withdrawals
 	// (--bundler-url / zkapi.bundler_url); empty uses the profile's.
@@ -57,6 +61,7 @@ type Client struct {
 	usedLeases        map[[32]byte]uint64
 	requestSlot       chan struct{}
 	settlementPoll    time.Duration
+	activationWait    time.Duration // bounds a request's wait for its note's activation (note_not_activated, indexer_root_lag)
 	settlementWake    chan struct{}
 	leaseGroup        *leaseGroup // accessed only while owning requestSlot
 	now               func() time.Time
@@ -73,8 +78,11 @@ type Client struct {
 }
 
 // chainEndpoints are the packaged deployment's remote origins. The payment RPC
-// and indexer are independent sources: deposits and withdrawals are activated
-// or closed only when both agree, and neither string comes from the companion.
+// and indexer are independent sources: a deposit's note is saved only when
+// both record it (or the owner's exit RPC stands in for the operator's
+// indexer once the deposit is final), and neither string comes from the
+// companion. A withdrawal completes on the payment RPC's vault state, and
+// also the exit RPC's when one is configured.
 type chainEndpoints struct{ RPC, Indexer, ProtocolServer string }
 
 func (c *Client) packagedEndpoints() (chainEndpoints, error) {
@@ -129,6 +137,14 @@ func (e *Error) Error() string {
 		return "zkAPI note state is reserved for withdrawal: the server holds a withdrawal clearance for the note's current state (for example because the zkAPI operator released it) and refuses every chat request from it, so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance"
 	}
 	switch e.Code {
+	case "note_not_activated":
+		return "zkAPI note_not_activated: the deposit is recorded, but the operator's batch has not activated the note yet, so it cannot pay for requests; retry shortly (withdrawals are available now)"
+	case "indexer_root_lag":
+		return "zkAPI indexer_root_lag: the vault activated the note, but the operator's indexer has not caught up with that activation yet, so no request can be prepared from it; retry in a few seconds"
+	case "note_not_recorded":
+		return "zkAPI note_not_recorded: the zkAPI server has not observed this note's deposit yet, so it cannot clear the withdrawal; retry shortly"
+	case "note_binding_mismatch":
+		return "zkAPI note_binding_mismatch: the zkAPI server refused the withdrawal clearance because the note's commitment or metadata differ from the vault's record of the note. Check the note on a block explorer; an escape (zkapi-clientd withdraw --escape --to ADDRESS) is checked by the vault alone"
 	case "escape_required":
 		return "zkAPI withdrawal needs an escape: the server cannot or will not clear a mutual close of the note's current state. Run zkapi-clientd withdraw --escape --to ADDRESS to review the escape and the amount it concedes"
 	case "conceded_mismatch":
@@ -226,10 +242,61 @@ func New(config Config) (*Client, error) {
 	inference.CheckRedirect = noRedirect
 	inference.Jar = nil
 	local := &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}, CheckRedirect: noRedirect, Timeout: 4 * time.Minute}
-	return &Client{config: config, local: local, inference: &inference, usedLeases: make(map[[32]byte]uint64), requestSlot: make(chan struct{}, 1), settlementPoll: 5 * time.Second, settlementWake: make(chan struct{}, 1), now: time.Now}, nil
+	return &Client{config: config, local: local, inference: &inference, usedLeases: make(map[[32]byte]uint64), requestSlot: make(chan struct{}, 1), settlementPoll: 5 * time.Second, activationWait: 2 * time.Minute, settlementWake: make(chan struct{}, 1), now: time.Now}, nil
 }
 
 func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// loopbackRPCClient reaches the owner's exit RPC or bundler at a plain-HTTP
+// address on this machine, which ValidateExitRPCURL allows. The configured
+// transport is HTTPS-only, and a relay or Tor exit could not reach this
+// machine anyway, so such a node is dialed directly: no proxy, no redirects,
+// no cookie jar, a bounded timeout, and a connection only to a loopback IP.
+var loopbackRPCClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                  nil,
+		DialContext:            (&net.Dialer{Timeout: 5 * time.Second, Control: dialLoopbackOnly}).DialContext,
+		DisableKeepAlives:      true,
+		DisableCompression:     true,
+		MaxResponseHeaderBytes: 1 << 20,
+	},
+	CheckRedirect: noRedirect,
+	Timeout:       20 * time.Second,
+}
+
+// dialLoopbackOnly refuses a direct connection to anything but a loopback IP,
+// so a name like localhost that resolves elsewhere never leaves this machine
+// around the configured transport.
+func dialLoopbackOnly(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() {
+		return errors.New("a plain-HTTP RPC must be on this machine")
+	}
+	return nil
+}
+
+// loopbackHTTPURL reports whether rawURL is plain HTTP to this machine:
+// localhost or a loopback IP, the only plain HTTP ValidateExitRPCURL allows.
+func loopbackHTTPURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "http" || u.User != nil {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	return u.Hostname() == "localhost" || (ip != nil && ip.IsLoopback())
+}
+
+// rpcHTTP is the client for a JSON-RPC call to rawURL: plain HTTP to this
+// machine (the owner's own node or bundler) is dialed directly
+// (loopbackRPCClient); everything else uses the configured direct, Wisp or
+// Tor transport, which refuses anything but HTTPS.
+func (c *Client) rpcHTTP(rawURL string) *http.Client {
+	if loopbackHTTPURL(rawURL) {
+		return loopbackRPCClient
+	}
+	return c.inference
+}
+
 func validateLoopbackURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
@@ -320,8 +387,13 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			for _, code := range []string{nested.Code, flat, failure.Code} {
 				switch code {
 				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state", "ownership_proof_sent",
-					// Circuit zkapi-v2-concession-v1 (design §6.3, §6.4).
-					"escape_required", "conceded_mismatch", "device_not_newest", "exit_locked", "note_near_expiry", "bound_fixed_at_state", "invalid_successor", "late_successor", "exit_lock_conflict":
+					// The concession exit (design §6.3, §6.4).
+					"escape_required", "conceded_mismatch", "device_not_newest", "exit_locked", "note_near_expiry", "bound_fixed_at_state", "invalid_successor", "late_successor", "exit_lock_conflict",
+					// Circuit zkapi-v2-concession-v2: a recorded note pays for
+					// requests only once an operator batch activated it (and
+					// the operator's indexer caught up with it), and a
+					// clearance is checked against the vault's note record.
+					"note_not_activated", "indexer_root_lag", "note_binding_mismatch", "note_not_recorded":
 					return nil, &Error{response.StatusCode, code}
 				}
 			}
@@ -351,8 +423,8 @@ func (c *Client) Check(ctx context.Context) error {
 		BillingAsset  string `json:"billing_asset"`
 		BillingUnit   string `json:"billing_unit"`
 		CircuitID     string `json:"circuit_id"`
-		// Bridge 5: the concession exit, its escape routes and the setup
-		// the companion's keys belong to.
+		// The concession exit, its escape routes and the setup the
+		// companion's keys belong to.
 		ExitConcession int    `json:"exit_concession"`
 		SetupID        string `json:"setup_id"`
 		// 2: the escape routes, and /oa/v1/withdraw/escape/cancel.
@@ -372,9 +444,13 @@ func (c *Client) Check(ctx context.Context) error {
 	return nil
 }
 
-// CompanionBridgeVersion is the bridge the companion must speak: 5 is circuit
-// zkapi-v2-concession-v1 with the escape routes.
-const CompanionBridgeVersion = 5
+// CompanionBridgeVersion is the bridge the companion must speak: 6 is circuit
+// zkapi-v2-concession-v2 with the escape routes. Exit plans carry the note's
+// registration commitment and metadata instead of a root, deposits carry no
+// path (/oa/v1/deposit/path is gone), /wallet/status reports the note's
+// activation, and a request for a note not yet activated is refused with
+// note_not_activated.
+const CompanionBridgeVersion = 6
 
 // Complete passes the caller's JSON unchanged over the anonymous HTTP client.
 // Raw SSE bytes remain available to the gateway immediately; no fake streaming
@@ -496,6 +572,7 @@ type reusableLease struct {
 
 func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (providerLease, error) {
 	waiting, retirementAttempted := false, false
+	var activationWaitStarted time.Time
 	for {
 		if err := ctx.Err(); err != nil {
 			return providerLease{}, err
@@ -523,6 +600,32 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 			activity.Diagnostic(ctx, "payment: requesting key; authorized spending cap=%d micro-USD (not a charge or ETH transfer)", limit)
 		}
 		lease, err := c.request(ctx, http.MethodPost, "/oa/v1/lease", leaseBody)
+		if isAwaitingActivation(err) {
+			// The note was recorded but no operator batch has activated it
+			// yet, or the operator's indexer has not caught up with the
+			// activation. Activation takes about a batch interval, so wait a
+			// bounded time, then report it; nothing was issued.
+			if activationWaitStarted.IsZero() {
+				activationWaitStarted = time.Now()
+				var refused *Error
+				if errors.As(err, &refused) && refused.Code == "indexer_root_lag" {
+					activity.Diagnostic(ctx, "payment: the private note is activated but the operator's indexer has not caught up yet; waiting for it")
+				} else {
+					activity.Diagnostic(ctx, "payment: the private note is recorded but not activated yet; waiting for the operator's batch")
+				}
+				activity.Report(ctx, activity.Event{Kind: activity.ActivationWaiting})
+			} else if time.Since(activationWaitStarted) >= c.activationWait {
+				return providerLease{}, err
+			}
+			timer := time.NewTimer(c.settlementPoll)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return providerLease{}, ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
 		if !isPendingSettlement(err) {
 			if err != nil {
 				return providerLease{}, err
@@ -569,6 +672,15 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 		case <-timer.C:
 		}
 	}
+}
+
+// isAwaitingActivation reports the companion's refusal to prepare a request
+// for a note no operator batch has activated yet, or one the vault activated
+// that the operator's indexer has not caught up with (indexer_root_lag). It
+// is retriable later and is never pending settlement: no key was issued.
+func isAwaitingActivation(err error) bool {
+	var refused *Error
+	return errors.As(err, &refused) && (refused.Code == "note_not_activated" || refused.Code == "indexer_root_lag")
 }
 
 func isPendingSettlement(err error) bool {

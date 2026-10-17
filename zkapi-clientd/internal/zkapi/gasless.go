@@ -144,7 +144,7 @@ var gaslessErrorNames = func() map[string]string {
 		// ZkApiWithdrawalPaymaster
 		"NotEntryPoint()", "SponsorshipPaused()", "SponsorshipInFlight(bytes32)", "BadPaymasterData()", "FeeAboveCap(uint256,uint256)", "FeeAboveCeiling()",
 		"GasLimitOutOfRange(uint8,uint256,uint256,uint256)", "MaxCostAbovePolicy(uint256,uint256)", "NotTransitAccount()", "UnsupportedCall()", "WrongNonceKey()",
-		"AttemptsExhausted(bytes32)", "BindingMismatch()", "DestinationNotSender()", "InvalidValidUntil()", "UnknownRoot()", "NoteNotActive()", "NullifierUsed()",
+		"AttemptsExhausted(bytes32)", "BindingMismatch()", "DestinationNotSender()", "InvalidValidUntil()", "NoteBindingMismatch()", "NoteNotActive()", "NullifierUsed()",
 		"InvalidFelt()", "WrongKind()", "InvalidBalance()", "BadSuccessor()", "ChallengedNullifier()", "SupersededState()", "EscapesDisabled()",
 		"EscapeAlreadySponsored(uint32)", "EscapeEvidencePending(uint32)", "PayoutBelowCost(uint256,uint256)", "ExitsPaused(uint64)", "NotPendingEscape()",
 		"NotStranded()", "NotRepayable()", "ZeroAmount()", "NativeTransferFailed()", "CreditsReserved()", "InvalidKind()",
@@ -154,7 +154,8 @@ var gaslessErrorNames = func() map[string]string {
 		"InvalidProof()", "InvalidNativeValue()", "StaleRoot()", "ReplayedNullifier()", "InvalidDestination()", "NotePendingWithdrawal()", "NoteExpired()",
 		"NoteNotExpired()", "InsufficientDeposit()", "InvalidCommitment()", "ChallengeExpired()", "ChallengeNotExpired()", "NotPendingWithdrawal()",
 		"InvalidDeploymentBinding()", "InvalidSiblings()", "Paused()", "NotPaused()", "Unauthorized()", "WrongWithdrawalKind()", "NotSuccessorEvidence()",
-		"NotStateEvidence()", "NotARaise()", "ProofExpired()", "PauseCooldown()", "NoteNotClosed()",
+		"NotStateEvidence()", "NotARaise()", "ProofExpired()", "PauseCooldown()", "NoteNotClosed()", "StaleActivation()", "InvalidActivation()",
+		"NoteNotActivated()",
 	} {
 		names[selectorOf(signature)] = signature[:strings.Index(signature, "(")]
 	}
@@ -1070,8 +1071,9 @@ func (e *rpcError) revertData() []byte {
 var errBundlerUnavailable = errors.New("bundler_unavailable: the bundler did not answer")
 
 // bundlerCall is one JSON-RPC call to the bundler through the configured
-// transport. A JSON-RPC error is returned as rpcError; a transport failure
-// as errBundlerUnavailable.
+// transport, or directly to a bundler on this machine (rpcHTTP). A JSON-RPC
+// error is returned as rpcError; a transport failure as
+// errBundlerUnavailable.
 func (h *FundingHandler) bundlerCall(ctx context.Context, url, method string, params []any) (json.RawMessage, *rpcError, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -1081,7 +1083,7 @@ func (h *FundingHandler) bundlerCall(ctx context.Context, url, method string, pa
 		return nil, nil, errBundlerUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
-	response, err := h.client.inference.Do(req)
+	response, err := h.client.rpcHTTP(url).Do(req)
 	if err != nil {
 		return nil, nil, errBundlerUnavailable
 	}
@@ -1307,7 +1309,7 @@ func (c *Client) CheckGaslessDeployment(ctx context.Context) error {
 		if err := ValidateExitRPCURL(c.config.ExitRPCURL); err != nil {
 			return err
 		}
-		if err := verifyGaslessCode(ctx, c.inference, c.config.ExitRPCURL, deployment); err != nil {
+		if err := verifyGaslessCode(ctx, c.rpcHTTP(c.config.ExitRPCURL), c.config.ExitRPCURL, deployment); err != nil {
 			return err
 		}
 	}

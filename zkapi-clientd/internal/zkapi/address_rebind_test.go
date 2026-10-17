@@ -236,9 +236,10 @@ func TestRebindResumesAfterCrashBetweenResetAndConfirm(t *testing.T) {
 	}
 }
 
-// The automatic repair searches from the earliest slot a deposit of this
-// note was signed for. Here an indexer view that was later reorganized moved
-// the latest prepared slot past the one where the withheld deposit landed.
+// The automatic repair compares every recorded note, not only those from the
+// latest prepared slot. Here an indexer view that was later reorganized
+// moved the latest prepared slot past the one where the withheld deposit
+// landed.
 func TestRebindSearchesFromTheEarliestSignedSlot(t *testing.T) {
 	f := newAddressFixture(t, true)
 	first, err := f.fundNative(t, 100000)
@@ -257,7 +258,7 @@ func TestRebindSearchesFromTheEarliestSignedSlot(t *testing.T) {
 		t.Fatalf("fixture did not move the prepared slot past the signed one: %+v", slot)
 	}
 	f.mu.Lock()
-	f.leaves = f.leaves[:12] // The fork is reorganized away ...
+	f.leaves, f.records = f.leaves[:12], f.records[:12] // The fork is reorganized away ...
 	f.leafVersion++
 	commitment := "0x" + hex.EncodeToString(f.accepted[first.TransactionHash].Data())[8:72]
 	f.registerDeposit(12, commitment, 100000, bucketedExpiry()) // ... and the withheld deposit lands.

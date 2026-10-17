@@ -245,7 +245,7 @@ func TestGaslessDerivationsFollowTheTransitVectors(t *testing.T) {
 	if err := json.Unmarshal(v.GasPolicy, &policy); err != nil {
 		t.Fatal(err)
 	}
-	if policy.CallFloor != [4]uint64{540000, 540000, 250000, 80000} || policy.CallCap != [4]uint64{950000, 1100000, 400000, 150000} || policy.PostOpFloor != 250000 || policy.MaxAttempts != 3 || policy.FinalizeReserveGas != 990000 {
+	if policy.CallFloor != [4]uint64{550000, 540000, 250000, 80000} || policy.CallCap != [4]uint64{950000, 1100000, 400000, 150000} || policy.PostOpFloor != 250000 || policy.MaxAttempts != 3 || policy.FinalizeReserveGas != 1000000 {
 		t.Fatalf("gas policy parsed as %+v", policy)
 	}
 	for i, sample := range v.ChargeSamples {
@@ -264,7 +264,7 @@ func TestGaslessDerivationsFollowTheTransitVectors(t *testing.T) {
 		t.Fatalf("derived defaults %+v differ from the vector's limits %+v", filled, op)
 	}
 	// The policy words are what gasPolicy() returns, in its order.
-	if words := filled.words(); len(words) != 30 || words[0] != 540000 || words[8] != 250000 || words[29] != 3 {
+	if words := filled.words(); len(words) != 30 || words[0] != 550000 || words[8] != 250000 || words[29] != 3 {
 		t.Fatalf("policy words %v", words)
 	}
 }
@@ -287,7 +287,7 @@ func TestGaslessUserOpJSONRoundTripsWithTheBundlerFieldNames(t *testing.T) {
 			t.Errorf("field %s missing from %s", name, encoded)
 		}
 	}
-	if len(fields) != 15 || fields["factory"] != common.HexToAddress(v.Factory).Hex() || fields["nonce"] != "0x"+vectorUint(t, v.Close.Nonce).Text(16) || fields["callGasLimit"] != "0x9cdc4" || fields["paymasterData"] != "0x00000000000009184e72a000" {
+	if len(fields) != 15 || fields["factory"] != common.HexToAddress(v.Factory).Hex() || fields["nonce"] != "0x"+vectorUint(t, v.Close.Nonce).Text(16) || fields["callGasLimit"] != "0x9eb10" || fields["paymasterData"] != "0x00000000000009184e72a000" {
 		t.Fatalf("unexpected encoding %s", encoded)
 	}
 	var decoded gaslessUserOpJSON
@@ -355,6 +355,21 @@ func TestGaslessSelectorsAndTopicsMatchTheContracts(t *testing.T) {
 	}
 	if gaslessErrorNames[selectorOf("NoteNotActive()")] != "NoteNotActive" || gaslessErrorNames[selectorOf("PayoutBelowCost(uint256,uint256)")] != "PayoutBelowCost" {
 		t.Fatal("error names missing")
+	}
+}
+
+// Vault revision 4 binds an exit to notes(noteId): the paymaster and the
+// vault refuse an exit whose note words differ with NoteBindingMismatch,
+// which replaced UnknownRoot. A dry run refused for it is a named refusal.
+func TestGaslessNoteBindingMismatchIsARefusal(t *testing.T) {
+	if selectorOf("NoteBindingMismatch()") != "41c6633b" || gaslessErrorNames["41c6633b"] != "NoteBindingMismatch" {
+		t.Fatal("NoteBindingMismatch is not named")
+	}
+	if _, named := gaslessErrorNames[selectorOf("UnknownRoot()")]; named {
+		t.Fatal("UnknownRoot, which no vault of this revision raises, is still named")
+	}
+	if code := GaslessRefusalCode(refusalOfFailure(aaFailure{Reason: "AA33 reverted", Code: "AA33", Inner: "NoteBindingMismatch"})); code != "note_binding_mismatch" {
+		t.Fatalf("a note binding mismatch was refused as %q", code)
 	}
 }
 

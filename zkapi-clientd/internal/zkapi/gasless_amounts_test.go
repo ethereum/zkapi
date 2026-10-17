@@ -85,8 +85,8 @@ func TestGaslessPreVerificationGasParity(t *testing.T) {
 		handleOpsBytes         int
 	}{
 		// A (LIM-070 term), B (reference minimum), PVG, handleOps bytes (C = 21,000 + 16 × bytes + 10,000)
-		{"close with initCode", closeWithInit, 66_316, 52_668, 66_316, 1_764},
-		{"close without initCode", &closeWithout, 65_356, 51_696, 65_356, 1_668},
+		{"close with initCode", closeWithInit, 66_132, 52_488, 66_132, 1_796},
+		{"close without initCode", &closeWithout, 65_184, 51_528, 65_184, 1_700},
 		{"forward", &forward, 57_904, 44_136, 57_904, 804},
 		{"finalize", &finalize, 57_956, 44_196, 57_956, 868},
 	} {

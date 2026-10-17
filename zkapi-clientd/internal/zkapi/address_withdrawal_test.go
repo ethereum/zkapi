@@ -114,7 +114,10 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 			}
 			return withdrawalJSONResponse(r, 200, policy), nil
 		case "/wallet/status":
-			return withdrawalJSONResponse(r, 200, map[string]any{"has_note": f.active, "pending_request": w.pending, "note": map[string]any{"note_id": w.noteID, "deposit_amount": 100000, "current_balance": w.walletBalance, "expiry_ts": 2000000000, "current_anchor": "0x55", "current_commitment_x": "0x66", "current_commitment_y": "0x77"}}), nil
+			f.mu.Lock()
+			cursor := f.cursor
+			f.mu.Unlock()
+			return withdrawalJSONResponse(r, 200, map[string]any{"has_note": f.active, "pending_request": w.pending, "activated": w.noteID < uint64(cursor), "activation_cursor": cursor, "note": map[string]any{"note_id": w.noteID, "deposit_amount": 100000, "current_balance": w.walletBalance, "expiry_ts": 2000000000, "current_anchor": "0x55", "current_commitment_x": "0x66", "current_commitment_y": "0x77"}}), nil
 		case "/funding/api/deposit/prepare":
 			f.prepared++
 			var body struct {
@@ -187,6 +190,7 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 			plan["public_inputs"].(map[string]any)["final_balance"] = w.planBalance
 			plan["public_inputs"].(map[string]any)["note_id"] = w.noteID
 			plan["public_inputs"].(map[string]any)["withdrawal_nullifier"] = w.reservedNullifier
+			w.bindNote(plan)
 			if w.planMutation != nil {
 				w.planMutation(plan)
 			}
@@ -226,28 +230,36 @@ func (f *withdrawalFixture) bridgeStatus() map[string]any {
 	return status
 }
 
+// bindNote makes a companion plan bind the reserved note as the vault
+// records it, as the companion proves it from its own note state.
+func (f *withdrawalFixture) bindNote(plan map[string]any) {
+	f.mu.Lock()
+	note, ok := f.vaultNotes[uint32(f.noteID)]
+	f.mu.Unlock()
+	if !ok {
+		return
+	}
+	inputs := plan["public_inputs"].(map[string]any)
+	inputs["registration_commitment"], inputs["deposit_amount"], inputs["expiry"] = note.commitment, note.amount, note.expiry
+}
+
 func withdrawalTestPlan(destination string) map[string]any {
 	decoded, _ := hex.DecodeString(strings.TrimPrefix(destination, "0x"))
 	address := make([]int, len(decoded))
 	for i, b := range decoded {
 		address[i] = int(b)
 	}
-	siblings := make([]string, 32)
-	for i := range siblings {
-		siblings[i] = "0xa"
-	}
 	return map[string]any{
 		"mode": "mutual",
 		"public_inputs": map[string]any{
 			"protocol_version": 2, "chain_id": 1, "contract_address": addressTestVault,
-			"active_root": "0x9", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
+			"registration_commitment": "0x1234", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
 			"clearance_signing_key_x": "0x3", "clearance_signing_key_y": "0x4",
 			"note_id": 12, "final_balance": 99999, "destination": address,
 			"withdrawal_nullifier": "0x123", "kind": 1, "next_nullifier": "0x0", "conceded": 0,
-			"valid_until": time.Now().Unix() + exitProofValidity,
+			"valid_until": time.Now().Unix() + exitProofValidity, "deposit_amount": testNote.Amount, "expiry": testNote.ExpiryTs,
 		},
-		"siblings": siblings,
-		"proof":    map[string]any{"backend": "groth16_bn254", "proof": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 256))},
+		"proof": map[string]any{"backend": "groth16_bn254", "proof": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 256))},
 	}
 }
 
@@ -316,19 +328,25 @@ func TestAddressWithdrawalSignsExactBoundCallAndPreservesDepositHistory(t *testi
 	if tx.Nonce() != 2 || tx.Value().Sign() != 0 || !strings.EqualFold(tx.To().Hex(), addressTestVault) {
 		t.Fatal("withdrawal escaped local signer nonce, zero value, or configured vault")
 	}
-	// mutualClose((16-field tuple),bytes): 16 words, the bytes offset 17*32,
-	// the length 256 and the proof, 836 bytes. Selector 0x72cd2e44.
-	signature := "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)"
+	// mutualClose((17-field tuple),bytes): 17 words, the bytes offset 18*32,
+	// the length 256 and the proof, 868 bytes. Selector 0x5acd3b15. Word 3
+	// is the note's registration commitment and word 16 its metadata,
+	// depositAmount | expiryTs << 128, as the vault records them.
+	signature := "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256),bytes)"
 	expected := hex.EncodeToString(crypto.Keccak256([]byte(signature))[:4])
-	if expected != "72cd2e44" {
+	if expected != "5acd3b15" || withdrawalSelector != expected {
 		t.Fatalf("the mutualClose selector is %s", expected)
 	}
+	f.mu.Lock()
+	note := f.vaultNotes[12]
+	f.mu.Unlock()
+	metadata := new(big.Int).Add(new(big.Int).SetUint64(note.amount), new(big.Int).Lsh(new(big.Int).SetUint64(note.expiry), 128))
 	validUntil := new(big.Int).SetBytes(tx.Data()[4+15*32 : 4+16*32]).Uint64()
-	for _, value := range []string{"0x2", "0x1", addressTestVault, "0x9", "0x1", "0x2", "0x3", "0x4", "0xc", "0x1869f", withdrawalTestDestination, "0x123", "0x1", "0x0", "0x0", fmt.Sprintf("0x%x", validUntil), "0x220", "0x100"} {
+	for _, value := range []string{"0x2", "0x1", addressTestVault, "0x1234", "0x1", "0x2", "0x3", "0x4", "0xc", "0x1869f", withdrawalTestDestination, "0x123", "0x1", "0x0", "0x0", fmt.Sprintf("0x%x", validUntil), fmt.Sprintf("0x%x", metadata), "0x240", "0x100"} {
 		expected += addressABIWord(value)
 	}
 	expected += strings.Repeat("5a", 256)
-	if got := hex.EncodeToString(tx.Data()); got != expected || len(tx.Data()) != 836 {
+	if got := hex.EncodeToString(tx.Data()); got != expected || len(tx.Data()) != 868 {
 		t.Fatalf("withdrawal calldata differs from the pinned contract ABI: got %d bytes, want %d", len(tx.Data()), len(expected)/2)
 	}
 	if now := uint64(time.Now().Unix()); validUntil < now || validUntil > now+exitProofValidity+exitProofClockAllowance {
@@ -341,12 +359,60 @@ func TestAddressWithdrawalSignsExactBoundCallAndPreservesDepositHistory(t *testi
 	}
 }
 
+// An exit proves the note itself (vault revision 4): its registration
+// commitment and metadata must equal notes(noteId), which the vault checks
+// (NoteBindingMismatch). Go reads that record before the companion proves,
+// requires it to be this wallet's corroborated deposit, and refuses a plan
+// that binds anything else; nothing is signed.
+func TestExitBindsTheVaultsRecordOfTheNote(t *testing.T) {
+	for name, test := range map[string]struct {
+		vault  func(*fixtureNote) bool
+		plan   func(map[string]any)
+		reason string
+	}{
+		"vault record of another expiry": {vault: func(n *fixtureNote) bool { n.expiry += 86400; return true }, reason: "does not match this wallet's deposit"},
+		"vault record of another amount": {vault: func(n *fixtureNote) bool { n.amount++; return true }, reason: "does not match this wallet's deposit"},
+		"note not recorded":              {vault: func(*fixtureNote) bool { return false }, reason: "does not record note 12"},
+		"plan of another commitment":     {plan: func(p map[string]any) { p["public_inputs"].(map[string]any)["registration_commitment"] = "0x5678" }, reason: "does not match the authorized note"},
+		"plan of another amount":         {plan: func(p map[string]any) { p["public_inputs"].(map[string]any)["deposit_amount"] = 100001 }, reason: "does not match the authorized note"},
+		"plan of another expiry":         {plan: func(p map[string]any) { p["public_inputs"].(map[string]any)["expiry"] = 2_000_000_000 }, reason: "does not match the authorized note"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWithdrawalFixture(t)
+			if test.vault != nil {
+				f.mu.Lock()
+				note := f.vaultNotes[12]
+				if test.vault(&note) {
+					f.vaultNotes[12] = note
+				} else {
+					delete(f.vaultNotes, 12)
+				}
+				f.mu.Unlock()
+			}
+			f.planMutation = test.plan
+			_, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+			if err == nil || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("the exit was not refused for its note record: %v", err)
+			}
+			if len(f.accepted) != 2 || (test.vault != nil && f.prepareCalls != 0) {
+				t.Fatalf("a mismatched exit was proved or signed: prepares=%d accepted=%d", f.prepareCalls, len(f.accepted))
+			}
+		})
+	}
+	// uint256(depositAmount) | uint256(expiryTs) << 128.
+	metadata := new(big.Int).Or(big.NewInt(100000), new(big.Int).Lsh(big.NewInt(2_000_000_000), 128))
+	if word := noteMetadataWord(100000, 2_000_000_000); word != fmt.Sprintf("%064x", metadata) {
+		t.Fatalf("note metadata word %s", word)
+	}
+}
+
 // checkSignedCloseWords checks validateSignedWithdrawal on signed mutualClose
-// calldata (design §6.7): 836 bytes; the fixed words; kind 1 with no
+// calldata (design §6.7): 868 bytes; the fixed words; kind 1 with no
 // successor nullifier or concession even under a binding of the changed
 // words; the bytes offset and length; valid_until in [now, now + 10,800 +
-// 300]; and the binding over words[:16] with the root and valid_until
-// blanked, so a re-proof at another root still matches.
+// 300]; and the binding over words[:17] with only valid_until blanked, so
+// a re-proof with a fresh lifetime still matches but the note's commitment
+// and metadata (words 3 and 16) are fixed.
 func checkSignedCloseWords(t *testing.T, data []byte, saved *addressWithdrawalRecord) {
 	t.Helper()
 	config := fundingConfig{ChainID: 1, Contract: addressTestVault}
@@ -355,7 +421,7 @@ func checkSignedCloseWords(t *testing.T, data []byte, saved *addressWithdrawalRe
 		t.Fatal(err)
 	}
 	words := func(raw []byte) []string {
-		out := make([]string, 18)
+		out := make([]string, 19)
 		for i := range out {
 			out[i] = hex.EncodeToString(raw[4+i*32 : 4+(i+1)*32])
 		}
@@ -366,7 +432,7 @@ func checkSignedCloseWords(t *testing.T, data []byte, saved *addressWithdrawalRe
 		tampered[4+index*32+31] ^= 1
 		return tampered
 	}
-	for _, index := range []int{0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17} {
+	for _, index := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18} {
 		if validateSignedWithdrawal(tamper(index), config, saved, now) == nil {
 			t.Errorf("close word %d tampering accepted", index)
 		}
@@ -381,8 +447,10 @@ func checkSignedCloseWords(t *testing.T, data []byte, saved *addressWithdrawalRe
 			t.Errorf("close word %d accepted under its own binding", index)
 		}
 	}
-	if validateSignedWithdrawal(tamper(3), config, saved, now) != nil {
-		t.Error("a re-proof at another root refused")
+	refreshed := append([]byte(nil), data...)
+	copy(refreshed[4+15*32:4+16*32], common.LeftPadBytes(big.NewInt(now.Unix()+60).Bytes(), 32))
+	if validateSignedWithdrawal(refreshed, config, saved, now) != nil {
+		t.Error("a re-proof with a fresh lifetime refused")
 	}
 	for name, validUntil := range map[string]int64{"expired": now.Unix() - 1, "too late": now.Unix() + exitProofValidity + exitProofClockAllowance + 1} {
 		changed := append([]byte(nil), data...)
@@ -598,8 +666,10 @@ func TestAddressWithdrawalRefreshesOnlyAfterExplicitFinalizedRevertRetry(t *test
 	if err != nil || status.Phase != "reverted" || f.prepareCalls != 1 || len(f.accepted) != 3 {
 		t.Fatalf("finalized revert did not stop for explicit retry: %+v %v", status, err)
 	}
+	// The note's commitment and metadata are fixed: a re-proof naming
+	// another note record is refused, and nothing is signed.
 	f.planMutation = func(plan map[string]any) {
-		plan["public_inputs"].(map[string]any)["active_root"] = "0xb"
+		plan["public_inputs"].(map[string]any)["registration_commitment"] = "0x5678"
 	}
 	for range 2 {
 		status, err = f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
@@ -607,13 +677,20 @@ func TestAddressWithdrawalRefreshesOnlyAfterExplicitFinalizedRevertRetry(t *test
 			t.Fatal("a repeated poll authorized a reverted transaction retry")
 		}
 	}
+	if _, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID, hash); err == nil || len(f.accepted) != 3 || f.journal(t).Withdrawal.Phase != "reverted" {
+		t.Fatalf("a re-proof for another note record was signed: %v", err)
+	}
+	refreshed := time.Now().Unix() + exitProofValidity - 100
+	f.planMutation = func(plan map[string]any) {
+		plan["public_inputs"].(map[string]any)["valid_until"] = refreshed
+	}
 	again := f.withdraw(t, hash)
 	record := f.journal(t)
-	if again == hash || f.accepted[again].Nonce() != 3 || f.prepareCalls != 2 || len(record.History) != 3 || !record.History[2].FinalizedRevert {
+	if again == hash || f.accepted[again].Nonce() != 3 || f.prepareCalls != 3 || len(record.History) != 3 || !record.History[2].FinalizedRevert {
 		t.Fatal("explicit retry did not preserve failed transaction history and use a fresh proof/nonce")
 	}
-	if got := hex.EncodeToString(f.accepted[again].Data()[4+3*32 : 4+4*32]); got != addressABIWord("0xb") {
-		t.Fatal("stale-root retry did not refresh the root")
+	if got := new(big.Int).SetBytes(f.accepted[again].Data()[4+15*32 : 4+16*32]); !got.IsInt64() || got.Int64() != refreshed {
+		t.Fatal("the retry did not carry the fresh proof's lifetime")
 	}
 }
 
@@ -1201,8 +1278,8 @@ func TestNativeWithdrawalKeepsGweiAmountAndZeroTransactionValue(t *testing.T) {
 	if tx == nil || tx.Value().Sign() != 0 || tx.Nonce() != 1 || len(f.accepted) != 2 {
 		t.Fatal("native withdrawal signed value or unexpected extra approval")
 	}
-	if len(tx.Data()) != 836 {
-		t.Fatalf("the mutualClose calldata is %d bytes, not 836", len(tx.Data()))
+	if len(tx.Data()) != 868 {
+		t.Fatalf("the mutualClose calldata is %d bytes, not 868", len(tx.Data()))
 	}
 	if err := validateSignedWithdrawal(tx.Data(), fundingConfig{ChainID: 1, Contract: addressTestVault}, f.journal(t).Withdrawal, time.Now()); err != nil {
 		t.Fatal(err)
@@ -1221,5 +1298,32 @@ func TestNativeWithdrawalKeepsGweiAmountAndZeroTransactionValue(t *testing.T) {
 	status, err = f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, 12, "", "")
 	if err != nil || status.Phase != "complete" || len(f.accepted) != 2 {
 		t.Fatal("native withdrawal repeated after restart")
+	}
+}
+
+// The protocol server checks a clearance's ownership proof against the
+// vault's record of the note. A deposit its RPC has not seen yet is retriable
+// (note_not_recorded); a record that differs is refused
+// (note_binding_mismatch). Both reach the owner by name, with fixed text, and
+// the saved intent resumes without anything signed.
+func TestAddressWithdrawalReportsTheServersNoteRecordRefusals(t *testing.T) {
+	for code, text := range map[string]string{"note_not_recorded": "retry shortly", "note_binding_mismatch": "checked by the vault alone"} {
+		t.Run(code, func(t *testing.T) {
+			f := newWithdrawalFixture(t)
+			f.unsettled, f.unsettledCode = true, code
+			_, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+			var refused *Error
+			if !errors.As(err, &refused) || refused.Code != code || !strings.Contains(err.Error(), text) || strings.Contains(err.Error(), "private companion") {
+				t.Fatalf("the server's refusal was hidden or leaked: %v", err)
+			}
+			if record := f.journal(t); record.Pending != nil || record.Withdrawal == nil || record.Withdrawal.Binding != "" || len(f.accepted) != 2 {
+				t.Fatalf("a refused clearance bound or signed a withdrawal: %+v", record.Withdrawal)
+			}
+			f.unsettled = false
+			f.withdraw(t)
+			if len(f.accepted) != 3 {
+				t.Fatal("the withdrawal did not resume once the server cleared it")
+			}
+		})
 	}
 }

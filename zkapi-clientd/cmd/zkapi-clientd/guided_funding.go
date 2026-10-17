@@ -65,11 +65,42 @@ func runGuidedFunding(ctx context.Context, c config.Config, usdText, _ string, u
 }
 
 // A fixed label: the daemon's detailed status stays out of the guided output.
-var errGuidedDepositConflict = errors.New("deposit needs attention: the payment RPC, the vault state, and the zkAPI indexer disagree about this mined deposit, so its private note was not activated; the funds stay on chain. Run zkapi-clientd config again to re-check. If this persists, compare the transaction on a block explorer and run zkapi-clientd config --menu, then choose repair")
+var errGuidedDepositConflict = errors.New("deposit needs attention: the payment RPC, the vault state, and the zkAPI indexer disagree about this mined deposit, so its private note was not saved; the funds stay on chain. Run zkapi-clientd config again to re-check. If this persists, compare the transaction on a block explorer and run zkapi-clientd config --menu, then choose repair")
+
+// errGuidedDepositConflictExitRPCUnusable replaces errGuidedDepositConflict
+// for a conflict the owner's exit RPC could not check at all
+// (ExitRPCUnusable): repair would need that RPC too, so it is named first.
+var errGuidedDepositConflictExitRPCUnusable = errors.New("deposit needs attention: the zkAPI indexer does not record this mined deposit, and your exit RPC could not check it instead (no answer, another Ethereum network, or no EIP-1898 block-hash reads), so its private note was not saved; the funds stay on chain. Check the RPC, or set another with zkapi-clientd config --exit-rpc-url URL and restart serve, then run zkapi-clientd config again to re-check; the saved deposit is kept")
+
+// guidedDepositConflict is the fixed error for a deposit a resume left in
+// verification_conflict.
+func guidedDepositConflict(state zkapi.AddressFundingStatus) error {
+	if state.ExitRPCUnusable {
+		return errGuidedDepositConflictExitRPCUnusable
+	}
+	return errGuidedDepositConflict
+}
+
+// guidedIndexerWaitPolls is how many checks may find a guided deposit
+// waiting for the zkAPI indexer before guidedIndexerWaitGuidance is shown:
+// about a minute at the guided poll interval, well past the indexer's
+// ordinary lag after mining.
+const guidedIndexerWaitPolls = 12
+
+// guidedIndexerWaitGuidance is the fixed label for a deposit the zkAPI
+// indexer keeps waiting (it is down, behind or withholds the note): the
+// owner's exit RPC confirms the note instead once the deposit is final there.
+const guidedIndexerWaitGuidance = "The zkAPI indexer has still not confirmed this deposit; checking continues. Your own Ethereum RPC can confirm it instead once the deposit is final there; the private note is then saved and can be withdrawn by escape without the operator's indexer. If you have not set one, set it with zkapi-clientd config --exit-rpc-url URL; the saved deposit is kept."
+
+// guidedDepositExitRPCUnusableLabel is the fixed label for a deposit the
+// zkAPI indexer has not confirmed whose check the owner's exit RPC cannot
+// make instead at all (ExitRPCUnusable): no answer, another network, or no
+// EIP-1898 reads. It replaces the verifying stage and guidedIndexerWaitGuidance.
+const guidedDepositExitRPCUnusableLabel = "Deposit mined, but the zkAPI indexer has not confirmed it and your exit RPC cannot check it instead (no answer, another Ethereum network, or no EIP-1898 block-hash reads); checking continues. Check the RPC, or set another with zkapi-clientd config --exit-rpc-url URL and restart serve, then run zkapi-clientd config again; the saved deposit is kept."
 
 // A conflict about an earlier, retired deposit can clear on re-check; no
 // deposit is saved then, so there is nothing to resume.
-var errGuidedDepositRechecked = errors.New("the zkAPI indexer no longer shows the earlier deposit and no deposit is saved; run zkapi-clientd config again to review a new deposit quote")
+var errGuidedDepositRechecked = errors.New("the zkAPI indexer no longer records the earlier deposit and no deposit is saved; run zkapi-clientd config again to review a new deposit quote")
 
 // runGuidedRepair binds the saved deposit to the vault note that finalized
 // vault state and the zkAPI indexer agree holds it, through the
@@ -108,10 +139,25 @@ func runGuidedRepair(ctx context.Context, c config.Config, ui setupPrompter) err
 		return err
 	}
 	if state.Phase != "active" {
-		return errors.New("repair did not activate the private balance; " + state.Message)
+		return errors.New("repair did not restore the private note; " + state.Message)
 	}
-	ui.Printf("Deposit note binding repaired. Private inference balance activated.\n")
+	ui.Printf("Deposit note binding repaired. %s\n", savedNoteLabel(state))
 	return nil
+}
+
+// savedNoteLabel is the fixed label of a saved deposit's note: recorded and
+// waiting for the operator's batch, activated, or saved with its activation
+// not yet read. Requests need it activated; withdrawals do not. It claims
+// activation only when the companion reported it.
+func savedNoteLabel(state zkapi.AddressFundingStatus) string {
+	switch {
+	case state.DepositStage == "awaiting_activation":
+		return "The private note is recorded; the operator's batch activates it shortly, and requests wait for it automatically. Withdrawals are available now."
+	case state.Activated != nil && *state.Activated:
+		return "Private inference balance activated."
+	default:
+		return "The private note is saved. Requests wait for the operator's batch to activate it if it has not yet; withdrawals are available now."
+	}
 }
 
 func setupUSD(amount uint64) string {
@@ -171,7 +217,7 @@ func guidedFunding(ctx context.Context, service guidedFundingService, usdText st
 			return err
 		}
 		if next.Phase == "verification_conflict" {
-			return errGuidedDepositConflict
+			return guidedDepositConflict(next)
 		}
 		if next.TransactionHash == "" && (next.Phase == "ready" || next.Phase == "waiting_funds") {
 			return errGuidedDepositRechecked
@@ -218,7 +264,7 @@ func guidedFunding(ctx context.Context, service guidedFundingService, usdText st
 		return err
 	}
 	if !ready.HasNote {
-		return errors.New("deposit recovery did not activate the private balance; run zkapi-clientd config with the same configuration")
+		return errors.New("deposit recovery did not save the private note; run zkapi-clientd config with the same configuration")
 	}
 	return checkSetupBalance(ready, ui)
 }
@@ -553,29 +599,40 @@ func finishGuidedDeposit(ctx context.Context, service guidedFundingService, init
 	if initial.Phase != "active" && !validWithdrawalTransactionHash(initial.TransactionHash) {
 		return errors.New("saved deposit transaction is missing; preserve recovery files")
 	}
-	state, previous, retrying := initial, "", false
+	state, previous, retrying, verifying, guided := initial, "", false, 0, false
 	for {
 		if state.BillingAsset != "native_eth" || state.Amount != initial.Amount || state.Address != initial.Address || state.ChainID != initial.ChainID || state.DeploymentID != initial.DeploymentID || (initial.TransactionHash != "" && state.TransactionHash != initial.TransactionHash) {
 			return errors.New("saved deposit changed during recovery; preserve its recovery files")
 		}
-		progress := state.Phase + state.TransactionHash + state.DepositStage
+		if state.Phase == "confirming" && state.DepositStage == "verifying" {
+			// A deposit the indexer still keeps waiting gets the way out
+			// that does not depend on it, once; the stage is restored below.
+			// An exit RPC that cannot check it gets its own label instead.
+			if verifying++; verifying >= guidedIndexerWaitPolls && !guided && !state.ExitRPCUnusable {
+				ui.Printf("%s\n", guidedIndexerWaitGuidance)
+				previous, guided = "", true
+			}
+		}
+		progress := state.Phase + state.TransactionHash + state.DepositStage + strconv.FormatBool(state.ExitRPCUnusable)
 		if progress != previous {
 			// Fixed labels only; remote messages and recovery internals do not
 			// enter the guided session's output.
 			switch state.Phase {
 			case "active":
 				clearSetupProgress(ui)
-				ui.Printf("Deposit confirmed. Private inference balance activated.\n")
+				ui.Printf("Deposit confirmed. %s\n", savedNoteLabel(state))
 			case "confirming":
-				if state.DepositStage == "verifying" {
-					setupProgress(ui, "Deposit mined; waiting for the zkAPI indexer to confirm it before activation.")
+				if state.DepositStage == "verifying" && state.ExitRPCUnusable {
+					setupProgress(ui, guidedDepositExitRPCUnusableLabel)
+				} else if state.DepositStage == "verifying" {
+					setupProgress(ui, "Deposit mined; waiting for the zkAPI indexer to record it before saving the private note.")
 				} else {
-					setupProgress(ui, "Deposit confirmed; activating your private balance.")
+					setupProgress(ui, "Deposit confirmed; saving your private note.")
 				}
 			case "deposit_pending":
 				switch state.DepositStage {
 				case "activating":
-					setupProgress(ui, "Deposit confirmed; activating your private balance.")
+					setupProgress(ui, "Deposit confirmed; saving your private note.")
 				case "fee_wait":
 					setupProgress(ui, "Current Ethereum fees exceed this transaction's signed fee cap. Waiting for fees to fall; retrying the same saved transaction.")
 				case "failed_finalizing":
@@ -596,7 +653,7 @@ func finishGuidedDeposit(ctx context.Context, service guidedFundingService, init
 			return nil
 		}
 		if state.Phase == "verification_conflict" {
-			return errGuidedDepositConflict
+			return guidedDepositConflict(state)
 		}
 		if state.Phase != "deposit_pending" && state.Phase != "confirming" {
 			return errors.New("deposit needs attention; run zkapi-clientd config with this configuration before continuing (a reverted transaction is never retried automatically)")

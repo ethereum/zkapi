@@ -62,7 +62,7 @@ func TestPackagedDeploymentsArePlaceholdersMatchingTheBrowserProfiles(t *testing
 					t.Errorf("%s differs from the browser profile's proof pin", field)
 				}
 			}
-			if identity.Proof.Circuit != RequiredCircuitID || identity.VaultRevision != 3 || identity.ExitConcession != 1 {
+			if identity.Proof.Circuit != RequiredCircuitID || identity.VaultRevision != RequiredVaultRevision || identity.ExitConcession != 1 {
 				t.Fatal("wrong concession deployment identity")
 			}
 		})
@@ -80,8 +80,8 @@ func TestPackagedDeploymentsArePlaceholdersMatchingTheBrowserProfiles(t *testing
 	}
 }
 
-// Only the concession vault is accepted: circuit zkapi-v2-concession-v1,
-// vault revision 3 with the concession exit, required ownership proofs, the
+// Only the concession vault is accepted: circuit zkapi-v2-concession-v2,
+// vault revision 4 with the concession exit, required ownership proofs, the
 // vault parameters and, once deployed, every code and key pin.
 func TestDeployedProfilesNeedEveryConcessionPin(t *testing.T) {
 	_, raw, err := pinnedDeployment("sepolia")
@@ -92,8 +92,10 @@ func TestDeployedProfilesNeedEveryConcessionPin(t *testing.T) {
 		t.Fatalf("the fixture is invalid: %v", err)
 	}
 	for _, change := range []struct{ name, before, after string }{
-		{"legacy circuit", `"circuit_id": "zkapi-v2-concession-v1"`, `"circuit_id": "zkapi-v2-note-bound-v1"`},
-		{"hardened vault", `"vault_revision": 3`, `"vault_revision": 2`},
+		{"legacy circuit", `"circuit_id": "zkapi-v2-concession-v2"`, `"circuit_id": "zkapi-v2-note-bound-v1"`},
+		{"root-bound concession circuit", `"circuit_id": "zkapi-v2-concession-v2"`, `"circuit_id": "zkapi-v2-concession-v1"`},
+		{"hardened vault", `"vault_revision": 4`, `"vault_revision": 2`},
+		{"root-bound concession vault", `"vault_revision": 4`, `"vault_revision": 3`},
 		{"no concession exit", `"exit_concession": 1`, `"exit_concession": 0`},
 		{"optional ownership proofs", `"clearance_ownership_proof": "required"`, `"clearance_ownership_proof": "optional"`},
 		{"no setup", `"setup_id": "dev"`, `"setup_id": ""`},

@@ -32,6 +32,10 @@ func accessPreparationError(ctx context.Context, err error) error {
 		message = "The returned access key failed local lease validation (verification, expiry, provider endpoint or required fields). It was not used for inference. Preserve wallet state; do not redeposit to fix this error."
 	case "tor_preparation_failed":
 		message = "Authenticated Tor route preparation failed before key acquisition. Check the configured Tor SOCKS listener; no direct fallback was used."
+	case "note_not_activated":
+		message = "The deposit is recorded, but the operator's batch has not activated the private note yet, so it cannot pay for requests. No key was issued; retry in a minute. Withdrawals are available now."
+	case "indexer_root_lag":
+		message = "The vault has activated the private note, but the operator's indexer has not caught up with it yet, so no key was issued; retry shortly. Withdrawals are available now."
 	default:
 		return err
 	}

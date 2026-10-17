@@ -40,6 +40,7 @@ func TestServeReadinessDoesNotAuthorizeOrPrepareWalletOperations(t *testing.T) {
 		{"low positive balance", zkapi.WalletReadiness{HasNote: true, Balance: 1}, ""},
 		{"empty balance", zkapi.WalletReadiness{HasNote: true}, "private balance is empty"},
 		{"ready", zkapi.WalletReadiness{HasNote: true, Balance: 999999}, ""},
+		{"awaiting activation", zkapi.WalletReadiness{HasNote: true, Balance: 999999, Activation: zkapi.NoteActivation{Known: true, Cursor: 10, Ahead: 2}}, ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newWizardFixture()
@@ -51,6 +52,12 @@ func TestServeReadinessDoesNotAuthorizeOrPrepareWalletOperations(t *testing.T) {
 			}
 			if fixture.quoteCalls != 0 || fixture.approveCalls != 0 || fixture.resumeCalls != 0 || ui.asks != 0 || ui.confirms != 0 {
 				t.Fatal("serve attempted interactive setup or a wallet mutation")
+			}
+			// A recorded note waiting for the operator's batch is reported,
+			// never treated as unfunded: requests wait for its activation.
+			pending := test.state.Activation.Known && !test.state.Activation.Activated
+			if shown := strings.Contains(ui.String(), "2 earlier notes first") && strings.Contains(ui.String(), "withdrawals are available now"); shown != pending {
+				t.Fatalf("activation pending shown=%v for %+v: %s", shown, test.state, ui.String())
 			}
 		})
 	}

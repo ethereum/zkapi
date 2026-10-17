@@ -60,6 +60,8 @@ func LogRequests(next http.Handler, logger *log.Logger) http.Handler {
 				logger.Printf("request settling request=%d action=retire_previous_key", request)
 			case activity.SettlementFinished:
 				logger.Printf("request settlement result request=%d ready=%t duration=%s", request, event.Complete, event.Duration.Round(time.Millisecond))
+			case activity.ActivationWaiting:
+				logger.Printf("request waiting request=%d reason=note_activation", request)
 			}
 		}))
 		started := time.Now()

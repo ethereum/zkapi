@@ -5,9 +5,52 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/core/types"
 )
+
+// The vault's incremental Merkle tree, which the fixture indexers' roots
+// follow (zkapi-core v2.rs; checked against the Rust vectors in
+// poseidon_test.go). clientd itself never hashes the tree: activation is the
+// companion's reading of the vault.
+const merkleDepth = 32
+
+var domainNode = poseidonDomain("zkapi.v2.node")
+
+// merkleNode mirrors v2::merkle_node (the vault's MerkleUpdateLib.poseidonNodeHash): one
+// permutation of the state (domainNode, left, right), rate lane one.
+func merkleNode(left, right *big.Int) *big.Int {
+	state := [poseidonWidth]*big.Int{
+		new(big.Int).Set(domainNode),
+		new(big.Int).Mod(left, bn254ScalarModulus),
+		new(big.Int).Mod(right, bn254ScalarModulus),
+	}
+	poseidonPermute(&state)
+	return state[1]
+}
+
+var merkleZeroHashes = sync.OnceValue(func() [merkleDepth + 1]*big.Int {
+	var zero [merkleDepth + 1]*big.Int
+	zero[0] = new(big.Int)
+	for level := 1; level <= merkleDepth; level++ {
+		zero[level] = merkleNode(zero[level-1], zero[level-1])
+	}
+	return zero
+})
+
+// merkleRoot mirrors v2::merkle_root for a leaf and its 32 bottom-up siblings.
+func merkleRoot(index uint32, leaf *big.Int, siblings []*big.Int) *big.Int {
+	current := new(big.Int).Set(leaf)
+	for level, sibling := range siblings {
+		if (index>>level)&1 == 0 {
+			current = merkleNode(current, sibling)
+		} else {
+			current = merkleNode(sibling, current)
+		}
+	}
+	return current
+}
 
 // fixtureHeader is a minimal post-London block header at number with block
 // time at. Its Hash is what an indexer view of that block names.
@@ -76,24 +119,21 @@ func fieldValue(value string) *big.Int {
 	return parsed
 }
 
-// depositEventReceipt is a successful receipt with one NoteDeposited log
-// whose newRoot is zero.
+// depositEventReceipt is a successful receipt with one NoteDeposited log.
 func depositEventReceipt(contract string, noteID uint32, commitment string, amount, expiry uint64) ethReceipt {
-	return depositEventReceiptAt(contract, noteID, commitment, amount, expiry, nil)
-}
-
-// depositEventReceiptAt is depositEventReceipt with NoteDeposited.newRoot.
-func depositEventReceiptAt(contract string, noteID uint32, commitment string, amount, expiry uint64, root *big.Int) ethReceipt {
-	if root == nil {
-		root = new(big.Int)
-	}
-	raw := fmt.Sprintf(`{"status":"0x1","to":%q,"logs":[{"address":%q,"topics":[%q,"0x%064x","0x%s"],"data":"0x%064x%064x%064x"}]}`, contract, contract, depositEventTopic, noteID, addressABIWord(commitment), amount, expiry, root)
+	raw := fmt.Sprintf(`{"status":"0x1","to":%q,"logs":[{"address":%q,"topics":[%q,"0x%064x","0x%s"],"data":"0x%064x%064x"}]}`, contract, contract, depositEventTopic, noteID, addressABIWord(commitment), amount, expiry)
 	var receipt ethReceipt
 	_ = json.Unmarshal([]byte(raw), &receipt)
 	return receipt
 }
 
-func snapshotBody(leaves []*big.Int, block uint64, hash string) map[string]any {
-	root, _ := testTree(leaves, 0)
-	return map[string]any{"root": fmt.Sprintf("0x%x", root), "next_note_id": len(leaves), "leaves": fieldHexes(leaves), "block_number": block, "block_hash": hash}
+// snapshotBody is an indexer snapshot that records notes, none of them
+// activated yet: its tree is still empty.
+func snapshotBody(notes []fixtureNote, block uint64, hash string) map[string]any {
+	recorded, tree := make([]*big.Int, len(notes)), make([]*big.Int, len(notes))
+	for id, note := range notes {
+		recorded[id], tree[id] = noteLeaf(uint32(id), fieldValue(note.commitment), note.amount, note.expiry), new(big.Int)
+	}
+	root, _ := testTree(tree, 0)
+	return map[string]any{"root": fmt.Sprintf("0x%x", root), "next_note_id": len(notes), "activation_cursor": 0, "leaves": fieldHexes(tree), "note_leaves": fieldHexes(recorded), "notes": fixtureNoteRecords(notes), "block_number": block, "block_hash": hash}
 }

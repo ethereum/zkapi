@@ -14,6 +14,49 @@ type WalletReadiness struct {
 	PendingRequest    bool
 	Balance           uint64
 	WithdrawalPending bool
+	// Activation is the held note's activation; requests wait for it.
+	Activation NoteActivation
+}
+
+// NoteActivation is the companion's reading of the vault's activation cursor
+// for its note. A deposit only records a note; an operator batch activates
+// it later by inserting its leaf into the tree (noteId < activationCursor).
+// A recorded note can exit at once, but requests need it activated. Known is
+// false when the companion gave no consistent reading (no note, an
+// unreadable chain, or an older companion).
+type NoteActivation struct {
+	Known     bool
+	Activated bool
+	Cursor    uint64
+	// Ahead counts the notes activated before this one (noteId -
+	// activationCursor) while it waits.
+	Ahead uint64
+}
+
+// ParseNoteActivation reads /wallet/status's activated and
+// activation_cursor. They describe public chain state, so a reading that
+// contradicts the note ID is reported as unknown rather than refused.
+func ParseNoteActivation(raw json.RawMessage) NoteActivation {
+	var wallet struct {
+		HasNote   bool    `json:"has_note"`
+		Activated *bool   `json:"activated"`
+		Cursor    *uint64 `json:"activation_cursor"`
+		Note      *struct {
+			ID *uint64 `json:"note_id"`
+		} `json:"note"`
+	}
+	if json.Unmarshal(raw, &wallet) != nil || !wallet.HasNote || wallet.Activated == nil || wallet.Cursor == nil || wallet.Note == nil || wallet.Note.ID == nil || *wallet.Note.ID > 0xffffffff || *wallet.Cursor > 1<<32 {
+		return NoteActivation{}
+	}
+	id, cursor := *wallet.Note.ID, *wallet.Cursor
+	if *wallet.Activated != (id < cursor) {
+		return NoteActivation{}
+	}
+	activation := NoteActivation{Known: true, Activated: *wallet.Activated, Cursor: cursor}
+	if !activation.Activated {
+		activation.Ahead = id - cursor
+	}
+	return activation
 }
 
 // Readiness never creates a lease or prepares a transaction. Withdrawal
@@ -44,6 +87,7 @@ func (c *Client) Readiness(ctx context.Context) (WalletReadiness, error) {
 			return invalid()
 		}
 		result.Balance = *wallet.Note.Balance
+		result.Activation = ParseNoteActivation(raw)
 	} else if wallet.Note != nil {
 		return invalid()
 	}

@@ -287,9 +287,9 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 			setupProgress(ui, "Preparing withdrawal with the ownership proof; this can take a few minutes.")
 			continue
 		}
-		if fees == "payout" && managementErrorCode(err) != "" {
+		if code := managementErrorCode(err); fees == "payout" && code != "" && code != "exit_rpc_unusable" {
 			// A gasless refusal does not clear by waiting: the wallet-paid
-			// path is the way out.
+			// path is the way out. An unusable exit RPC is no refusal.
 			clearSetupProgress(ui)
 			return fmt.Errorf("%w. The fee cannot be paid from the payout now; run zkapi-clientd config --menu, choose withdraw and the wallet-paid fee, or zkapi-clientd withdraw --to %s --fees wallet", err, destination)
 		}
@@ -480,15 +480,20 @@ func withdrawalPaymentNeedsRefresh(current, displayed zkapi.AddressPaymentQuote)
 
 func readGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui setupPrompter, wait func(context.Context) error) (zkapi.AddressWithdrawalStatus, error) {
 	defer clearSetupProgress(ui)
-	warned := false
+	shown := ""
 	for {
 		state, err := service.Status(ctx)
 		if err == nil {
 			return state, nil
 		}
-		if !warned {
-			setupProgress(ui, "Withdrawal status is temporarily unavailable; checking saved progress again.")
-			warned = true
+		// Fixed labels only, each shown when it changes.
+		label := "Withdrawal status is temporarily unavailable; checking saved progress again."
+		if managementErrorCode(err) == "exit_rpc_unusable" {
+			label = guidedExitRPCDownLabel
+		}
+		if label != shown {
+			setupProgress(ui, "%s", label)
+			shown = label
 		}
 		if err := wait(ctx); err != nil {
 			return state, err
@@ -496,12 +501,22 @@ func readGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService, 
 	}
 }
 
+// guidedExitRPCDownLabel is the fixed label for a withdrawal whose status
+// is read through the owner's exit RPC alone (a sponsored withdrawal) while
+// that RPC does not answer or serves another network (exit_rpc_unusable).
+const guidedExitRPCDownLabel = "Withdrawal status cannot be read: your exit RPC does not answer or is on another Ethereum network; checking continues. Check the RPC, or set another with zkapi-clientd config --exit-rpc-url URL and restart serve. Ctrl+C preserves progress."
+
+// guidedExitRPCUnusableLabel is the fixed label for a withdrawal whose close
+// the owner's exit RPC cannot check at all (ExitRPCUnusable): the payout is
+// final on Ethereum, and only the owner can fix the RPC it waits for.
+const guidedExitRPCUnusableLabel = "The withdrawal is final on Ethereum, but your exit RPC cannot confirm that the vault shows the note closed (no answer, another Ethereum network, or no EIP-1898 block-hash reads); checking continues. Check the RPC, or set another with zkapi-clientd config --exit-rpc-url URL and restart serve. Ctrl+C preserves progress."
+
 func finishGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService, initial zkapi.AddressWithdrawalStatus, ui setupPrompter, wait func(context.Context) error) error {
 	defer clearSetupProgress(ui)
 	if (!validWithdrawalTransactionHash(initial.TransactionHash) && !validWithdrawalTransactionHash(initial.UserOpHash)) || initial.Destination == "" {
 		return errors.New("saved withdrawal transaction is missing; preserve recovery files")
 	}
-	state, announced := initial, false
+	state, shown := initial, ""
 	for {
 		if !sameGuidedWithdrawalWallet(initial, state) || state.Amount != initial.Amount || !strings.EqualFold(state.Destination, initial.Destination) || !sameGuidedWithdrawalOperation(initial, state) {
 			return errors.New("saved withdrawal changed during recovery; preserve recovery files")
@@ -526,15 +541,19 @@ func finishGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService
 				ui.Printf("Network fee: %s ETH.\n", fundingUnits(state.ActualFeeWei, 18))
 			}
 			return nil
-		case "withdrawal_pending", "confirming":
-			if !announced {
-				setupProgress(ui, "Withdrawal submitted; waiting for Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress.")
-				announced = true
+		case "withdrawal_pending", "confirming", "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
+			// Fixed labels only, each shown when the stage changes; the
+			// status message does not enter the guided session's output.
+			label := "Withdrawal submitted; waiting for Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress."
+			if state.Phase != "withdrawal_pending" && state.Phase != "confirming" {
+				label = "Sponsored operation sent to the bundler; waiting for inclusion and Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress."
 			}
-		case "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
-			if !announced {
-				setupProgress(ui, "Sponsored operation sent to the bundler; waiting for inclusion and Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress.")
-				announced = true
+			if state.ExitRPCUnusable {
+				label = guidedExitRPCUnusableLabel
+			}
+			if label != shown {
+				setupProgress(ui, "%s", label)
+				shown = label
 			}
 		default:
 			return errors.New("withdrawal needs attention; run zkapi-clientd config --menu to recover it; a reverted transaction is never retried automatically")
@@ -548,7 +567,7 @@ func finishGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService
 			if err != nil {
 				return err
 			}
-			announced = false // Restore the stage after a temporary status message.
+			shown = "" // Restore the stage after a temporary status message.
 		}
 		state = next
 	}

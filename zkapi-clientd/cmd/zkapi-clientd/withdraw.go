@@ -390,9 +390,10 @@ func requestWithdrawalPath(ctx context.Context, c config.Config, method, path st
 	if response.StatusCode != http.StatusOK {
 		var result struct {
 			Error string `json:"error"`
+			Code  string `json:"code"`
 		}
 		if json.Unmarshal(raw, &result) == nil && result.Error != "" {
-			return state, fmt.Errorf("withdrawal: %s", result.Error)
+			return state, &managementError{message: result.Error, code: result.Code, scope: "withdrawal"}
 		}
 		return state, errors.New("local withdrawal request failed; check saved status before retrying")
 	}

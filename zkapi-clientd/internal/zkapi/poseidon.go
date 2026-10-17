@@ -3,29 +3,25 @@ package zkapi
 import (
 	"fmt"
 	"math/big"
-	"sync"
 )
 
 // A Go port of zkAPI v2's own Poseidon (zkapi-core v2.rs, arkworks
-// PoseidonSponge), used only to recompute public note leaves and Merkle nodes
-// from the indexer's privacy-safe tree snapshot. It is not circomlib Poseidon.
+// PoseidonSponge), used only to recompute public note leaves from the
+// indexer's privacy-safe snapshot of note records. It is not circomlib
+// Poseidon.
 const (
 	poseidonWidth         = 3
 	poseidonRate          = 2
 	poseidonFullRounds    = 8
 	poseidonPartialRounds = 57
 	poseidonRounds        = poseidonFullRounds + poseidonPartialRounds
-	merkleDepth           = 32
 )
 
 var bn254ScalarModulus, _ = new(big.Int).SetString("30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001", 16)
 
 var poseidonARK, poseidonMDS = loadPoseidonParameters()
 
-var (
-	domainLeaf = poseidonDomain("zkapi.v2.leaf")
-	domainNode = poseidonDomain("zkapi.v2.node")
-)
+var domainLeaf = poseidonDomain("zkapi.v2.leaf")
 
 func loadPoseidonParameters() (ark [poseidonRounds * poseidonWidth]*big.Int, mds [poseidonWidth][poseidonWidth]*big.Int) {
 	parse := func(value string) *big.Int {
@@ -112,42 +108,6 @@ func poseidonHash(inputs ...*big.Int) *big.Int {
 // noteLeaf mirrors v2::note_leaf, the vault's NoteLeafLib.computeLeaf.
 func noteLeaf(noteID uint32, commitment *big.Int, amount, expiry uint64) *big.Int {
 	return poseidonHash(domainLeaf, new(big.Int).SetUint64(uint64(noteID)), commitment, new(big.Int).SetUint64(amount), new(big.Int).SetUint64(expiry))
-}
-
-// merkleNode mirrors v2::merkle_node (the vault's MerkleUpdateLib.poseidonNodeHash): one
-// permutation of the state (domainNode, left, right), rate lane one. The domain sits in the
-// capacity lane, so a node costs one permutation and cannot collide with a poseidonHash
-// output, whose capacity lane starts at zero.
-func merkleNode(left, right *big.Int) *big.Int {
-	state := [poseidonWidth]*big.Int{
-		new(big.Int).Set(domainNode),
-		new(big.Int).Mod(left, bn254ScalarModulus),
-		new(big.Int).Mod(right, bn254ScalarModulus),
-	}
-	poseidonPermute(&state)
-	return state[1]
-}
-
-var merkleZeroHashes = sync.OnceValue(func() [merkleDepth + 1]*big.Int {
-	var zero [merkleDepth + 1]*big.Int
-	zero[0] = new(big.Int)
-	for level := 1; level <= merkleDepth; level++ {
-		zero[level] = merkleNode(zero[level-1], zero[level-1])
-	}
-	return zero
-})
-
-// merkleRoot mirrors v2::merkle_root for a leaf and its 32 bottom-up siblings.
-func merkleRoot(index uint32, leaf *big.Int, siblings []*big.Int) *big.Int {
-	current := new(big.Int).Set(leaf)
-	for level, sibling := range siblings {
-		if (index>>level)&1 == 0 {
-			current = merkleNode(current, sibling)
-		} else {
-			current = merkleNode(sibling, current)
-		}
-	}
-	return current
 }
 
 // parseFieldElement accepts the indexer's and companion's 0x hex (with or

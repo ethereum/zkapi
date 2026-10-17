@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
 )
 
 var queuedTestPrompt = json.RawMessage(`{"model":"example/model","messages":[{"role":"user","content":"private content"}],"stream":true}`)
@@ -133,6 +135,110 @@ func TestCompleteWaitsOnlyForExplicitSettlementAndAcquiresFreshKeys(t *testing.T
 			}
 			if leases.Load() != 6 || calls.Load() != 2 || <-keys == <-keys {
 				t.Fatalf("settlement retry reused access or repeated inference: leases=%d calls=%d", leases.Load(), calls.Load())
+			}
+		})
+	}
+}
+
+// A note recorded but not activated by the operator's batch yet cannot pay
+// for requests: the companion refuses the lease with note_not_activated and
+// issues no key. The request waits for the activation a bounded time,
+// asking again, then reports the code; it never waits as for settlement.
+func TestCompleteWaitsBoundedForTheNotesActivation(t *testing.T) {
+	for name, refusals := range map[string]int32{"activated while waiting": 3, "not activated in time": -1} {
+		t.Run(name, func(t *testing.T) {
+			var leases, calls atomic.Int32
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer upstream.Close()
+			client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/oa/v1/lease" {
+					t.Errorf("unexpected companion request %s while waiting for activation", r.URL.Path)
+					return
+				}
+				if n := leases.Add(1); refusals < 0 || n <= refusals {
+					w.WriteHeader(http.StatusConflict)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": "note_not_activated", "message": "private companion diagnostics"}})
+					return
+				}
+				writeQueuedTestLease(w, upstream.URL, leases.Load())
+			}, upstream)
+			client.settlementPoll, client.activationWait = time.Millisecond, 50*time.Millisecond
+			var events []activity.Event
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			ctx = activity.WithReporter(ctx, func(event activity.Event) { events = append(events, event) })
+			response, err := client.Complete(ctx, queuedTestPrompt)
+			if refusals > 0 {
+				if err != nil {
+					t.Fatal(err)
+				}
+				response.Body.Close()
+				if leases.Load() != refusals+1 || calls.Load() != 1 || len(events) == 0 || events[0].Kind != activity.ActivationWaiting {
+					t.Fatalf("the activated note was not served after waiting: leases=%d calls=%d events=%+v", leases.Load(), calls.Load(), events)
+				}
+				return
+			}
+			var refused *Error
+			if !errors.As(err, &refused) || refused.Code != "note_not_activated" || refused.Status != http.StatusConflict || strings.Contains(err.Error(), "private") || !strings.Contains(err.Error(), "withdrawals are available") {
+				t.Fatalf("the wait for activation did not end with note_not_activated: %v", err)
+			}
+			if leases.Load() < 2 || calls.Load() != 0 || len(events) != 1 || events[0].Kind != activity.ActivationWaiting {
+				t.Fatalf("the wait asked once, reached the provider or reported settlement: leases=%d calls=%d events=%+v", leases.Load(), calls.Load(), events)
+			}
+		})
+	}
+}
+
+// A note the vault activated that the operator's indexer has not caught up
+// with yet is refused with the retriable indexer_root_lag (503): the request
+// waits for it within the same bounded activation wait, then reports the
+// code.
+func TestCompleteWaitsBoundedForTheIndexerToCatchUp(t *testing.T) {
+	for name, refusals := range map[string]int32{"caught up while waiting": 2, "not caught up in time": -1} {
+		t.Run(name, func(t *testing.T) {
+			var leases, calls atomic.Int32
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer upstream.Close()
+			client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/oa/v1/lease" {
+					t.Errorf("unexpected companion request %s while waiting for the indexer", r.URL.Path)
+					return
+				}
+				if n := leases.Add(1); refusals < 0 || n <= refusals {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "indexer_root_lag", "message": "private companion diagnostics", "detail": map[string]any{"activated": true, "retriable": true}}})
+					return
+				}
+				writeQueuedTestLease(w, upstream.URL, leases.Load())
+			}, upstream)
+			client.settlementPoll, client.activationWait = time.Millisecond, 50*time.Millisecond
+			var events []activity.Event
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			ctx = activity.WithReporter(ctx, func(event activity.Event) { events = append(events, event) })
+			response, err := client.Complete(ctx, queuedTestPrompt)
+			if refusals > 0 {
+				if err != nil {
+					t.Fatal(err)
+				}
+				response.Body.Close()
+				if leases.Load() != refusals+1 || calls.Load() != 1 || len(events) == 0 || events[0].Kind != activity.ActivationWaiting {
+					t.Fatalf("the activated note was not served once the indexer caught up: leases=%d calls=%d events=%+v", leases.Load(), calls.Load(), events)
+				}
+				return
+			}
+			var refused *Error
+			if !errors.As(err, &refused) || refused.Code != "indexer_root_lag" || refused.Status != http.StatusServiceUnavailable || strings.Contains(err.Error(), "private") || !strings.Contains(err.Error(), "retry") {
+				t.Fatalf("the wait for the indexer did not end with indexer_root_lag: %v", err)
+			}
+			if leases.Load() < 2 || calls.Load() != 0 || len(events) != 1 || events[0].Kind != activity.ActivationWaiting {
+				t.Fatalf("the wait asked once, reached the provider or reported settlement: leases=%d calls=%d events=%+v", leases.Load(), calls.Load(), events)
 			}
 		})
 	}

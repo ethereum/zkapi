@@ -21,8 +21,9 @@ import (
 // mutable remote manifest must not silently change the vault, signer or oracle
 // that owns an existing wallet. Updating deployments requires a source release.
 //
-// This release serves only the concession-exit vault (revision 3, circuit
-// zkapi-v2-concession-v1). Until it is deployed on a network, the network's
+// This release serves only the concession-exit vault (revision 4, circuit
+// zkapi-v2-concession-v2: note-bound exits and operator-activated
+// deposits). Until it is deployed on a network, the network's
 // manifest is a "not_deployed" placeholder that pins only the circuit, the
 // setup and the vault parameters, and nothing starts against it.
 //
@@ -43,7 +44,12 @@ func SetPackagedDeploymentsForTesting(fsys fs.FS) func() {
 }
 
 // RequiredCircuitID is the statement this release proves and verifies.
-const RequiredCircuitID = "zkapi-v2-concession-v1"
+const RequiredCircuitID = "zkapi-v2-concession-v2"
+
+// RequiredVaultRevision is the vault this release's statements and calldata
+// target: deposits record notes, operator batches activate them, and exits
+// bind notes(noteId) instead of a tree root.
+const RequiredVaultRevision = 4
 
 // ErrDeploymentNotDeployed refuses a network whose packaged manifest is a
 // placeholder: its vault is not deployed yet.
@@ -222,9 +228,9 @@ func parseDeploymentIdentity(network string, raw []byte) (deploymentIdentity, er
 	if json.Unmarshal(raw, &identity) != nil || identity.ChainID != chain || identity.ID == "" || identity.Asset != "native_eth" || identity.Unit != "gwei" || identity.Proof.Circuit != RequiredCircuitID || identity.Proof.SetupID == "" || identity.NoteTTL == 0 {
 		return deploymentIdentity{}, invalid
 	}
-	// Only the concession vault: revision 3 with the concession exit, whose
-	// clearances require an ownership proof.
-	if identity.VaultRevision != 3 || identity.ExitConcession != 1 || identity.ClearanceOwnershipProof != "required" || identity.SettlementWindow == 0 || identity.ChallengePeriod == 0 || identity.MaxPauseDuration < 2*identity.ChallengePeriod {
+	// Only the concession vault of RequiredVaultRevision with the concession
+	// exit, whose clearances require an ownership proof.
+	if identity.VaultRevision != RequiredVaultRevision || identity.ExitConcession != 1 || identity.ClearanceOwnershipProof != "required" || identity.SettlementWindow == 0 || identity.ChallengePeriod == 0 || identity.MaxPauseDuration < 2*identity.ChallengePeriod {
 		return deploymentIdentity{}, invalid
 	}
 	for _, pin := range []string{identity.Proof.RequestVKKeccak256, identity.Proof.WithdrawalVKKeccak256} {

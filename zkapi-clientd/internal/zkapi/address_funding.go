@@ -38,9 +38,43 @@ type AddressFundingStatus struct {
 	DepositStage    string `json:"deposit_stage,omitempty"`
 	TransactionHash string `json:"transaction_hash,omitempty"`
 	Message         string `json:"message"`
+	// ExitRPCUnusable marks a deposit the zkAPI indexer has not confirmed
+	// whose check the owner's exit RPC cannot make instead at all
+	// (depositExitRPCUnusableMessage), so a guided session can say so with
+	// a fixed label.
+	ExitRPCUnusable bool `json:"exit_rpc_unusable,omitempty"`
 	// EscapePayoutCredits lists credited escape payouts of earlier notes
 	// that the vault still holds (see EscapePayoutCredit).
 	EscapePayoutCredits []EscapePayoutCredit `json:"escape_payout_credits,omitempty"`
+	// Activated reports, for phase active, the companion's reading of the
+	// vault's activation cursor: whether an operator batch has inserted the
+	// note into the tree. Requests wait for it; withdrawals do not.
+	// ActivationQueuePosition counts the notes activated before it while it
+	// waits. All three are absent when the companion gave no reading.
+	Activated               *bool   `json:"activated,omitempty"`
+	ActivationCursor        *uint64 `json:"activation_cursor,omitempty"`
+	ActivationQueuePosition *uint64 `json:"activation_queue_position,omitempty"`
+	// activation is the reading the fields above report.
+	activation NoteActivation
+}
+
+// setActivation reports activation on an active note's status. Activation is
+// live, public chain state read through the companion; it is never saved.
+func setActivation(status *AddressFundingStatus, activation NoteActivation) {
+	if status.Phase != "active" || !activation.Known {
+		return
+	}
+	status.activation = activation
+	activated, cursor := activation.Activated, activation.Cursor
+	status.Activated, status.ActivationCursor = &activated, &cursor
+	if activated {
+		status.DepositStage, status.Message = "active", "Your private balance is ready."
+		return
+	}
+	ahead := activation.Ahead
+	status.ActivationQueuePosition = &ahead
+	status.DepositStage = "awaiting_activation"
+	status.Message = fmt.Sprintf("The deposit is recorded and the private note is saved; it can be withdrawn now. Requests start once the operator's batch activates the note (%d earlier notes are activated first).", ahead)
 }
 
 var errAddressNeedsETH = errors.New("send more ETH to the payment address for Ethereum network fees")
@@ -74,9 +108,32 @@ func (h *FundingHandler) addressSnapshotFor(ctx context.Context, exit bool) (fun
 	if err != nil {
 		return config, nil, AddressFundingStatus{}, err
 	}
-	if exit || h.escapeSaved(config) {
+	if exit || h.escapeSaved(config, false) {
 		config = config.exitConfig()
 	}
+	return h.addressSnapshotAt(ctx, config)
+}
+
+// depositSnapshot is addressSnapshot for a new deposit: its quote, or its
+// funding. A deposit is no exit: once the saved escape or gasless withdrawal
+// is done (exitDone), the deposit is read, simulated and sent through the
+// payment RPC, so the owner's exit RPC is never named a deposit it need not
+// corroborate. While that withdrawal is still under way, funding is refused
+// after the same reads through the exit RPC as before.
+func (h *FundingHandler) depositSnapshot(ctx context.Context) (fundingConfig, *addressFundingRecord, AddressFundingStatus, error) {
+	config, err := h.config(ctx)
+	if err != nil {
+		return config, nil, AddressFundingStatus{}, err
+	}
+	if h.escapeSaved(config, true) {
+		config = config.exitConfig()
+	}
+	return h.addressSnapshotAt(ctx, config)
+}
+
+// addressSnapshotAt reads the funding address's public status through
+// config's RPC.
+func (h *FundingHandler) addressSnapshotAt(ctx context.Context, config fundingConfig) (fundingConfig, *addressFundingRecord, AddressFundingStatus, error) {
 	if err := h.assertAddressChain(ctx, config); err != nil {
 		return config, nil, AddressFundingStatus{}, err
 	}
@@ -110,7 +167,7 @@ func (h *FundingHandler) addressSnapshotFor(ctx context.Context, exit bool) (fun
 		return config, record, status, err
 	}
 	if record.Phase == "active" {
-		hasNote, err := h.addressHasNote(ctx)
+		hasNote, activation, err := h.addressNote(ctx)
 		if err != nil {
 			return config, record, status, err
 		}
@@ -119,33 +176,82 @@ func (h *FundingHandler) addressSnapshotFor(ctx context.Context, exit bool) (fun
 			status.DepositStage = ""
 			status.Message = "The saved private note is missing from the companion. Restore its state before further funding; no new deposit will be sent."
 		}
+		setActivation(&status, activation)
+		h.exitRPCNoteHint(config, &status)
 	}
 	return config, record, status, nil
 }
 
+// exitRPCNoteHint tells the owner of a note that the exit RPC corroborated
+// instead of the indexer (corroborateDepositByExitRPC) that, while it waits
+// for its activation, an escape withdraws it without the operator.
+func (h *FundingHandler) exitRPCNoteHint(config fundingConfig, status *AddressFundingStatus) {
+	if status.DepositStage != "awaiting_activation" {
+		return
+	}
+	deposit, err := h.readAddressDeposit(config)
+	if err != nil || deposit == nil || !deposit.Active || deposit.Binding == nil || !deposit.Binding.ExitRPC {
+		return
+	}
+	status.Message += " The zkAPI indexer had not recorded the note, so your exit RPC confirmed it; if the operator does not activate it, withdraw it by escape (zkapi-clientd withdraw --escape --to ADDRESS)."
+}
+
+// exitRPCDepositGuidance tells the owner of a deposit the indexer has not
+// confirmed how its note is saved, and kept escapable, without the indexer
+// (corroborateDepositByExitRPC).
+func exitRPCDepositGuidance(config fundingConfig) string {
+	if config.ExitRPC != "" {
+		return " Once the deposit is final on your exit RPC, the note is checked through it instead of the zkAPI indexer and saved, so it can be withdrawn by escape."
+	}
+	return " Setting your own Ethereum RPC with zkapi-clientd config --exit-rpc-url URL lets the note be checked through it instead, once the deposit is final there, and saved, so it can be withdrawn by escape without the operator's indexer."
+}
+
+// depositExitRPCUnusableMessage replaces the verifying message, and its
+// exitRPCDepositGuidance, while the owner's exit RPC cannot check a deposit
+// the indexer has not confirmed at all (errExitRPCDepositCheckUnusable).
+const depositExitRPCUnusableMessage = "The deposit is mined; waiting for the zkAPI indexer to confirm its note record before saving the private note. Your exit RPC could not check it instead: it did not answer, is on another Ethereum network, or refused to read the vault at a block hash (EIP-1898). Check the RPC, or set another with zkapi-clientd config --exit-rpc-url URL."
+
+// depositExitRPCUnusableGuidance replaces exitRPCDepositGuidance on an
+// indexer conflict the exit RPC cannot check at all; the conflict names why.
+const depositExitRPCUnusableGuidance = " Your exit RPC could not check it instead; check the RPC, or set another with zkapi-clientd config --exit-rpc-url URL."
+
 // escapeSaved reports whether the saved withdrawal is an escape, or a
 // gasless withdrawal (whose reads prefer the exit RPC too, design 3.1). It
-// reads the payment record only when one exists, and creates nothing.
-func (h *FundingHandler) escapeSaved(config fundingConfig) bool {
+// reads the payment record only when one exists, and creates nothing. For a
+// new deposit (deposit set), a withdrawal that is done (exitDone) is not.
+func (h *FundingHandler) escapeSaved(config fundingConfig, deposit bool) bool {
 	if _, err := os.Lstat(h.addressStatePath()); err != nil {
 		return false
 	}
 	record, err := h.loadAddress(config)
-	return err == nil && record.Withdrawal != nil && (record.Withdrawal.Mode == "escape" || record.Withdrawal.Transit != nil)
+	if err != nil || record.Withdrawal == nil || (record.Withdrawal.Mode != "escape" && record.Withdrawal.Transit == nil) {
+		return false
+	}
+	return !deposit || !exitDone(record)
 }
 
-func (h *FundingHandler) addressHasNote(ctx context.Context) (bool, error) {
+// exitDone reports a saved withdrawal that leaves nothing to follow: it is
+// complete, its payout waits in no transit account or paymaster
+// (waitingPayout), and no transaction is pending but a deposit's own. A new
+// deposit retires its record (retireWithdrawal).
+func exitDone(record *addressFundingRecord) bool {
+	pending := record.Pending
+	return record.Withdrawal.Phase == "complete" && !record.Withdrawal.waitingPayout() && (pending == nil || pending.Kind == "deposit" || pending.Kind == "approval" || pending.Kind == "approval_reset")
+}
+
+// addressNote reads whether the companion holds a note, and its activation.
+func (h *FundingHandler) addressNote(ctx context.Context) (bool, NoteActivation, error) {
 	raw, err := h.client.WalletStatus(ctx)
 	if err != nil {
-		return false, err
+		return false, NoteActivation{}, err
 	}
 	var wallet struct {
 		HasNote *bool `json:"has_note"`
 	}
 	if json.Unmarshal(raw, &wallet) != nil || wallet.HasNote == nil {
-		return false, errors.New("invalid companion note status")
+		return false, NoteActivation{}, errors.New("invalid companion note status")
 	}
-	return *wallet.HasNote, nil
+	return *wallet.HasNote, ParseNoteActivation(raw), nil
 }
 
 func addressPublicStatus(record *addressFundingRecord) AddressFundingStatus {
@@ -171,12 +277,12 @@ func addressPublicStatus(record *addressFundingRecord) AddressFundingStatus {
 		status.Message = "The deposit is awaiting confirmation. Checking again reuses the same transaction."
 	case "confirming":
 		status.DepositStage = "activating"
-		status.Message = "The deposit is mined. Checking again verifies it and activates the saved private note."
+		status.Message = "The deposit is mined. Checking again verifies it and saves the private note."
 	case "verification_conflict":
 		status.Message = errDepositVerificationConflict.Error() + "." + conflictGuidance
 	case "active":
 		status.DepositStage = "active"
-		status.Message = "Your private balance is ready."
+		status.Message = "Your private note is saved. Withdrawals are available; requests need its activation by the operator's batch."
 	case "reverted":
 		status.Message = "The saved transaction reverted. Retry explicitly to reuse the private note with a fresh transaction after finality."
 	case "legacy_recovery":
@@ -200,13 +306,14 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 	if amount == 0 || amount > 1_000_000_000_000 {
 		return AddressFundingStatus{}, errors.New("invalid deposit amount")
 	}
-	config, record, status, err := h.addressSnapshot(ctx)
+	config, record, status, err := h.depositSnapshot(ctx)
 	if err != nil {
 		return status, err
 	}
 	// Live progress is diagnostic only; never persist it or let it change
 	// transaction identity, signing, replay, or the finality requirement.
-	depositStage := ""
+	depositStage, exitRPCUnusable := "", false
+	activation := status.activation
 	update := func() AddressFundingStatus {
 		next := addressPublicStatus(record)
 		next.TokenBalance, next.ETHBalance, next.EscapePayoutCredits = status.TokenBalance, status.ETHBalance, status.EscapePayoutCredits
@@ -214,8 +321,13 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 			next.DepositStage = depositStage
 		}
 		if depositStage == "verifying" {
-			next.Message = "The deposit is mined; waiting for the zkAPI indexer to confirm it before activating the private note."
+			next.Message = "The deposit is mined; waiting for the zkAPI indexer to confirm its note record before saving the private note." + exitRPCDepositGuidance(config)
+			if exitRPCUnusable {
+				next.Message, next.ExitRPCUnusable = depositExitRPCUnusableMessage, true
+			}
 		}
+		setActivation(&next, activation)
+		h.exitRPCNoteHint(config, &next)
 		return next
 	}
 	// A verification conflict is never terminal: report it, keep the saved
@@ -224,6 +336,13 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		next := update()
 		next.Phase, next.DepositStage = "verification_conflict", ""
 		next.Message = err.Error() + "." + conflictGuidance
+		switch {
+		case errors.Is(err, errExitRPCDepositCheckUnusable):
+			next.Message += depositExitRPCUnusableGuidance
+			next.ExitRPCUnusable = true
+		case errors.Is(err, errIndexerDepositConflict):
+			next.Message += exitRPCDepositGuidance(config)
+		}
 		return next
 	}
 	// The indexer showing this note's deposit is a durable conflict.
@@ -237,8 +356,8 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		return conflicted(err), nil
 	}
 	// A finalized deposit revert is retired, or reported as retryable, only
-	// after the indexer's tree shows no deposit of the note within
-	// findDepositLeaf's bounds from every slot a deposit of it was signed for.
+	// after the indexer's note records show no deposit of the note
+	// (findDepositNote).
 	revertUnconfirmed := func(receipt *addressReceipt) (AddressFundingStatus, bool, error) {
 		deposit, err := h.readAddressDeposit(config)
 		if err != nil {
@@ -268,10 +387,11 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		return update(), errWithdrawalPayoutWaiting
 	}
 	if record.Phase == "active" {
-		hasNote, err := h.addressHasNote(ctx)
+		hasNote, current, err := h.addressNote(ctx)
 		if err != nil {
 			return update(), err
 		}
+		activation = current
 		if hasNote {
 			if record.Amount != amount {
 				return update(), errors.New("a private note is already active; close it before funding a new amount")
@@ -285,8 +405,9 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 	}
 	if record.Pending == nil && record.Phase == "verification_conflict" {
 		// An earlier, retired deposit of this note showed in the indexer's
-		// tree. Re-check it on every resume, whatever the balance. Once it is
-		// gone this call signs nothing; a fresh quote or resume continues.
+		// note records. Re-check it on every resume, whatever the balance.
+		// Once it is gone this call signs nothing; a fresh quote or resume
+		// continues.
 		deposit, err := h.readAddressDeposit(config)
 		if err != nil {
 			return update(), err
@@ -399,7 +520,7 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 	}
 	if record.Pending != nil {
 		// Native deposits match the web wallet: a canonical successful mined
-		// receipt can activate immediately. Reverts still require finality in
+		// receipt saves the note immediately. Reverts still require finality in
 		// addressFinalReceipt before a later explicit retry may use a new nonce.
 		receipt, confirmed, receiptErr := h.addressFinalReceipt(ctx, config, record.Pending.Hash, record.Pending.Kind == "deposit" && !config.nativeETH())
 		if receiptErr != nil {
@@ -477,8 +598,9 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 					}
 				case errors.Is(err, errDepositVerificationPending):
 					// Mined, but the vault and indexer have not both
-					// confirmed it; keep polling without activating.
+					// recorded it; keep polling without saving the note.
 					depositStage = "verifying"
+					exitRPCUnusable = errors.Is(err, errExitRPCDepositCheckUnusable)
 					return update(), nil
 				case errors.Is(err, errDepositVerificationConflict):
 					record.Phase = "verification_conflict"
@@ -492,6 +614,11 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 			record.Phase = "active"
 			if err := h.saveAddress(record); err != nil {
 				return update(), err
+			}
+			// Activation is display only: an unreadable status leaves it
+			// unreported, never the deposit unconfirmed.
+			if _, current, err := h.addressNote(ctx); err == nil {
+				activation = current
 			}
 			return update(), nil
 		}
@@ -552,9 +679,10 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 			kind, data = "approval_reset", "0x095ea7b3"+addressABIWord(config.Contract)+strings.Repeat("0", 64)
 		}
 	} else {
-		// Approval may take minutes. Obtain the current empty-leaf witness,
-		// bound to its indexer slot, immediately before simulating/signing.
-		bound, bindErr := h.bindDepositPath(ctx, config, record, deposit)
+		// Approval may take minutes. Record the indexer slot the deposit is
+		// prepared for, and search for an earlier deposit of this note,
+		// immediately before simulating/signing.
+		bound, bindErr := h.bindDepositSlot(ctx, config, record, deposit)
 		if errors.Is(bindErr, errDepositVerificationConflict) {
 			return landed(bindErr)
 		}
@@ -638,11 +766,11 @@ func validDepositRecovery(record depositRecord) bool {
 	if r := record.Rebind; r != nil && r.ExpiryTs == 0 {
 		return false
 	}
-	if s := record.Slot; s != nil && (!isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.PreparedChainAt < 0 || s.EmptyBefore > s.NoteID) {
+	if s := record.Slot; s != nil && (!isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.PreparedChainAt < 0) {
 		return false
 	}
 	for _, s := range record.SignedSlots {
-		if !isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.PreparedChainAt < 0 || s.EmptyBefore > s.NoteID {
+		if !isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.PreparedChainAt < 0 {
 			return false
 		}
 	}
@@ -663,6 +791,17 @@ var errAddressRPCUnavailable = errors.New("payment RPC unavailable; retry the sa
 
 // errExitRPCUnavailable is the owner's exit RPC failing after its retries.
 var errExitRPCUnavailable = errors.New("the exit RPC (--exit-rpc-url) did not answer; nothing was read from or sent through another RPC in its place. Retry, or configure another exit RPC")
+
+// errExitRPCWrongNetwork is the owner's exit RPC, as the only source
+// (exitConfig), serving another chain.
+var errExitRPCWrongNetwork = errors.New("the exit RPC (--exit-rpc-url) is on another Ethereum network; nothing was read from or sent through another RPC in its place. Check it, or configure another exit RPC")
+
+// exitRPCUnusable reports an error of the owner's exit RPC as the only
+// source (exitConfig): it did not answer after its retries, or it serves
+// another network. Waiting does not help; the RPC needs fixing.
+func exitRPCUnusable(err error) bool {
+	return errors.Is(err, errExitRPCUnavailable) || errors.Is(err, errExitRPCWrongNetwork)
+}
 
 // exitRPCRetryDelays are the waits before each retry of an exit RPC call
 // that did not answer (exitConfig).
@@ -718,9 +857,11 @@ func (h *FundingHandler) addressRPCAt(ctx context.Context, url, method string, p
 		return nil, nil, errors.New("invalid payment RPC request")
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// This uses the configured direct/Wisp client. Never use http.DefaultClient
-	// and never reflect RPC errors, request bodies, or signed bytes to callers.
-	response, err := h.client.inference.Do(req)
+	// This uses the configured direct/Wisp/Tor client, or for the owner's
+	// node on this machine a direct one (rpcHTTP). Never use
+	// http.DefaultClient and never reflect RPC errors, request bodies, or
+	// signed bytes to callers.
+	response, err := h.client.rpcHTTP(url).Do(req)
 	if err != nil {
 		return nil, nil, errAddressRPCUnavailable
 	}
@@ -769,6 +910,9 @@ func (h *FundingHandler) assertAddressChain(ctx context.Context, config fundingC
 		return err
 	}
 	if !chain.IsUint64() || chain.Uint64() != config.ChainID {
+		if config.exitOnly {
+			return errExitRPCWrongNetwork
+		}
 		return errors.New("payment RPC is on the wrong Ethereum network; no transaction was sent")
 	}
 	return nil

@@ -1,7 +1,7 @@
 # Browser deployment profile fixtures
 
 These mirror the SDK's build profiles (`sdk/assets/config/{mainnet,sepolia}.json`)
-for the concession-exit vault (revision 3, circuit `zkapi-v2-concession-v1`).
+for the concession-exit vault (revision 4, circuit `zkapi-v2-concession-v2`).
 Until that vault is deployed on a network, both the SDK profile and the
 packaged clientd deployment are `deployment_status: "not_deployed"`
 placeholders that pin only the circuit, setup, proving-key hashes and the

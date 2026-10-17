@@ -143,9 +143,23 @@ client sends chain reads and transactions only to the RPC packaged with the
 release, and to your own exit RPC when you configure one
 (`config --exit-rpc-url`), and refuses a wallet companion that reports another
 RPC, indexer or protocol server. Deployment checks then also run through the
-exit RPC, and an escape reads and sends its transactions only through it, so
-that RPC's provider sees the note's exit and your interest in the vault, as
-any wallet's RPC would. A gasless escape (`--escape --fees payout`, its
+exit RPC, and an escape reads and sends its transactions only through it.
+Every withdrawal's completion also reads the payout's receipt and the note's
+vault record through it, and so do deposit recording, when the zkAPI indexer
+has not confirmed a deposit by the time it is final there (the deposit's
+receipt and its note's record), and repair, when the indexer does not record
+the note (its finalized record). So that RPC's provider sees the note's
+exit, those transactions and note IDs, and your interest in the vault, as
+any wallet's RPC would, and, under direct HTTPS, your IP address. A new
+deposit is no exit: once an escape or a gasless withdrawal is complete and
+nothing of it waits (its payout in the transit account or the paymaster, or
+a pending claim), the next deposit's quote and funding read, simulate and
+send it through the packaged RPC alone. An HTTPS
+exit RPC is reached through the configured transport (direct, Wisp relay,
+SOCKS5 or Tor); plain HTTP to a node on this machine is dialed directly. An
+escape needs an HTTPS exit RPC for now, since the wallet companion reads the
+escape's state through it only by way of the configured transport, which
+carries HTTPS alone. A gasless escape (`--escape --fees payout`, its
 initiation or its sponsored finalization) is the exception: its operation is
 sent to the bundler, the deployment's (run by the operator) unless you set
 your own `--bundler-url`, never through the exit RPC, so that bundler learns
@@ -172,31 +186,43 @@ a blind second approval. Signed pending operations resume their exact bytes;
 reverts never automatically sign a replacement. Wallet state is preserved
 across updates.
 
-Successful native ETH deposits activate after the saved transaction's successful
-mined receipt, canonical block and deposit event are validated, and two further
-sources agree: the vault's `notes(noteId)` at the receipt's block hash, and the
-zkAPI indexer's whole-tree snapshot, which must hold this deposit's leaf at that
-note. The note secret reaches the wallet companion only after they agree. The
-vault read goes to the packaged RPC, which already serves the deposit and sees
-its note ID in the public deposit event. The snapshot is the same response for
-every client, so the indexer does not learn which note is yours. Disagreement
-leaves the deposit in `verification_conflict`; nothing is activated, retired or
-replaced until a later check agrees. Success does not wait for Ethereum
-finality. Failed receipts retain the finality gate before explicit retry; a
-deposit signed by this release is also retired only after the indexer shows
-its note did not land. Because the RPC can withhold a deposit and relay it
-after that check, a retry is signed only when a bounded search of the
-indexer tree it is built from finds none of the note's earlier deposits
-(CLI_ZKAPI.md describes the bound). That search uses the same whole-tree
-snapshot. A quote repeated while the tree is unchanged reads only the tree's
-root, which is also the same response for every client. So the indexer
-still cannot tell which note is yours. Missing or ambiguous receipts preserve
-the exact signed transaction without authorizing a replacement. Withdrawals
-and public ETH returns require their own finality checks, and a withdrawal
-completes locally only after the vault and the indexer both show the note
-closed.
+A successful native ETH deposit's note is saved after the saved transaction's
+successful mined receipt, canonical block and deposit event are validated, and
+two further sources agree: the vault's `notes(noteId)` at the receipt's block
+hash, and the zkAPI indexer's whole-vault snapshot, which must record this
+deposit's leaf at that note. The note secret reaches the wallet companion only
+after they agree. The vault read goes to the packaged RPC, which already serves
+the deposit and sees its note ID in the public deposit event. The snapshot is
+the same response for every client, so the indexer does not learn which note
+is yours; the client asks for its records part with a fixed query, also the
+same for every client. While the indexer has not confirmed the deposit (it
+is behind, unavailable or does not record it) and you set your own exit
+RPC, each check reads that RPC's chain ID and finalized block, which name no
+transaction. Only once the deposit's block is final there is that RPC asked
+for the deposit's receipt and the vault's record of its note, as an escape
+already asks it; a deposit the indexer confirms before that, as it normally
+does within seconds of mining, is never named to it. Disagreement leaves the
+deposit in `verification_conflict`; nothing is saved, retired or replaced
+until a later check agrees. Success does not
+wait for Ethereum finality. The operator's batches then activate recorded
+notes in order; the activation is public chain state, which the wallet
+companion reads from the vault, and every batch covers whichever notes are
+next, so it reveals nothing about which note is yours. Failed receipts retain
+the finality gate before explicit retry; a deposit signed by this release is
+also retired only after the indexer shows its note did not land. Because the
+RPC can withhold a deposit and relay it after that check, a retry is signed
+only when the indexer's note records, in the snapshot it is signed from, hold
+none of the note's earlier deposits. That search uses the same whole-vault
+snapshot. A quote repeated while no note was recorded since reads only the
+view's root and next note ID, which are also the same response for every
+client. So the indexer still cannot tell which note is yours. Missing or
+ambiguous receipts preserve the exact signed transaction without authorizing a
+replacement. Withdrawals and public ETH returns require their own finality
+checks, and a withdrawal completes locally only after the vault, read at the
+payout's block, shows the note closed (through your exit RPC as well when one
+is set, which then also reads the payout's receipt).
 
-Pre-finality activation exposes the same reorganization risk as the web wallet:
+Saving a note before finality exposes the same reorganization risk as the web wallet:
 a block can be replaced after a private note or inference credit becomes usable.
 The wallet does not provide complete rollback and reconciliation for that
 event. Local reset cannot undo credit already issued, and later inference

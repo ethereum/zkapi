@@ -32,12 +32,25 @@ ETH amount, receiving address and locally generated QR. It waits automatically
 for ETH and updates the receiving balance. Once funded, Enter approves the
 fixed deposit with network fees that adjust automatically while the receiving
 balance covers the principal and required fees. It checks a fresh quote before
-signing, deposits and activates the private balance once its successful mined
+signing, deposits, and saves the private note once its successful mined
 receipt is validated against the canonical block and saved deposit, and the
-vault state and the zkAPI indexer confirm the same note (see
+vault state and the zkAPI indexer record the same note (see
 [chain verification](#chain-verification-and-recovery)). There is
 no additional 15-minute finality gate for successful native ETH deposits, matching
 the web wallet. No model is selected or priced during funding.
+
+A deposit only records its note in the vault (vault revision 4). The
+operator's batches then activate recorded notes in order, inserting each
+into the vault's tree, usually within a minute. A recorded note can be
+withdrawn at once, by a mutual close or an escape, but pays for requests only
+once it is activated. Until then the funding status reports deposit stage
+`awaiting_activation` with `activated: false`, the vault's
+`activation_cursor` and the note's `activation_queue_position` (the notes
+activated before it), as the wallet companion reads them from the vault;
+`zkapi-clientd status` reports the same `activated`, `activation_cursor` and
+`activation_queue_position`. A request in the meantime waits up to two
+minutes for the activation, then fails with `note_not_activated` (no key is
+issued; retry later).
 
 If the last fee or balance check leaves the deposit unsigned, configuration
 refreshes the same fixed deposit and continues watching instead of exiting.
@@ -48,7 +61,8 @@ funding shortage requires Enter again once funded. The recommended fee buffer
 remains optional; the signer caps fees to the fresh quote and available balance.
 
 After signing, progress distinguishes waiting to be mined, waiting for network
-fees to fall below the signed cap, and private balance activation. In an
+fees to fall below the signed cap, saving the private note, and its
+activation. In an
 interactive terminal, payment details and progress update in place, with a
 spinner and elapsed time while waiting. Enlarge a short terminal to show the
 payment QR; the receiving address and amounts remain available as text. Prompts
@@ -269,7 +283,8 @@ do not attach to or reconfigure an already-running daemon.
 ## Deployment origins
 
 This release serves only the concession-exit vault (circuit
-`zkapi-v2-concession-v1`, vault revision 3). Its embedded profiles are
+`zkapi-v2-concession-v2`, vault revision 4: note-bound exits and
+operator-activated deposits). Its embedded profiles are
 `zkapi-native-eth-mainnet-concession-v1` and
 `zkapi-native-eth-sepolia-concession-v1`. Until that vault is deployed on a
 network, its profile ships as a placeholder (`"deployment_status":
@@ -311,23 +326,35 @@ and the Poseidon library hash to the pins, the vault's `proofAdapter()` is
 the pinned adapter, and the vault's and adapter's getters
 (`stateSigningKeyX/Y`, `clearanceSigningKeyX/Y`, `challengePeriod`,
 `noteTtl`, `maxPauseDuration`, `CONCESSION_ESCAPE_VERSION`,
-`ROOT_HISTORY_WINDOW`, `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH`,
+`NOTE_BOUND_EXIT_VERSION`, `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH`,
 `WITHDRAWAL_VK_HASH`) and `eth_chainId` return the pinned values. A mismatch
 refuses deposits with `deployment_mismatch`; exits stay available.
 
 `config --exit-rpc-url URL` saves your own Ethereum RPC (HTTPS, or plain HTTP
 to a node on this machine; no credentials, query or fragment). Deployment
-checks use it as well. An escape then reads the chain and sends its
+checks use it as well, and so do deposit recording, when the operator's
+indexer does not record a final deposit, and withdrawal completion (see
+[chain verification](#chain-verification-and-recovery)), so its provider
+sees those transactions and note IDs (and, under direct HTTPS, your IP
+address). An HTTPS exit RPC is reached through the configured transport
+(direct, Wisp relay, SOCKS5 or Tor); plain HTTP to this machine is dialed
+directly, since no relay or Tor exit can reach it. An escape needs an HTTPS
+exit RPC for now: the wallet companion also reads the escape's state
+through the exit RPC, and it reaches the network only through the
+configured transport, which carries HTTPS alone, so those reads fail for a
+plain-HTTP exit RPC and the escape cannot proceed (the saved settings
+summary says so). With an HTTPS exit RPC, an escape reads the chain and sends its
 transactions only through it (a gasless escape's operations excepted, see
 below): the balance, nonce, fee and simulation reads,
-the receipts, the raise and finalization logs, and the wallet companion's
-exit state (note status, known roots, logs for a tree rebuild). The pinned
+the receipts, the raise and finalization logs, the vault's record of the
+note the escape proof binds, and the wallet companion's exit state (note
+status and logs). The pinned
 RPC, which the operator may run, is never asked in its place: a call your
 exit RPC does not answer (a timeout, a 429 rate limit, a 5xx) is retried
 twice, then the escape stops with an error naming the exit RPC, and you
 retry later or configure another one. So a pinned RPC that is down or
 answers falsely can neither block an escape nor end one, nor choose the
-nonce, gas limit or Merkle root an escape is signed with. `config
+nonce, gas limit or note record an escape is signed with. `config
 --exit-rpc-url none` clears it; escapes then use the pinned RPC, and every
 open escape's status warns about it: the pinned RPC then decides when the
 escape's exit lock is released and reports whether it landed, was defeated
@@ -366,76 +393,84 @@ Transactions are signed for the network's pinned chain ID; the RPC's
 The RPC is a third party, so its answers are corroborated before they change
 private state:
 
-- **Deposit activation.** After a successful receipt, the vault's
+- **Deposit recording.** After a successful receipt, the vault's
   `notes(noteId)` is read at the receipt's own block hash (EIP-1898, canonical
-  only), and the indexer's whole-tree snapshot (the same response for every
+  only), and the indexer's whole-vault snapshot (the same response for every
   client, so it does not reveal which note is yours) must have applied that
-  block and hold this deposit's leaf at the receipt's note ID. The client
-  recomputes the leaf with zkAPI Poseidon. The note secret is handed to the
-  wallet only after both agree. While the indexer is behind, unavailable or an
-  older version without snapshot block metadata, the deposit stays in phase
+  block and record this deposit's leaf at the receipt's note ID. The client
+  asks for the snapshot's records part (`/v1/tree/snapshot?parts=records`,
+  the same request from every client) and still reads a whole snapshot from
+  an indexer that ignores the request. Its
+  `note_leaves` hold the recorded leaf of every deposited note, activated or
+  not; the client recomputes the leaf with zkAPI Poseidon. The note secret is
+  handed to the wallet only after both agree; the note need not be activated.
+  While the indexer is behind, unavailable or an older version without
+  snapshot block metadata or note records, the deposit stays in phase
   `confirming` with stage `verifying` and polling continues. Disagreement sets
   phase `verification_conflict`. The conflict is not final: running
   `zkapi-clientd config` again checks the saved transaction against the vault
-  and the indexer once more, and activates the deposit if they now agree.
-  Otherwise it stops and points to the repair below.
-- **Reverted deposits.** Before a finalized failed deposit is retired or
-  requoted, the indexer must show that this note did not land at the empty
-  slot the signed transaction was built for. The slot is checked against the
-  indexer's tree and saved with the note just before signing, together with
-  the run of empty slots right below it in that tree. A reported revert can
-  also be a deposit the RPC withheld and relays later, so the slot of every
-  deposit signed for the note is kept. Another deposit of the same note is
-  signed only when a search of the indexer tree it is built from, starting
-  at each of those slots, does not find the note. An earlier deposit missing
-  from that tree cannot land beside the new one. Quotes run the same search
-  to refuse early. While the indexer is unavailable, a quote is still given,
-  but approval signs nothing. A saved `verification_conflict` without a
-  pending transaction is the exception: there the quote's search decides
-  whether the conflict clears, so it must complete, and while the indexer is
-  unavailable the quote is refused and the conflict stays. The search is
-  bounded: it compares the first 64 occupied slots from each kept slot on,
-  and the first 64 in the empty run below it, for expiry days back to about
-  63 days before the search. A deposit lands after its slot only when every
-  slot in between is empty, and before it only inside that run, when the
-  indexer's view it was built from was a short fork that was then orphaned.
-  The expiry days come from chain time, not from this device's clock. The
-  vault derives a deposit's expiry from its block's time, so the search runs
-  from the block time of the indexer view each slot was built from to the
-  block time of the view it searches, with one day of tolerance on each side.
-  Each of those times comes from the payment RPC's header for the indexer
-  view's block, and is accepted only when that header hashes to the block
-  hash the indexer names. While the RPC does not serve that header
-  (`eth_getBlockByHash`), or serves one this release cannot hash (a header
-  format introduced by a later network upgrade), nothing is signed and a
-  reported revert waits. A slot saved before this release, or rewritten by
-  one, has only the device clock's preparation time, and its search starts
-  7 days before it. Nothing is signed, and no reported revert is retired,
-  while this device's clock is more than a day from that chain time: correct
-  the system clock and retry.
-  So a landed deposit is missed only in two cases. After it lands, challenges
-  restore 64 or more escaped notes between the slot it was built for (or the
-  start of the run) and the slot it landed in. Or it landed about 63 or more
-  days earlier, past its note's 30-day term on the packaged deployments unless
-  vault pauses extended it by more than 33 days. (A slot saved by a
-  pre-release build of this version records no run and is never searched
-  below, so a deposit signed for such a slot from a view that was then
-  orphaned is also missed when it landed below the slot. A slot saved by an
-  earlier release on a device clock more than 6 days fast is also missed
-  when its deposit landed within that much of its preparation.) If the note is
-  found, the deposit is reported as a `verification_conflict` and no
-  replacement is signed. Running
-  `zkapi-clientd config` again checks once more; **repair** (below) binds
-  the note that landed. Deposits that reuse your public commitment with a
-  different amount are ignored, so they cannot block a genuine retry. A
-  deposit signed by 0.1.6 or earlier, or whose `pending-deposit.json` such
-  a release rewrote (dropping `slot`, `signed_slots` and each slot's
-  `empty_before`), has no recorded slot: its reported revert is retired, and
-  a retry signed, without this search.
+  and the indexer once more, and saves the note if they now agree.
+  Otherwise it stops and points to the repair below. The indexer is the
+  operator's, so it alone never keeps a deposit from being escaped: with an
+  exit RPC set (`config --exit-rpc-url URL`), once the deposit's block is
+  final there, the exit RPC stands in for an indexer that is behind, down or
+  disagrees. It must serve the same successful receipt in the same block,
+  with this deposit's event at the same note, and the vault's `notes(noteId)`
+  at that block (canonical only) must hold exactly this deposit. The note is
+  then saved and can be withdrawn at once, by an escape if the operator does
+  not cooperate; requests still wait for its activation. Its status says so.
+  If the exit RPC disagrees, the deposit is a `verification_conflict` and
+  nothing is saved. An exit RPC that does not answer or is on another
+  network, or that refuses reads at a block hash (EIP-1898) once the deposit
+  is final there, is named in the deposit's status (`exit_rpc_unusable`), so
+  you can fix it or set another; the deposit keeps waiting, or stays a
+  conflict. Without an exit RPC the deposit keeps waiting, and its status
+  says how to set one. Repair (below) uses the exit RPC the same way:
+  finalized vault state read through it binds a note the indexer does not
+  record.
+- **Reverted deposits.** A reported revert can be a deposit the RPC withheld
+  and relays later, and a second deposit of the same note would share its
+  nullifier. So the indexer's next note ID, the slot a deposit is prepared
+  for, is saved with the note just before signing, and the slot of every
+  deposit signed for the note is kept. Before a finalized failed deposit is
+  retired or requoted, and before another deposit of the note is signed, the
+  indexer's snapshot (at or after the receipt's block) must record no note
+  with this deposit's commitment and amount. Every recorded note is compared,
+  activated or not: a deposit is never removed from the note records, and a
+  withheld deposit can land any number of notes after its slot. If the note
+  is found, the deposit is reported as a `verification_conflict` and no
+  replacement is signed. Running `zkapi-clientd config` again checks once
+  more; **repair** (below) binds the note that landed. Deposits that reuse
+  your public commitment with a different amount are ignored, so they cannot
+  block a genuine retry. Quotes run the same search to refuse early. While
+  the indexer is unavailable, a quote is still given, but approval signs
+  nothing. A saved `verification_conflict` without a pending transaction is
+  the exception: there the quote's search decides whether the conflict
+  clears, so it must complete, and while the indexer is unavailable the
+  quote is refused and the conflict stays. Nothing is signed while this
+  device's clock is more than a day from the block time of the indexer view
+  the deposit is prepared from, or while the payment RPC does not serve that
+  view's header (`eth_getBlockByHash`) hashing to the block the indexer
+  names: correct the system clock and retry. A deposit signed by 0.1.6 or
+  earlier, or whose `pending-deposit.json` such a release rewrote (dropping
+  `slot` and `signed_slots`), has no recorded slot: its reported revert is
+  retired, and a retry signed, without this search.
 - **Withdrawals.** Before the wallet companion deletes its note state, the
-  vault (at the payout receipt's block) must show the note closed and the
-  indexer must no longer list its leaf; until then the withdrawal keeps
-  waiting. A finalized escape of the same reservation (same note, nullifier,
+  vault (at the payout receipt's canonical block) must show the note closed;
+  until then the withdrawal keeps waiting. When the payment RPC served the
+  receipt and an exit RPC is set, both must agree: the exit RPC must serve
+  the same successful receipt, final, in the same block and with the same
+  logs, and show the note closed at that block. An exit RPC that does not
+  answer, is on another network, or refuses reads at a block hash (EIP-1898)
+  is named in the withdrawal's status, so you can fix it or set another; the
+  withdrawal keeps waiting. A sponsored (`--fees payout`) withdrawal reads
+  the chain through the exit RPC alone: one that does not answer or is on
+  another network stops each check with an error naming it, which the guided
+  session shows as a fixed label. Without an exit RPC the payment RPC's vault
+  state alone decides. A close removes no leaf from the vault's tree, so the
+  indexer's tree is not consulted: a note closed before
+  its activation is still inserted by its batch, and only a missed defeat's
+  retirement zeroes a leaf. A finalized escape of the same reservation (same note, nullifier,
   payout and destination) is accepted as an independently relayed payout:
   after a reverted withdrawal, choose `confirm` in the `withdraw` menu action
   and enter that transaction's hash. An escape pays `B − c_final`: the
@@ -472,14 +507,14 @@ and asks for confirmation before anything changes. The repair calls the
 daemon's wallet-management route `POST /admin/funding/rebind` (optional JSON
 fields `note_id` and `replace_note_id`), which verifies the deposit against
 finalized vault state and the indexer itself. It succeeds when the private
-balance is active again.
+note is saved again (activated or still waiting for its batch).
 
 Rebind never changes the note secret, commitment or amount; it accepts a note
 only when the finalized vault state and the indexer both hold exactly this
-deposit there. Left blank, the note ID comes from a saved deposit's receipt
-or, failing that, from this deposit's leaf in the indexer's tree, searched
-with the bound above from every slot any of its deposits was signed for,
-earliest first. It refuses while a withdrawal, public return or unconfirmed
+deposit there, or, when the indexer does not and an exit RPC is set, when
+the exit RPC's finalized vault state holds it as well. Left blank, the note ID comes from a saved deposit's receipt
+or, failing that, from the first note the indexer's note records hold with
+this deposit's commitment and amount. It refuses while a withdrawal, public return or unconfirmed
 deposit transaction is saved (including an earlier deposit of the note
 retired after a reported revert), or while the wallet has an unsettled
 request, and it replaces an existing wallet note only when you name it and it
@@ -497,7 +532,7 @@ withdrawal proof that shows the server the note ID and payout before the
 close is on chain (see [privacy boundaries](PRIVACY.md)). It names no
 destination and the vault accepts it neither as an escape nor as a close.
 The wallet
-companion must report bridge version 5 with `exit_concession: 1` and the
+companion must report bridge version 6 with `exit_concession: 1` and the
 deployment's setup ID in its `/oa/v1/status`; an older companion is refused
 before any note is reserved.
 
@@ -871,14 +906,18 @@ charge), and `--early-exit bound` concedes the state's bound so the request
 never appears on chain. The guided **withdraw** menu shows the same
 decision and command when a mutual close needs an escape.
 
-Before it proves, the companion finds the note's Merkle path at a root the
-vault holds: the path it saved at deposit, then the indexer's (checked with
-the vault's `isKnownRoot`), then a rebuild from the vault's logs since its
-deploy block. It asks the server whether another device already spent the
+An exit proof binds the note itself, not a tree root: its registration
+commitment and its deposit amount and expiry, which the vault checks against
+`notes(noteId)` (`NoteBindingMismatch`). So an exit needs no Merkle path, no
+indexer and no activation. Before the companion proves, the client reads that
+record from the vault (through your exit RPC for an escape) and requires it
+to be this wallet's deposit; the statement must bind exactly it. The
+companion asks the server whether another device already spent the
 note's state, and refuses with `device_not_newest` when the server shows a
 valid request proof of the next state. The escape proof is valid for 3 hours;
 the transaction is checked word by word against the decision you confirmed
-(kind 0, destination, concession, `B − c` and `valid_until`) before it is
+(kind 0, destination, concession, `B − c`, `valid_until` and the note's
+commitment and metadata) before it is
 signed, and is sent through your exit RPC when one is configured. Its
 simulation is advisory: when the RPC refuses to simulate or estimate it, the
 quote carries a warning and a fixed gas limit, and you may still approve it
@@ -915,7 +954,8 @@ routes are `POST /oa/v1/withdraw/escape/prepare`,
 FILE` writes an encrypted copy of the note (format `zkapi-exit-kit-v1`, the
 browser SDK's: PBKDF2 with SHA-256 and 600,000 iterations, then
 AES-256-GCM) with the deployment profile, the note's secret and current
-state, the state's bound and the deposit-time Merkle path. `exit-kit escape`
+state and the state's bound; an escape needs no Merkle path, and one an older
+kit carries is ignored. `exit-kit escape`
 reads kits the browser SDK exported as well as this tool's. Export it again after each chat request: an
 older kit escapes from a state that was already spent, and that escape is
 defeated. `zkapi-walletd exit-kit escape --kit FILE --destination ADDRESS

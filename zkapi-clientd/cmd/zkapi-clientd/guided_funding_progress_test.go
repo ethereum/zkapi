@@ -138,7 +138,7 @@ func TestGuidedDepositRestoresStageAfterInterruptedRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	updates := strings.Join(u.progress, "\n")
-	if strings.Count(updates, "Deposit confirmed; activating") != 2 || !strings.Contains(updates, "Could not confirm") || u.active != "" {
+	if strings.Count(updates, "Deposit confirmed; saving") != 2 || !strings.Contains(updates, "Could not confirm") || u.active != "" {
 		t.Fatalf("stage did not recover after the interruption: %s", updates)
 	}
 	if strings.Contains(u.String(), "waiting") || !strings.Contains(u.String(), "Private inference balance activated") || f.approveCalls != 0 {
@@ -205,14 +205,14 @@ func TestGuidedDepositConfirmsSuccessfulMiningWithoutFinalityWait(t *testing.T) 
 	}
 	output := u.String()
 	previous := -1
-	for _, want := range []string{"waiting to be mined", "signed fee cap", "Deposit confirmed; activating", "Deposit confirmed. Private inference balance activated"} {
+	for _, want := range []string{"waiting to be mined", "signed fee cap", "Deposit confirmed; saving", "Deposit confirmed. Private inference balance activated"} {
 		index := strings.Index(output, want)
 		if index <= previous {
 			t.Fatalf("missing or out-of-order progress %q: %s", want, output)
 		}
 		previous = index
 	}
-	if strings.Count(output, "Deposit confirmed; activating") != 1 || strings.Contains(output, "untrusted remote") || strings.Contains(output, "finalit") || strings.Contains(output, "finalized") || strings.Contains(output, "15 minutes") {
+	if strings.Count(output, "Deposit confirmed; saving") != 1 || strings.Contains(output, "untrusted remote") || strings.Contains(output, "finalit") || strings.Contains(output, "finalized") || strings.Contains(output, "15 minutes") {
 		t.Fatal("successful deposit repeated progress, leaked remote data, or claimed a finality wait")
 	}
 	if f.approveCalls != 0 || f.resumeCalls != len(stages) {
@@ -290,6 +290,169 @@ func TestGuidedDepositLegacyFinalityStageRemainsNeutral(t *testing.T) {
 	}
 }
 
+// Review finding (clientd-flows 0, follow-up): a guided deposit the zkAPI
+// indexer keeps waiting (it is down or withholds the note) does not sit at
+// the verifying stage alone. Once that stage persists, a fixed label says
+// that the owner's exit RPC can confirm the note and keep it escapable, and
+// how to set one; the stage is shown again below it. Ordinary indexer lag
+// shows no such guidance, and the daemon's text never enters the output.
+func TestGuidedDepositExplainsTheExitRPCWhileTheIndexerKeepsItWaiting(t *testing.T) {
+	const verifyingLabel = "Deposit mined; waiting for the zkAPI indexer to record it before saving the private note."
+	if !strings.Contains(guidedIndexerWaitGuidance, "escape") || !strings.Contains(guidedIndexerWaitGuidance, "zkapi-clientd config --exit-rpc-url URL") {
+		t.Fatal("the guidance does not name the escape or how to set an exit RPC")
+	}
+	for _, polls := range []int{guidedIndexerWaitPolls - 1, guidedIndexerWaitPolls + 3} {
+		f := newWizardFixture()
+		u := &recordingSetupDisplay{}
+		initial := wizardState("confirming")
+		initial.DepositStage = "activating"
+		f.resume = func(uint64) (zkapi.AddressFundingStatus, error) {
+			if f.resumeCalls > polls {
+				return wizardState("active"), nil
+			}
+			state := wizardState("confirming")
+			state.DepositStage = "verifying"
+			state.Message = "untrusted remote details must stay hidden"
+			return state, nil
+		}
+		if err := finishGuidedDeposit(context.Background(), f, initial, u, immediateWizardPoll); err != nil {
+			t.Fatal(err)
+		}
+		output := u.String()
+		want, stages := 0, 1
+		if polls >= guidedIndexerWaitPolls {
+			want, stages = 1, 2
+		}
+		if strings.Count(output, guidedIndexerWaitGuidance) != want {
+			t.Fatalf("after %d checks waiting for the indexer the exit RPC guidance was shown %d times: %s", polls, strings.Count(output, guidedIndexerWaitGuidance), output)
+		}
+		if count := strings.Count(strings.Join(u.progress, "\n"), verifyingLabel); count != stages {
+			t.Fatalf("the verifying stage was shown %d times, want %d: %v", count, stages, u.progress)
+		}
+		if strings.Contains(output, "untrusted remote") || strings.Contains(strings.Join(u.progress, "\n"), "untrusted remote") || f.approveCalls != 0 || f.resumeCalls != polls+1 {
+			t.Fatal("the guidance leaked daemon text or changed the recovery")
+		}
+	}
+}
+
+// Review finding (clientd-fixes 0, follow-up): while the owner's exit RPC
+// cannot check a deposit the indexer has not confirmed, the guided session
+// shows a fixed label naming the remedy instead of the verifying stage, and
+// never the guidance that the exit RPC will confirm the note; both return
+// once the exit RPC works. The daemon's text never enters the output.
+func TestGuidedDepositNamesAnExitRPCThatCannotCheckIt(t *testing.T) {
+	const verifyingLabel = "Deposit mined; waiting for the zkAPI indexer to record it before saving the private note."
+	// Past the indexer wait the guidance follows the label once the exit RPC
+	// works; before it, only the verifying stage does.
+	for _, polls := range []struct{ unusable, usable, guidance int }{{guidedIndexerWaitPolls + 2, 1, 1}, {2, 2, 0}} {
+		f := newWizardFixture()
+		// The plain transcript keeps labels and guidance in the order shown.
+		u := &fundingWizardUI{}
+		initial := wizardState("confirming")
+		initial.DepositStage = "activating"
+		f.resume = func(uint64) (zkapi.AddressFundingStatus, error) {
+			if f.resumeCalls > polls.unusable+polls.usable {
+				return wizardState("active"), nil
+			}
+			state := wizardState("confirming")
+			state.DepositStage = "verifying"
+			state.ExitRPCUnusable = f.resumeCalls <= polls.unusable
+			state.Message = "untrusted remote details must stay hidden"
+			return state, nil
+		}
+		if err := finishGuidedDeposit(context.Background(), f, initial, u, immediateWizardPoll); err != nil {
+			t.Fatal(err)
+		}
+		output := u.String()
+		label, verifying := strings.Index(output, guidedDepositExitRPCUnusableLabel), strings.Index(output, verifyingLabel)
+		if strings.Count(output, guidedDepositExitRPCUnusableLabel) != 1 || strings.Count(output, verifyingLabel) != 1 || label < 0 || label > verifying {
+			t.Fatalf("after %d checks the unusable exit RPC was not shown while it lasted, then the verifying stage: %s", polls.unusable, output)
+		}
+		if guidance := strings.Index(output, guidedIndexerWaitGuidance); strings.Count(output, guidedIndexerWaitGuidance) != polls.guidance || (guidance >= 0 && (guidance < label || guidance > verifying)) {
+			t.Fatalf("after %d checks the exit RPC guidance was shown while the exit RPC could not check the deposit: %s", polls.unusable, output)
+		}
+		if !strings.Contains(guidedDepositExitRPCUnusableLabel, "config --exit-rpc-url URL") || strings.Contains(output, "untrusted remote") || f.approveCalls != 0 || f.resumeCalls != polls.unusable+polls.usable+1 {
+			t.Fatal("the label does not name the remedy, leaked daemon text, or changed the recovery")
+		}
+	}
+}
+
+// Review finding (clientd-fixes5, low): a verification conflict the owner's
+// exit RPC could not check at all (ExitRPCUnusable) stops the guided session
+// with a fixed error naming the --exit-rpc-url remedy, not repair, which
+// would need that RPC too: when it is reached while following a deposit and
+// when a saved conflict is re-verified. The daemon's text never enters it.
+func TestGuidedDepositConflictNamesAnExitRPCThatCannotCheckIt(t *testing.T) {
+	conflict := func(unusable bool) zkapi.AddressFundingStatus {
+		state := wizardState("verification_conflict")
+		state.ExitRPCUnusable, state.Message = unusable, "untrusted remote details must stay hidden"
+		return state
+	}
+	for _, unusable := range []bool{true, false} {
+		want := map[bool]error{true: errGuidedDepositConflictExitRPCUnusable, false: errGuidedDepositConflict}[unusable]
+		f := newWizardFixture()
+		f.resume = func(uint64) (zkapi.AddressFundingStatus, error) { return conflict(unusable), nil }
+		initial := wizardState("confirming")
+		initial.DepositStage = "activating"
+		if err := finishGuidedDeposit(context.Background(), f, initial, &fundingWizardUI{}, immediateWizardPoll); !errors.Is(err, want) {
+			t.Fatalf("following a deposit, unusable %v: %v", unusable, err)
+		}
+		f = newWizardFixture()
+		f.address = func() zkapi.AddressFundingStatus { return wizardState("verification_conflict") }
+		f.resume = func(uint64) (zkapi.AddressFundingStatus, error) { return conflict(unusable), nil }
+		f.ready = func(int) zkapi.WalletReadiness { return zkapi.WalletReadiness{} }
+		if err := guidedFunding(context.Background(), f, "", &fundingWizardUI{}, immediateWizardPoll); !errors.Is(err, want) {
+			t.Fatalf("re-verifying a saved conflict, unusable %v: %v", unusable, err)
+		}
+	}
+	if text := errGuidedDepositConflictExitRPCUnusable.Error(); !strings.Contains(text, "config --exit-rpc-url URL") || strings.Contains(text, "repair") {
+		t.Fatalf("the error does not name the exit RPC remedy alone: %s", text)
+	}
+}
+
+// A deposit is saved once the vault and the indexer record it; the
+// operator's batch activates it later. Guided setup then says requests wait
+// for that activation and withdrawals do not, never that it is activated.
+func TestGuidedDepositReportsARecordedNoteAwaitingActivation(t *testing.T) {
+	f := newWizardFixture()
+	u := &recordingSetupDisplay{}
+	initial := wizardState("confirming")
+	initial.DepositStage = "activating"
+	f.resume = func(uint64) (zkapi.AddressFundingStatus, error) {
+		state := wizardState("active")
+		state.DepositStage = "awaiting_activation"
+		activated := false
+		state.Activated = &activated
+		return state, nil
+	}
+	if err := finishGuidedDeposit(context.Background(), f, initial, u, immediateWizardPoll); err != nil {
+		t.Fatal(err)
+	}
+	if output := u.String(); strings.Contains(output, "activated.") || !strings.Contains(output, "Deposit confirmed. The private note is recorded") || !strings.Contains(output, "Withdrawals are available now") {
+		t.Fatalf("a recorded note was not reported as awaiting activation: %s", output)
+	}
+}
+
+// A saved note whose activation the companion has not read yet (its status
+// omits activated) is reported as saved, never as activated.
+func TestGuidedDepositNeverClaimsAnUnreadActivation(t *testing.T) {
+	f := newWizardFixture()
+	u := &recordingSetupDisplay{}
+	initial := wizardState("confirming")
+	initial.DepositStage = "activating"
+	f.resume = func(uint64) (zkapi.AddressFundingStatus, error) {
+		state := wizardState("active")
+		state.Activated = nil
+		return state, nil
+	}
+	if err := finishGuidedDeposit(context.Background(), f, initial, u, immediateWizardPoll); err != nil {
+		t.Fatal(err)
+	}
+	if output := u.String(); strings.Contains(output, "activated.") || !strings.Contains(output, "Deposit confirmed. The private note is saved") || !strings.Contains(output, "withdrawals are available now") {
+		t.Fatalf("an unread activation was reported as activated: %s", output)
+	}
+}
+
 func TestGuidedDepositObservedSuccessMovesDirectlyToActivation(t *testing.T) {
 	f := newWizardFixture()
 	u := &recordingSetupDisplay{}
@@ -298,7 +461,7 @@ func TestGuidedDepositObservedSuccessMovesDirectlyToActivation(t *testing.T) {
 	if err := finishGuidedDeposit(context.Background(), f, initial, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
-	if len(u.progress) != 1 || u.progress[0] != "Deposit confirmed; activating your private balance." || u.active != "" || !strings.Contains(u.String(), "Deposit confirmed. Private inference balance activated.") || f.approveCalls != 0 || f.resumeCalls != 1 {
+	if len(u.progress) != 1 || u.progress[0] != "Deposit confirmed; saving your private note." || u.active != "" || !strings.Contains(u.String(), "Deposit confirmed. Private inference balance activated.") || f.approveCalls != 0 || f.resumeCalls != 1 {
 		t.Fatal("observed success retained a finality wait or changed transaction recovery")
 	}
 }

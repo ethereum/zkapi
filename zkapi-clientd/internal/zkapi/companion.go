@@ -21,7 +21,8 @@ type CompanionConfig struct {
 	VerifierURL     string `json:"verifier_url"`
 	TestnetPassword string `json:"-"`
 	// ExitRPCURL is the user's own Ethereum RPC for exits (--exit-rpc-url):
-	// the companion also reads expiry, Merkle roots and logs through it.
+	// the companion also reads the note's vault record, expiry and logs
+	// through it.
 	ExitRPCURL string `json:"-"`
 }
 

@@ -12,7 +12,8 @@ import (
 )
 
 // RebindDeposit repairs a saved deposit's note binding from finalized vault
-// state and the indexer snapshot, for example after an RPC reported the wrong
+// state and the indexer's note records (or, when the indexer does not confirm
+// it, the owner's exit RPC), for example after an RPC reported the wrong
 // note ID, or a revert for a deposit that landed. Only the note ID and expiry
 // can change: the secret, commitment and amount come from this daemon's own
 // journal. A companion note is replaced only when the caller names it and it
@@ -121,16 +122,11 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 				break
 			}
 		}
-		if !found && deposit.Slot != nil {
-			// Without a usable receipt, only our exact leaf from a slot this
-			// note's deposits were built for, earliest first, identifies it.
-			ttl, err := h.noteTTL()
-			if err != nil {
-				return AddressFundingStatus{}, err
-			}
-			slots := append(signedDepositSlots(deposit, record), *deposit.Slot)
-			if snapshot, err := h.indexerSnapshot(ctx, config); err == nil && h.snapshotChainTime(ctx, config, snapshot) == nil {
-				candidate, found = findSignedDepositLeaf(snapshot, slots, commitment, deposit.Amount, ttl, snapshot.Time)
+		if !found {
+			// Without a usable receipt, only a recorded note holding exactly
+			// this deposit, the first one, identifies it.
+			if snapshot, err := h.indexerSnapshot(ctx, config); err == nil {
+				candidate, found = findDepositNote(snapshot, commitment, deposit.Amount)
 			}
 		}
 		if !found {
@@ -138,10 +134,12 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 		}
 	}
 
-	// Finalized vault state and the indexer must both hold exactly this
-	// deposit at the candidate note. Expiry is taken from the vault; an
-	// active note remains closable after its expiry, so it is not required
-	// to be in the future.
+	// Finalized vault state and the indexer must both record exactly this
+	// deposit at the candidate note, activated or not. When the operator's
+	// indexer does not, finalized vault state read through the owner's exit
+	// RPC stands in for it. Expiry is taken from the vault; an active note
+	// remains closable after its expiry, so it is not required to be in the
+	// future.
 	finalizedNumber, finalizedHash, err := h.finalizedBlock(ctx, config)
 	if err != nil {
 		return AddressFundingStatus{}, err
@@ -161,13 +159,28 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 	if deposit.Rebind != nil && deposit.Rebind.ExpiryTs != expiry {
 		return AddressFundingStatus{}, errors.New("the saved rebind no longer matches finalized vault state; preserve recovery files")
 	}
+	binding := &depositBinding{NoteID: candidate, ExpiryTs: expiry, BlockNumber: finalizedNumber, BlockHash: finalizedHash}
 	snapshot, err := h.confirmedSnapshot(ctx, config, finalizedNumber)
 	if err != nil {
-		return AddressFundingStatus{}, fmt.Errorf("the zkAPI indexer has not confirmed note %d yet; retry shortly (%v)", candidate, err)
+		err = fmt.Errorf("the zkAPI indexer has not confirmed note %d yet; retry shortly (%v)", candidate, err)
+	} else if leaf, present := snapshot.recordedLeaf(candidate); !present || leaf.Cmp(noteLeaf(candidate, commitment, deposit.Amount, expiry)) != 0 {
+		err = fmt.Errorf("the zkAPI indexer does not record this deposit at note %d; nothing was changed", candidate)
+	} else {
+		binding.IndexerBlock = snapshot.BlockNumber
 	}
-	leaf, present, err := snapshot.leaf(candidate)
-	if err != nil || !present || leaf.Cmp(noteLeaf(candidate, commitment, deposit.Amount, expiry)) != 0 {
-		return AddressFundingStatus{}, fmt.Errorf("the zkAPI indexer does not show this deposit at note %d; nothing was changed", candidate)
+	if err != nil {
+		if config.ExitRPC == "" {
+			return AddressFundingStatus{}, fmt.Errorf("%v; to repair without the zkAPI indexer, set your own Ethereum RPC with zkapi-clientd config --exit-rpc-url URL", err)
+		}
+		exitNote, exitErr := h.exitRPCFinalizedNote(ctx, config, candidate)
+		if exitErr != nil {
+			// A read that failed is no disagreeing vault record.
+			return AddressFundingStatus{}, fmt.Errorf("%v; your exit RPC could not read its finalized vault state instead (it did not answer, is on another Ethereum network, or refused to read the vault at a block hash); check the RPC, or set another with zkapi-clientd config --exit-rpc-url URL", err)
+		}
+		if exitNote.Status != noteActive || !strings.EqualFold(exitNote.Commitment, note.Commitment) || exitNote.Amount != deposit.Amount || exitNote.ExpiryTs != expiry {
+			return AddressFundingStatus{}, fmt.Errorf("%v; your exit RPC's finalized vault state does not confirm it either", err)
+		}
+		binding.ExitRPC = true
 	}
 	// A saved transaction is the target only when its own receipt names the
 	// verified note; any other final saved deposit is retired below.
@@ -183,7 +196,7 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 		return AddressFundingStatus{}, err
 	}
 
-	deposit.Binding = &depositBinding{NoteID: candidate, ExpiryTs: expiry, BlockNumber: finalizedNumber, BlockHash: finalizedHash, IndexerBlock: snapshot.BlockNumber}
+	deposit.Binding = binding
 	deposit.Active, deposit.Rebind = true, nil
 	if deposit.TransactionHash == "" {
 		deposit.TransactionHash = targetHash

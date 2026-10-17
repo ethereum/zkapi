@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -536,6 +537,46 @@ func TestConfigureKeyReuseWindowPersistsAndWiresZKAPI(t *testing.T) {
 	for _, value := range []string{"-1", "301", "invalid"} {
 		if _, err := parseConfigureOptions([]string{"--key-reuse-window-seconds", value}, io.Discard); err == nil {
 			t.Fatal("invalid window accepted", value)
+		}
+	}
+}
+
+// Review finding (clientd-fixes 3): the exit RPC's flag help and the saved
+// summary state everything it is used for (escapes, deployment checks,
+// withdrawal completion, deposit recording and repair) and that it
+// therefore sees those transactions and note IDs.
+func TestExitRPCHelpAndSummaryStateWhatItSees(t *testing.T) {
+	var help bytes.Buffer
+	if _, err := parseConfigureOptions([]string{"--help"}, &help); !errors.Is(err, flag.ErrHelp) {
+		t.Fatal(err)
+	}
+	for _, use := range []string{"escapes", "deployment checks", "withdrawal's completion", "deposit recording and repair", "sees those transactions and note IDs", "http:// to this machine is dialed directly", "cannot serve escapes yet, which need an HTTPS exit RPC"} {
+		if !strings.Contains(help.String(), use) {
+			t.Errorf("the --exit-rpc-url help omits %q", use)
+		}
+	}
+	ui := &fundingWizardUI{}
+	showConfigureSummary(config.Config{ZKAPI: config.ZKAPI{Network: "mainnet", ExitRPCURL: "https://rpc.example"}}, ui)
+	if !strings.Contains(ui.String(), "Exit RPC: https://rpc.example (deployment checks, deposit and withdrawal confirmation, exit transactions; it sees those transactions and note IDs)") {
+		t.Fatalf("the summary does not state the exit RPC's uses: %s", ui.String())
+	}
+	const escapes = "Escapes cannot use a plain-HTTP exit RPC yet; set an HTTPS exit RPC before you escape."
+	if strings.Contains(ui.String(), escapes) {
+		t.Fatalf("the summary warns about an HTTPS exit RPC: %s", ui.String())
+	}
+	// The wallet companion reads an escape's chain state through the
+	// configured transport, which carries HTTPS alone.
+	// Review finding (clientd-fixes5, nit): the scheme is compared as
+	// parsed, so an upper-case HTTP:// (which the exit RPC check accepts)
+	// is warned about too.
+	for _, plain := range []string{"http://127.0.0.1:8545", "HTTP://127.0.0.1:8545", "Http://localhost:8545"} {
+		if err := zkapi.ValidateExitRPCURL(plain); err != nil {
+			t.Fatalf("%s: %v", plain, err)
+		}
+		ui = &fundingWizardUI{}
+		showConfigureSummary(config.Config{ZKAPI: config.ZKAPI{Network: "mainnet", ExitRPCURL: plain}}, ui)
+		if !strings.Contains(ui.String(), escapes) {
+			t.Fatalf("the summary does not say escapes need an HTTPS exit RPC for %s: %s", plain, ui.String())
 		}
 	}
 }

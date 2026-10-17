@@ -41,7 +41,7 @@ const (
 	selectorNoteTTL                 = "0x225af2e7"
 	selectorMaxPauseDuration        = "0x64433d27"
 	selectorConcessionEscapeVersion = "0x5e00b426"
-	selectorRootHistoryWindow       = "0x1fe72de0"
+	selectorNoteBoundExitVersion    = "0x56853816"
 	selectorCircuitIDHash           = "0xda0e8385"
 	selectorRequestVKHash           = "0xfe351488"
 	selectorWithdrawalVKHash        = "0x7fcd0926"
@@ -171,7 +171,8 @@ func verifyDeploymentCode(ctx context.Context, client *http.Client, rpcURL strin
 		{"noteTtl()", d.Contract, selectorNoteTTL, uintWord(d.NoteTTL)},
 		{"maxPauseDuration()", d.Contract, selectorMaxPauseDuration, uintWord(d.MaxPauseDuration)},
 		{"CONCESSION_ESCAPE_VERSION()", d.Contract, selectorConcessionEscapeVersion, uintWord(1)},
-		{"ROOT_HISTORY_WINDOW()", d.Contract, selectorRootHistoryWindow, uintWord(86400)},
+		// Vault revision 4: exits bind notes(noteId) instead of a tree root.
+		{"NOTE_BOUND_EXIT_VERSION()", d.Contract, selectorNoteBoundExitVersion, uintWord(1)},
 		{"the adapter's CIRCUIT_ID_HASH()", d.ProofAdapter, selectorCircuitIDHash, circuitHash},
 		{"the adapter's REQUEST_VK_HASH()", d.ProofAdapter, selectorRequestVKHash, addressABIWord(strings.ToLower(d.Proof.RequestVKKeccak256))},
 		{"the adapter's WITHDRAWAL_VK_HASH()", d.ProofAdapter, selectorWithdrawalVKHash, addressABIWord(strings.ToLower(d.Proof.WithdrawalVKKeccak256))},
@@ -213,7 +214,7 @@ func (c *Client) CheckDeployment(ctx context.Context) error {
 		if err := ValidateExitRPCURL(c.config.ExitRPCURL); err != nil {
 			return err
 		}
-		if err := verifyDeploymentCode(ctx, c.inference, c.config.ExitRPCURL, deployment); err != nil {
+		if err := verifyDeploymentCode(ctx, c.rpcHTTP(c.config.ExitRPCURL), c.config.ExitRPCURL, deployment); err != nil {
 			return err
 		}
 	}

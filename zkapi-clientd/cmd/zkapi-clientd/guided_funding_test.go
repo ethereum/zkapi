@@ -71,7 +71,12 @@ type wizardFundingFixture struct {
 
 func wizardState(phase string) zkapi.AddressFundingStatus {
 	q := wizardQuote()
-	return zkapi.AddressFundingStatus{Phase: phase, Address: q.Address, ChainID: q.ChainID, DeploymentID: q.DeploymentID, BillingAsset: "native_eth", Amount: q.Amount, ETHBalance: q.BalanceWei, TransactionHash: "0x" + strings.Repeat("a", 64)}
+	state := zkapi.AddressFundingStatus{Phase: phase, Address: q.Address, ChainID: q.ChainID, DeploymentID: q.DeploymentID, BillingAsset: "native_eth", Amount: q.Amount, ETHBalance: q.BalanceWei, TransactionHash: "0x" + strings.Repeat("a", 64)}
+	if phase == "active" {
+		activated := true
+		state.Activated = &activated
+	}
+	return state
 }
 func wizardQuote() zkapi.AddressPaymentQuote {
 	q := paymentTestQuote("deposit")

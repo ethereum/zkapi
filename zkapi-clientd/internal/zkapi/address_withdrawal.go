@@ -38,6 +38,10 @@ type AddressWithdrawalStatus struct {
 	Phase           string `json:"phase"`
 	TransactionHash string `json:"transaction_hash,omitempty"`
 	Message         string `json:"message"`
+	// ExitRPCUnusable marks a pending withdrawal whose close the owner's
+	// exit RPC cannot check at all (withdrawalExitRPCUnusableMessage), so
+	// guided sessions can show a fixed label for it.
+	ExitRPCUnusable bool `json:"exit_rpc_unusable,omitempty"`
 	// NoteExpiry is the active note's expiry (Unix seconds). After it no
 	// chat request can move the note to a new state.
 	NoteExpiry uint64 `json:"note_expiry,omitempty"`
@@ -228,29 +232,86 @@ type withdrawalBridgeStatus struct {
 	EscapePayoutCredited bool `json:"escape_payout_credited"`
 }
 
-// withdrawalInputs is the 16-field statement of circuit
-// zkapi-v2-concession-v1 (WithdrawalPublicInputsV2C), in public-input order.
+// withdrawalInputs is the 17-input statement of circuit
+// zkapi-v2-concession-v2 (WithdrawalPublicInputsV2C), in public-input order.
+// The proof binds the note itself, not a tree root: input 3 is its
+// registration commitment, and deposit_amount and expiry are input 16, its
+// packed metadata.
 type withdrawalInputs struct {
-	ProtocolVersion uint64  `json:"protocol_version"`
-	ChainID         uint64  `json:"chain_id"`
-	Contract        string  `json:"contract_address"`
-	ActiveRoot      string  `json:"active_root"`
-	StateKeyX       string  `json:"state_signing_key_x"`
-	StateKeyY       string  `json:"state_signing_key_y"`
-	ClearanceKeyX   string  `json:"clearance_signing_key_x"`
-	ClearanceKeyY   string  `json:"clearance_signing_key_y"`
-	NoteID          uint64  `json:"note_id"`
-	FinalBalance    uint64  `json:"final_balance"`
-	Destination     []uint8 `json:"destination"`
-	Nullifier       string  `json:"withdrawal_nullifier"`
-	Kind            uint64  `json:"kind"`
-	NextNullifier   string  `json:"next_nullifier"`
-	Conceded        uint64  `json:"conceded"`
-	ValidUntil      uint64  `json:"valid_until"`
+	ProtocolVersion        uint64  `json:"protocol_version"`
+	ChainID                uint64  `json:"chain_id"`
+	Contract               string  `json:"contract_address"`
+	RegistrationCommitment string  `json:"registration_commitment"`
+	StateKeyX              string  `json:"state_signing_key_x"`
+	StateKeyY              string  `json:"state_signing_key_y"`
+	ClearanceKeyX          string  `json:"clearance_signing_key_x"`
+	ClearanceKeyY          string  `json:"clearance_signing_key_y"`
+	NoteID                 uint64  `json:"note_id"`
+	FinalBalance           uint64  `json:"final_balance"`
+	Destination            []uint8 `json:"destination"`
+	Nullifier              string  `json:"withdrawal_nullifier"`
+	Kind                   uint64  `json:"kind"`
+	NextNullifier          string  `json:"next_nullifier"`
+	Conceded               uint64  `json:"conceded"`
+	ValidUntil             uint64  `json:"valid_until"`
+	DepositAmount          uint64  `json:"deposit_amount"`
+	Expiry                 uint64  `json:"expiry"`
 }
 
-// withdrawalTuple is the vault's WithdrawalPublicInputs tuple.
-const withdrawalTuple = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)"
+// withdrawalTuple is the vault's WithdrawalPublicInputs tuple (vault
+// revision 4): word 3 is the note's registration commitment and word 16 its
+// metadata.
+const withdrawalTuple = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256)"
+
+// exitNote is what an exit statement says of its note: the registration
+// commitment (word 3) and the deposit amount and expiry the vault stored
+// (word 16, noteMetadataWord). The vault refuses a proof whose words differ
+// from notes(noteId) (NoteBindingMismatch).
+type exitNote struct {
+	Commitment string
+	Amount     uint64
+	ExpiryTs   uint64
+}
+
+// noteMetadataWord is the note metadata word the vault packs from
+// notes(noteId): uint256(depositAmount) | uint256(expiryTs) << 128.
+func noteMetadataWord(amount, expiry uint64) string {
+	return fmt.Sprintf("%032x%032x", expiry, amount)
+}
+
+// exitNote reads the note an exit of noteID binds from the vault at the
+// latest block, through config (the exit RPC for an escape). The record is
+// immutable once the deposit is recorded, activated or not. It must match
+// this wallet's own deposit: the corroborated deposit binding when it names
+// the note, else the payment journal's commitment and amount. A mismatch
+// would only revert on chain, so nothing is signed.
+func (h *FundingHandler) exitNote(ctx context.Context, config fundingConfig, record *addressFundingRecord, noteID uint64) (exitNote, error) {
+	if noteID > 0xffffffff {
+		return exitNote{}, errors.New("invalid withdrawal note")
+	}
+	note, err := h.vaultNote(ctx, config, uint32(noteID), "latest")
+	if err != nil {
+		return exitNote{}, err
+	}
+	if note.Status == noteUninitialized {
+		return exitNote{}, fmt.Errorf("the vault does not record note %d; retry once its deposit is visible to the payment RPC", noteID)
+	}
+	deposit, err := h.readAddressDeposit(config)
+	if err != nil {
+		return exitNote{}, err
+	}
+	matches := func(commitment string, amount uint64) bool {
+		return strings.EqualFold(note.Commitment, "0x"+addressABIWord(commitment)) && (amount == 0 || note.Amount == amount)
+	}
+	if deposit != nil && deposit.Active && deposit.Binding != nil && uint64(deposit.Binding.NoteID) == noteID {
+		if !matches(deposit.Commitment, deposit.Amount) || note.ExpiryTs != deposit.Binding.ExpiryTs {
+			return exitNote{}, fmt.Errorf("the vault's record of note %d does not match this wallet's deposit; nothing was signed, preserve recovery files", noteID)
+		}
+	} else if record.Commitment != "" && !matches(record.Commitment, record.Amount) {
+		return exitNote{}, fmt.Errorf("the vault's record of note %d does not match this wallet's deposit; nothing was signed, preserve recovery files", noteID)
+	}
+	return exitNote{Commitment: note.Commitment, Amount: note.Amount, ExpiryTs: note.ExpiryTs}, nil
+}
 
 // exitProofValidity is how long the vault accepts an escape or close proof;
 // a proof is signed only while its valid_until is within this (plus a small
@@ -258,14 +319,17 @@ const withdrawalTuple = "(uint16,uint64,address,uint256,uint256,uint256,uint256,
 const exitProofValidity = 10_800
 const exitProofClockAllowance = 300
 
-// withdrawalCalldataLength is selector | 16 tuple words | offset | length |
-// 8 proof words: 836 bytes.
-const withdrawalCalldataLength = 4 + 26*32
+// withdrawalCalldataLength is selector | 17 tuple words | offset | length |
+// 8 proof words: 868 bytes.
+const withdrawalCalldataLength = 4 + 27*32
+
+// withdrawalProofOffset is the bytes argument's offset word: it follows the
+// 17 static tuple words and itself.
+const withdrawalProofOffset = 18 * 32
 
 type withdrawalPlan struct {
 	Mode         string           `json:"mode"`
 	PublicInputs withdrawalInputs `json:"public_inputs"`
-	Siblings     []string         `json:"siblings"`
 	Proof        struct {
 		Backend string `json:"backend"`
 		Proof   string `json:"proof"`
@@ -370,7 +434,29 @@ func (h *FundingHandler) escapePayoutCredits(ctx context.Context, config funding
 	return credits, nil
 }
 
-const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed before finishing local bookkeeping."
+const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state to show the note closed before finishing local bookkeeping."
+
+// withdrawalExitRPCUnusableMessage replaces withdrawalVerifyingMessage while
+// the owner's exit RPC cannot check the close at all
+// (errExitRPCCloseCheckUnusable).
+const withdrawalExitRPCUnusableMessage = "The withdrawal is final on Ethereum, but your exit RPC could not check that the vault shows the note closed: it did not answer, is on another Ethereum network, or refused to read the vault at a block hash (EIP-1898). Local bookkeeping waits for it; check the RPC, or set another with zkapi-clientd config --exit-rpc-url URL."
+
+// withdrawalPendingMessage is the status message of a withdrawal whose close
+// corroborateWithdrawalClosed has not confirmed yet.
+func withdrawalPendingMessage(err error) string {
+	if errors.Is(err, errExitRPCCloseCheckUnusable) {
+		return withdrawalExitRPCUnusableMessage
+	}
+	return withdrawalVerifyingMessage
+}
+
+// markWithdrawalPending sets the status of a withdrawal whose close
+// corroborateWithdrawalClosed has not confirmed yet: its message, and
+// whether the exit RPC cannot check the close at all.
+func markWithdrawalPending(status *AddressWithdrawalStatus, err error) {
+	status.Message = withdrawalPendingMessage(err)
+	status.ExitRPCUnusable = errors.Is(err, errExitRPCCloseCheckUnusable)
+}
 
 // requireClearanceOwnershipCapability runs only before a companion reserves a
 // note for a new withdrawal. Where the pinned deployment's server may require
@@ -909,14 +995,14 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	} else if w.Transit != nil && w.Phase == "gasless_refused" {
 		w.Phase, w.GaslessRefusal = "quoted", ""
 	}
-	// Payout evidence comes from the pinned RPC. The vault and indexer must
-	// also show the note closed before the companion deletes its state; while
-	// they do not, a saved withdrawal keeps polling and an explicit alternate
+	// Payout evidence comes from the pinned RPC. The vault must also show the
+	// note closed before the companion deletes its state; while it does not,
+	// a saved withdrawal keeps polling and an explicit alternate
 	// confirmation reports why nothing changed.
 	closeUnconfirmed := func(err error) (AddressWithdrawalStatus, error) {
 		if errors.Is(err, errWithdrawalVerificationPending) && (w.Phase == "withdrawal_pending" || w.Phase == "confirming") {
 			next := update()
-			next.Message = withdrawalVerifyingMessage
+			markWithdrawalPending(&next, err)
 			return next, nil
 		}
 		return update(), err
@@ -1034,6 +1120,11 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			return update(), err
 		}
 	}
+	// The note the proof must bind, read before the companion proves.
+	note, err := h.exitNote(ctx, config, record, w.NoteID)
+	if err != nil {
+		return update(), err
+	}
 	prepare := map[string]any{"destination": w.proofDestination()}
 	if mode := quoteMode(ctx); mode != nil && mode.AcceptUnsettledRequestRisk {
 		if err := h.requireUnsettledRequestOverride(ctx); err != nil {
@@ -1061,7 +1152,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	if json.Unmarshal(raw, &plan) != nil {
 		return update(), errors.New("invalid withdrawal proof response")
 	}
-	data, binding, err := withdrawalCalldata(plan, config, w, wallet.Note.Balance, time.Now())
+	data, binding, err := withdrawalCalldata(plan, config, w, note, wallet.Note.Balance, time.Now())
 	if err != nil {
 		return update(), err
 	}
@@ -1184,15 +1275,16 @@ func withdrawalStatusMatches(status withdrawalBridgeStatus, record *addressWithd
 }
 
 // withdrawalCalldata builds mutualClose calldata from the companion's plan
-// and checks it against the authorized note, destination and balance, with
-// valid_until in the signing window at now.
-func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addressWithdrawalRecord, previousBalance uint64, now time.Time) (string, string, error) {
+// and checks it against the authorized note (including the vault's record
+// of it), destination and balance, with valid_until in the signing window at
+// now.
+func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addressWithdrawalRecord, note exitNote, previousBalance uint64, now time.Time) (string, string, error) {
 	p := plan.PublicInputs
 	invalid := errors.New("withdrawal proof does not match the authorized note, destination, balance, or deployment")
 	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.proofDestination()) || p.FinalBalance > previousBalance || plan.Proof.Backend != "groth16_bn254" {
 		return "", "", invalid
 	}
-	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.proofDestination())
+	words, proof, err := withdrawalWords(p, note, plan.Proof.Proof, saved.proofDestination())
 	if err != nil {
 		return "", "", invalid
 	}
@@ -1200,7 +1292,7 @@ func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addres
 	if saved.Binding != "" && (saved.Binding != binding || saved.Amount != p.FinalBalance || !strings.EqualFold(addressABIWord(saved.Nullifier), addressABIWord(p.Nullifier))) {
 		return "", "", invalid
 	}
-	data := "0x" + withdrawalSelector + strings.Join(words, "") + fmt.Sprintf("%064x%064x", 17*32, len(proof)) + hex.EncodeToString(proof)
+	data := "0x" + withdrawalSelector + strings.Join(words, "") + fmt.Sprintf("%064x%064x", withdrawalProofOffset, len(proof)) + hex.EncodeToString(proof)
 	raw, _ := hex.DecodeString(data[2:])
 	expected := *saved
 	expected.Amount, expected.Nullifier, expected.Binding = p.FinalBalance, "0x"+addressABIWord(p.Nullifier), binding
@@ -1210,31 +1302,37 @@ func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addres
 	return data, binding, nil
 }
 
-// withdrawalWords is the 16 tuple words of p, with destination as the
-// payout address, and the 256 proof bytes.
-func withdrawalWords(p withdrawalInputs, encodedProof, destination string) ([]string, []byte, error) {
+// withdrawalWords is the 17 tuple words of p, with destination as the
+// payout address, and the 256 proof bytes. p must bind note: its
+// registration commitment, deposit amount and expiry as the vault records
+// them.
+func withdrawalWords(p withdrawalInputs, note exitNote, encodedProof, destination string) ([]string, []byte, error) {
 	proof, err := base64.StdEncoding.DecodeString(encodedProof)
 	if err != nil || len(proof) != 256 {
 		return nil, nil, errors.New("invalid proof")
 	}
-	for _, field := range []string{p.ActiveRoot, p.StateKeyX, p.StateKeyY, p.ClearanceKeyX, p.ClearanceKeyY, p.Nullifier, p.NextNullifier} {
+	for _, field := range []string{p.RegistrationCommitment, p.StateKeyX, p.StateKeyY, p.ClearanceKeyX, p.ClearanceKeyY, p.Nullifier, p.NextNullifier} {
 		if !isField(field) {
 			return nil, nil, errors.New("invalid field")
 		}
 	}
-	words := []string{fmt.Sprintf("%064x", p.ProtocolVersion), fmt.Sprintf("%064x", p.ChainID), addressABIWord(p.Contract), addressABIWord(p.ActiveRoot), addressABIWord(p.StateKeyX), addressABIWord(p.StateKeyY), addressABIWord(p.ClearanceKeyX), addressABIWord(p.ClearanceKeyY), fmt.Sprintf("%064x", p.NoteID), fmt.Sprintf("%064x", p.FinalBalance), addressABIWord(destination), addressABIWord(p.Nullifier), fmt.Sprintf("%064x", p.Kind), addressABIWord(p.NextNullifier), fmt.Sprintf("%064x", p.Conceded), fmt.Sprintf("%064x", p.ValidUntil)}
+	if !isField(note.Commitment) || !strings.EqualFold(addressABIWord(p.RegistrationCommitment), addressABIWord(note.Commitment)) || p.DepositAmount != note.Amount || p.Expiry != note.ExpiryTs {
+		return nil, nil, errors.New("the statement does not bind the vault's record of the note")
+	}
+	words := []string{fmt.Sprintf("%064x", p.ProtocolVersion), fmt.Sprintf("%064x", p.ChainID), addressABIWord(p.Contract), addressABIWord(p.RegistrationCommitment), addressABIWord(p.StateKeyX), addressABIWord(p.StateKeyY), addressABIWord(p.ClearanceKeyX), addressABIWord(p.ClearanceKeyY), fmt.Sprintf("%064x", p.NoteID), fmt.Sprintf("%064x", p.FinalBalance), addressABIWord(destination), addressABIWord(p.Nullifier), fmt.Sprintf("%064x", p.Kind), addressABIWord(p.NextNullifier), fmt.Sprintf("%064x", p.Conceded), fmt.Sprintf("%064x", p.ValidUntil), noteMetadataWord(p.DepositAmount, p.Expiry)}
 	for i := range words {
 		words[i] = strings.ToLower(words[i])
 	}
 	return words, proof, nil
 }
 
-// withdrawalBinding is the keccak of the 16 tuple words with the root (word
-// 3) and valid_until (word 15) blanked: a re-proof at another root or with a
-// fresh lifetime keeps every other public input of the authorized exit.
+// withdrawalBinding is the keccak of the 17 tuple words with valid_until
+// (word 15) blanked: a re-proof with a fresh lifetime keeps every other
+// public input of the authorized exit. The note's commitment and metadata
+// (words 3 and 16) are fixed per note, so they stay bound.
 func withdrawalBinding(words []string) string {
-	bound := append([]string{}, words[:16]...)
-	bound[3], bound[15] = "", ""
+	bound := append([]string{}, words[:17]...)
+	bound[15] = ""
 	return crypto.Keccak256Hash([]byte(strings.Join(bound, ""))).Hex()
 }
 
@@ -1352,22 +1450,23 @@ func (h *FundingHandler) checkRelayedEscapePayout(ctx context.Context, config fu
 }
 
 // validateSignedWithdrawal checks signed mutualClose calldata against the
-// saved authorization: 836 bytes; the fixed words 0, 1, 2, 8, 9, 10 and 11;
+// saved authorization: 868 bytes; the fixed words 0, 1, 2, 8, 9, 10 and 11;
 // kind 1 with no successor nullifier and no concession; the bytes offset and
-// length; and the binding over the 16 tuple words with words 3 and 15
-// blanked. With a nonzero now (before signing), valid_until (word 15) must
-// also lie in [now, now + 10,800 + 300].
+// length; and the binding over the 17 tuple words with word 15 blanked,
+// which fixes the note's commitment and metadata (words 3 and 16). With a
+// nonzero now (before signing), valid_until (word 15) must also lie in
+// [now, now + 10,800 + 300].
 func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressWithdrawalRecord, now time.Time) error {
 	invalid := errors.New("signed withdrawal does not match its saved authorization; preserve recovery files")
 	if saved == nil || len(data) != withdrawalCalldataLength || hex.EncodeToString(data[:4]) != withdrawalSelector || saved.Binding == "" || !isHex(saved.Nullifier, 32) {
 		return invalid
 	}
-	words := make([]string, 18)
+	words := make([]string, 19)
 	for i := range words {
 		words[i] = hex.EncodeToString(data[4+i*32 : 4+(i+1)*32])
 	}
 	zero := strings.Repeat("0", 64)
-	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
+	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 17: fmt.Sprintf("%064x", withdrawalProofOffset), 18: fmt.Sprintf("%064x", 256)}
 	for index, value := range expected {
 		if !strings.EqualFold(words[index], value) {
 			return invalid
@@ -1472,7 +1571,7 @@ func (h *FundingHandler) adoptPostWithdrawalDeposit(config fundingConfig, deposi
 		return nil
 	}
 	if record.Withdrawal.Phase != "complete" || record.Withdrawal.NoteID == uint64(noteID) {
-		return errors.New("a closed note cannot be activated again")
+		return errors.New("a closed note cannot be saved again")
 	}
 	if record.Pending != nil {
 		return errors.New("a saved transaction must be recovered before adopting a new note")

@@ -356,10 +356,12 @@ func (g *gaslessFixture) view(t *testing.T, to, data string) (any, map[string]an
 			return word(new(big.Int).SetUint64(g.pausedAt)), nil, true
 		case selectorPendingWithdrawals:
 			pending, ok := g.pending[uint32(arg(0).Uint64())]
+			// (exists, withdrawalNullifier, finalBalance, destination,
+			// challengeDeadline) of vault revision 4.
 			if !ok {
-				return word(new(big.Int), new(big.Int), new(big.Int), new(big.Int), new(big.Int), new(big.Int)), nil, true
+				return word(new(big.Int), new(big.Int), new(big.Int), new(big.Int), new(big.Int)), nil, true
 			}
-			return word(big.NewInt(1), new(big.Int), pending.nullifier, new(big.Int).SetUint64(pending.finalBalance), new(big.Int).SetBytes(pending.destination.Bytes()), new(big.Int).SetUint64(pending.deadline)), nil, true
+			return word(big.NewInt(1), pending.nullifier, new(big.Int).SetUint64(pending.finalBalance), new(big.Int).SetBytes(pending.destination.Bytes()), new(big.Int).SetUint64(pending.deadline)), nil, true
 		}
 	}
 	return nil, nil, false

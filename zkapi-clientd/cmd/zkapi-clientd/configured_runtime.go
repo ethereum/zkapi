@@ -102,7 +102,16 @@ func configuredWalletReady(ctx context.Context, service guidedFundingService, ui
 		ui.Printf("A previous inference is settling; new requests will wait automatically.\n")
 		return nil
 	}
+	if state.Activation.Known && !state.Activation.Activated {
+		ui.Printf("%s\n", activationPendingMessage(state.Activation))
+	}
 	return checkSetupBalance(state, ui)
+}
+
+// activationPendingMessage explains a recorded note that the operator's
+// batch has not activated yet.
+func activationPendingMessage(activation zkapi.NoteActivation) string {
+	return fmt.Sprintf("The deposit is recorded; the operator's batch activates the private note shortly (%d earlier notes first). Requests wait for it automatically, and withdrawals are available now.", activation.Ahead)
 }
 
 // Config owns a temporary runtime only for the selected wallet operation. It

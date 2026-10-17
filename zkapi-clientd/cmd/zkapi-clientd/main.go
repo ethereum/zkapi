@@ -537,6 +537,15 @@ func status(ctx context.Context, dir string, c config.Config) error {
 			result["funded"] = state.HasNote
 			result["private_balance"] = state.Note.CurrentBalance
 			result["pending_settlement"] = state.PendingRequest
+			// A recorded note pays for requests only once the operator's
+			// batch activated it; withdrawals never wait for that.
+			if activation := zkapi.ParseNoteActivation(data); activation.Known {
+				result["activated"] = activation.Activated
+				result["activation_cursor"] = activation.Cursor
+				if !activation.Activated {
+					result["activation_queue_position"] = activation.Ahead
+				}
+			}
 		}
 	}
 	e := json.NewEncoder(os.Stdout)

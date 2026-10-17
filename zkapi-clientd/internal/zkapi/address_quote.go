@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -153,7 +152,7 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	if amount == 0 || amount > 1_000_000_000_000 {
 		return quote, errors.New("invalid deposit amount")
 	}
-	config, record, _, err := h.addressSnapshot(ctx)
+	config, record, _, err := h.depositSnapshot(ctx)
 	if err != nil {
 		return quote, err
 	}
@@ -197,8 +196,8 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	}
 	if retryHash == "" {
 		// An earlier deposit of this note, already retired, may have landed
-		// since. Approval searches the tree it signs from again; a retry that
-		// would be refused is not quoted for funding. A quote saves phase
+		// since. Approval searches the snapshot it signs from again; a retry
+		// that would be refused is not quoted for funding. A quote saves phase
 		// waiting_funds, so a saved conflict is only cleared by a search that
 		// completes.
 		search := h.advisePriorDeposits
@@ -228,12 +227,8 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	if err = h.saveAddress(record); err != nil {
 		return quote, err
 	}
-	data, err := h.refreshAddressDeposit(ctx, deposit)
-	if err != nil {
-		return quote, err
-	}
 	ctx = context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Capture: &quote, RetryHash: retryHash})
-	err = h.signAddressTransaction(ctx, config, record, "deposit", config.Contract, data)
+	err = h.signAddressTransaction(ctx, config, record, "deposit", config.Contract, depositCalldata(deposit.Commitment, deposit.Amount))
 	return quote, err
 }
 func (h *FundingHandler) ApproveAddressDeposit(ctx context.Context, id string) (AddressFundingStatus, error) {
@@ -310,32 +305,6 @@ func checkedAddressQuote(record *addressFundingRecord, id, kind string) (*Addres
 	}
 	copy := *q
 	return &copy, nil
-}
-func (h *FundingHandler) refreshAddressDeposit(ctx context.Context, deposit *depositRecord) (string, error) {
-	path, err := h.depositPath(ctx)
-	if err != nil {
-		return "", err
-	}
-	raw, _ := json.Marshal(path)
-	var refreshed struct {
-		ZeroPath []string `json:"zero_path"`
-	}
-	if json.Unmarshal(raw, &refreshed) != nil || len(refreshed.ZeroPath) != 32 {
-		return "", errors.New("invalid refreshed deposit path")
-	}
-	// deposit(bytes32,uint128): the vault appends the leaf itself (revision 3). The path stays
-	// with the record, for the note's exit proof.
-	data := depositCalldata(deposit.Commitment, deposit.Amount)
-	for _, sibling := range refreshed.ZeroPath {
-		if !isField(sibling) {
-			return "", errors.New("invalid refreshed deposit path")
-		}
-	}
-	deposit.ZeroPath = refreshed.ZeroPath
-	if err = h.save(*deposit); err != nil {
-		return "", err
-	}
-	return data, nil
 }
 func positiveDifference(left, right *big.Int) *big.Int {
 	n := new(big.Int).Sub(left, right)

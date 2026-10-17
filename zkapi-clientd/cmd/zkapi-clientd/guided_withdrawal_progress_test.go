@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -130,5 +131,85 @@ func TestEarlierCreditedEscapePayoutsArePrinted(t *testing.T) {
 	}
 	if !strings.Contains(u.String(), want) {
 		t.Fatalf("the guided withdrawal omitted the credit: %s", u.String())
+	}
+}
+
+// Review finding (clientd-fixes 1): while the owner's exit RPC cannot check
+// a final withdrawal's close, the guided session shows a fixed label naming
+// the remedy instead of the finality wait, and the finality wait again once
+// the exit RPC answers. The status message never enters its output.
+func TestGuidedWithdrawalNamesAnExitRPCThatCannotCheckTheClose(t *testing.T) {
+	const finality = "Withdrawal submitted; waiting for Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress."
+	f := &withdrawalWizardFixture{}
+	u := &recordingSetupDisplay{}
+	f.resume = func(call int, _ string, _ uint64) (zkapi.AddressWithdrawalStatus, error) {
+		state := withdrawalWizardState("withdrawal_pending")
+		switch call {
+		case 1, 2:
+			state.ExitRPCUnusable, state.Message = true, "remote status message"
+		case 3:
+		default:
+			return withdrawalWizardState("complete"), nil
+		}
+		return state, nil
+	}
+	if err := finishGuidedWithdrawal(context.Background(), f, withdrawalWizardState("withdrawal_pending"), u, immediateWizardPoll); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{finality, guidedExitRPCUnusableLabel, finality}; !slices.Equal(u.progress, want) {
+		t.Fatalf("the unusable exit RPC was not shown while it lasted: %q", u.progress)
+	}
+	if !strings.Contains(guidedExitRPCUnusableLabel, "config --exit-rpc-url URL") || strings.Contains(u.String(), "remote status message") || !strings.Contains(u.String(), "Withdrawal complete:") {
+		t.Fatalf("the label does not name the remedy, or the remote message was printed: %s", u.String())
+	}
+}
+
+// Review finding (clientd-fixes5, low): while a sponsored withdrawal's status
+// cannot be read because the owner's exit RPC does not answer or serves
+// another network (exit_rpc_unusable), the guided session shows a fixed
+// label naming that RPC and its remedy instead of the generic wait, and the
+// stage again once the RPC answers. The daemon's message never enters its
+// output.
+func TestGuidedWithdrawalNamesAnUnusableExitRPCWhileItsStatusFails(t *testing.T) {
+	const finality = "Withdrawal submitted; waiting for Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress."
+	unusable := &managementError{message: "daemon message about the exit RPC", code: "exit_rpc_unusable", scope: "withdrawal"}
+	f := &withdrawalWizardFixture{}
+	u := &recordingSetupDisplay{}
+	initial := withdrawalWizardState("withdrawal_pending")
+	f.resume = func(call int, _ string, _ uint64) (zkapi.AddressWithdrawalStatus, error) {
+		if call == 1 {
+			return zkapi.AddressWithdrawalStatus{}, unusable
+		}
+		return withdrawalWizardState("complete"), nil
+	}
+	f.status = func(call int) (zkapi.AddressWithdrawalStatus, error) {
+		if call <= 2 {
+			return zkapi.AddressWithdrawalStatus{}, unusable
+		}
+		return initial, nil
+	}
+	if err := finishGuidedWithdrawal(context.Background(), f, initial, u, immediateWizardPoll); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{finality, guidedExitRPCDownLabel, finality}; !slices.Equal(u.progress, want) {
+		t.Fatalf("the unusable exit RPC was not named while the status failed: %q", u.progress)
+	}
+	if !strings.Contains(guidedExitRPCDownLabel, "config --exit-rpc-url URL") || strings.Contains(u.String(), "daemon message") || !strings.Contains(u.String(), "Withdrawal complete:") {
+		t.Fatalf("the label does not name the remedy, or the daemon's message was printed: %s", u.String())
+	}
+}
+
+// An unusable exit RPC is no gasless refusal: a payout quote it fails keeps
+// being retried, never stopped with the wallet-paid way out.
+func TestGuidedPayoutQuoteRetriesAnUnusableExitRPC(t *testing.T) {
+	f := &withdrawalWizardFixture{availability: &zkapi.GaslessAvailability{Available: true}}
+	f.quote = func(int, string, uint64, string) (zkapi.AddressPaymentQuote, error) {
+		return zkapi.AddressPaymentQuote{}, &managementError{message: "the exit RPC (--exit-rpc-url) did not answer", code: "exit_rpc_unusable"}
+	}
+	u := &fundingWizardUI{answers: []string{withdrawalTestDestination, "payout"}}
+	waited := errors.New("waited")
+	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error { return waited }, "")
+	if !errors.Is(err, waited) || f.quoteCalls != 1 || f.approveCalls != 0 {
+		t.Fatalf("the unusable exit RPC stopped the payout quote: %v %+v", err, f)
 	}
 }

@@ -12,7 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// realVaultLayout is the revision-3 vault's selectors and event layouts as
+// realVaultLayout is the revision-4 vault's selectors and event layouts as
 // the compiled protocol/contracts sources produce them
 // (crates/zkapi-serverd/tests/fixtures/vault_calldata_golden.json, which
 // check-calldata-golden.sh keeps equal to the contracts).
@@ -56,7 +56,8 @@ func TestEverySelectorAndTopicIsTheRealVaults(t *testing.T) {
 		"noteTtl":                   selectorNoteTTL,
 		"maxPauseDuration":          selectorMaxPauseDuration,
 		"CONCESSION_ESCAPE_VERSION": selectorConcessionEscapeVersion,
-		"ROOT_HISTORY_WINDOW":       selectorRootHistoryWindow,
+		"NOTE_BOUND_EXIT_VERSION":   selectorNoteBoundExitVersion,
+		"pendingWithdrawals":        "0x" + selectorPendingWithdrawals,
 		"CIRCUIT_ID_HASH":           selectorCircuitIDHash,
 		"REQUEST_VK_HASH":           selectorRequestVKHash,
 		"WITHDRAWAL_VK_HASH":        selectorWithdrawalVKHash,
@@ -89,12 +90,16 @@ func TestEverySelectorAndTopicIsTheRealVaults(t *testing.T) {
 		}
 	}
 	// The payout matchers read EscapeWithdrawalFinalized as two topics and
-	// three data words, and EscapePayoutDeferred as three topics and one word.
+	// three data words, and EscapePayoutDeferred as three topics and one word;
+	// the deposit matcher reads NoteDeposited as three topics and two words.
 	if finalized := layout.Events["EscapeWithdrawalFinalized"]; len(finalized.Topics) != 2+2*64 || !isHex(finalized.Data, 96) {
 		t.Fatalf("EscapeWithdrawalFinalized layout changed: %+v", finalized)
 	}
 	if deferred := layout.Events["EscapePayoutDeferred"]; len(deferred.Topics) != 2+3*64 || !isHex(deferred.Data, 32) {
 		t.Fatalf("EscapePayoutDeferred layout changed: %+v", deferred)
+	}
+	if deposited := layout.Events["NoteDeposited"]; len(deposited.Topics) != 2+3*64 || !isHex(deposited.Data, 64) {
+		t.Fatalf("NoteDeposited layout changed: %+v", deposited)
 	}
 }
 
@@ -132,6 +137,11 @@ func TestRealProofsEncodeToTheSharedWithdrawalGoldenVector(t *testing.T) {
 	// The signing window opens VALIDITY before a proof's valid_until.
 	signingTime := func(p withdrawalInputs) time.Time { return time.Unix(int64(p.ValidUntil)-exitProofValidity, 0) }
 	destination := func(p withdrawalInputs) string { return common.BytesToAddress(p.Destination).Hex() }
+	// The vault's record of the note each proof binds, as notes(noteId)
+	// returns it on the golden deployment.
+	note := func(p withdrawalInputs) exitNote {
+		return exitNote{Commitment: p.RegistrationCommitment, Amount: p.DepositAmount, ExpiryTs: p.Expiry}
+	}
 
 	e := golden.Escape
 	var plan escapePlan
@@ -142,7 +152,7 @@ func TestRealProofsEncodeToTheSharedWithdrawalGoldenVector(t *testing.T) {
 	stateBalance, _ := parseUnits(e.StateBalance)
 	saved := &addressWithdrawalRecord{NoteID: e.PublicInputs.NoteID, Destination: destination(e.PublicInputs), Mode: "escape",
 		StateBalance: stateBalance, Conceded: e.PublicInputs.Conceded, Bound: e.PublicInputs.Conceded}
-	escape, _, err := escapeCalldata(plan, config, saved, signingTime(e.PublicInputs))
+	escape, _, err := escapeCalldata(plan, config, saved, note(e.PublicInputs), signingTime(e.PublicInputs))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +165,7 @@ func TestRealProofsEncodeToTheSharedWithdrawalGoldenVector(t *testing.T) {
 	closePlan.Mode, closePlan.PublicInputs = "mutual", c.PublicInputs
 	closePlan.Proof.Backend, closePlan.Proof.Proof = "groth16_bn254", c.Proof
 	closeSaved := &addressWithdrawalRecord{NoteID: c.PublicInputs.NoteID, Destination: destination(c.PublicInputs)}
-	closeData, _, err := withdrawalCalldata(closePlan, config, closeSaved, c.PublicInputs.FinalBalance, signingTime(c.PublicInputs))
+	closeData, _, err := withdrawalCalldata(closePlan, config, closeSaved, note(c.PublicInputs), c.PublicInputs.FinalBalance, signingTime(c.PublicInputs))
 	if err != nil {
 		t.Fatal(err)
 	}

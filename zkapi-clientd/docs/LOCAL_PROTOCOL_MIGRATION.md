@@ -9,9 +9,11 @@ development build, not a deployed production release. See
 
 ## Protocol and deployment gate
 
-The client now uses vault revision 3 and circuit `zkapi-v2-concession-v1`,
-including upstream concession exits, independent exit-RPC support, and
-payout-funded withdrawals where a deployed manifest enables them. The Rust
+The client now uses vault revision 4 and circuit `zkapi-v2-concession-v2`,
+including upstream concession exits with note-bound exit proofs (no Merkle
+path), deposits that operator batches activate later, independent exit-RPC
+support, and payout-funded withdrawals where a deployed manifest enables
+them. The Rust
 companion is `crates/zkapi-companion`, not the removed legacy companion patch.
 
 **Both shipping networks remain `not_deployed`.** There is no configured vault,
