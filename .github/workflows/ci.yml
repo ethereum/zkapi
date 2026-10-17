@@ -184,6 +184,17 @@ jobs:
           forge fmt "$RUNNER_TEMP/Groth16ProofAdapter.sol"
           diff -u "$RUNNER_TEMP/Groth16ProofAdapter.sol" src/adapters/Groth16ProofAdapter.sol
 
+      # The Poseidon library the vault links is generated with the setup too
+      # (compressSubtree and compressPairPath, the on-chain activation's and
+      # retirement's hashing, follow the generator), and its runtime codehash
+      # is pinned in deployment manifests: it is the setup's copy, formatted.
+      - name: Bn254Poseidon is the formatted generator output
+        working-directory: protocol/contracts
+        run: |
+          cp "$ZKAPI_SETUP_DIR/Bn254Poseidon.sol" "$RUNNER_TEMP/Bn254Poseidon.sol"
+          forge fmt "$RUNNER_TEMP/Bn254Poseidon.sol"
+          diff -u "$RUNNER_TEMP/Bn254Poseidon.sol" src/libraries/Bn254Poseidon.sol
+
       # FORGE_SNAPSHOT_CHECK compares the gas snapshot of the exit entry points
       # (snapshots/) with the committed one; regenerate it with forge test.
       - name: Forge test
@@ -203,8 +214,10 @@ jobs:
 
       # No RPC: dry runs with the public Anvil development key. The script
       # checks the signing keys and the setup policy, links Bn254Poseidon
-      # itself and checks the adapter against the setup manifest and the
-      # vault's getters against its inputs, and writes the provisional
+      # itself and checks the adapter (its circuit and all five verifying
+      # keys) against the setup manifest and the vault's getters against its
+      # inputs (a fresh revision-4 vault: NOTE_BOUND_EXIT_VERSION 1, the empty
+      # tree's root, no note recorded or activated), and writes the provisional
       # manifest OUTPUT_PATH.pending ("simulated", deployBlockLowerBound, no
       # deployBlock); the expected codehashes are then recomputed from both
       # projects' artifacts (the compiler settings match, so they agree). On
@@ -233,7 +246,7 @@ jobs:
               forge script script/Deploy.s.sol --chain-id "$2"
           }
           check() {
-            node -e 'const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const [chain, allowDev, ...want] = process.argv.slice(2); const keys = [m.stateSigningKeyX, m.stateSigningKeyY, m.clearanceSigningKeyX, m.clearanceSigningKeyY]; if (m.deploymentStatus !== "simulated" || "deployBlock" in m || !Number.isSafeInteger(m.deployBlockLowerBound) || m.chainId !== Number(chain) || m.allowDevSetup !== (allowDev === "1") || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || !/^0x[0-9a-fA-F]{40}$/.test(m.poseidonLibrary) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400 || m.maxPauseDuration !== 604800 || m.concessionEscapeVersion !== 1 || m.vaultRevision !== 3 || m.circuitId !== "zkapi-v2-concession-v1" || m.setupId !== "dev" || !/^0x[0-9a-f]{64}$/.test(m.vaultRuntimeCodehash) || !("withdrawalPaymaster" in m) || m.withdrawalPaymaster !== null || "withdrawalAccountFactory" in m || "paymasterGasPolicy" in m || keys.some(k => typeof k !== "string" || !/^[0-9]+$/.test(k)) || keys.join() !== want.map(k => BigInt(k).toString()).join()) { console.error(m); process.exit(1); }' "$PWD/../../.demo/$1.pending" "$2" "$3" "$4" "$5" "$6" "$7"
+            node -e 'const fs = require("fs"); const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); const setup = JSON.parse(fs.readFileSync(`${process.env.ZKAPI_SETUP_DIR}/manifest.json`, "utf8")); const [chain, allowDev, ...want] = process.argv.slice(2); const keys = [m.stateSigningKeyX, m.stateSigningKeyY, m.clearanceSigningKeyX, m.clearanceSigningKeyY]; if (m.deploymentStatus !== "simulated" || "deployBlock" in m || !Number.isSafeInteger(m.deployBlockLowerBound) || m.chainId !== Number(chain) || m.allowDevSetup !== (allowDev === "1") || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || !/^0x[0-9a-fA-F]{40}$/.test(m.poseidonLibrary) || m.treasuryChangeDelay !== 172800 || "rootHistoryWindow" in m || m.maxPauseDuration !== 604800 || m.concessionEscapeVersion !== 1 || m.noteBoundExitVersion !== 1 || m.vaultRevision !== 4 || m.circuitId !== "zkapi-v2-concession-v2" || m.setupId !== "dev" || ["request", "withdrawal", "insertion1", "insertion4", "insertion16"].some(k => m[`${k}VkKeccak256`] !== setup.vk_keccak256[k]) || !/^0x[0-9a-f]{64}$/.test(m.vaultRuntimeCodehash) || !("withdrawalPaymaster" in m) || m.withdrawalPaymaster !== null || "withdrawalAccountFactory" in m || "paymasterGasPolicy" in m || keys.some(k => typeof k !== "string" || !/^[0-9]+$/.test(k)) || keys.join() !== want.map(k => BigInt(k).toString()).join()) { console.error(m); process.exit(1); }' "$PWD/../../.demo/$1.pending" "$2" "$3" "$4" "$5" "$6" "$7"
             node ../../scripts/expected-codehashes.mjs --artifacts out --deployment "../../.demo/$1.pending" --check
             node ../../scripts/expected-codehashes.mjs --artifacts ../../protocol/contracts/out --deployment "../../.demo/$1.pending" --check
           }
@@ -421,11 +434,12 @@ jobs:
       - name: Every encoder's golden escape and close lands on an Anvil vault
         run: node scripts/check-withdrawal-golden.mjs
 
-  # The end-to-end acceptance of circuit zkapi-v2-concession-v1 and the
+  # The end-to-end acceptance of circuit zkapi-v2-concession-v2 and the
   # §10.7 Phase B drill scenarios that run on a local chain
   # (docs/v2-acceptance.md): contracts deployed by Deploy.s.sol and finalized
   # on chain, real proofs, the drill build of serverd (--adversary),
-  # indexerd, challengerd behind the signer sidecar, the browser SDK with its
+  # indexerd, challengerd behind the signer sidecar, the activation worker
+  # (proved insertion batches), the browser SDK with its
   # WebAssembly in Node and the clientd companion, on Anvil with mock
   # provider, OA org and price feed. Writes the run's gas.json.
   lifecycle-acceptance:

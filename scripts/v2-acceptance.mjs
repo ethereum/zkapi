@@ -1,18 +1,26 @@
 #!/usr/bin/env node
-// Entirely local end-to-end acceptance of circuit zkapi-v2-concession-v1
-// (vault revision 3), the §10.7 Phase B drill scenarios that run on a local
-// chain, and a gas measurement (docs/v2-acceptance.md).
+// Entirely local end-to-end acceptance of circuit zkapi-v2-concession-v2
+// (vault revision 4: note-bound exits, a request tree of activated notes),
+// the §10.7 Phase B drill scenarios that run on a local chain, and a gas
+// measurement (docs/v2-acceptance.md).
 //
 // Real: the contracts (deployed by demo/contracts/script/Deploy.s.sol and
 // finalized by scripts/expected-codehashes.mjs), the dev setup's Groth16
 // proofs, `zkapi serverd` (a drill build with --adversary modes),
-// zkapi-indexerd, zkapi-challenged, the challenge signer sidecar
-// (docker/aws/signer), the browser SDK (sdk/, its WebAssembly in Node), the
+// zkapi-indexerd, zkapi-challenged, the activation worker zkapi-activated,
+// the challenge signer sidecar (docker/aws/signer), the browser SDK (sdk/, its WebAssembly in Node), the
 // clientd companion (zkapi-walletd) and the in-memory wallet driver
 // (examples/v2_acceptance_wallet.rs, the browser wallet core natively).
 // Mocks: the OpenRouter-style provider and the ETH/USD price feed, both on
 // loopback. Anvil runs with Sepolia's chain ID, because the signer signs only
 // for 1 and 11155111; nothing leaves loopback.
+//
+// Activation: a deposit only records its note, which can exit at once but
+// makes anonymous requests only once activated (appended to the request
+// tree). The operator's activation worker (zkapi-activated) runs in the
+// stack and proves every batch (activateNotes with an insertion proof); one
+// drill stops it and activates with the permissionless no-prover
+// activateNotesOnChain and the siblings the indexer serves.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -30,6 +38,7 @@ import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, SENDER_CREATOR, SENDE
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SETUP_DIR = path.join(ROOT, 'protocol/setup/v2-concession-dev');
+const CIRCUIT_ID = 'zkapi-v2-concession-v2';
 // Anvil with Sepolia's chain ID: the signer sidecar refuses any other chain
 // but mainnet's. Deploy.s.sol treats it as off a local chain, so the drill
 // vault's dev setup needs ALLOW_DEV_SETUP=1 there, as on Sepolia.
@@ -79,9 +88,12 @@ const CHALLENGE_PRIORITY_FEE_PER_GAS = 2n * GWEI;
 // Anvil's mnemonic: public test keys, funded only on a disposable chain.
 const MNEMONIC = 'test test test test test test test test test test test junk';
 // Every role has its own account: the deployer/owner, the challenger, the
-// treasury, the clients, destinations, a third party and, for gasless
-// withdrawals, the mini bundler's sender, the gasless SDK owner and a griefer.
-const ANVIL_ACCOUNTS = 13;
+// treasury, the clients, destinations, a third party, for gasless
+// withdrawals the mini bundler's sender, the gasless SDK owner and a griefer,
+// and the activation worker's sender.
+const ANVIL_ACCOUNTS = 14;
+// The activation worker's bounded wait for a fuller batch, scaled down.
+const ACTIVATION_WAIT_SECONDS = 2;
 // The paymaster's and the factory's EntryPoint stakes and the paymaster's
 // initial float (Deploy.s.sol requires them explicitly off local chain IDs).
 const PAYMASTER_STAKE_WEI = 100_000_000_000_000_000n;
@@ -328,8 +340,9 @@ export function gaslessProfile(finalized, bundlerUrl = null) {
 export function trustedDeployment(finalized, services) {
     assert.equal(finalized.deploymentStatus, 'deployed', 'profiles come only from a finalized manifest');
     assert.ok(Number.isSafeInteger(finalized.deployBlock) && finalized.deployBlock > 0, 'finalized manifests carry deployBlock');
-    assert.equal(finalized.vaultRevision, 3);
+    assert.equal(finalized.vaultRevision, 4, 'profiles are for a revision-4 vault');
     assert.equal(finalized.concessionEscapeVersion, 1);
+    assert.equal(finalized.noteBoundExitVersion, 1, 'the vault has no note-bound exits (NOTE_BOUND_EXIT_VERSION)');
     const key = (x, y) => ({ x: felt(x), y: felt(y) });
     return {
         deployment_status: 'deployed',
@@ -357,6 +370,10 @@ export function trustedDeployment(finalized, services) {
         request_verifying_key_sha256: services.keyHashes.requestVk,
         request_vk_keccak256: finalized.requestVkKeccak256,
         withdrawal_vk_keccak256: finalized.withdrawalVkKeccak256,
+        // The insertion keys the operator's activation worker proves with (clients never do).
+        insertion1_vk_keccak256: finalized.insertion1VkKeccak256,
+        insertion4_vk_keccak256: finalized.insertion4VkKeccak256,
+        insertion16_vk_keccak256: finalized.insertion16VkKeccak256,
         vault_runtime_codehash: finalized.vaultRuntimeCodehash,
         proof_adapter_address: finalized.proofAdapter.toLowerCase(),
         adapter_runtime_codehash: finalized.adapterRuntimeCodehash,
@@ -366,7 +383,7 @@ export function trustedDeployment(finalized, services) {
         note_ttl: finalized.noteTtl,
         max_pause_duration: finalized.maxPauseDuration,
         settlement_window_seconds: services.settlementWindowSeconds,
-        vault_revision: 3,
+        vault_revision: 4,
         exit_concession: 1,
         clearance_ownership_proof: 'required',
         allow_dev_setup: finalized.allowDevSetup,
@@ -571,10 +588,10 @@ async function main() {
     if (opts.help) {
         console.log('Usage: node scripts/v2-acceptance.mjs [--bin-dir target/acceptance/release] [--output-dir .zkapi/acceptance] [--stop-after STEP]\n'
             + 'Runs only disposable loopback services, with mock provider, OA org and price feed. See docs/v2-acceptance.md.\n'
-            + '--stop-after ends a development run early, after one of: deploy, stack, honest, stale, clients, mismatch, sdk-honest,\n'
-            + 'sdk-close, raise, companion, companion-close, gasless-close, gasless-bundler, gasless-griefing, gasless-replay,\n'
-            + 'gasless-fallback, gasless-escape, gasless-sdk-escape, pause, gasless-pause, pause-max, gasless-reopen, anchors,\n'
-            + 'lie-expired, withhold, rebuild, hang, missed, late-successor.');
+            + '--stop-after ends a development run early, after one of: deploy, stack, honest, activation-fallback, stale, clients,\n'
+            + 'mismatch, sdk-honest, sdk-close, raise, companion, companion-close, gasless-close, gasless-bundler, gasless-griefing,\n'
+            + 'gasless-replay, gasless-fallback, gasless-escape, gasless-sdk-escape, pause, gasless-pause, pause-max, gasless-reopen,\n'
+            + 'anchors, lie-expired, withhold, indexer-down, hang, missed, late-successor.');
         return;
     }
     const { AbiCoder, Interface, Wallet, getBytes } = await import(
@@ -754,7 +771,7 @@ async function main() {
         const [owner, challengerAccount, treasury] = accounts;
         // Each client and destination has its own account.
         const account = Object.fromEntries(['driver', 'companion', 'sdk', 'destination', 'thirdParty', 'sdkDestination', 'companionDestination',
-            'bundler', 'gaslessSdk', 'griefer'].map((name, index) => [name, accounts[3 + index]]));
+            'bundler', 'gaslessSdk', 'griefer', 'activator'].map((name, index) => [name, accounts[3 + index]]));
         assert.ok(Object.values(account).every(Boolean), 'Anvil serves an account for every role');
         // Mines a block every second, so block time follows the wall clock
         // (CHAIN_LAG_SECONDS behind it) and confirmations and the finalized
@@ -836,6 +853,7 @@ async function main() {
         assert.equal(finalizing.code, 0, `finalize failed:\n${finalizing.output}`);
         const finalized = await readJSON(finalizedPath);
         assert.equal(finalized.deploymentStatus, 'deployed');
+        assert.equal(finalized.circuitId, CIRCUIT_ID);
         await fs.copyFile(path.join(deployDir, 'deployment.json.pending'), path.join(runDir, 'deployment.json.pending'));
         await fs.copyFile(finalizedPath, path.join(runDir, 'deployment.json'));
         await fs.rm(deployDir, { recursive: true, force: true });
@@ -875,7 +893,11 @@ async function main() {
             return { commitment, amount, expiry: Number(expiry), status: Number(status) };
         }
         const NOTE = Object.freeze({ Active: 1, PendingWithdrawal: 2, Closed: 3 });
+        // The packed metadata of a stored note: input 16 of a withdrawal statement.
+        const noteMetadata = note => note.amount | (BigInt(note.expiry) << 128n);
         assert.equal(await vaultRead('CONCESSION_ESCAPE_VERSION'), 1n);
+        assert.equal(await vaultRead('NOTE_BOUND_EXIT_VERSION'), 1n);
+        assert.equal(await vaultRead('activationCursor'), 0n);
         assert.equal(await vaultRead('challengePeriod'), BigInt(TIMING.challengePeriod));
         assert.equal(await vaultRead('maxPauseDuration'), BigInt(TIMING.maxPauseDuration));
         assert.equal((await vaultRead('owner')).toLowerCase(), owner.toLowerCase());
@@ -988,19 +1010,80 @@ async function main() {
         await save('trusted-deployment.json', { trusted_deployment: trusted });
 
         // ---------------------------------------------------------------- daemons
-        log('Daemon order: indexer, zkapi db init, signer, challenger, serverd.');
+        log('Daemon order: indexer, zkapi db init, signer, challenger, activation worker, serverd.');
         const indexerArgs = ['--listen', `127.0.0.1:${indexerPort}`, '--rpc-url', rpcUrl, '--contract-address', vaultAddress,
             '--from-block', String(deployBlock), '--poll-interval-ms', '100', '--chain-id', String(CHAIN_ID),
             '--confirmations', String(INDEXER_CONFIRMATIONS), '--max-head-age-secs', '0', '--cursor-path', path.join(runDir, 'indexer.json')];
         let indexer = launch(path.join(opts.binDir, 'zkapi-indexerd'), indexerArgs, 'indexer.log');
+        // The indexer's snapshot once its root is the vault's (read again on
+        // every poll: the activation worker may move the root meanwhile).
         async function synchronizedTree() {
-            const chainRoot = await vaultRead('currentRoot');
             return waitFor('indexer root matches the chain', async () => {
                 const snapshot = await get(`${indexerUrl}/v1/tree/snapshot`);
-                return BigInt(snapshot.root) === chainRoot && snapshot;
+                return BigInt(snapshot.root) === await vaultRead('currentRoot') && snapshot;
             });
         }
         await synchronizedTree();
+        // Every NotesActivated not recorded yet, with its transaction's gas
+        // (`activate_<K>` for a proved batch, `activate_on_chain_<K>`).
+        const recordedActivations = new Set();
+        async function recordActivations() {
+            const logs = await rpc('eth_getLogs', [{ address: vaultAddress, fromBlock: hex(deployBlock), toBlock: 'latest',
+                topics: [vault.getEvent('NotesActivated').topicHash] }]);
+            const batches = [];
+            for (const entry of logs) {
+                if (recordedActivations.has(entry.transactionHash)) continue;
+                recordedActivations.add(entry.transactionHash);
+                const event = vault.parseLog(entry);
+                const batch = { first_note_id: Number(event.args.firstNoteId), count: Number(event.args.count), proved: event.args.proved,
+                    new_root: felt(event.args.newRoot), transaction: entry.transactionHash };
+                gas.record(`${batch.proved ? 'activate' : 'activate_on_chain'}_${batch.count}`,
+                    await rpc('eth_getTransactionReceipt', [entry.transactionHash]), { first_note_id: batch.first_note_id });
+                batches.push(batch);
+            }
+            (evidence.activations ??= []).push(...batches);
+            return batches;
+        }
+        // Waits until the activation worker has activated `noteId` and every
+        // other recorded note, so that no activation moves the root under a
+        // request made next, and the indexer serves the new root. Returns the
+        // batches that landed meanwhile.
+        async function activateThrough(noteId) {
+            await waitFor(`the activation worker activates note ${noteId} and every recorded note`, async () => {
+                const [cursor, next] = await Promise.all([vaultRead('activationCursor'), vaultRead('nextNoteId')]);
+                return cursor > BigInt(noteId) && cursor === next;
+            }, 180_000, 300);
+            await synchronizedTree();
+            return recordActivations();
+        }
+        // The no-prover fallback anyone can use: activates the recorded notes up
+        // to `noteId` with activateNotesOnChain from a third party, in the batch
+        // sizes the worker picks (the largest of 16, 4 and 1 that the cursor is
+        // aligned to and the recorded notes fill), with the siblings of the
+        // cursor's slot the indexer serves at the vault's current root.
+        async function activateOnChain(noteId) {
+            for (let cursor = Number(await vaultRead('activationCursor')); cursor <= noteId; cursor = Number(await vaultRead('activationCursor'))) {
+                const pending = Number(await vaultRead('nextNoteId')) - cursor;
+                const count = [16, 4, 1].find(size => cursor % size === 0 && pending >= size);
+                assert.ok(count, `note ${noteId} is not recorded (cursor ${cursor}, ${pending} pending)`);
+                const root = await vaultRead('currentRoot');
+                const slot = await waitFor(`the indexer's path of slot ${cursor} at the current root`, async () => {
+                    const served = await get(`${indexerUrl}/v1/tree/notes/${cursor}/path`);
+                    return BigInt(served.root) === root && served.activation_cursor === cursor && served.activated === false && served;
+                });
+                assert.equal(slot.siblings.length, 32);
+                const receipt = await vaultSend(account.thirdParty, 'activateNotesOnChain', [cursor, count, slot.siblings]);
+                assert.equal(receipt.status, '0x1', `activateNotesOnChain(${cursor}, ${count}) reverted`);
+                const activated = eventOf(receipt, 'NotesActivated');
+                assert.equal(Number(activated.args.firstNoteId), cursor);
+                assert.equal(Number(activated.args.count), count);
+                assert.equal(activated.args.proved, false);
+                assert.equal(BigInt(activated.args.newRoot), await vaultRead('currentRoot'));
+            }
+            assert.equal(await vaultRead('isActivated', [noteId]), true);
+            await synchronizedTree();
+            return recordActivations();
+        }
         const dbPath = path.join(runDir, 'server.db');
         const zkapi = path.join(opts.binDir, 'zkapi');
         const dbInit = await runToExit(zkapi, ['--proof-setup-dir', SETUP_DIR, 'db', 'init', '--deployment', manifestPath, '--db', dbPath], 'db-init.log');
@@ -1075,6 +1158,55 @@ async function main() {
         assert.equal(challengerReady.schema, 'zkapi-challenged-status/v2');
         const challengerStatus = () => get(`${challengerStatusUrl}/status`);
 
+        // The activation worker, from an Anvil account of its own (Anvil signs
+        // for it; the signer sidecar signs only the challenger's calls). Every
+        // call it sends passes this recorder, which requires a proved
+        // activateNotes to the vault within the fee caps.
+        const activationSends = [];
+        const activatorRpcUrl = await serve(async (req, res) => {
+            const call = await body(req);
+            let send;
+            if (call.method === 'eth_sendTransaction') {
+                try {
+                    const tx = call.params[0];
+                    const parsed = vault.parseTransaction({ data: tx.data });
+                    send = { call: parsed?.name, first_note_id: Number(parsed?.args?.firstNoteId ?? -1), count: Number(parsed?.args?.count ?? 0),
+                        max_fee_per_gas: tx.maxFeePerGas, at: Date.now() };
+                    assert.equal(tx.from.toLowerCase(), account.activator.toLowerCase());
+                    assert.equal(tx.to.toLowerCase(), vaultAddress);
+                    assert.equal(send.call, 'activateNotes', `the activation worker sent ${send.call}`);
+                    assert.ok(BigInt(tx.maxFeePerGas) <= CHALLENGE_MAX_FEE_PER_GAS, 'the worker bids within its fee cap');
+                    activationSends.push(send);
+                } catch (error) {
+                    fatal ??= error;
+                    throw error;
+                }
+            }
+            const reply = await proxyJsonRpc(rpcUrl, call);
+            if (send) Object.assign(send, reply.error ? { error: reply.error } : { hash: reply.result });
+            respond(res, 200, reply);
+        });
+        const activatorStatusPort = await freePort();
+        const activatorStatusUrl = `http://127.0.0.1:${activatorStatusPort}`;
+        const activatorArgs = ['--rpc-url', activatorRpcUrl, '--indexer-url', indexerUrl, '--sender', account.activator,
+            '--deployment', manifestPath, '--confirmations', String(INDEXER_CONFIRMATIONS), '--checkpoint', path.join(runDir, 'activator.json'),
+            '--proof-setup-dir', SETUP_DIR, '--poll-interval-ms', '200', '--max-activation-wait-seconds', String(ACTIVATION_WAIT_SECONDS),
+            '--max-fee-per-gas-wei', String(CHALLENGE_MAX_FEE_PER_GAS), '--max-priority-fee-per-gas-wei', String(CHALLENGE_MAX_PRIORITY_FEE_PER_GAS),
+            '--priority-fee-per-gas-wei', String(CHALLENGE_PRIORITY_FEE_PER_GAS), '--status-listen', `127.0.0.1:${activatorStatusPort}`];
+        let activator = null;
+        let activatorStarts = 0;
+        async function startActivator() {
+            activator = launch(path.join(opts.binDir, 'zkapi-activated'), activatorArgs, `activator-${++activatorStarts}.log`);
+            return waitFor('activation worker status', async () => {
+                const status = await get(`${activatorStatusUrl}/status`);
+                return status.chain?.latest_block != null && status;
+            }, 60_000);
+        }
+        const activatorReady = await startActivator();
+        assert.equal(activatorReady.schema, 'zkapi-activated-status/v1');
+        // Drills that show a note before its activation stop the worker first.
+        const stopActivator = () => stop(activator);
+
         const serverPort = await freePort();
         const serverUrl = `http://127.0.0.1:${serverPort}`;
         // The OA org and verifier the companion phase uses (the companion
@@ -1128,7 +1260,7 @@ async function main() {
                 return BigInt(health.current_root) === await vaultRead('currentRoot') && health;
             }, 90_000);
             const health = await get(`${serverUrl}/health`);
-            assert.equal(health.circuit_id, 'zkapi-v2-concession-v1');
+            assert.equal(health.circuit_id, CIRCUIT_ID);
             assert.equal(health.exit_concession, 1);
             return health;
         }
@@ -1137,7 +1269,8 @@ async function main() {
         assert.equal(BigInt(attestation.state_signing_key.x), BigInt(signingKeys.state_signing_key.x));
         assert.equal(BigInt(attestation.clearance_signing_key.y), BigInt(signingKeys.clearance_signing_key.y));
         evidence.stack = { signer_health: signerHealth, server_health: serverHealth, refused_server_starts: refusedStarts,
-            db_init: 'bound', timing: { ...TIMING, ...timing },
+            db_init: 'bound', timing: { ...TIMING, ...timing, activation_wait_seconds: ACTIVATION_WAIT_SECONDS },
+            activator_status: { schema: activatorReady.schema, state: activatorReady.state },
             // serverd, the indexer and the challenger read a profile that
             // carries the gasless object and ignore it.
             profile_gasless: { bundler_url: trusted.gasless.bundler_url, paymaster: trusted.gasless.withdrawal_paymaster_address,
@@ -1178,35 +1311,39 @@ async function main() {
                     child.stdin.write(JSON.stringify({ id, command, ...data }) + '\n');
                 });
             };
-            assert.equal((await call('circuit')).circuit_id, 'zkapi-v2-concession-v1');
+            assert.equal((await call('circuit')).circuit_id, CIRCUIT_ID);
             await call('init', { config });
             return call;
         }
-        const WITHDRAWAL_TUPLE = 'tuple(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)';
+        const WITHDRAWAL_TUPLE = 'tuple(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256)';
         const wallNow = () => Math.floor(Date.now() / 1000);
         async function treePath(client, noteId) {
             const snapshot = await synchronizedTree();
             return client('tree_path', { args: { snapshot, note_id: noteId, require_existing: true } });
         }
-        async function driverDeposit(client, amount = DEPOSIT, from = account.driver) {
-            const snapshot = await synchronizedTree();
+        // A deposit records the note and leaves the request tree as it was;
+        // `activate` (the default) then activates it for requests. A note
+        // that only exits needs no activation.
+        async function driverDeposit(client, { amount = DEPOSIT, from = account.driver, activate = true } = {}) {
             const params = await client('deposit_params');
-            const merkle = await client('tree_path', { args: { snapshot, note_id: snapshot.next_note_id, require_existing: false } });
-            const receipt = await vaultSend(from, 'deposit', [felt(params.registration_commitment), amount, merkle.siblings],
+            const receipt = await vaultSend(from, 'deposit', [felt(params.registration_commitment), amount],
                 { value: BigInt(amount) * GWEI, operation: 'deposit' });
             assert.equal(receipt.status, '0x1');
+            assert.deepEqual(vaultEvents(receipt).map(event => event.name), ['NoteDeposited'], 'a deposit only records the note');
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
             const note = await noteView(noteId);
             assert.equal(note.amount, BigInt(amount));
             assert.equal(note.status, NOTE.Active);
-            const status = await client('confirm_deposit', { args: { note_id: noteId, amount, expiry_ts: note.expiry } });
+            assert.equal(BigInt(note.commitment), BigInt(params.registration_commitment));
+            assert.equal(deposited.args.amount, BigInt(amount));
+            assert.equal(Number(deposited.args.expiryTs), note.expiry);
+            // The vault's record, which the wallet checks against its deposit.
+            const recorded = { commitment: felt(note.commitment), amount: String(amount), expiry_ts: note.expiry };
+            const status = await client('confirm_deposit', { args: { note_id: noteId, amount, expiry_ts: note.expiry, recorded } });
             assert.equal(status.state.note.is_genesis, true);
-            // Amendment A1: the deposit's own root and siblings prove the note
-            // for good; exits need no indexer.
-            const depositPath = { active_root: felt(deposited.args.newRoot), siblings: merkle.siblings };
-            assert.equal((await client('note_path_matches', { args: { active_root: depositPath.active_root, siblings: depositPath.siblings } })).matches, true);
-            return { noteId, receipt, depositPath, expiry: note.expiry };
+            const activations = activate ? await activateThrough(noteId) : [];
+            return { noteId, receipt, expiry: note.expiry, activations };
         }
         const quotePayload = async () => JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1,
             billing_quote: await get(`${gateUrl}/v2/billing/quote`) });
@@ -1250,12 +1387,26 @@ async function main() {
             assert.equal(status.pending_request, false);
             return { ...sent, response, status };
         }
-        async function driverEscape(client, noteId, { snapshot, conceded = 0, destination = account.destination, validUntil, path: merkle,
+        // A withdrawal statement names the note as the vault stores it: its
+        // registration commitment and its amount and expiry (no root, no path).
+        async function assertNoteBound(plan, noteId) {
+            const note = await noteView(noteId);
+            const inputs = plan.public_inputs;
+            assert.equal(Number(inputs.note_id), noteId);
+            assert.equal(BigInt(inputs.registration_commitment), BigInt(note.commitment), 'the statement names the stored commitment');
+            assert.equal(BigInt(inputs.deposit_amount), note.amount, 'the statement names the stored amount');
+            assert.equal(Number(inputs.expiry), note.expiry, 'the statement names the stored expiry');
+            const words = coder.decode([WITHDRAWAL_TUPLE], plan.inputs_abi)[0];
+            assert.equal(words[16], noteMetadata(note), 'input 16 packs the stored amount and expiry');
+        }
+        async function driverEscape(client, noteId, { snapshot, conceded = 0, destination = account.destination, validUntil,
             from = account.driver, send = true, operation = 'escape' } = {}) {
             const plan = await client('prepare_withdrawal', { ...(snapshot ? { snapshot } : {}), args: { mode: 'escape', destination,
-                conceded, valid_until: validUntil ?? (await chainNow()) + 10_800, active_root: merkle.active_root, merkle_siblings: merkle.siblings } });
+                conceded, valid_until: validUntil ?? (await chainNow()) + 10_800 } });
             assert.equal(plan.public_inputs.kind, 0);
-            assert.ok(plan.calldata.startsWith('0xa38d62aa') && plan.calldata.length === 2 + 836 * 2, 'escape calldata layout');
+            assert.ok(plan.calldata.startsWith(vault.getFunction('initiateEscapeWithdrawal').selector) && plan.calldata.length === 2 + 868 * 2,
+                'escape calldata layout');
+            await assertNoteBound(plan, noteId);
             if (!send) return { plan };
             const receipt = await sendTx({ from, to: vaultAddress, data: plan.calldata });
             assert.equal(receipt.status, '0x1', 'the escape reverted');
@@ -1266,19 +1417,24 @@ async function main() {
             assert.equal(recorded.args.conceded, BigInt(conceded));
             return { plan, receipt, initiated, recorded, deadline: Number(initiated.args.challengeDeadline) };
         }
-        async function clearance(client, merkle) {
-            const ownership = await client('prepare_withdrawal', { args: { mode: 'ownership', valid_until: wallNow() + 3_000,
-                active_root: merkle.active_root, merkle_siblings: merkle.siblings } });
+        async function clearance(client) {
+            const ownership = await client('prepare_withdrawal', { args: { mode: 'ownership', valid_until: wallNow() + 3_000 } });
             assert.equal(ownership.public_inputs.kind, 2);
             const granted = await request(`${gateUrl}/v2/withdraw/clearance`, { method: 'POST', value: ownership.clearance_request });
             return { ownership, granted };
         }
-        async function driverMutualClose(client, noteId, merkle, destination = account.destination) {
-            const { ownership, granted } = await clearance(client, merkle);
-            assert.equal(granted.status, 200, `clearance refused: ${JSON.stringify(granted.value)}`);
+        async function prepareMutualClose(client, noteId, granted, destination = account.destination) {
             const close = await client('prepare_withdrawal', { args: { mode: 'mutual', destination, valid_until: (await chainNow()) + 10_800,
-                active_root: merkle.active_root, merkle_siblings: merkle.siblings, clearance: granted.value } });
-            assert.ok(close.calldata.startsWith('0x72cd2e44') && close.calldata.length === 2 + 836 * 2, 'close calldata layout');
+                clearance: granted.value } });
+            assert.ok(close.calldata.startsWith(vault.getFunction('mutualClose').selector) && close.calldata.length === 2 + 868 * 2,
+                'close calldata layout');
+            await assertNoteBound(close, noteId);
+            return close;
+        }
+        async function driverMutualClose(client, noteId, destination = account.destination) {
+            const { ownership, granted } = await clearance(client);
+            assert.equal(granted.status, 200, `clearance refused: ${JSON.stringify(granted.value)}`);
+            const close = await prepareMutualClose(client, noteId, granted, destination);
             const receipt = await sendTx({ from: account.driver, to: vaultAddress, data: close.calldata });
             assert.equal(receipt.status, '0x1', 'the mutual close reverted');
             gas.record('mutual_close', receipt, { note_id: noteId });
@@ -1320,8 +1476,9 @@ async function main() {
             assert.equal(state.bound_at_state, 0, 'an installed successor resets the bound');
             assert.equal((await get(`${gateUrl}/v2/requests/${first.id}`)).nullifier_status, 'finalized');
             // An ownership proof (kind 2) never lands on chain.
-            const { ownership, granted } = await clearance(client, note.depositPath);
+            const { ownership, granted } = await clearance(client);
             assert.equal(granted.status, 200, `clearance refused: ${JSON.stringify(granted.value)}`);
+            await assertNoteBound(ownership, note.noteId);
             const tuple = coder.decode([WITHDRAWAL_TUPLE], ownership.inputs_abi)[0];
             const asEscape = vault.encodeFunctionData('initiateEscapeWithdrawal', [tuple, ownership.proof_hex]);
             const asClose = vault.encodeFunctionData('mutualClose', [tuple, ownership.proof_hex]);
@@ -1332,10 +1489,17 @@ async function main() {
             gas.record('ownership_proof_on_chain_reverts', rejected);
             const nullifier = ownership.public_inputs.withdrawal_nullifier;
             assert.equal((await get(`${gateUrl}/v2/nullifiers/${nullifier}`)).nullifier_status, 'clearance_reserved');
-            // The close proves at the deposit's root (Amendment A1).
-            const close = await client('prepare_withdrawal', { args: { mode: 'mutual', destination: account.destination,
-                valid_until: (await chainNow()) + 10_800, active_root: note.depositPath.active_root, merkle_siblings: note.depositPath.siblings,
-                clearance: granted.value } });
+            const close = await prepareMutualClose(client, note.noteId, granted);
+            // The vault compares the statement's note (input 3, the
+            // registration commitment, and input 16, amount and expiry) with
+            // notes[noteId] before it verifies the proof.
+            const words = [...coder.decode([WITHDRAWAL_TUPLE], close.inputs_abi)[0]];
+            const bindingRefusals = {};
+            for (const index of [3, 16]) {
+                const tampered = words.map((value, k) => (k === index ? BigInt(value) + 1n : value));
+                bindingRefusals[index] = await revertName(vault.encodeFunctionData('mutualClose', [tampered, close.proof_hex]));
+                assert.equal(bindingRefusals[index], 'NoteBindingMismatch', `input ${index} tampered`);
+            }
             const receipt = await sendTx({ from: account.driver, to: vaultAddress, data: close.calldata });
             assert.equal(receipt.status, '0x1');
             gas.record('mutual_close', receipt, { note_id: note.noteId });
@@ -1352,9 +1516,33 @@ async function main() {
             assert.equal(final.state.note.current_balance, payout, 'the wallet\'s balance is what the close paid');
             return { note_id: note.noteId, charges: [first.response.charge_applied, second.response.charge_applied],
                 payout_gwei: payout, treasury_gwei: 2 * INFERENCE_CHARGE, close_transaction: receipt.transactionHash,
-                ownership_proof_on_chain: 'WrongWithdrawalKind (escape and close)', client_final_balance: final.state.note.current_balance };
+                ownership_proof_on_chain: 'WrongWithdrawalKind (escape and close)', tampered_note_binding: bindingRefusals,
+                activations: note.activations, client_final_balance: final.state.note.current_balance };
         });
         stopAfter('honest');
+
+        await scenario('activation without the worker: a third party activates a note with activateNotesOnChain and the indexer\'s siblings; the restarted worker resumes from the chain', async () => {
+            await stopActivator();
+            const client = await wallet('on-chain-activation');
+            const note = await driverDeposit(client, { activate: false });
+            assert.equal(await vaultRead('isActivated', [note.noteId]), false);
+            const batches = await activateOnChain(note.noteId);
+            assert.ok(batches.some(batch => !batch.proved && batch.first_note_id <= note.noteId && note.noteId < batch.first_note_id + batch.count),
+                `an unproved batch activated the note: ${json(batches)}`);
+            const served = await honestRequest(client, note.noteId, 'on-chain-activation');
+            const close = await driverMutualClose(client, note.noteId);
+            assert.equal(eventOf(close.receipt, 'MutualClose').args.finalBalance, BigInt(DEPOSIT - INFERENCE_CHARGE));
+            const sendsBefore = activationSends.length;
+            const resumed = await startActivator();
+            const idle = await waitFor('the restarted worker finds nothing to activate', async () => {
+                const status = await get(`${activatorStatusUrl}/status`);
+                return status.queue?.pending_notes === 0 && status.queue?.activation_cursor === note.noteId + 1 && status;
+            }, 60_000, 500);
+            assert.equal(activationSends.length, sendsBefore, 'the worker sent nothing for notes activated without it');
+            return { note_id: note.noteId, on_chain_batches: batches, request: served.id, close: close.receipt.transactionHash,
+                worker_after_restart: { state: idle.state, activation_cursor: idle.queue.activation_cursor, started: resumed.started_at } };
+        });
+        stopAfter('activation-fallback');
 
         await scenario('stale exit after spending: defeat, SupersededState, re-escape from an older state and defeat', async () => {
             const client = await wallet('stale');
@@ -1376,8 +1564,7 @@ async function main() {
             assert.equal((await client('verify_request', { args: { public_inputs: served.public_inputs, proof: served.proof.proof } })).valid, true,
                 'the evidence at the successor verifies');
             // 1. Escape from S2 after spending S3: defeated by the request at N3.
-            const merkle = await treePath(client, note.noteId);
-            const fromS2 = await driverEscape(client, note.noteId, { snapshot: 'S2', path: merkle });
+            const fromS2 = await driverEscape(client, note.noteId, { snapshot: 'S2' });
             const defeat = await waitEvent('EscapeWithdrawalChallenged', note.noteId, fromS2.receipt.blockNumber);
             gas.record('defeat', defeat.receipt, { note_id: note.noteId });
             assert.equal(BigInt(defeat.event.args.nullifier), BigInt(snapshots[2].withdrawal_nullifier));
@@ -1403,25 +1590,25 @@ async function main() {
             const indexerPublished = await get(`${indexerUrl}/v1/nullifiers/${snapshots[2].successor_nullifier}/published`);
             assert.equal(indexerPublished.published, true);
             // 2. From S1: its successor N2 is challenged, so SupersededState.
-            const fromS1 = await driverEscape(client, note.noteId, { snapshot: 'S1', path: merkle, send: false });
+            const fromS1 = await driverEscape(client, note.noteId, { snapshot: 'S1', send: false });
             assert.equal(await revertName(fromS1.plan.calldata), 'SupersededState');
             const superseded = await sendTx({ from: account.driver, to: vaultAddress, data: fromS1.plan.calldata, gasLimit: 1_000_000 });
             assert.equal(superseded.status, '0x0');
             gas.record('escape_superseded_state_reverts', superseded);
             // 3. From S0 (two states older): recorded, then defeated by the request at N1.
-            const fromS0 = await driverEscape(client, note.noteId, { snapshot: 'S0', path: note.depositPath });
+            const fromS0 = await driverEscape(client, note.noteId, { snapshot: 'S0' });
             const second = await waitEvent('EscapeWithdrawalChallenged', note.noteId, fromS0.receipt.blockNumber);
             gas.record('defeat', second.receipt, { note_id: note.noteId });
             assert.equal(BigInt(second.event.args.nullifier), BigInt(snapshots[0].withdrawal_nullifier));
             assert.equal(await vaultRead('challengedNullifiers', [snapshots[0].withdrawal_nullifier]), true);
             // 4. S2 again: ChallengedNullifier.
-            const again = await driverEscape(client, note.noteId, { snapshot: 'S2', path: merkle, send: false });
+            const again = await driverEscape(client, note.noteId, { snapshot: 'S2', send: false });
             assert.equal(await revertName(again.plan.calldata), 'ChallengedNullifier');
             // Defeats move no funds; the newest state then closes mutually.
             const mid = await balances(vaultAddress, treasury, account.destination);
             assert.equal(mid[vaultAddress], before[vaultAddress]);
             assert.equal(mid[account.destination], before[account.destination]);
-            const close = await driverMutualClose(client, note.noteId, await treePath(client, note.noteId));
+            const close = await driverMutualClose(client, note.noteId);
             const payout = DEPOSIT - 4 * INFERENCE_CHARGE;
             assert.equal(eventOf(close.receipt, 'MutualClose').args.finalBalance, BigInt(payout));
             const after = await balances(vaultAddress, treasury, account.destination);
@@ -1569,7 +1756,7 @@ async function main() {
         const companionManifest = { deployment_id: trusted.deployment_id, protocol_version: 2, chain_id: CHAIN_ID,
             rpc_url: trusted.rpc_url, contract_address: vaultAddress, billing_token_address: null, billing_asset: 'native_eth',
             billing_unit: 'gwei', native_asset_wei_per_unit: trusted.native_asset_wei_per_unit, native_price_feed_address: feed,
-            native_price_feed_decimals: 8, native_price_max_age_seconds: 4_500, vault_revision: 3, deployment_status: 'deployed',
+            native_price_feed_decimals: 8, native_price_max_age_seconds: 4_500, vault_revision: 4, deployment_status: 'deployed',
             exit_concession: 1, settlement_window_seconds: W, deploy_block: deployBlock, protocol_server_url: gateUrl,
             indexer_url: indexerUrl, request_charge_cap: CAP, proof_backend: 'groth16_bn254',
             proof_setup: { circuit_id: trusted.circuit_id, setup_id: trusted.setup_id },
@@ -1660,9 +1847,10 @@ async function main() {
         });
         stopAfter('mismatch');
 
-        await scenario('SDK: deposit with deployment checks, request, settle; indexer down, escape with the deposit-time path', async () => {
+        await scenario('SDK: deposit with deployment checks; a request waits for activation (note_not_activated), then request and settle; indexer down, escape with no path', async () => {
             const sdk = await sdkAgent('honest', { walletAccount: account.sdk });
             await sdk('init');
+            await stopActivator();
             const deposited = await sdk('deposit', { amount: '0.001' });
             const note = deposited.note;
             assert.ok(note, `no note after the deposit: ${json(deposited)}`);
@@ -1672,18 +1860,23 @@ async function main() {
             const depositTx = deposited.sent.find(item => item.data === vault.getFunction('deposit').selector);
             assert.ok(depositTx, 'the wallet sent the deposit');
             gas.record('deposit', await rpc('eth_getTransactionReceipt', [depositTx.hash]), { client: 'sdk' });
+            // Recorded, not in the request tree yet: the SDK refuses a request
+            // before proving anything, and asks again once the note is activated.
+            assert.equal(await vaultRead('isActivated', [noteId]), false);
+            await sdk('activation_timing', { timing: { waitMs: 3_000, pollMs: 1_000 } });
+            const early = await sdkRefusal(sdk('chat', { sessionId: 'acceptance-sdk', model: MODEL, prompt: PROMPT }));
+            assert.equal(early.code, 'note_not_activated', json(early));
+            await startActivator();
+            const activations = await activateThrough(noteId);
             const chat = await sdk('chat', { sessionId: 'acceptance-sdk', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
             const settled = await sdk('settle');
             assert.equal(Number(settled.note.current_balance), DEPOSIT - INFERENCE_CHARGE, json(settled.note));
-            // Another deposit moves the root past this note's deposit root.
-            // It is the note claimExpired sweeps at the end of the run.
+            // Another deposit, recorded and never activated: the note
+            // claimExpired sweeps at the end of the run.
             expiryNote = { client: await wallet('expiry') };
-            Object.assign(expiryNote, await driverDeposit(expiryNote.client));
-            const depositRoot = (await vaultEventsSince('NoteDeposited', noteId, deployBlock))[0].args.newRoot;
-            assert.notEqual(await vaultRead('currentRoot'), depositRoot);
-            // The operator's indexer goes down; the escape needs no indexer
-            // (Amendment A1: the deposit's root is a known root for good).
+            Object.assign(expiryNote, await driverDeposit(expiryNote.client, { activate: false }));
+            // The operator's indexer goes down: an exit reads no tree.
             await stop(indexer);
             const before = await balances(vaultAddress, account.sdkDestination);
             const escaped = await sdk('withdraw', { mode: 'escape', destination: account.sdkDestination });
@@ -1698,22 +1891,23 @@ async function main() {
             assert.equal(recorded.args.conceded, 0n, 'a fresh state escapes conceding nothing');
             assert.equal(recorded.args.stateBalance, BigInt(DEPOSIT - INFERENCE_CHARGE));
             const pending = await vaultRead('pendingWithdrawals', [noteId]);
+            assert.equal(pending.length, 5, 'pendingWithdrawals: exists, nullifier, finalBalance, destination, deadline');
             assert.equal(pending[0], true);
-            const root = pending[1];
-            assert.equal(root, depositRoot, 'the escape proves at the note\'s deposit root, not the current one');
-            assert.equal(await vaultRead('isKnownRoot', [root]), true);
+            assert.equal(pending[2], BigInt(DEPOSIT - INFERENCE_CHARGE));
+            const escapeCall = vault.parseTransaction({ data: (await rpc('eth_getTransactionByHash', [escapeTx.hash])).input });
+            const stored = await noteView(noteId);
+            assert.equal(BigInt(escapeCall.args.inputs.registrationCommitment), BigInt(stored.commitment), 'the escape names the stored commitment');
+            assert.equal(escapeCall.args.inputs.noteMetadata, noteMetadata(stored), 'the escape names the stored amount and expiry');
             await save('sdk-honest-escape.json', escaped);
-            const pathSource = escaped.result?.pathSource;
-            assert.equal(pathSource, 'deposit', 'the SDK took the deposit-time path');
             assert.deepEqual(escaped.result?.decision, { rule: 'E2.escape', conceded: '0' });
             // Restart the indexer from its checkpoint.
             indexer = launch(path.join(opts.binDir, 'zkapi-indexerd'), indexerArgs, 'indexer-2.log');
             await synchronizedTree();
             pendingEscapes.push({ name: 'sdk-honest', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
                 payout: DEPOSIT - INFERENCE_CHARGE, stateBalance: DEPOSIT - INFERENCE_CHARGE, before });
-            return { note_id: noteId, deposit: depositTx.hash, escape: escapeTx.hash, path_source: pathSource,
-                decision: escaped.result?.decision ?? null, sdk_statuses: escaped.statuses,
-                proof_root: felt(root), proof_root_is_the_deposit_root: true, deposit_root_is_not_current: true, conceded: 0,
+            return { note_id: noteId, deposit: depositTx.hash, request_before_activation: early.code, activations, escape: escapeTx.hash,
+                decision: escaped.result?.decision ?? null, sdk_statuses: escaped.statuses, conceded: 0,
+                statement_binding: { registration_commitment: felt(stored.commitment), note_metadata: felt(noteMetadata(stored)) },
                 indexer_down_during_escape: true, sdk_settled_balance: Number(settled.note.current_balance) };
         });
         stopAfter('sdk-honest');
@@ -1752,11 +1946,12 @@ async function main() {
             return { close: closeTx.hash, payout_gwei: payout, treasury_gwei: DEPOSIT - payout, state_balance: stateBalance,
                 statuses: closed.statuses, client_final_state: { phase: synced.record.phase, mode: synced.record.mode, note: null } };
         };
-        await scenario('SDK honest close (Phase C smoke): deposit, request, settle, mutual close through the SDK', async () => {
+        await scenario('SDK honest close (Phase C smoke): deposit, activation, request, settle, mutual close through the SDK', async () => {
             const sdk = await sdkAgent('close', { walletAccount: account.sdk });
             await sdk('init');
             const deposited = await sdk('deposit', { amount: '0.001' });
             const noteId = Number(deposited.note.note_id);
+            await activateThrough(noteId);
             const chat = await sdk('chat', { sessionId: 'acceptance-sdk-close', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
             const settled = await sdk('settle');
@@ -1783,7 +1978,7 @@ async function main() {
             // The owner concedes less than the request will cost.
             const conceded = 100;
             assert.ok(conceded < INFERENCE_CHARGE);
-            const escape = await driverEscape(client, note.noteId, { conceded, destination: slowReceiver, path: note.depositPath });
+            const escape = await driverEscape(client, note.noteId, { conceded, destination: slowReceiver });
             assert.equal(escape.recorded.args.stateBalance, BigInt(DEPOSIT));
             // The lease retires; the server settles its charge, but the
             // nullifier is consumed on chain, so it signs no successor (O7).
@@ -1803,7 +1998,7 @@ async function main() {
             assert.equal(BigInt(raiseCall.args.inputs.requestNullifier), BigInt(sent.nullifier), 'raised with the request at the escaped nullifier');
             const concession = await vaultRead('pendingConcessions', [note.noteId]);
             assert.equal(concession[2], BigInt(INFERENCE_CHARGE));
-            assert.equal((await vaultRead('pendingWithdrawals', [note.noteId]))[3], BigInt(DEPOSIT - INFERENCE_CHARGE));
+            assert.equal((await vaultRead('pendingWithdrawals', [note.noteId]))[2], BigInt(DEPOSIT - INFERENCE_CHARGE));
             const status = await client('status');
             assert.equal(status.state.note.bound_at_state, CAP);
             assert.equal(status.archived.at(-1).disposition, 'abandoned_for_escape');
@@ -1815,6 +2010,36 @@ async function main() {
         });
         stopAfter('raise');
 
+        const companionError = answer => answer.value?.error?.code ?? answer.value?.code ?? null;
+        // A deposit as clientd makes it: the companion's plan (a commitment
+        // and the predicted slot, no path), the deposit (zkapi-clientd signs
+        // it; the harness sends it), and the confirmation, which the
+        // companion checks against notes(noteId). `activate` (the default)
+        // then activates the note for requests.
+        async function companionDeposit(companion, { amount = DEPOSIT, activate = true } = {}) {
+            const plan = await companion.call('POST', '/deposit/prepare', { amount });
+            assert.equal(plan.status, 200, json(plan.value));
+            assert.ok(!('zero_path' in plan.value) && !('active_root' in plan.value), 'a deposit plan carries no path');
+            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), amount],
+                { value: BigInt(amount) * GWEI, operation: 'deposit' });
+            assert.equal(receipt.status, '0x1');
+            const deposited = eventOf(receipt, 'NoteDeposited');
+            const noteId = Number(deposited.args.noteId);
+            assert.equal(noteId, plan.value.next_note_id);
+            const note = await noteView(noteId);
+            assert.equal(BigInt(note.commitment), BigInt(plan.value.commitment));
+            const confirmed = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount,
+                expiry_ts: note.expiry });
+            assert.equal(confirmed.status, 200, json(confirmed.value));
+            if (activate) await activateThrough(noteId);
+            return noteId;
+        }
+        async function companionRequest(companion) {
+            const lease = await companion.call('POST', '/oa/v1/lease', { request_limit_micro_usd: 1_000_000 });
+            assert.equal(lease.status, 200, json(lease.value));
+            assert.equal(lease.value.verified, true, json(lease.value));
+            await inference({ openrouter_api_base: lease.value.base_url, api_key: lease.value.api_key });
+        }
         await scenario('companion: forced early exit conceding 0 while the operator is unreachable, raised to the real charge', async () => {
             // The companion takes only OA org keys: serverd switches its key
             // source (every direct-provider lease has settled).
@@ -1823,18 +2048,24 @@ async function main() {
             const bridge = await companion.call('GET', '/oa/v1/status');
             assert.equal(bridge.status, 200);
             assert.equal(bridge.value.exit_concession, 1);
-            const plan = await companion.call('POST', '/deposit/prepare', { amount: DEPOSIT });
-            assert.equal(plan.status, 200, json(plan.value));
-            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), DEPOSIT, plan.value.zero_path],
-                { value: BigInt(DEPOSIT) * GWEI, operation: 'deposit' });
-            const deposited = eventOf(receipt, 'NoteDeposited');
-            const noteId = Number(deposited.args.noteId);
-            assert.equal(noteId, plan.value.next_note_id);
-            const note = await noteView(noteId);
-            const confirmed = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount: DEPOSIT,
-                expiry_ts: note.expiry, deposit_root: felt(deposited.args.newRoot), deposit_siblings: plan.value.zero_path });
-            assert.equal(confirmed.status, 200, json(confirmed.value));
-            await synchronizedTree();
+            await stopActivator();
+            const noteId = await companionDeposit(companion, { activate: false });
+            // Recorded, not activated: the companion refuses to prepare a
+            // request (retriable once the note is activated) and says why.
+            const recorded = await companion.call('GET', '/status');
+            assert.equal(recorded.status, 200, json(recorded.value));
+            assert.equal(recorded.value.activated, false, json(recorded.value));
+            assert.ok(recorded.value.activation_cursor <= noteId, json(recorded.value));
+            const early = await companion.call('POST', '/oa/v1/lease', { request_limit_micro_usd: 1_000_000 });
+            assert.notEqual(early.status, 200, json(early.value));
+            assert.equal(companionError(early), 'note_not_activated', json(early.value));
+            await startActivator();
+            const activations = await activateThrough(noteId);
+            const activated = await waitFor('the companion reports the note activated', async () => {
+                const answer = await companion.call('GET', '/status');
+                return answer.status === 200 && answer.value.activated === true && answer.value;
+            }, 30_000, 500);
+            assert.ok(activated.activation_cursor > noteId, json(activated));
             // One request, as clientd makes it: an OA bridge lease (the
             // companion proves the request; the verifier binds the key), then
             // the inference with that key.
@@ -1853,10 +2084,11 @@ async function main() {
                     { destination: account.companionDestination, conceded: String(decision.value.conceded ?? '0'), early_exit: 'concede_nothing' })).value;
                 assert.equal(prepared.status, 'prepared', json(prepared));
                 assert.equal(String(prepared.conceded), '0');
-                assert.equal(prepared.path_source, 'deposit', 'the escape proves from the deposit-time path');
             } finally {
                 gate.mode = 'pass';
             }
+            assert.ok(prepared.calldata.startsWith(vault.getFunction('initiateEscapeWithdrawal').selector)
+                && prepared.calldata.length === 2 + 868 * 2, 'the companion\'s escape calldata layout');
             const escapeReceipt = await sendTx({ from: account.companion, to: vaultAddress, data: prepared.calldata });
             assert.equal(escapeReceipt.status, '0x1');
             gas.record('escape', escapeReceipt, { client: 'companion', conceded: 0 });
@@ -1875,8 +2107,9 @@ async function main() {
             await startServer();
             pendingEscapes.push({ name: 'companion-forced', client: 'companion', companion, noteId, destination: account.companionDestination,
                 payout: DEPOSIT - INFERENCE_CHARGE, before: await balances(account.companionDestination) });
-            return { note_id: noteId, decision: { rule: prepared.reason ?? null, conceded: prepared.conceded, bound: prepared.bound_at_state },
-                path_source: prepared.path_source, escape: escapeReceipt.transactionHash, raise: raised.event.transactionHash,
+            return { note_id: noteId, request_before_activation: companionError(early), activations,
+                decision: { rule: prepared.reason ?? null, conceded: prepared.conceded, bound: prepared.bound_at_state },
+                escape: escapeReceipt.transactionHash, raise: raised.event.transactionHash,
                 traffic: companionTraffic(companion, ['operator', 'indexer', 'exit_rpc', 'verifier']),
                 escape_status_phase: status.value.phase ?? status.value.record?.phase ?? null };
         });
@@ -1886,27 +2119,6 @@ async function main() {
         // and the stale-device pre-check (E4.2) run by a real client: a copy
         // of the companion's wallet taken before two requests is the stale
         // device, and its escape is refused before any proof leaves it.
-        const companionError = answer => answer.value?.error?.code ?? answer.value?.code ?? null;
-        async function companionDeposit(companion, amount = DEPOSIT) {
-            const plan = await companion.call('POST', '/deposit/prepare', { amount });
-            assert.equal(plan.status, 200, json(plan.value));
-            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), amount, plan.value.zero_path],
-                { value: BigInt(amount) * GWEI, operation: 'deposit' });
-            const deposited = eventOf(receipt, 'NoteDeposited');
-            const noteId = Number(deposited.args.noteId);
-            const note = await noteView(noteId);
-            const confirmed = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount,
-                expiry_ts: note.expiry, deposit_root: felt(deposited.args.newRoot), deposit_siblings: plan.value.zero_path });
-            assert.equal(confirmed.status, 200, json(confirmed.value));
-            await synchronizedTree();
-            return noteId;
-        }
-        async function companionRequest(companion) {
-            const lease = await companion.call('POST', '/oa/v1/lease', { request_limit_micro_usd: 1_000_000 });
-            assert.equal(lease.status, 200, json(lease.value));
-            assert.equal(lease.value.verified, true, json(lease.value));
-            await inference({ openrouter_api_base: lease.value.base_url, api_key: lease.value.api_key });
-        }
         await scenario('companion: honest close through its mutual route; a stale copy of its wallet is refused (device_not_newest) before proving', async () => {
             await startServer(null, { keySource: 'oa_org' });
             const companion = await startCompanion('close');
@@ -1955,10 +2167,14 @@ async function main() {
             assert.equal(Number(pi.conceded), 0);
             const asHex = value => Array.isArray(value) ? `0x${Buffer.from(value).toString('hex')}` : String(value);
             const asAddress = value => `0x${BigInt(asHex(value)).toString(16).padStart(40, '0')}`;
-            const tuple = [pi.protocol_version, pi.chain_id, asAddress(pi.contract_address), asHex(pi.active_root),
+            const stored = await noteView(noteId);
+            assert.equal(BigInt(asHex(pi.registration_commitment)), BigInt(stored.commitment), 'the close names the stored commitment');
+            assert.equal(BigInt(pi.deposit_amount), stored.amount);
+            assert.equal(Number(pi.expiry), stored.expiry);
+            const tuple = [pi.protocol_version, pi.chain_id, asAddress(pi.contract_address), asHex(pi.registration_commitment),
                 asHex(pi.state_signing_key_x), asHex(pi.state_signing_key_y), asHex(pi.clearance_signing_key_x), asHex(pi.clearance_signing_key_y),
                 pi.note_id, BigInt(pi.final_balance), asAddress(pi.destination), asHex(pi.withdrawal_nullifier), pi.kind,
-                asHex(pi.next_nullifier), BigInt(pi.conceded), pi.valid_until];
+                asHex(pi.next_nullifier), BigInt(pi.conceded), pi.valid_until, BigInt(pi.deposit_amount) | (BigInt(pi.expiry) << 128n)];
             const proofHex = `0x${Buffer.from(prepared.proof.proof, 'base64').toString('hex')}`;
             // zkapi-clientd signs this call; the harness sends it.
             const before = await balances(vaultAddress, treasury, destination);
@@ -2151,6 +2367,7 @@ async function main() {
         await scenario('gasless close (SDK, fees: payout): a payout address with no ETH receives P − charged; no wallet transaction; the float is replenished', async () => {
             await gaslessClient();
             const note = await gaslessDeposit(gaslessSdk);
+            await activateThrough(note.noteId);
             const chat = await gaslessSdk('chat', { sessionId: 'acceptance-gasless', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
             const settledRequest = await gaslessSdk('settle');
@@ -2534,7 +2751,7 @@ async function main() {
         await scenario('gasless escape as zkapi-clientd (ephemeral owner key): the companion proves an early escape to S, the sponsored initiation records S\'s debt, the challenger raises the concession', async () => {
             await startServer(null, { keySource: 'oa_org' });
             const companion = await startCompanion('gasless');
-            const noteId = await companionDeposit(companion, GASLESS_ESCAPE_UNITS);
+            const noteId = await companionDeposit(companion, { amount: GASLESS_ESCAPE_UNITS });
             await companionRequest(companion);
             const owner = Wallet.createRandom();
             const payee = freshAddress();
@@ -2606,7 +2823,7 @@ async function main() {
             const margin = chargeWithinMargin(outcome);
             gas.record('gasless_escape', receipt, { client: 'sdk', note_id: note.noteId, user_op_hash: outcome.op.args.userOpHash.toLowerCase(), owed_wei: owed.toString(), ...margin });
             gaslessEscapes.push({ name: 'sdk-gasless', client: 'sdk', sdk, payee, S, noteId: note.noteId, owed,
-                finalBalance: Number((await vaultRead('pendingWithdrawals', [note.noteId]))[3]), recordId: escaped.result.recordId });
+                finalBalance: Number((await vaultRead('pendingWithdrawals', [note.noteId]))[2]), recordId: escaped.result.recordId });
             // A second balance beside the pending escape: the pause drill's.
             gaslessPauseNote = await gaslessDeposit(sdk);
             return { note_id: note.noteId, transit_account: S, payee, escape: escaped.result.transactionHash, owed_wei: owed.toString(),
@@ -2614,10 +2831,13 @@ async function main() {
         });
         stopAfter('gasless-sdk-escape');
 
-        // Prepared now, abandoned, replayed after its valid_until.
+        // Prepared now, abandoned, replayed after its valid_until. The note only
+        // exits, so it is never activated for requests (a later activation of
+        // another note appends it all the same: activation follows the order of
+        // the deposits).
         const replay = { client: await wallet('replay') };
-        Object.assign(replay, await driverDeposit(replay.client));
-        replay.abandoned = await driverEscape(replay.client, replay.noteId, { validUntil: (await chainNow()) + 600, path: replay.depositPath, send: false });
+        Object.assign(replay, await driverDeposit(replay.client, { activate: false }));
+        replay.abandoned = await driverEscape(replay.client, replay.noteId, { validUntil: (await chainNow()) + 600, send: false });
         assert.equal(await revertName(replay.abandoned.plan.calldata), null, 'the abandoned proof would still land now');
         // The missed-defeat note: two settled requests, so a request at the
         // genesis state's successor exists.
@@ -2692,9 +2912,9 @@ async function main() {
             assert.equal(paused.status, '0x1');
             assert.equal(await vaultRead('paused'), true);
             // New exits are blocked while paused (until maxPauseDuration).
-            const blocked = await driverEscape(replay.client, replay.noteId, { path: replay.depositPath, send: false });
+            const blocked = await driverEscape(replay.client, replay.noteId, { send: false });
             assert.equal(await revertName(blocked.plan.calldata), 'Paused');
-            const deadlines = await Promise.all(pendingEscapes.map(async entry => Number((await vaultRead('pendingWithdrawals', [entry.noteId]))[5])));
+            const deadlines = await Promise.all(pendingEscapes.map(async entry => Number((await vaultRead('pendingWithdrawals', [entry.noteId]))[4])));
             await skipChain(Math.max(...deadlines) - await chainNow() + 5, 'challenge period, while paused');
             const results = {};
             for (const entry of pendingEscapes.splice(0)) {
@@ -2752,16 +2972,16 @@ async function main() {
             assert.equal(afterRefusal.prepared, null, 'nothing was proved');
             assert.equal(afterRefusal.signatures.length, beforeRefusal.signatures.length, 'nothing was signed');
             // Both sponsored escapes are past their deadline.
-            const deadlines = await Promise.all(gaslessEscapes.map(async entry => Number((await vaultRead('pendingWithdrawals', [entry.noteId]))[5])));
+            const deadlines = await Promise.all(gaslessEscapes.map(async entry => Number((await vaultRead('pendingWithdrawals', [entry.noteId]))[4])));
             const now = await chainNow();
             if (Math.max(...deadlines) >= now) await skipChain(Math.max(...deadlines) - now + 5, 'the gasless escapes\' challenge period, while paused');
             const results = {};
             // (b) zkapi-clientd's sponsored FINALIZE: not gated by the pause.
             const clientd = gaslessEscapes.find(entry => entry.client === 'clientd');
             const pending = await vaultRead('pendingWithdrawals', [clientd.noteId]);
-            assert.equal(Number(pending[3]), clientd.finalBalance, 'the raised balance B − c_final');
+            assert.equal(Number(pending[2]), clientd.finalBalance, 'the raised balance B − c_final');
             const finalize = await clientdOperation({ owner: clientd.owner, payee: clientd.payee, kind: 3,
-                vaultCall: vault.encodeFunctionData('finalizeEscapeWithdrawal', [clientd.noteId]), nonceKey: BigInt(pending[2]) & ((1n << 192n) - 1n) });
+                vaultCall: vault.encodeFunctionData('finalizeEscapeWithdrawal', [clientd.noteId]), nonceKey: BigInt(pending[1]) & ((1n << 192n) - 1n) });
             assert.equal(finalize.withInitCode, false);
             const before = await balances(clientd.payee, treasury);
             const receipt = await clientdSend(finalize);
@@ -2862,7 +3082,7 @@ async function main() {
             assert.equal(replayed.status, '0x0');
             gas.record('escape_expired_proof_reverts', replayed);
             // A fresh escape lands although the vault is still paused.
-            const escape = await driverEscape(replay.client, replay.noteId, { path: replay.depositPath });
+            const escape = await driverEscape(replay.client, replay.noteId);
             pendingEscapes.push({ name: 'driver-escape-after-pause', client: 'driver', wallet: replay.client, noteId: replay.noteId,
                 destination: account.destination, payout: DEPOSIT, exitedNullifier: escape.plan.public_inputs.withdrawal_nullifier,
                 stateBalance: DEPOSIT });
@@ -2939,7 +3159,7 @@ async function main() {
             const rule = check === 'S4' ? 'E3.forced' : 'E3.lost_epsilon';
             const conceded = check === 'S4' ? 0 : Math.min(charge, bound);
             const balanceBefore = Number(after.state.note.current_balance);
-            const escape = await driverEscape(client, note.noteId, { conceded, path: note.depositPath });
+            const escape = await driverEscape(client, note.noteId, { conceded });
             // The concession that is paid: the challenger raises an S4 exit to
             // the settled charge; the lost-ε concession already covers what
             // the bound lets it take.
@@ -2983,6 +3203,7 @@ async function main() {
             await sdk('init');
             const deposited = await sdk('deposit', { amount: '0.001' });
             const noteId = Number(deposited.note.note_id);
+            await activateThrough(noteId);
             const chat = await sdk('chat', { sessionId: 'acceptance-random-anchor', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
             // Settling installs nothing: the successor fails S4.
@@ -3018,6 +3239,7 @@ async function main() {
             await sdk('init');
             const deposited = await sdk('deposit', { amount: '0.001' });
             const noteId = Number(deposited.note.note_id);
+            await activateThrough(noteId);
             // The lease reaches serverd, which reserves it and issues a key;
             // the operator keeps the key, spends it, and tells the SDK that its
             // quote expired before acceptance.
@@ -3075,6 +3297,7 @@ async function main() {
             await sdk('init');
             const deposited = await sdk('deposit', { amount: '0.001' });
             const noteId = Number(deposited.note.note_id);
+            await activateThrough(noteId);
             const chat = await sdk('chat', { sessionId: 'acceptance-withhold', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200);
             // The server settles the request but never signs its successor.
@@ -3126,54 +3349,52 @@ async function main() {
 
         // ---------------------------------------------------------------- operator and indexer outages
         await startServer();
-        await scenario('indexer down, then rebuild from logs: an SDK note without its deposit-time path escapes at the rebuilt root', async () => {
-            const sdk = await sdkAgent('rebuild', { walletAccount: account.sdk });
+        await scenario('indexer down: notes recorded and never activated exit with no path (an SDK escape and a wallet-core escape)', async () => {
+            const sdk = await sdkAgent('no-path', { walletAccount: account.sdk });
             await sdk('init');
+            await stopActivator();
             const deposited = await sdk('deposit', { amount: '0.001' });
             const noteId = Number(deposited.note.note_id);
-            const depositRoot = (await vaultEventsSince('NoteDeposited', noteId, deployBlock))[0].args.newRoot;
-            // A later deposit moves the root; that note escapes too.
-            const filler = { client: await wallet('rebuild-filler') };
-            Object.assign(filler, await driverDeposit(filler.client));
-            const currentRoot = await vaultRead('currentRoot');
-            assert.notEqual(currentRoot, depositRoot);
-            // The rebuild reads the vault's logs up to the finalized block.
-            const fillerBlock = Number(BigInt(filler.receipt.blockNumber));
-            await waitFor('the filler deposit is final', async () =>
-                Number(BigInt((await rpc('eth_getBlockByNumber', ['finalized', false])).number)) >= fillerBlock, 30_000);
-            const dropped = await sdk('drop_deposit_path');
-            assert.equal(dropped.dropped, true, 'the SDK had saved a deposit-time path');
-            assert.equal(dropped.deposit_path_saved, false);
+            const other = { client: await wallet('no-path') };
+            Object.assign(other, await driverDeposit(other.client, { activate: false }));
+            // Neither note is in the request tree, and the operator's indexer
+            // is down: an exit needs neither.
+            for (const id of [noteId, other.noteId]) assert.equal(await vaultRead('isActivated', [id]), false, `note ${id} is not activated`);
+            const rootBefore = await vaultRead('currentRoot');
             await stop(indexer);
             const escaped = await sdk('withdraw', { mode: 'escape', destination: account.sdkDestination });
             const escapeTx = escaped.sent.find(item => item.data === vault.getFunction('initiateEscapeWithdrawal').selector);
             assert.ok(escapeTx, json(escaped.statuses));
             const receipt = await waitReceipt(escapeTx.hash);
             assert.equal(receipt.status, '0x1');
-            gas.record('escape', receipt, { client: 'sdk', conceded: 0, path: 'rebuild' });
-            assert.equal(escaped.result?.pathSource, 'rebuild', 'with no saved path and no indexer the path is rebuilt from the logs');
+            gas.record('escape', receipt, { client: 'sdk', conceded: 0, activated: false });
             assert.deepEqual(escaped.result?.decision, { rule: 'E2.escape', conceded: '0' });
-            const pending = await vaultRead('pendingWithdrawals', [noteId]);
-            assert.equal(pending[0], true);
-            assert.equal(pending[1], currentRoot, 'the escape proves at the root rebuilt from the logs, not the deposit root');
+            const otherEscape = await driverEscape(other.client, other.noteId);
+            assert.equal(await vaultRead('currentRoot'), rootBefore, 'exits leave the request tree as it was');
+            for (const id of [noteId, other.noteId]) assert.equal((await noteView(id)).status, NOTE.PendingWithdrawal);
             indexer = launch(path.join(opts.binDir, 'zkapi-indexerd'), indexerArgs, 'indexer-3.log');
             await synchronizedTree();
-            const fillerEscape = await driverEscape(filler.client, filler.noteId, { path: filler.depositPath });
-            pendingEscapes.push({ name: 'sdk-rebuild', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
+            // Activation appends a recorded note's leaf whatever its status: the
+            // restarted worker activates both pending escapes, which stay pending.
+            await startActivator();
+            const activations = await activateThrough(Math.max(noteId, other.noteId));
+            for (const id of [noteId, other.noteId]) assert.equal((await noteView(id)).status, NOTE.PendingWithdrawal);
+            pendingEscapes.push({ name: 'sdk-no-path', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
                 payout: DEPOSIT, stateBalance: DEPOSIT });
-            pendingEscapes.push({ name: 'rebuild-filler', client: 'driver', wallet: filler.client, noteId: filler.noteId,
+            pendingEscapes.push({ name: 'driver-no-path', client: 'driver', wallet: other.client, noteId: other.noteId,
                 destination: account.destination, payout: DEPOSIT, stateBalance: DEPOSIT,
-                exitedNullifier: fillerEscape.plan.public_inputs.withdrawal_nullifier });
-            return { note_id: noteId, path_source: escaped.result.pathSource, proof_root: felt(pending[1]), deposit_root: felt(depositRoot),
-                indexer_down_during_escape: true, escape: escapeTx.hash, decision: escaped.result.decision };
+                exitedNullifier: otherEscape.plan.public_inputs.withdrawal_nullifier });
+            return { note_ids: [noteId, other.noteId], activated_at_escape: false, indexer_down_during_escape: true, escape: escapeTx.hash,
+                driver_escape: otherEscape.receipt.transactionHash, decision: escaped.result.decision, activated_while_pending: activations };
         });
-        stopAfter('rebuild');
+        stopAfter('indexer-down');
 
         await scenario('hang: serverd --adversary hang holds every call; the SDK escapes within its exit budget, before must_initiate_by', async () => {
             const sdk = await sdkAgent('hang', { walletAccount: account.sdk });
             await sdk('init');
             const deposited = await sdk('deposit', { amount: '0.001' });
             const noteId = Number(deposited.note.note_id);
+            await activateThrough(noteId);
             const chat = await sdk('chat', { sessionId: 'acceptance-hang', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
             // The operator hangs from now on: every connection stays open with
@@ -3231,7 +3452,7 @@ async function main() {
             await stop(challenger);
             // A stale escape from the genesis state, whose successor's request
             // is in the server's evidence: a defeat is due, and nobody sends it.
-            const escape = await driverEscape(missed.client, missed.noteId, { snapshot: 'S0', path: missed.depositPath });
+            const escape = await driverEscape(missed.client, missed.noteId, { snapshot: 'S0' });
             assert.equal(BigInt(escape.recorded.args.nextNullifier), BigInt(missed.requests[1].nullifier), 'evidence at N⁺ exists');
             pendingEscapes.push({ name: 'missed-defeat', client: 'driver', wallet: missed.client, noteId: missed.noteId,
                 destination: account.destination, payout: DEPOSIT, missed: true, escapeBlock: Number(BigInt(escape.receipt.blockNumber)),
@@ -3241,7 +3462,7 @@ async function main() {
         });
 
         await scenario('finalize every pending escape; payouts, treasury shares and client states', async () => {
-            const deadlines = await Promise.all(pendingEscapes.map(async entry => Number((await vaultRead('pendingWithdrawals', [entry.noteId]))[5])));
+            const deadlines = await Promise.all(pendingEscapes.map(async entry => Number((await vaultRead('pendingWithdrawals', [entry.noteId]))[4])));
             await skipChain(Math.max(...deadlines) - await chainNow() + 5, 'challenge period');
             const results = {};
             for (const entry of pendingEscapes.splice(0)) {
@@ -3250,7 +3471,7 @@ async function main() {
                 const defeats = await vaultEventsSince('EscapeWithdrawalChallenged', entry.noteId, deployBlock);
                 results[entry.name] = { finalize: receipt.transactionHash, payout_gwei: entry.payout, treasury_gwei: DEPOSIT - entry.payout,
                     raises: raises.map(event => Number(event.args.conceded)), defeats: defeats.length, deferred };
-                if (['sdk-withhold', 'missed-defeat', 'sdk-hang', 'sdk-rebuild'].includes(entry.name)) {
+                if (['sdk-withhold', 'missed-defeat', 'sdk-hang', 'sdk-no-path', 'driver-no-path'].includes(entry.name)) {
                     assert.equal(defeats.length, 0, `${entry.name}: never defeated`);
                 }
                 if (entry.client === 'sdk') {
@@ -3299,7 +3520,6 @@ async function main() {
             const rootAfter = await vaultRead('currentRoot');
             assert.notEqual(rootAfter, rootBefore);
             assert.equal(BigInt(retired.event.args.newRoot), rootAfter);
-            assert.equal(await vaultRead('isKnownRoot', [rootAfter]), true);
             const status = await waitFor('the challenger counts the missed defeat', async () => {
                 const current = await challengerStatus();
                 return current.escapes_finalized_with_successor_evidence_total >= 1 && current;
@@ -3312,13 +3532,16 @@ async function main() {
             const missLine = new RegExp(`MISSED escape deadline note_id=${missed.noteId} .*missed="defeat"`);
             assert.ok(logs.some(text => text.replace(/\u001b\[[0-9;]*m/g, '').split('\n').some(line => missLine.test(line))),
                 'the challenger logs the miss of this note');
-            // The retired leaf is gone from the tree: the newest state of the
-            // note can no longer prove membership at the current root.
+            // The retired leaf is gone from the tree (the note's record is
+            // not): the newest state of the note can no longer prove membership
+            // at the current root, which requests must use.
             const snapshot = await synchronizedTree();
             assert.equal(BigInt(snapshot.leaves[missed.noteId]), 0n);
-            const atCurrentRoot = await missed.client('tree_path', { args: { snapshot, note_id: missed.noteId, require_existing: true } });
-            assert.equal((await missed.client('note_path_matches', { args: { active_root: atCurrentRoot.active_root,
-                siblings: atCurrentRoot.siblings } })).matches, false, 'the note\'s leaf is not under the current root');
+            const recordedLeaf = (await missed.client('note_leaf')).leaf;
+            assert.equal(BigInt(snapshot.note_leaves[missed.noteId]), BigInt(recordedLeaf), 'the indexer keeps the recorded leaf');
+            const served = await get(`${indexerUrl}/v1/tree/notes/${missed.noteId}/path`);
+            assert.equal(served.activated, true);
+            assert.equal(BigInt(served.leaf), 0n, 'the current tree holds no leaf for the note');
             const signer = await get(`${signerUrl}/health`);
             assert.equal(signer.retirements_last_24h, 1);
             return { note_id: missed.noteId, retirement: retired.event.transactionHash, new_root: felt(rootAfter),
@@ -3344,6 +3567,7 @@ async function main() {
             await sdk('init');
             const deposited = await sdk('deposit', { amount: '0.001' });
             const noteId = Number(deposited.note.note_id);
+            await activateThrough(noteId);
             await sdk('hold_successors', { on: true });
             const chat = await sdk('chat', { sessionId: 'acceptance-late', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
@@ -3405,6 +3629,7 @@ async function main() {
         await scenario('expiry sweep and pause cooldown end: claimExpired after effectiveExpiry; a pause after PAUSE_COOLDOWN', async () => {
             // Stop the daemons first: block time now runs ahead of the wall clock.
             await stop(challenger);
+            await stopActivator();
             await stop(server);
             gate.target = null;
             const expiry = Number(await vaultRead('effectiveExpiry', [expiryNote.noteId]));
@@ -3435,6 +3660,13 @@ async function main() {
             oa_org_keys: mock.events.filter(event => event.source === 'oa_org' && event.type === 'issued').length };
         evidence.challenger_sends = challengeSends.map(send => ({ call: send.call, note_id: send.note_id, hash: send.hash ?? null,
             error: send.error ?? null, ...send.fees }));
+        // Every activateNotes the worker sent, and every batch that landed.
+        await recordActivations();
+        evidence.activation_sends = activationSends.map(send => ({ first_note_id: send.first_note_id, count: send.count,
+            hash: send.hash ?? null, error: send.error ?? null, max_fee_per_gas: send.max_fee_per_gas }));
+        assert.ok(evidence.activations.some(batch => batch.proved) && evidence.activations.some(batch => !batch.proved),
+            'the run activated with proofs (the worker) and without (the fallback drill)');
+        assert.equal(await vaultRead('activationCursor'), await vaultRead('nextNoteId'), 'every recorded note was activated');
         // Every operation the operator's bundler was sent, and every bundle it sent.
         evidence.bundler = bundler.summary();
         evidence.paymaster = { float_wei: (await floatWei()).toString(), lost_wei: (await pmRead('lostWei')).toString(),
@@ -3460,8 +3692,10 @@ async function main() {
         for (const file of [fileURLToPath(import.meta.url), path.join(ROOT, 'crates/zkapi-serverd/examples/v2_acceptance_wallet.rs'),
             path.join(ROOT, 'scripts/acceptance/sdk-agent.mjs'), path.join(ROOT, 'scripts/acceptance/mini-bundler.mjs'),
             ...['entrypoint-v0.7.0.runtime.hex', 'sender-creator-v0.7.0.runtime.hex'].map(file => path.join(ROOT, 'protocol/contracts/test/fixtures', file)),
-            ...['zkapi', 'zkapi-indexerd', 'zkapi-challenged', 'zkapi-walletd', 'examples/v2_acceptance_wallet'].map(file => path.join(opts.binDir, file)),
-            ...['request.pk', 'request.vk', 'withdrawal.pk', 'withdrawal.vk'].map(file => path.join(SETUP_DIR, file)),
+            ...['zkapi', 'zkapi-indexerd', 'zkapi-challenged', 'zkapi-activated', 'zkapi-walletd', 'examples/v2_acceptance_wallet']
+                .map(file => path.join(opts.binDir, file)),
+            ...['request.pk', 'request.vk', 'withdrawal.pk', 'withdrawal.vk', 'insertion1.pk', 'insertion1.vk', 'insertion4.pk', 'insertion4.vk',
+                'insertion16.pk', 'insertion16.vk'].map(file => path.join(SETUP_DIR, file)),
             path.join(ROOT, 'sdk/wasm/zkapi_browser_bg.wasm')]) {
             hashes[path.relative(ROOT, file)] = await sha256File(file).catch(() => null);
         }
@@ -3470,7 +3704,7 @@ async function main() {
             assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.error?.message ?? result.stderr}`);
             return result.stdout;
         };
-        const gasReport = { schema: 'zkapi-acceptance-gas/v1', circuit_id: 'zkapi-v2-concession-v1', setup_id: finalized.setupId,
+        const gasReport = { schema: 'zkapi-acceptance-gas/v1', circuit_id: CIRCUIT_ID, setup_id: finalized.setupId,
             chain: 'anvil', chain_id: CHAIN_ID, note: 'transaction gasUsed of real calls on a fresh Anvil vault (receipt gas, refunds applied)',
             snapshot: await readJSON(path.join(ROOT, 'protocol/contracts/snapshots/concession-exit-gas.json')).catch(() => null),
             summary: gas.summary(), transactions: gas.entries };
@@ -3487,6 +3721,7 @@ async function main() {
                 proof_system: 'protocol/setup/v2-concession-dev (single-party dev setup, drill vault only)',
                 server: 'zkapi serverd (drill build: --adversary withhold, born-spent, reuse-anchor, random-anchor, overcharge, lie-expired, hang), SQLite archive bound by zkapi db init',
                 indexer: `zkapi-indexerd at ${INDEXER_CONFIRMATIONS} confirmations, stopped and restarted from its checkpoint`,
+                activation: 'zkapi-activated: proved activateNotes batches (insertion proofs of the dev setup) from its own account; with the worker stopped, a third party\'s activateNotesOnChain with the indexer\'s siblings',
                 challenger: 'zkapi-challenged: defeats, raises and retire-on-miss through the signer sidecar',
                 signer: 'docker/aws/signer (EIP-1559, allowlisted calls, retirement budget)',
                 clients: { wallet_core: 'examples/v2_acceptance_wallet (zkapi-browser natively; the harness applies the exit rules for it)',

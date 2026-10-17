@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// Expected runtime codehashes of a zkAPI deployment (vault revision 3), computed from the
+// Expected runtime codehashes of a zkAPI deployment (vault revision 4), computed from the
 // pinned-compiler Forge artifacts alone: the vault's deployedBytecode with the Bn254Poseidon
 // link applied and its immutableReferences filled from the constructor arguments, the adapter's
-// deployedBytecode, and the library's deployedBytecode (with its own address in a call-protection
-// prefix, if the compiler emitted one). A deployment with the gasless-withdrawal paymaster adds
+// deployedBytecode (one contract for the request, withdrawal and three insertion verifying keys,
+// with no link or immutable), and the library's deployedBytecode (with its own address in a
+// call-protection prefix, if the compiler emitted one). A deployment with the gasless-withdrawal paymaster adds
 // the paymaster's, the transit-account factory's and the account logic's deployedBytecode with
 // their immutables filled the same way, and the two canonical ERC-4337 v0.7.0 runtimes (the
 // EntryPoint and its SenderCreator), which are pinned constants. Anyone can rebuild the artifacts

@@ -7,17 +7,20 @@ import {console2} from "forge-std/console2.sol";
 
 import {ZkApiVault} from "zkapi-contracts/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.sol";
+import {MerkleUpdateLib} from "zkapi-contracts/libraries/MerkleUpdateLib.sol";
 import {IEntryPoint} from "zkapi-contracts/gasless/IERC4337.sol";
 import {ZkApiWithdrawalAccountFactory} from "zkapi-contracts/gasless/ZkApiWithdrawalAccountFactory.sol";
 import {ZkApiWithdrawalPaymaster} from "zkapi-contracts/gasless/ZkApiWithdrawalPaymaster.sol";
 import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 import {SetupPolicy} from "./SetupPolicy.sol";
 
-/// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v1, vault revision 3).
+/// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v2, vault revision 4).
 /// @notice Links (or deploys) the Bn254Poseidon library, deploys the circuit-specific Groth16
-///         verifier and the native ETH ZkApiVault with its 11 constructor arguments, checks the
-///         adapter's circuit and verifying-key hashes against the setup manifest and the vault's
-///         getters against the inputs, then (unless GASLESS=0) deploys the gasless-withdrawal
+///         verifier (one adapter for the request, withdrawal and 1-, 4- and 16-note insertion
+///         statements) and the native ETH ZkApiVault with its 11 constructor arguments, checks the
+///         adapter's circuit and five verifying-key hashes against the setup manifest and the vault's
+///         getters against the inputs (a fresh vault: the empty request tree, no note recorded or
+///         activated), then (unless GASLESS=0) deploys the gasless-withdrawal
 ///         paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same broadcast, stakes
 ///         it and its transit-account factory, funds its deposit and checks its getters, and writes
 ///         the provisional deployment manifest, including the linked addresses and every runtime
@@ -70,20 +73,24 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///           MAX_PAUSE_DURATION_SECONDS – longest a pause blocks exits; at least twice the
 ///                         challenge period. Required except on local chains (default 7 days).
 ///           REQUEST_CHARGE_CAP – positive per-request gwei limit; defaults to 1,000,000.
-///           SETUP_MANIFEST – the setup's manifest.json; the adapter's CIRCUIT_ID_HASH and VK hashes
+///           SETUP_MANIFEST – the setup's manifest.json; the adapter's CIRCUIT_ID_HASH and its five
+///                         VK hashes (request, withdrawal, insertion1, insertion4, insertion16)
 ///                         must match it. Required except on local chains (default
 ///                         protocol/setup/v2-concession-dev). SetupPolicy decides which setups
 ///                         may deploy: off local chains the single-party dev and rehearsal
-///                         setups need ALLOW_DEV_SETUP=1, and an mpc-1 setup must have the
+///                         setups need ALLOW_DEV_SETUP=1, and an mpc-1 setup must have all five
 ///                         verifying keys of the committed
-///                         protocol/setup/v2-concession/manifest.json.
+///                         protocol/setup/v2-concession/manifest.json. Whoever can forge an
+///                         insertion proof can set the request tree's root, so the insertion
+///                         keys get the same policy as the others.
 ///           ALLOW_DEV_SETUP – 1 deploys a dev or rehearsal setup off local chains, mainnet
 ///                         included (the Sepolia drill vault, or a vault that trusts its
 ///                         setup's generator not to forge proofs); recorded in the manifest
 ///                         as allowDevSetup. Default 0.
 ///           POSEIDON_ADDRESS – an already deployed Bn254Poseidon to link; its runtime codehash
-///                         must equal the compiled library's at that address. Unset deploys a
-///                         fresh library.
+///                         must equal the compiled library's at that address (a library deployed
+///                         for revision 3, which had insertPath32 and no compressSubtree, does
+///                         not). Unset deploys a fresh library.
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
 ///         Gasless withdrawals (ERC-4337):
 ///           GASLESS     – 1 (default) deploys ZkApiWithdrawalPaymaster after the vault; 0 skips
@@ -123,7 +130,7 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     uint64 internal constant DEFAULT_NOTE_TTL = 30 days;
     uint64 internal constant LOCAL_MAX_PAUSE_DURATION = 7 days;
-    uint256 internal constant VAULT_REVISION = 3;
+    uint256 internal constant VAULT_REVISION = 4;
     string internal constant DEFAULT_SETUP_MANIFEST = "../../protocol/setup/v2-concession-dev/manifest.json";
     /// Largest integer a JSON number carries exactly in JavaScript (Number.MAX_SAFE_INTEGER).
     uint256 internal constant MAX_SAFE_INTEGER = 9_007_199_254_740_991;
@@ -163,8 +170,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     struct Setup {
         string circuitId;
         string setupId;
-        bytes32 requestVkHash;
-        bytes32 withdrawalVkHash;
+        /// The verifying-key hashes, in SetupPolicy._vkKinds() order.
+        bytes32[5] vkHashes;
         bool allowDevSetup;
     }
 
@@ -330,8 +337,10 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         string memory manifest = vm.readFile(path);
         setup.circuitId = vm.parseJsonString(manifest, ".circuit_id");
         setup.setupId = vm.parseJsonString(manifest, ".setup_id");
-        setup.requestVkHash = vm.parseJsonBytes32(manifest, ".vk_keccak256.request");
-        setup.withdrawalVkHash = vm.parseJsonBytes32(manifest, ".vk_keccak256.withdrawal");
+        string[5] memory kinds = _vkKinds();
+        for (uint256 k = 0; k < kinds.length; ++k) {
+            setup.vkHashes[k] = vm.parseJsonBytes32(manifest, string.concat(".vk_keccak256.", kinds[k]));
+        }
         uint256 allowDev = vm.envOr("ALLOW_DEV_SETUP", uint256(0));
         require(allowDev <= 1, "ALLOW_DEV_SETUP must be 0 or 1");
         setup.allowDevSetup = allowDev == 1;
@@ -339,18 +348,18 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         SetupFacts memory facts;
         facts.circuitId = setup.circuitId;
         facts.setupId = setup.setupId;
-        facts.requestVkHash = setup.requestVkHash;
-        facts.withdrawalVkHash = setup.withdrawalVkHash;
+        facts.vkHashes = setup.vkHashes;
         facts.ceremonyPinned = vm.exists(CEREMONY_MANIFEST);
         if (facts.ceremonyPinned) {
             string memory ceremony = vm.readFile(CEREMONY_MANIFEST);
             require(
                 _eq(vm.parseJsonString(ceremony, ".circuit_id"), CIRCUIT_ID)
                     && _eq(vm.parseJsonString(ceremony, ".setup_id"), CEREMONY_SETUP_ID),
-                "protocol/setup/v2-concession/manifest.json is not the zkapi-v2-concession-v1 mpc-1 setup"
+                "protocol/setup/v2-concession/manifest.json is not the zkapi-v2-concession-v2 mpc-1 setup"
             );
-            facts.ceremonyRequestVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.request");
-            facts.ceremonyWithdrawalVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.withdrawal");
+            for (uint256 k = 0; k < kinds.length; ++k) {
+                facts.ceremonyVkHashes[k] = vm.parseJsonBytes32(ceremony, string.concat(".vk_keccak256.", kinds[k]));
+            }
         }
         _checkSetupPolicy(facts, local, setup.allowDevSetup);
     }
@@ -455,19 +464,33 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         d.paymasterOwnershipPending = handover;
     }
 
-    /// The adapter compiled into this script verifies the setup in SETUP_MANIFEST.
+    /// The adapter compiled into this script verifies the setup in SETUP_MANIFEST: its circuit and
+    /// all five verifying keys.
     function _checkAdapter(Groth16ProofAdapter adapter, Setup memory setup) internal view {
         require(adapter.CIRCUIT_ID_HASH() == keccak256(bytes(setup.circuitId)), "adapter CIRCUIT_ID_HASH != manifest");
-        require(adapter.REQUEST_VK_HASH() == setup.requestVkHash, "adapter REQUEST_VK_HASH != manifest");
-        require(adapter.WITHDRAWAL_VK_HASH() == setup.withdrawalVkHash, "adapter WITHDRAWAL_VK_HASH != manifest");
+        // In SetupPolicy._vkKinds() order.
+        bytes32[5] memory compiled = [
+            adapter.REQUEST_VK_HASH(),
+            adapter.WITHDRAWAL_VK_HASH(),
+            adapter.INSERTION1_VK_HASH(),
+            adapter.INSERTION4_VK_HASH(),
+            adapter.INSERTION16_VK_HASH()
+        ];
+        string[5] memory names = [
+            "REQUEST_VK_HASH", "WITHDRAWAL_VK_HASH", "INSERTION1_VK_HASH", "INSERTION4_VK_HASH", "INSERTION16_VK_HASH"
+        ];
+        for (uint256 k = 0; k < compiled.length; ++k) {
+            require(compiled[k] == setup.vkHashes[k], string.concat("adapter ", names[k], " != manifest"));
+        }
     }
 
-    /// Post-deploy checks: the vault's getters equal the inputs and the expected constants.
+    /// Post-deploy checks: the vault's getters equal the inputs and the expected constants, and it
+    /// starts empty (the empty request tree's root, no note recorded or activated).
     function _checkVault(Deployed memory d, Params memory p) internal view {
         ZkApiVault vault = d.vault;
         require(vault.PROTOCOL_VERSION() == 2, "PROTOCOL_VERSION");
         require(vault.CONCESSION_ESCAPE_VERSION() == 1, "CONCESSION_ESCAPE_VERSION");
-        require(vault.ROOT_HISTORY_WINDOW() == 1 days, "ROOT_HISTORY_WINDOW");
+        require(vault.NOTE_BOUND_EXIT_VERSION() == 1, "NOTE_BOUND_EXIT_VERSION");
         require(address(vault.proofAdapter()) == address(d.adapter), "proofAdapter");
         require(vault.owner() == p.owner && vault.treasury() == p.treasury, "owner or treasury");
         require(
@@ -480,7 +503,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
                 && vault.clearanceSigningKeyX() == p.clearanceKeyX && vault.clearanceSigningKeyY() == p.clearanceKeyY,
             "signing keys"
         );
-        require(vault.isKnownRoot(vault.currentRoot()), "empty root not recorded");
+        require(vault.currentRoot() == MerkleUpdateLib.EMPTY_ROOT, "currentRoot is not the empty tree's root");
+        require(vault.nextNoteId() == 0 && vault.activationCursor() == 0, "nextNoteId or activationCursor");
     }
 
     /// Post-deploy checks of the gasless block: the paymaster's and the factory's pins equal the
@@ -567,12 +591,16 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeUint(m, "protocolVersion", vault.PROTOCOL_VERSION());
         vm.serializeUint(m, "vaultRevision", VAULT_REVISION);
         vm.serializeUint(m, "concessionEscapeVersion", vault.CONCESSION_ESCAPE_VERSION());
+        vm.serializeUint(m, "noteBoundExitVersion", vault.NOTE_BOUND_EXIT_VERSION());
         vm.serializeString(m, "circuitId", setup.circuitId);
         vm.serializeString(m, "setupId", setup.setupId);
         vm.serializeBool(m, "allowDevSetup", setup.allowDevSetup);
         vm.serializeBytes32(m, "circuitIdHash", d.adapter.CIRCUIT_ID_HASH());
         vm.serializeBytes32(m, "requestVkKeccak256", d.adapter.REQUEST_VK_HASH());
         vm.serializeBytes32(m, "withdrawalVkKeccak256", d.adapter.WITHDRAWAL_VK_HASH());
+        vm.serializeBytes32(m, "insertion1VkKeccak256", d.adapter.INSERTION1_VK_HASH());
+        vm.serializeBytes32(m, "insertion4VkKeccak256", d.adapter.INSERTION4_VK_HASH());
+        vm.serializeBytes32(m, "insertion16VkKeccak256", d.adapter.INSERTION16_VK_HASH());
         vm.serializeAddress(m, "owner", p.owner);
         vm.serializeAddress(m, "vault", address(vault));
         vm.serializeAddress(m, "billingToken", vault.billingToken());
@@ -592,7 +620,6 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeUint(m, "pauseCooldown", vault.PAUSE_COOLDOWN());
         vm.serializeUint(m, "treasuryChangeDelay", vault.treasuryChangeDelay());
         vm.serializeUint(m, "unpauseClaimGrace", vault.unpauseClaimGrace());
-        vm.serializeUint(m, "rootHistoryWindow", vault.ROOT_HISTORY_WINDOW());
         // serializeUint writes values up to 2^64 - 1 as bare JSON numbers, which JavaScript rounds
         // above 2^53 - 1; key coordinates can be any field element, so they are decimal strings.
         vm.serializeString(m, "stateSigningKeyX", vm.toString(p.stateKeyX));

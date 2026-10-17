@@ -3,12 +3,20 @@ import { Interface, Transaction, Wallet, getAddress, id, isHexString, keccak256 
 // Configuration errors carry fixed, secret-free messages that startup may print.
 export class ConfigError extends Error {}
 
-export function parseChainId(value) {
-  if (value !== '1' && value !== '11155111') throw new ConfigError('Explicit challenge chain ID must be 1 or 11155111');
+// One sidecar instance signs for one daemon. Its profile selects the calls it
+// may sign and the prefix of its environment: the challenge signer of
+// zkapi-challenged reads ZKAPI_CHALLENGE_*, the activation signer of
+// zkapi-activated (ZKAPI_SIGNER_PROFILE=activation) ZKAPI_ACTIVATION_*. Each
+// has its own key, sender and fee caps.
+export const SIGNER_PROFILES = Object.freeze(['challenge', 'activation']);
+export const SIGNER_ENV_PREFIX = Object.freeze({ challenge: 'ZKAPI_CHALLENGE', activation: 'ZKAPI_ACTIVATION' });
+
+export function parseChainId(value, profile = 'challenge') {
+  if (value !== '1' && value !== '11155111') throw new ConfigError(`Explicit ${profile} chain ID must be 1 or 11155111`);
   return BigInt(value);
 }
-// The calls of the concession-exit challenger (vault revision 3, circuit
-// zkapi-v2-concession-v1): a defeat by a request proof at an escape's
+// The calls of the concession-exit challenger (vault revision 4, circuit
+// zkapi-v2-concession-v2): a defeat by a request proof at an escape's
 // successor nullifier, a raise by one at its escaped nullifier, and the
 // retirement of a closed note's leaf after a missed defeat. The revision-2
 // challenge with siblings (0x8a43467c) is refused.
@@ -17,6 +25,26 @@ export const CHALLENGE_ABI = `function challengeEscapeWithdrawal(uint32 noteId,$
 export const RAISE_ABI = `function raiseEscapeConcession(uint32 noteId,${REQUEST_INPUTS},bytes proof,uint128 amount)`;
 export const RETIRE_ABI = 'function retireClosedLeaf(uint32 noteId,uint256[32] siblings)';
 export const vaultInterface = new Interface([CHALLENGE_ABI, RAISE_ABI, RETIRE_ABI]);
+// The one call of the activation worker: a proved insertion batch of 1, 4 or
+// 16 notes aligned at the vault's activation cursor. The vault builds the
+// statement from its own storage, so the call carries no deployment binding.
+// The permissionless on-chain fallback (activateNotesOnChain, 0x027e21e9),
+// which the worker never sends, is refused like every other call.
+export const ACTIVATE_ABI = 'function activateNotes(uint32 firstNoteId,uint256 count,uint256 expectedRoot,uint256 newRoot,bytes proof)';
+export const activationInterface = new Interface([ACTIVATE_ABI]);
+export const ACTIVATION_BATCH_SIZES = Object.freeze([1n, 4n, 16n]);
+// Gas limit caps, above the largest call of each profile: a leaf retirement
+// takes about 2.0M (its 1,648,631 measured plus the challenger's 20%), a
+// 16-note activation about 720,000 (its 600,000 measured plus the worker's
+// 20%).
+export const DEFAULT_MAX_GAS = Object.freeze({ challenge: 12_000_000n, activation: 1_000_000n });
+const PROFILE_CALLS = Object.freeze({
+  challenge: {
+    calls: vaultInterface, label: 'Challenge',
+    refusal: 'Only canonical challengeEscapeWithdrawal, raiseEscapeConcession and retireClosedLeaf calls are authorized',
+  },
+  activation: { calls: activationInterface, label: 'Activation', refusal: 'Only canonical activateNotes calls are authorized' },
+});
 export const GWEI = 1_000_000_000n;
 export const DEFAULT_SEPOLIA_MAX_FEE_PER_GAS = 10n * GWEI;
 export const DEFAULT_PRIORITY_FEE_PER_GAS = 1n * GWEI;
@@ -25,9 +53,9 @@ export const ABSOLUTE_FEE_CEILING = 1_000_000n * GWEI;
 // geth's and reth's default --rpc.txfeecap: 1 ether of gas limit x maxFeePerGas.
 export const DEFAULT_TX_FEE_CAP = 10n ** 18n;
 export const UPSTREAM_TIMEOUT_MS = 8_000;
-// Leaf retirements (about 6M gas each) follow only a missed defeat, which is
-// rare and alarmed on, but any closed note simulates successfully, and a
-// copy that mines after the leaf is gone still pays about 5.9M gas before it
+// Leaf retirements (about 1.65M gas each) follow only a missed defeat, which
+// is rare and alarmed on, but any closed note simulates successfully, and a
+// copy that mines after the leaf is gone still pays about 1.6M gas before it
 // reverts StaleRoot. Retirement transactions signed per rolling day, one per
 // nonce, are capped so that a compromised caller cannot spend the float
 // meant for defeats and raises on them.
@@ -46,9 +74,9 @@ export const ESCAPE_FINALIZED_TOPIC = id('EscapeWithdrawalFinalized(uint32,uint2
 export const DEFAULT_RETIREMENT_LOOKBACK_BLOCKS = 50_400n;
 export const MAX_RETIREMENT_LOOKBACK_BLOCKS = 5_000_000n;
 export const RETIREMENT_LOG_RANGE_BLOCKS = 10_000n;
-// eth_getCode: zkapi-challenged checks the vault's, adapter's and Poseidon
-// library's runtime codehashes against its deployment manifest through this
-// RPC before it polls (design §5.5 startup probes).
+// eth_getCode: zkapi-challenged and zkapi-activated check the vault's,
+// adapter's and Poseidon library's runtime codehashes against their deployment
+// manifest through this RPC before they poll (design §5.5 startup probes).
 const readMethods = new Set([
   'eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getLogs',
   'eth_getTransactionReceipt', 'eth_getTransactionByHash',
@@ -123,25 +151,45 @@ function envBoolean(env, name) {
   if (value !== 'true' && value !== 'false') throw new ConfigError(`${name} must be true or false`);
   return value === 'true';
 }
+// Unset or empty means the challenge signer.
+export function parseSignerProfile(env) {
+  const value = env.ZKAPI_SIGNER_PROFILE;
+  if (value === undefined || value === '') return 'challenge';
+  if (!SIGNER_PROFILES.includes(value)) throw new ConfigError('ZKAPI_SIGNER_PROFILE must be challenge or activation');
+  return value;
+}
 export function parseSignerConfig(env) {
-  if (env.ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI !== undefined) {
+  const profile = parseSignerProfile(env);
+  const prefix = SIGNER_ENV_PREFIX[profile];
+  // One environment configures one signer: a copied environment file can
+  // never hand one daemon's key, vault or caps to the other's signer.
+  for (const other of SIGNER_PROFILES.filter(name => name !== profile)) {
+    const foreign = Object.keys(env).find(name => name.startsWith(`${SIGNER_ENV_PREFIX[other]}_`));
+    if (foreign) throw new ConfigError(`${foreign} configures the ${other} signer, not this ${profile} signer (ZKAPI_SIGNER_PROFILE)`);
+  }
+  if (profile === 'challenge' && env.ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI !== undefined) {
     throw new ConfigError('ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI is no longer supported; remove it and set ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI (the EIP-1559 fee cap in wei)');
   }
-  const port = envInteger(env, 'ZKAPI_CHALLENGE_PORT') ?? 8547n;
-  if (port > 65535n) throw new ConfigError('ZKAPI_CHALLENGE_PORT must be between 1 and 65535');
-  return {
-    chainId: parseChainId(env.ZKAPI_CHALLENGE_CHAIN_ID),
-    privateKey: env.ZKAPI_CHALLENGE_PRIVATE_KEY,
-    vault: env.ZKAPI_CHALLENGE_VAULT,
-    rpcUrl: env.ZKAPI_CHALLENGE_RPC_URL,
-    listenHost: env.ZKAPI_CHALLENGE_LISTEN_HOST || '127.0.0.1',
+  const port = envInteger(env, `${prefix}_PORT`) ?? 8547n;
+  if (port > 65535n) throw new ConfigError(`${prefix}_PORT must be between 1 and 65535`);
+  const config = {
+    profile,
+    chainId: parseChainId(env[`${prefix}_CHAIN_ID`], profile),
+    privateKey: env[`${prefix}_PRIVATE_KEY`],
+    vault: env[`${prefix}_VAULT`],
+    rpcUrl: env[`${prefix}_RPC_URL`],
+    listenHost: env[`${prefix}_LISTEN_HOST`] || '127.0.0.1',
     port: Number(port),
-    maxGas: envInteger(env, 'ZKAPI_CHALLENGE_MAX_GAS'),
-    maxFeePerGas: envInteger(env, 'ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI'),
-    priorityFeePerGas: envInteger(env, 'ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI'),
-    maxPriorityFeePerGas: envInteger(env, 'ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI'),
-    feeCeiling: envInteger(env, 'ZKAPI_CHALLENGE_FEE_CEILING_WEI'),
-    txFeeCap: envInteger(env, 'ZKAPI_CHALLENGE_TX_FEE_CAP_WEI'),
+    maxGas: envInteger(env, `${prefix}_MAX_GAS`),
+    maxFeePerGas: envInteger(env, `${prefix}_MAX_FEE_PER_GAS_WEI`),
+    priorityFeePerGas: envInteger(env, `${prefix}_PRIORITY_FEE_PER_GAS_WEI`),
+    maxPriorityFeePerGas: envInteger(env, `${prefix}_MAX_PRIORITY_FEE_PER_GAS_WEI`),
+    feeCeiling: envInteger(env, `${prefix}_FEE_CEILING_WEI`),
+    txFeeCap: envInteger(env, `${prefix}_TX_FEE_CAP_WEI`),
+  };
+  if (profile !== 'challenge') return config;
+  return {
+    ...config,
     maxRetirementsPerDay: envCount(env, 'ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY', MAX_RETIREMENTS_PER_DAY_LIMIT),
     retireOnMiss: envBoolean(env, 'ZKAPI_CHALLENGE_RETIRE_ON_MISS'),
     retirementLookbackBlocks: envLookback(env, 'ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS'),
@@ -177,11 +225,14 @@ export function createUpstream(url, { timeoutMs = UPSTREAM_TIMEOUT_MS } = {}) {
   };
 }
 
-export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, retireOnMiss, retirementLookbackBlocks, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
+export function createSigner({ profile = 'challenge', privateKey, vault, rpc, chainId, maxGas = DEFAULT_MAX_GAS[profile], maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, retireOnMiss, retirementLookbackBlocks, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
   requireValid(Object.keys(unsupported).length === 0, 'Unsupported signer option');
-  requireValid(chainId === 1n || chainId === 11155111n, 'Explicit challenge chain ID must be 1 or 11155111');
+  requireValid(SIGNER_PROFILES.includes(profile), 'Unsupported signer profile');
+  const challenger = profile === 'challenge';
+  const { calls, label, refusal } = PROFILE_CALLS[profile];
+  requireValid(chainId === 1n || chainId === 11155111n, `Explicit ${profile} chain ID must be 1 or 11155111`);
   // Mainnet never inherits the testnet default; null counts as unset.
-  requireValid(maxFeePerGas != null || chainId !== 1n, 'Mainnet requires an explicit ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI');
+  requireValid(maxFeePerGas != null || chainId !== 1n, `Mainnet requires an explicit ${SIGNER_ENV_PREFIX[profile]}_MAX_FEE_PER_GAS_WEI`);
   const feeCapSource = maxFeePerGas == null ? 'default' : 'explicit';
   maxFeePerGas ??= DEFAULT_SEPOLIA_MAX_FEE_PER_GAS;
   let wallet;
@@ -193,42 +244,48 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   const positive = value => typeof value === 'bigint' && value > 0n;
   requireValid(positive(feeCeiling) && feeCeiling <= ABSOLUTE_FEE_CEILING, 'Fee ceiling is invalid');
   requireValid(positive(txFeeCap), 'Transaction fee cap is invalid');
-  maxRetirementsPerDay ??= DEFAULT_MAX_RETIREMENTS_PER_DAY;
-  requireValid(typeof maxRetirementsPerDay === 'bigint' && maxRetirementsPerDay >= 0n && maxRetirementsPerDay <= MAX_RETIREMENTS_PER_DAY_LIMIT, 'Retirement budget is invalid');
-  retireOnMiss ??= true;
-  requireValid(typeof retireOnMiss === 'boolean', 'Retirement policy is invalid');
-  retirementLookbackBlocks ??= DEFAULT_RETIREMENT_LOOKBACK_BLOCKS;
-  requireValid(typeof retirementLookbackBlocks === 'bigint' && retirementLookbackBlocks > 0n
-    && retirementLookbackBlocks <= MAX_RETIREMENT_LOOKBACK_BLOCKS, 'Retirement lookback is invalid');
+  if (challenger) {
+    maxRetirementsPerDay ??= DEFAULT_MAX_RETIREMENTS_PER_DAY;
+    requireValid(typeof maxRetirementsPerDay === 'bigint' && maxRetirementsPerDay >= 0n && maxRetirementsPerDay <= MAX_RETIREMENTS_PER_DAY_LIMIT, 'Retirement budget is invalid');
+    retireOnMiss ??= true;
+    requireValid(typeof retireOnMiss === 'boolean', 'Retirement policy is invalid');
+    retirementLookbackBlocks ??= DEFAULT_RETIREMENT_LOOKBACK_BLOCKS;
+    requireValid(typeof retirementLookbackBlocks === 'bigint' && retirementLookbackBlocks > 0n
+      && retirementLookbackBlocks <= MAX_RETIREMENT_LOOKBACK_BLOCKS, 'Retirement lookback is invalid');
+  } else {
+    requireValid([maxRetirementsPerDay, retireOnMiss, retirementLookbackBlocks].every(value => value == null), 'Retirement settings apply only to the challenge signer');
+  }
   requireValid(positive(maxFeePerGas) && maxFeePerGas <= feeCeiling, 'Fee cap is invalid or exceeds the fee ceiling');
   requireValid(maxPriorityFeePerGas == null || (positive(maxPriorityFeePerGas) && maxPriorityFeePerGas <= maxFeePerGas), 'Priority fee cap is invalid or exceeds the fee cap');
   priorityFeePerGas ??= min(DEFAULT_PRIORITY_FEE_PER_GAS, maxPriorityFeePerGas ?? maxFeePerGas);
   requireValid(positive(priorityFeePerGas), 'Default priority fee is invalid or exceeds the priority fee cap');
   // A small multiple of the default tip, so a caller cannot make every
-  // challenge pay the whole fee cap as tip unless the operator opts in.
+  // transaction pay the whole fee cap as tip unless the operator opts in.
   maxPriorityFeePerGas ??= min(maxFeePerGas, 10n * priorityFeePerGas);
   requireValid(priorityFeePerGas <= maxPriorityFeePerGas, 'Default priority fee is invalid or exceeds the priority fee cap');
   const feeBounds = { max_fee_per_gas: hex(maxFeePerGas), max_priority_fee_per_gas: hex(maxPriorityFeePerGas) };
   let queue = Promise.resolve();
 
   const policy = Object.freeze({
-    sender, vault: destination, transaction_type: '0x2', fee_cap_source: feeCapSource,
+    profile, sender, vault: destination, transaction_type: '0x2', fee_cap_source: feeCapSource,
     max_fee_per_gas: hex(maxFeePerGas), priority_fee_per_gas: hex(priorityFeePerGas),
     max_priority_fee_per_gas: hex(maxPriorityFeePerGas), fee_ceiling: hex(feeCeiling), tx_fee_cap_wei: hex(txFeeCap),
     max_gas: hex(maxGas), required_balance: hex(maxGas * maxFeePerGas),
-    max_retirements_per_day: Number(maxRetirementsPerDay),
-    retire_on_miss: retireOnMiss, retirement_lookback_blocks: Number(retirementLookbackBlocks),
+    ...(challenger && {
+      max_retirements_per_day: Number(maxRetirementsPerDay),
+      retire_on_miss: retireOnMiss, retirement_lookback_blocks: Number(retirementLookbackBlocks),
+    }),
   });
 
   // The leaf retirements broadcast (or possibly broadcast) in the last
   // RETIREMENT_WINDOW_MS, one entry per (note, nonce), by first signing time.
   // Each entry is one unit of the budget: a nonce mines at most one
-  // transaction, and every retirement that mines costs about 6M gas, even
+  // transaction, and every retirement that mines costs about 1.65M gas, even
   // one that reverts StaleRoot because the leaf is already gone. A fee
   // replacement or re-send on a counted nonce therefore needs no new budget.
   // The same note on another nonce takes a new unit, and only once every
   // earlier counted nonce of that note is mined (retirement_in_flight):
-  // copies cannot queue behind a pending retirement, each to pay about 5.9M
+  // copies cannot queue behind a pending retirement, each to pay about 1.6M
   // gas to revert once the first lands. A retirement refused for the budget
   // is counted and reported (status, /health, audit log). Kept in memory: a
   // restart of this sidecar starts a new window.
@@ -290,7 +347,9 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       note_id: hex(BigInt(note)), lookback_blocks: hex(retirementLookbackBlocks),
     });
   }
+  // The challenge signer's only; the activation signer reports none.
   function retirementStatus() {
+    if (!challenger) return {};
     const refusedRecently = lastRetirementRefusal !== null && lastRetirementRefusal > now() - RETIREMENT_WINDOW_MS;
     return {
       retirements_last_24h: retirementsInWindow(),
@@ -319,7 +378,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     if (loggedHashes.has(hash)) return null;
     evictOldest(loggedHashes, hash); loggedHashes.add(hash);
     return {
-      event: 'challenge_signed', nonce: transaction.nonce, transaction_hash: hash,
+      event: `${profile}_signed`, nonce: transaction.nonce, transaction_hash: hash,
       max_fee_per_gas_wei: transaction.maxFeePerGas.toString(10),
       max_priority_fee_per_gas_wei: transaction.maxPriorityFeePerGas.toString(10),
     };
@@ -333,7 +392,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     const transition = `${code}|${reason}|${message}`;
     if (lastRefusal.get(nonce) === transition) return null;
     evictOldest(lastRefusal, nonce); lastRefusal.set(nonce, transition);
-    const line = { event: 'challenge_refused', nonce, code, reason, message };
+    const line = { event: `${profile}_refused`, nonce, code, reason, message };
     for (const [name, value] of Object.entries(details)) {
       if (name === 'transaction_hash') line.transaction_hash = value;
       else line[weiDetails.has(name) ? `${name}_wei` : name] = BigInt(value).toString(10);
@@ -401,10 +460,14 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     requireValid(isHexString(tx.data) && tx.data.length <= 16_386, 'Invalid calldata');
     let call;
     try {
-      call = vaultInterface.parseTransaction({ data: tx.data });
-      if (!call || vaultInterface.encodeFunctionData(call.fragment, call.args).toLowerCase() !== tx.data.toLowerCase()) throw new Error();
-    } catch { throw new RpcError(-32602, 'Only canonical challengeEscapeWithdrawal, raiseEscapeConcession and retireClosedLeaf calls are authorized'); }
-    if (call.name !== 'retireClosedLeaf') {
+      call = calls.parseTransaction({ data: tx.data });
+      if (!call || calls.encodeFunctionData(call.fragment, call.args).toLowerCase() !== tx.data.toLowerCase()) throw new Error();
+    } catch { throw new RpcError(-32602, refusal); }
+    if (call.name === 'activateNotes') {
+      // The vault refuses any other batch; the simulation then checks its cursor and root.
+      requireValid(ACTIVATION_BATCH_SIZES.includes(call.args.count) && call.args.firstNoteId % call.args.count === 0n, 'Activation must be an aligned batch of 1, 4 or 16 notes');
+      requireValid(isHexString(call.args.proof, 256), 'Activation requires a 256-byte Groth16 proof');
+    } else if (call.name !== 'retireClosedLeaf') {
       // A defeat or raise carries a request proof, which must be this deployment's.
       requireValid(call.args.inputs.protocolVersion === 2n && call.args.inputs.chainId === chainId && address(call.args.inputs.contractAddress) === destination, 'Challenge proof targets another deployment');
       requireValid(isHexString(call.args.proof, 256), 'Challenge requires a 256-byte Groth16 proof');
@@ -416,7 +479,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     try { return await call(); }
     catch (error) {
       // Includes provider errors such as rate limits: transient, never invalid evidence.
-      if (error instanceof RpcError && error.data?.reason === 'upstream_rejected') throw new RpcError(-32000, 'Challenge simulation failed', 'simulation_failed');
+      if (error instanceof RpcError && error.data?.reason === 'upstream_rejected') throw new RpcError(-32000, `${label} simulation failed`, 'simulation_failed');
       throw error;
     }
   }
@@ -432,7 +495,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   // hash and upstream_tx_fee_cap, which the node answers before its pool.
   async function signAndSend(tx) {
     const transaction = validateTransaction(tx);
-    const call = vaultInterface.parseTransaction({ data: transaction.data });
+    const call = calls.parseTransaction({ data: transaction.data });
     const retiredNote = call.name === 'retireClosedLeaf' ? call.args.noteId.toString(10) : null;
     if (retiredNote !== null && !retireOnMiss) {
       throw new RpcError(-32003, 'Leaf retirements are off (ZKAPI_CHALLENGE_RETIRE_ON_MISS=false)', 'retirement_disabled');
@@ -499,7 +562,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   }
 
   return {
-    sender, vault: destination, chainId, policy, checkChain, status,
+    profile, sender, vault: destination, chainId, policy, checkChain, status,
     retirementStatus: () => {
       const { refused_recently: _, ...retirement } = retirementStatus();
       return retirement;

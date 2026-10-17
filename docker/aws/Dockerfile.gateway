@@ -2,7 +2,7 @@ FROM nginx:1.28-alpine
 
 # Public proving artifacts must come from the same checkout as the daemon image,
 # and be built with the same ALLOW_DEV_SETUP (compose.yml passes it to both):
-# the ceremony setup of circuit zkapi-v2-concession-v1 by default, or with
+# the ceremony setup of circuit zkapi-v2-concession-v2 by default, or with
 # ALLOW_DEV_SETUP=1 the single-party development setup. nginx serves only
 # request.pk, withdrawal.pk and manifest.json; until G-SETUP commits the
 # ceremony keys those routes answer 404 in a default build.

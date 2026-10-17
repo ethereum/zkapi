@@ -4,9 +4,10 @@
 // protocol/contracts/test/fixtures/withdrawal-golden.json holds a real kind-0
 // escape and kind-1 close proof (vault-challenge.json's escape_a2_concede and
 // close_b0), their exact calldata, and the deployment and deposits they land
-// on. Forge's WithdrawalGoldenTest pins it to abi.encodeCall against the real
-// vault. This script runs every encoder on it and submits each one's output
-// to a vault deployed on a fresh Anvil:
+// on (exits are note-bound: neither note is activated). Forge's
+// WithdrawalGoldenTest pins it to abi.encodeCall against the real vault. This
+// script runs every encoder on it and submits each one's output to a vault
+// deployed on a fresh Anvil:
 //
 //   rust-serverd    zkapi-serverd watcher::withdrawal_calldata (Rust challenger/server)
 //   rust-companion  zkapi-companion chain::withdrawal_calldata (Rust wallet companion)
@@ -63,7 +64,7 @@ function update() {
   });
   const printed = Object.fromEntries(log.split('\n').map(line => /^\s*([a-z_]+)=(0x[0-9a-f]+)\s*$/.exec(line))
     .filter(Boolean).map(([, key, value]) => [key, value]));
-  for (const key of ['deposit_a', 'deposit_b', 'escape', 'close', 'active_root']) assert.ok(printed[key], `forge printed no ${key}`);
+  for (const key of ['deposit_a', 'deposit_b', 'escape', 'close']) assert.ok(printed[key], `forge printed no ${key}`);
   const statement = name => ({
     public_inputs: fixtures[name].public_inputs,
     proof: Buffer.from(fixtures[name].proof_hex.slice(2), 'hex').toString('base64'),
@@ -71,7 +72,7 @@ function update() {
     inputs_abi: fixtures[name].inputs_abi,
   });
   const golden = {
-    description: 'Shared withdrawal golden vector (design §11 WP-F): a real kind-0 escape (conceding 100,000) and a real kind-1 close of circuit zkapi-v2-concession-v1, setup dev, with their calldata as Solidity abi.encodeCall encodes them against the real vault (WithdrawalGoldenTest), and the deployment and deposits they land on. The Rust (zkapi-serverd, zkapi-companion), JS (sdk/wallet.js) and Go (zkapi-clientd) encoders must produce exactly `calldata`; scripts/check-withdrawal-golden.mjs submits each encoder\'s output to this deployment on Anvil. Regenerate: node scripts/check-withdrawal-golden.mjs --update.',
+    description: 'Shared withdrawal golden vector (design §11 WP-F): a real kind-0 escape (conceding 100,000) and a real kind-1 close of circuit zkapi-v2-concession-v2, setup dev, with their calldata as Solidity abi.encodeCall encodes them against the real vault (WithdrawalGoldenTest), and the deployment and deposits they land on. The Rust (zkapi-serverd, zkapi-companion), JS (sdk/wallet.js) and Go (zkapi-clientd) encoders must produce exactly `calldata`; scripts/check-withdrawal-golden.mjs submits each encoder\'s output to this deployment on Anvil. Regenerate: node scripts/check-withdrawal-golden.mjs --update.',
     source: { fixture: 'protocol/contracts/test/fixtures/vault-challenge.json', escape: 'escape_a2_concede', close: 'close_b0' },
     circuit_id: fixtures.circuit_id,
     setup_id: fixtures.setup_id,
@@ -86,7 +87,6 @@ function update() {
       { note_id: 0, value_wei: DEPOSIT_WEI.toString(), calldata: printed.deposit_a },
       { note_id: 1, value_wei: DEPOSIT_WEI.toString(), calldata: printed.deposit_b },
     ],
-    active_root: printed.active_root,
     escape: { ...statement('escape_a2_concede'), state_balance: '790000', calldata: printed.escape },
     close: { ...statement('close_b0'), calldata: printed.close },
   };
@@ -200,7 +200,7 @@ async function deploy(rpc, golden) {
     data: linked(artifact('ZkApiVault'), { 'src/libraries/Bn254Poseidon.sol:Bn254Poseidon': poseidon.contractAddress }) + args.join('') });
   assert.equal(vault.status, '0x1');
   assert.equal(vault.contractAddress.toLowerCase(), d.vault.toLowerCase(), 'the vault is at the address the proofs bind');
-  // The deposits, at the fixture's time (the leaves hold the bucketed expiry).
+  // The deposits, at the fixture's time (the notes record the bucketed expiry).
   await rpc('anvil_impersonateAccount', [golden.depositor]);
   await rpc('anvil_setBalance', [golden.depositor, hex(10n ** 20n)]);
   await rpc('evm_setNextBlockTimestamp', [hex(golden.timestamp)]);
@@ -208,13 +208,27 @@ async function deploy(rpc, golden) {
     const receipt = await send(rpc, { from: golden.depositor, to: d.vault, value: hex(deposit.value_wei), data: deposit.calldata });
     assert.equal(receipt.status, '0x1', `deposit of note ${deposit.note_id}`);
   }
-  const root = await rpc('eth_call', [{ to: d.vault, data: '0xfdab463d' }, 'latest']);
-  assert.equal(BigInt(root), BigInt(golden.active_root), 'the deposits rebuild the proofs\' root');
+  // Each statement names its note as recorded; no activation is needed.
+  for (const call of ['escape', 'close']) await assertBound(rpc, d.vault, golden[call].public_inputs);
+  assert.equal(BigInt(await rpc('eth_call', [{ to: d.vault, data: '0x93e0ce4e' }, 'latest'])), 0n, 'no note is activated');
+}
+
+// notes(noteId) word i.
+async function noteWords(rpc, vault, noteId) {
+  const words = await rpc('eth_call', [{ to: vault, data: `0x9f18e4ed${word(noteId)}` }, 'latest']);
+  return index => BigInt(`0x${words.slice(2 + index * 64, 2 + (index + 1) * 64)}`);
+}
+
+// The statement's registration commitment and note metadata are what the vault recorded.
+async function assertBound(rpc, vault, inputs) {
+  const note = await noteWords(rpc, vault, inputs.note_id);
+  assert.equal(note(0), BigInt(inputs.registration_commitment), `note ${inputs.note_id}: registration commitment`);
+  assert.equal(note(1), BigInt(inputs.deposit_amount), `note ${inputs.note_id}: deposit amount`);
+  assert.equal(note(2), BigInt(inputs.expiry), `note ${inputs.note_id}: expiry`);
 }
 
 async function noteStatus(rpc, vault, noteId) {
-  const words = await rpc('eth_call', [{ to: vault, data: `0x9f18e4ed${word(noteId)}` }, 'latest']);
-  return Number(BigInt(`0x${words.slice(2 + 3 * 64, 2 + 4 * 64)}`));
+  return Number((await noteWords(rpc, vault, noteId))(3));
 }
 
 async function submit(rpc, golden, name, output) {

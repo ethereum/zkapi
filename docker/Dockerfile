@@ -1,7 +1,7 @@
 FROM rust:bookworm AS builder
 
-# The operator image runs native ETH API, indexer and challenge services.
-# The browser SDK and host application build separately.
+# The operator image runs native ETH API, indexer, challenge and activation
+# services. The browser SDK and host application build separately.
 WORKDIR /app
 
 # Unset (the default): the daemons accept only the pinned ceremony keys
@@ -36,7 +36,8 @@ WORKDIR /srv/zkapi
 COPY --from=builder /app/target/release/zkapi /usr/local/bin/zkapi
 COPY --from=builder /app/target/release/zkapi-indexerd /usr/local/bin/zkapi-indexerd
 COPY --from=builder /app/target/release/zkapi-challenged /usr/local/bin/zkapi-challenged
-# The setup of circuit zkapi-v2-concession-v1 the daemons load. By default the
+COPY --from=builder /app/target/release/zkapi-activated /usr/local/bin/zkapi-activated
+# The setup of circuit zkapi-v2-concession-v2 the daemons load. By default the
 # ceremony setup: a release build loads only its pinned mpc-1 keys, which
 # G-SETUP commits, and until then the daemons refuse to start. With
 # ALLOW_DEV_SETUP=1, the single-party development setup.

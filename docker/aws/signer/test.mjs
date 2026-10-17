@@ -3,13 +3,14 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { dirname } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Interface, Transaction, Wallet, keccak256 } from 'ethers';
 import {
   ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_TX_FEE_CAP, ESCAPE_FINALIZED_TOPIC, GWEI, RpcError, UPSTREAM_TIMEOUT_MS,
-  createSigner, createUpstream, parseChainId, parseSignerConfig, vaultInterface,
+  activationInterface, createSigner, createUpstream, parseChainId, parseSignerConfig, parseSignerProfile, vaultInterface,
 } from './signer.mjs';
 import { createHttpServer } from './server.mjs';
 
@@ -28,6 +29,11 @@ const validTx = { from: sender, to: vault, data, gas: '0x7a1200', nonce: '0x4' }
 const legacyChallenge = new Interface([
   'function challengeEscapeWithdrawal(uint32 noteId,(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256) inputs,bytes proof,uint256[32] siblings)',
 ]).encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, proof, Array(32).fill(0)]);
+// The activation worker's proved batch, and the vault's permissionless
+// on-chain fallback, which the worker never sends.
+const activation = (firstNoteId = 4, count = 4, batchProof = proof) => activationInterface.encodeFunctionData('activateNotes', [firstNoteId, count, 11, 12, batchProof]);
+const onChainActivation = new Interface(['function activateNotesOnChain(uint32 firstNoteId,uint256 count,uint256[32] siblings)'])
+  .encodeFunctionData('activateNotesOnChain', [4, 4, Array(32).fill(0)]);
 const ONE_ETH = '0xde0b6b3a7640000';
 const wei = value => `0x${value.toString(16)}`;
 const fees = (maxFee, tip) => ({ maxFeePerGas: wei(maxFee), maxPriorityFeePerGas: wei(tip) });
@@ -119,6 +125,8 @@ test('rejects unauthorized transaction changes before any RPC or signature', asy
     { data: legacyChallenge },
     { data: new Interface(['function finalizeEscapeWithdrawal(uint32)']).encodeFunctionData('finalizeEscapeWithdrawal', [0]) },
     { data: new Interface(['function claimExpired(uint32)']).encodeFunctionData('claimExpired', [0]) },
+    // The activation worker's calls belong to the activation signer.
+    { data: activation() }, { data: onChainActivation },
   ];
   for (const modification of modifications) {
     const { signer, calls } = fixture();
@@ -658,7 +666,7 @@ test('RPC method allowlist excludes generic signing, account management, fee ora
 test('signer status reports policy, base fee, balance coverage and warnings', async () => {
   const healthy = await fixture().signer.handle('zkapi_signerStatus', []);
   assert.deepEqual(healthy, {
-    chain_id: '0xaa36a7', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
+    chain_id: '0xaa36a7', profile: 'challenge', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
     max_retirements_per_day: 2, retire_on_miss: true, retirement_lookback_blocks: 50400,
@@ -754,7 +762,7 @@ test('HTTP errors suppress provider details, carry structured refusal reasons, a
   const post = value => fetch(base, { method: 'POST', body: JSON.stringify(value) }).then(r => r.json());
   const health = await fetch(`${base}/health`).then(r => r.json());
   assert.deepEqual(health, {
-    status: 'ok', chain_id: Number(CHAIN_ID), sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
+    status: 'ok', chain_id: Number(CHAIN_ID), profile: 'challenge', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
     max_retirements_per_day: 2, retire_on_miss: true, retirement_lookback_blocks: 50400,
@@ -852,7 +860,7 @@ test('Mainnet refuses to start without an explicit fee cap; Sepolia uses a repor
     ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '2700000000000000000', ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '0',
   });
   assert.deepEqual(configured, {
-    chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '127.0.0.1', port: 65535, maxGas: 9_000_000n,
+    profile: 'challenge', chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '127.0.0.1', port: 65535, maxGas: 9_000_000n,
     maxFeePerGas: 300n * GWEI, priorityFeePerGas: 2n * GWEI, maxPriorityFeePerGas: 20n * GWEI, feeCeiling: 1_000n * GWEI,
     txFeeCap: 2_700_000_000_000_000_000n, maxRetirementsPerDay: 0n, retireOnMiss: undefined, retirementLookbackBlocks: undefined,
   });
@@ -992,7 +1000,10 @@ test('server process refuses unsafe fee configuration and prints only the safe r
   }
 });
 
-test('server process starts from strict configuration and prints its fee policy without key material', async t => {
+// Starts server.mjs against a stub upstream (Sepolia, a 9 gwei base fee and a
+// 1 wei balance) on a free port, with the environment `env(upstreamUrl, port)`
+// returns, and resolves its startup line.
+async function startSignerProcess(t, env) {
   const upstream = createServer(async (request, response) => {
     let body = '';
     for await (const chunk of request) body += chunk;
@@ -1009,23 +1020,27 @@ test('server process starts from strict configuration and prints its fee policy 
   await new Promise(resolve => probe.close(resolve));
   const child = spawn(process.execPath, ['server.mjs'], {
     cwd: here, stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      PATH: process.env.PATH, ZKAPI_CHALLENGE_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_PRIVATE_KEY: key, ZKAPI_CHALLENGE_VAULT: vault,
-      ZKAPI_CHALLENGE_RPC_URL: `http://127.0.0.1:${upstream.address().port}/private-api-key`, ZKAPI_CHALLENGE_PORT: String(port),
-      ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: '10000000000', ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI: '',
-      ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '100000000000000000',
-    },
+    env: { PATH: process.env.PATH, ...env(`http://127.0.0.1:${upstream.address().port}/private-api-key`, port) },
   });
   t.after(() => child.kill());
-  let stdout = '';
-  let stderr = '';
-  child.stderr.on('data', chunk => { stderr += chunk; });
+  const output = { stdout: '', stderr: '' };
+  child.stderr.on('data', chunk => { output.stderr += chunk; });
   const line = await new Promise((resolve, reject) => {
-    child.stdout.on('data', chunk => { stdout += chunk; if (stdout.includes('\n')) resolve(JSON.parse(stdout.split('\n')[0])); });
-    child.on('exit', code => reject(new Error(`signer exited with ${code}: ${stderr}`)));
+    child.stdout.on('data', chunk => { output.stdout += chunk; if (output.stdout.includes('\n')) resolve(JSON.parse(output.stdout.split('\n')[0])); });
+    child.on('exit', code => reject(new Error(`signer exited with ${code}: ${output.stderr}`)));
   });
+  return { line, port, output };
+}
+
+test('server process starts from strict configuration and prints its fee policy without key material', async t => {
+  const { line, port, output } = await startSignerProcess(t, (rpcUrl, listenPort) => ({
+    ZKAPI_CHALLENGE_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_PRIVATE_KEY: key, ZKAPI_CHALLENGE_VAULT: vault,
+    ZKAPI_CHALLENGE_RPC_URL: rpcUrl, ZKAPI_CHALLENGE_PORT: String(listenPort),
+    ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: '10000000000', ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI: '',
+    ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '100000000000000000',
+  }));
   assert.deepEqual(line, {
-    status: 'listening', chain_id: 11155111, sender: sender.toLowerCase(), vault, fee_model: 'eip1559', fee_cap_source: 'explicit',
+    status: 'listening', profile: 'challenge', chain_id: 11155111, sender: sender.toLowerCase(), vault, fee_model: 'eip1559', fee_cap_source: 'explicit',
     max_fee_per_gas_wei: '10000000000', priority_fee_per_gas_wei: '1000000000', max_priority_fee_per_gas_wei: '10000000000',
     // 0.1 ETH over 12M gas leaves 8.33 gwei per gas, below the 10 gwei fee cap.
     fee_ceiling_wei: '10000000000000', tx_fee_cap_wei: '100000000000000000', max_fee_per_gas_allowed_at_max_gas_wei: '8333333333',
@@ -1037,7 +1052,7 @@ test('server process starts from strict configuration and prints its fee policy 
   assert.equal(health.status, 'ok');
   assert.equal(health.max_fee_per_gas, wei(10n * GWEI));
   assert.equal(health.tx_fee_cap_wei, wei(10n ** 17n));
-  for (const secret of [key.slice(2), 'private-api-key']) assert.ok(!stdout.includes(secret) && !stderr.includes(secret));
+  for (const secret of [key.slice(2), 'private-api-key']) assert.ok(!output.stdout.includes(secret) && !output.stderr.includes(secret));
 });
 
 test('refusals and signatures are logged once per transition without provider details', async () => {
@@ -1065,4 +1080,222 @@ test('refusals and signatures are logged once per transition without provider de
   assert.deepEqual(lost.logs, [{ event: 'challenge_refused', nonce: 4, code: -32000, reason: 'broadcast_ambiguous', message: 'Transaction broadcast outcome is unknown', transaction_hash: keccak256(broadcasts(lost.calls)[0].params[0]) }]);
   const text = JSON.stringify([...logs, ...lost.logs]);
   for (const secret of [key.slice(2), 'private-api-key', broadcasts(lost.calls)[0].params[0].slice(2, 66), data.slice(2, 10)]) assert.ok(!text.includes(secret));
+});
+
+// The activation signer (ZKAPI_SIGNER_PROFILE=activation): a second instance
+// for zkapi-activated, with its own key, sender and caps, that signs the
+// worker's activateNotes and nothing else.
+const activateTx = { from: sender, to: vault, data: activation(), gas: wei(720_000n), nonce: '0x4' };
+const activationFixture = (overrides = {}, options = {}) => fixture({ eth_estimateGas: wei(600_000n), ...overrides }, { profile: 'activation', ...options });
+
+test('the activation signer signs aligned activateNotes batches by their pinned selector, as EIP-1559 within its own caps', async () => {
+  assert.equal(activationInterface.getFunction('activateNotes').selector, '0xa2b2c715');
+  assert.equal(onChainActivation.slice(0, 10), '0x027e21e9');
+  // The selector, four words, the proof's offset and length words and 256 bytes.
+  assert.equal((activation().length - 2) / 2, 452);
+  for (const [firstNoteId, count] of [[0, 1], [5, 1], [4, 4], [16, 16], [48, 16]]) {
+    const call = activation(firstNoteId, count);
+    const { signer, calls, logs } = activationFixture();
+    const hash = await signer.handle('eth_sendTransaction', [{ ...activateTx, data: call }]);
+    assert.deepEqual(calls.map(c => c.method), ['eth_chainId', 'eth_call', 'eth_estimateGas', 'eth_getBlockByNumber', 'eth_getBalance', 'eth_sendRawTransaction']);
+    assert.deepEqual(calls[1].params, [{ from: sender.toLowerCase(), to: vault, data: call, value: '0x0' }, 'latest']);
+    const signed = Transaction.from(calls.at(-1).params[0]);
+    assert.equal(signed.hash, hash);
+    assert.deepEqual([signed.type, signed.from, signed.to.toLowerCase(), signed.data, signed.value, signed.nonce, signed.gasLimit, signed.chainId],
+      [2, sender, vault, call, 0n, 4, 720_000n, CHAIN_ID]);
+    assert.deepEqual([signed.maxFeePerGas, signed.maxPriorityFeePerGas], [10n * GWEI, GWEI]);
+    assert.deepEqual(logs, [{ event: 'activation_signed', nonce: 4, transaction_hash: hash, max_fee_per_gas_wei: '10000000000', max_priority_fee_per_gas_wei: '1000000000' }]);
+  }
+  // Proposed fees within the activation signer's caps are signed exactly.
+  const { signer, calls } = activationFixture({}, { maxFeePerGas: 50n * GWEI, maxPriorityFeePerGas: 5n * GWEI });
+  await signer.handle('eth_sendTransaction', [{ ...activateTx, ...fees(30n * GWEI, 5n * GWEI) }]);
+  const bid = Transaction.from(broadcasts(calls)[0].params[0]);
+  assert.deepEqual([bid.maxFeePerGas, bid.maxPriorityFeePerGas], [30n * GWEI, 5n * GWEI]);
+});
+
+test('the activation signer refuses the challenger\'s calls, the on-chain fallback, other vault calls and malformed batches before any RPC', async () => {
+  const refusal = 'Only canonical activateNotes calls are authorized';
+  const batch = 'Activation must be an aligned batch of 1, 4 or 16 notes';
+  const shortProof = 'Activation requires a 256-byte Groth16 proof';
+  for (const [call, message] of [
+    [data, refusal],
+    [vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 5]), refusal],
+    [vaultInterface.encodeFunctionData('retireClosedLeaf', [9, Array(32).fill(0)]), refusal],
+    [legacyChallenge, refusal],
+    [onChainActivation, refusal],
+    [new Interface(['function deposit(bytes32,uint128)']).encodeFunctionData('deposit', [`0x${'11'.repeat(32)}`, 1]), refusal],
+    [new Interface(['function finalizeEscapeWithdrawal(uint32)']).encodeFunctionData('finalizeEscapeWithdrawal', [0]), refusal],
+    ['0xdeadbeef', refusal],
+    [`${activation()}00`, refusal],
+    [`${activation().slice(0, 10)}${'00'.repeat(32)}${activation().slice(10)}`, refusal],
+    [activation(0, 0), batch], [activation(0, 2), batch], [activation(0, 8), batch], [activation(0, 32), batch],
+    [activation(1, 4), batch], [activation(2, 4), batch], [activation(8, 16), batch],
+    [activation(4, 4, '0x00'), shortProof], [activation(4, 4, `0x${'00'.repeat(288)}`), shortProof],
+  ]) {
+    const { signer, calls, logs } = activationFixture();
+    await assert.rejects(signer.handle('eth_sendTransaction', [{ ...activateTx, data: call }]), { code: -32602, message }, call.slice(0, 74));
+    assert.equal(calls.length, 0);
+    assert.deepEqual(logs, [{ event: 'activation_refused', nonce: 4, code: -32602, reason: 'invalid_request', message }]);
+  }
+  // The transaction is bound as the challenger's is, under a 1M gas cap.
+  for (const [change, expected] of [
+    [{ gas: wei(1_000_001n) }, { code: -32602, message: 'Gas exceeds configured limit', data: { reason: 'gas_limit_exceeds_cap', max_gas: wei(1_000_000n) } }],
+    [{ to: sender }, { code: -32602, message: 'Destination is not authorized' }],
+    [{ from: vault }, { code: -32602, message: 'Sender is not authorized' }],
+    [{ value: '0x1' }, { code: -32602, message: 'Value must be zero' }],
+    [{ chainId: '0x1' }, { code: -32602, message: 'Chain ID does not match the configured chain' }],
+    [{ gasPrice: '0x1' }, { code: -32602, message: 'Unsupported transaction field' }],
+    [fees(10n * GWEI + 1n, GWEI), { code: -32602, data: { reason: 'fee_out_of_bounds', max_fee_per_gas: wei(10n * GWEI), max_priority_fee_per_gas: wei(10n * GWEI) } }],
+  ]) {
+    const { signer, calls } = activationFixture();
+    await assert.rejects(signer.handle('eth_sendTransaction', [{ ...activateTx, ...change }]), expected, JSON.stringify(change));
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('the activation signer simulates again: a stale batch is simulation_failed, and the gas, estimate and transaction fee bounds hold', async () => {
+  // StaleActivation() after a competing activation or retirement: the worker rebuilds.
+  const stale = activationFixture({ eth_call: new RpcError(-32000, 'Upstream RPC rejected the request', 'upstream_rejected') });
+  await assert.rejects(stale.signer.handle('eth_sendTransaction', [activateTx]), { code: -32000, message: 'Activation simulation failed', data: { reason: 'simulation_failed' } });
+  assert.equal(broadcasts(stale.calls).length, 0);
+  const estimate = activationFixture({ eth_estimateGas: wei(720_001n) });
+  await assert.rejects(estimate.signer.handle('eth_sendTransaction', [activateTx]), { code: -32602, data: { reason: 'gas_estimate_exceeds_limit', estimate: wei(720_001n) } });
+  assert.equal(broadcasts(estimate.calls).length, 0);
+  // 720,000 gas at the 10 gwei default bid is 0.0072 ETH.
+  const cap = 720_000n * 10n * GWEI - 1n;
+  const capped = activationFixture({}, { txFeeCap: cap });
+  await assert.rejects(capped.signer.handle('eth_sendTransaction', [activateTx]), {
+    code: -32003, data: { reason: 'tx_fee_above_cap', gas_limit: wei(720_000n), max_fee_per_gas: wei(10n * GWEI), tx_fee_cap_wei: wei(cap), max_fee_per_gas_allowed: wei(10n * GWEI - 1n) },
+  });
+  assert.deepEqual(capped.calls, []);
+  const required = 720_000n * 10n * GWEI;
+  const poor = activationFixture({ eth_getBalance: wei(required - 1n) });
+  await assert.rejects(poor.signer.handle('eth_sendTransaction', [activateTx]),
+    { code: -32003, data: { reason: 'insufficient_balance', balance: wei(required - 1n), required_balance: wei(required) } });
+  assert.equal(broadcasts(poor.calls).length, 0);
+});
+
+test('activation signer status and health report its profile and caps, without retirement fields', async t => {
+  const { signer } = activationFixture();
+  const policy = {
+    profile: 'activation', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
+    max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
+    fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: wei(1_000_000n), required_balance: wei(1_000_000n * 10n * GWEI),
+  };
+  assert.deepEqual(signer.policy, policy);
+  assert.deepEqual(await signer.handle('zkapi_signerStatus', []), {
+    chain_id: '0xaa36a7', ...policy, block_number: '0x10', base_fee_per_gas: '0x3b9aca00', balance: ONE_ETH, warnings: [],
+  });
+  // The 1M gas cap at the 10 gwei fee cap needs 0.01 ETH.
+  const low = await activationFixture({ eth_getBalance: wei(1_000_000n * 10n * GWEI - 1n) }).signer.handle('zkapi_signerStatus', []);
+  assert.deepEqual(low.warnings, ['balance_below_required']);
+  const server = createHttpServer(signer).listen(0, '127.0.0.1');
+  await once(server, 'listening'); t.after(() => server.close());
+  const health = await fetch(`http://127.0.0.1:${server.address().port}/health`).then(r => r.json());
+  assert.deepEqual(health, { status: 'ok', chain_id: Number(CHAIN_ID), ...policy });
+});
+
+test('ZKAPI_SIGNER_PROFILE=activation reads only ZKAPI_ACTIVATION_* and refuses the challenge signer\'s variables, and the reverse', () => {
+  for (const value of [undefined, '', 'challenge']) assert.equal(parseSignerProfile({ ZKAPI_SIGNER_PROFILE: value }), 'challenge');
+  assert.equal(parseSignerProfile({ ZKAPI_SIGNER_PROFILE: 'activation' }), 'activation');
+  for (const bad of ['ACTIVATION', 'activator', 'challenger', ' activation', 'worker']) {
+    assert.throws(() => parseSignerProfile({ ZKAPI_SIGNER_PROFILE: bad }), configError('ZKAPI_SIGNER_PROFILE must be challenge or activation'), bad);
+  }
+  const env = { ZKAPI_SIGNER_PROFILE: 'activation', ZKAPI_ACTIVATION_CHAIN_ID: '1', ZKAPI_ACTIVATION_PRIVATE_KEY: key, ZKAPI_ACTIVATION_VAULT: vault, ZKAPI_ACTIVATION_RPC_URL: 'https://rpc.invalid' };
+  const parsed = parseSignerConfig(env);
+  assert.deepEqual(parsed, {
+    profile: 'activation', chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '127.0.0.1', port: 8547, maxGas: undefined,
+    maxFeePerGas: undefined, priorityFeePerGas: undefined, maxPriorityFeePerGas: undefined, feeCeiling: undefined, txFeeCap: undefined,
+  });
+  const { rpcUrl, listenHost, port, ...options } = parsed;
+  assert.throws(() => createSigner({ ...options, rpc: async () => assert.fail('no RPC expected') }), { message: 'Mainnet requires an explicit ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI' });
+  const configured = parseSignerConfig({
+    ...env, ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI: '300000000000', ZKAPI_ACTIVATION_PRIORITY_FEE_PER_GAS_WEI: '2000000000',
+    ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI: '20000000000', ZKAPI_ACTIVATION_FEE_CEILING_WEI: '1000000000000',
+    ZKAPI_ACTIVATION_MAX_GAS: '800000', ZKAPI_ACTIVATION_PORT: '8548', ZKAPI_ACTIVATION_LISTEN_HOST: '0.0.0.0',
+    ZKAPI_ACTIVATION_TX_FEE_CAP_WEI: '500000000000000000',
+  });
+  assert.deepEqual(configured, {
+    profile: 'activation', chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '0.0.0.0', port: 8548, maxGas: 800_000n,
+    maxFeePerGas: 300n * GWEI, priorityFeePerGas: 2n * GWEI, maxPriorityFeePerGas: 20n * GWEI, feeCeiling: 1_000n * GWEI, txFeeCap: 5n * 10n ** 17n,
+  });
+  const { rpcUrl: _url, listenHost: _host, port: _port, ...configuredOptions } = configured;
+  const { policy } = createSigner({ ...configuredOptions, rpc: async () => assert.fail('no RPC expected') });
+  assert.deepEqual([policy.profile, policy.fee_cap_source, policy.max_gas, policy.max_fee_per_gas, policy.tx_fee_cap_wei],
+    ['activation', 'explicit', wei(800_000n), wei(300n * GWEI), wei(5n * 10n ** 17n)]);
+  for (const name of ['ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI', 'ZKAPI_ACTIVATION_PRIORITY_FEE_PER_GAS_WEI', 'ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI',
+    'ZKAPI_ACTIVATION_FEE_CEILING_WEI', 'ZKAPI_ACTIVATION_TX_FEE_CAP_WEI', 'ZKAPI_ACTIVATION_MAX_GAS', 'ZKAPI_ACTIVATION_PORT']) {
+    for (const bad of ['0', '0x10', '1e9', ' 5', '-1', '05', 'REPLACE_WITH_FEE_CAP_WEI']) {
+      assert.throws(() => parseSignerConfig({ ...env, [name]: bad }), configError(`${name} must be a positive decimal integer`), `${name}=${bad}`);
+    }
+  }
+  assert.throws(() => parseSignerConfig({ ...env, ZKAPI_ACTIVATION_PORT: '65536' }), configError('ZKAPI_ACTIVATION_PORT must be between 1 and 65535'));
+  for (const chain of [undefined, '', '137', '0x1']) {
+    assert.throws(() => parseSignerConfig({ ...env, ZKAPI_ACTIVATION_CHAIN_ID: chain }), configError('Explicit activation chain ID must be 1 or 11155111'), String(chain));
+  }
+  // One environment configures one signer, whatever the values.
+  for (const [name, value] of [['ZKAPI_CHALLENGE_PRIVATE_KEY', key], ['ZKAPI_CHALLENGE_VAULT', vault], ['ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY', ''], ['ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI', '1']]) {
+    assert.throws(() => parseSignerConfig({ ...env, [name]: value }), configError(`${name} configures the challenge signer, not this activation signer (ZKAPI_SIGNER_PROFILE)`), name);
+  }
+  const challengeEnv = { ZKAPI_CHALLENGE_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_PRIVATE_KEY: key, ZKAPI_CHALLENGE_VAULT: vault, ZKAPI_CHALLENGE_RPC_URL: 'https://rpc.invalid' };
+  assert.equal(parseSignerConfig({ ...challengeEnv, ZKAPI_SIGNER_PROFILE: 'challenge' }).profile, 'challenge');
+  for (const profile of [undefined, '', 'challenge']) {
+    assert.throws(() => parseSignerConfig({ ...challengeEnv, ZKAPI_SIGNER_PROFILE: profile, ZKAPI_ACTIVATION_PRIVATE_KEY: key }),
+      configError('ZKAPI_ACTIVATION_PRIVATE_KEY configures the activation signer, not this challenge signer (ZKAPI_SIGNER_PROFILE)'), String(profile));
+  }
+  // Leaf retirements belong to the challenge signer.
+  for (const option of [{ maxRetirementsPerDay: 1n }, { retireOnMiss: false }, { retirementLookbackBlocks: 10n }]) {
+    assert.throws(() => activationFixture({}, option), { message: 'Retirement settings apply only to the challenge signer' }, JSON.stringify(Object.keys(option)));
+  }
+  for (const profile of ['activator', null, 1]) assert.throws(() => fixture({}, { profile }), { message: 'Unsupported signer profile' }, String(profile));
+});
+
+test('the activation signer process starts from its own environment, prints its policy without key material and refuses the challenge signer\'s', async t => {
+  const { line, port, output } = await startSignerProcess(t, (rpcUrl, listenPort) => ({
+    ZKAPI_SIGNER_PROFILE: 'activation', ZKAPI_ACTIVATION_CHAIN_ID: '11155111', ZKAPI_ACTIVATION_PRIVATE_KEY: key, ZKAPI_ACTIVATION_VAULT: vault,
+    ZKAPI_ACTIVATION_RPC_URL: rpcUrl, ZKAPI_ACTIVATION_PORT: String(listenPort), ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI: '20000000000',
+  }));
+  assert.deepEqual(line, {
+    status: 'listening', profile: 'activation', chain_id: 11155111, sender: sender.toLowerCase(), vault, fee_model: 'eip1559', fee_cap_source: 'explicit',
+    max_fee_per_gas_wei: '20000000000', priority_fee_per_gas_wei: '1000000000', max_priority_fee_per_gas_wei: '10000000000',
+    fee_ceiling_wei: '10000000000000', tx_fee_cap_wei: '1000000000000000000', max_fee_per_gas_allowed_at_max_gas_wei: '1000000000000',
+    max_gas: '1000000', required_balance_wei: '20000000000000000', balance_wei: '1',
+    base_fee_per_gas_wei: '9000000000', warnings: ['balance_below_required'],
+  });
+  const health = await fetch(`http://127.0.0.1:${port}/health`).then(r => r.json());
+  assert.deepEqual([health.status, health.profile, health.max_gas, Object.hasOwn(health, 'retirements_last_24h')], ['ok', 'activation', wei(1_000_000n), false]);
+  for (const secret of [key.slice(2), 'private-api-key']) assert.ok(!output.stdout.includes(secret) && !output.stderr.includes(secret));
+  const base = { PATH: process.env.PATH, ZKAPI_SIGNER_PROFILE: 'activation', ZKAPI_ACTIVATION_PRIVATE_KEY: key, ZKAPI_ACTIVATION_VAULT: vault, ZKAPI_ACTIVATION_RPC_URL: 'http://127.0.0.1:1/private-api-key' };
+  for (const [env, reason] of [
+    [{ ZKAPI_ACTIVATION_CHAIN_ID: '1' }, 'Mainnet requires an explicit ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI'],
+    [{ ZKAPI_ACTIVATION_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_PRIVATE_KEY: key }, 'ZKAPI_CHALLENGE_PRIVATE_KEY configures the challenge signer, not this activation signer'],
+    [{ ZKAPI_ACTIVATION_CHAIN_ID: '11155111', ZKAPI_ACTIVATION_MAX_GAS: '0' }, 'ZKAPI_ACTIVATION_MAX_GAS must be a positive decimal integer'],
+    [{ ZKAPI_ACTIVATION_CHAIN_ID: '11155111' }, 'Upstream RPC request failed (upstream_unavailable)'],
+  ]) {
+    const result = spawnSync(process.execPath, ['server.mjs'], { cwd: here, encoding: 'utf8', timeout: 30_000, env: { ...base, ...env } });
+    assert.equal(result.status, 1, reason);
+    assert.ok(result.stderr.startsWith(`Activation signer startup failed: ${reason}`), result.stderr);
+    for (const secret of [key.slice(2), 'private-api-key']) assert.ok(!result.stderr.includes(secret) && !result.stdout.includes(secret));
+  }
+});
+
+test('each env example configures one signer profile, and its documented defaults are the signer\'s', async () => {
+  for (const [file, profile] of [['signer.env.example', 'challenge'], ['activation-signer.env.example', 'activation']]) {
+    const lines = (await readFile(join(here, '..', file), 'utf8')).split('\n');
+    const settings = pattern => Object.fromEntries(lines.map(line => pattern.exec(line)).filter(Boolean).map(([, name, value]) => [name, value]));
+    const required = settings(/^([A-Z0-9_]+)=(.*)$/);
+    const optional = settings(/^#([A-Z0-9_]+)=(.*)$/);
+    const prefix = profile === 'challenge' ? 'ZKAPI_CHALLENGE_' : 'ZKAPI_ACTIVATION_';
+    for (const name of [...Object.keys(required), ...Object.keys(optional)]) assert.ok(name.startsWith(prefix), `${file}: ${name}`);
+    // Compose sets the activation signer's profile.
+    const env = { ...required, ...(profile === 'activation' && { ZKAPI_SIGNER_PROFILE: profile }) };
+    assert.throws(() => parseSignerConfig(env), configError(`${prefix}MAX_FEE_PER_GAS_WEI must be a positive decimal integer`), file);
+    const filled = { ...env, [`${prefix}PRIVATE_KEY`]: key, [`${prefix}VAULT`]: vault, [`${prefix}MAX_FEE_PER_GAS_WEI`]: '10000000000' };
+    const policy = values => {
+      const { rpcUrl, listenHost, port, ...options } = parseSignerConfig(values);
+      assert.equal(options.profile, profile);
+      return createSigner({ ...options, rpc: async () => assert.fail('no RPC expected') }).policy;
+    };
+    assert.deepEqual(policy({ ...filled, ...optional }), policy(filled), file);
+  }
 });

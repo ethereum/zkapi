@@ -9,8 +9,8 @@ import {
 } from './v2-acceptance.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
     accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
-import { SELECTORS, TOPICS, bundleGas, checkUserOperation, decodeFailedOp, encodeGetUserOpHash, encodeHandleOps, estimateFromPolicy,
-    failedOpRpcError, packUserOperation, sponsoredKind, userOperationHash, userOperationReceipt, vaultCallOf } from './acceptance/mini-bundler.mjs';
+import { EXIT_CALL_BYTES, SELECTORS, TOPICS, bundleGas, checkUserOperation, decodeFailedOp, encodeGetUserOpHash, encodeHandleOps,
+    estimateFromPolicy, failedOpRpcError, packUserOperation, sponsoredKind, userOperationHash, userOperationReceipt, vaultCallOf } from './acceptance/mini-bundler.mjs';
 
 test('provider mock accounts only accepted calls against the issued child key', async () => {
     const mock = mockProvider('test-management');
@@ -173,11 +173,12 @@ test('drill timing passes serverd\'s and zkapi-challenged\'s startup checks, and
 
 test('profiles come only from a finalized Deploy.s.sol manifest', () => {
     const finalized = {
-        deploymentStatus: 'deployed', deployBlock: 7, chainId: CHAIN_ID, vaultRevision: 3, concessionEscapeVersion: 1,
+        deploymentStatus: 'deployed', deployBlock: 7, chainId: CHAIN_ID, vaultRevision: 4, concessionEscapeVersion: 1, noteBoundExitVersion: 1,
         vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
         poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
-        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
-        requestVkKeccak256: `0x${'11'.repeat(32)}`, withdrawalVkKeccak256: `0x${'22'.repeat(32)}`,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v2', setupId: 'dev', allowDevSetup: true,
+        requestVkKeccak256: `0x${'11'.repeat(32)}`, withdrawalVkKeccak256: `0x${'22'.repeat(32)}`, insertion1VkKeccak256: `0x${'a1'.repeat(32)}`,
+        insertion4VkKeccak256: `0x${'a4'.repeat(32)}`, insertion16VkKeccak256: `0x${'a6'.repeat(32)}`,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
         challengePeriod: 3_600, noteTtl: 2_592_000, maxPauseDuration: 7_200,
         // Deploy.s.sol writes the key coordinates as decimal strings.
@@ -193,13 +194,23 @@ test('profiles come only from a finalized Deploy.s.sol manifest', () => {
     assert.equal(profile.contract_address, '0xabcd000000000000000000000000000000000001');
     assert.equal(profile.clearance_signing_key.y, `0x${(2n ** 64n + 1n).toString(16).padStart(64, '0')}`);
     assert.equal(profile.exit_concession, 1);
-    assert.equal(profile.vault_revision, 3);
+    assert.equal(profile.vault_revision, 4);
     assert.equal(profile.settlement_window_seconds, 962);
     assert.equal(profile.allow_dev_setup, true);
+    // The server stack's profile pins all five verifying keys of the adapter.
+    assert.deepEqual([profile.request_vk_keccak256, profile.withdrawal_vk_keccak256, profile.insertion1_vk_keccak256,
+        profile.insertion4_vk_keccak256, profile.insertion16_vk_keccak256],
+    [finalized.requestVkKeccak256, finalized.withdrawalVkKeccak256, finalized.insertion1VkKeccak256, finalized.insertion4VkKeccak256,
+        finalized.insertion16VkKeccak256]);
     for (const status of ['pending', 'simulated']) {
         assert.throws(() => trustedDeployment({ ...finalized, deploymentStatus: status }, services), /finalized manifest/);
     }
     assert.throws(() => trustedDeployment({ ...finalized, deployBlock: undefined }, services), /deployBlock/);
+    // A revision-3 vault (root history, deposit-time paths) is not this deployment.
+    assert.throws(() => trustedDeployment({ ...finalized, vaultRevision: 3 }, services), /revision-4 vault/);
+    const withoutNoteBoundExits = { ...finalized };
+    delete withoutNoteBoundExits.noteBoundExitVersion;
+    assert.throws(() => trustedDeployment(withoutNoteBoundExits, services), /no note-bound exits/);
 });
 
 test('the companion\'s proxy admits only its own basic credentials', () => {
@@ -260,7 +271,7 @@ test('the gas ledger summarizes receipts by operation', () => {
 // scripts/deployment-profile.mjs: every consumer's profile from one finalized
 // manifest (migration runbook B2, step 5).
 test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, and clientd\'s own names', async () => {
-    const { clientdProfile, deploymentProfile, setupPins } = await import('./deployment-profile.mjs');
+    const { VERIFYING_KEYS, clientdProfile, deploymentProfile, setupPins } = await import('./deployment-profile.mjs');
     const fs = await import('node:fs');
     const os = await import('node:os');
     const path = await import('node:path');
@@ -269,11 +280,13 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
     const setupDir = path.join(root, 'protocol/setup/v2-concession-dev');
     const setup = JSON.parse(fs.readFileSync(path.join(setupDir, 'manifest.json'), 'utf8'));
     const finalized = {
-        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 3, concessionEscapeVersion: 1,
-        vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
+        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 4, concessionEscapeVersion: 1,
+        noteBoundExitVersion: 1, vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
         poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
-        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v2', setupId: 'dev', allowDevSetup: true,
         requestVkKeccak256: setup.vk_keccak256.request, withdrawalVkKeccak256: setup.vk_keccak256.withdrawal,
+        insertion1VkKeccak256: setup.vk_keccak256.insertion1, insertion4VkKeccak256: setup.vk_keccak256.insertion4,
+        insertion16VkKeccak256: setup.vk_keccak256.insertion16,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
         challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800,
         // Deploy.s.sol writes decimal coordinates; a 77-digit one would not
@@ -282,7 +295,13 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
     };
     const keyHashes = setupPins(setupDir, finalized);
     assert.equal(keyHashes.requestVk, setup.files['request.vk']);
-    assert.throws(() => setupPins(setupDir, { ...finalized, withdrawalVkKeccak256: `0x${'00'.repeat(32)}` }), /withdrawal verifying key/);
+    // Every one of the adapter's five verifying keys must be the setup's.
+    for (const [kind, field] of Object.entries(VERIFYING_KEYS)) {
+        assert.throws(() => setupPins(setupDir, { ...finalized, [field]: `0x${'00'.repeat(32)}` }), new RegExp(`${kind} verifying key`));
+        const missing = { ...finalized };
+        delete missing[field];
+        assert.throws(() => setupPins(setupDir, missing), new RegExp(`no ${field}`));
+    }
     assert.throws(() => setupPins(setupDir, { ...finalized, setupId: 'mpc-1' }), /setup dev/);
     const services = { protocolServerUrl: 'https://api.example', indexerUrl: 'https://indexer.example', rpcUrl: 'https://rpc.example',
         verifierUrl: 'https://verifier.example', priceFeed: '0x694AA1769357215DE4FAC081bf1f309aDC325306', settlementWindowSeconds: 14_705, keyHashes };
@@ -296,6 +315,7 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
     const placeholder = JSON.parse(fs.readFileSync(path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'), 'utf8'));
     const clientd = clientdProfile(placeholder, profile, finalized, keyHashes);
     assert.equal(clientd.deployment_status, 'deployed');
+    assert.equal(clientd.vault_revision, 4);
     assert.equal(clientd.deployment_id, 'zkapi-native-eth-sepolia-concession-v1');
     assert.equal(clientd.challenge_period_seconds, 43_200);
     assert.equal(clientd.note_ttl_seconds, 2_592_000);
@@ -366,11 +386,13 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
     const implementation = '0xAbCd000000000000000000000000000000000006';
     const creation = accountCreationCode(implementation);
     const finalized = {
-        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 3, concessionEscapeVersion: 1,
-        vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
+        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 4, concessionEscapeVersion: 1,
+        noteBoundExitVersion: 1, vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
         poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
-        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v2', setupId: 'dev', allowDevSetup: true,
         requestVkKeccak256: setup.vk_keccak256.request, withdrawalVkKeccak256: setup.vk_keccak256.withdrawal,
+        insertion1VkKeccak256: setup.vk_keccak256.insertion1, insertion4VkKeccak256: setup.vk_keccak256.insertion4,
+        insertion16VkKeccak256: setup.vk_keccak256.insertion16,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
         challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800,
         stateSigningKeyX: '1', stateSigningKeyY: '2', clearanceSigningKeyX: '3', clearanceSigningKeyY: '4',
@@ -646,8 +668,8 @@ test('mini bundler: v0.7 packing and the user operation hash match the golden ve
         paymasterVerificationGasLimit: undefined, paymasterPostOpGasLimit: undefined };
     assert.equal(packUserOperation(plain).paymasterAndData, '0x');
     assert.equal(packUserOperation(plain).initCode, '0x');
-    assert.equal(bundleGas([op]), 642_500n + 180_000n + 50_000n + 430_000n + 270_000n + 300_000n);
-    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 642_500n + 180_000n + 50_000n);
+    assert.equal(bundleGas([op]), 650_000n + 180_000n + 50_000n + 440_000n + 270_000n + 300_000n);
+    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 650_000n + 180_000n + 50_000n);
 });
 
 test('mini bundler: refuses malformed operations by field', () => {
@@ -751,6 +773,18 @@ test('mini bundler: estimates answer the profile\'s pinned defaults by kind', as
     const finalize = withdraw(`0xff8f5585${word(9)}`);
     assert.equal(sponsoredKind(finalize), 3);
     assert.equal(vaultCallOf(finalize), `0xff8f5585${word(9)}`);
-    assert.equal(sponsoredKind(withdraw(`0xa38d62aa${'00'.repeat(832)}`)), 2);
+    // A close or an escape is exactly the 868 bytes the paymaster parses: the 17-word statement, the
+    // proof's offset and length words and the proof.
+    assert.equal(EXIT_CALL_BYTES, 4 + 17 * 32 + 32 + 32 + 256);
+    assert.equal(SELECTORS.initiateEscapeWithdrawal, '0x8e110492');
+    assert.equal(SELECTORS.mutualClose, '0x5acd3b15');
+    assert.equal(sponsoredKind(withdraw(`0x8e110492${'00'.repeat(864)}`)), 2);
+    assert.equal(sponsoredKind(withdraw(`0x5acd3b15${'00'.repeat(864)}`)), 1);
+    // The revision-3 exits (16-word statement, 836 bytes) and any other length are not sponsored kinds.
+    assert.equal(sponsoredKind(withdraw(`0xa38d62aa${'00'.repeat(832)}`)), null);
+    assert.equal(sponsoredKind(withdraw(`0x72cd2e44${'00'.repeat(832)}`)), null);
+    assert.equal(sponsoredKind(withdraw(`0x8e110492${'00'.repeat(832)}`)), null);
+    assert.equal(sponsoredKind(withdraw(`0x5acd3b15${'00'.repeat(896)}`)), null);
+    assert.equal(sponsoredKind(withdraw(`0xff8f5585${word(9)}00`)), null);
     assert.equal(vaultCallOf('0x12345678'), null);
 });

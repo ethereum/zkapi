@@ -1,8 +1,14 @@
-# Deployment-bound challenge signer
+# Deployment-bound challenge and activation signer
 
-This internal JSON-RPC sidecar supplies `eth_sendTransaction` to
-`zkapi-challenged`. It signs only the three calls the concession-exit
-challenger makes (vault revision 3, circuit `zkapi-v2-concession-v1`), in their
+This internal JSON-RPC sidecar supplies `eth_sendTransaction` to one daemon.
+Each daemon gets an instance of its own, selected by `ZKAPI_SIGNER_PROFILE`:
+the challenge signer (the default) for `zkapi-challenged`, described below,
+and the [activation signer](#activation-profile) for the activation worker
+`zkapi-activated`. Each instance signs only its daemon's calls, for one
+configured vault and explicitly configured chain, from its own dedicated key.
+
+The challenge signer signs only the three calls the concession-exit
+challenger makes (vault revision 4, circuit `zkapi-v2-concession-v2`), in their
 canonical ABI encoding, for one configured vault and explicitly configured chain
 (Mainnet 1 or Sepolia 11155111), from its dedicated key, with zero ETH value:
 
@@ -13,8 +19,9 @@ canonical ABI encoding, for one configured vault and explicitly configured chain
 | `retireClosedLeaf(uint32, uint256[32])` | `0xe41f4c31` | Retire a closed note's leaf after a missed defeat. |
 
 The revision-2 challenge with a Merkle path (`0x8a43467c`) and every other
-vault call are refused, so this signer cannot serve an earlier challenger or
-vault: run it only in the stack of a concession-exit vault. It decodes the
+vault call, the activation worker's included, are refused, so this signer
+cannot serve an earlier challenger or vault: run it only in the stack of a
+concession-exit vault. It decodes the
 complete ABI, checks that a defeat's or raise's proof names this deployment and
 carries a 256-byte Groth16 proof, simulates the call again, and checks the gas,
 fee, transaction fee and balance bounds before signing an EIP-1559 (type 2)
@@ -35,6 +42,7 @@ leading zeros are refused, and an empty value means the default.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `ZKAPI_SIGNER_PROFILE` | `challenge` | `challenge` or `activation` (see [Activation profile](#activation-profile)); Compose sets it for each signer service. A challenge signer refuses to start while any `ZKAPI_ACTIVATION_` variable is present, and an activation signer while any `ZKAPI_CHALLENGE_` one is, so one environment file never configures both. |
 | `ZKAPI_CHALLENGE_PRIVATE_KEY` | required | Dedicated, funded sender key for this deployment. |
 | `ZKAPI_CHALLENGE_RPC_URL` | required | Upstream RPC for the chain: HTTPS, or HTTP on loopback only. |
 | `ZKAPI_CHALLENGE_CHAIN_ID` | required | Canonical `1` or `11155111`; no default or fallback. |
@@ -44,7 +52,7 @@ leading zeros are refused, and an empty value means the default.
 | `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | min(fee cap, 10 x default tip) | Tip cap: the highest `maxPriorityFeePerGas` the signer signs. At most the fee cap. |
 | `ZKAPI_CHALLENGE_FEE_CEILING_WEI` | 10,000 gwei; at most 1,000,000 gwei | Typo guard: the fee cap must not exceed it. |
 | `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` | 1 ETH (`1000000000000000000`) | Transaction fee cap: the highest gas limit x `maxFeePerGas` the signer signs, for proposed and default bids alike. Match the upstream node's `--rpc.txfeecap`; see [Node transaction fee cap](#node-transaction-fee-cap). The challenger reads its own copy from `deployment.env`. |
-| `ZKAPI_CHALLENGE_MAX_GAS` | 12,000,000; at most 16,777,216 | Gas limit cap. |
+| `ZKAPI_CHALLENGE_MAX_GAS` | 12,000,000; at most 16,777,216 | Gas limit cap. The largest call, a leaf retirement, needs about 2.0M; see [Node transaction fee cap](#node-transaction-fee-cap) for a lower cap. |
 | `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | `true`; `true` or `false` | The operator's retire-on-miss policy (design §5.4). Keep it equal to the challenger's `ZKAPI_CHALLENGE_RETIRE_ON_MISS` in `deployment.env`; `false` refuses every leaf retirement with `retirement_disabled`. |
 | `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` | 50,400 (about 7 days of 12 s blocks); 1 to 5,000,000 | How far back a leaf retirement's note must show an `EscapeWithdrawalFinalized` log. See [Retirement policy and budget](#retirement-policy-and-budget). |
 | `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` | 2; 0 to 1,000 | Nonces on which the signer signs a leaf retirement (`retireClosedLeaf`) per rolling 24 hours; fee replacements on a counted nonce are free, and 0 refuses every retirement. See [Retirement policy and budget](#retirement-policy-and-budget). |
@@ -111,7 +119,7 @@ below rather than far beyond it.
 A defeat or raise needs a pending escape and a request proof the vault
 accepts, so a caller can spend gas on them only as fast as real escapes need
 them. A leaf retirement needs only a `Closed` note and the current siblings:
-every closed note simulates successfully, each retirement costs about 6M gas,
+every closed note simulates successfully, each retirement costs about 1.65M gas,
 and each changes the vault root, so every request proof in flight must be made
 again at the new root. A compromised challenger host could otherwise spend the
 float meant for defeats and raises on the ever-growing set of closed notes.
@@ -136,8 +144,8 @@ The signer applies the same policy before it counts a retirement:
   replacements on a counted nonce are not checked again.
 
 The budget counts nonces, not notes. A nonce mines at most one transaction,
-and every retirement that mines pays about 6M gas, including a copy that
-mines after the leaf is gone: `verifyAndUpdate` hashes both paths before it
+and every retirement that mines pays about 1.65M gas, including a copy that
+mines after the leaf is gone: `retireClosedLeaf` hashes both paths before it
 reverts `StaleRoot`. The signer therefore signs retirements on at most
 `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` nonces (default 2) per rolling 24
 hours, each counted from its first signing:
@@ -178,18 +186,20 @@ that default, are:
 | --- | --- | --- |
 | Defeat | 600,000, or the estimate plus 20% when higher (estimated 0.33-0.40M) | about 1,666 gwei |
 | Raise | 450,000, or the estimate plus 20% when higher (estimated about 0.33M) | about 2,222 gwei |
-| Leaf retirement | the estimate plus 20%, about 7.2M (estimated about 6.0M) | about 138.9 gwei |
+| Leaf retirement | the estimate plus 20%, about 2.0M (1,648,631 measured) | about 500 gwei |
 
-The gas figures are the design estimates; re-measure them on the deployed
-vault. Defeats and raises are deadline-bound and fit any realistic fee cap. A
-leaf retirement follows a missed defeat, has no deadline, and is the only call
-the node's default cap constrains. To let it bid a higher fee cap, either:
+The defeat and raise figures are the design estimates, the retirement's CI's
+Forge measurement (`protocol/contracts/snapshots/activation-gas.json`);
+re-measure them on the deployed vault. Defeats and raises are deadline-bound
+and fit any realistic fee cap. A leaf retirement follows a missed defeat, has
+no deadline, and is the only call the node's default cap constrains. To let it
+bid a fee cap above about 500 gwei, either:
 
 - raise the node's `--rpc.txfeecap` and `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`
-  together, in `signer.env` and in `deployment.env`, for example to 3.6 ETH for
-  a 300 gwei fee cap at the default 12M `ZKAPI_CHALLENGE_MAX_GAS`; or
+  together, in `signer.env` and in `deployment.env`, for example to 1.5 ETH
+  for a 750 gwei fee cap at 2.0M gas; or
 - keep the fee cap within the transaction fee cap divided by its gas limit:
-  about 138.9 gwei at 1 ETH for 7.2M gas, or 125 gwei to leave room up to 8M.
+  about 500 gwei at 1 ETH for 2.0M gas, or 400 gwei to leave room up to 2.5M.
   A hosted provider's cap usually cannot be raised.
 
 The signer checks every bid, proposed or default, against
@@ -199,10 +209,11 @@ limit allows. Status warns `tx_fee_cap_below_fee_cap` while
 `ZKAPI_CHALLENGE_MAX_GAS` x fee cap exceeds it. That warning assumes the largest
 gas limit the signer accepts, so it is conservative: at the default 12M gas and
 1 ETH it appears above a fee cap of about 83.3 gwei, while defeats and raises
-still sign at the full fee cap up to about 1,666 gwei. Lowering
-`ZKAPI_CHALLENGE_MAX_GAS` clears it: 8M keeps room above a leaf retirement and
-allows 125 gwei; with `ZKAPI_CHALLENGE_RETIRE_ON_MISS=false` in the
-challenger's environment, 1M allows 1,000 gwei. A call whose gas limit exceeds
+still sign at the full fee cap up to about 1,666 gwei, and a leaf retirement up
+to about 500 gwei. Lowering `ZKAPI_CHALLENGE_MAX_GAS` clears it: 2.5M keeps
+room above a leaf retirement and allows 400 gwei; with
+`ZKAPI_CHALLENGE_RETIRE_ON_MISS=false` in the challenger's environment, 1M
+allows 1,000 gwei. A call whose gas limit exceeds
 `ZKAPI_CHALLENGE_MAX_GAS` is refused with `gas_limit_exceeds_cap` (the
 challenger reports `signer_refused`, critical at once), so keep a margin above
 the measured gas limits.
@@ -232,11 +243,12 @@ transactions. The signer checks each transaction against gas limit x its
 `N` is the number of transactions that may be pending at once, and `K` a budget
 of reverted attempts. A transaction that reverts still pays for its gas, and
 the daemon then retries. At a 100 gwei cap a defeat reserves 0.06 ETH and a
-leaf retirement about 0.72 ETH. The challenger sizes its own float for
+leaf retirement about 0.2 ETH. The challenger sizes its own float for
 `ceil(m/2)` defeats per note, at most 64 concurrent escapes and a 20% margin.
 Re-measure after deploying the vault. `zkapi_signerStatus.required_balance`
-is `MAX_GAS` x fee cap, a conservative figure for one leaf retirement. Multiply
-it for concurrency and the retry budget.
+is `MAX_GAS` x fee cap, a conservative figure for one leaf retirement (six
+times its need at the default 12M gas). Multiply it for concurrency and the
+retry budget.
 
 ## JSON-RPC interface
 
@@ -290,13 +302,14 @@ for a counted note on a new nonce: nine, about 72 seconds at worst (a refused
 one may read up to ⌈lookback / 10,000⌉ log ranges). Give the daemon an
 `eth_sendTransaction` timeout of at least 90 seconds.
 
-`zkapi_signerStatus []` returns `{chain_id, sender, vault, transaction_type:
+`zkapi_signerStatus []` returns `{chain_id, profile, sender, vault, transaction_type:
 "0x2", fee_cap_source, max_fee_per_gas, priority_fee_per_gas,
 max_priority_fee_per_gas, fee_ceiling, tx_fee_cap_wei, max_gas,
 required_balance, max_retirements_per_day, retire_on_miss,
 retirement_lookback_blocks, retirements_last_24h,
 retirement_refusals, last_retirement_refusal_at, block_number,
-base_fee_per_gas, balance, warnings}`. The retirement fields are plain numbers:
+base_fee_per_gas, balance, warnings}`, `profile` being `"challenge"`. The
+retirement fields are plain numbers:
 the retirement nonces counted in the window, the refusals for the budget since start,
 and the UNIX time of the latest (or null); `GET /health` reports them too. Wei
 values are hex quantities that can exceed 64 bits (parse them as u128). The
@@ -323,8 +336,8 @@ The read-only passthrough allows `eth_chainId`, `eth_blockNumber`,
 `eth_getBlockByNumber`, `eth_getLogs`, `eth_getTransactionReceipt`,
 `eth_getTransactionByHash`, `eth_getTransactionCount`, `eth_call`,
 `eth_estimateGas`, `eth_getBalance`, `eth_feeHistory` and `eth_getCode` (the
-challenger checks the vault's, adapter's and Poseidon library's codehashes
-through it at startup). Every other method returns -32601.
+challenger and the activation worker check the vault's, adapter's and Poseidon
+library's codehashes through it at startup). Every other method returns -32601.
 
 ## Replacing a pending challenge
 
@@ -354,7 +367,7 @@ sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --no-dep
 
 A container reads its environment files only when it is created, so
 `docker compose restart` keeps the old values. The daemon never bids above the
-transaction fee cap / gas limit (about 1,666 gwei for a defeat and 138.9 gwei
+transaction fee cap / gas limit (about 1,666 gwei for a defeat and 500 gwei
 for a leaf retirement at 1 ETH), so when it reports `tx_fee_cap_reached`,
 raising the fee caps changes nothing: raise the node's `--rpc.txfeecap` first,
 then `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` in `signer.env` (recreate the signer) and
@@ -411,9 +424,9 @@ vault that still has active notes or pending escapes. A legacy vault (circuit
    one other exception is `tx_fee_cap_below_fee_cap` with a fee cap above the
    transaction fee cap / `ZKAPI_CHALLENGE_MAX_GAS` (about 83.3 gwei at 1 ETH
    and the default 12M gas): defeats and raises still sign there, and a leaf
-   retirement up to about 138.9 gwei. Prefer to clear it by lowering
+   retirement up to about 500 gwei. Prefer to clear it by lowering
    `ZKAPI_CHALLENGE_MAX_GAS` with a margin above the largest call the
-   challenger makes, for example 8M (see
+   challenger makes, for example 2.5M (see
    [Node transaction fee cap](#node-transaction-fee-cap)), which also lowers
    `required_balance`.
 
@@ -440,13 +453,78 @@ refusals that follow on that nonce, at lower bids, repeat its reason and are
 not logged again. Keep the private key out of the server/indexer/challenger
 environments and deployment manifests.
 
+## Activation profile
+
+With `ZKAPI_SIGNER_PROFILE=activation` the sidecar is the activation worker's
+signer (Compose's `activation-signer` service, at `http://activation-signer:8547`).
+It signs exactly one call, in its canonical ABI encoding, to the configured
+vault, with zero ETH value:
+
+| Call | Selector | Purpose |
+| --- | --- | --- |
+| `activateNotes(uint32 firstNoteId, uint256 count, uint256 expectedRoot, uint256 newRoot, bytes proof)` | `0xa2b2c715` | Append a proved, aligned batch of recorded notes to the request tree. |
+
+Everything else is refused before any upstream call with `-32602` (`Only
+canonical activateNotes calls are authorized`): the challenger's three calls,
+every other vault call, and the vault's permissionless fallback
+`activateNotesOnChain(uint32, uint256, uint256[32])` (`0x027e21e9`), which the
+worker never sends and which costs far more gas. A batch must hold 1, 4 or 16
+notes and start at a multiple of its size, and carry a 256-byte Groth16 proof;
+the vault builds the statement from its own storage, so the call names no
+deployment beyond its destination. The signer then simulates it again: a batch
+another activation or a leaf retirement made obsolete reverts
+`StaleActivation()` and is refused as `simulation_failed`, which the worker
+answers by rebuilding. Gas, fee, transaction fee and balance bounds, the fee
+model, nonce handling, refusal reasons and the no-broadcast guarantee are the
+challenge signer's, above.
+
+It reads only `ZKAPI_ACTIVATION_` variables, with the meanings and defaults of
+the `ZKAPI_CHALLENGE_` ones in [Configuration](#configuration), except:
+
+- `ZKAPI_ACTIVATION_MAX_GAS` defaults to 1,000,000: an activation takes about
+  277,000 gas for 1 note, 343,000 for 4 and 600,000 for 16, and the worker's gas
+  limit is its estimate plus 20% (720,000 for 16 notes). `required_balance` is
+  therefore 0.01 ETH at a 10 gwei fee cap.
+- There are no retirement settings: leaf retirements are the challenger's.
+  Passing a `ZKAPI_CHALLENGE_` variable, including
+  `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI`, refuses startup.
+- On Mainnet `ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI` is required.
+
+Copy [`../activation-signer.env.example`](../activation-signer.env.example) to
+`/etc/zkapi/activation-signer.env` (root-owned, mode `0600`), with a key and
+sender of its own: never the challenge signer's. Each daemon assumes nobody
+else sends from its account, and a pending activation must never hold up a
+defeat. The worker proposes both fees within its own caps
+(`ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI` and
+`ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI` in `activation.env`), which must
+not exceed this signer's, and bids within the lower of its own and this
+signer's `tx_fee_cap_wei`.
+
+There is no aggregate budget, unlike leaf retirements: a call simulates only
+as the batch at the vault's activation cursor and current root, so at most one
+activation per batch can succeed, and a copy that mines after it reverts
+`StaleActivation()` before any proof verification, for little gas. Activation
+has no deadline: a base fee above the cap only delays it, and the worker's
+status warns while notes wait. Fund the sender for one pending transaction
+(gas limit x fee cap, 0.072 ETH for a 16-note activation at 100 gwei) plus the
+activations expected until the next top-up.
+
+`GET /health`, `zkapi_signerStatus` and the startup line report `profile:
+"activation"` and omit the retirement fields; the audit lines are
+`activation_signed` and `activation_refused`, and startup failures are printed
+as `Activation signer startup failed: ...`. The read-only passthrough is the
+same.
+
 ## Tests
 
 Run `npm ci --ignore-scripts && npm test` here. The unit tests use a public
 fixture key and mock RPC responses. They decode the actual ethers signatures and
 cover the three allowed calls by their pinned selectors and calldata sizes, the
 refusal of the revision-2 challenge, other vault calls and non-canonical
-encodings, the fee bounds, the Mainnet cap rule, strict configuration, refusal
+encodings, the activation profile (aligned `activateNotes` batches only, the
+refusal of the on-chain fallback and of the challenger's calls, its
+configuration, status and process, and one profile per environment), the fee
+bounds, the Mainnet cap rule, strict configuration, refusal
 reasons, the transaction fee cap and a node's fee-cap refusal, the retirement
 budget (nonces per rolling day, free same-nonce replacements, one pending nonce
 per note, what counts), the no-broadcast
@@ -454,7 +532,9 @@ guarantee, candidate hashes, idempotent re-sends, status warnings, mismatched
 deployment bindings, forbidden methods, durable nonce retries and sanitized
 HTTP errors. `npm run test:anvil` runs a disposable anvil (`--chain-id
 11155111`, automine off). It checks the price actually charged, the base-fee and
-balance refusals, and same-nonce replacement. Anvil has no `--rpc.txfeecap`, so
+balance refusals, same-nonce replacement, and an activation signer whose
+`activateNotes` mines while the fallback and the challenger's calls never reach
+the node. Anvil has no `--rpc.txfeecap`, so
 the fee-cap test puts a JSON-RPC proxy in front of it that refuses broadcasts
 above 1 ETH with geth's exact error. Without anvil those tests are skipped
 unless `ZKAPI_REQUIRE_ANVIL=1`, which makes a missing anvil a failure. No test

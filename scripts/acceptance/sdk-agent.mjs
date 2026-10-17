@@ -17,8 +17,9 @@
 // - `hold_successors`: the operator's signed successor reaches the SDK only
 //   once an exit proof was released (a late successor, E4.6): until then
 //   every recovery answer reads as still reserved;
-// - `drop_deposit_path`: the saved deposit-time path is lost, so an exit
-//   takes its path from the indexer or the vault's logs.
+// - `activation_timing`: shortens how long a chat waits for its note's
+//   activation before it refuses with `note_not_activated`, as the SDK's own
+//   tests do.
 //
 // Gasless withdrawals (ERC-4337, `fees: 'payout'`): `withdraw` and `finalize`
 // pass `fees` and the other sponsored options through; `collect`
@@ -262,6 +263,9 @@ async function handle(command) {
         case 'gasless_timing':
             client.gaslessTimingOverrides = { ...(command.timing || {}) };
             return { timing: client.gaslessTiming };
+        case 'activation_timing':
+            client.activationTimingOverrides = { ...(command.timing || {}) };
+            return { timing: client.activationTiming };
         case 'claim': {
             const statuses = [];
             const result = await client.claimEscapePayout(command.recordId, message => statuses.push(message));
@@ -282,14 +286,6 @@ async function handle(command) {
         case 'hold_successors':
             holdSuccessors = command.on !== false;
             return { holding: holdSuccessors, held_readings: heldReadings };
-        case 'drop_deposit_path': {
-            await client.refresh({ quiet: true });
-            const current = runtime.runtime;
-            const { deposit_path: dropped, ...kept } = current.state;
-            await runtime.commit({ ...current, state: kept });
-            await client.refresh({ quiet: true });
-            return { dropped: Boolean(dropped), ...state() };
-        }
         case 'close':
             setTimeout(() => process.exit(0), 10);
             return { closed: true };
@@ -305,7 +301,7 @@ function summarize(value) {
     const { secret, secret_s: secretS, balance_blinding: blinding, ...rest } = value;
     return JSON.parse(JSON.stringify(rest, (_, v) => typeof v === 'bigint' ? v.toString() : v));
 }
-const PLAN_FIELDS = ['mode', 'phase', 'noteId', 'decision', 'pathSource', 'concededAtInit', 'boundAtState', 'stateBalance',
+const PLAN_FIELDS = ['mode', 'phase', 'noteId', 'decision', 'concededAtInit', 'boundAtState', 'stateBalance',
     'validUntil', 'withdrawalNullifier', 'destination', 'warnings'];
 function state() {
     const snapshot = client.snapshot();
@@ -341,7 +337,6 @@ function state() {
             transactionHash: plan.transactionHash ?? null }) : null,
         gasless: summarize(snapshot.gasless ?? snapshot.config?.gasless ?? null),
         held_readings: heldReadings,
-        deposit_path_saved: Boolean(durable.state?.deposit_path),
         worker_operations: [...new Set(workerOperations)],
         device_clock_offset_seconds: clockOffsetMs / 1000,
     };

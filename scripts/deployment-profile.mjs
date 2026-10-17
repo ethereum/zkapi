@@ -42,19 +42,26 @@ const SETUP_DIRS = Object.freeze({ 'mpc-1': 'protocol/setup/v2-concession', dev:
 
 const felt = value => `0x${BigInt(value).toString(16).padStart(64, '0')}`;
 
+// The verifying keys of a setup (its manifest's vk_keccak256 names) and the
+// finalized manifest's field for each: the adapter verifies all five.
+export const VERIFYING_KEYS = Object.freeze({ request: 'requestVkKeccak256', withdrawal: 'withdrawalVkKeccak256',
+    insertion1: 'insertion1VkKeccak256', insertion4: 'insertion4VkKeccak256', insertion16: 'insertion16VkKeccak256' });
+
 /**
  * The key pins of `setupDir` for `finalized`: the setup must be the
- * deployment's (circuit, setup ID and both verifying-key hashes), and each
- * key file present must hash to what the setup's manifest records.
+ * deployment's (circuit, setup ID and all five verifying-key hashes, the
+ * insertion keys the operator's activation worker proves with included), and
+ * each key file present must hash to what the setup's manifest records.
  */
 export function setupPins(setupDir, finalized) {
     const manifest = JSON.parse(fs.readFileSync(path.join(setupDir, 'manifest.json'), 'utf8'));
     assert.equal(manifest.circuit_id, finalized.circuitId, `${setupDir} is not the setup of circuit ${finalized.circuitId}`);
     assert.equal(manifest.setup_id, finalized.setupId, `${setupDir} is setup ${manifest.setup_id}, the vault's is ${finalized.setupId}`);
-    assert.equal(manifest.vk_keccak256.request.toLowerCase(), finalized.requestVkKeccak256.toLowerCase(),
-        'the setup\'s request verifying key is not the vault\'s');
-    assert.equal(manifest.vk_keccak256.withdrawal.toLowerCase(), finalized.withdrawalVkKeccak256.toLowerCase(),
-        'the setup\'s withdrawal verifying key is not the vault\'s');
+    for (const [kind, field] of Object.entries(VERIFYING_KEYS)) {
+        assert.ok(typeof finalized[field] === 'string', `the finalized manifest has no ${field}`);
+        assert.equal(manifest.vk_keccak256[kind]?.toLowerCase(), finalized[field].toLowerCase(),
+            `the setup's ${kind} verifying key is not the vault's`);
+    }
     for (const [file, hash] of Object.entries(manifest.files)) {
         const keyPath = path.join(setupDir, file);
         if (fs.existsSync(keyPath)) {
@@ -110,7 +117,7 @@ export function clientdProfile(base, profile, finalized, keyHashes) {
         challenge_period_seconds: profile.challenge_period,
         max_pause_duration_seconds: profile.max_pause_duration,
         settlement_window_seconds: profile.settlement_window_seconds,
-        vault_revision: 3,
+        vault_revision: 4,
         exit_concession: 1,
         clearance_ownership_proof: 'required',
         state_signing_key: profile.state_signing_key,

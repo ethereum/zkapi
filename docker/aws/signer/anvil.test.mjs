@@ -6,8 +6,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { Transaction, Wallet } from 'ethers';
-import { ESCAPE_FINALIZED_TOPIC, GWEI, createSigner, createUpstream, vaultInterface } from './signer.mjs';
+import { Interface, Transaction, Wallet } from 'ethers';
+import { ESCAPE_FINALIZED_TOPIC, GWEI, activationInterface, createSigner, createUpstream, vaultInterface } from './signer.mjs';
 
 const CHAIN_ID = 11155111n;
 const haveAnvil = spawnSync('anvil', ['--version'], { stdio: 'ignore' }).status === 0;
@@ -267,4 +267,25 @@ test('a leaf retirement is signed only for a note whose EscapeWithdrawalFinalize
   await mine(rpc);
   assert.equal((await receipt(rpc, hash)).status, '0x1');
   assert.equal((await signer.handle('zkapi_signerStatus', [])).retirements_last_24h, 1);
+});
+
+test('an activation signer signs only activateNotes, which mines; the on-chain fallback and the challenger\'s calls never reach the node', { skip }, async t => {
+  const rpc = await startAnvil(t);
+  const activator = signerFor(rpc, { profile: 'activation', maxFeePerGas: 10n * GWEI });
+  const batch = activationInterface.encodeFunctionData('activateNotes', [0, 1, 11, 12, `0x${'00'.repeat(256)}`]);
+  const fallback = new Interface(['function activateNotesOnChain(uint32 firstNoteId,uint256 count,uint256[32] siblings)'])
+    .encodeFunctionData('activateNotesOnChain', [0, 1, Array(32).fill(0)]);
+  const retirement = vaultInterface.encodeFunctionData('retireClosedLeaf', [0, Array(32).fill(0)]);
+  for (const call of [fallback, data, retirement]) {
+    await assert.rejects(activator.handle('eth_sendTransaction', [tx(0, { data: call })]),
+      { code: -32602, message: 'Only canonical activateNotes calls are authorized' });
+  }
+  // The challenge signer refuses the activation in turn.
+  await assert.rejects(signerFor(rpc, { maxFeePerGas: 10n * GWEI }).handle('eth_sendTransaction', [tx(0, { data: batch })]), { code: -32602 });
+  assert.equal(await poolSize(rpc), 0, 'nothing was broadcast');
+  const hash = await activator.handle('eth_sendTransaction', [tx(0, { data: batch })]);
+  await mine(rpc);
+  assert.deepEqual([(await receipt(rpc, hash)).status, await nonceOf(rpc, 'latest')], ['0x1', 1]);
+  const mined = Transaction.from(await rpc('eth_getRawTransactionByHash', [hash]));
+  assert.deepEqual([mined.type, mined.to.toLowerCase(), mined.data.slice(0, 10), mined.value], [2, vault, '0xa2b2c715', 0n]);
 });

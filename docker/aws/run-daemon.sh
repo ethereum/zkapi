@@ -32,8 +32,8 @@ seconds() {
 }
 
 require CHAIN_ID VAULT_ADDRESS DEPLOY_BLOCK CIRCUIT_ID
-if [ "$CIRCUIT_ID" != zkapi-v2-concession-v1 ]; then
-    echo "This image requires the zkapi-v2-concession-v1 circuit and a fresh vault" >&2
+if [ "$CIRCUIT_ID" != zkapi-v2-concession-v2 ]; then
+    echo "This image requires the zkapi-v2-concession-v2 circuit and a fresh vault" >&2
     exit 1
 fi
 
@@ -44,9 +44,9 @@ case "${1:-}" in
         # itself: it refuses development keys in any spelling (by derived public
         # key), weak or reused seeds, and keys that differ from the vault's,
         # before it opens /data/server.db. A string match here would be bypassable.
-        # ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS, ZKAPI_ROOT_MAX_STALENESS_SECONDS,
-        # ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS and ZKAPI_ALLOW_LEGACY_CLEARANCE (which
-        # serverd refuses on this circuit) also reach serverd from the environment.
+        # ZKAPI_ROOT_MAX_STALENESS_SECONDS, ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS and
+        # ZKAPI_ALLOW_LEGACY_CLEARANCE (which serverd refuses on this circuit) also
+        # reach serverd from the environment.
         set -- zkapi --protocol-version 2 --chain-id "$CHAIN_ID" \
             --contract-address "$VAULT_ADDRESS" \
             --request-charge-cap "$REQUEST_CHARGE_CAP" \
@@ -108,8 +108,25 @@ case "${1:-}" in
             --proof-setup-dir "$ZKAPI_PROOF_SETUP_DIR" \
             --status-listen 127.0.0.1:3002
         ;;
+    activator)
+        require ZKAPI_ACTIVATION_RPC_URL ZKAPI_ACTIVATION_SENDER \
+            ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI
+        # Appends the vault's recorded notes to the request tree in proved
+        # batches with the setup's insertion keys; it needs no server database.
+        # The RPC (its own signer, never the challenger's), sender, fee and
+        # batch-wait settings reach zkapi-activated from the environment. Its
+        # status listener stays on the container's loopback, for the
+        # healthcheck and `docker compose exec`; never publish it.
+        exec zkapi-activated --indexer-url http://indexer:3001 \
+            --deployment "$ZKAPI_DEPLOYMENT_MANIFEST" \
+            --chain-id "$CHAIN_ID" --contract-address "$VAULT_ADDRESS" \
+            --confirmations "${ACTIVATION_CONFIRMATIONS:-2}" \
+            --checkpoint /data/activation.json \
+            --proof-setup-dir "$ZKAPI_PROOF_SETUP_DIR" \
+            --status-listen 127.0.0.1:3003
+        ;;
     *)
-        echo "Usage: zkapi-run server|db-init|indexer|challenger" >&2
+        echo "Usage: zkapi-run server|db-init|indexer|challenger|activator" >&2
         exit 2
         ;;
 esac

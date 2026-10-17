@@ -13,6 +13,12 @@ import { test } from 'node:test';
 // missing binary a failure instead of a skip.
 const CONFIG_PATH = resolve('docker/aws/nginx.conf');
 const config = await readFile(CONFIG_PATH, 'utf8');
+// The indexer's routes, as its create_router declares them, with a sample
+// value for each path parameter.
+const indexerSource = await readFile(resolve('crates/zkapi-indexerd/src/http.rs'), 'utf8');
+const indexerRouter = indexerSource.slice(indexerSource.indexOf('pub fn create_router'));
+const indexerRoutes = [...indexerRouter.slice(0, indexerRouter.indexOf('.with_state(')).matchAll(/\.route\(\s*"([^"]+)"/g)]
+    .map(([, route]) => route.replaceAll(/\{[a-z_]+\}/g, '1'));
 
 function tokenize(source) {
     const tokens = [];
@@ -188,7 +194,7 @@ test('clearance, lease issuance and other /v2/ POST routes are limited', () => {
 });
 
 test('tree, health, attestation, static and internal routes are not limited or not proxied', () => {
-    for (const uri of ['/health', '/v1/attestation', '/v1/tree/root', '/v1/tree/notes/1/zero-path',
+    for (const uri of ['/health', '/v1/attestation', '/v1/tree/root', '/v1/tree/next-note-id', '/v1/tree/notes/1/path', '/v1/tree/snapshot',
         '/config.json', '/proofs/request.pk', '/proofs/withdrawal.pk', '/proofs/manifest.json']) {
         assert.equal(all(selectLocation(uri).block, 'limit_req').length, 0, uri);
     }
@@ -199,6 +205,24 @@ test('tree, health, attestation, static and internal routes are not limited or n
         assert.deepEqual(location.args, ['/'], uri);
         assert.deepEqual(one(location.block, 'return').args, ['404'], uri);
     }
+});
+
+test('the gateway publishes exactly the indexer\'s tree routes and none of its internal ones', () => {
+    const proxied = uri => all(selectLocation(uri).block, 'proxy_pass').map(d => d.args[0]);
+    const tree = indexerRoutes.filter(route => route.startsWith('/v1/tree/'));
+    // The gateway publishes /v1/tree/ by prefix, so a route the indexer adds
+    // there is public: this list changes only on purpose. Revision 4 serves
+    // no zero-slot paths and no root history.
+    assert.deepEqual(tree, ['/v1/tree/root', '/v1/tree/next-note-id', '/v1/tree/snapshot', '/v1/tree/notes/1/path']);
+    for (const route of tree) {
+        assert.deepEqual(proxied(route), ['$indexer_upstream'], route);
+        assert.equal(all(selectLocation(route).block, 'limit_req').length, 0, route);
+    }
+    // Its health, metrics, published-nullifier and pending-escape routes are
+    // for the operator and the other daemons only.
+    const internal = indexerRoutes.filter(route => !route.startsWith('/v1/tree/'));
+    assert.deepEqual(internal, ['/health', '/metrics', '/v1/nullifiers/1/published', '/v1/escapes/pending']);
+    for (const route of internal) assert.ok(!proxied(route).includes('$indexer_upstream'), route);
 });
 
 test('throttled responses are ErrorResponse JSON with a matching Retry-After', () => {

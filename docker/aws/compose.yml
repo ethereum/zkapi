@@ -1,7 +1,7 @@
 name: zkapi
 
 x-daemon: &daemon
-  image: zkapi/aws:${ZKAPI_IMAGE_TAG:-concession-v1}
+  image: zkapi/aws:${ZKAPI_IMAGE_TAG:-concession-v2}
   build:
     context: ../..
     dockerfile: docker/Dockerfile
@@ -18,6 +18,31 @@ x-daemon: &daemon
   volumes:
     - ${ZKAPI_DATA_DIR:-/var/lib/zkapi}:/data
   networks: [backend]
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+# The restricted signer sidecar (signer/README.md). Each daemon that sends
+# transactions gets an instance of its own, with its own key, sender and fee
+# caps, that signs only that daemon's calls.
+x-signer: &signer
+  image: zkapi/signer:${ZKAPI_IMAGE_TAG:-concession-v2}
+  build:
+    context: ./signer
+  restart: unless-stopped
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+  networks: [backend]
+  healthcheck:
+    test: ["CMD", "node", "--input-type=module", "-e", "const r = await fetch('http://127.0.0.1:8547/health', {signal: AbortSignal.timeout(5000)}); if (!r.ok) process.exit(1);"]
+    interval: 10s
+    timeout: 6s
+    retries: 3
+    start_period: 10s
   logging:
     driver: json-file
     options:
@@ -115,34 +140,56 @@ services:
       start_period: 60s
 
   signer:
-    image: zkapi/signer:${ZKAPI_IMAGE_TAG:-concession-v1}
-    build:
-      context: ./signer
+    <<: *signer
     profiles: ["challenge"]
-    restart: unless-stopped
-    read_only: true
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: ["ALL"]
-    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
     env_file:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/signer.env
     environment:
       ZKAPI_CHALLENGE_LISTEN_HOST: 0.0.0.0
-    networks: [backend]
+
+  # Appends the vault's recorded notes to the request tree in proved batches
+  # (docs/activation-worker.md), so that they can make requests. Start it
+  # after the challenger, before the API takes deposits.
+  activator:
+    <<: *daemon
+    profiles: ["activation"]
+    command: ["activator"]
+    env_file:
+      - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
+      - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/activation.env
+    volumes:
+      - ${ZKAPI_DATA_DIR:-/var/lib/zkapi}:/data
+      - *manifest
+    depends_on:
+      # It needs no server database. A stale or diverged indexer only holds
+      # a batch back (indexer_path_behind); it must never keep the worker down.
+      indexer:
+        condition: service_started
+      activation-signer:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "--input-type=module", "-e", "const r = await fetch('http://127.0.0.1:8547/health', {signal: AbortSignal.timeout(5000)}); if (!r.ok) process.exit(1);"]
+      # Liveness of the poll loop only. /health returns 503 for alarms (a
+      # note pending too long, a refused proof) and is for alerting, not
+      # restarts.
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:3003/livez"]
       interval: 10s
       timeout: 6s
       retries: 3
-      start_period: 10s
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "5"
+      start_period: 60s
+
+  # The activation worker's own signer: it signs only activateNotes calls to
+  # the vault, from the worker's sender, never the challenger's.
+  activation-signer:
+    <<: *signer
+    profiles: ["activation"]
+    env_file:
+      - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/activation-signer.env
+    environment:
+      ZKAPI_SIGNER_PROFILE: activation
+      ZKAPI_ACTIVATION_LISTEN_HOST: 0.0.0.0
 
   gateway:
-    image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v1}
+    image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v2}
     build:
       context: ../..
       dockerfile: docker/aws/Dockerfile.gateway

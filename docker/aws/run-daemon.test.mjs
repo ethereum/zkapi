@@ -13,7 +13,6 @@ const REPORTED_ENV = [
     'ZKAPI_STATE_SEED',
     'ZKAPI_CLEAR_SEED',
     'ZKAPI_ALLOW_LEGACY_CLEARANCE',
-    'ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS',
     'ZKAPI_ROOT_MAX_STALENESS_SECONDS',
     'ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS',
     'ZKAPI_CHALLENGE_RPC_URL',
@@ -25,13 +24,20 @@ const REPORTED_ENV = [
     'ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS',
     'ZKAPI_CHALLENGE_RAISE_MIN_UNITS',
     'ZKAPI_CHALLENGE_RETIRE_ON_MISS',
+    'ZKAPI_ACTIVATION_RPC_URL',
+    'ZKAPI_ACTIVATION_SENDER',
+    'ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI',
+    'ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI',
+    'ZKAPI_ACTIVATION_PRIORITY_FEE_PER_GAS_WEI',
+    'ZKAPI_ACTIVATION_TX_FEE_CAP_WEI',
+    'ZKAPI_MAX_ACTIVATION_WAIT_SECONDS',
 ];
 
 const BASE_ENV = {
     CHAIN_ID: '11155111',
     VAULT_ADDRESS: '0x0000000000000000000000000000000000000001',
     DEPLOY_BLOCK: '1',
-    CIRCUIT_ID: 'zkapi-v2-concession-v1',
+    CIRCUIT_ID: 'zkapi-v2-concession-v2',
     REQUEST_CHARGE_CAP: '50000',
     ZKAPI_NATIVE_BILLING_RPC_URL: 'https://rpc.example',
     ZKAPI_NATIVE_PRICE_FEED_ADDRESS: '0x0000000000000000000000000000000000000003',
@@ -42,6 +48,10 @@ const BASE_ENV = {
     ZKAPI_CHALLENGE_SENDER: '0x0000000000000000000000000000000000000002',
     ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: '100000000000',
     ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI: '10000000000',
+    ZKAPI_ACTIVATION_RPC_URL: 'http://activation-signer:8547',
+    ZKAPI_ACTIVATION_SENDER: '0x0000000000000000000000000000000000000004',
+    ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI: '50000000000',
+    ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI: '5000000000',
 };
 
 async function launch(role, { set = {}, unset = [], exitCode = 0, refusal = '' } = {}) {
@@ -57,7 +67,7 @@ async function launch(role, { set = {}, unset = [], exitCode = 0, refusal = '' }
             `exit ${exitCode}`,
             '',
         ].join('\n');
-        for (const name of ['zkapi', 'zkapi-indexerd', 'zkapi-challenged']) {
+        for (const name of ['zkapi', 'zkapi-indexerd', 'zkapi-challenged', 'zkapi-activated']) {
             await writeFile(join(bin, name), fake, { mode: 0o755 });
         }
         const env = { PATH: `${bin}:/usr/bin:/bin`, ...BASE_ENV, ...set };
@@ -83,7 +93,7 @@ function flag(args, name) {
     return args[index + 1];
 }
 
-for (const role of ['server', 'challenger']) {
+for (const role of ['server', 'challenger', 'activator']) {
     for (const override of [null, '/custom/proofs']) {
         test(`${role} launches with ${override ? 'explicit' : 'default'} proof artifacts`, async () => {
             const result = await launch(role, { set: override ? { ZKAPI_PROOF_SETUP_DIR: override } : {} });
@@ -169,6 +179,8 @@ test('server requires both signing seeds and starts nothing without them', async
 });
 
 test('server passes clearance, root and lease-ceiling settings only through the environment', async () => {
+    // --clearance-root-window-seconds is gone with revision 4 (a clearance is
+    // bound to the stored note): the launcher must never pass it.
     const flags = ['--allow-legacy-clearance', '--clearance-root-window-seconds',
         '--root-max-staleness-seconds', '--request-limit-max-usd-micros'];
     const defaults = await launch('server');
@@ -180,7 +192,6 @@ test('server passes clearance, root and lease-ceiling settings only through the 
         // serverd refuses this one on the concession circuit; the launcher
         // still leaves the decision to it.
         ZKAPI_ALLOW_LEGACY_CLEARANCE: 'true',
-        ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS: '600',
         ZKAPI_ROOT_MAX_STALENESS_SECONDS: '30',
         ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS: '6000000',
     };
@@ -192,13 +203,14 @@ test('server passes clearance, root and lease-ceiling settings only through the 
 
 test('the deployment env example sets the canary lease ceiling and no legacy clearance', async () => {
     const example = await readFile(resolve('docker/aws/deployment.env.example'), 'utf8');
-    assert.match(example, /^CIRCUIT_ID=zkapi-v2-concession-v1$/m);
+    assert.match(example, /^CIRCUIT_ID=zkapi-v2-concession-v2$/m);
     assert.match(example, /^ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS=6000000$/m);
+    assert.doesNotMatch(example, /CLEARANCE_ROOT_WINDOW/);
     assert.doesNotMatch(example, /^ZKAPI_ALLOW_LEGACY_CLEARANCE=/m);
     assert.doesNotMatch(example, /LEGACY_CLEARANCE_MAX_PER_MINUTE/);
 });
 
-for (const role of ['server', 'challenger']) {
+for (const role of ['server', 'challenger', 'activator']) {
     test(`${role} reads the mounted deployment manifest, or an explicit one`, async () => {
         const defaults = await launch(role);
         assert.equal(defaults.status, 0, defaults.stderr);
@@ -295,11 +307,26 @@ test('db-init binds the server database to the manifest and the proof setup', as
 });
 
 test('every role refuses another circuit before starting anything', async () => {
-    for (const role of ['server', 'db-init', 'indexer', 'challenger']) {
-        const result = await launch(role, { set: { CIRCUIT_ID: 'zkapi-v2-note-bound-v1' } });
-        assert.equal(result.status, 1, role);
-        assert.equal(result.stderr.trim(), 'This image requires the zkapi-v2-concession-v1 circuit and a fresh vault');
-        assert.deepEqual(result.args, []);
+    // The legacy note-bound vault's and the revision-3 concession vault's circuits alike.
+    for (const circuit of ['zkapi-v2-note-bound-v1', 'zkapi-v2-concession-v1']) {
+        for (const role of ['server', 'db-init', 'indexer', 'challenger', 'activator']) {
+            const result = await launch(role, { set: { CIRCUIT_ID: circuit } });
+            assert.equal(result.status, 1, `${role} ${circuit}`);
+            assert.equal(result.stderr.trim(), 'This image requires the zkapi-v2-concession-v2 circuit and a fresh vault');
+            assert.deepEqual(result.args, []);
+        }
+    }
+});
+
+test('compose and the README default every image to the tag of the circuit the launcher requires', async () => {
+    // A stale default would build a new image over the previous line's tag.
+    const launcher = await readFile(resolve('docker/aws/run-daemon.sh'), 'utf8');
+    const circuit = /"\$CIRCUIT_ID" != (zkapi-v2-[a-z0-9-]+)/.exec(launcher)[1];
+    for (const file of ['docker/aws/compose.yml', 'docker/aws/README.md']) {
+        const text = await readFile(resolve(file), 'utf8');
+        const tags = [...text.matchAll(/\$\{ZKAPI_IMAGE_TAG:-([^}]*)\}/g)].map(match => match[1]);
+        assert.ok(tags.length > 0, file);
+        assert.deepEqual([...new Set(tags)], [circuit.replace(/^zkapi-v2-/, '')], file);
     }
 });
 
@@ -383,9 +410,61 @@ test('challenger receives the shared transaction fee cap from deployment.env thr
     }
 });
 
+test('activator requires its signer RPC, sender and both fee caps', async () => {
+    for (const name of [
+        'ZKAPI_ACTIVATION_RPC_URL',
+        'ZKAPI_ACTIVATION_SENDER',
+        'ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI',
+        'ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI',
+    ]) {
+        for (const options of [{ unset: [name] }, { set: { [name]: '' } }]) {
+            const result = await launch('activator', options);
+            assert.equal(result.status, 1);
+            assert.equal(result.stderr.trim(), `Missing required environment variable: ${name}`);
+            assert.deepEqual(result.args, []);
+        }
+    }
+    // The challenger's settings are not the worker's.
+    const challengerOnly = await launch('activator', { unset: ['ZKAPI_CHALLENGE_RPC_URL', 'ZKAPI_CHALLENGE_SENDER'] });
+    assert.equal(challengerOnly.status, 0, challengerOnly.stderr);
+});
+
+test('activator serves status on loopback and takes its signer, fees and batch wait from the environment', async () => {
+    const set = {
+        ZKAPI_ACTIVATION_PRIORITY_FEE_PER_GAS_WEI: '2000000000',
+        ZKAPI_ACTIVATION_TX_FEE_CAP_WEI: '1000000000000000000',
+        ZKAPI_MAX_ACTIVATION_WAIT_SECONDS: '60',
+    };
+    const result = await launch('activator', { set });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(flag(result.args, '--status-listen'), '127.0.0.1:3003');
+    assert.equal(flag(result.args, '--indexer-url'), 'http://indexer:3001');
+    assert.equal(flag(result.args, '--chain-id'), '11155111');
+    assert.equal(flag(result.args, '--contract-address'), BASE_ENV.VAULT_ADDRESS);
+    assert.equal(flag(result.args, '--confirmations'), '2');
+    assert.equal(flag(result.args, '--checkpoint'), '/data/activation.json');
+    assert.equal(flag(result.args, '--deployment'), '/srv/zkapi/deployment.json');
+    // No server database, no event replay, and never a dry run.
+    for (const name of ['--db-path', '--from-block', '--dry-run', '--rpc-url', '--sender', '--max-fee-per-gas-wei',
+        '--max-priority-fee-per-gas-wei', '--priority-fee-per-gas-wei', '--tx-fee-cap-wei', '--max-activation-wait-seconds']) {
+        assert.ok(!result.args.includes(name), name);
+    }
+    assert.equal(result.received.ZKAPI_ACTIVATION_RPC_URL, 'http://activation-signer:8547');
+    assert.equal(result.received.ZKAPI_ACTIVATION_SENDER, BASE_ENV.ZKAPI_ACTIVATION_SENDER);
+    assert.equal(result.received.ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI, '50000000000');
+    assert.equal(result.received.ZKAPI_ACTIVATION_MAX_PRIORITY_FEE_PER_GAS_WEI, '5000000000');
+    for (const [name, value] of Object.entries(set)) assert.equal(result.received[name], value, name);
+});
+
+test('activator forwards an explicit confirmation depth', async () => {
+    const result = await launch('activator', { set: { ACTIVATION_CONFIRMATIONS: '6', CHALLENGE_CONFIRMATIONS: '3' } });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(flag(result.args, '--confirmations'), '6');
+});
+
 test('unknown roles print the usage and exit 2', async () => {
     const result = await launch('indexer-resync');
     assert.equal(result.status, 2);
-    assert.equal(result.stderr.trim(), 'Usage: zkapi-run server|db-init|indexer|challenger');
+    assert.equal(result.stderr.trim(), 'Usage: zkapi-run server|db-init|indexer|challenger|activator');
     assert.deepEqual(result.args, []);
 });

@@ -39,6 +39,13 @@ const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const HEX = /^0x([0-9a-fA-F]{2})*$/;
 const QUANTITY = /^0x(0|[1-9a-fA-F][0-9a-fA-F]*)$/;
 const PACKED_TUPLE = '(address,uint256,bytes,bytes,bytes32,uint256,bytes32,bytes,bytes)';
+// The vault's 17-word withdrawal statement (Types.WithdrawalPublicInputs, revision 4).
+const WITHDRAWAL_TUPLE = '(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256)';
+// The exact vault calls the paymaster parses: a close or an escape is the
+// statement, the proof's offset and length words and the 256-byte proof
+// (4 + 17 * 32 + 32 + 32 + 256 bytes); a finalization is one uint32.
+export const EXIT_CALL_BYTES = 868;
+const FINALIZE_CALL_BYTES = 36;
 export const SELECTORS = Object.freeze({
     handleOps: selectorOf(`handleOps(${PACKED_TUPLE}[],address)`),
     getUserOpHash: selectorOf(`getUserOpHash(${PACKED_TUPLE})`),
@@ -47,6 +54,9 @@ export const SELECTORS = Object.freeze({
     failedOpWithRevert: selectorOf('FailedOpWithRevert(uint256,string,bytes)'),
     withdraw: selectorOf('withdraw(bytes)'),
     execute: selectorOf('execute(address,bytes)'),
+    mutualClose: selectorOf(`mutualClose(${WITHDRAWAL_TUPLE},bytes)`),
+    initiateEscapeWithdrawal: selectorOf(`initiateEscapeWithdrawal(${WITHDRAWAL_TUPLE},bytes)`),
+    finalizeEscapeWithdrawal: selectorOf('finalizeEscapeWithdrawal(uint32)'),
 });
 export const TOPICS = Object.freeze({
     userOperationEvent: keccak256(new TextEncoder().encode('UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)')),
@@ -261,15 +271,19 @@ export function bundleGas(ops) {
         + BigInt(op.paymasterVerificationGasLimit ?? 0) + BigInt(op.paymasterPostOpGasLimit ?? 0), 0n) + 300_000n;
 }
 
-/** The kind of a sponsored withdraw(bytes) callData by its vault call: 1 close, 2 escape, 3 finalize, 4 forward. */
+/**
+ * The kind of a sponsored withdraw(bytes) callData by its vault call: 1 close, 2 escape, 3 finalize, 4 forward;
+ * null for any other call, or one of another length than the paymaster parses.
+ */
 export function sponsoredKind(callData) {
     const call = vaultCallOf(callData);
     if (call == null) return null;
     if (call === '0x') return 4;
     const selector = call.slice(0, 10);
-    if (selector === '0xff8f5585') return 3;
-    if (selector === '0xa38d62aa') return 2;
-    if (selector === '0x72cd2e44') return 1;
+    const bytes = (call.length - 2) / 2;
+    if (selector === SELECTORS.finalizeEscapeWithdrawal && bytes === FINALIZE_CALL_BYTES) return 3;
+    if (selector === SELECTORS.initiateEscapeWithdrawal && bytes === EXIT_CALL_BYTES) return 2;
+    if (selector === SELECTORS.mutualClose && bytes === EXIT_CALL_BYTES) return 1;
     return null;
 }
 
