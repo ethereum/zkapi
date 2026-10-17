@@ -80,9 +80,9 @@ contract GasTest is GaslessTestBase {
 
     mapping(uint8 => Prepared) prepared;
     Groth16ProofAdapter realAdapter;
-    /// The test tree holds eight notes: the operations setUp only prepares all exit this one
-    /// (each test starts from setUp's state, and a second measurement follows a revert to it),
-    /// the operations setUp executes get a note each.
+    /// setUp records eight notes: the operations setUp only prepares all exit this one (each test
+    /// starts from setUp's state, and a second measurement follows a revert to it), the operations
+    /// setUp executes get a note each.
     uint32 sharedNote;
     uint256 nextNullifier = 1001;
     uint256 nextCommitment = 42;
@@ -111,7 +111,7 @@ contract GasTest is GaslessTestBase {
         _prepRepeatClose(SC_CLOSE_REPEAT);
         _prepEscapeWithBalance(SC_ESCAPE_WITH_BALANCE);
         sharedNote = _bigNote(nextCommitment++);
-        assertEq(sharedNote, 7, "the test tree's last slot");
+        assertEq(sharedNote, 7, "the eighth note");
         // the closes
         _prepClose(SC_CLOSE_EOA, _fundedPayee(SC_CLOSE_EOA), true);
         _prepClose(SC_CLOSE_EMPTY, EMPTY_PAYEE, true);

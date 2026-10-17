@@ -1,4 +1,4 @@
-//! Exit decisions of circuit `zkapi-v2-concession-v1` (design §6.3 C4 and
+//! Exit decisions of circuit `zkapi-v2-concession-v2` (design §6.3 C4 and
 //! §6.4 E0–E6) as pure functions of local facts.
 //!
 //! Nothing here reads the network or the clock: callers pass `now`, the
@@ -420,7 +420,10 @@ pub struct ReleasedExit {
     pub valid_until: u64,
 }
 
-/// The vault's view of the note (`notes(noteId).status`).
+/// The vault's view of the note (`notes(noteId).status`). `Active` is set
+/// by the deposit itself and says nothing about activation in the request
+/// tree ([`crate::tree::note_activation`]): a recorded note that is not yet
+/// activated is `Active` and can exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoteChainStatus {

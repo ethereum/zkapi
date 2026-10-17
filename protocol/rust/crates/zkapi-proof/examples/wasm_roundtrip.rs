@@ -3,10 +3,12 @@
 //!
 //! Usage: wasm_roundtrip /absolute/path/to/prove-browser-fixture.mjs /absolute/sdk
 //!
-//! The fixture asks the bundle for a genesis request and an escape (kind 0,
-//! `conceded = 0`, `valid_until`) to the destination below; both proofs and
-//! the escape's canonical fields are checked here. It needs a bundle built
-//! for circuit `zkapi-v2-concession-v1` with the development setup.
+//! The fixture asks the bundle for a genesis request (at the root of a tree
+//! holding the note) and an escape (kind 0, `conceded = 0`, `valid_until`)
+//! to the destination below, which takes no tree: it names the note's
+//! registration commitment and packed amount and expiry. Both proofs and the
+//! escape's canonical fields are checked here. It needs a bundle built for
+//! circuit `zkapi-v2-concession-v2` with the development setup.
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::{
@@ -15,6 +17,7 @@ use std::{
 };
 use zkapi_core::v2 as core;
 use zkapi_proof::compact::{CompactSigner, RequestVerifier, WithdrawalVerifier, CIRCUIT_ID};
+use zkapi_types::inputs::note_metadata;
 use zkapi_types::{Felt252, RequestPublicInputsV2, WithdrawalPublicInputsV2C, MERKLE_DEPTH};
 
 const VALID_UNTIL: u64 = 2_000_010_800;
@@ -45,7 +48,7 @@ fn main() -> Result<()> {
         "request": { "payload": "browser artifact test", "active_root": root, "merkle_siblings": siblings,
             "client_request_id": "wasm-roundtrip", "request_time": 2000000000u64, "created_at_ms": 2000000000000u64 },
         "withdrawal": { "mode": "escape", "destination": "0x1111111111111111111111111111111111111111",
-            "conceded": 0, "valid_until": VALID_UNTIL, "active_root": root, "merkle_siblings": siblings }
+            "conceded": 0, "valid_until": VALID_UNTIL }
     });
     let mut child = Command::new("node")
         .args(&args[1..])
@@ -91,6 +94,11 @@ fn main() -> Result<()> {
             && withdrawal.next_nullifier
                 == core::successor_nullifier(&secret, 0, &core::GENESIS_ANCHOR),
         "WASM escape statement is not canonical"
+    );
+    anyhow::ensure!(
+        withdrawal.registration_commitment == core::registration_commitment(&secret)
+            && withdrawal.note_metadata() == note_metadata(1_000_000, expiry),
+        "WASM escape statement does not name the stored note values"
     );
     println!("Shipped WASM request and escape withdrawal proofs verified natively.");
     Ok(())

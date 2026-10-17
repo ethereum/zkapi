@@ -34,10 +34,33 @@ pub enum ClientError {
     #[error("verification failed: {0}")]
     VerificationFailed(String),
     /// The server refused a clearance with a code that reserves nothing:
-    /// `clearance_ownership_required`, `legacy_clearance_capacity`, or
-    /// `nullifier_used` (a request already owns the nullifier).
+    /// `clearance_ownership_required`, `legacy_clearance_capacity`,
+    /// `nullifier_used` (a request already owns the nullifier),
+    /// `note_binding_mismatch` (the ownership proof names other values than
+    /// the vault records for the note) or `note_not_active` (the note is no
+    /// longer `Active`).
     #[error("clearance refused: {0}")]
     ClearanceRefused(String),
+    /// The operator answered every clearance retry with `note_not_recorded`:
+    /// its chain view does not hold the note's deposit yet.
+    #[error("note_not_recorded: the operator has not yet observed this note's deposit; retry the clearance later")]
+    NoteNotRecorded,
+    /// The vault records the note with other values than the wallet's: an
+    /// exit names the note by its registration commitment, amount and expiry,
+    /// and the vault refuses one that differs from its record.
+    #[error("note_binding_mismatch: {0}")]
+    NoteBindingMismatch(String),
+    /// The note is not in the request tree yet. Notes are activated in id
+    /// order, and `queue_position` notes are activated before this one (0:
+    /// it is next). Exits do not wait for activation.
+    #[error("note_not_activated: the note is not in the request tree yet ({queue_position} notes are activated before it); exits remain available")]
+    NoteNotActivated { queue_position: u32 },
+    /// A request's Merkle path does not lead from the note's leaf to its
+    /// `active_root`: the path is stale, or the note is not activated.
+    #[error(
+        "merkle_path_mismatch: the Merkle path does not lead from the note's leaf to active_root"
+    )]
+    MerklePathMismatch,
     /// C2: a request proof at this state already carries another bound.
     #[error("bound_fixed_at_state: every request proof at this note state must carry the solvency bound {bound}, not {requested}")]
     BoundFixedAtState { bound: u128, requested: u128 },

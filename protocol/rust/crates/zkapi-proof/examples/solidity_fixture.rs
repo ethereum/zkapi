@@ -5,12 +5,21 @@
 //! cargo run --release -p zkapi-proof --example solidity_fixture -- ../setup/v2-concession-dev
 //! ```
 //!
-//! Prints JSON: for each statement its `public_inputs` (serde), `inputs_abi`
-//! (the static Solidity tuple: one 32-byte word per public input, in order)
-//! and `proof_hex` (256 bytes). Statements: a genesis and a signed request,
-//! an escape with `c = 0` and with `c > 0`, a genesis escape with `c > 0`, a
-//! mutual close, an ownership proof and an escape to a full 160-bit
-//! destination.
+//! Prints JSON: for each request and withdrawal statement its
+//! `public_inputs` (serde), `inputs_abi` (the static Solidity tuple: one
+//! 32-byte word per public input, in order; 17 for a withdrawal, which names
+//! the note's registration commitment and packed amount and expiry instead of
+//! a root) and `proof_hex` (256 bytes). Statements: a genesis and a signed
+//! request, an escape with `c = 0` and with `c > 0`, a genesis escape with
+//! `c > 0`, a mutual close, an ownership proof and an escape to a full
+//! 160-bit destination.
+//!
+//! `insertion1`, `insertion4` and `insertion16` are activations of K = 1, 4
+//! and 16 notes at cursor K, after K activated notes (so every path above the
+//! subtree has a non-empty sibling; K = 1 inserts a right child), in the
+//! format of `support/activation.rs`: `count`, `inputs` (the `3 + 2K` words
+//! of `assertValidInsertion`), `inputs_abi`, `proof_hex`, and the roots,
+//! notes and siblings they derive from.
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::Serialize;
@@ -21,6 +30,10 @@ use zkapi_proof::compact::{
 use zkapi_proof::dev::{tree_with, DevDeployment, DevNote, DevRequest, DevWithdrawal};
 use zkapi_types::wire::Groth16ProofWire;
 use zkapi_types::{Felt252, RequestPublicInputsV2, WithdrawalKind, WithdrawalPublicInputsV2C};
+
+#[path = "support/activation.rs"]
+mod activation;
+use activation::{ActivationFixture, Activator};
 
 const TIMESTAMP: u64 = 2_000_000_000;
 const VALID_UNTIL: u64 = TIMESTAMP + 10_800;
@@ -44,6 +57,21 @@ struct Fixtures {
     close: Fixture<WithdrawalPublicInputsV2C>,
     ownership: Fixture<WithdrawalPublicInputsV2C>,
     escape_full_destination: Fixture<WithdrawalPublicInputsV2C>,
+    insertion1: ActivationFixture,
+    insertion4: ActivationFixture,
+    insertion16: ActivationFixture,
+}
+
+/// `count` notes from id `first` (distinct secrets, amounts and expiries).
+fn batch(first: u32, count: u32) -> Vec<DevNote> {
+    (first..first + count)
+        .map(|note_id| DevNote {
+            secret: Felt252::from_u64(1_000 + u64::from(note_id)),
+            note_id,
+            deposit_amount: 1_000_000 + 1_000 * u128::from(note_id),
+            expiry: 4_000_000_000 + 86_400 * u64::from(note_id),
+        })
+        .collect()
 }
 
 fn encode(inputs: &[Felt252], proof: &Groth16ProofWire) -> Result<(String, String)> {
@@ -68,6 +96,7 @@ fn main() -> Result<()> {
     let request_verifier = RequestVerifier::load(&setup)?;
     let withdrawals = WithdrawalProver::load(&setup)?;
     let withdrawal_verifier = WithdrawalVerifier::load(&setup)?;
+    let activator = Activator::load(&setup)?;
 
     let deployment = DevDeployment::new(31_337, Felt252::from_u64(0x1234));
     let note = DevNote {
@@ -111,7 +140,6 @@ fn main() -> Result<()> {
      -> Result<Fixture<_>> {
         let (public, witness) = state.withdrawal(
             &deployment,
-            &tree,
             &DevWithdrawal {
                 kind,
                 destination,
@@ -129,6 +157,13 @@ fn main() -> Result<()> {
         })
     };
 
+    // The activation of the `size` notes at cursor `size`, after the first `size`.
+    let insertion = |size: u32| -> Result<ActivationFixture> {
+        let activated = batch(0, size);
+        let mut tree = tree_with(&activated.iter().collect::<Vec<_>>());
+        activator.activate(&mut tree, &batch(size, size))
+    };
+
     let fixtures = Fixtures {
         circuit_id: CIRCUIT_ID,
         setup_id: requests.setup_id().to_string(),
@@ -140,6 +175,9 @@ fn main() -> Result<()> {
         close: withdrawal(&s1, WithdrawalKind::MutualClose, [0x11; 20], 0)?,
         ownership: withdrawal(&s1, WithdrawalKind::Ownership, [0; 20], 0)?,
         escape_full_destination: withdrawal(&s1, WithdrawalKind::Escape, [0xff; 20], 0)?,
+        insertion1: insertion(1)?,
+        insertion4: insertion(4)?,
+        insertion16: insertion(16)?,
     };
     println!("{}", serde_json::to_string_pretty(&fixtures)?);
     Ok(())

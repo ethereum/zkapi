@@ -16,14 +16,18 @@ use std::io::{self, Write};
 use anyhow::{anyhow, ensure, Result};
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField, Zero};
-use ark_relations::r1cs::{ConstraintMatrices, SynthesisMode};
+use ark_relations::r1cs::ConstraintMatrices;
 
-use crate::compact::{request_template, withdrawal_template, KeyKind};
-use crate::groth16::synthesize;
+use crate::compact::KeyKind;
 
 /// The file names `examples/export_r1cs.rs` writes.
 pub const REQUEST_R1CS_FILE: &str = "request.r1cs";
 pub const WITHDRAWAL_R1CS_FILE: &str = "withdrawal.r1cs";
+
+/// The `.r1cs` file name of a circuit (`<kind>.r1cs`).
+pub fn r1cs_file(kind: KeyKind) -> String {
+    format!("{kind}.r1cs")
+}
 
 const MAGIC: &[u8; 4] = b"r1cs";
 const VERSION: u32 = 1;
@@ -35,11 +39,7 @@ const FIELD_BYTES: u32 = 32;
 /// The finalized constraint matrices of a circuit, synthesized from its
 /// template in setup mode.
 pub fn circuit_matrices(kind: KeyKind) -> Result<ConstraintMatrices<Fr>> {
-    let cs = match kind {
-        KeyKind::Request => synthesize(request_template(), SynthesisMode::Setup),
-        KeyKind::Withdrawal => synthesize(withdrawal_template(), SynthesisMode::Setup),
-    }
-    .map_err(|error| anyhow!("synthesize {kind} circuit: {error}"))?;
+    let cs = kind.synthesize_template()?;
     cs.to_matrices()
         .ok_or_else(|| anyhow!("{kind} constraint matrices unavailable"))
 }
@@ -172,6 +172,21 @@ mod tests {
         // nPubOut = 0, nPubIn = 12.
         assert_eq!(u32::from_le_bytes(bytes[64..68].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(bytes[68..72].try_into().unwrap()), 12);
+    }
+
+    /// Every circuit, the insertion circuits included, declares exactly its
+    /// statement's inputs public, in a file named after its kind.
+    #[test]
+    fn every_circuit_declares_its_inputs_public() {
+        for kind in KeyKind::ALL {
+            let bytes = r1cs_bytes(kind).unwrap();
+            let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            assert_eq!(word(64), 0, "{kind} nPubOut");
+            assert_eq!(word(68) as usize, kind.public_inputs(), "{kind} nPubIn");
+            assert_eq!(r1cs_file(kind), format!("{}.r1cs", kind.as_str()));
+        }
+        assert_eq!(r1cs_file(KeyKind::Request), REQUEST_R1CS_FILE);
+        assert_eq!(r1cs_file(KeyKind::Withdrawal), WITHDRAWAL_R1CS_FILE);
     }
 
     #[test]

@@ -6,8 +6,6 @@ import {ZkApiVault} from "../../src/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "../../src/adapters/Groth16ProofAdapter.sol";
 import {Types} from "../../src/libraries/Types.sol";
 import {Errors} from "../../src/libraries/Errors.sol";
-import {Bn254Poseidon} from "../../src/libraries/Bn254Poseidon.sol";
-import {NoteLeafLib} from "../../src/libraries/NoteLeafLib.sol";
 import {PackedUserOperation} from "../../src/gasless/IERC4337.sol";
 import {ZkApiWithdrawalAccountFactory} from "../../src/gasless/ZkApiWithdrawalAccountFactory.sol";
 import {ZkApiWithdrawalPaymaster} from "../../src/gasless/ZkApiWithdrawalPaymaster.sol";
@@ -92,7 +90,6 @@ contract RealAdapterTest is GaslessTestBase {
     bytes closeProof;
     Types.WithdrawalPublicInputs escapeInputs;
     bytes escapeProof;
-    uint256[32] goldenEmptySiblings;
     /// A real transit account of another payee, created before the factory override: its
     /// provenance still checks out, and the golden close names another destination than it.
     address otherS;
@@ -105,11 +102,6 @@ contract RealAdapterTest is GaslessTestBase {
         vm.warp(vm.parseJsonUint(fixtures, ".timestamp"));
         vm.fee(BASEFEE);
         _etchEntryPoint();
-        uint256 zero;
-        for (uint256 level = 0; level < 32; ++level) {
-            goldenEmptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
-        }
         real = new Groth16ProofAdapter();
         (escapeInputs, escapeProof) = _golden("escape_a2_concede");
         Types.WithdrawalPublicInputs memory escape = escapeInputs;
@@ -135,7 +127,12 @@ contract RealAdapterTest is GaslessTestBase {
         vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT);
         vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(vm.parseJsonBytes32(fixtures, ".note_b_registration"), DEPOSIT);
         vm.stopPrank();
-        assertEq(vault.currentRoot(), closeInputs.activeRoot, "golden root");
+        (uint256 commitment, uint256 metadata) = _binding(closeInputs.noteId);
+        assertEq(closeInputs.registrationCommitment, commitment, "golden close names its note");
+        assertEq(closeInputs.noteMetadata, metadata, "golden close names its note");
+        (commitment, metadata) = _binding(escapeInputs.noteId);
+        assertEq(escapeInputs.registrationCommitment, commitment, "golden escape names its note");
+        assertEq(escapeInputs.noteMetadata, metadata, "golden escape names its note");
         paymaster = new ZkApiWithdrawalPaymaster(
             entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
         );
@@ -297,16 +294,5 @@ contract RealAdapterTest is GaslessTestBase {
             ),
             vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"))
         );
-    }
-
-    function _goldenLeaf(uint32 noteId) private view returns (uint256) {
-        if (noteId >= vault.nextNoteId()) return 0;
-        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiry);
-    }
-
-    function _goldenPath(uint32 index) private view returns (uint256[32] memory siblings) {
-        siblings = goldenEmptySiblings;
-        siblings[0] = _goldenLeaf(index ^ 1);
     }
 }

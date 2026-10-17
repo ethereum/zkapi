@@ -34,6 +34,8 @@ contract RejectingWithdrawals is MockAdapterIdentity {
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {
         revert Errors.InvalidProof();
     }
+
+    function assertValidInsertion(uint256, uint256[] calldata, bytes calldata) external pure {}
 }
 
 /// @dev A vault whose versions and adapter the paymaster's constructor checks: only the getters
@@ -41,6 +43,7 @@ contract RejectingWithdrawals is MockAdapterIdentity {
 contract VersionedVault {
     uint16 public immutable PROTOCOL_VERSION;
     uint16 public immutable CONCESSION_ESCAPE_VERSION;
+    uint16 public immutable NOTE_BOUND_EXIT_VERSION;
     address public immutable proofAdapter;
     uint256 public constant nativeAssetWeiPerUnit = 1 gwei;
     uint256 public constant stateSigningKeyX = 11;
@@ -49,9 +52,10 @@ contract VersionedVault {
     uint256 public constant clearanceSigningKeyY = 14;
     uint64 public constant maxPauseDuration = 7 days;
 
-    constructor(uint16 protocolVersion, uint16 concessionVersion, address adapter_) {
+    constructor(uint16 protocolVersion, uint16 concessionVersion, uint16 noteBoundVersion, address adapter_) {
         PROTOCOL_VERSION = protocolVersion;
         CONCESSION_ESCAPE_VERSION = concessionVersion;
+        NOTE_BOUND_EXIT_VERSION = noteBoundVersion;
         proofAdapter = adapter_;
     }
 }
@@ -137,20 +141,27 @@ contract ValidationTest is GaslessTestBase {
         assertEq(address(_deploy(ENTRY_POINT, address(vault)).entryPoint()), ENTRY_POINT, "the pinned runtime");
     }
 
-    /// The vault must speak protocol version 2 with concession escapes version 1 and name an
-    /// adapter with code, since validation re-runs the vault's checks and the adapter's proof.
+    /// The vault must speak protocol version 2 with concession escapes version 1 and note-bound
+    /// exits version 1 (the parser assumes the 17-input statement) and name an adapter with code,
+    /// since validation re-runs the vault's checks and the adapter's proof.
     function test_constructorRefusesABadVault() public {
-        VersionedVault wrongProtocol = new VersionedVault(3, 1, address(adapter));
+        VersionedVault wrongProtocol = new VersionedVault(3, 1, 1, address(adapter));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
         _deploy(ENTRY_POINT, address(wrongProtocol));
-        VersionedVault wrongConcession = new VersionedVault(2, 2, address(adapter));
+        VersionedVault wrongConcession = new VersionedVault(2, 2, 1, address(adapter));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
         _deploy(ENTRY_POINT, address(wrongConcession));
-        VersionedVault codelessAdapter = new VersionedVault(2, 1, address(0x1234));
+        VersionedVault rootBoundExits = new VersionedVault(2, 1, 0, address(adapter));
+        vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
+        _deploy(ENTRY_POINT, address(rootBoundExits));
+        VersionedVault wrongNoteBound = new VersionedVault(2, 1, 2, address(adapter));
+        vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
+        _deploy(ENTRY_POINT, address(wrongNoteBound));
+        VersionedVault codelessAdapter = new VersionedVault(2, 1, 1, address(0x1234));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
         _deploy(ENTRY_POINT, address(codelessAdapter));
         // the same mock with the right versions and an adapter with code is accepted
-        VersionedVault right = new VersionedVault(2, 1, address(adapter));
+        VersionedVault right = new VersionedVault(2, 1, 1, address(adapter));
         ZkApiWithdrawalPaymaster p = _deploy(ENTRY_POINT, address(right));
         assertEq(address(p.adapter()), address(adapter));
         assertEq(p.WEI_PER_UNIT(), 1 gwei);
@@ -322,8 +333,8 @@ contract ValidationTest is GaslessTestBase {
         callData[35] = 0x40;
         op.callData = callData;
         _refused(_resign(op), unsupported);
-        // a length the paymaster does not accept (835, 837, 1)
-        op.callData = _callData(_slice(vaultCall, 0, 835));
+        // a length the paymaster does not accept (867, 869, 1)
+        op.callData = _callData(_slice(vaultCall, 0, 867));
         _refused(_resign(op), unsupported);
         op.callData = _callData(abi.encodePacked(vaultCall, uint8(0)));
         _refused(_resign(op), unsupported);
@@ -344,11 +355,11 @@ contract ValidationTest is GaslessTestBase {
         _refused(_resign(op), unsupported);
         // the proof's offset or length word is not canonical
         other = _closeCall(inputs);
-        other[547] = 0x40;
+        other[579] = 0x60;
         op.callData = _callData(other);
         _refused(_resign(op), unsupported);
         other = _closeCall(inputs);
-        other[579] = 0xff;
+        other[611] = 0xff;
         op.callData = _callData(other);
         _refused(_resign(op), unsupported);
         // a finalize with upper bits in the note id
@@ -503,10 +514,32 @@ contract ValidationTest is GaslessTestBase {
         assertTrue(ok, "closes resume");
     }
 
-    function test_unknownRoot() public {
-        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
-        inputs.activeRoot += 1;
-        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.UnknownRoot.selector);
+    /// The statement must name its note as the vault stores it (the vault's NoteBindingMismatch,
+    /// the same selector): another registration commitment, amount or expiry, or another note's
+    /// values, for a close and an escape. The note need not be activated.
+    function test_noteBindingMismatch() public {
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory base, uint32 id) = _closeReady();
+        assertFalse(vault.isActivated(id));
+        assertEq(ZkApiWithdrawalPaymaster.NoteBindingMismatch.selector, Errors.NoteBindingMismatch.selector);
+        uint32 other = _depositUnits(42, BIG / 2);
+        (uint256 otherCommitment, uint256 otherMetadata) = _binding(other);
+        assertEq(otherCommitment, base.registrationCommitment);
+        for (uint256 field = 0; field < 4; ++field) {
+            Types.WithdrawalPublicInputs memory inputs = _closeTo(id, 1001, base.finalBalance, op.sender);
+            if (field == 0) inputs.registrationCommitment += 1;
+            if (field == 1) inputs.noteMetadata -= 1;
+            if (field == 2) inputs.noteMetadata += uint256(1) << 128;
+            if (field == 3) inputs.noteMetadata = otherMetadata;
+            _refusedUncounted(
+                _withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteBindingMismatch.selector, _closeKey(1001)
+            );
+        }
+        (PackedUserOperation memory escape, Types.WithdrawalPublicInputs memory escapeInputs) =
+            _escapeOp(other, 2001, 2002, BIG / 2 - 2_000_000, 1_000_000);
+        escapeInputs.noteMetadata += 1;
+        _refused(_withInputs(escape, escapeInputs, true), ZkApiWithdrawalPaymaster.NoteBindingMismatch.selector);
+        (bool ok,) = _tryHandle(_withInputs(op, base, false));
+        assertTrue(ok, "the statement as stored");
     }
 
     function test_noteNotActive() public {
@@ -514,8 +547,10 @@ contract ValidationTest is GaslessTestBase {
         vm.prank(user);
         vault.mutualClose(_close(inputs.noteId, 9, BIG), PROOF);
         _refused(op, ZkApiWithdrawalPaymaster.NoteNotActive.selector);
-        // a note that was never deposited
+        // a note that was never deposited, named with its (zero) stored values or with note 0's
         inputs.noteId = 7;
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteNotActive.selector);
+        (inputs.registrationCommitment, inputs.noteMetadata) = (0, 0);
         _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteNotActive.selector);
     }
 

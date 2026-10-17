@@ -5,7 +5,8 @@
 //! cargo run --release -p zkapi-proof --example setup -- ../setup/v2-concession-dev
 //! ```
 //!
-//! Writes the four keys, `manifest.json`, `Bn254Poseidon.sol` and
+//! Writes the ten keys (request, withdrawal and the 1-, 4- and 16-note
+//! insertion circuits), `manifest.json`, `Bn254Poseidon.sol` and
 //! `Groth16ProofAdapter.sol`. Release builds refuse `dev` keys.
 fn main() -> anyhow::Result<()> {
     let directory = std::env::args()
@@ -21,11 +22,11 @@ fn main() -> anyhow::Result<()> {
     )?;
     let manifest: zkapi_proof::compact::SetupManifest = serde_json::from_str(&manifest)?;
     println!(
-        "{} setup {} written to {directory}\nrequest VK keccak256 {}\nwithdrawal VK keccak256 {}",
-        manifest.circuit_id,
-        manifest.setup_id,
-        manifest.vk_keccak256.request,
-        manifest.vk_keccak256.withdrawal
+        "{} setup {} written to {directory}",
+        manifest.circuit_id, manifest.setup_id
     );
+    for kind in zkapi_proof::compact::KeyKind::ALL {
+        println!("{kind} VK keccak256 {}", manifest.vk_keccak256.get(kind));
+    }
     Ok(())
 }

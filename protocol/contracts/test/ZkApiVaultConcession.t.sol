@@ -6,12 +6,14 @@ import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
 import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {MerkleUpdateLib} from "../src/libraries/MerkleUpdateLib.sol";
 import {VaultTestBase} from "./helpers/VaultTestBase.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
 
-/// @dev The concession exit (circuit zkapi-v2-concession-v1, vault revision 3) against the mock
+/// @dev The concession exit (circuit zkapi-v2-concession-v2, vault revision 4) against the mock
 ///      adapter: initiation, defeat, raise, finalization, the re-escape rules of the design's
-///      section 4.6, close, expiry, retirement and the any-known-root rule (Amendment A1).
+///      section 4.6, close, expiry, retirement and the note binding of withdrawals (a statement
+///      names its note as stored, so it needs no root and survives every tree change).
 ///      Note 0's states S_i have nullifiers N(i) = 1000 + i; the escape from S_i names N(i) and
 ///      its successor N(i + 1). The balance of S_2 is 790,000 of a 1,000,000 deposit.
 contract ZkApiVaultConcessionTest is VaultTestBase {
@@ -58,10 +60,9 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertTrue(vault.usedNullifiers(N(2)));
         assertTrue(vault.usedNullifiers(N(3)));
         assertEq(uint256(_status(id)), uint256(Types.NoteStatus.PendingWithdrawal));
-        (bool exists, uint256 activeRoot, uint256 nullifier, uint128 finalBalance, address destination, uint64 dl) =
+        (bool exists, uint256 nullifier, uint128 finalBalance, address destination, uint64 dl) =
             vault.pendingWithdrawals(id);
         assertTrue(exists);
-        assertEq(activeRoot, inputs.activeRoot);
         assertEq(nullifier, N(2));
         assertEq(finalBalance, B2 - SB2);
         assertEq(destination, user);
@@ -70,36 +71,38 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertEq(next, N(3));
         assertEq(stateBalance, B2);
         assertEq(conceded, SB2);
-        // No Merkle work: the root and its history are untouched.
+        // No Merkle work: the root is untouched.
         assertEq(vault.currentRoot(), root);
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
 
-    /// An unrelated deposit mined first changes nothing about the escape. The pending record keeps
-    /// the proof's root, but the events report the live root: the indexer and the clients' log
-    /// rebuild require every root-bearing event other than NoteDeposited and ClosedLeafRetired to
-    /// carry the current computed root. A defeat after a further deposit reports the root live at
-    /// the defeat, neither the proof's root nor the one live at initiation.
-    function test_depositLandingFirstDoesNotInvalidateTheEscape() public {
+    /// Tree changes mined first (other deposits, an activation, a retirement) change nothing about
+    /// the escape: its statement names the note, not a root. The events report the live root: the
+    /// indexer and the clients' log rebuild require every root-bearing event other than
+    /// NotesActivated and ClosedLeafRetired to carry the current computed root. A defeat after a
+    /// further activation and a retirement reports the root live at the defeat.
+    function test_treeChangesLandingFirstDoNotInvalidateTheEscape() public {
         uint32 id = _deposit(42);
+        uint32 other = _deposit(43);
         Types.WithdrawalPublicInputs memory inputs = _escapeFrom(id, 2, B2, 0);
-        uint256 proofRoot = inputs.activeRoot;
-        _deposit(43);
+        uint256 builtAt = vault.currentRoot();
         _deposit(44);
-        assertNotEq(vault.currentRoot(), proofRoot);
+        _activate(1);
+        assertNotEq(vault.currentRoot(), builtAt);
         uint256 liveRoot = vault.currentRoot();
         uint64 deadline = uint64(vm.getBlockTimestamp()) + CHALLENGE_PERIOD;
         vm.expectEmit(address(vault));
         emit Events.EscapeWithdrawalInitiated(id, N(2), B2, user, deadline, liveRoot);
         _initiate(inputs);
-        (, uint256 activeRoot,,,,) = vault.pendingWithdrawals(id);
-        assertEq(activeRoot, proofRoot);
         assertEq(vault.currentRoot(), liveRoot);
 
-        _deposit(45);
+        _activate(1);
+        vault.mutualClose(_close(other, 9000, DEPOSIT), PROOF);
+        _retire(other);
+        _activate(1);
         uint256 defeatRoot = vault.currentRoot();
         assertNotEq(defeatRoot, liveRoot);
-        assertNotEq(defeatRoot, proofRoot);
+        assertEq(defeatRoot, _mirrorRoot());
         Types.RequestPublicInputs memory request = _evidence(N(3), SB2);
         vm.expectEmit(address(vault));
         emit Events.EscapeWithdrawalChallenged(id, N(2), defeatRoot);
@@ -243,11 +246,11 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         _defeat(id, N(3));
         _escapeReverts(_escapeFrom(id, 2, B2, SB2), Errors.ChallengedNullifier.selector);
         _escapeReverts(_escapeFrom(id, 1, 940_000, 0), Errors.SupersededState.selector);
-        // The flags are checked before the root and the proof.
-        Types.WithdrawalPublicInputs memory unknownRoot = _escapeFrom(id, 1, 940_000, 0);
-        unknownRoot.activeRoot = 12_345;
+        // The flags are checked before the note binding and the proof.
+        Types.WithdrawalPublicInputs memory unbound = _escapeFrom(id, 1, 940_000, 0);
+        unbound.registrationCommitment += 1;
         vm.expectRevert(Errors.SupersededState.selector);
-        vault.initiateEscapeWithdrawal(unknownRoot, PROOF);
+        vault.initiateEscapeWithdrawal(unbound, PROOF);
     }
 
     /// The vault consumes only canonical nullifiers, even behind an adapter that accepts anything
@@ -308,7 +311,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         vault.challengeEscapeWithdrawal(id, request, PROOF);
 
         assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Active));
-        (bool exists,,,,,) = vault.pendingWithdrawals(id);
+        (bool exists,,,,) = vault.pendingWithdrawals(id);
         assertFalse(exists);
         (uint256 next, uint128 stateBalance, uint128 conceded) = _concession(id);
         assertEq(next, 0);
@@ -354,9 +357,11 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
     /// The defeat checks neither the request's root nor its time: historical evidence counts.
     function test_defeatAcceptsHistoricalEvidence() public {
         uint32 id = _deposit(42);
+        _activate(1);
         Types.RequestPublicInputs memory old = _evidence(N(3), SB2);
         vm.warp(vm.getBlockTimestamp() + 20 days);
         _deposit(43);
+        _activate(1);
         _initiate(_escapeFrom(id, 2, B2, 0));
         assertNotEq(old.activeRoot, vault.currentRoot());
         _defeat(id, old);
@@ -563,6 +568,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
 
     function test_mutualClosePaysAndLeavesTheTree() public {
         uint32 id = _deposit(42);
+        _activate(1);
         uint256 root = vault.currentRoot();
         Types.WithdrawalPublicInputs memory close = _close(id, N(2), B2);
         // A kind-1 proof publishes no successor; the vault ignores the word and consumes only N.
@@ -594,6 +600,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
 
     function test_claimExpiredTakesNoSiblingsAndLeavesTheLeaf() public {
         uint32 id = _deposit(42);
+        _activate(1);
         uint256 root = vault.currentRoot();
         vm.warp(vault.effectiveExpiry(id) - 1);
         vm.expectRevert(Errors.NoteNotExpired.selector);
@@ -627,6 +634,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
 
     function test_retireClosedLeafNeedsAClosedNote() public {
         uint32 id = _deposit(42);
+        _activate(1);
         uint256[32] memory path = _path(id);
         vm.expectRevert(Errors.NoteNotClosed.selector);
         vault.retireClosedLeaf(id, path);
@@ -638,11 +646,31 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         vault.retireClosedLeaf(7, path);
     }
 
+    /// A Closed note whose leaf is not in the tree yet cannot be retired, whatever path is given;
+    /// once activated, it can.
+    function test_retireClosedLeafNeedsAnActivatedNote() public {
+        uint32 a = _deposit(42);
+        uint32 b = _deposit(43);
+        _activate(1);
+        vault.mutualClose(_close(b, N(2), B2), PROOF);
+        uint256[32] memory path = _path(b);
+        vm.expectRevert(Errors.NoteNotActivated.selector);
+        vault.retireClosedLeaf(b, path);
+        vm.expectRevert(Errors.NoteNotActivated.selector);
+        vault.retireClosedLeaf(b, emptySiblings);
+        assertTrue(vault.isActivated(a));
+        assertFalse(vault.isActivated(b));
+        _activate(1);
+        _retire(b);
+        assertEq(vault.currentRoot(), _mirrorRoot());
+    }
+
     function test_retireClosedLeafRemovesTheLeafOnce() public {
         uint32 a = _deposit(42);
         uint32 b = _deposit(43);
+        _activate(1);
+        _activate(1);
         vault.mutualClose(_close(a, N(2), B2), PROOF);
-        uint256 oldRoot = vault.currentRoot();
         uint256[32] memory path = _path(a);
         // The root of the tree that holds only note b's leaf.
         uint256 expected = _leafOf(b);
@@ -657,22 +685,25 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         vault.retireClosedLeaf(a, path);
         retired[a] = true;
         assertEq(vault.currentRoot(), expected);
-        assertTrue(vault.knownRoots(expected));
-        assertTrue(vault.isKnownRoot(oldRoot));
+        assertEq(uint256(_status(a)), uint256(Types.NoteStatus.Closed));
         // A second retirement finds the leaf gone.
         vm.expectRevert(Errors.StaleRoot.selector);
         vault.retireClosedLeaf(a, path);
         path = _path(a);
         vm.expectRevert(Errors.StaleRoot.selector);
         vault.retireClosedLeaf(a, path);
-        // A deposit and an exit of the other note still work on the new tree.
+        // A deposit, its activation and an exit of the other note still work on the new tree.
         _deposit(44);
+        _activateOnChain(1);
+        assertEq(vault.currentRoot(), _mirrorRoot());
         vault.mutualClose(_close(b, 9000, DEPOSIT), PROOF);
     }
 
     function test_retireClosedLeafAfterEscapeAndExpiry() public {
         uint32 escaped = _deposit(42);
         uint32 expired = _deposit(43);
+        _activate(1);
+        _activate(1);
         _initiate(_escapeFrom(escaped, 2, B2, 0));
         vm.warp(_deadline(escaped));
         vault.finalizeEscapeWithdrawal(escaped);
@@ -686,52 +717,44 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
             empty = Bn254Poseidon.compress(DOMAIN_NODE, empty, empty);
         }
         assertEq(vault.currentRoot(), empty);
+        assertEq(vault.currentRoot(), MerkleUpdateLib.EMPTY_ROOT);
     }
 
-    // ===================================================== known roots (Amendment A1)
+    // ================================================================ note binding
 
-    /// Every root the vault set stays known for good: the empty tree's, each deposit's and each
-    /// retirement's. A root it never held is unknown.
-    function test_everyRootTheVaultHeldStaysKnown() public {
-        uint256[6] memory roots;
-        roots[0] = vault.currentRoot();
+    /// A recorded note exits before it is activated: an escape and a close of notes that never
+    /// entered the request tree, with the root still the empty tree's.
+    function test_unactivatedNotesExit() public {
         uint32 a = _deposit(42);
-        roots[1] = vault.currentRoot();
         uint32 b = _deposit(43);
-        roots[2] = vault.currentRoot();
-        vault.mutualClose(_close(a, N(2), B2), PROOF);
-        _retire(a);
-        roots[3] = vault.currentRoot();
-        _deposit(44);
-        roots[4] = vault.currentRoot();
-        vault.mutualClose(_close(b, 9000, DEPOSIT), PROOF);
-        _retire(b);
-        roots[5] = vault.currentRoot();
-        vm.warp(vm.getBlockTimestamp() + 3650 days);
-        for (uint256 i = 0; i < roots.length; ++i) {
-            assertTrue(vault.isKnownRoot(roots[i]));
-            assertTrue(vault.knownRoots(roots[i]));
-        }
-        assertFalse(vault.isKnownRoot(12_345));
-        assertFalse(vault.isKnownRoot(0));
+        assertFalse(vault.isActivated(a));
+        assertFalse(vault.isActivated(b));
+        _initiate(_escapeFrom(a, 2, B2, 0));
+        vault.mutualClose(_close(b, 9000, 800_000), PROOF);
+        vm.warp(_deadline(a));
+        vault.finalizeEscapeWithdrawal(a);
+        assertEq(uint256(_status(a)), uint256(Types.NoteStatus.Closed));
+        assertEq(uint256(_status(b)), uint256(Types.NoteStatus.Closed));
+        assertEq(vault.currentRoot(), MerkleUpdateLib.EMPTY_ROOT);
+        assertEq(vault.activationCursor(), 0);
+        assertEq(user.balance, 100 ether - 2 * uint256(DEPOSIT) * 1 gwei + uint256(B2 + 800_000) * 1 gwei);
     }
 
-    /// A client exits with the Merkle path it saved at deposit: an escape and a close at their
-    /// notes' deposit-time roots, after later deposits, a retirement and more than the old
-    /// one-day root window.
-    function test_exitsAtTheDepositTimeRootAfterLaterDepositsAndARetirement() public {
+    /// A statement built when its note was recorded stays valid through every later tree change:
+    /// other deposits, the note's activation and later ones, a retirement, and more than a day.
+    function test_exitsBuiltBeforeActivationLandAfterActivationsAndARetirement() public {
         uint32 a = _deposit(42);
         Types.WithdrawalPublicInputs memory escape = _escapeFrom(a, 2, B2, 0);
         uint32 b = _deposit(43);
         Types.WithdrawalPublicInputs memory close = _close(b, 9000, 800_000);
         uint32 c = _deposit(44);
+        _deposit(45);
+        _activate(4);
         vault.mutualClose(_close(c, 9100, DEPOSIT), PROOF);
         _retire(c);
-        _deposit(45);
+        _deposit(46);
+        _activateOnChain(1);
         vm.warp(vm.getBlockTimestamp() + 2 days);
-        assertNotEq(vault.currentRoot(), escape.activeRoot);
-        assertNotEq(vault.currentRoot(), close.activeRoot);
-        // Both roots were replaced more than ROOT_HISTORY_WINDOW ago.
         escape.validUntil = uint64(vm.getBlockTimestamp());
         close.validUntil = uint64(vm.getBlockTimestamp());
         _initiate(escape);
@@ -740,51 +763,86 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertEq(uint256(_status(b)), uint256(Types.NoteStatus.Closed));
     }
 
-    function test_withdrawalsRefuseARootTheVaultNeverHeld() public {
-        uint32 id = _deposit(42);
-        Types.WithdrawalPublicInputs memory escape = _escapeFrom(id, 2, B2, 0);
-        Types.WithdrawalPublicInputs memory close = _close(id, N(2), B2);
-        escape.activeRoot = 12_345;
-        close.activeRoot = 12_345;
-        vm.expectRevert(Errors.UnknownRoot.selector);
-        vault.initiateEscapeWithdrawal(escape, PROOF);
-        vm.expectRevert(Errors.UnknownRoot.selector);
-        vault.mutualClose(close, PROOF);
-        _assertUntouched(id);
+    /// A statement must name its note exactly as stored, checked before the proof: a different
+    /// registration commitment, amount or expiry, another note's values (the same secret, so a
+    /// valid proof of note b exists), or values for a note never recorded revert
+    /// NoteBindingMismatch, before and after activation, for escapes and closes alike.
+    function test_withdrawalsRefuseAStatementNotNamingTheNoteAsStored() public {
+        uint32 a = _deposit(42);
+        vm.warp(vm.getBlockTimestamp() + 3 days);
+        uint32 b = _deposit(42);
+        (uint256 commitment, uint256 metadata) = _binding(a);
+        (, uint128 amount, uint64 expiryTs,) = vault.notes(a);
+        (uint256 otherCommitment, uint256 otherMetadata) = _binding(b);
+        assertEq(otherCommitment, commitment);
+        assertNotEq(otherMetadata, metadata);
+        uint256[2][6] memory wrong = [
+            [commitment + 1, metadata],
+            [uint256(43), metadata],
+            [commitment, _metadata(amount - 1, expiryTs)],
+            [commitment, _metadata(amount, expiryTs + 1 days)],
+            [otherCommitment, otherMetadata],
+            [uint256(0), uint256(0)]
+        ];
+        for (uint256 round = 0; round < 2; ++round) {
+            for (uint256 i = 0; i < wrong.length; ++i) {
+                _bindingReverts(a, wrong[i][0], wrong[i][1]);
+            }
+            // b's values for a note never recorded.
+            uint32 future = vault.nextNoteId();
+            Types.WithdrawalPublicInputs memory escape = _escape(future, N(0), N(1), 0, 0);
+            Types.WithdrawalPublicInputs memory close = _close(future, N(0), 0);
+            (escape.registrationCommitment, escape.noteMetadata) = (otherCommitment, otherMetadata);
+            (close.registrationCommitment, close.noteMetadata) = (otherCommitment, otherMetadata);
+            _escapeReverts(escape, Errors.NoteBindingMismatch.selector);
+            _closeReverts(close, Errors.NoteBindingMismatch.selector);
+            if (round == 0) _activateAll();
+        }
+        _assertUntouched(a);
+        _assertUntouched(b);
+        // The values as stored go through.
+        _initiate(_escapeFrom(a, 2, B2, 0));
+        vault.mutualClose(_close(b, N(9), DEPOSIT), PROOF);
     }
 
-    // ========================================= closed notes stay closed (Amendment A1)
+    /// An escape and a close of note `id` carrying (`commitment`, `metadata`) revert
+    /// NoteBindingMismatch.
+    function _bindingReverts(uint32 id, uint256 commitment, uint256 metadata) internal {
+        Types.WithdrawalPublicInputs memory escape = _escapeFrom(id, 2, B2, 0);
+        Types.WithdrawalPublicInputs memory close = _close(id, N(2), B2);
+        (escape.registrationCommitment, escape.noteMetadata) = (commitment, metadata);
+        (close.registrationCommitment, close.noteMetadata) = (commitment, metadata);
+        _escapeReverts(escape, Errors.NoteBindingMismatch.selector);
+        _closeReverts(close, Errors.NoteBindingMismatch.selector);
+    }
+
+    // ================================================================ closed notes
 
     uint256 constant CLOSED_BY_MUTUAL_CLOSE = 0;
     uint256 constant CLOSED_BY_FINALIZED_ESCAPE = 1;
     uint256 constant CLOSED_BY_EXPIRY_CLAIM = 2;
 
-    /// Under Amendment A1 a Closed note's leaf stays provable for good: in every root the vault
-    /// held before the leaf is retired, and in every root if it never is. The Active check of
-    /// initiateEscapeWithdrawal and mutualClose is then the only barrier to a second payout. For
-    /// each way a note closes, an escape and a close from an older unconsumed state (S_0), from
-    /// the closing state (S_2) and from a newer unconsumed state (S_4) revert NoteNotActive at the
-    /// note's deposit-time root and at the root live when it closed, before and after its leaf
-    /// is retired, and at the root after the retirement.
+    /// A Closed note's statements keep matching its stored values for good (closing changes only
+    /// the status, and activation inserts its original leaf whatever the status), so the Active
+    /// check of initiateEscapeWithdrawal and mutualClose is the only barrier to a second payout.
+    /// For each way a note closes, before its activation, an escape and a close from an older
+    /// unconsumed state (S_0), from the closing state (S_2) and from a newer unconsumed state
+    /// (S_4) revert NoteNotActive: before the note is activated, after, and after its leaf is
+    /// retired.
     function test_closedNoteNeverExitsAgain() public {
         for (uint256 route = 0; route < 3; ++route) {
             uint256 snapshot = vm.snapshotState();
             uint32 id = _deposit(42);
-            uint256 depositRoot = vault.currentRoot();
             _deposit(43);
             _closeBy(route, id);
-            uint256 closedRoot = vault.currentRoot();
-            assertNotEq(closedRoot, depositRoot);
             uint256 held = address(vault).balance;
 
-            _assertNeverExitsAgain(id, depositRoot);
-            _assertNeverExitsAgain(id, closedRoot);
+            _assertNeverExitsAgain(id);
+            _activateAll();
+            assertTrue(vault.isActivated(id));
+            _assertNeverExitsAgain(id);
             _retire(id);
-            assertTrue(vault.isKnownRoot(depositRoot));
-            assertTrue(vault.isKnownRoot(closedRoot));
-            _assertNeverExitsAgain(id, depositRoot);
-            _assertNeverExitsAgain(id, closedRoot);
-            _assertNeverExitsAgain(id, vault.currentRoot());
+            _assertNeverExitsAgain(id);
 
             assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Closed));
             assertEq(address(vault).balance, held);
@@ -797,15 +855,16 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         }
     }
 
-    /// A note id never deposited has no leaf, but the mock adapter accepts any statement: an escape
-    /// or a close of it (zero balance, the only one its zero deposit admits) reverts NoteNotActive
-    /// rather than recording a pending escape that the later deposit at that id would inherit.
+    /// A note id never deposited stores zeros, but the mock adapter accepts any statement: an escape
+    /// or a close of it naming those zeros (zero balance, the only one its zero deposit admits)
+    /// reverts NoteNotActive rather than recording a pending escape that the later deposit at that
+    /// id would inherit.
     function test_exitsOfANoteNeverDepositedRevert() public {
         _deposit(42);
         uint32 future = vault.nextNoteId();
         _escapeReverts(_escape(future, N(0), N(1), 0, 0), Errors.NoteNotActive.selector);
         _closeReverts(_close(future, N(0), 0), Errors.NoteNotActive.selector);
-        (bool exists,,,,,) = vault.pendingWithdrawals(future);
+        (bool exists,,,,) = vault.pendingWithdrawals(future);
         assertFalse(exists);
         assertFalse(vault.usedNullifiers(N(0)));
         assertEq(uint256(_status(future)), uint256(Types.NoteStatus.Uninitialized));
@@ -825,21 +884,15 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Closed));
     }
 
-    /// Escapes and closes of Closed note `id` from S_0, S_2 and S_4 at `root` (a fresh proof:
-    /// validUntil is in the future) revert NoteNotActive.
-    function _assertNeverExitsAgain(uint32 id, uint256 root) internal {
+    /// Escapes and closes of Closed note `id` from S_0, S_2 and S_4 (fresh proofs: validUntil is
+    /// in the future) revert NoteNotActive.
+    function _assertNeverExitsAgain(uint32 id) internal {
         uint256[3] memory states = [uint256(0), 2, 4];
         uint128[3] memory balances = [DEPOSIT, B2, 600_000];
         for (uint256 i = 0; i < states.length; ++i) {
-            Types.WithdrawalPublicInputs memory escape = _escapeFrom(id, states[i], balances[i], 0);
-            escape.activeRoot = root;
-            _escapeReverts(escape, Errors.NoteNotActive.selector);
-            escape = _escapeFrom(id, states[i], balances[i], balances[i] / 2);
-            escape.activeRoot = root;
-            _escapeReverts(escape, Errors.NoteNotActive.selector);
-            Types.WithdrawalPublicInputs memory close = _close(id, N(states[i]), balances[i]);
-            close.activeRoot = root;
-            _closeReverts(close, Errors.NoteNotActive.selector);
+            _escapeReverts(_escapeFrom(id, states[i], balances[i], 0), Errors.NoteNotActive.selector);
+            _escapeReverts(_escapeFrom(id, states[i], balances[i], balances[i] / 2), Errors.NoteNotActive.selector);
+            _closeReverts(_close(id, N(states[i]), balances[i]), Errors.NoteNotActive.selector);
         }
     }
 
@@ -871,9 +924,12 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         ZkApiVault tight = _newVault(CHALLENGE_PERIOD, 2 * CHALLENGE_PERIOD);
         assertEq(tight.maxPauseDuration(), 2 * CHALLENGE_PERIOD);
         assertEq(tight.CONCESSION_ESCAPE_VERSION(), 1);
+        assertEq(tight.NOTE_BOUND_EXIT_VERSION(), 1);
+        assertEq(tight.PROTOCOL_VERSION(), 2);
         assertEq(tight.PAUSE_COOLDOWN(), 1 days);
-        assertEq(tight.ROOT_HISTORY_WINDOW(), 1 days);
-        assertTrue(tight.isKnownRoot(tight.currentRoot()));
+        assertEq(tight.currentRoot(), MerkleUpdateLib.EMPTY_ROOT);
+        assertEq(tight.activationCursor(), 0);
+        assertEq(tight.nextNoteId(), 0);
     }
 
     // ================================================================== helpers
@@ -890,7 +946,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
 
     function _assertPending(uint32 id, uint256 nullifier, uint256 next) internal view {
         assertEq(uint256(_status(id)), uint256(Types.NoteStatus.PendingWithdrawal));
-        (bool exists,, uint256 pendingNullifier,,,) = vault.pendingWithdrawals(id);
+        (bool exists, uint256 pendingNullifier,,,) = vault.pendingWithdrawals(id);
         assertTrue(exists);
         assertEq(pendingNullifier, nullifier);
         (uint256 pendingNext,,) = _concession(id);
@@ -907,7 +963,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
 
     function _assertUntouched(uint32 id) internal view {
         assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Active));
-        (bool exists,,,,,) = vault.pendingWithdrawals(id);
+        (bool exists,,,,) = vault.pendingWithdrawals(id);
         assertFalse(exists);
         for (uint256 i = 0; i < 6; ++i) {
             assertFalse(vault.usedNullifiers(N(i)));

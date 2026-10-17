@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "description": "The shared exit-rule vectors of circuit zkapi-v2-concession-v1, one file for every client: the companion wallet (zkapi-client tests/shared_vectors.rs, and zkapi-companion for the exit kit), the browser SDK (sdk/test/zkapi-exit-rules-vectors.test.mjs, through its pure exit policy and the shipped WebAssembly) and zkapi-clientd (the E5 payout matcher and the exit-proof lifetime) must reproduce every expected value; a change here is a change to all of them. Sections: successor_checks (S1-S6, design §6.1); concession_allowed and ownership_proof (C3, §6.3); near_expiry (C4); constants, e_low, must_initiate_by and unsettled_escape_after (E0, §6.4); classify and decide (E1-E3, with the C5/E2.4 clearance outcomes); payout (E5); lock_releasable (E6); exit_kit (E7). C1 (one lock) and C2 (one bound per state) are tested in each implementation; E4's calldata is the shared withdrawal golden vector (protocol/contracts/test/fixtures/withdrawal-golden.json). Times are UNIX seconds, amounts are billing units. `ZKAPI_WRITE_VECTORS=1 cargo test -p zkapi-client --test shared_vectors` regenerates successor_checks; every other section is hand-written from the design.",
+  "description": "The shared exit-rule vectors of circuit zkapi-v2-concession-v2, one file for every client: the companion wallet (zkapi-client tests/shared_vectors.rs, and zkapi-companion for the exit kit), the browser SDK (sdk/test/zkapi-exit-rules-vectors.test.mjs, through its pure exit policy and the shipped WebAssembly) and zkapi-clientd (the E5 payout matcher and the exit-proof lifetime) must reproduce every expected value; a change here is a change to all of them. Sections: successor_checks (S1-S6, design §6.1); concession_allowed and ownership_proof (C3, §6.3); near_expiry (C4); constants, e_low, must_initiate_by and unsettled_escape_after (E0, §6.4); classify and decide (E1-E3, with the C5/E2.4 clearance outcomes); payout (E5); lock_releasable (E6); exit_kit (E7). C1 (one lock) and C2 (one bound per state) are tested in each implementation; E4's calldata is the shared withdrawal golden vector (protocol/contracts/test/fixtures/withdrawal-golden.json). Times are UNIX seconds, amounts are billing units. `ZKAPI_WRITE_VECTORS=1 cargo test -p zkapi-client --test shared_vectors` regenerates successor_checks; every other section is hand-written from the design.",
   "constants": {
     "call_timeout_seconds": 20,
     "recovery_budget_seconds": 120,
@@ -1148,7 +1148,7 @@
     }
   ],
   "successor_checks": {
-    "description": "S1-S6 (design §6.1) for circuit zkapi-v2-concession-v1. Load `state` and `journal` (a case's own `journal` replaces it), deliver each `response` for the journal's request, and expect `install`, `invalid_successor` (a correctly signed successor failing S3, S4 or S5, archived and treated as withheld) or `reject` (S1, S2 or S6 fails; nothing changes). For `install`, `installed` is the resulting balance, anchor, prev_anchor, blinding and bound_at_state.",
+    "description": "S1-S6 (design §6.1) for circuit zkapi-v2-concession-v2. Load `state` and `journal` (a case's own `journal` replaces it), deliver each `response` for the journal's request, and expect `install`, `invalid_successor` (a correctly signed successor failing S3, S4 or S5, archived and treated as withheld) or `reject` (S1, S2 or S6 fails; nothing changes). For `install`, `installed` is the resulting balance, anchor, prev_anchor, blinding and bound_at_state.",
     "state_signing_key": {
       "x": "0x2ee22e021c822b4ac78593468652a9ffa0d1fc3d46a7d257a1a26990be32b504",
       "y": "0x1aad05d53f9e1f38373cd8a397adf0de5adaeb233d2ce4c266b14232a5cc57ca"
@@ -1612,7 +1612,7 @@
     ]
   },
   "exit_kit": {
-    "description": "E7: a zkapi-exit-kit-v1 the browser SDK sealed (buildExitKitPayload and sealExitKit, crates/zkapi-companion/tests/fixtures/make-sdk-exit-kit.mjs). Every client opens `fixture` with `passphrase`, refuses `wrong_passphrase`, and reads `expected`.",
+    "description": "E7: a zkapi-exit-kit-v1 the browser SDK sealed (buildExitKitPayload and sealExitKit, crates/zkapi-companion/tests/fixtures/make-sdk-exit-kit.mjs). Every client opens `fixture` with `passphrase`, refuses `wrong_passphrase`, and reads `expected`. The kit predates note-bound exits and still carries the deposit-time `merkle_path` (`merkle_path_root`, `merkle_path_siblings`): a reader accepts a kit with or without it (or with the older `deposit_path`) and ignores it, since an exit needs no path.",
     "fixture": "crates/zkapi-companion/tests/fixtures/sdk-exit-kit-v1.json",
     "passphrase": "zkapi exit kit fixture",
     "wrong_passphrase": "not the passphrase",

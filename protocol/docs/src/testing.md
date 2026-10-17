@@ -10,8 +10,9 @@ cargo test --release --workspace --locked
 Protocol tests cover canonical fields and serialization, Merkle trees, native
 wallet persistence and the shared exit-rule vectors, browser wallet state,
 compact proof encoding, commitment binding, signing-seed policy, setup ids and
-key headers, the request/withdrawal circuit constraints (positive, negative and
-mutate-each-public-input cases with the `CircomReduction` prover), the R1CS
+key headers, the request, withdrawal and insertion circuit constraints
+(positive, negative and mutate-each-public-input cases with the
+`CircomReduction` prover), the R1CS
 export round trip and negative assignments, the zkey import gates, and the
 cross-check of the reduction against `ark-circom`. `ZKAPI_SETUP_DIR` runs the
 proof tests against any setup directory. `cargo run --release -p zkapi-proof
@@ -22,8 +23,9 @@ evidence, clearance ownership proofs, settlement terminality and the
 settle-then-sign gate, defeat and raise decisions and status, the companion's
 exit routes, and indexer reorganization and divergence handling.
 
-From `protocol/contracts/`, run `forge test` for deposit, the concession exit
-(initiation, defeat, raise, finalization), the bounded pause, the treasury
+From `protocol/contracts/`, run `forge test` for deposit, activation (proved
+and on chain), note-bound exits, the concession exit (initiation, defeat,
+raise, finalization), the bounded pause, the treasury
 timelock, invariant fuzzing, the generated mutation test over real proofs, the
 gas snapshot (`FORGE_SNAPSHOT_CHECK=true`), the shared withdrawal golden vector
 and real Groth16 verifier regressions. `node scripts/check-withdrawal-golden.mjs`

@@ -5,17 +5,13 @@ import {Errors} from "./Errors.sol";
 import {Bn254Poseidon} from "./Bn254Poseidon.sol";
 
 /// @title MerkleUpdateLib
-/// @notice The note tree: depth 32, zero leaves, node = Bn254Poseidon.compress("zkapi.v2.node", left,
-///         right) (zkapi_core::v2::merkle_node), note ID as the leaf index. Leaves are appended in
-///         order (insert) and only ever changed back to zero (retire), so the tree is kept as its
-///         frontier: `filled[i]` holds the complete left subtree of height i that the next right
-///         subtree at that height will be hashed with.
-/// @dev `filled[i]` is read by an insertion whose index has bit i set, and holds the subtree of
-///      index `(index >> i) - 1` then. It is written at the one level where an insertion completes
-///      a subtree (the index's lowest zero bit), and by a retirement that changes the subtree the
-///      frontier still refers to (the level below the lowest common ancestor of the retired leaf and
-///      the next free slot; see retire). Every root the vault ever held stays a valid proof root for
-///      the notes that were not retired, since no other leaf ever changes.
+/// @notice The request tree: depth 32, zero leaves, node = Bn254Poseidon.compress("zkapi.v2.node",
+///         left, right) (zkapi_core::v2::merkle_node), note ID as the leaf index. The vault stores
+///         only its root. Notes are appended in aligned batches of 1, 4 or 16 leaves (activation)
+///         and a Closed note's leaf can be set back to zero (retirement); every other leaf never
+///         changes. No frontier is kept: each on-chain update authenticates the path it is given
+///         against the current root, so proved updates (which hash nothing on-chain) and on-chain
+///         ones can follow each other in any order.
 library MerkleUpdateLib {
     uint256 internal constant MERKLE_DEPTH = 32;
     uint256 internal constant FIELD_MODULUS =
@@ -72,6 +68,41 @@ library MerkleUpdateLib {
         }
     }
 
+    /// @notice Appends `leaves` (1, 4 or 16 of them, the caller's batch) at `firstIndex`, which must
+    ///         be aligned to their count, and returns the new root. `siblings` is the path above the
+    ///         batch's subtree (entries below its height are ignored). Reverts StaleRoot unless the
+    ///         subtree at that position is empty under `currentRoot`, so nothing is overwritten and
+    ///         every other node, retired leaves included, is preserved.
+    function appendSubtree(
+        uint256 currentRoot,
+        uint32 firstIndex,
+        uint256[] memory leaves,
+        uint256[32] calldata siblings
+    ) internal pure returns (uint256 newRoot) {
+        uint256 count = leaves.length;
+        uint256 height = count == 1 ? 0 : count == 4 ? 2 : 4;
+        uint256 subtree = count == 1 ? leaves[0] : Bn254Poseidon.compressSubtree(DOMAIN_NODE, leaves);
+        uint256 oldRoot;
+        (oldRoot, newRoot) =
+            Bn254Poseidon.compressPairPath(DOMAIN_NODE, firstIndex, zeroHash(height), subtree, siblings, height);
+        if (oldRoot != currentRoot) revert Errors.StaleRoot();
+    }
+
+    /// @notice Replaces the leaf `oldLeaf` at `index` with `newLeaf`, given the leaf's siblings, and
+    ///         returns the new root. Reverts StaleRoot when the siblings and `oldLeaf` do not
+    ///         reproduce `currentRoot`.
+    function replaceLeaf(
+        uint256 currentRoot,
+        uint32 index,
+        uint256 oldLeaf,
+        uint256 newLeaf,
+        uint256[32] calldata siblings
+    ) internal pure returns (uint256 newRoot) {
+        uint256 oldRoot;
+        (oldRoot, newRoot) = Bn254Poseidon.compressPairPath(DOMAIN_NODE, index, oldLeaf, newLeaf, siblings, 0);
+        if (oldRoot != currentRoot) revert Errors.StaleRoot();
+    }
+
     /// @notice The root of the tree with `leaf` at `index` given the leaf's siblings, bottom up.
     function computeRoot(uint32 index, uint256 leaf, uint256[32] calldata siblings)
         internal
@@ -87,60 +118,5 @@ library MerkleUpdateLib {
                 ++level;
             }
         }
-    }
-
-    /// @notice Appends `leaf` at `index`, the next free slot of the tree whose frontier is `filled`,
-    ///         and returns the new root: 32 compressions, no proof needed.
-    function insert(uint256[32] storage filled, uint32 index, uint256 leaf) internal returns (uint256 newRoot) {
-        bytes memory zeros = ZERO_HASHES;
-        uint256[32] memory siblings;
-        uint256 completedLevel = MERKLE_DEPTH;
-        for (uint256 level = 0; level < MERKLE_DEPTH;) {
-            if (((index >> level) & 1) == 1) {
-                siblings[level] = filled[level];
-            } else {
-                assembly ("memory-safe") {
-                    mstore(add(siblings, mul(level, 0x20)), mload(add(add(zeros, 0x20), mul(level, 0x20))))
-                }
-                if (completedLevel == MERKLE_DEPTH) completedLevel = level;
-            }
-            unchecked {
-                ++level;
-            }
-        }
-        uint256 completed;
-        (newRoot, completed) = Bn254Poseidon.insertPath32(DOMAIN_NODE, index, leaf, siblings);
-        // The subtree this insertion completes: the path's node at the lowest zero bit of index.
-        // With every bit set (the last slot) nothing is stored; no insertion follows.
-        if (completedLevel < MERKLE_DEPTH) filled[completedLevel] = completed;
-    }
-
-    /// @notice Sets the leaf at `index` (below `nextIndex`, the next free slot) back to zero, given
-    ///         the leaf's siblings at `currentRoot`, and returns the new root. Reverts StaleRoot
-    ///         when the siblings and `oldLeaf` do not reproduce `currentRoot`.
-    /// @dev The one frontier entry the change can reach is at the level just below the lowest
-    ///      common ancestor of `index` and `nextIndex` (the highest bit where they differ): there
-    ///      the two are siblings, the retired leaf's side is the complete left subtree `filled`
-    ///      holds, and above it both share the frontier node, which the next insertion recomputes.
-    function retire(
-        uint256[32] storage filled,
-        uint32 nextIndex,
-        uint256 currentRoot,
-        uint32 index,
-        uint256 oldLeaf,
-        uint256[32] calldata siblings
-    ) internal returns (uint256 newRoot) {
-        uint256 differing = uint256(index ^ nextIndex);
-        uint256 level = MERKLE_DEPTH - 1;
-        while ((differing >> level) & 1 == 0) {
-            unchecked {
-                --level;
-            }
-        }
-        (uint256 computedOldRoot, uint256 root, uint256 node) =
-            Bn254Poseidon.compressPairPath32(DOMAIN_NODE, index, oldLeaf, 0, siblings, level);
-        if (computedOldRoot != currentRoot) revert Errors.StaleRoot();
-        filled[level] = node;
-        newRoot = root;
     }
 }

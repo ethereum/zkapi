@@ -7,8 +7,10 @@ nullifier. The vault settles the remaining balance when the note closes, and
 its concession exit lets an owner leave without the operator.
 
 The current circuit binds signed balances to the private membership leaf and
-the nullifier chain to the note. Its circuit ID is `zkapi-v2-concession-v1`
-(vault revision 3). Read the [ceremony setup and trust assumptions](setup/v2-concession/README.md)
+the nullifier chain to the note, binds withdrawals to the note the vault
+stores, and appends recorded notes to the request tree with proved batches.
+Its circuit ID is `zkapi-v2-concession-v2` (vault revision 4). Read the
+[ceremony setup and trust assumptions](setup/v2-concession/README.md)
 and the [development setup](setup/v2-concession-dev/README.md) before using
 its keys.
 

@@ -3,9 +3,13 @@ pragma solidity ^0.8.28;
 
 /// @title Events – All events emitted by ZkApiVault
 abstract contract Events {
-    event NoteDeposited(
-        uint32 indexed noteId, bytes32 indexed commitment, uint128 amount, uint64 expiryTs, uint256 newRoot
-    );
+    /// @notice A note was recorded. Its leaf enters the request tree when it is activated
+    ///         (NotesActivated); it can exit at once.
+    event NoteDeposited(uint32 indexed noteId, bytes32 indexed commitment, uint128 amount, uint64 expiryTs);
+
+    /// @notice Notes firstNoteId .. firstNoteId + count - 1 were appended to the request tree, whose
+    ///         root is now newRoot. `proved` tells a proved batch from the on-chain fallback.
+    event NotesActivated(uint32 indexed firstNoteId, uint32 count, uint256 newRoot, bool proved);
 
     event MutualClose(uint32 indexed noteId, uint256 nullifier, uint128 finalBalance, address destination);
 

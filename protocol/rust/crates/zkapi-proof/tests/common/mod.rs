@@ -1,5 +1,6 @@
-//! Shared statement fixtures: an honest state chain, the positive cases and
-//! every negative case of the WP-A test plan, at the circuit level.
+//! Shared statement fixtures: an honest state chain, note activations, the
+//! positive cases and every negative case of the WP-A test plan, at the
+//! circuit level.
 #![allow(dead_code)]
 
 use ark_bn254::Fr;
@@ -8,10 +9,14 @@ use ark_relations::r1cs::{ConstraintSystemRef, SynthesisMode};
 use zkapi_core::v2 as core;
 use zkapi_core::MerkleTree;
 use zkapi_proof::compact::{
-    request_circuit, withdrawal_circuit, RequestWitnessData, WithdrawalWitnessData,
+    request_circuit, withdrawal_circuit, KeyKind, RequestWitnessData, WithdrawalWitnessData,
 };
 use zkapi_proof::dev::{tree_with, DevDeployment, DevNote, DevRequest, DevState, DevWithdrawal};
 use zkapi_proof::groth16::{synthesize, RequestCircuit, WithdrawalCircuit};
+use zkapi_proof::insertion::{
+    insertion_roots, InsertedNote, InsertionCircuit, InsertionPublic, InsertionWitness,
+    INSERTION_SIZES,
+};
 use zkapi_types::{Felt252, RequestPublicInputsV2, WithdrawalKind, WithdrawalPublicInputsV2C};
 
 pub const CHAIN_ID: u64 = 31_337;
@@ -132,9 +137,7 @@ impl Chain {
         state: &DevState,
         withdrawal: &DevWithdrawal,
     ) -> (WithdrawalPublicInputsV2C, WithdrawalWitnessData) {
-        state
-            .withdrawal(&self.deployment, &self.tree, withdrawal)
-            .unwrap()
+        state.withdrawal(&self.deployment, withdrawal).unwrap()
     }
 
     /// The canonical withdrawal statement for `state` without the builder's
@@ -151,7 +154,7 @@ impl Chain {
             protocol_version: 2,
             chain_id: CHAIN_ID,
             contract_address: self.deployment.contract_address,
-            active_root: self.tree.root(),
+            registration_commitment: state.note.registration(),
             state_signing_key_x: state_key.x,
             state_signing_key_y: state_key.y,
             clearance_signing_key_x: clearance_key.x,
@@ -168,12 +171,13 @@ impl Chain {
             },
             conceded: withdrawal.conceded,
             valid_until: withdrawal.valid_until,
+            deposit_amount: state.note.deposit_amount,
+            expiry: state.note.expiry,
         };
         let witness = WithdrawalWitnessData {
             secret: state.note.secret,
             deposit_amount: state.note.deposit_amount,
             expiry: state.note.expiry,
-            merkle_siblings: self.tree.get_siblings(state.note.note_id),
             state_balance: state.balance,
             state_blinding: state.blinding,
             current_anchor: state.anchor,
@@ -213,12 +217,62 @@ impl Chain {
     }
 }
 
+/// `count` notes from id `first`, with distinct secrets, amounts and expiries.
+pub fn batch_notes(first: u32, count: usize) -> Vec<DevNote> {
+    (first..first + count as u32)
+        .map(|note_id| DevNote {
+            secret: Felt252::from_u64(1_000 + u64::from(note_id)),
+            note_id,
+            deposit_amount: DEPOSIT + 1_000 * u128::from(note_id),
+            expiry: EXPIRY + 86_400 * u64::from(note_id),
+        })
+        .collect()
+}
+
+/// What the vault stores for `note`, as the insertion statement carries it.
+pub fn stored(note: &DevNote) -> InsertedNote {
+    InsertedNote {
+        registration_commitment: core::felt_to_field(&note.registration()),
+        deposit_amount: note.deposit_amount,
+        expiry: note.expiry,
+    }
+}
+
+/// The honest activation of `notes` (consecutive ids from the first) in
+/// `tree`, with the path of the first slot read from the tree.
+pub fn activation(tree: &MerkleTree, notes: &[DevNote]) -> InsertionCircuit {
+    let first_note_id = notes[0].note_id;
+    let notes: Vec<InsertedNote> = notes.iter().map(stored).collect();
+    let siblings = tree
+        .get_siblings(first_note_id)
+        .map(|value| core::felt_to_field(&value));
+    let (old_root, new_root) = insertion_roots(first_note_id, &notes, &siblings);
+    InsertionCircuit {
+        public: InsertionPublic {
+            old_root,
+            new_root,
+            first_note_id,
+            notes,
+        },
+        witness: InsertionWitness { siblings },
+    }
+}
+
+/// The activation of the `size` notes at cursor `size`, after the first
+/// `size` notes were activated (so the path above the subtree is not empty).
+pub fn second_batch(size: usize) -> InsertionCircuit {
+    let first = batch_notes(0, size);
+    let tree = tree_with(&first.iter().collect::<Vec<_>>());
+    activation(&tree, &batch_notes(size as u32, size))
+}
+
 /// A circuit, plus optional overrides of instance values after synthesis (for
 /// statements whose typed fields cannot hold the value, such as
 /// `valid_until >= 2^64`). Instance index 0 is the constant one.
 pub enum CaseCircuit {
-    Request(RequestCircuit),
-    Withdrawal(WithdrawalCircuit),
+    Request(Box<RequestCircuit>),
+    Withdrawal(Box<WithdrawalCircuit>),
+    Insertion(Box<InsertionCircuit>),
 }
 
 pub struct Case {
@@ -235,7 +289,7 @@ impl Case {
     ) -> Self {
         Self {
             name,
-            circuit: CaseCircuit::Request(request_circuit(public, witness).unwrap()),
+            circuit: CaseCircuit::Request(Box::new(request_circuit(public, witness).unwrap())),
             instance_overrides: vec![],
         }
     }
@@ -247,7 +301,17 @@ impl Case {
     ) -> Self {
         Self {
             name,
-            circuit: CaseCircuit::Withdrawal(withdrawal_circuit(public, witness).unwrap()),
+            circuit: CaseCircuit::Withdrawal(Box::new(
+                withdrawal_circuit(public, witness).unwrap(),
+            )),
+            instance_overrides: vec![],
+        }
+    }
+
+    fn insertion(name: &'static str, circuit: InsertionCircuit) -> Self {
+        Self {
+            name,
+            circuit: CaseCircuit::Insertion(Box::new(circuit)),
             instance_overrides: vec![],
         }
     }
@@ -258,8 +322,9 @@ impl Case {
             construct_matrices: true,
         };
         let cs = match self.circuit {
-            CaseCircuit::Request(circuit) => synthesize(circuit, mode),
-            CaseCircuit::Withdrawal(circuit) => synthesize(circuit, mode),
+            CaseCircuit::Request(circuit) => synthesize(*circuit, mode),
+            CaseCircuit::Withdrawal(circuit) => synthesize(*circuit, mode),
+            CaseCircuit::Insertion(circuit) => synthesize(*circuit, mode),
         }
         .unwrap();
         for (index, value) in self.instance_overrides {
@@ -268,8 +333,15 @@ impl Case {
         cs
     }
 
-    pub fn is_withdrawal(&self) -> bool {
-        matches!(self.circuit, CaseCircuit::Withdrawal(_))
+    /// The circuit (and key kind) of the case.
+    pub fn kind(&self) -> KeyKind {
+        match &self.circuit {
+            CaseCircuit::Request(_) => KeyKind::Request,
+            CaseCircuit::Withdrawal(_) => KeyKind::Withdrawal,
+            CaseCircuit::Insertion(circuit) => {
+                KeyKind::insertion(circuit.public.size()).expect("an insertion size")
+            }
+        }
     }
 }
 
@@ -322,6 +394,40 @@ pub fn positive_cases() -> Vec<Case> {
     cases.push(Case::withdrawal("escape_from_non_derived_anchor", &p, &w));
     let (p, w) = c.request_of(&c.same_secret_note.genesis(Felt252::from_u64(5)), &c.r0);
     cases.push(Case::request("request_same_secret_other_note", &p, &w));
+    // Withdrawals take no tree: note B closes at genesis whether or not it
+    // is activated.
+    let (p, w) = c.withdrawal_of(
+        &c.same_secret_note.genesis(Felt252::from_u64(5)),
+        &withdrawal(WithdrawalKind::MutualClose, DESTINATION, 0),
+    );
+    cases.push(Case::withdrawal("close_same_secret_other_note", &p, &w));
+
+    // Activations: A into the empty tree, then B next to it (the tree of the
+    // request cases), and full batches at the first two aligned cursors.
+    let empty = MerkleTree::new();
+    cases.push(Case::insertion(
+        "activate_a",
+        activation(&empty, std::slice::from_ref(&c.note)),
+    ));
+    cases.push(Case::insertion(
+        "activate_b",
+        activation(
+            &tree_with(&[&c.note]),
+            std::slice::from_ref(&c.same_secret_note),
+        ),
+    ));
+    for size in INSERTION_SIZES {
+        let name = match size {
+            1 => ["insertion1_first_batch", "insertion1_second_batch"],
+            4 => ["insertion4_first_batch", "insertion4_second_batch"],
+            _ => ["insertion16_first_batch", "insertion16_second_batch"],
+        };
+        cases.push(Case::insertion(
+            name[0],
+            activation(&empty, &batch_notes(0, size)),
+        ));
+        cases.push(Case::insertion(name[1], second_batch(size)));
+    }
     cases
 }
 
@@ -535,7 +641,7 @@ pub fn negative_cases() -> Vec<Case> {
     circuit.public.destination += two_pow(160);
     cases.push(Case {
         name: "destination_at_least_2_160",
-        circuit: CaseCircuit::Withdrawal(circuit),
+        circuit: CaseCircuit::Withdrawal(Box::new(circuit)),
         instance_overrides: vec![],
     });
     let mut range = Case::withdrawal("valid_until_at_least_2_64", &pr, &wr);
@@ -546,6 +652,85 @@ pub fn negative_cases() -> Vec<Case> {
     cases.push(range);
     let mut range = Case::withdrawal("conceded_at_least_2_128", &pr, &wr);
     range.instance_overrides = vec![(15, two_pow(128))];
+    cases.push(range);
+
+    // Note binding (inputs 3 and 16), which the vault checks against what it
+    // stores for note_id. A commitment the secret does not open, also at
+    // genesis, where no signature binds the leaf: without W5's opening, a
+    // genesis exit could name a victim's stored note.
+    let escape = withdrawal(WithdrawalKind::Escape, DESTINATION, 0);
+    let foreign = core::registration_commitment(&Felt252::from_u64(43));
+    for (name, state) in [
+        ("withdrawal_foreign_registration_commitment", &c.s1),
+        ("genesis_withdrawal_foreign_registration_commitment", &c.s0),
+    ] {
+        let (mut fp, fw) = c.withdrawal_of(state, &escape);
+        fp.registration_commitment = foreign;
+        cases.push(Case::withdrawal(name, &fp, &fw));
+    }
+    // Another amount or expiry in input 16: the signed state commits to the
+    // stored leaf, and a genesis balance is exactly the stored amount.
+    let (mut mp, mw) = c.withdrawal_of(&c.s1, &escape);
+    mp.deposit_amount += 1;
+    cases.push(Case::withdrawal(
+        "withdrawal_signed_state_other_amount",
+        &mp,
+        &mw,
+    ));
+    let (mut mp, mw) = c.withdrawal_of(&c.s1, &escape);
+    mp.expiry += 1;
+    cases.push(Case::withdrawal(
+        "withdrawal_signed_state_other_expiry",
+        &mp,
+        &mw,
+    ));
+    for (name, amount) in [
+        ("genesis_withdrawal_larger_amount", 2 * DEPOSIT),
+        ("genesis_withdrawal_smaller_amount", DEPOSIT - 1),
+    ] {
+        let (mut mp, mw) = c.withdrawal_of(&c.s0, &escape);
+        mp.deposit_amount = amount;
+        cases.push(Case::withdrawal(name, &mp, &mw));
+    }
+    // A same-secret note with other stored values (the same C): A's signed
+    // state names its M, at A's id or moved to its id.
+    let richer = DevNote {
+        note_id: 2,
+        deposit_amount: 2 * DEPOSIT,
+        expiry: EXPIRY + 86_400,
+        ..c.note.clone()
+    };
+    let (mut sp, sw) = c.withdrawal_of(&c.s1, &escape);
+    assert_eq!(sp.registration_commitment, richer.registration());
+    sp.deposit_amount = richer.deposit_amount;
+    sp.expiry = richer.expiry;
+    cases.push(Case::withdrawal(
+        "withdrawal_signed_state_with_same_secret_note_metadata",
+        &sp,
+        &sw,
+    ));
+    let moved = DevState {
+        note: richer.clone(),
+        anchor: core::next_anchor(&core::nullifier(
+            &c.note.secret,
+            richer.note_id,
+            &c.s0.anchor,
+        )),
+        ..c.s1.clone()
+    };
+    let (sp, sw) = c.withdrawal_unchecked(&moved, &escape);
+    cases.push(Case::withdrawal(
+        "withdrawal_signed_state_moved_to_same_secret_note_with_other_values",
+        &sp,
+        &sw,
+    ));
+    // Input 16 outside the packing: an expiry of 2^64 or more, and a value
+    // that wraps the field.
+    let mut range = Case::withdrawal("note_metadata_expiry_at_least_2_64", &pr, &wr);
+    range.instance_overrides = vec![(17, core::felt_to_field(&pr.note_metadata()) + two_pow(192))];
+    cases.push(range);
+    let mut range = Case::withdrawal("note_metadata_minus_one", &pr, &wr);
+    range.instance_overrides = vec![(17, -Fr::ONE)];
     cases.push(range);
 
     // Q2 / Q3 ranges on the request.
@@ -563,5 +748,86 @@ pub fn negative_cases() -> Vec<Case> {
     let (mut ep, ew) = c.request_of(&c.s1, &c.r1);
     ep.request_time = EXPIRY + 1;
     cases.push(Case::request("request_after_expiry", &ep, &ew));
+
+    cases.extend(negative_insertion_cases(&c));
+    cases
+}
+
+/// Activations that would change the tree other than by appending the stored
+/// notes at the cursor. Instance indices: 1 old root, 2 new root, 3 cursor,
+/// then `C_j` at `4 + 2j` and `M_j` at `5 + 2j`.
+fn negative_insertion_cases(c: &Chain) -> Vec<Case> {
+    let mut cases = Vec::new();
+    let tree_a = tree_with(&[&c.note]);
+    let b = std::slice::from_ref(&c.same_secret_note);
+
+    // I4: a stale old root (the empty tree's, before A's activation) with B's
+    // path in the current tree.
+    let mut stale = activation(&tree_a, b);
+    stale.public.old_root = core::felt_to_field(&MerkleTree::new().root());
+    cases.push(Case::insertion("insertion_stale_old_root", stale));
+    // I4: the destination already holds a leaf. The old root is the real
+    // root, but no empty subtree under the path reproduces it.
+    let occupied = tree_with(&[&c.note, &c.same_secret_note]);
+    let mut overwrite = activation(&occupied, &batch_notes(1, 1));
+    overwrite.public.old_root = core::felt_to_field(&occupied.root());
+    cases.push(Case::insertion(
+        "insertion_overwrites_an_occupied_slot",
+        overwrite,
+    ));
+    let partly = tree_with(&[&batch_notes(2, 1)[0]]);
+    let mut overwrite = activation(&partly, &batch_notes(0, 4));
+    overwrite.public.old_root = core::felt_to_field(&partly.root());
+    cases.push(Case::insertion(
+        "insertion4_overwrites_an_occupied_slot",
+        overwrite,
+    ));
+    // I1: a cursor off the K alignment, with roots consistent for it.
+    for (name, first, size) in [
+        ("insertion4_misaligned_cursor", 2, 4),
+        ("insertion16_misaligned_cursor", 8, 16),
+    ] {
+        let misaligned = activation(&MerkleTree::new(), &batch_notes(first, size));
+        cases.push(Case::insertion(name, misaligned));
+    }
+    // I2: two stored notes listed in each other's places, and the commitment
+    // and metadata of one note in each other's inputs.
+    let mut swapped = second_batch(4);
+    swapped.public.notes.swap(0, 1);
+    cases.push(Case::insertion("insertion4_notes_swapped", swapped));
+    let honest = activation(&tree_a, b);
+    let (commitment, metadata) = (
+        honest.public.notes[0].registration_commitment,
+        honest.public.notes[0].metadata(),
+    );
+    let mut swapped = Case::insertion("insertion1_commitment_and_metadata_swapped", honest);
+    swapped.instance_overrides = vec![(4, metadata), (5, commitment)];
+    cases.push(swapped);
+    // I3 / I4: a new root of other note values than the stored ones.
+    let mut other_root = second_batch(4);
+    let mut other_notes = other_root.public.notes.clone();
+    other_notes[3].expiry += 1;
+    other_root.public.new_root = insertion_roots(
+        other_root.public.first_note_id,
+        &other_notes,
+        &other_root.witness.siblings,
+    )
+    .1;
+    cases.push(Case::insertion(
+        "insertion4_new_root_of_other_values",
+        other_root,
+    ));
+    let mut other_root = activation(&tree_a, b);
+    other_root.public.new_root = core::felt_to_field(&tree_a.root());
+    cases.push(Case::insertion("insertion_new_root_unchanged", other_root));
+    // Ranges: M_0 with an expiry of 2^64 or more, and a cursor of 2^32 or more.
+    let honest = activation(&tree_a, b);
+    let metadata = honest.public.notes[0].metadata();
+    let mut range = Case::insertion("insertion1_metadata_expiry_at_least_2_64", honest);
+    range.instance_overrides = vec![(5, metadata + two_pow(192))];
+    cases.push(range);
+    let mut range = Case::insertion("insertion1_cursor_at_least_2_32", activation(&tree_a, b));
+    range.instance_overrides = vec![(3, Fr::from(1u64) + two_pow(32))];
+    cases.push(range);
     cases
 }

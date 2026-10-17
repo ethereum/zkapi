@@ -14,14 +14,19 @@ import {IZkApiProofAdapter} from "./interfaces/IZkApiProofAdapter.sol";
 
 /// @title ZkApiVault
 /// @notice Native ETH settlement in whole gwei with in-protocol BN254 Groth16 verification, for
-///         circuit zkapi-v2-concession-v1 (vault revision 3).
+///         circuit zkapi-v2-concession-v2 (vault revision 4).
 /// @dev An escape names the nullifier N_k of the state it leaves and that state's derived successor
 ///      nullifier N_{k+1}, may concede an amount c, and pays B_k - c. Only a request proof at
 ///      N_{k+1} defeats it; a request proof at N_k can only raise c, to at most that request's
-///      solvency bound. The note tree is append-only: deposits append leaves to its frontier (no
-///      proof, so deposits never race each other) and only retireClosedLeaf changes one (a Closed
-///      note's, back to zero), so exits do no Merkle work and every root the vault ever held stays
-///      a valid proof root (knownRoots) for every note that was not retired.
+///      solvency bound.
+///      Notes and the request tree: deposit only records a note (no Merkle work). Withdrawals are
+///      bound to the note as stored (its registration commitment and packed amount and expiry are
+///      public inputs compared with notes[noteId]), so a note can exit as soon as it is recorded and
+///      no exit reads the tree. The request tree, whose root anonymous API requests prove
+///      membership under, gets the recorded notes appended in order, in aligned batches of 1, 4 or
+///      16 (activateNotes with an insertion proof, or activateNotesOnChain, which anyone may call
+///      and which hashes on-chain): activationCursor counts the notes appended. retireClosedLeaf
+///      sets a Closed note's leaf back to zero; no other leaf ever changes.
 ///      Ownership transfers are two-step and stay open while paused, for incident key rotation:
 ///      transferOwnership only nominates pendingOwner, and the current owner keeps every power
 ///      (including unpause and replacing the nomination) until the nominee calls acceptOwnership.
@@ -33,11 +38,11 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     /// @notice Minimum unpaused time between an unpause and the next pause.
     uint64 public constant PAUSE_COOLDOWN = 1 days;
     uint64 public constant DEFAULT_CHALLENGE_PERIOD = 24 hours;
+    /// @notice Capability marker of note-bound withdrawals and activated request trees (vault
+    ///         revision 4).
+    uint16 public constant NOTE_BOUND_EXIT_VERSION = 1;
     uint64 public constant EXPIRY_BUCKET = 1 days;
     uint256 public constant MERKLE_DEPTH = 32;
-    /// @notice The root window of off-chain services (the server's clearance check). The vault
-    ///         itself accepts any root it ever held (isKnownRoot), however long ago it was replaced.
-    uint64 public constant ROOT_HISTORY_WINDOW = 1 days;
     /// @notice Lower bound of the treasury timelock; the delay is max(this, challengePeriod).
     uint64 public constant MIN_TREASURY_CHANGE_DELAY = 2 days;
     /// @notice Execution gas forwarded on treasury pushes; a failed push accrues to treasuryArrears.
@@ -90,6 +95,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     uint64 public totalPausedDuration;
     /// @notice Treasury payouts (gwei units) whose push failed; see withdrawTreasuryArrears.
     uint128 public treasuryArrears;
+    /// @notice Notes appended to the request tree: notes 0 .. activationCursor - 1 are activated,
+    ///         activationCursor .. nextNoteId - 1 are recorded and wait for activation.
+    uint32 public activationCursor;
     address public pendingTreasury;
     /// @notice Active-clock time (wall clock minus all paused time) from which acceptTreasury may
     ///         apply pendingTreasury; paused time never counts toward the delay.
@@ -110,10 +118,6 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     /// @notice Escape payouts (gwei units) whose push to their destination failed, by destination;
     ///         see claimEscapePayout.
     mapping(address => uint128) public escapePayoutCredits;
-    /// @notice Every root the vault ever set as currentRoot, including the empty tree's.
-    mapping(uint256 => bool) public knownRoots;
-    /// @dev The note tree's frontier: see MerkleUpdateLib.
-    uint256[32] private _filledSubtrees;
 
     modifier whenNotPaused() {
         if (paused) revert Errors.Paused();
@@ -171,11 +175,10 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         clearanceSigningKeyY = clearanceSigningKeyY_;
         maxPauseDuration = maxPauseDuration_;
         currentRoot = MerkleUpdateLib.EMPTY_ROOT;
-        knownRoots[MerkleUpdateLib.EMPTY_ROOT] = true;
     }
 
-    /// @notice Deposits `amount` gwei units under `commitment` as the next note, appending its leaf
-    ///         to the tree. No Merkle proof is needed, so deposits never invalidate each other.
+    /// @notice Deposits `amount` gwei units under `commitment` as the next note. The note can exit
+    ///         at once; it can make anonymous API requests once it is activated (NotesActivated).
     function deposit(bytes32 commitment, uint128 amount) external payable nonReentrant whenNotPaused {
         if (amount > MAX_NATIVE_UNITS || msg.value != uint256(amount) * nativeAssetWeiPerUnit) {
             revert Errors.InvalidNativeValue();
@@ -189,16 +192,68 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         uint256 bucketedExpiry = ((rawExpiry + EXPIRY_BUCKET - 1) / EXPIRY_BUCKET) * EXPIRY_BUCKET;
         if (bucketedExpiry > type(uint64).max) revert Errors.InvalidFelt();
         uint64 expiryTs = uint64(bucketedExpiry);
-        uint256 newLeaf = NoteLeafLib.computeLeaf(noteId, commitment, amount, expiryTs);
-        uint256 newRoot = MerkleUpdateLib.insert(_filledSubtrees, noteId, newLeaf);
-
-        _setCurrentRoot(newRoot);
         notes[noteId] = Types.Note(commitment, amount, expiryTs, Types.NoteStatus.Active);
         // Deposits cannot happen while paused, so only completed pauses precede this note.
         uint64 pausedBefore = totalPausedDuration;
         if (pausedBefore != 0) _activeExpiry[noteId] = expiryTs - pausedBefore;
         nextNoteId = noteId + 1;
-        emit NoteDeposited(noteId, commitment, amount, expiryTs, newRoot);
+        emit NoteDeposited(noteId, commitment, amount, expiryTs);
+    }
+
+    /// @notice Activates the next `count` recorded notes (count 1, 4 or 16) with a proof of the
+    ///         insertion statement: the tree at `expectedRoot` with notes firstNoteId .. firstNoteId +
+    ///         count - 1 appended as one aligned subtree is the tree at `newRoot`. The statement's
+    ///         notes are read from storage here (commitment and packed amount and expiry, whatever the
+    ///         note's status), so a proof can neither skip, reorder nor alter a recorded note.
+    ///         Anyone may call it; the operator's activation worker does.
+    /// @dev firstNoteId and expectedRoot must equal activationCursor and currentRoot: an activation
+    ///      or a retirement landing first makes a prepared one revert StaleActivation before any
+    ///      verification. Deposits landing meanwhile do not.
+    function activateNotes(
+        uint32 firstNoteId,
+        uint256 count,
+        uint256 expectedRoot,
+        uint256 newRoot,
+        bytes calldata proof
+    ) external nonReentrant whenNotPaused {
+        _requireActivationRange(firstNoteId, count);
+        if (expectedRoot != currentRoot) revert Errors.StaleActivation();
+        uint256[] memory inputs = new uint256[](3 + 2 * count);
+        inputs[0] = expectedRoot;
+        inputs[1] = newRoot;
+        inputs[2] = firstNoteId;
+        for (uint256 j = 0; j < count;) {
+            Types.Note storage note = notes[uint32(uint256(firstNoteId) + j)];
+            inputs[3 + 2 * j] = uint256(note.commitment);
+            inputs[4 + 2 * j] = _noteMetadata(note);
+            unchecked {
+                ++j;
+            }
+        }
+        proofAdapter.assertValidInsertion(count, inputs, proof);
+        _activate(firstNoteId, count, newRoot, true);
+    }
+
+    /// @notice Activates the next `count` recorded notes (count 1, 4 or 16) without a proof: hashes
+    ///         their leaves and the path above them on-chain. `siblings` is the path of their (empty)
+    ///         subtree at currentRoot, which an indexer serves or any client rebuilds from events.
+    ///         Anyone may call it, so activation never depends on a prover; it costs far more gas.
+    function activateNotesOnChain(uint32 firstNoteId, uint256 count, uint256[32] calldata siblings)
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        _requireActivationRange(firstNoteId, count);
+        uint256[] memory leaves = new uint256[](count);
+        for (uint256 j = 0; j < count;) {
+            uint32 noteId = uint32(uint256(firstNoteId) + j);
+            leaves[j] = _leaf(noteId, notes[noteId]);
+            unchecked {
+                ++j;
+            }
+        }
+        uint256 newRoot = MerkleUpdateLib.appendSubtree(currentRoot, firstNoteId, leaves, siblings);
+        _activate(firstNoteId, count, newRoot, false);
     }
 
     /// @notice Closes an Active note with a clearance-backed (kind 1) withdrawal proof: pays
@@ -213,7 +268,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         if (inputs.kind != KIND_CLOSE) revert Errors.WrongWithdrawalKind();
         if (block.timestamp > inputs.validUntil) revert Errors.ProofExpired();
         _requireDestination(inputs.destination);
-        if (!isKnownRoot(inputs.activeRoot)) revert Errors.UnknownRoot();
+        _requireNoteBinding(inputs);
         proofAdapter.assertValidWithdrawal(inputs, proof);
         _closeActive(inputs);
         emit MutualClose(inputs.noteId, inputs.withdrawalNullifier, inputs.finalBalance, inputs.destination);
@@ -238,7 +293,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         if (challengedNullifiers[nullifier]) revert Errors.ChallengedNullifier();
         // The successor of this state was spent (it defeated an escape), so this state is stale.
         if (challengedNullifiers[nextNullifier]) revert Errors.SupersededState();
-        if (!isKnownRoot(inputs.activeRoot)) revert Errors.UnknownRoot();
+        _requireNoteBinding(inputs);
         proofAdapter.assertValidWithdrawal(inputs, proof);
 
         Types.Note storage note = notes[inputs.noteId];
@@ -256,7 +311,6 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         _escapes[inputs.noteId] = Types.Escape({
             withdrawalNullifier: nullifier,
             nextNullifier: nextNullifier,
-            activeRoot: inputs.activeRoot,
             destination: inputs.destination,
             challengeDeadline: deadline,
             finalBalance: inputs.finalBalance,
@@ -370,16 +424,19 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         emit ExpiredClaimed(noteId, amount, currentRoot);
     }
 
-    /// @notice Removes a Closed note's leaf from the tree, so that proofs built on later roots no
-    ///         longer contain it. Permissionless and open while paused; an operator tool.
+    /// @notice Removes a Closed, activated note's leaf from the request tree, so that requests,
+    ///         which must use the current root, can no longer prove its membership. Needed after an
+    ///         escape the operator failed to defeat (a later state of the note may still be unspent);
+    ///         a normally closed note has no spendable state left. Permissionless and open while
+    ///         paused; an operator tool.
     /// @dev Reverts StaleRoot when `siblings` do not reproduce currentRoot with the note's leaf,
     ///      including when the leaf was already retired.
     function retireClosedLeaf(uint32 noteId, uint256[32] calldata siblings) external nonReentrant {
         Types.Note storage note = notes[noteId];
         if (note.status != Types.NoteStatus.Closed) revert Errors.NoteNotClosed();
-        uint256 newRoot =
-            MerkleUpdateLib.retire(_filledSubtrees, nextNoteId, currentRoot, noteId, _leaf(noteId, note), siblings);
-        _setCurrentRoot(newRoot);
+        if (noteId >= activationCursor) revert Errors.NoteNotActivated();
+        uint256 newRoot = MerkleUpdateLib.replaceLeaf(currentRoot, noteId, _leaf(noteId, note), 0, siblings);
+        currentRoot = newRoot;
         emit ClosedLeafRetired(noteId, newRoot);
     }
 
@@ -421,8 +478,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         emit TreasuryArrearsPaid(recipient, amount);
     }
 
-    /// @notice Blocks deposit, claimExpired, setTreasury, acceptTreasury, withdrawTreasuryArrears
-    ///         and renounceOwnership until unpause. Blocks for at most maxPauseDuration:
+    /// @notice Blocks deposit, activateNotes, activateNotesOnChain, claimExpired, setTreasury,
+    ///         acceptTreasury, withdrawTreasuryArrears and renounceOwnership until unpause. Blocks
+    ///         for at most maxPauseDuration:
     ///         initiateEscapeWithdrawal and mutualClose, which reopen at pausedAt + maxPauseDuration
     ///         even while paused. Stay open while paused: challengeEscapeWithdrawal,
     ///         raiseEscapeConcession, finalizeEscapeWithdrawal and claimEscapePayout, so escapes in
@@ -455,22 +513,20 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         super.renounceOwnership();
     }
 
-    /// @notice True for every root the vault ever held. The tree is append-only for every note
-    ///         that is not Closed, so each root recorded since a note's deposit contains its leaf,
-    ///         and a client can exit with the Merkle path it saved at deposit.
-    function isKnownRoot(uint256 root) public view returns (bool) {
-        return knownRoots[root];
+    /// @notice Whether `noteId` is in the request tree, so it can make anonymous API requests (a
+    ///         note can exit whether or not it is activated).
+    function isActivated(uint32 noteId) external view returns (bool) {
+        return noteId < activationCursor;
     }
 
-    /// @notice A pending escape as revision 2 exposed it (6 words): exists, the escape proof's
-    ///         activeRoot, withdrawalNullifier, the current payout finalBalance, destination and
-    ///         challengeDeadline. All zero for a note without a pending escape.
+    /// @notice A pending escape (5 words): exists, withdrawalNullifier, the current payout
+    ///         finalBalance, destination and challengeDeadline. All zero for a note without a
+    ///         pending escape.
     function pendingWithdrawals(uint32 noteId)
         external
         view
         returns (
             bool exists,
-            uint256 activeRoot,
             uint256 withdrawalNullifier,
             uint128 finalBalance,
             address destination,
@@ -480,7 +536,6 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         Types.Escape storage escape = _escapes[noteId];
         destination = escape.destination;
         exists = destination != address(0);
-        activeRoot = escape.activeRoot;
         withdrawalNullifier = escape.withdrawalNullifier;
         finalBalance = escape.finalBalance;
         challengeDeadline = escape.challengeDeadline;
@@ -564,9 +619,40 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         usedNullifiers[nullifier] = true;
     }
 
-    function _setCurrentRoot(uint256 newRoot) private {
+    /// @dev count is 1, 4 or 16, firstNoteId is activationCursor and aligned to count, and the
+    ///      notes are recorded.
+    function _requireActivationRange(uint32 firstNoteId, uint256 count) private view {
+        if (count != 1 && count != 4 && count != 16) revert Errors.InvalidActivation();
+        if (firstNoteId != activationCursor) revert Errors.StaleActivation();
+        if (firstNoteId % count != 0 || uint256(firstNoteId) + count > nextNoteId) {
+            revert Errors.InvalidActivation();
+        }
+    }
+
+    function _activate(uint32 firstNoteId, uint256 count, uint256 newRoot, bool proved) private {
         currentRoot = newRoot;
-        knownRoots[newRoot] = true;
+        // casting to 'uint32' is safe because firstNoteId + count <= nextNoteId, a uint32
+        // forge-lint: disable-next-line(unsafe-typecast)
+        activationCursor = uint32(uint256(firstNoteId) + count);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        emit NotesActivated(firstNoteId, uint32(count), newRoot, proved);
+    }
+
+    /// @dev The withdrawal statement names the note as stored: its registration commitment and its
+    ///      packed amount and expiry. With W5 of the circuit (R = H(d_reg, s, 0) equals input 3, and
+    ///      the leaf is computed from inputs 3 and 16), this replaces a tree-membership proof. An
+    ///      unrecorded note stores zeros, which no secret opens.
+    function _requireNoteBinding(Types.WithdrawalPublicInputs calldata inputs) private view {
+        Types.Note storage note = notes[inputs.noteId];
+        if (inputs.registrationCommitment != uint256(note.commitment) || inputs.noteMetadata != _noteMetadata(note)) {
+            revert Errors.NoteBindingMismatch();
+        }
+    }
+
+    /// @dev uint256(depositAmount) | uint256(expiryTs) << 128: input 16 of the withdrawal statement and
+    ///      M_j of the insertion statement.
+    function _noteMetadata(Types.Note storage note) private view returns (uint256) {
+        return uint256(note.depositAmount) | (uint256(note.expiryTs) << 128);
     }
 
     /// @dev The note and record of an escape that can still be challenged or raised.

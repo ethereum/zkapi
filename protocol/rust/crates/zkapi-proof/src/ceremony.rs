@@ -149,15 +149,21 @@ pub struct PublicPtau {
 
 /// The powers of tau an `mpc-1` setup may be built on: the Hermez phase-1
 /// transcripts prepared for phase 2, `powersOfTau28_hez_final_<p>.ptau` for
-/// `p` = 16 (the withdrawal circuit's domain) to 27, with the Blake2b-512 the
-/// snarkjs README lists for each ("Prepare phase 2"; the snarkjs 0.7.5 and
-/// current READMEs list the same hashes). The power-16 file, downloaded from
-/// the listed source, has this hash and passes [`Ptau::lagrange_bases`].
+/// `p` = 15 (the QAP domain of all five circuits: request, withdrawal and the
+/// three insertion circuits) to 27, with the Blake2b-512 the snarkjs README
+/// lists for each ("Prepare phase 2"; the snarkjs 0.7.5 and current READMEs
+/// list the same hashes). The power-15 and power-16 files, downloaded from
+/// the listed source, have these hashes and pass [`Ptau::lagrange_bases`].
 ///
 /// Adding a transcript is a reviewed change to this list, and only with the
 /// hash its publisher lists: an import never trusts a powers of tau because
 /// the coordinator pinned it.
 pub const PUBLIC_PTAU: &[PublicPtau] = &[
+    PublicPtau {
+        name: "powersOfTau28_hez_final_15.ptau",
+        power: 15,
+        blake2b512: "982372c867d229c236091f767e703253249a9b432c1710b4f326306bfa2428a17b06240359606cfe4d580b10a5a1f63fbed499527069c18ae17060472969ae6e",
+    },
     PublicPtau {
         name: "powersOfTau28_hez_final_16.ptau",
         power: 16,
@@ -932,8 +938,12 @@ mod tests {
             );
             powers.push(entry.power);
         }
-        // Every power from the withdrawal domain (2^16) up, once each.
-        assert_eq!(powers, (16..=27).collect::<Vec<_>>());
+        // Every power from the circuits' domain (2^15) up, once each.
+        assert_eq!(powers, (15..=27).collect::<Vec<_>>());
+        for kind in crate::compact::KeyKind::ALL {
+            let shape = crate::compact::circuit_shape(kind).unwrap();
+            assert_eq!(shape.domain_size, 1 << powers[0], "{kind}");
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
 import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {MerkleUpdateLib} from "../src/libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 
 /// @dev Rust-generated proofs (CircomReduction prover, committed setup), the generated verifier and
@@ -16,8 +17,10 @@ import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 ///          ../setup/v2-concession-dev > ../contracts/test/fixtures/vault-challenge.json
 ///      Note A (id 0) has the honest chain a0 -R0-> a1 -R1-> a2 -R2-> a3 (charges 60,000, 150,000
 ///      and 40,000; R2's bound is 100,000), so B2 = 790,000. Note B (id 1) shares A's secret and is
-///      at genesis. Every proof is at the root holding A and B unless named otherwise, and is valid
-///      until the fixture's valid_until (7 days after the deposits).
+///      at genesis. Withdrawal proofs name their note as recorded (registration commitment and
+///      packed amount and expiry), so they need no activation; request proofs are at the root
+///      holding A and B. Every proof is valid until the fixture's valid_until (7 days after the
+///      deposits).
 contract ZkApiVaultGroth16Test is Test {
     uint256 constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465;
     uint128 constant DEPOSIT = 1_000_000;
@@ -39,7 +42,7 @@ contract ZkApiVaultGroth16Test is Test {
     function setUp() public {
         vm.chainId(31_337);
         fixtures = vm.readFile("test/fixtures/vault-challenge.json");
-        assertEq(vm.parseJsonString(fixtures, ".circuit_id"), "zkapi-v2-concession-v1");
+        assertEq(vm.parseJsonString(fixtures, ".circuit_id"), "zkapi-v2-concession-v2");
         vm.warp(vm.parseJsonUint(fixtures, ".timestamp"));
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
@@ -275,12 +278,14 @@ contract ZkApiVaultGroth16Test is Test {
     /// InvalidProof: the vault keys its nullifier bookkeeping on the raw words, so an escape naming
     /// N_{k+1} + r could not be defeated by the real successor request (NotSuccessorEvidence), and
     /// one naming N_k + r would slip past ChallengedNullifier after a defeat, or N_{k+1} + r past
-    /// SupersededState. The root and the keys are refused by the vault's own checks first.
+    /// SupersededState. The registration commitment and the note metadata (compared with the
+    /// note's record) and the keys are refused by the vault's own checks first.
     function test_realWithdrawalsRefuseNonCanonicalFieldInputs() public {
         _depositAB();
         string[2] memory names = ["escape_a2", "close_a2"];
         for (uint256 n = 0; n < names.length; ++n) {
-            _withdrawalWordReverts(names[n], 3, Errors.UnknownRoot.selector);
+            _withdrawalWordReverts(names[n], 3, Errors.NoteBindingMismatch.selector);
+            _withdrawalWordReverts(names[n], 16, Errors.NoteBindingMismatch.selector);
             for (uint256 key = 4; key < 8; ++key) {
                 _withdrawalWordReverts(names[n], key, Errors.InvalidDeploymentBinding.selector);
             }
@@ -372,23 +377,26 @@ contract ZkApiVaultGroth16Test is Test {
     /// The vault relies on the withdrawal proof for every word of an escape or a close that it
     /// does not check itself. Each such word of escape_a2 and close_a2, changed to another
     /// canonical value that passes every check made before verification, reverts InvalidProof:
-    /// the note id (to B, also Active), the payout, the destination, the nullifier, the successor
-    /// nullifier, the concession and validUntil, each increased by one, and the root replaced by
-    /// another root the vault held (A's deposit-time root). The note stays Active and neither
-    /// nullifier is consumed. Without verification, each would pay out or record an escape.
+    /// the note id (to B, also Active and recorded with the same commitment, amount and expiry),
+    /// the payout, the destination, the nullifier, the successor nullifier, the concession and
+    /// validUntil, each increased by one. The words the vault checks against the note's record,
+    /// the registration commitment and the note metadata, revert NoteBindingMismatch before the
+    /// proof. The note stays Active and neither nullifier is consumed. Without verification, each
+    /// would pay out or record an escape.
     function test_realWithdrawalsRefuseTamperedStatements() public {
         _depositAB();
-        uint256 rootA = vm.parseJsonUint(fixtures, ".root_a");
-        assertTrue(vault.isKnownRoot(rootA));
         string[2] memory names = ["escape_a2", "close_a2"];
         // noteId, finalBalance, destination, withdrawalNullifier, nextNullifier, conceded, validUntil
         uint256[7] memory proofOnly = [uint256(8), 9, 10, 11, 13, 14, 15];
         for (uint256 n = 0; n < names.length; ++n) {
             bytes memory words = vm.parseJsonBytes(fixtures, string.concat(".", names[n], ".inputs_abi"));
             for (uint256 i = 0; i < proofOnly.length; ++i) {
-                _tamperedWithdrawalReverts(names[n], proofOnly[i], _word(words, proofOnly[i]) + 1);
+                _tamperedWithdrawalReverts(
+                    names[n], proofOnly[i], _word(words, proofOnly[i]) + 1, Errors.InvalidProof.selector
+                );
             }
-            _tamperedWithdrawalReverts(names[n], 3, rootA);
+            _tamperedWithdrawalReverts(names[n], 3, _word(words, 3) + 1, Errors.NoteBindingMismatch.selector);
+            _tamperedWithdrawalReverts(names[n], 16, _word(words, 16) + 1, Errors.NoteBindingMismatch.selector);
         }
         (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2");
         for (uint32 id = 0; id < 2; ++id) {
@@ -404,26 +412,27 @@ contract ZkApiVaultGroth16Test is Test {
     }
 
     /// Submits fixture `name` (an escape or a close, by its kind) with ABI word `index` set to the
-    /// canonical `value`, as the user, expecting InvalidProof.
-    function _tamperedWithdrawalReverts(string memory name, uint256 index, uint256 value) private {
+    /// canonical `value`, as the user, expecting `err`.
+    function _tamperedWithdrawalReverts(string memory name, uint256 index, uint256 value, bytes4 err) private {
         bytes memory words = vm.parseJsonBytes(fixtures, string.concat(".", name, ".inputs_abi"));
         require(value < SCALAR_MODULUS && value != _word(words, index), "not a canonical change");
         _setWord(words, index, value);
         Types.WithdrawalPublicInputs memory inputs = abi.decode(words, (Types.WithdrawalPublicInputs));
         bytes memory proof = vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"));
         vm.prank(USER);
-        vm.expectRevert(Errors.InvalidProof.selector);
+        vm.expectRevert(err);
         if (inputs.kind == 1) vault.mutualClose(inputs, proof);
         else vault.initiateEscapeWithdrawal(inputs, proof);
     }
 
-    // ========================================= closed notes stay closed (Amendment A1)
+    // ================================================================ closed notes
 
-    /// Under Amendment A1 a closed note's leaf stays in every root the vault held, A's deposit-time
-    /// root among them, so the Active check is the only barrier to a second payout. After close_a2,
-    /// and after a finalized escape_a2, every exit proof of A reverts NoteNotActive, before and
-    /// after A's leaf is retired: escapes from the older states a0 and a1 (a0's nullifiers are
-    /// unconsumed), from a2, and from a2 at A's deposit-time root, and close_a2.
+    /// A closed note's statements keep matching its record (closing changes only the status, and
+    /// activation inserts its original leaf whatever the status), so the Active check is the only
+    /// barrier to a second payout. After close_a2, and after a finalized escape_a2, both before A
+    /// is activated, every exit proof of A reverts NoteNotActive: before A's activation, after it,
+    /// and after A's leaf is retired. Escapes from the older states a0 and a1 (a0's nullifiers are
+    /// unconsumed), from a2, and close_a2.
     function test_realClosedNoteNeverExitsAgain() public {
         for (uint256 route = 0; route < 2; ++route) {
             uint256 snapshot = vm.snapshotState();
@@ -439,6 +448,10 @@ contract ZkApiVaultGroth16Test is Test {
             assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Closed));
             uint256 held = address(vault).balance;
             _assertRealNeverExitsAgain();
+            _activateOnChain(1);
+            _activateOnChain(1);
+            assertEq(vault.currentRoot(), _root());
+            _assertRealNeverExitsAgain();
             _retire(0);
             _assertRealNeverExitsAgain();
             assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Closed));
@@ -451,11 +464,9 @@ contract ZkApiVaultGroth16Test is Test {
     }
 
     function _assertRealNeverExitsAgain() private {
-        string[6] memory names =
-            ["escape_a0", "escape_a1", "escape_a2", "escape_a2_concede", "escape_a2_at_root_a", "close_a2"];
+        string[5] memory names = ["escape_a0", "escape_a1", "escape_a2", "escape_a2_concede", "close_a2"];
         for (uint256 i = 0; i < names.length; ++i) {
             (Types.WithdrawalPublicInputs memory inputs, bytes memory proof) = _withdrawal(names[i]);
-            assertTrue(vault.isKnownRoot(inputs.activeRoot));
             vm.prank(USER);
             vm.expectRevert(Errors.NoteNotActive.selector);
             if (inputs.kind == 1) vault.mutualClose(inputs, proof);
@@ -463,50 +474,59 @@ contract ZkApiVaultGroth16Test is Test {
         }
     }
 
-    // ===================================================== known roots (Amendment A1)
+    // ================================================== note-bound exits and the tree
 
-    /// The escape uses A's deposit-time root (A alone in the tree) after B's and C's deposits,
-    /// B's close and the retirement of B's leaf, and more than ROOT_HISTORY_WINDOW later.
-    function test_realEscapeAtTheDepositTimeRootAfterDepositsAndARetirement() public {
-        _depositA();
-        uint256 rootA = vault.currentRoot();
-        assertEq(rootA, vm.parseJsonUint(fixtures, ".root_a"));
-        _depositB();
+    /// Recorded notes exit before any activation: A's escape finalizes and B closes while the
+    /// request tree is still empty.
+    function test_realExitsBeforeActivation() public {
+        _depositAB();
+        assertEq(vault.activationCursor(), 0);
+        assertEq(vault.currentRoot(), MerkleUpdateLib.EMPTY_ROOT);
+        _initiate("escape_a2");
+        (Types.WithdrawalPublicInputs memory closeB, bytes memory closeProof) = _withdrawal("close_b0");
+        vault.mutualClose(closeB, closeProof);
+        vm.warp(_deadline(0));
+        vault.finalizeEscapeWithdrawal(0);
+        assertEq(USER.balance, 8 * uint256(DEPOSIT) * 1 gwei + uint256(B2 + DEPOSIT) * 1 gwei);
+        assertEq(vault.currentRoot(), MerkleUpdateLib.EMPTY_ROOT);
+    }
+
+    /// The same proofs land after every kind of tree change: A and B activated (proved and
+    /// on-chain mixes give the same root), C and D deposited, B closed and its leaf retired, C
+    /// activated, more than a day later. The escape's event carries the live root.
+    function test_realExitsAfterActivationsAndARetirement() public {
+        _depositAB();
+        _activateOnChain(1);
+        _activateOnChain(1);
         _depositOther(2, 0x1234);
+        _depositOther(3, 0x5678);
         (Types.WithdrawalPublicInputs memory closeB, bytes memory closeProof) = _withdrawal("close_b0");
         vault.mutualClose(closeB, closeProof);
         _retire(1);
-        _depositOther(3, 0x5678);
+        _activateOnChain(1);
+        assertEq(vault.currentRoot(), _root());
         vm.warp(vm.getBlockTimestamp() + 2 days);
-        assertNotEq(vault.currentRoot(), rootA);
 
-        (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2_at_root_a");
-        assertEq(escape.activeRoot, rootA);
-        // The event's root word is the live root, not the proof's.
+        (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2");
         _expectInitiated(escape, vault.currentRoot());
-        _initiate("escape_a2_at_root_a");
+        _initiate("escape_a2");
         vm.warp(_deadline(0));
         vault.finalizeEscapeWithdrawal(0);
         assertEq(USER.balance, 6 * uint256(DEPOSIT) * 1 gwei + uint256(DEPOSIT + B2) * 1 gwei);
     }
 
-    /// The events of an escape at A's deposit-time root report the root live when each lands: at
-    /// initiation (after B's deposit) and at the defeat by R3 (after C's deposit), never the
-    /// proof's root, which the indexer and the clients' log rebuild would reject.
-    function test_realDepositTimeRootEscapeEventsReportTheLiveRoot() public {
-        _depositA();
-        uint256 rootA = vault.currentRoot();
-        _depositB();
+    /// The events of an escape report the root live when each lands: at initiation (after A's
+    /// activation) and at the defeat by R3 (after B's), which the indexer and the clients' log
+    /// rebuild check against their mirror.
+    function test_realEscapeEventsReportTheLiveRoot() public {
+        _depositAB();
+        _activateOnChain(1);
         uint256 rootAtInitiation = vault.currentRoot();
-        (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2_at_root_a");
-        assertEq(escape.activeRoot, rootA);
-        assertNotEq(rootAtInitiation, rootA);
+        (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2");
         _expectInitiated(escape, rootAtInitiation);
-        _initiate("escape_a2_at_root_a");
-        (, uint256 pendingRoot,,,,) = vault.pendingWithdrawals(0);
-        assertEq(pendingRoot, rootA);
+        _initiate("escape_a2");
 
-        _depositOther(2, 0x1234);
+        _activateOnChain(1);
         uint256 rootAtDefeat = vault.currentRoot();
         assertNotEq(rootAtDefeat, rootAtInitiation);
         vm.expectEmit(address(vault));
@@ -527,28 +547,121 @@ contract ZkApiVaultGroth16Test is Test {
         );
     }
 
-    /// The close uses B's deposit-time root (A and B) after C's and D's deposits, A's escape and
-    /// the retirement of A's leaf, and more than ROOT_HISTORY_WINDOW later.
-    function test_realCloseAtTheDepositTimeRootAfterDepositsAndARetirement() public {
-        _depositAB();
-        uint256 rootAB = vault.currentRoot();
-        assertEq(rootAB, vm.parseJsonUint(fixtures, ".root_ab"));
-        _depositOther(2, 0x1234);
-        _initiate("escape_a2");
-        vm.warp(_deadline(0));
-        vault.finalizeEscapeWithdrawal(0);
-        _retire(0);
-        _depositOther(3, 0x5678);
-        vm.warp(vm.getBlockTimestamp() + 2 days);
+    // ============================================================ proved activation
 
-        (Types.WithdrawalPublicInputs memory close, bytes memory proof) = _withdrawal("close_b0");
-        assertEq(close.activeRoot, rootAB);
-        vault.mutualClose(close, proof);
+    /// The fixture's insertion proofs activate A, B, C and D one at a time: the vault hands the
+    /// real adapter exactly the fixture's statement, built from its records, and reaches root_a,
+    /// root_ab (the root of every request proof) and root_abcd.
+    function test_realProvedActivations() public {
+        _depositNotes(4);
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".empty_root"));
+        _activateProved("activate_a");
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_a"));
+        _activateProved("activate_b");
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_ab"));
+        (Types.RequestPublicInputs memory request,) = _request("request_a0");
+        assertEq(request.activeRoot, vault.currentRoot());
+        _activateProved("activate_c");
+        assertEq(vault.currentRoot(), _root());
+        _activateProved("activate_d");
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_abcd"));
+        assertEq(vault.currentRoot(), _root());
+        assertEq(vault.activationCursor(), 4);
+    }
+
+    /// The batches of four and sixteen from the empty tree: one K = 4 batch reaches the root of
+    /// the four singletons, and the K = 16 batch the fixture's root_16. The notes' records come
+    /// from the deposits whatever their status: B closed and A pending before the activation; B's
+    /// leaf is then retired.
+    function test_realBatchActivations() public {
+        _depositNotes(16);
+        (Types.WithdrawalPublicInputs memory closeB, bytes memory closeProof) = _withdrawal("close_b0");
+        vault.mutualClose(closeB, closeProof);
+        _initiate("escape_a2");
+        uint256 deposited = vm.snapshotState();
+        _activateProved("activate_batch16");
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_16"));
+        assertEq(vault.activationCursor(), 16);
+        vm.revertToState(deposited);
+        _activateProved("activate_batch4");
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_abcd"));
+        assertEq(vault.activationCursor(), 4);
+        assertEq(uint256(_status(0)), uint256(Types.NoteStatus.PendingWithdrawal));
         assertEq(uint256(_status(1)), uint256(Types.NoteStatus.Closed));
-        assertEq(USER.balance, 6 * uint256(DEPOSIT) * 1 gwei + uint256(B2 + DEPOSIT) * 1 gwei);
+        _retire(1);
+        assertEq(vault.currentRoot(), _root());
+    }
+
+    /// Proved and on-chain activations interleave on one tree: A on-chain, B proved (its proof is
+    /// at root_a, which the on-chain activation reached), C on-chain, D proved.
+    function test_realProvedAndOnChainActivationsInterleave() public {
+        _depositNotes(4);
+        _activateOnChain(1);
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_a"));
+        _activateProved("activate_b");
+        _activateOnChain(1);
+        _activateProved("activate_d");
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_abcd"));
+    }
+
+    /// A competing activation landing first makes the fixture's proof of the same batch stale, and
+    /// a retirement landing first makes the next proof stale: StaleActivation before the adapter.
+    function test_realActivationsGoStale() public {
+        _depositNotes(4);
+        _activateOnChain(1);
+        _activationReverts("activate_a", Errors.StaleActivation.selector);
+        _activateProved("activate_b");
+        (Types.WithdrawalPublicInputs memory closeB, bytes memory closeProof) = _withdrawal("close_b0");
+        vault.mutualClose(closeB, closeProof);
+        _retire(1);
+        _activationReverts("activate_c", Errors.StaleActivation.selector);
+        _activateOnChain(1);
+        assertEq(vault.currentRoot(), _root());
+        assertEq(vault.activationCursor(), 3);
+    }
+
+    // ================================================================= note binding
+
+    /// Valid withdrawal proofs of note 1 under values the vault did not record for it (another
+    /// secret's commitment, another amount, another expiry): the real adapter accepts each, and
+    /// the vault refuses each with NoteBindingMismatch before verifying it.
+    function test_realProofsOfUnrecordedNoteValuesAreRefused() public {
+        _depositAB();
+        string[3] memory names = ["escape_b0_foreign_commitment", "escape_b0_other_amount", "escape_b0_other_expiry"];
+        (Types.WithdrawalPublicInputs memory honest,) = _withdrawal("escape_b0_genesis_concede");
+        for (uint256 i = 0; i < names.length; ++i) {
+            (Types.WithdrawalPublicInputs memory inputs, bytes memory proof) = _withdrawal(names[i]);
+            assertEq(inputs.noteId, 1);
+            adapter.assertValidWithdrawal(inputs, proof);
+            assertTrue(
+                inputs.registrationCommitment != honest.registrationCommitment
+                    || inputs.noteMetadata != honest.noteMetadata
+            );
+            _escapeReverts(names[i], Errors.NoteBindingMismatch.selector);
+        }
+        assertEq(uint256(_status(1)), uint256(Types.NoteStatus.Active));
+        _initiate("escape_b0_genesis_concede");
     }
 
     // ================================================================ gas snapshot
+
+    /// Transaction gas of a proved activation of each batch size with the real adapter (cold
+    /// vault and adapter), under the ceilings and pinned in snapshots/activation-gas.json.
+    function test_realActivationGasSnapshot() public {
+        _depositNotes(16);
+        uint256 deposited = vm.snapshotState();
+        string[3] memory names = ["activate_a", "activate_batch4", "activate_batch16"];
+        string[3] memory labels = ["activateNotes1", "activateNotes4", "activateNotes16"];
+        uint256[3] memory ceilings = [uint256(400_000), 450_000, 750_000];
+        for (uint256 i = 0; i < names.length; ++i) {
+            (uint32 first, uint256 count, uint256 oldRoot, uint256 newRoot,, bytes memory proof) = _activation(names[i]);
+            uint256 gas =
+                _txGas(abi.encodeCall(vault.activateNotes, (first, count, oldRoot, newRoot, proof)), labels[i]);
+            assertLe(gas, ceilings[i], labels[i]);
+            vm.snapshotValue("activation-gas", labels[i], gas);
+            vm.revertToState(deposited);
+        }
+    }
 
     /// Transaction gas (21,000 + calldata + execution with cold vault and adapter, refunds
     /// ignored) of each exit entry point with real proofs, under the design's ceilings, and
@@ -627,10 +740,83 @@ contract ZkApiVaultGroth16Test is Test {
         assertEq(_leafOf(1), vm.parseJsonUint(fixtures, ".note_b_leaf"));
     }
 
+    /// Deposits A and B: recorded, not activated, and bound to by every withdrawal fixture of theirs.
     function _depositAB() private {
         _depositA();
         _depositB();
-        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_ab"));
+        assertEq(vault.currentRoot(), MerkleUpdateLib.EMPTY_ROOT);
+        (Types.WithdrawalPublicInputs memory a,) = _withdrawal("escape_a2");
+        (Types.WithdrawalPublicInputs memory b,) = _withdrawal("close_b0");
+        _assertBound(a);
+        _assertBound(b);
+    }
+
+    function _assertBound(Types.WithdrawalPublicInputs memory inputs) private view {
+        (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(inputs.noteId);
+        assertEq(inputs.registrationCommitment, uint256(commitment), "registration commitment");
+        assertEq(inputs.noteMetadata, uint256(amount) | (uint256(expiryTs) << 128), "note metadata");
+    }
+
+    /// Deposits the fixture's notes 0 .. n - 1 (A, B, then other secrets), each recorded exactly as
+    /// the fixture's activations name it.
+    function _depositNotes(uint256 n) private {
+        vm.deal(USER, USER.balance + n * uint256(DEPOSIT) * 1 gwei);
+        for (uint256 i = 0; i < n; ++i) {
+            string memory note = string.concat(".notes[", vm.toString(i), "]");
+            assertEq(vault.nextNoteId(), i);
+            vm.prank(USER);
+            vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(
+                vm.parseJsonBytes32(fixtures, string.concat(note, ".registration_commitment")), DEPOSIT
+            );
+            (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(uint32(i));
+            assertEq(
+                uint256(amount) | (uint256(expiryTs) << 128),
+                vm.parseJsonUint(fixtures, string.concat(note, ".metadata"))
+            );
+            assertEq(uint256(commitment), vm.parseJsonUint(fixtures, string.concat(note, ".registration_commitment")));
+            assertEq(_leafOf(uint32(i)), vm.parseJsonUint(fixtures, string.concat(note, ".leaf")));
+        }
+    }
+
+    /// A fixture activation: [oldRoot, newRoot, first, C_0, M_0, ...] and its proof.
+    function _activation(string memory name)
+        private
+        view
+        returns (
+            uint32 first,
+            uint256 count,
+            uint256 oldRoot,
+            uint256 newRoot,
+            uint256[] memory inputs,
+            bytes memory proof
+        )
+    {
+        first = uint32(vm.parseJsonUint(fixtures, string.concat(".", name, ".first_note_id")));
+        count = vm.parseJsonUint(fixtures, string.concat(".", name, ".count"));
+        oldRoot = vm.parseJsonUint(fixtures, string.concat(".", name, ".old_root"));
+        newRoot = vm.parseJsonUint(fixtures, string.concat(".", name, ".new_root"));
+        inputs = vm.parseJsonUintArray(fixtures, string.concat(".", name, ".inputs"));
+        proof = vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"));
+    }
+
+    /// Submits fixture activation `name` from a third party; the vault must hand the adapter the
+    /// fixture's exact statement and reach its new root.
+    function _activateProved(string memory name) private {
+        (uint32 first, uint256 count, uint256 oldRoot, uint256 newRoot, uint256[] memory inputs, bytes memory proof) =
+            _activation(name);
+        vm.expectCall(address(adapter), abi.encodeCall(adapter.assertValidInsertion, (count, inputs, proof)));
+        vm.expectEmit(address(vault));
+        emit Events.NotesActivated(first, uint32(count), newRoot, true);
+        vm.prank(OPERATOR);
+        vault.activateNotes(first, count, oldRoot, newRoot, proof);
+        assertEq(vault.currentRoot(), newRoot);
+    }
+
+    function _activationReverts(string memory name, bytes4 err) private {
+        (uint32 first, uint256 count, uint256 oldRoot, uint256 newRoot,, bytes memory proof) = _activation(name);
+        vm.prank(OPERATOR);
+        vm.expectRevert(err);
+        vault.activateNotes(first, count, oldRoot, newRoot, proof);
     }
 
     function _depositOther(uint32 expectedId, uint256 commitment) private {
@@ -651,8 +837,9 @@ contract ZkApiVaultGroth16Test is Test {
         return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiry);
     }
 
+    /// The request tree's leaf at `index`: an activated, unretired note's recorded leaf.
     function _treeLeaf(uint32 index) private view returns (uint256) {
-        if (index >= vault.nextNoteId() || retired[index]) return 0;
+        if (index >= vault.activationCursor() || retired[index]) return 0;
         return _leafOf(index);
     }
 
@@ -663,6 +850,26 @@ contract ZkApiVaultGroth16Test is Test {
         siblings[0] = _treeLeaf(index ^ 1);
         uint32 pair = (index >> 1) ^ 1;
         siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
+    }
+
+    /// The live tree's root, from slots 0..3.
+    function _root() private view returns (uint256 root) {
+        root = Bn254Poseidon.compress(
+            DOMAIN_NODE,
+            Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(0), _treeLeaf(1)),
+            Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(2), _treeLeaf(3))
+        );
+        for (uint256 level = 2; level < 32; ++level) {
+            root = Bn254Poseidon.compress(DOMAIN_NODE, root, emptySiblings[level]);
+        }
+    }
+
+    /// Activates the next `count` recorded notes with the on-chain fallback, from a third party.
+    function _activateOnChain(uint256 count) private {
+        uint32 first = vault.activationCursor();
+        uint256[32] memory siblings = _path(first);
+        vm.prank(OPERATOR);
+        vault.activateNotesOnChain(first, count, siblings);
     }
 
     function _initiate(string memory name) private returns (Types.WithdrawalPublicInputs memory, bytes memory) {
@@ -694,11 +901,11 @@ contract ZkApiVaultGroth16Test is Test {
     }
 
     function _deadline(uint32 noteId) private view returns (uint64 deadline) {
-        (,,,,, deadline) = vault.pendingWithdrawals(noteId);
+        (,,,, deadline) = vault.pendingWithdrawals(noteId);
     }
 
     function _finalBalance(uint32 noteId) private view returns (uint128 finalBalance) {
-        (,,, finalBalance,,) = vault.pendingWithdrawals(noteId);
+        (,, finalBalance,,) = vault.pendingWithdrawals(noteId);
     }
 
     function _request(string memory name) private view returns (Types.RequestPublicInputs memory, bytes memory) {

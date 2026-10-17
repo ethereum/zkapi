@@ -47,7 +47,7 @@ contract EscapeTest is GaslessTestBase {
         assertEq(
             depositBefore - entryPoint.balanceOf(address(paymaster)), actualGasCost, "the float paid the initiation"
         );
-        (bool exists,,, uint128 finalBalance, address destination,) = vault.pendingWithdrawals(id);
+        (bool exists,, uint128 finalBalance, address destination,) = vault.pendingWithdrawals(id);
         assertTrue(exists);
         assertEq(finalBalance, PAYOUT);
         assertEq(destination, s);

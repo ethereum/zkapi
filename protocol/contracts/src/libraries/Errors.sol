@@ -105,4 +105,19 @@ library Errors {
 
     /// @notice retireClosedLeaf on a note that is not Closed.
     error NoteNotClosed();
+
+    /// @notice A withdrawal statement's registrationCommitment or noteMetadata is not what the vault
+    ///         stores for its note.
+    error NoteBindingMismatch();
+
+    /// @notice An activation named another first note or root than the vault's current ones (a
+    ///         competing activation or a retirement landed first): rebuild it from the new state.
+    error StaleActivation();
+
+    /// @notice An activation of an unsupported count (1, 4 or 16), off the count's alignment, or of
+    ///         notes not yet recorded.
+    error InvalidActivation();
+
+    /// @notice A retirement named a note that is not in the request tree yet.
+    error NoteNotActivated();
 }

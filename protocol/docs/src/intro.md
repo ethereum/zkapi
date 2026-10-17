@@ -9,8 +9,10 @@ security argument.
 
 The current implementation uses BN254 Groth16 proofs, BN254 Poseidon hashing,
 and Baby-JubJub Schnorr signatures and note-bound balance commitments, for
-circuit `zkapi-v2-concession-v1` and vault revision 3. The Solidity vault
-settles native ETH in whole gwei. These are classical elliptic-curve
+circuit `zkapi-v2-concession-v2` and vault revision 4. The Solidity vault
+settles native ETH in whole gwei, binds withdrawals to the notes it records,
+and keeps the root of the request tree, to which proved batches append the
+recorded notes. These are classical elliptic-curve
 primitives. Review the [setup trust assumptions](../../setup/v2-concession/README.md)
 and the [development setup](../../setup/v2-concession-dev/README.md) before
 deploying.

@@ -10,6 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use zkapi_types::inputs::note_metadata;
 use zkapi_types::{Felt252, SchnorrSignature};
 
 use crate::error::ClientError;
@@ -49,19 +50,25 @@ pub struct NoteState {
     /// state it was exported at.
     #[serde(default)]
     pub state_seq: u64,
-    /// Amendment A1: the note's Merkle path at the root its own deposit set.
-    /// The vault accepts any root it ever held, and the tree is append-only
-    /// for every note that is not closed, so this path proves membership for
-    /// every exit, with no indexer and no log rebuild.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deposit_path: Option<DepositPath>,
 }
 
-/// A note's Merkle path at the root of its deposit (Amendment A1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DepositPath {
-    pub root: Felt252,
-    pub siblings: Vec<Felt252>,
+/// What the vault's `notes(noteId)` records for a note, its status aside:
+/// the registration commitment `C`, the deposit amount and the expiry. Every
+/// exit statement names the note by `C` and the packed amount and expiry
+/// ([`RecordedNote::note_metadata`]), and the vault refuses one that differs
+/// from its record, so exits need no Merkle path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedNote {
+    pub registration_commitment: Felt252,
+    pub deposit_amount: u128,
+    pub expiry_ts: u64,
+}
+
+impl RecordedNote {
+    /// `deposit_amount + expiry_ts · 2^128`, the vault's packed metadata.
+    pub fn note_metadata(&self) -> Felt252 {
+        note_metadata(self.deposit_amount, self.expiry_ts)
+    }
 }
 
 impl NoteState {
@@ -100,7 +107,16 @@ impl NoteState {
             state_signature: None,
             bound_at_state: 0,
             state_seq: 0,
-            deposit_path: None,
+        }
+    }
+
+    /// What the vault must record under `note_id` for this note's exits to
+    /// verify.
+    pub fn recorded_note(&self) -> RecordedNote {
+        RecordedNote {
+            registration_commitment: zkapi_core::v2::registration_commitment(&self.secret_s),
+            deposit_amount: self.deposit_amount,
+            expiry_ts: self.expiry_ts,
         }
     }
 
@@ -198,9 +214,8 @@ mod tests {
         assert!(state.state_signature.is_none());
     }
 
-    /// A state file written before `bound_at_state`, `state_seq` and
-    /// `deposit_path` existed loads with no bound, sequence 0 and no saved
-    /// path.
+    /// A state file written before `bound_at_state` and `state_seq` existed
+    /// loads with no bound and sequence 0.
     #[test]
     fn a_state_file_without_the_concession_fields_loads_with_defaults() {
         let dir = test_dir("no_concession_fields");
@@ -218,14 +233,77 @@ mod tests {
             Felt252::from_u64(20),
         );
         let mut value = serde_json::to_value(&state).unwrap();
-        for field in ["bound_at_state", "state_seq", "deposit_path"] {
+        for field in ["bound_at_state", "state_seq"] {
             value.as_object_mut().unwrap().remove(field);
         }
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let loaded = NoteState::load(&path).unwrap();
         assert_eq!(loaded.bound_at_state, 0);
         assert_eq!(loaded.state_seq, 0);
-        assert!(loaded.deposit_path.is_none());
+    }
+
+    /// A state file (or an exit kit's note) written while exits proved tree
+    /// membership still loads: the deposit-time path it carries is ignored,
+    /// and saving the state drops it.
+    #[test]
+    fn a_state_file_with_a_deposit_path_loads_and_drops_it() {
+        let dir = test_dir("deposit_path");
+        let path = dir.join("note_state.json");
+        let state = NoteState::new_from_deposit(
+            2,
+            1,
+            Felt252::from_u64(0xdead),
+            7,
+            Felt252::from_u64(42),
+            5000,
+            1700000000,
+            "0xff".to_string(),
+            Felt252::from_u64(10),
+            Felt252::from_u64(20),
+        );
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["deposit_path"] = serde_json::json!({
+            "root": "0x5",
+            "siblings": vec!["0x0"; zkapi_types::MERKLE_DEPTH],
+        });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = NoteState::load(&path).unwrap();
+        assert_eq!(loaded.note_id, 7);
+        assert_eq!(loaded.recorded_note(), state.recorded_note());
+        loaded.save(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("deposit_path").is_none());
+    }
+
+    /// The vault's record of a note: `C = H_reg(s)` and the amount and
+    /// expiry, packed as the withdrawal statement's input 16.
+    #[test]
+    fn the_recorded_note_packs_amount_and_expiry() {
+        let state = NoteState::new_from_deposit(
+            2,
+            1,
+            Felt252::from_u64(0xdead),
+            7,
+            Felt252::from_u64(42),
+            5000,
+            1700000000,
+            "0xff".to_string(),
+            Felt252::from_u64(10),
+            Felt252::from_u64(20),
+        );
+        let recorded = state.recorded_note();
+        assert_eq!(
+            recorded.registration_commitment,
+            zkapi_core::v2::registration_commitment(&Felt252::from_u64(42))
+        );
+        assert_eq!(
+            (recorded.deposit_amount, recorded.expiry_ts),
+            (5000, 1700000000)
+        );
+        let mut packed = [0u8; 32];
+        packed[8..16].copy_from_slice(&1700000000u64.to_be_bytes());
+        packed[16..32].copy_from_slice(&5000u128.to_be_bytes());
+        assert_eq!(recorded.note_metadata(), Felt252(packed));
     }
 
     /// A state file written before `prev_anchor` existed still loads; its

@@ -60,6 +60,7 @@ fn genesis(secret: u64, note_id: u32) -> BrowserNoteState {
             note_id,
             amount: DEPOSIT,
             expiry_ts: EXPIRY,
+            recorded: None,
         },
     )
     .unwrap()
@@ -85,16 +86,28 @@ fn request_args(tree: &MerkleTree, note_id: u32, id: &str) -> PrepareRequestArgs
     }
 }
 
-fn withdrawal_args(tree: &MerkleTree, note_id: u32, mode: &str) -> PrepareWithdrawalArgs {
+fn withdrawal_args(mode: &str) -> PrepareWithdrawalArgs {
     PrepareWithdrawalArgs {
         mode: mode.into(),
         destination: (mode != "ownership").then(|| DESTINATION.to_string()),
         conceded: (mode == "escape").then_some(0),
         valid_until: VALID_UNTIL,
-        active_root: tree.root(),
-        merkle_siblings: tree.get_siblings(note_id).to_vec(),
         clearance: None,
     }
+}
+
+/// The statement names `state`'s note as the vault records it: `C` at
+/// input 3 and the packed amount and expiry at input 16.
+fn assert_binds_the_note(inputs: &WithdrawalPublicInputsV2C, state: &BrowserNoteState) {
+    let binding = note_binding(state);
+    let fields = inputs.to_field_elements();
+    assert_eq!(inputs.note_id, state.note_id);
+    assert_eq!(fields[3], binding.registration_commitment);
+    assert_eq!(fields[16], binding.note_metadata);
+    assert_eq!(
+        (inputs.deposit_amount, inputs.expiry),
+        (state.deposit_amount, state.expiry_ts)
+    );
 }
 
 /// A journal for a request at `state` with bound `bound`, as
@@ -520,13 +533,14 @@ fn requests_and_exits_follow_the_anchor_chain() {
         &at_genesis,
         PrepareWithdrawalArgs {
             conceded: Some(100),
-            ..withdrawal_args(&tree, NOTE_ID, "escape")
+            ..withdrawal_args("escape")
         },
         withdrawal_prover(),
     )
     .unwrap();
     let inputs = &escape.public_inputs;
     assert!(withdrawal_verifier.verify(inputs, &escape.proof).unwrap());
+    assert_binds_the_note(inputs, &at_genesis);
     assert_eq!(
         (
             inputs.kind,
@@ -588,7 +602,7 @@ fn requests_and_exits_follow_the_anchor_chain() {
     let exit = prepare_withdrawal_with_prover(
         &config(),
         &without_prev,
-        withdrawal_args(&tree, NOTE_ID, "escape"),
+        withdrawal_args("escape"),
         withdrawal_prover(),
     )
     .unwrap();
@@ -605,12 +619,13 @@ fn requests_and_exits_follow_the_anchor_chain() {
     let ownership = prepare_withdrawal_with_prover(
         &config(),
         &signed,
-        withdrawal_args(&tree, NOTE_ID, "ownership"),
+        withdrawal_args("ownership"),
         withdrawal_prover(),
     )
     .unwrap();
     let owned = &ownership.public_inputs;
     assert!(withdrawal_verifier.verify(owned, &ownership.proof).unwrap());
+    assert_binds_the_note(owned, &signed);
     assert_eq!(
         (
             owned.kind,
@@ -633,13 +648,14 @@ fn requests_and_exits_follow_the_anchor_chain() {
         &signed,
         PrepareWithdrawalArgs {
             clearance: Some(clearance),
-            ..withdrawal_args(&tree, NOTE_ID, "mutual")
+            ..withdrawal_args("mutual")
         },
         withdrawal_prover(),
     )
     .unwrap();
     let closed = &close.public_inputs;
     assert!(withdrawal_verifier.verify(closed, &close.proof).unwrap());
+    assert_binds_the_note(closed, &signed);
     assert_eq!(
         (
             closed.kind,
@@ -654,11 +670,10 @@ fn requests_and_exits_follow_the_anchor_chain() {
 #[test]
 fn withdrawal_arguments_are_checked_before_proving() {
     let state = with_bound(&installed_successor(100, 10), 40);
-    let tree = tree_for(&state);
     let prove = |args: PrepareWithdrawalArgs| {
         prepare_withdrawal_with_prover(&config(), &state, args, withdrawal_prover())
     };
-    let escape = || withdrawal_args(&tree, NOTE_ID, "escape");
+    let escape = || withdrawal_args("escape");
     assert_refused(
         prove(PrepareWithdrawalArgs {
             conceded: Some(41),
@@ -706,13 +721,6 @@ fn withdrawal_arguments_are_checked_before_proving() {
         }),
         codes::WITHDRAWAL_ARGS,
     );
-    assert_refused(
-        prove(PrepareWithdrawalArgs {
-            active_root: Felt252::from_u64(1),
-            ..escape()
-        }),
-        codes::MERKLE_PATH_MISMATCH,
-    );
     // A fresh state (bound 0) may only escape with c = 0.
     let fresh = BrowserNoteState {
         bound_at_state: 0,
@@ -733,7 +741,7 @@ fn withdrawal_arguments_are_checked_before_proving() {
 
     let mutual = || PrepareWithdrawalArgs {
         clearance: Some(clearance.clone()),
-        ..withdrawal_args(&tree, NOTE_ID, "mutual")
+        ..withdrawal_args("mutual")
     };
     assert_refused(
         prove(PrepareWithdrawalArgs {
@@ -778,7 +786,7 @@ fn withdrawal_arguments_are_checked_before_proving() {
         codes::CLEARANCE_INVALID,
     );
 
-    let ownership = || withdrawal_args(&tree, NOTE_ID, "ownership");
+    let ownership = || withdrawal_args("ownership");
     assert_refused(
         prove(PrepareWithdrawalArgs {
             destination: Some(DESTINATION.into()),
@@ -800,14 +808,147 @@ fn withdrawal_arguments_are_checked_before_proving() {
         }),
         codes::WITHDRAWAL_ARGS,
     );
-    // Stale callers that still send the note-bound fields are refused.
-    assert!(
-        serde_json::from_value::<PrepareWithdrawalArgs>(serde_json::json!({
-            "mode": "escape", "destination": DESTINATION, "conceded": 0, "valid_until": 1,
-            "active_root": "0x1", "merkle_siblings": [], "has_clearance": false
-        }))
-        .is_err()
+    // Exits take no root or path: stale callers that still send them (or
+    // older fields) are refused rather than proving something else.
+    let current = serde_json::json!({
+        "mode": "escape", "destination": DESTINATION, "conceded": 0, "valid_until": 1
+    });
+    serde_json::from_value::<PrepareWithdrawalArgs>(current.clone()).unwrap();
+    for (field, value) in [
+        ("active_root", serde_json::json!("0x1")),
+        ("merkle_siblings", serde_json::json!(vec!["0x0"; 32])),
+        ("has_clearance", serde_json::json!(false)),
+    ] {
+        let mut stale = current.clone();
+        stale[field] = value;
+        assert!(
+            serde_json::from_value::<PrepareWithdrawalArgs>(stale).is_err(),
+            "{field}"
+        );
+    }
+}
+
+/// A note in no tree at all (recorded, not activated) exits in every mode:
+/// the statement names it by its recorded values, with no root or path.
+#[test]
+fn a_note_exits_before_it_is_activated() {
+    let state = genesis(42, 1_000);
+    let verifier = WithdrawalVerifier::load(setup_dir()).unwrap();
+    let clearance = ClearanceResponseV2 {
+        status: "cleared".into(),
+        withdrawal_nullifier: withdrawal_nullifier(&state),
+        signature: deployment().sign_clearance(&withdrawal_nullifier(&state)),
+    };
+    for args in [
+        withdrawal_args("escape"),
+        withdrawal_args("ownership"),
+        PrepareWithdrawalArgs {
+            clearance: Some(clearance),
+            ..withdrawal_args("mutual")
+        },
+    ] {
+        let mode = args.mode.clone();
+        let plan =
+            prepare_withdrawal_with_prover(&config(), &state, args, withdrawal_prover()).unwrap();
+        assert!(
+            verifier.verify(&plan.public_inputs, &plan.proof).unwrap(),
+            "{mode}"
+        );
+        assert_binds_the_note(&plan.public_inputs, &state);
+        assert_eq!(plan.public_inputs.final_balance, DEPOSIT);
+        // Another note's values do not verify under the same proof.
+        let mut other = plan.public_inputs.clone();
+        other.registration_commitment = note_binding(&genesis(43, 1_000)).registration_commitment;
+        assert!(!verifier.verify(&other, &plan.proof).unwrap(), "{mode}");
+    }
+    // Requests still need the note's leaf at the request root.
+    let empty = MerkleTree::new();
+    assert_refused(
+        prepare_request_with_prover(
+            &config(),
+            &state,
+            request_args(&empty, 1_000, "unactivated"),
+            request_prover(),
+        ),
+        codes::MERKLE_PATH_MISMATCH,
     );
+}
+
+#[test]
+fn a_deposit_is_confirmed_only_against_its_own_record() {
+    let args = |recorded: Option<RecordedNote>| ConfirmDepositArgs {
+        secret: Felt252::from_u64(42),
+        note_id: 5,
+        amount: DEPOSIT,
+        expiry_ts: EXPIRY,
+        recorded,
+    };
+    let record = RecordedNote {
+        commitment: core::registration_commitment(&Felt252::from_u64(42)),
+        amount: DEPOSIT,
+        expiry_ts: EXPIRY,
+    };
+    let state = confirm_deposit(&config(), args(Some(record.clone()))).unwrap();
+    let binding = note_binding(&state);
+    assert_eq!(binding.registration_commitment, record.commitment);
+    assert_eq!(
+        binding.note_metadata,
+        zkapi_types::inputs::note_metadata(DEPOSIT, EXPIRY)
+    );
+    assert_eq!(binding.note_leaf, state_note_leaf(&state));
+    for wrong in [
+        RecordedNote {
+            commitment: core::registration_commitment(&Felt252::from_u64(43)),
+            ..record.clone()
+        },
+        RecordedNote {
+            amount: DEPOSIT - 1,
+            ..record.clone()
+        },
+        RecordedNote {
+            expiry_ts: EXPIRY + 86_400,
+            ..record.clone()
+        },
+        RecordedNote {
+            commitment: Felt252::ZERO,
+            amount: 0,
+            expiry_ts: 0,
+        },
+    ] {
+        assert_refused(
+            confirm_deposit(&config(), args(Some(wrong))),
+            codes::NOTE_BINDING_MISMATCH,
+        );
+    }
+    // The record travels as JSON with a string amount; callers without one
+    // confirm as before.
+    let parsed: ConfirmDepositArgs = serde_json::from_value(serde_json::json!({
+        "secret": "0x2a", "note_id": 5, "amount": DEPOSIT, "expiry_ts": EXPIRY,
+        "recorded": {"commitment": record.commitment, "amount": DEPOSIT.to_string(), "expiry_ts": EXPIRY}
+    }))
+    .unwrap();
+    assert_eq!(parsed.recorded, Some(record));
+    let legacy: ConfirmDepositArgs = serde_json::from_value(serde_json::json!({
+        "secret": "0x2a", "note_id": 5, "amount": DEPOSIT, "expiry_ts": EXPIRY
+    }))
+    .unwrap();
+    confirm_deposit(&config(), legacy).unwrap();
+}
+
+#[test]
+fn activation_status_is_the_notes_place_behind_the_cursor() {
+    assert_eq!(
+        note_activation(3, 4),
+        NoteActivation {
+            note_id: 3,
+            activation_cursor: 4,
+            activated: true,
+            queue_position: None
+        }
+    );
+    assert_eq!(note_activation(4, 4).queue_position, Some(0));
+    assert_eq!(note_activation(21, 16).queue_position, Some(5));
+    assert!(!note_activation(21, 16).activated);
 }
 
 #[test]
@@ -872,32 +1013,61 @@ fn the_bundle_loads_only_keys_of_its_own_setup() {
     .is_err());
 }
 
-#[test]
-fn the_rebuilt_tree_matches_the_vault_tree_after_every_event() {
-    let mut rebuilt = NoteTree::new();
-    let mut reference = MerkleTree::new();
-    let deposit = |note_id: u32| TreeEvent::NoteDeposited {
+fn deposit_event(note_id: u32) -> TreeEvent {
+    TreeEvent::NoteDeposited {
         note_id,
         commitment: core::registration_commitment(&Felt252::from_u64(100 + note_id as u64)),
         amount: 1_000 + note_id as u128,
         expiry_ts: EXPIRY,
+    }
+}
+
+fn deposited_leaf(note_id: u32) -> Felt252 {
+    let TreeEvent::NoteDeposited {
+        commitment,
+        amount,
+        expiry_ts,
+        ..
+    } = deposit_event(note_id)
+    else {
+        unreachable!()
     };
-    for note_id in 0..6 {
-        let event = deposit(note_id);
-        let TreeEvent::NoteDeposited {
-            commitment,
-            amount,
-            expiry_ts,
-            ..
-        } = event
-        else {
-            unreachable!()
-        };
-        reference.set_leaf(
-            note_id,
-            core::note_leaf(note_id, &commitment, amount, expiry_ts),
+    core::note_leaf(note_id, &commitment, amount, expiry_ts)
+}
+
+/// Deposits record notes and leave the root; activations of 1, 4 and 16
+/// notes append exactly the recorded leaves; retirements leave holes that
+/// later activations keep. After every event the root is the vault's.
+#[test]
+fn the_rebuilt_tree_matches_the_vault_tree_after_every_event() {
+    fn activate(rebuilt: &mut NoteTree, reference: &mut MerkleTree, count: u32) {
+        let first = rebuilt.activation_cursor();
+        for note_id in first..first + count {
+            reference.set_leaf(note_id, deposited_leaf(note_id));
+        }
+        assert_eq!(
+            rebuilt
+                .apply(&TreeEvent::NotesActivated {
+                    first_note_id: first,
+                    count
+                })
+                .unwrap(),
+            reference.root()
         );
-        assert_eq!(rebuilt.apply(&event).unwrap(), reference.root());
+        assert_eq!(rebuilt.activation_cursor(), first + count);
+    }
+    let mut rebuilt = NoteTree::new();
+    let mut reference = MerkleTree::new();
+    let empty = reference.root();
+    for note_id in 0..6 {
+        assert_eq!(rebuilt.apply(&deposit_event(note_id)).unwrap(), empty);
+    }
+    assert_eq!(
+        (rebuilt.next_note_id(), rebuilt.activation_cursor()),
+        (6, 0)
+    );
+    for _ in 0..4 {
+        activate(&mut rebuilt, &mut reference, 1);
     }
     reference.set_leaf(2, Felt252::ZERO);
     assert_eq!(
@@ -906,31 +1076,80 @@ fn the_rebuilt_tree_matches_the_vault_tree_after_every_event() {
             .unwrap(),
         reference.root()
     );
-    let path = rebuilt.path(4).unwrap();
-    assert_eq!(path.active_root, reference.root());
-    assert_eq!(path.siblings, reference.get_siblings(4).to_vec());
+    for note_id in 6..33 {
+        assert_eq!(
+            rebuilt.apply(&deposit_event(note_id)).unwrap(),
+            reference.root()
+        );
+    }
+    activate(&mut rebuilt, &mut reference, 4);
+    activate(&mut rebuilt, &mut reference, 4);
+    activate(&mut rebuilt, &mut reference, 4);
+    activate(&mut rebuilt, &mut reference, 16);
+    reference.set_leaf(17, Felt252::ZERO);
+    assert_eq!(
+        rebuilt
+            .apply(&TreeEvent::ClosedLeafRetired { note_id: 17 })
+            .unwrap(),
+        reference.root()
+    );
+    assert_eq!(rebuilt.activation_cursor(), 32);
+
+    // Paths of activated notes; retired notes have none; the recorded but
+    // not activated note 32 is refused as such.
+    for note_id in [0, 3, 4, 16, 31] {
+        let path = rebuilt.path(note_id).unwrap();
+        assert_eq!(path.active_root, reference.root());
+        assert_eq!(path.siblings, reference.get_siblings(note_id).to_vec());
+    }
     assert_refused(rebuilt.path(2), codes::TREE_EVENT_INVALID);
-    assert_refused(rebuilt.path(6), codes::TREE_EVENT_INVALID);
-    // Out of order, a repeated retirement and a retirement of a note that
-    // was never deposited are refused.
-    assert_refused(rebuilt.apply(&deposit(7)), codes::TREE_EVENT_INVALID);
-    assert_refused(
-        rebuilt.apply(&TreeEvent::ClosedLeafRetired { note_id: 2 }),
-        codes::TREE_EVENT_INVALID,
-    );
-    assert_refused(
-        rebuilt.apply(&TreeEvent::ClosedLeafRetired { note_id: 6 }),
-        codes::TREE_EVENT_INVALID,
-    );
+    assert_refused(rebuilt.path(17), codes::TREE_EVENT_INVALID);
+    assert_refused(rebuilt.path(32), codes::NOTE_NOT_ACTIVATED);
+    assert_refused(rebuilt.path(33), codes::TREE_EVENT_INVALID);
+
+    // Out of order, misaligned or premature activations, retirements of
+    // notes that are not activated or already retired, and out-of-order
+    // deposits are refused, and change nothing.
+    let before = rebuilt.root();
+    for event in [
+        deposit_event(34),
+        TreeEvent::NotesActivated {
+            first_note_id: 32,
+            count: 4,
+        },
+        TreeEvent::NotesActivated {
+            first_note_id: 32,
+            count: 2,
+        },
+        TreeEvent::NotesActivated {
+            first_note_id: 31,
+            count: 1,
+        },
+        TreeEvent::NotesActivated {
+            first_note_id: 33,
+            count: 1,
+        },
+        TreeEvent::ClosedLeafRetired { note_id: 32 },
+        TreeEvent::ClosedLeafRetired { note_id: 17 },
+    ] {
+        assert_refused(rebuilt.apply(&event), codes::TREE_EVENT_INVALID);
+    }
+    assert_eq!(rebuilt.root(), before);
+    assert_eq!(rebuilt.activation_cursor(), 32);
+    activate(&mut rebuilt, &mut reference, 1);
+    rebuilt.path(32).unwrap();
 
     // The dense-leaves form gives the same path.
-    let leaves: Vec<Felt252> = (0..6).map(|index| reference.get_leaf(index)).collect();
-    assert_eq!(tree_path_from_leaves(leaves.clone(), 4).unwrap(), path);
+    let leaves: Vec<Felt252> = (0..33).map(|index| reference.get_leaf(index)).collect();
+    assert_eq!(
+        tree_path_from_leaves(leaves.clone(), 4).unwrap(),
+        rebuilt.path(4).unwrap()
+    );
     assert_refused(
         tree_path_from_leaves(leaves.clone(), 2),
         codes::TREE_EVENT_INVALID,
     );
-    assert_refused(tree_path_from_leaves(leaves, 6), codes::TREE_EVENT_INVALID);
+    assert_refused(tree_path_from_leaves(leaves, 33), codes::TREE_EVENT_INVALID);
 
     // Events travel as JSON with string amounts.
     let event: TreeEvent = serde_json::from_value(serde_json::json!({
@@ -951,6 +1170,76 @@ fn the_rebuilt_tree_matches_the_vault_tree_after_every_event() {
         "event": "note_deposited", "note_id": 6, "commitment": "0x05", "amount": 5, "expiry_ts": 7
     }))
     .is_err());
+    assert_eq!(
+        serde_json::from_value::<TreeEvent>(serde_json::json!({
+            "event": "notes_activated", "first_note_id": 16, "count": 16
+        }))
+        .unwrap(),
+        TreeEvent::NotesActivated {
+            first_note_id: 16,
+            count: 16
+        }
+    );
+    assert!(serde_json::from_value::<TreeEvent>(serde_json::json!({
+        "event": "notes_activated", "first_note_id": 16, "count": 16, "new_root": "0x1"
+    }))
+    .is_err());
+}
+
+/// The indexer's snapshot carries the activation cursor: only notes below
+/// it have a request path, and the empty slot at the cursor is where the
+/// next activation goes. A snapshot without a cursor has every note in the
+/// tree.
+#[test]
+fn snapshot_paths_follow_the_activation_cursor() {
+    let mut reference = MerkleTree::new();
+    for note_id in 0..4 {
+        reference.set_leaf(note_id, deposited_leaf(note_id));
+    }
+    reference.set_leaf(1, Felt252::ZERO);
+    let mut leaves: Vec<Felt252> = (0..4).map(|index| reference.get_leaf(index)).collect();
+    leaves.extend([Felt252::ZERO; 3]);
+    let snapshot = |cursor: Option<u32>, leaves: Vec<Felt252>| TreeSnapshot {
+        root: reference.root(),
+        next_note_id: leaves.len() as u32,
+        leaves,
+        activation_cursor: cursor,
+    };
+    let path = tree_path(snapshot(Some(4), leaves.clone()), 3, true).unwrap();
+    assert_eq!(path.active_root, reference.root());
+    assert_eq!(path.siblings, reference.get_siblings(3).to_vec());
+    assert_refused(
+        tree_path(snapshot(Some(4), leaves.clone()), 4, true),
+        codes::NOTE_NOT_ACTIVATED,
+    );
+    assert_refused(
+        tree_path(snapshot(Some(4), leaves.clone()), 6, true),
+        codes::NOTE_NOT_ACTIVATED,
+    );
+    assert!(tree_path(snapshot(Some(4), leaves.clone()), 7, true).is_err());
+    // The slot the next activation fills, and nothing else.
+    let slot = tree_path(snapshot(Some(4), leaves.clone()), 4, false).unwrap();
+    assert_eq!(slot.siblings, reference.get_siblings(4).to_vec());
+    assert!(tree_path(snapshot(Some(4), leaves.clone()), 7, false).is_err());
+    // Leaves above the cursor, a cursor above the recorded notes, or a root
+    // that the leaves do not reach are refused.
+    let mut beyond = leaves.clone();
+    beyond[5] = Felt252::from_u64(9);
+    assert!(tree_path(snapshot(Some(4), beyond), 3, true).is_err());
+    assert!(tree_path(snapshot(Some(8), leaves.clone()), 3, true).is_err());
+    let mut lying = snapshot(Some(4), leaves.clone());
+    lying.root = Felt252::from_u64(5);
+    assert!(tree_path(lying, 3, true).is_err());
+    // Without a cursor (an older indexer) every recorded note is in the tree.
+    let legacy = snapshot(None, leaves[..4].to_vec());
+    assert_eq!(tree_path(legacy.clone(), 3, true).unwrap(), path);
+    assert_eq!(tree_path(legacy, 4, false).unwrap(), slot);
+    let parsed: TreeSnapshot = serde_json::from_value(serde_json::json!({
+        "root": reference.root(), "next_note_id": 0, "leaves": [],
+        "activation_cursor": 0, "note_leaves": [], "notes": []
+    }))
+    .unwrap();
+    assert_eq!(parsed.activation_cursor, Some(0));
 }
 
 #[test]
@@ -1022,7 +1311,7 @@ fn a_lost_journal_response_is_checked_against_s1_s2_s4_and_s6() {
 }
 
 #[test]
-fn a_saved_path_is_kept_only_if_it_leads_to_its_root() {
+fn a_path_matches_only_the_notes_leaf_at_its_root() {
     let state = genesis(42, NOTE_ID);
     let tree = tree_for(&state);
     let path = |root: Felt252| NotePathArgs {
@@ -1030,15 +1319,15 @@ fn a_saved_path_is_kept_only_if_it_leads_to_its_root() {
         siblings: tree.get_siblings(NOTE_ID).to_vec(),
     };
     assert!(note_path_matches(&state, path(tree.root())).unwrap());
-    // Another root, another note or another deposit amount does not match.
+    // Another root or another note does not match.
     assert!(!note_path_matches(&state, path(Felt252::from_u64(5))).unwrap());
     assert!(!note_path_matches(&genesis(42, NOTE_ID + 1), path(tree.root())).unwrap());
-    // The deposit-time path stays valid while later deposits append leaves:
-    // the vault keeps every root it held (Amendment A1).
+    // A later activation moves the root: the old path no longer reaches it,
+    // the new one does.
     let mut later = tree.clone();
     later.set_leaf(NOTE_ID + 5, Felt252::from_u64(9));
     assert_ne!(later.root(), tree.root());
-    assert!(note_path_matches(&state, path(tree.root())).unwrap());
+    assert!(!note_path_matches(&state, path(later.root())).unwrap());
     assert!(note_path_matches(
         &state,
         NotePathArgs {

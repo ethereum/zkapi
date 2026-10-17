@@ -7,7 +7,8 @@ The protocol workspace contains five crates:
   HTTP messages, and Schnorr signatures.
 - [zkapi-core](../../rust/crates/zkapi-core): BN254 Poseidon, registration,
   note, nullifier, successor-anchor and state helpers, and Merkle trees.
-- [zkapi-proof](../../rust/crates/zkapi-proof): Groth16 circuits, the
+- [zkapi-proof](../../rust/crates/zkapi-proof): Groth16 circuits (request,
+  withdrawal, and insertion for activation batches of 1, 4 and 16), the
   `CircomReduction` prover, commitments, signing, key headers and setup policy,
   R1CS export and ceremony import, proving, and verification.
 - [zkapi-client](../../rust/crates/zkapi-client): native wallet state,

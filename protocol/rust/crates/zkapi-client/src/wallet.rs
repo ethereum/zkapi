@@ -1,6 +1,12 @@
-//! zkAPI v2 wallet for circuit `zkapi-v2-concession-v1`: compact Groth16
+//! zkAPI v2 wallet for circuit `zkapi-v2-concession-v2`: compact Groth16
 //! proofs, note-bound nullifiers, derived successor anchors and the three
 //! withdrawal kinds (escape, mutual close, ownership proof).
+//!
+//! Requests prove the note's membership in the request tree at the vault's
+//! current root, which holds the note only once it is activated
+//! ([`crate::tree::note_activation`]). Exits name the note by what the vault
+//! records for it (`C`, amount and expiry) and need no Merkle path, so a
+//! note can exit before it is activated.
 //!
 //! The client rules of design §6.1–§6.3 live here:
 //! - S1–S6 before a successor is installed, with S3 against
@@ -46,11 +52,12 @@ use crate::journal::{
     archive_request, latest_records, read_archive, ArchiveListing, ArchivedRequest,
     PendingRequestJournal,
 };
-use crate::note_state::{DepositPath, NoteState};
+use crate::note_state::{NoteState, RecordedNote};
+use crate::tree::{note_activation, NoteActivation};
 
 /// Delays before resending the identical clearance body after a retriable
-/// `stale_root` (the server has not yet observed the indexer's root) or
-/// `capacity_exhausted` answer.
+/// `note_not_recorded` (the server's chain view does not hold the note's
+/// deposit yet) or `capacity_exhausted` answer.
 #[cfg(not(test))]
 const CLEARANCE_RETRY_DELAYS_MS: [u64; 4] = [1_000, 2_000, 4_000, 8_000];
 #[cfg(test)]
@@ -90,7 +97,11 @@ struct OwnershipProofMarker {
     /// the lock it was made under, which the user may cancel (E6).
     #[serde(default)]
     valid_until: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::exit_lock::kept_ownership_proof"
+    )]
     ownership: Option<ClearanceOwnershipProofV2C>,
 }
 
@@ -192,6 +203,9 @@ impl Wallet {
         }
     }
 
+    /// Install the genesis state of the deposit recorded as `note_id`. No
+    /// Merkle path is involved: the note can exit at once, and makes requests
+    /// once activated.
     pub fn confirm_deposit(
         &mut self,
         secret: Felt252,
@@ -199,36 +213,51 @@ impl Wallet {
         deposit_amount: u128,
         expiry: u64,
     ) -> Result<(), ClientError> {
-        self.confirm_deposit_with_path(secret, note_id, deposit_amount, expiry, None)
+        self.install_deposit(secret, note_id, deposit_amount, expiry, None)
     }
 
-    /// Install the genesis state of a deposit, keeping its Merkle path at the
-    /// root the deposit set (Amendment A1) when the caller has it: the vault
-    /// accepts that root for every later exit. The path must prove the note's
-    /// leaf at that root.
-    pub fn confirm_deposit_with_path(
+    /// Like `confirm_deposit`, after checking `recorded`, the vault's
+    /// `notes(note_id)`: it must hold this secret's registration commitment
+    /// and exactly this amount and expiry. Every exit names the note by those
+    /// values, and the vault refuses one that differs from its record, so a
+    /// mismatch is refused here and nothing is installed.
+    pub fn confirm_recorded_deposit(
         &mut self,
         secret: Felt252,
         note_id: u32,
         deposit_amount: u128,
         expiry: u64,
-        deposit_path: Option<DepositPath>,
+        recorded: &RecordedNote,
+    ) -> Result<(), ClientError> {
+        self.install_deposit(secret, note_id, deposit_amount, expiry, Some(recorded))
+    }
+
+    fn install_deposit(
+        &mut self,
+        secret: Felt252,
+        note_id: u32,
+        deposit_amount: u128,
+        expiry: u64,
+        recorded: Option<&RecordedNote>,
     ) -> Result<(), ClientError> {
         if self.state.is_some() {
             return Err(ClientError::NoteAlreadyExists);
         }
-        let leaf = core::note_leaf(
-            note_id,
-            &core::registration_commitment(&secret),
+        let registration_commitment = core::registration_commitment(&secret);
+        let expected = RecordedNote {
+            registration_commitment,
             deposit_amount,
-            expiry,
-        );
-        if let Some(path) = &deposit_path {
-            check_path(note_id, &leaf, path)?;
+            expiry_ts: expiry,
+        };
+        if let Some(recorded) = recorded.filter(|recorded| **recorded != expected) {
+            return Err(ClientError::NoteBindingMismatch(format!(
+                "the vault records note {note_id} as {recorded:?}, not as this deposit's {expected:?}"
+            )));
         }
+        let leaf = core::note_leaf(note_id, &registration_commitment, deposit_amount, expiry);
         let blinding = random_scalar();
         let commitment = balance_commitment(deposit_amount, &blinding, &leaf);
-        let mut state = NoteState::new_from_deposit(
+        self.persist_state(NoteState::new_from_deposit(
             self.config.protocol_version,
             self.config.chain_id,
             self.config.contract_address,
@@ -239,29 +268,33 @@ impl Wallet {
             blinding.to_hex(),
             commitment.x,
             commitment.y,
-        );
-        state.deposit_path = deposit_path;
-        state.save(&self.state_path)?;
-        self.state = Some(state);
-        Ok(())
+        ))
     }
 
-    /// Save a Merkle path of the note at a root the vault held (Amendment
-    /// A1), for a note confirmed without one. The path must prove the note's
-    /// leaf at `path.root`; the caller checks that the vault knows the root.
-    pub fn save_deposit_path(&mut self, path: DepositPath) -> Result<(), ClientError> {
-        let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
-        check_path(state.note_id, &state_note_leaf(state), &path)?;
-        let mut next = state.clone();
-        next.deposit_path = Some(path);
-        self.persist_state(next)
+    /// What the vault must record under the current note's id for its exits
+    /// to verify; compare it with `notes(noteId)`.
+    pub fn recorded_note(&self) -> Option<RecordedNote> {
+        self.state.as_ref().map(NoteState::recorded_note)
     }
 
-    /// The note's saved Merkle path (Amendment A1), if any.
-    pub fn deposit_path(&self) -> Option<&DepositPath> {
+    /// The current note's activation status under the vault's
+    /// `activationCursor()`.
+    pub fn activation(&self, activation_cursor: u32) -> Option<NoteActivation> {
         self.state
             .as_ref()
-            .and_then(|state| state.deposit_path.as_ref())
+            .map(|state| note_activation(state.note_id, activation_cursor))
+    }
+
+    /// Refuse a request from a note the vault has not activated yet (its
+    /// leaf is not at the current root), with its place in the queue.
+    pub fn check_activated(&self, activation_cursor: u32) -> Result<(), ClientError> {
+        let activation = self
+            .activation(activation_cursor)
+            .ok_or(ClientError::NoActiveNote)?;
+        match activation.queue_position {
+            None => Ok(()),
+            Some(queue_position) => Err(ClientError::NoteNotActivated { queue_position }),
+        }
     }
 
     pub async fn request_flow(
@@ -399,6 +432,11 @@ impl Wallet {
         }
 
         let siblings = siblings_array(merkle_siblings)?;
+        // Only an activated note's leaf is at the request root: a path that
+        // does not reach `active_root` fixes no bound and proves nothing.
+        if core::merkle_root(state.note_id, &state_note_leaf(state), &siblings) != active_root {
+            return Err(ClientError::MerklePathMismatch);
+        }
         let current_blinding = parse_scalar(&state.balance_blinding)?;
         let expected_current = balance_commitment(
             state.current_balance,
@@ -1118,10 +1156,8 @@ impl Wallet {
     pub async fn withdrawal_mutual_close(
         &self,
         destination: [u8; 20],
-        active_root: Felt252,
-        merkle_siblings: Vec<Felt252>,
     ) -> Result<(WithdrawalPublicInputsV2C, Groth16ProofWire), ClientError> {
-        self.withdrawal_mutual_close_recorded(destination, active_root, merkle_siblings, || Ok(()))
+        self.withdrawal_mutual_close_recorded(destination, || Ok(()))
             .await
     }
 
@@ -1131,11 +1167,9 @@ impl Wallet {
     pub async fn withdrawal_mutual_close_recorded(
         &self,
         destination: [u8; 20],
-        active_root: Felt252,
-        merkle_siblings: Vec<Felt252>,
         before_send: impl FnOnce() -> Result<(), ClientError>,
     ) -> Result<(WithdrawalPublicInputsV2C, Groth16ProofWire), ClientError> {
-        self.withdrawal_mutual_close_cleared(destination, active_root, merkle_siblings, before_send)
+        self.withdrawal_mutual_close_cleared(destination, before_send)
             .await
             .map(|(public, proof, _)| (public, proof))
     }
@@ -1147,8 +1181,6 @@ impl Wallet {
     pub async fn withdrawal_mutual_close_cleared(
         &self,
         destination: [u8; 20],
-        active_root: Felt252,
-        merkle_siblings: Vec<Felt252>,
         before_send: impl FnOnce() -> Result<(), ClientError>,
     ) -> Result<
         (
@@ -1160,24 +1192,22 @@ impl Wallet {
     > {
         check_payout_destination(&destination)?;
         self.lock_for_proof(ExitMode::Mutual)?;
-        let ownership = self.ownership_proof(active_root, merkle_siblings.clone())?;
+        let ownership = self.ownership_proof()?;
         before_send()?;
-        self.mutual_close_with_clearance(destination, active_root, merkle_siblings, ownership)
+        self.mutual_close_with_clearance(destination, ownership)
             .await
     }
 
     /// A fresh mutual close (kind 1) of the current state from a clearance
     /// signature obtained earlier: the vault refuses a close after its
     /// `valid_until` (L6), and the clearance signs only the nullifier, so an
-    /// expired close is proved again with a new lifetime, at the same root
-    /// and path (any root the vault ever held stays known, Amendment A1).
-    /// Needs the exit lock in `mutual` mode; recorded as released before it
-    /// is returned.
+    /// expired close is proved again with a new lifetime; the statement
+    /// names the note by its recorded values, which never change. Needs the
+    /// exit lock in `mutual` mode; recorded as released before it is
+    /// returned.
     pub fn mutual_close_from_clearance(
         &self,
         destination: [u8; 20],
-        active_root: Felt252,
-        merkle_siblings: Vec<Felt252>,
         clearance_signature: &zkapi_types::SchnorrSignature,
     ) -> Result<(WithdrawalPublicInputsV2C, Groth16ProofWire), ClientError> {
         check_payout_destination(&destination)?;
@@ -1189,8 +1219,6 @@ impl Wallet {
             destination,
             0,
             valid_until,
-            active_root,
-            merkle_siblings,
             Some(*clearance_signature),
         )?;
         self.record_release(
@@ -1235,11 +1263,7 @@ impl Wallet {
     /// retry resends the same proof, also under a new lock after the user
     /// cancelled the one it was made under (E6). Recorded as released, and
     /// the state marked for C5 with the proof, before it is returned.
-    pub fn ownership_proof(
-        &self,
-        active_root: Felt252,
-        merkle_siblings: Vec<Felt252>,
-    ) -> Result<ClearanceOwnershipProofV2C, ClientError> {
+    pub fn ownership_proof(&self) -> Result<ClearanceOwnershipProofV2C, ClientError> {
         let lock = self.lock_for_proof(ExitMode::Mutual)?;
         let now = now_seconds();
         // The state's newest ownership proof: one released under this lock,
@@ -1285,15 +1309,8 @@ impl Wallet {
         }
         let valid_until = now
             + OWNERSHIP_PROOF_VALIDITY_SECONDS.saturating_sub(OWNERSHIP_CLOCK_SKEW_MARGIN_SECONDS);
-        let (public_inputs, proof) = self.build_withdrawal(
-            WithdrawalKind::Ownership,
-            [0; 20],
-            0,
-            valid_until,
-            active_root,
-            merkle_siblings,
-            None,
-        )?;
+        let (public_inputs, proof) =
+            self.build_withdrawal(WithdrawalKind::Ownership, [0; 20], 0, valid_until, None)?;
         let ownership = ClearanceOwnershipProofV2C {
             public_inputs,
             proof,
@@ -1315,8 +1332,6 @@ impl Wallet {
     async fn mutual_close_with_clearance(
         &self,
         destination: [u8; 20],
-        active_root: Felt252,
-        merkle_siblings: Vec<Felt252>,
         ownership: ClearanceOwnershipProofV2C,
     ) -> Result<
         (
@@ -1329,12 +1344,8 @@ impl Wallet {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
         let nullifier = state_nullifier(state);
         let clearance = self.request_clearance(&nullifier, ownership).await?;
-        let (public, proof) = self.mutual_close_from_clearance(
-            destination,
-            active_root,
-            merkle_siblings,
-            &clearance.signature,
-        )?;
+        let (public, proof) =
+            self.mutual_close_from_clearance(destination, &clearance.signature)?;
         Ok((public, proof, clearance.signature))
     }
 
@@ -1348,8 +1359,6 @@ impl Wallet {
         &self,
         destination: [u8; 20],
         conceded: u128,
-        active_root: Felt252,
-        merkle_siblings: Vec<Felt252>,
     ) -> Result<(WithdrawalPublicInputsV2C, Groth16ProofWire), ClientError> {
         check_payout_destination(&destination)?;
         let lock = self.lock_for_proof(ExitMode::Escape)?;
@@ -1366,8 +1375,6 @@ impl Wallet {
             destination,
             conceded,
             valid_until,
-            active_root,
-            merkle_siblings,
             None,
         )?;
         self.record_release(
@@ -1413,15 +1420,15 @@ impl Wallet {
         self.state.as_ref().map(state_note_leaf)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Prove an exit of the current state. The statement names the note by
+    /// `C = H_reg(s)` and its amount and expiry, which the vault compares
+    /// with `notes[note_id]`; no Merkle path is involved.
     fn build_withdrawal(
         &self,
         kind: WithdrawalKind,
         destination: [u8; 20],
         conceded: u128,
         valid_until: u64,
-        active_root: Felt252,
-        merkle_siblings: Vec<Felt252>,
         clearance_signature: Option<zkapi_types::SchnorrSignature>,
     ) -> Result<(WithdrawalPublicInputsV2C, Groth16ProofWire), ClientError> {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
@@ -1429,7 +1436,6 @@ impl Wallet {
             protocol_version: state.protocol_version,
             chain_id: state.chain_id,
             contract_address: state.contract_address,
-            active_root,
             state_signing_key: self.config.state_signing_key.clone(),
             clearance_signing_key: self.config.clearance_signing_key.clone(),
             note_id: state.note_id,
@@ -1439,7 +1445,6 @@ impl Wallet {
             secret: state.secret_s,
             deposit_amount: state.deposit_amount,
             expiry: state.expiry_ts,
-            merkle_siblings: siblings_array(merkle_siblings)?,
             state_balance: state.current_balance,
             state_blinding: parse_scalar(&state.balance_blinding)?,
             current_anchor: state.current_anchor,
@@ -1496,16 +1501,18 @@ impl Wallet {
             let code = serde_json::from_str::<ErrorResponse>(&body)
                 .map(|error| error.error_code)
                 .unwrap_or_default();
-            let stale_root = status == reqwest::StatusCode::CONFLICT && code == "stale_root";
+            // The server compares the ownership proof's note values with its
+            // own `notes(noteId)` read; a note it cannot see yet is retried.
+            let unrecorded = code == "note_not_recorded";
             let saturated =
                 status == reqwest::StatusCode::SERVICE_UNAVAILABLE && code == "capacity_exhausted";
-            if stale_root || saturated {
+            if unrecorded || saturated {
                 if let Some(delay) = delays.next() {
                     tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
                     continue;
                 }
-                if stale_root {
-                    return Err(ClientError::StaleRoot);
+                if unrecorded {
+                    return Err(ClientError::NoteNotRecorded);
                 }
             }
             if (status == reqwest::StatusCode::BAD_REQUEST
@@ -1513,6 +1520,8 @@ impl Wallet {
                 || (status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                     && code == "legacy_clearance_capacity")
                 || (status == reqwest::StatusCode::CONFLICT && code == "nullifier_used")
+                || code == "note_binding_mismatch"
+                || code == "note_not_active"
             {
                 return Err(ClientError::ClearanceRefused(code));
             }
@@ -1661,17 +1670,6 @@ impl Wallet {
             ClientProofMode::Groth16 { setup_dir } => setup_dir,
         }
     }
-}
-
-/// Check that `path` proves `leaf` at note `note_id` under `path.root`.
-fn check_path(note_id: u32, leaf: &Felt252, path: &DepositPath) -> Result<(), ClientError> {
-    let siblings = siblings_array(path.siblings.clone())?;
-    if core::merkle_root(note_id, leaf, &siblings) != path.root {
-        return Err(ClientError::VerificationFailed(
-            "the Merkle path does not prove the note's leaf at its root".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Refuse a payout to the zero address for escapes and mutual closes. Only
@@ -1878,7 +1876,8 @@ mod tests {
         }
     }
 
-    /// A genesis note alone in an otherwise empty tree.
+    /// A genesis note, activated alone in an otherwise empty tree: `root`
+    /// and `siblings` are its request path.
     fn fixture(server_url: &str) -> Fixture {
         fixture_expiring(server_url, 4_000_000_000)
     }
@@ -2025,14 +2024,14 @@ mod tests {
         let server = MockServer::start().await;
         let fixture = fixture(&server.url);
         fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
-        server.reply(409, error("stale_root", true));
+        server.reply(409, error("note_not_recorded", true));
         server.reply(503, error("capacity_exhausted", true));
         server.reply(200, clearance(&fixture));
 
         let before = now_seconds();
         let (public, proof) = fixture
             .wallet
-            .withdrawal_mutual_close(DESTINATION, fixture.root, fixture.siblings.clone())
+            .withdrawal_mutual_close(DESTINATION)
             .await
             .unwrap();
 
@@ -2054,9 +2053,9 @@ mod tests {
         let ownership = request.ownership_proof;
         assert_eq!(request.withdrawal_nullifier, nullifier(&fixture));
 
-        // The ownership proof (kind 2): same state, nullifier, root, keys and
-        // balance, but no destination, no successor nullifier, no concession
-        // and a valid_until inside the server's one-hour window.
+        // The ownership proof (kind 2): same state, nullifier, note values,
+        // keys and balance, but no destination, no successor nullifier, no
+        // concession and a valid_until inside the server's one-hour window.
         let owned = &ownership.public_inputs;
         assert_eq!(owned.withdrawal_kind(), Some(WithdrawalKind::Ownership));
         assert_eq!(owned.destination, [0; 20]);
@@ -2064,7 +2063,24 @@ mod tests {
         assert_eq!(owned.conceded, 0);
         assert_eq!(owned.withdrawal_nullifier, request.withdrawal_nullifier);
         assert_eq!(owned.final_balance, 2_000_000);
-        assert_eq!(owned.active_root, fixture.root);
+        let recorded = fixture.wallet.recorded_note().unwrap();
+        assert_eq!(
+            (
+                owned.registration_commitment,
+                owned.deposit_amount,
+                owned.expiry
+            ),
+            (
+                recorded.registration_commitment,
+                recorded.deposit_amount,
+                recorded.expiry_ts
+            )
+        );
+        assert_eq!(
+            public.registration_commitment,
+            owned.registration_commitment
+        );
+        assert_eq!(public.note_metadata(), recorded.note_metadata());
         assert!(owned.valid_until > before);
         assert!(owned.valid_until <= now_seconds() + OWNERSHIP_PROOF_VALIDITY_SECONDS);
 
@@ -2100,19 +2116,22 @@ mod tests {
         );
     }
 
+    /// A server that does not see the note's deposit yet is asked again with
+    /// the same body; when it never does, the wallet says so, and a later
+    /// attempt resends the same proof.
     #[tokio::test]
-    async fn persistent_stale_root_resends_one_ownership_proof() {
+    async fn an_unrecorded_note_resends_one_ownership_proof() {
         let server = MockServer::start().await;
         let fixture = fixture(&server.url);
         fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
         for _ in 0..=CLEARANCE_RETRY_DELAYS_MS.len() {
-            server.reply(409, error("stale_root", true));
+            server.reply(409, error("note_not_recorded", true));
         }
-        let result = fixture
-            .wallet
-            .withdrawal_mutual_close(DESTINATION, fixture.root, fixture.siblings.clone())
-            .await;
-        assert!(matches!(result, Err(ClientError::StaleRoot)), "{result:?}");
+        let result = fixture.wallet.withdrawal_mutual_close(DESTINATION).await;
+        assert!(
+            matches!(result, Err(ClientError::NoteNotRecorded)),
+            "{result:?}"
+        );
         let calls = server.calls();
         assert_eq!(calls.len(), CLEARANCE_RETRY_DELAYS_MS.len() + 1);
         assert!(calls.iter().all(|(_, body)| *body == calls[0].1));
@@ -2121,7 +2140,7 @@ mod tests {
         server.reply(200, clearance(&fixture));
         fixture
             .wallet
-            .withdrawal_mutual_close(DESTINATION, fixture.root, fixture.siblings.clone())
+            .withdrawal_mutual_close(DESTINATION)
             .await
             .unwrap();
         let calls = server.calls();
@@ -2130,26 +2149,32 @@ mod tests {
         assert_eq!(lock.released.iter().filter(|p| p.kind == 2).count(), 1);
     }
 
+    /// Refusals are not retried: `nullifier_used`, `note_binding_mismatch`
+    /// and `note_not_active` reserve nothing; a `stale_root` no longer
+    /// concerns clearances.
     #[tokio::test]
     async fn rejected_clearance_is_not_retried() {
-        for (status, code) in [(400, "invalid_proof"), (409, "nullifier_used")] {
+        for (status, code) in [
+            (400, "invalid_proof"),
+            (409, "nullifier_used"),
+            (409, "note_binding_mismatch"),
+            (409, "note_not_active"),
+            (409, "stale_root"),
+        ] {
             let server = MockServer::start().await;
             let fixture = fixture(&server.url);
             fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
             server.reply(status, error(code, false));
-            let result = fixture
-                .wallet
-                .withdrawal_mutual_close(DESTINATION, fixture.root, fixture.siblings.clone())
-                .await;
+            let result = fixture.wallet.withdrawal_mutual_close(DESTINATION).await;
             let refused =
                 matches!(&result, Err(ClientError::ClearanceRefused(refused)) if refused == code);
             let failed =
                 matches!(&result, Err(ClientError::ServerError(message)) if message.contains(code));
             assert!(
-                if code == "nullifier_used" {
-                    refused
-                } else {
+                if ["invalid_proof", "stale_root"].contains(&code) {
                     failed
+                } else {
+                    refused
                 },
                 "{result:?}"
             );
@@ -2157,28 +2182,32 @@ mod tests {
         }
     }
 
+    /// A state whose balance no longer matches its note (here a genesis
+    /// state holding less than the deposit) cannot be proved.
+    fn corrupt_balance(fixture: &mut Fixture) {
+        let path = fixture.state_dir.join("note_state.json");
+        let mut state = NoteState::load(&path).unwrap();
+        state.current_balance -= 1;
+        state.save(&path).unwrap();
+        fixture.reopen();
+    }
+
     #[tokio::test]
     async fn invalid_ownership_witness_or_destination_sends_no_clearance_request() {
         let server = MockServer::start().await;
-        let fixture = fixture(&server.url);
+        let mut fixture = fixture(&server.url);
         fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
-        let mut wrong_path = fixture.siblings.clone();
-        wrong_path[3] = Felt252::from_u64(9);
-        for (destination, root, siblings) in [
-            (DESTINATION, Felt252::from_u64(7), fixture.siblings.clone()),
-            (DESTINATION, fixture.root, wrong_path),
-            (DESTINATION, fixture.root, fixture.siblings[1..].to_vec()),
-            ([0; 20], fixture.root, fixture.siblings.clone()),
-        ] {
-            let result = fixture
-                .wallet
-                .withdrawal_mutual_close(destination, root, siblings)
-                .await;
-            assert!(
-                matches!(result, Err(ClientError::ProofGeneration(_))),
-                "{result:?}"
-            );
-        }
+        let result = fixture.wallet.withdrawal_mutual_close([0; 20]).await;
+        assert!(
+            matches!(result, Err(ClientError::ProofGeneration(_))),
+            "{result:?}"
+        );
+        corrupt_balance(&mut fixture);
+        let result = fixture.wallet.withdrawal_mutual_close(DESTINATION).await;
+        assert!(
+            matches!(result, Err(ClientError::ProofGeneration(_))),
+            "{result:?}"
+        );
         assert!(server.calls().is_empty());
         // Nothing that failed to build was recorded as released.
         assert!(fixture
@@ -2188,10 +2217,7 @@ mod tests {
             .unwrap()
             .released
             .is_empty());
-        assert!(fixture
-            .wallet
-            .withdrawal_escape_hatch([0; 20], 0, fixture.root, fixture.siblings.clone())
-            .is_err());
+        assert!(fixture.wallet.withdrawal_escape_hatch([0; 20], 0).is_err());
     }
 
     /// The ownership proof is recorded as released, and the state marked for
@@ -2211,22 +2237,17 @@ mod tests {
         let mut recorded = Vec::new();
         let result = fixture
             .wallet
-            .withdrawal_mutual_close_recorded(
-                DESTINATION,
-                fixture.root,
-                fixture.siblings.clone(),
-                || {
-                    recorded.push((
-                        server.calls().len(),
-                        fixture.wallet.exit_lock().unwrap().unwrap().released.len(),
-                        fixture
-                            .wallet
-                            .ownership_proof_sent_at_current_state()
-                            .unwrap(),
-                    ));
-                    Ok(())
-                },
-            )
+            .withdrawal_mutual_close_recorded(DESTINATION, || {
+                recorded.push((
+                    server.calls().len(),
+                    fixture.wallet.exit_lock().unwrap().unwrap().released.len(),
+                    fixture
+                        .wallet
+                        .ownership_proof_sent_at_current_state()
+                        .unwrap(),
+                ));
+                Ok(())
+            })
             .await;
         assert!(
             matches!(result, Err(ClientError::ServerError(_))),
@@ -2241,12 +2262,9 @@ mod tests {
 
         let result = fixture
             .wallet
-            .withdrawal_mutual_close_recorded(
-                DESTINATION,
-                fixture.root,
-                fixture.siblings.clone(),
-                || Err(ClientError::Serialization("storage unavailable".into())),
-            )
+            .withdrawal_mutual_close_recorded(DESTINATION, || {
+                Err(ClientError::Serialization("storage unavailable".into()))
+            })
             .await;
         assert!(
             matches!(result, Err(ClientError::Serialization(_))),
@@ -2255,13 +2273,12 @@ mod tests {
         assert_eq!(server.calls().len(), 1, "a failed record sends nothing");
 
         let other = MockServer::start().await;
-        let fresh = fixture_expiring(&other.url, 4_000_000_000);
+        let mut fresh = fixture_expiring(&other.url, 4_000_000_000);
         fresh.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
-        let mut wrong_path = fresh.siblings.clone();
-        wrong_path[3] = Felt252::from_u64(9);
+        corrupt_balance(&mut fresh);
         let result = fresh
             .wallet
-            .withdrawal_mutual_close_recorded(DESTINATION, fresh.root, wrong_path, || {
+            .withdrawal_mutual_close_recorded(DESTINATION, || {
                 panic!("recorded a proof that was never built")
             })
             .await;
@@ -2285,12 +2302,7 @@ mod tests {
         assert_eq!(fixture.state().bound_at_state, 1_000);
         fixture.wallet.set_exit_lock(ExitMode::Escape).unwrap();
         assert!(matches!(
-            fixture.wallet.withdrawal_escape_hatch(
-                DESTINATION,
-                1_001,
-                fixture.root,
-                fixture.siblings.clone()
-            ),
+            fixture.wallet.withdrawal_escape_hatch(DESTINATION, 1_001,),
             Err(ClientError::ConcessionAboveBound {
                 conceded: 1_001,
                 bound: 1_000
@@ -2299,7 +2311,7 @@ mod tests {
         let before = now_seconds();
         let (public, proof) = fixture
             .wallet
-            .withdrawal_escape_hatch(DESTINATION, 1_000, fixture.root, fixture.siblings.clone())
+            .withdrawal_escape_hatch(DESTINATION, 1_000)
             .unwrap();
         let state = fixture.wallet.state().unwrap();
         assert_eq!(public.withdrawal_kind(), Some(WithdrawalKind::Escape));
@@ -2348,9 +2360,7 @@ mod tests {
         // original wallet holds no exit lock.
         let (copy, copy_dir) = copy_of(&fixture);
         copy.set_exit_lock(ExitMode::Escape).unwrap();
-        let (escape, _) = copy
-            .withdrawal_escape_hatch(DESTINATION, 0, fixture.root, fixture.siblings.clone())
-            .unwrap();
+        let (escape, _) = copy.withdrawal_escape_hatch(DESTINATION, 0).unwrap();
         let _ = std::fs::remove_dir_all(copy_dir);
         let request = prepare(&mut fixture);
         let verifier = RequestVerifier::load(SETUP_DIR).unwrap();
@@ -2637,9 +2647,7 @@ mod tests {
     #[test]
     fn exit_proofs_are_released_only_under_a_durable_lock() {
         let fixture = fixture("http://127.0.0.1:1");
-        let escape = |wallet: &Wallet| {
-            wallet.withdrawal_escape_hatch(DESTINATION, 0, fixture.root, fixture.siblings.clone())
-        };
+        let escape = |wallet: &Wallet| wallet.withdrawal_escape_hatch(DESTINATION, 0);
         assert!(matches!(
             escape(&fixture.wallet),
             Err(ClientError::ExitLockConflict(_))
@@ -2703,7 +2711,7 @@ mod tests {
         fixture.wallet.set_exit_lock(ExitMode::Escape).unwrap();
         let (escape, _) = fixture
             .wallet
-            .withdrawal_escape_hatch(DESTINATION, 900, fixture.root, fixture.siblings.clone())
+            .withdrawal_escape_hatch(DESTINATION, 900)
             .unwrap();
         let before = fixture.state();
         let late = signed_response(&fixture, &second, 300, None);
@@ -2777,10 +2785,7 @@ mod tests {
         let server = MockServer::start().await;
         let mut fixture = fixture(&server.url);
         fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
-        fixture
-            .wallet
-            .ownership_proof(fixture.root, fixture.siblings.clone())
-            .unwrap();
+        fixture.wallet.ownership_proof().unwrap();
         fixture.wallet.cancel_exit_lock().unwrap();
         let refused = prepare_with_bound(&mut fixture, 1_000);
         assert!(
@@ -2803,49 +2808,259 @@ mod tests {
         assert_eq!(fixture.state().bound_at_state, 0);
     }
 
-    /// Amendment A1: the deposit-time path is checked and kept, and an escape
-    /// proves membership with it.
+    /// A wallet whose note was recorded at `note_id` but not activated: the
+    /// request tree holds no leaf of it.
+    fn unactivated(server_url: &str, note_id: u32) -> Fixture {
+        let state_dir =
+            std::env::temp_dir().join(format!("zkapi-client-wallet-{}", uuid::Uuid::new_v4()));
+        let mut wallet = Wallet::new(config(server_url, &state_dir)).unwrap();
+        wallet
+            .confirm_deposit(Felt252::from_u64(42), note_id, 2_000_000, 4_000_000_000)
+            .unwrap();
+        // The tree holds the activated notes before it, never this one.
+        let mut tree = crate::tree::SparseTree::new();
+        for activated in 0..note_id {
+            tree.set_leaf(activated, Felt252::from_u64(100 + u64::from(activated)));
+        }
+        Fixture {
+            wallet,
+            state_signer: CompactSigner::from_seed(&Felt252::from_u64(11)),
+            clearance_signer: CompactSigner::from_seed(&Felt252::from_u64(12)),
+            root: tree.root(),
+            siblings: tree.siblings(note_id).to_vec(),
+            state_dir,
+            server_url: server_url.to_string(),
+        }
+    }
+
+    /// Exits name the note by what the vault records for it and need no
+    /// path: a note that is in no tree (not activated) escapes, proves
+    /// ownership and closes, and every statement carries `C` at input 3 and
+    /// the packed amount and expiry at input 16.
+    #[tokio::test]
+    async fn a_note_exits_without_a_path_before_it_is_activated() {
+        let server = MockServer::start().await;
+        let fixture = unactivated(&server.url, 3);
+        let recorded = fixture.wallet.recorded_note().unwrap();
+        assert_eq!(
+            recorded.registration_commitment,
+            core::registration_commitment(&Felt252::from_u64(42))
+        );
+        let verifier = WithdrawalVerifier::load(SETUP_DIR).unwrap();
+        let binds_the_note = |public: &WithdrawalPublicInputsV2C| {
+            let fields = public.to_field_elements();
+            assert_eq!(public.note_id, 3);
+            assert_eq!(fields[3], recorded.registration_commitment);
+            assert_eq!(fields[16], recorded.note_metadata());
+        };
+
+        fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
+        server.reply(200, clearance(&fixture));
+        let (close, close_proof, signature) = fixture
+            .wallet
+            .withdrawal_mutual_close_cleared(DESTINATION, || Ok(()))
+            .await
+            .unwrap();
+        let request: ClearanceRequestV2C = serde_json::from_slice(&server.calls()[0].1).unwrap();
+        let owned = &request.ownership_proof.public_inputs;
+        assert!(verifier
+            .verify(owned, &request.ownership_proof.proof)
+            .unwrap());
+        binds_the_note(owned);
+        assert!(verifier.verify(&close, &close_proof).unwrap());
+        binds_the_note(&close);
+        // A re-proof from the kept clearance names the same note.
+        let (again, again_proof) = fixture
+            .wallet
+            .mutual_close_from_clearance(DESTINATION, &signature)
+            .unwrap();
+        assert!(verifier.verify(&again, &again_proof).unwrap());
+        binds_the_note(&again);
+
+        let (copy, copy_dir) = copy_of(&fixture);
+        ExitLock::remove(&copy_dir.join(EXIT_LOCK_FILE)).unwrap();
+        copy.set_exit_lock(ExitMode::Escape).unwrap();
+        let (escape, escape_proof) = copy.withdrawal_escape_hatch(DESTINATION, 0).unwrap();
+        assert!(verifier.verify(&escape, &escape_proof).unwrap());
+        binds_the_note(&escape);
+        assert_eq!(escape.final_balance, 2_000_000);
+        // A statement naming other note values does not verify.
+        let mut other = escape.clone();
+        other.expiry += 1;
+        assert!(!verifier.verify(&other, &escape_proof).unwrap());
+        let _ = std::fs::remove_dir_all(copy_dir);
+    }
+
+    /// Until the vault activates the note, a request is refused before any
+    /// bound is fixed: by its place in the queue when the caller knows the
+    /// vault's cursor, and by its path in any case.
     #[test]
-    fn the_deposit_path_is_checked_saved_and_proves_exits() {
+    fn a_request_waits_for_the_notes_activation() {
+        let mut fixture = unactivated("http://127.0.0.1:1", 3);
+        assert_eq!(
+            fixture.wallet.activation(1),
+            Some(crate::tree::note_activation(3, 1))
+        );
+        assert!(matches!(
+            fixture.wallet.check_activated(1),
+            Err(ClientError::NoteNotActivated { queue_position: 2 })
+        ));
+        assert!(matches!(
+            fixture.wallet.check_activated(3),
+            Err(ClientError::NoteNotActivated { queue_position: 0 })
+        ));
+        fixture.wallet.check_activated(4).unwrap();
+        let refused = prepare_with_bound(&mut fixture, 1_000);
+        assert!(
+            matches!(refused, Err(ClientError::MerklePathMismatch)),
+            "{refused:?}"
+        );
+        assert_eq!(fixture.state().bound_at_state, 0);
+        assert!(!fixture.wallet.has_pending_request());
+        // Once its leaf is in the tree, the request proves.
+        let mut tree = crate::tree::SparseTree::new();
+        for activated in 0..3 {
+            tree.set_leaf(activated, Felt252::from_u64(100 + u64::from(activated)));
+        }
+        tree.set_leaf(3, fixture.wallet.current_note_leaf().unwrap());
+        fixture.root = tree.root();
+        fixture.siblings = tree.siblings(3).to_vec();
+        let request = prepare(&mut fixture);
+        assert!(RequestVerifier::load(SETUP_DIR)
+            .unwrap()
+            .verify(&request.public_inputs, &request.proof)
+            .unwrap());
+        let empty =
+            std::env::temp_dir().join(format!("zkapi-client-wallet-{}", uuid::Uuid::new_v4()));
+        let wallet = Wallet::new(config("http://127.0.0.1:1", &empty)).unwrap();
+        assert!(matches!(
+            wallet.check_activated(9),
+            Err(ClientError::NoActiveNote)
+        ));
+        let _ = std::fs::remove_dir_all(empty);
+    }
+
+    /// A deposit confirmed against the vault's record installs only when the
+    /// record holds this secret's commitment and exactly this amount and
+    /// expiry: an exit naming other values would be refused on chain.
+    #[test]
+    fn a_recorded_deposit_must_match_the_vaults_record() {
         let state_dir =
             std::env::temp_dir().join(format!("zkapi-client-wallet-{}", uuid::Uuid::new_v4()));
         let mut wallet = Wallet::new(config("http://127.0.0.1:1", &state_dir)).unwrap();
         let secret = Felt252::from_u64(42);
-        let leaf = core::note_leaf(
-            3,
-            &core::registration_commitment(&secret),
-            2_000_000,
-            4_000_000_000,
-        );
-        // A neighbour at note 2 makes the path non-trivial.
-        let mut tree = crate::tree::SparseTree::new();
-        tree.set_leaf(2, Felt252::from_u64(77));
-        tree.set_leaf(3, leaf);
-        let path = DepositPath {
-            root: tree.root(),
-            siblings: tree.siblings(3).to_vec(),
+        let recorded = RecordedNote {
+            registration_commitment: core::registration_commitment(&secret),
+            deposit_amount: 2_000_000,
+            expiry_ts: 4_000_000_000,
         };
-        let mut wrong = path.clone();
-        wrong.root = Felt252::from_u64(5);
-        assert!(wallet
-            .confirm_deposit_with_path(secret, 3, 2_000_000, 4_000_000_000, Some(wrong))
-            .is_err());
-        assert!(wallet.state().is_none());
+        for wrong in [
+            RecordedNote {
+                registration_commitment: core::registration_commitment(&Felt252::from_u64(43)),
+                ..recorded
+            },
+            RecordedNote {
+                deposit_amount: 2_000_001,
+                ..recorded
+            },
+            RecordedNote {
+                expiry_ts: 4_000_086_400,
+                ..recorded
+            },
+            RecordedNote {
+                registration_commitment: Felt252::ZERO,
+                deposit_amount: 0,
+                expiry_ts: 0,
+            },
+        ] {
+            let result =
+                wallet.confirm_recorded_deposit(secret, 3, 2_000_000, 4_000_000_000, &wrong);
+            assert!(
+                matches!(result, Err(ClientError::NoteBindingMismatch(_))),
+                "{result:?}"
+            );
+            assert!(wallet.state().is_none());
+            assert!(!state_dir.join("note_state.json").exists());
+        }
         wallet
-            .confirm_deposit_with_path(secret, 3, 2_000_000, 4_000_000_000, Some(path.clone()))
+            .confirm_recorded_deposit(secret, 3, 2_000_000, 4_000_000_000, &recorded)
             .unwrap();
         let reopened = Wallet::new(config("http://127.0.0.1:1", &state_dir)).unwrap();
-        assert_eq!(reopened.deposit_path(), Some(&path));
-        reopened.set_exit_lock(ExitMode::Escape).unwrap();
-        let (public, proof) = reopened
-            .withdrawal_escape_hatch(DESTINATION, 0, path.root, path.siblings.clone())
-            .unwrap();
-        assert_eq!(public.active_root, path.root);
-        assert!(WithdrawalVerifier::load(SETUP_DIR)
-            .unwrap()
-            .verify(&public, &proof)
-            .unwrap());
+        assert_eq!(reopened.recorded_note(), Some(recorded));
+        assert_eq!(reopened.state().unwrap().note_id, 3);
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    /// State written by earlier builds stays usable: a saved deposit-time
+    /// path is ignored, and a C5 marker keeping an ownership proof of the
+    /// earlier, root-bearing statement still marks the state; that proof is
+    /// never resent, and no second one is made while it may be live (C3).
+    #[test]
+    fn state_of_earlier_builds_loads_and_exits_without_its_path() {
+        let mut fixture = fixture("http://127.0.0.1:1");
+        let state_path = fixture.state_dir.join("note_state.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        saved["deposit_path"] = serde_json::json!({
+            "root": "0x5",
+            "siblings": vec!["0x0"; MERKLE_DEPTH],
+        });
+        std::fs::write(&state_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let state = fixture.state();
+        let rooted = serde_json::json!({
+            "public_inputs": {
+                "protocol_version": 2, "chain_id": 1, "contract_address": "0x1234",
+                "active_root": fixture.root, "state_signing_key_x": "0x3",
+                "state_signing_key_y": "0x4", "clearance_signing_key_x": "0x5",
+                "clearance_signing_key_y": "0x6", "note_id": NOTE_ID,
+                "final_balance": 2_000_000, "destination": vec![0u8; 20],
+                "withdrawal_nullifier": nullifier(&fixture), "kind": 2,
+                "next_nullifier": "0x0", "conceded": 0, "valid_until": now_seconds() + 3_000
+            },
+            "proof": {"backend": "groth16_bn254", "proof": "AA=="}
+        });
+        let marker = fixture.state_dir.join(OWNERSHIP_PROOF_MARKER_FILE);
+        let state_nullifier = nullifier(&fixture);
+        let write_marker = |valid_until: u64| {
+            let mut ownership = rooted.clone();
+            ownership["public_inputs"]["valid_until"] = serde_json::json!(valid_until);
+            std::fs::write(
+                &marker,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1, "note_id": NOTE_ID, "nullifier": state_nullifier,
+                    "valid_until": valid_until, "ownership": ownership
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write_marker(now_seconds() + 3_000);
+        fixture.reopen();
+        assert_eq!(fixture.state().recorded_note(), state.recorded_note());
+        assert!(fixture
+            .wallet
+            .ownership_proof_sent_at_current_state()
+            .unwrap());
+        assert!(matches!(
+            fixture.wallet.check_request_allowed(),
+            Err(ClientError::OwnershipProofSent)
+        ));
+        fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
+        assert!(matches!(
+            fixture.wallet.ownership_proof(),
+            Err(ClientError::ExitLockConflict(_))
+        ));
+        write_marker(now_seconds() - 1);
+        let fresh = fixture.wallet.ownership_proof().unwrap();
+        let verifier = WithdrawalVerifier::load(SETUP_DIR).unwrap();
+        assert!(verifier.verify(&fresh.public_inputs, &fresh.proof).unwrap());
+        fixture.wallet.cancel_exit_lock().unwrap();
+        fixture.wallet.set_exit_lock(ExitMode::Escape).unwrap();
+        let (escape, proof) = fixture
+            .wallet
+            .withdrawal_escape_hatch(DESTINATION, 0)
+            .unwrap();
+        assert!(verifier.verify(&escape, &proof).unwrap());
     }
 
     /// The exit decision's view of the released records: the journal and the
@@ -2897,9 +3112,7 @@ mod tests {
         );
         assert!(!wallet.has_pending_request());
         wallet.set_exit_lock(ExitMode::Escape).unwrap();
-        let (escape, proof) = wallet
-            .withdrawal_escape_hatch(DESTINATION, 0, fixture.root, fixture.siblings.clone())
-            .unwrap();
+        let (escape, proof) = wallet.withdrawal_escape_hatch(DESTINATION, 0).unwrap();
         assert_eq!(escape.final_balance, 2_000_000 - 400);
         assert!(WithdrawalVerifier::load(SETUP_DIR)
             .unwrap()
@@ -2928,9 +3141,9 @@ mod tests {
 
     /// L6 and §3.3: a close expires, and the clearance signs only the
     /// nullifier, so an expired close is proved again from the kept
-    /// signature with a new lifetime, at the same root and path, without a
-    /// second ownership proof or clearance request. A signature that does
-    /// not verify proves nothing, and only the mutual lock allows it.
+    /// signature with a new lifetime, without a second ownership proof or
+    /// clearance request. A signature that does not verify proves nothing,
+    /// and only the mutual lock allows it.
     #[tokio::test]
     async fn an_expired_close_is_proved_again_from_its_clearance() {
         let server = MockServer::start().await;
@@ -2939,12 +3152,7 @@ mod tests {
         server.reply(200, clearance(&fixture));
         let (first, _, signature) = fixture
             .wallet
-            .withdrawal_mutual_close_cleared(
-                DESTINATION,
-                fixture.root,
-                fixture.siblings.clone(),
-                || Ok(()),
-            )
+            .withdrawal_mutual_close_cleared(DESTINATION, || Ok(()))
             .await
             .unwrap();
         let forged = fixture.state_signer.sign(&core::clearance_message(
@@ -2954,23 +3162,15 @@ mod tests {
             &nullifier(&fixture),
         ));
         assert!(matches!(
-            fixture.wallet.mutual_close_from_clearance(
-                DESTINATION,
-                fixture.root,
-                fixture.siblings.clone(),
-                &forged
-            ),
+            fixture
+                .wallet
+                .mutual_close_from_clearance(DESTINATION, &forged),
             Err(ClientError::VerificationFailed(_))
         ));
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         let (again, proof) = fixture
             .wallet
-            .mutual_close_from_clearance(
-                DESTINATION,
-                fixture.root,
-                fixture.siblings.clone(),
-                &signature,
-            )
+            .mutual_close_from_clearance(DESTINATION, &signature)
             .unwrap();
         assert!(again.valid_until > first.valid_until);
         assert_eq!(again.withdrawal_kind(), Some(WithdrawalKind::MutualClose));
@@ -3003,12 +3203,9 @@ mod tests {
         // Only under the mutual lock.
         fixture.wallet.set_exit_lock(ExitMode::Escape).unwrap();
         assert!(matches!(
-            fixture.wallet.mutual_close_from_clearance(
-                DESTINATION,
-                fixture.root,
-                fixture.siblings.clone(),
-                &signature
-            ),
+            fixture
+                .wallet
+                .mutual_close_from_clearance(DESTINATION, &signature),
             Err(ClientError::ExitLockConflict(_))
         ));
     }
@@ -3020,14 +3217,8 @@ mod tests {
     fn a_second_ownership_proof_waits_until_the_first_expires() {
         let fixture = fixture("http://127.0.0.1:1");
         fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
-        let first = fixture
-            .wallet
-            .ownership_proof(fixture.root, fixture.siblings.clone())
-            .unwrap();
-        let resent = fixture
-            .wallet
-            .ownership_proof(fixture.root, fixture.siblings.clone())
-            .unwrap();
+        let first = fixture.wallet.ownership_proof().unwrap();
+        let resent = fixture.wallet.ownership_proof().unwrap();
         assert_eq!(resent.proof, first.proof);
         let path = fixture.state_dir.join(EXIT_LOCK_FILE);
         let marker = fixture.state_dir.join(OWNERSHIP_PROOF_MARKER_FILE);
@@ -3044,9 +3235,7 @@ mod tests {
         // Still accepted by the server, too close to expiry to resend.
         set_valid_until(now_seconds() + OWNERSHIP_RESEND_MARGIN_SECONDS - 1);
         assert!(matches!(
-            fixture
-                .wallet
-                .ownership_proof(fixture.root, fixture.siblings.clone()),
+            fixture.wallet.ownership_proof(),
             Err(ClientError::ExitLockConflict(_))
         ));
         assert_eq!(
@@ -3054,10 +3243,7 @@ mod tests {
             1
         );
         set_valid_until(now_seconds() - 1);
-        let second = fixture
-            .wallet
-            .ownership_proof(fixture.root, fixture.siblings.clone())
-            .unwrap();
+        let second = fixture.wallet.ownership_proof().unwrap();
         assert_ne!(second.proof, first.proof);
         assert_eq!(
             fixture.wallet.exit_lock().unwrap().unwrap().released.len(),
@@ -3074,20 +3260,14 @@ mod tests {
     fn a_cancelled_lock_makes_no_second_live_ownership_proof() {
         let mut fixture = fixture("http://127.0.0.1:1");
         fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
-        let first = fixture
-            .wallet
-            .ownership_proof(fixture.root, fixture.siblings.clone())
-            .unwrap();
+        let first = fixture.wallet.ownership_proof().unwrap();
         let relock = |fixture: &mut Fixture| {
             fixture.wallet.cancel_exit_lock().unwrap();
             assert!(fixture.wallet.exit_lock().unwrap().is_none());
             fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
         };
         relock(&mut fixture);
-        let again = fixture
-            .wallet
-            .ownership_proof(fixture.root, fixture.siblings.clone())
-            .unwrap();
+        let again = fixture.wallet.ownership_proof().unwrap();
         assert_eq!(again.proof, first.proof);
         let lock = fixture.wallet.exit_lock().unwrap().unwrap();
         assert_eq!(
@@ -3105,17 +3285,12 @@ mod tests {
         set_valid_until(now_seconds() + OWNERSHIP_RESEND_MARGIN_SECONDS - 1);
         relock(&mut fixture);
         assert!(matches!(
-            fixture
-                .wallet
-                .ownership_proof(fixture.root, fixture.siblings.clone()),
+            fixture.wallet.ownership_proof(),
             Err(ClientError::ExitLockConflict(_))
         ));
         set_valid_until(now_seconds() - 1);
         relock(&mut fixture);
-        let second = fixture
-            .wallet
-            .ownership_proof(fixture.root, fixture.siblings.clone())
-            .unwrap();
+        let second = fixture.wallet.ownership_proof().unwrap();
         assert_ne!(second.proof, first.proof);
         assert!(fixture
             .wallet

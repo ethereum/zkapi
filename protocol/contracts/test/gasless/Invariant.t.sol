@@ -123,7 +123,7 @@ contract GaslessHandler is GaslessTestBase {
     function raise(uint32 noteSeed, uint128 amountSeed) external {
         (bool ok, uint32 id) = _note(noteSeed, Types.NoteStatus.PendingWithdrawal);
         if (!ok) return;
-        (,, uint256 nullifier,,,) = vault.pendingWithdrawals(id);
+        (, uint256 nullifier,,,) = vault.pendingWithdrawals(id);
         uint128 amount = uint128(bound(amountSeed, 0, NOTE_AMOUNT));
         Types.RequestPublicInputs memory request = _evidence(nullifier, amount);
         vm.prank(challenger);
@@ -142,7 +142,7 @@ contract GaslessHandler is GaslessTestBase {
     function sponsoredFinalize(uint32 noteSeed) external {
         (bool ok, uint32 id) = _note(noteSeed, Types.NoteStatus.PendingWithdrawal);
         if (!ok) return;
-        (,,,, address destination, uint64 deadline) = vault.pendingWithdrawals(id);
+        (,,, address destination, uint64 deadline) = vault.pendingWithdrawals(id);
         uint8 which = destination == accounts[0] ? 0 : destination == accounts[1] ? 1 : 2;
         if (which == 2) return;
         if (vm.getBlockTimestamp() < deadline) vm.warp(deadline);
@@ -152,7 +152,7 @@ contract GaslessHandler is GaslessTestBase {
     function directFinalize(uint32 noteSeed) external {
         (bool ok, uint32 id) = _note(noteSeed, Types.NoteStatus.PendingWithdrawal);
         if (!ok) return;
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(id);
         if (vm.getBlockTimestamp() < deadline) vm.warp(deadline);
         vault.finalizeEscapeWithdrawal(id);
     }
@@ -327,7 +327,7 @@ contract GaslessHandler is GaslessTestBase {
     function _pendingOfAccount(uint32 seed) internal returns (bool ok, uint32 id, uint8 which) {
         (ok, id) = _note(seed, Types.NoteStatus.PendingWithdrawal);
         if (!ok) return (false, 0, 0);
-        (,,,, address destination, uint64 deadline) = vault.pendingWithdrawals(id);
+        (,,, address destination, uint64 deadline) = vault.pendingWithdrawals(id);
         if (destination != accounts[0] && destination != accounts[1]) return (false, 0, 0);
         which = destination == accounts[0] ? 0 : 1;
         if (vm.getBlockTimestamp() < deadline) vm.warp(deadline);

@@ -17,7 +17,7 @@ library Types {
         NoteStatus status;
     }
 
-    /// @dev A pending escape, 5 slots. The getters pendingWithdrawals (6 words: exists, activeRoot,
+    /// @dev A pending escape, 4 slots. The getters pendingWithdrawals (5 words: exists,
     ///      withdrawalNullifier, finalBalance, destination, challengeDeadline) and pendingConcessions
     ///      (3 words: nextNullifier, stateBalance, conceded) are what clients and the challenger
     ///      decode; `exists` is destination != 0 and stateBalance = finalBalance + conceded.
@@ -26,8 +26,6 @@ library Types {
         uint256 withdrawalNullifier;
         /// @dev N_{k+1}: only a request proof at this nullifier defeats the escape.
         uint256 nextNullifier;
-        /// @dev The escape proof's activeRoot; informational, the vault never reads it.
-        uint256 activeRoot;
         address destination;
         uint64 challengeDeadline;
         /// @dev The current payout: the state balance B_k minus `conceded`.
@@ -52,13 +50,16 @@ library Types {
         uint256 anonymousCommitmentY;
     }
 
-    /// @dev Field order is the exact Groth16 public-input order (16 inputs). A static tuple, so its
-    ///      ABI words are the public inputs in order.
+    /// @dev Field order is the exact Groth16 public-input order (17 inputs). A static tuple, so its
+    ///      ABI words are the public inputs in order. The note is bound by the values the vault
+    ///      stores for noteId (registrationCommitment and noteMetadata), not by a tree root, so a
+    ///      note can exit before it is activated in the request tree.
     struct WithdrawalPublicInputs {
         uint16 protocolVersion;
         uint64 chainId;
         address contractAddress;
-        uint256 activeRoot;
+        /// @dev notes[noteId].commitment: the registration commitment R = H(d_reg, s, 0).
+        uint256 registrationCommitment;
         uint256 stateSigningKeyX;
         uint256 stateSigningKeyY;
         uint256 clearanceSigningKeyX;
@@ -78,5 +79,7 @@ library Types {
         uint128 conceded;
         /// @dev The latest second at which the vault accepts the proof.
         uint64 validUntil;
+        /// @dev notes[noteId] packed: uint256(depositAmount) | uint256(expiryTs) << 128.
+        uint256 noteMetadata;
     }
 }

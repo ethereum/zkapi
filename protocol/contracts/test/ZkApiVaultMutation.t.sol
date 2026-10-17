@@ -7,8 +7,9 @@ import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 
 /// @dev Generated mutation test: for every real fixture proof (both fixture files), every one of
-///      its public inputs (12 request, 16 withdrawal) is changed in turn to another value of its
-///      Solidity type and inside the scalar field, and the real adapter must revert InvalidProof.
+///      its public inputs (12 request, 17 withdrawal, 3 + 2K for an activation of K notes) is
+///      changed in turn to another value of its Solidity type and inside the scalar field, and the
+///      real adapter must revert InvalidProof.
 ///      So does every one of the 8 proof words. The inputs are mutated as ABI words, in
 ///      public-input order, so an adapter that skipped, reordered or misencoded an input fails
 ///      here even if the Rust side is right.
@@ -29,8 +30,9 @@ contract ZkApiVaultMutationTest is Test {
 
     /// Bit widths of the request inputs in order (256: a field element).
     uint16[12] REQUEST_BITS = [16, 64, 160, 256, 256, 256, 64, 128, 256, 256, 256, 256];
-    /// Bit widths of the withdrawal inputs in order.
-    uint16[16] WITHDRAWAL_BITS = [16, 64, 160, 256, 256, 256, 256, 256, 32, 128, 160, 256, 8, 256, 128, 64];
+    /// Bit widths of the withdrawal inputs in order (the packed note metadata, input 16, is a
+    /// field element).
+    uint16[17] WITHDRAWAL_BITS = [16, 64, 160, 256, 256, 256, 256, 256, 32, 128, 160, 256, 8, 256, 128, 64, 256];
 
     function setUp() public {
         adapter = new Groth16ProofAdapter();
@@ -66,6 +68,17 @@ contract ZkApiVaultMutationTest is Test {
         }
     }
 
+    function test_everyInsertionInputIsBound() public {
+        string[3] memory solidity = ["insertion1", "insertion4", "insertion16"];
+        for (uint256 i = 0; i < solidity.length; ++i) {
+            _mutateInsertion("test/fixtures/solidity-fixture.json", solidity[i]);
+        }
+        string[3] memory vault = ["activate_b", "activate_batch4", "activate_batch16"];
+        for (uint256 i = 0; i < vault.length; ++i) {
+            _mutateInsertion("test/fixtures/vault-challenge.json", vault[i]);
+        }
+    }
+
     function _mutateRequest(string memory file, string memory name) private {
         (bytes memory words, bytes memory proof) = _fixture(file, name);
         assertEq(words.length, 12 * 32, name);
@@ -92,9 +105,9 @@ contract ZkApiVaultMutationTest is Test {
 
     function _mutateWithdrawal(string memory file, string memory name) private {
         (bytes memory words, bytes memory proof) = _fixture(file, name);
-        assertEq(words.length, 16 * 32, name);
+        assertEq(words.length, 17 * 32, name);
         adapter.assertValidWithdrawal{gas: VERIFY_GAS}(abi.decode(words, (Types.WithdrawalPublicInputs)), proof);
-        for (uint256 i = 0; i < 16; ++i) {
+        for (uint256 i = 0; i < 17; ++i) {
             bytes memory mutated = _mutateWord(words, i, WITHDRAWAL_BITS[i]);
             Types.WithdrawalPublicInputs memory inputs = abi.decode(mutated, (Types.WithdrawalPublicInputs));
             vm.expectRevert(Errors.InvalidProof.selector);
@@ -111,6 +124,44 @@ contract ZkApiVaultMutationTest is Test {
             adapter.assertValidWithdrawal{gas: VERIFY_GAS}(original, mutatedProof);
             vm.expectRevert(Errors.InvalidProof.selector);
             adapter.assertValidWithdrawal{gas: VERIFY_GAS}(original, _addToWord(proof, i, BASE_MODULUS));
+        }
+    }
+
+    /// Every input of an activation is a field element: the roots, the first note id and each
+    /// note's commitment and packed metadata.
+    function _mutateInsertion(string memory file, string memory name) private {
+        string memory json = vm.readFile(file);
+        uint256 count = vm.parseJsonUint(json, string.concat(".", name, ".count"));
+        bytes memory words = vm.parseJsonBytes(json, string.concat(".", name, ".inputs_abi"));
+        bytes memory proof = vm.parseJsonBytes(json, string.concat(".", name, ".proof_hex"));
+        uint256 length = 3 + 2 * count;
+        assertEq(words.length, length * 32, name);
+        assertEq(_words(words), vm.parseJsonUintArray(json, string.concat(".", name, ".inputs")), name);
+        adapter.assertValidInsertion{gas: VERIFY_GAS}(count, _words(words), proof);
+        for (uint256 i = 0; i < length; ++i) {
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidInsertion{gas: VERIFY_GAS}(count, _words(_mutateWord(words, i, 256)), proof);
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidInsertion{gas: VERIFY_GAS}(count, _words(_addToWord(words, i, SCALAR_MODULUS)), proof);
+        }
+        uint256[] memory original = _words(words);
+        for (uint256 i = 0; i < 8; ++i) {
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidInsertion{gas: VERIFY_GAS}(count, original, _mutateWord(proof, i, 256));
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidInsertion{gas: VERIFY_GAS}(count, original, _addToWord(proof, i, BASE_MODULUS));
+        }
+    }
+
+    /// `data` read as consecutive 32-byte words.
+    function _words(bytes memory data) private pure returns (uint256[] memory out) {
+        out = new uint256[](data.length / 32);
+        for (uint256 i = 0; i < out.length; ++i) {
+            uint256 value;
+            assembly ("memory-safe") {
+                value := mload(add(add(data, 0x20), mul(i, 0x20)))
+            }
+            out[i] = value;
         }
     }
 

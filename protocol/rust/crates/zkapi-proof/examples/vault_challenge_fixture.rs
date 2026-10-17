@@ -1,4 +1,4 @@
-//! Real-proof vault fixtures for circuit `zkapi-v2-concession-v1`:
+//! Real-proof vault fixtures for circuit `zkapi-v2-concession-v2`:
 //!
 //! ```text
 //! cargo run --release -p zkapi-proof --example vault_challenge_fixture -- \
@@ -11,8 +11,23 @@
 //!
 //! Note A (id 0) has the honest chain `a0 -R0-> a1 -R1-> a2 -R2-> a3`, each
 //! successor signed at `next_anchor(N)`. Note B (id 1) shares A's secret and
-//! stays at genesis. Every proof is at root `ab` (A and B deposited) unless
-//! named otherwise, and is valid until `valid_until`.
+//! stays at genesis. `notes` lists the 16 notes the fixtures deposit, in id
+//! order: A, B, then notes 2 to 15 of other secrets (`notes[i]` holds what
+//! the vault stores for note `i`, its packed `metadata` and its leaf).
+//!
+//! Activation (`support/activation.rs` format):
+//! * `activate_a` then `activate_b`: one proved K = 1 batch each, from the
+//!   empty tree (`empty_root`) to `root_a` and then `root_ab`, the root every
+//!   request proof is at. `activate_c` and `activate_d` continue with notes 2
+//!   and 3 to `root_abcd`.
+//! * `activate_batch4`: notes 0 to 3 in one K = 4 batch from the empty tree,
+//!   also to `root_abcd`; `activate_batch16`: notes 0 to 15 in one K = 16
+//!   batch, to `root_16`.
+//!
+//! Withdrawals are bound to the stored note (input 3 is the registration
+//! commitment, input 16 the packed amount and expiry), so every withdrawal
+//! proof is valid whether or not its note is activated, and at any root.
+//! Each is valid until `valid_until`.
 //!
 //! * Withholding: the user at `a2` sent R2 (`request_a2`, `sb = 100,000`) and
 //!   the operator withheld `a3`. `escape_a2_concede` concedes `sb`
@@ -23,10 +38,16 @@
 //! * Re-escapes after that defeat: `escape_a2` again (ChallengedNullifier),
 //!   `escape_a1` (SupersededState: its next nullifier `N2` was flagged),
 //!   `escape_a0` (verified, then defeated by `request_a1`).
-//! * `escape_a2_at_root_a` is at the root before B's deposit; `escape_a2_expired`
-//!   has `valid_until = timestamp - 1`; `ownership_a2` is kind 2 (rejected by
-//!   the vault); `escape_b0_genesis_concede`, `close_b0` and `request_b0` use
-//!   note B (same secret, disjoint nullifiers).
+//! * `escape_a2_expired` has `valid_until = timestamp - 1`; `ownership_a2` is
+//!   kind 2 (rejected by the vault); `escape_b0_genesis_concede`, `close_b0`
+//!   and `request_b0` use note B (same secret, disjoint nullifiers).
+//! * Note binding: `escape_b0_foreign_commitment` (note 1 with another
+//!   secret's commitment), `escape_b0_other_amount` (note 1 as if it held
+//!   2,000,000 gwei: a genesis escape paying that out) and
+//!   `escape_b0_other_expiry` (a day later) are valid proofs of statements
+//!   whose commitment or packed values differ from what the vault stores for
+//!   note 1, so the vault must refuse them (NoteBindingMismatch) before the
+//!   adapter, which accepts them.
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::Serialize;
@@ -38,6 +59,10 @@ use zkapi_proof::compact::{
 use zkapi_proof::dev::{tree_with, DevDeployment, DevNote, DevRequest, DevState, DevWithdrawal};
 use zkapi_types::wire::Groth16ProofWire;
 use zkapi_types::{Felt252, WithdrawalKind};
+
+#[path = "support/activation.rs"]
+mod activation;
+use activation::{word, Activator, StoredNote};
 
 const TIMESTAMP: u64 = 2_000_000_000;
 const NOTE_TTL: u64 = 30 * 86_400;
@@ -85,7 +110,6 @@ impl Generator {
     fn withdrawal(
         &self,
         state: &DevState,
-        tree: &MerkleTree,
         kind: WithdrawalKind,
         destination: [u8; 20],
         conceded: u128,
@@ -93,7 +117,6 @@ impl Generator {
     ) -> Result<Fixture> {
         let (public, witness) = state.withdrawal(
             &self.deployment,
-            tree,
             &DevWithdrawal {
                 kind,
                 destination,
@@ -162,6 +185,7 @@ fn main() -> Result<()> {
         ),
     };
     let deployment = &generator.deployment;
+    let activator = Activator::load(&setup)?;
     let expiry = (TIMESTAMP + NOTE_TTL).div_ceil(86_400) * 86_400;
     let a = DevNote {
         secret: Felt252::from_u64(42),
@@ -173,8 +197,33 @@ fn main() -> Result<()> {
         note_id: 1,
         ..a.clone()
     };
-    let tree_a = tree_with(&[&a]);
+    let mut notes = vec![a.clone(), b.clone()];
+    notes.extend((2..16u32).map(|note_id| DevNote {
+        secret: Felt252::from_u64(1_000 + u64::from(note_id)),
+        note_id,
+        ..a.clone()
+    }));
     let tree_ab = tree_with(&[&a, &b]);
+
+    // Activations: A then B, then C and D; and the same notes in batches.
+    let mut tree = MerkleTree::new();
+    let empty_root = tree.root();
+    let activate_a = activator.activate(&mut tree, &notes[0..1])?;
+    let root_a = tree.root();
+    let activate_b = activator.activate(&mut tree, &notes[1..2])?;
+    anyhow::ensure!(tree.root() == tree_ab.root(), "A and B activate to root_ab");
+    let activate_c = activator.activate(&mut tree, &notes[2..3])?;
+    let activate_d = activator.activate(&mut tree, &notes[3..4])?;
+    let root_abcd = tree.root();
+    let mut batch_tree = MerkleTree::new();
+    let activate_batch4 = activator.activate(&mut batch_tree, &notes[0..4])?;
+    anyhow::ensure!(
+        batch_tree.root() == root_abcd,
+        "one K = 4 batch is four singletons"
+    );
+    let mut batch_tree = MerkleTree::new();
+    let activate_batch16 = activator.activate(&mut batch_tree, &notes)?;
+    let root_16 = batch_tree.root();
 
     let (r0, r1, r2, r3) = (
         request(100_000, 99, 9),
@@ -187,69 +236,99 @@ fn main() -> Result<()> {
     let a2 = a1.successor(deployment, &r1, 150_000, &Felt252::from_u64(19))?;
     let a3 = a2.successor(deployment, &r2, 40_000, &Felt252::from_u64(21))?;
     let b0 = b.genesis(Felt252::from_u64(8));
+    // Note 1 as the vault does not store it: another secret's commitment, or
+    // B's commitment with another amount or expiry. Genesis states need no
+    // signature, so anyone can prove them.
+    let unstored = |note: DevNote| note.genesis(Felt252::from_u64(8));
+    let b0_foreign = unstored(DevNote {
+        secret: Felt252::from_u64(43),
+        ..b.clone()
+    });
+    let b0_other_amount = unstored(DevNote {
+        deposit_amount: 2 * DEPOSIT,
+        ..b.clone()
+    });
+    let b0_other_expiry = unstored(DevNote {
+        expiry: expiry + 86_400,
+        ..b.clone()
+    });
 
     let w = |state: &DevState, kind, destination, conceded| {
-        generator.withdrawal(state, &tree_ab, kind, destination, conceded, VALID_UNTIL)
+        generator.withdrawal(state, kind, destination, conceded, VALID_UNTIL)
     };
     let mut fixtures = serde_json::Map::new();
-    let mut put = |name: &str, fixture: Fixture| -> Result<()> {
-        fixtures.insert(name.to_string(), serde_json::to_value(fixture)?);
-        Ok(())
+    let mut put = |name: &str, fixture: Value| {
+        fixtures.insert(name.to_string(), fixture);
     };
-    put("request_a0", generator.request(&a0, &tree_ab, &r0)?)?;
-    put("request_a1", generator.request(&a1, &tree_ab, &r1)?)?;
-    put("request_a2", generator.request(&a2, &tree_ab, &r2)?)?;
-    put("request_a3", generator.request(&a3, &tree_ab, &r3)?)?;
-    put("request_b0", generator.request(&b0, &tree_ab, &r0)?)?;
-    put("escape_a0", w(&a0, WithdrawalKind::Escape, DESTINATION, 0)?)?;
-    put("escape_a1", w(&a1, WithdrawalKind::Escape, DESTINATION, 0)?)?;
-    put("escape_a2", w(&a2, WithdrawalKind::Escape, DESTINATION, 0)?)?;
+    let value = |fixture: Fixture| serde_json::to_value(fixture);
+    put("activate_a", serde_json::to_value(activate_a)?);
+    put("activate_b", serde_json::to_value(activate_b)?);
+    put("activate_c", serde_json::to_value(activate_c)?);
+    put("activate_d", serde_json::to_value(activate_d)?);
+    put("activate_batch4", serde_json::to_value(activate_batch4)?);
+    put("activate_batch16", serde_json::to_value(activate_batch16)?);
+    put("request_a0", value(generator.request(&a0, &tree_ab, &r0)?)?);
+    put("request_a1", value(generator.request(&a1, &tree_ab, &r1)?)?);
+    put("request_a2", value(generator.request(&a2, &tree_ab, &r2)?)?);
+    put("request_a3", value(generator.request(&a3, &tree_ab, &r3)?)?);
+    put("request_b0", value(generator.request(&b0, &tree_ab, &r0)?)?);
+    put(
+        "escape_a0",
+        value(w(&a0, WithdrawalKind::Escape, DESTINATION, 0)?)?,
+    );
+    put(
+        "escape_a1",
+        value(w(&a1, WithdrawalKind::Escape, DESTINATION, 0)?)?,
+    );
+    put(
+        "escape_a2",
+        value(w(&a2, WithdrawalKind::Escape, DESTINATION, 0)?)?,
+    );
     put(
         "escape_a2_concede",
-        w(&a2, WithdrawalKind::Escape, DESTINATION, r2.solvency_bound)?,
-    )?;
+        value(w(
+            &a2,
+            WithdrawalKind::Escape,
+            DESTINATION,
+            r2.solvency_bound,
+        )?)?,
+    );
     put(
         "escape_a2_other_destination",
-        w(&a2, WithdrawalKind::Escape, [0x22; 20], 0)?,
-    )?;
-    put(
-        "escape_a2_at_root_a",
-        generator.withdrawal(
-            &a2,
-            &tree_a,
-            WithdrawalKind::Escape,
-            DESTINATION,
-            0,
-            VALID_UNTIL,
-        )?,
-    )?;
+        value(w(&a2, WithdrawalKind::Escape, [0x22; 20], 0)?)?,
+    );
     put(
         "escape_a2_expired",
-        generator.withdrawal(
-            &a2,
-            &tree_ab,
-            WithdrawalKind::Escape,
-            DESTINATION,
-            0,
-            TIMESTAMP - 1,
-        )?,
-    )?;
+        value(generator.withdrawal(&a2, WithdrawalKind::Escape, DESTINATION, 0, TIMESTAMP - 1)?)?,
+    );
     put(
         "escape_b0_genesis_concede",
-        w(&b0, WithdrawalKind::Escape, DESTINATION, 250_000)?,
-    )?;
+        value(w(&b0, WithdrawalKind::Escape, DESTINATION, 250_000)?)?,
+    );
+    put(
+        "escape_b0_foreign_commitment",
+        value(w(&b0_foreign, WithdrawalKind::Escape, DESTINATION, 0)?)?,
+    );
+    put(
+        "escape_b0_other_amount",
+        value(w(&b0_other_amount, WithdrawalKind::Escape, DESTINATION, 0)?)?,
+    );
+    put(
+        "escape_b0_other_expiry",
+        value(w(&b0_other_expiry, WithdrawalKind::Escape, DESTINATION, 0)?)?,
+    );
     put(
         "close_a2",
-        w(&a2, WithdrawalKind::MutualClose, DESTINATION, 0)?,
-    )?;
+        value(w(&a2, WithdrawalKind::MutualClose, DESTINATION, 0)?)?,
+    );
     put(
         "close_b0",
-        w(&b0, WithdrawalKind::MutualClose, DESTINATION, 0)?,
-    )?;
+        value(w(&b0, WithdrawalKind::MutualClose, DESTINATION, 0)?)?,
+    );
     put(
         "ownership_a2",
-        w(&a2, WithdrawalKind::Ownership, [0; 20], 0)?,
-    )?;
+        value(w(&a2, WithdrawalKind::Ownership, [0; 20], 0)?)?,
+    );
 
     let mut out = json!({
         "circuit_id": CIRCUIT_ID,
@@ -264,12 +343,17 @@ fn main() -> Result<()> {
         "destination": format!("0x{}", hex::encode(DESTINATION)),
         "state_signing_key": deployment.state_key(),
         "clearance_signing_key": deployment.clearance_key(),
-        "note_a_registration": a.registration(),
-        "note_b_registration": b.registration(),
-        "note_a_leaf": a.leaf(),
-        "note_b_leaf": b.leaf(),
-        "root_a": tree_a.root(),
-        "root_ab": tree_ab.root(),
+        "note_a_registration": word(&a.registration()),
+        "note_b_registration": word(&b.registration()),
+        "note_a_leaf": word(&a.leaf()),
+        "note_b_leaf": word(&b.leaf()),
+        "note_metadata": word(&zkapi_types::inputs::note_metadata(DEPOSIT, expiry)),
+        "notes": notes.iter().map(StoredNote::of).collect::<Vec<_>>(),
+        "empty_root": word(&empty_root),
+        "root_a": word(&root_a),
+        "root_ab": word(&tree_ab.root()),
+        "root_abcd": word(&root_abcd),
+        "root_16": word(&root_16),
         "states": {
             "a0": state_summary(&a0),
             "a1": state_summary(&a1),

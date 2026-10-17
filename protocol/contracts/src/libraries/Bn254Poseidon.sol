@@ -50,27 +50,28 @@ library Bn254Poseidon {
         }
     }
 
-    /// @notice The roots of the depth-32 tree with oldLeaf and with newLeaf at index, from the
-    ///         leaf's siblings (bottom up), and the new path's node at nodeLevel (the leaf at 0,
-    ///         the root at 32): 64 compressions with capacity as the node domain.
-    function compressPairPath32(
+    /// @notice The roots of the depth-32 tree with oldNode and with newNode as the node of height
+    ///         startLevel over index (startLevel 0: a leaf), from the siblings above it, bottom up
+    ///         (siblings[level] for level >= startLevel; the entries below are ignored):
+    ///         2 * (32 - startLevel) compressions with capacity as the node domain. With oldNode
+    ///         the empty subtree's root this authenticates an empty range and appends to it; with
+    ///         newNode zero it retires a leaf.
+    function compressPairPath(
         uint256 capacity,
         uint32 index,
-        uint256 oldLeaf,
-        uint256 newLeaf,
+        uint256 oldNode,
+        uint256 newNode,
         uint256[32] calldata siblings,
-        uint256 nodeLevel
-    ) public pure returns (uint256 oldRoot, uint256 newRoot, uint256 newNode) {
+        uint256 startLevel
+    ) public pure returns (uint256 oldRoot, uint256 newRoot) {
         uint256 freeMemoryPointer;
         assembly ("memory-safe") {
             freeMemoryPointer := mload(0x40)
         }
         uint256 constants = _constants();
-        oldRoot = oldLeaf;
-        newRoot = newLeaf;
-        newNode = newLeaf;
-        for (uint256 level = 0; level < 32;) {
-            if (level == nodeLevel) newNode = newRoot;
+        oldRoot = oldNode;
+        newRoot = newNode;
+        for (uint256 level = startLevel; level < 32;) {
             uint256 sibling = siblings[level];
             if (((index >> level) & 1) == 0) {
                 (, oldRoot,) = _permute(capacity, oldRoot, sibling, constants);
@@ -83,46 +84,32 @@ library Bn254Poseidon {
                 ++level;
             }
         }
-        if (nodeLevel >= 32) newNode = newRoot;
         assembly ("memory-safe") {
             mstore(0x40, freeMemoryPointer)
         }
     }
 
-    /// @notice The root of the depth-32 tree with leaf at index, from the leaf's siblings (bottom
-    ///         up), and the node the insertion completes: the path's node at the level of the
-    ///         lowest zero bit of index (the leaf itself when index is even; the root when every
-    ///         bit is set). An append-only tree stores that node as the left sibling of the
-    ///         insertions that follow.
-    function insertPath32(uint256 capacity, uint32 index, uint256 leaf, uint256[32] memory siblings)
-        public
-        pure
-        returns (uint256 root, uint256 completed)
-    {
+    /// @notice The root of the complete binary tree over leaves, whose length must be a power of
+    ///         two: leaves.length - 1 compressions with capacity as the node domain. Overwrites its
+    ///         (memory) argument.
+    function compressSubtree(uint256 capacity, uint256[] memory leaves) public pure returns (uint256 root) {
         uint256 freeMemoryPointer;
         assembly ("memory-safe") {
             freeMemoryPointer := mload(0x40)
         }
+        uint256 width = leaves.length;
+        require(width != 0 && width & (width - 1) == 0);
         uint256 constants = _constants();
-        root = leaf;
-        completed = leaf;
-        bool completing = true;
-        for (uint256 level = 0; level < 32;) {
-            uint256 sibling = siblings[level];
-            if (((index >> level) & 1) == 0) {
-                if (completing) {
-                    completed = root;
-                    completing = false;
+        while (width > 1) {
+            width /= 2;
+            for (uint256 i = 0; i < width;) {
+                (, leaves[i],) = _permute(capacity, leaves[2 * i], leaves[2 * i + 1], constants);
+                unchecked {
+                    ++i;
                 }
-                (, root,) = _permute(capacity, root, sibling, constants);
-            } else {
-                (, root,) = _permute(capacity, sibling, root, constants);
-            }
-            unchecked {
-                ++level;
             }
         }
-        if (completing) completed = root;
+        root = leaves[0];
         assembly ("memory-safe") {
             mstore(0x40, freeMemoryPointer)
         }

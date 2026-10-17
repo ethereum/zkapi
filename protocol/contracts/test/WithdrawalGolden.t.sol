@@ -5,12 +5,11 @@ import {Test, console} from "forge-std/Test.sol";
 import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "../src/adapters/Groth16ProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
-import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 
 /// @dev The shared withdrawal golden vector (design §11 WP-F): a real kind-0 escape and a real
 ///      kind-1 close (vault-challenge.json's escape_a2_concede and close_b0) with their exact
-///      calldata, and the deposits and deployment they land on. The Rust (zkapi-serverd watcher,
+///      calldata, and the deposits and deployment they land on (exits are note-bound: neither note
+///      is activated). The Rust (zkapi-serverd watcher,
 ///      zkapi-companion chain), JS (sdk/wallet.js) and Go (zkapi-clientd) encoders assert byte
 ///      equality with test/fixtures/withdrawal-golden.json, and scripts/check-withdrawal-golden.mjs
 ///      submits each encoder's output to a vault on Anvil. This test pins the JSON to Solidity's
@@ -18,7 +17,6 @@ import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 ///      Regenerate the JSON with: node scripts/check-withdrawal-golden.mjs --update
 ///      (ZKAPI_PRINT_WITHDRAWAL_GOLDEN=1 makes this test print it instead of checking it).
 contract WithdrawalGoldenTest is Test {
-    uint256 constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465;
     uint128 constant DEPOSIT = 1_000_000;
     address constant DEPLOYER = address(0xf00d);
     address constant USER = 0x1111111111111111111111111111111111111111;
@@ -36,7 +34,6 @@ contract WithdrawalGoldenTest is Test {
     string fixtures;
     string golden;
     bool printing;
-    uint256[32] emptySiblings;
 
     function setUp() public {
         vm.chainId(31_337);
@@ -44,11 +41,6 @@ contract WithdrawalGoldenTest is Test {
         printing = vm.envOr("ZKAPI_PRINT_WITHDRAWAL_GOLDEN", false);
         if (!printing) golden = vm.readFile("test/fixtures/withdrawal-golden.json");
         vm.warp(vm.parseJsonUint(fixtures, ".timestamp"));
-        uint256 zero;
-        for (uint256 level = 0; level < 32; ++level) {
-            emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
-        }
         adapter = new Groth16ProofAdapter();
         (Types.WithdrawalPublicInputs memory escape,) = _withdrawal(ESCAPE);
         vm.setNonce(DEPLOYER, 0);
@@ -80,8 +72,8 @@ contract WithdrawalGoldenTest is Test {
         assertEq(close.kind, 1);
         bytes memory escapeCalldata = abi.encodeCall(ZkApiVault.initiateEscapeWithdrawal, (escape, escapeProof));
         bytes memory closeCalldata = abi.encodeCall(ZkApiVault.mutualClose, (close, closeProof));
-        assertEq(escapeCalldata.length, 836);
-        assertEq(closeCalldata.length, 836);
+        assertEq(escapeCalldata.length, 868);
+        assertEq(closeCalldata.length, 868);
 
         bytes memory depositA =
             abi.encodeCall(ZkApiVault.deposit, (vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT));
@@ -89,15 +81,16 @@ contract WithdrawalGoldenTest is Test {
         bytes memory depositB =
             abi.encodeCall(ZkApiVault.deposit, (vm.parseJsonBytes32(fixtures, ".note_b_registration"), DEPOSIT));
         _call(depositB, uint256(DEPOSIT) * 1 gwei);
-        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_ab"));
-        assertEq(vault.currentRoot(), escape.activeRoot);
+        // Each statement names its note as recorded; no activation is needed.
+        _assertBound(escape);
+        _assertBound(close);
+        assertEq(vault.activationCursor(), 0);
 
         if (printing) {
             _print("deposit_a", depositA);
             _print("deposit_b", depositB);
             _print("escape", escapeCalldata);
             _print("close", closeCalldata);
-            console.log(string.concat("active_root=", vm.toString(bytes32(vault.currentRoot()))));
         } else {
             assertEq(vm.parseJsonBytes(golden, ".deposits[0].calldata"), depositA, "deposit A");
             assertEq(vm.parseJsonBytes(golden, ".deposits[1].calldata"), depositB, "deposit B");
@@ -105,7 +98,6 @@ contract WithdrawalGoldenTest is Test {
             assertEq(vm.parseJsonBytes(golden, ".close.calldata"), closeCalldata, "close");
             assertEq(vm.parseJsonBytes(golden, ".escape.proof_hex"), escapeProof, "escape proof");
             assertEq(vm.parseJsonBytes(golden, ".close.proof_hex"), closeProof, "close proof");
-            assertEq(vm.parseJsonUint(golden, ".active_root"), vault.currentRoot(), "root");
             assertEq(vm.parseJsonAddress(golden, ".deployment.vault"), address(vault), "vault");
         }
 
@@ -139,17 +131,11 @@ contract WithdrawalGoldenTest is Test {
         (,,, status) = vault.notes(noteId);
     }
 
-    function _leafOf(uint32 noteId) private view returns (uint256) {
-        if (noteId >= vault.nextNoteId()) return 0;
-        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiry);
-    }
-
-    /// Siblings of slot `index` (0 or 1) in a tree holding only notes 0 and 1.
-    function _path(uint32 index) private view returns (uint256[32] memory siblings) {
-        require(index < 2, "golden tree");
-        siblings = emptySiblings;
-        siblings[0] = _leafOf(index ^ 1);
+    /// The statement's registration commitment and note metadata are what the vault recorded.
+    function _assertBound(Types.WithdrawalPublicInputs memory inputs) private view {
+        (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(inputs.noteId);
+        assertEq(inputs.registrationCommitment, uint256(commitment), "registration commitment");
+        assertEq(inputs.noteMetadata, uint256(amount) | (uint256(expiryTs) << 128), "note metadata");
     }
 
     function _withdrawal(string memory name) private view returns (Types.WithdrawalPublicInputs memory, bytes memory) {

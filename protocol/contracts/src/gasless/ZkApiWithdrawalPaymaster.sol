@@ -49,11 +49,14 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58;
     /// @dev P (20) ‖ paymasterVerificationGasLimit (16) ‖ paymasterPostOpGasLimit (16) ‖ feeCapWei (12).
     uint256 private constant PAYMASTER_DATA_LENGTH = 64;
-    /// @dev withdraw(bytes) with a 0-, 36- or 836-byte argument: selector + offset word + length word.
+    /// @dev withdraw(bytes) with a 0-, 36- or 868-byte argument: selector + offset word + length word.
+    ///      An exit call is the selector, the 17-word statement (544 bytes), the proof's offset and
+    ///      length words and the 256-byte proof.
     uint256 private constant CALLDATA_HEAD = 68;
-    uint256 private constant EXIT_CALL_LENGTH = 836;
+    uint256 private constant EXIT_CALL_LENGTH = 868;
     uint256 private constant FINALIZE_CALL_LENGTH = 36;
-    uint256 private constant PROOF_OFFSET_WORD = 0x220;
+    uint256 private constant STATEMENT_END = 548;
+    uint256 private constant PROOF_OFFSET_WORD = 0x240;
     uint256 private constant PROOF_LENGTH = 0x100;
 
     // ------------------------------------------------------------------------------ gas constants
@@ -68,7 +71,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     ///         the real Groth16 adapter (adapterVerifyCold), a treasury that uses its whole
     ///         100,000-gas push and a never-used treasury or destination (25,000, EIP-161), under
     ///         the 63/64 rule, plus 20,000.
-    uint256 internal constant CALL_FLOOR_CLOSE = 540_000;
+    uint256 internal constant CALL_FLOOR_CLOSE = 550_000;
     uint256 internal constant CALL_FLOOR_ESCAPE = 540_000;
     uint256 internal constant CALL_FLOOR_FINALIZE = 250_000;
     uint256 internal constant CALL_FLOOR_FORWARD = 80_000;
@@ -98,7 +101,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     ///         vault state, or paymasterValidationCold) plus VALIDATION_GAS_SLACK, rounded up to
     ///         10,000; both measurements fit under the cap with 20,000 to spare; the cap is
     ///         MAX_VERIFICATION_GAS minus VALIDATION_GAS_SLACK.
-    uint256 internal constant PM_VERIFICATION_FLOOR = 400_000;
+    uint256 internal constant PM_VERIFICATION_FLOOR = 410_000;
     uint256 internal constant PM_VERIFICATION_CAP = 496_000;
     /// @notice postOp's own gas on a CLOSE or FORWARD settling path with a plain transfer to a
     ///         funded EOA (postOpEoa): POSTOP_BASE_GAS + EOA_PUSH_GAS is pinned at or under the
@@ -293,7 +296,9 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     error BindingMismatch();
     error DestinationNotSender();
     error InvalidValidUntil();
-    error UnknownRoot();
+    /// @notice The exit statement's registrationCommitment or noteMetadata is not what the vault
+    ///         stores for its note.
+    error NoteBindingMismatch();
     error NoteNotActive();
     error NullifierUsed();
     error InvalidFelt();
@@ -401,7 +406,10 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         uint256 priorityFeeCeiling_
     ) Ownable(owner_) {
         if (address(entryPoint_).codehash != ENTRY_POINT_V070_CODEHASH) revert BadEntryPoint();
-        if (vault_.PROTOCOL_VERSION() != 2 || vault_.CONCESSION_ESCAPE_VERSION() != 1) revert BadVault();
+        if (
+            vault_.PROTOCOL_VERSION() != 2 || vault_.CONCESSION_ESCAPE_VERSION() != 1
+                || vault_.NOTE_BOUND_EXIT_VERSION() != 1
+        ) revert BadVault();
         IZkApiProofAdapter adapter_ = vault_.proofAdapter();
         if (address(adapter_).code.length == 0) revert BadVault();
         entryPoint = entryPoint_;
@@ -537,14 +545,16 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         validationData = (uint256(o.validUntil) << 160) | (uint256(o.validAfter) << 208);
     }
 
-    /// @dev CLOSE and ESCAPE: the proof's binding, time bound, root, note, nullifier and nonce key,
-    ///      then the kind's own rules, the payout against the required cost, and the proof last.
+    /// @dev CLOSE and ESCAPE: the proof's binding, time bound, note and note binding, nullifier and
+    ///      nonce key, then the kind's own rules, the payout against the required cost, and the
+    ///      proof last.
     function _validateExit(uint8 kind, Figures memory f, bytes calldata vaultCall, Policy memory pol)
         private
         view
         returns (Outcome memory o)
     {
-        Types.WithdrawalPublicInputs memory inputs = abi.decode(vaultCall[4:516], (Types.WithdrawalPublicInputs));
+        Types.WithdrawalPublicInputs memory inputs =
+            abi.decode(vaultCall[4:STATEMENT_END], (Types.WithdrawalPublicInputs));
         if (inputs.destination != f.sender) revert DestinationNotSender();
         if (
             inputs.protocolVersion != 2 || inputs.chainId != block.chainid || inputs.contractAddress != address(vault)
@@ -557,9 +567,15 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         // Validation cannot compare with the clock: while paused the vault refuses exits until
         // pausedAt + maxPauseDuration, so refuse here and tell the client when exits reopen.
         if (vault.paused()) revert ExitsPaused(vault.pausedAt() + MAX_PAUSE_DURATION);
-        if (!vault.isKnownRoot(inputs.activeRoot)) revert UnknownRoot();
-        (, uint128 depositAmount,, Types.NoteStatus status) = vault.notes(inputs.noteId);
+        (bytes32 commitment, uint128 depositAmount, uint64 expiryTs, Types.NoteStatus status) =
+            vault.notes(inputs.noteId);
         if (status != Types.NoteStatus.Active) revert NoteNotActive();
+        // The vault's note binding: the statement names the note as stored (no tree root; the
+        // note need not be activated).
+        if (
+            inputs.registrationCommitment != uint256(commitment)
+                || inputs.noteMetadata != (uint256(depositAmount) | (uint256(expiryTs) << 128))
+        ) revert NoteBindingMismatch();
         uint256 n = inputs.withdrawalNullifier;
         if (n >= MerkleUpdateLib.FIELD_MODULUS) revert InvalidFelt();
         if (vault.usedNullifiers(n)) revert NullifierUsed();
@@ -594,7 +610,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
             o.key = keyFor(KIND_ESCAPE, 0, inputs.noteId, address(0));
         }
         // Last, after every cheap refusal: the Groth16 verification dominates the gas.
-        adapter.assertValidWithdrawal(inputs, vaultCall[580:836]);
+        adapter.assertValidWithdrawal(inputs, vaultCall[STATEMENT_END + 64:EXIT_CALL_LENGTH]);
     }
 
     /// @dev Whether S's recorded sponsored escape is still open: the note is pending, or closed with
@@ -613,7 +629,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     ///      the pause: finalization stays open while paused.
     function _validateFinalize(Figures memory f, bytes calldata vaultCall) private view returns (Outcome memory o) {
         uint32 noteId = uint32(uint256(bytes32(vaultCall[4:36])));
-        (bool exists,, uint256 nullifier, uint128 finalBalance, address destination, uint64 deadline) =
+        (bool exists, uint256 nullifier, uint128 finalBalance, address destination, uint64 deadline) =
             vault.pendingWithdrawals(noteId);
         (,,, Types.NoteStatus status) = vault.notes(noteId);
         if (!exists || status != Types.NoteStatus.PendingWithdrawal) revert NotPendingEscape();
@@ -651,7 +667,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     }
 
     /// @dev The exact callData shapes: withdraw(bytes) with a strict ABI layout and a vault call of
-    ///      0 (FORWARD), 36 (FINALIZE) or 836 bytes (CLOSE or ESCAPE by the vault selector).
+    ///      0 (FORWARD), 36 (FINALIZE) or 868 bytes (CLOSE or ESCAPE by the vault selector).
     function _parseCallData(bytes calldata callData) private pure returns (uint8 kind, bytes calldata vaultCall) {
         if (callData.length < CALLDATA_HEAD) revert UnsupportedCall();
         if (bytes4(callData[0:4]) != ZkApiWithdrawalAccount.withdraw.selector) revert UnsupportedCall();
@@ -670,8 +686,8 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
             return (KIND_FINALIZE, vaultCall);
         }
         if (
-            uint256(bytes32(vaultCall[516:548])) != PROOF_OFFSET_WORD
-                || uint256(bytes32(vaultCall[548:580])) != PROOF_LENGTH
+            uint256(bytes32(vaultCall[STATEMENT_END:STATEMENT_END + 32])) != PROOF_OFFSET_WORD
+                || uint256(bytes32(vaultCall[STATEMENT_END + 32:STATEMENT_END + 64])) != PROOF_LENGTH
         ) revert UnsupportedCall();
         if (selector == ZkApiVault.mutualClose.selector) return (KIND_CLOSE, vaultCall);
         if (selector == ZkApiVault.initiateEscapeWithdrawal.selector) return (KIND_ESCAPE, vaultCall);

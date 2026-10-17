@@ -8,11 +8,14 @@ import {Errors} from "../src/libraries/Errors.sol";
 
 /// @dev Real proofs from zkapi-proof/examples/solidity_fixture.rs (test/fixtures/solidity-fixture.json),
 ///      proved with the shipping CircomReduction prover against the committed setup, verified by
-///      the generated adapter. Regenerate with
+///      the generated adapter: requests, withdrawals of every kind and activations of 1, 4 and 16
+///      notes (insertion1, insertion4, insertion16: each at cursor K after K activated notes).
+///      Regenerate with
 ///        cargo run --release -p zkapi-proof --example solidity_fixture -- ../setup/v2-concession-dev \
 ///          > ../contracts/test/fixtures/solidity-fixture.json
 contract Groth16ProofAdapterTest is Test {
-    string constant CIRCUIT_ID = "zkapi-v2-concession-v1";
+    string constant CIRCUIT_ID = "zkapi-v2-concession-v2";
+    uint256 constant SCALAR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
     Groth16ProofAdapter adapter;
     string fixtures;
@@ -33,11 +36,18 @@ contract Groth16ProofAdapterTest is Test {
         assertEq(vm.parseJsonString(manifest, ".circuit_id"), CIRCUIT_ID);
         assertEq(vm.parseJsonString(manifest, ".setup_id"), vm.parseJsonString(fixtures, ".setup_id"));
         assertEq(adapter.CIRCUIT_ID_HASH(), keccak256(bytes(CIRCUIT_ID)));
-        assertEq(adapter.CIRCUIT_ID_HASH(), 0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687);
+        assertEq(adapter.CIRCUIT_ID_HASH(), 0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1);
         assertEq(adapter.REQUEST_VK_HASH(), vm.parseJsonBytes32(manifest, ".vk_keccak256.request"));
         assertEq(adapter.WITHDRAWAL_VK_HASH(), vm.parseJsonBytes32(manifest, ".vk_keccak256.withdrawal"));
+        assertEq(adapter.INSERTION1_VK_HASH(), vm.parseJsonBytes32(manifest, ".vk_keccak256.insertion1"));
+        assertEq(adapter.INSERTION4_VK_HASH(), vm.parseJsonBytes32(manifest, ".vk_keccak256.insertion4"));
+        assertEq(adapter.INSERTION16_VK_HASH(), vm.parseJsonBytes32(manifest, ".vk_keccak256.insertion16"));
         assertEq(vm.parseJsonUint(manifest, ".circuits.request.public_inputs"), 12);
-        assertEq(vm.parseJsonUint(manifest, ".circuits.withdrawal.public_inputs"), 16);
+        assertEq(vm.parseJsonUint(manifest, ".circuits.withdrawal.public_inputs"), 17);
+        // [oldRoot, newRoot, firstNoteId] and (C, M) per note.
+        assertEq(vm.parseJsonUint(manifest, ".circuits.insertion1.public_inputs"), 5);
+        assertEq(vm.parseJsonUint(manifest, ".circuits.insertion4.public_inputs"), 11);
+        assertEq(vm.parseJsonUint(manifest, ".circuits.insertion16.public_inputs"), 35);
     }
 
     function test_verifiesRustRequestProofs() public view {
@@ -104,6 +114,85 @@ contract Groth16ProofAdapterTest is Test {
         inputs.validUntil += 1;
         vm.expectRevert(Errors.InvalidProof.selector);
         adapter.assertValidWithdrawal(inputs, proof);
+        // The note binding: another registration commitment, or another amount or expiry.
+        (inputs, proof) = _withdrawal("close");
+        inputs.registrationCommitment += 1;
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidWithdrawal(inputs, proof);
+        (inputs, proof) = _withdrawal("close");
+        inputs.noteMetadata += 1;
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidWithdrawal(inputs, proof);
+        (inputs, proof) = _withdrawal("close");
+        inputs.noteMetadata += uint256(1 days) << 128;
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidWithdrawal(inputs, proof);
+    }
+
+    /// The insertion proofs of each batch size verify for the statement the vault builds:
+    /// [oldRoot, newRoot, firstNoteId, C_0, M_0, ...].
+    function test_verifiesRustInsertionProofsOfEverySize() public view {
+        uint256[3] memory sizes = [uint256(1), 4, 16];
+        for (uint256 i = 0; i < sizes.length; ++i) {
+            string memory name = string.concat("insertion", vm.toString(sizes[i]));
+            (uint256 count, uint256[] memory inputs, bytes memory proof) = _insertion(name);
+            assertEq(count, sizes[i]);
+            assertEq(inputs.length, 3 + 2 * count);
+            assertEq(inputs[0], vm.parseJsonUint(fixtures, string.concat(".", name, ".old_root")));
+            assertEq(inputs[1], vm.parseJsonUint(fixtures, string.concat(".", name, ".new_root")));
+            assertEq(inputs[2], vm.parseJsonUint(fixtures, string.concat(".", name, ".first_note_id")));
+            assertEq(inputs[2], count, "at cursor K");
+            for (uint256 j = 0; j < count; ++j) {
+                string memory note = string.concat(".", name, ".notes[", vm.toString(j), "]");
+                assertEq(inputs[3 + 2 * j], vm.parseJsonUint(fixtures, string.concat(note, ".registration_commitment")));
+                assertEq(inputs[4 + 2 * j], vm.parseJsonUint(fixtures, string.concat(note, ".metadata")));
+            }
+            adapter.assertValidInsertion(count, inputs, proof);
+        }
+    }
+
+    /// An insertion proof verifies only as the statement of its own size: another count (one of
+    /// the supported sizes or not), too few or too many inputs, a tampered input or one written as
+    /// value + r, and a malformed proof are each refused.
+    function test_insertionRefusesOtherStatements() public {
+        (uint256 count, uint256[] memory inputs, bytes memory proof) = _insertion("insertion4");
+        uint256[5] memory otherCounts = [uint256(0), 1, 2, 16, 3];
+        for (uint256 i = 0; i < otherCounts.length; ++i) {
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidInsertion(otherCounts[i], inputs, proof);
+        }
+        uint256[] memory short = new uint256[](inputs.length - 1);
+        uint256[] memory long = new uint256[](inputs.length + 1);
+        for (uint256 i = 0; i < inputs.length; ++i) {
+            if (i < short.length) short[i] = inputs[i];
+            long[i] = inputs[i];
+        }
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidInsertion(count, short, proof);
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidInsertion(count, long, proof);
+        // The smaller statement's inputs under the larger count, and its proof under its own count
+        // with the larger statement's inputs.
+        (uint256 one, uint256[] memory oneInputs, bytes memory oneProof) = _insertion("insertion1");
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidInsertion(count, oneInputs, oneProof);
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidInsertion(one, inputs, oneProof);
+        for (uint256 i = 0; i < inputs.length; ++i) {
+            uint256 original = inputs[i];
+            inputs[i] = original + 1;
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidInsertion(count, inputs, proof);
+            inputs[i] = original + SCALAR_MODULUS;
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidInsertion(count, inputs, proof);
+            inputs[i] = original;
+        }
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidInsertion(count, inputs, bytes.concat(proof, hex"00"));
+        vm.expectRevert(Errors.InvalidProof.selector);
+        adapter.assertValidInsertion(count, inputs, new bytes(256));
+        adapter.assertValidInsertion(count, inputs, proof);
     }
 
     function test_rejectsMalformedProofs() public {
@@ -170,6 +259,16 @@ contract Groth16ProofAdapterTest is Test {
             ),
             vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"))
         );
+    }
+
+    function _insertion(string memory name)
+        private
+        view
+        returns (uint256 count, uint256[] memory inputs, bytes memory proof)
+    {
+        count = vm.parseJsonUint(fixtures, string.concat(".", name, ".count"));
+        inputs = vm.parseJsonUintArray(fixtures, string.concat(".", name, ".inputs"));
+        proof = vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"));
     }
 
     function _withdrawal(string memory name) private view returns (Types.WithdrawalPublicInputs memory, bytes memory) {

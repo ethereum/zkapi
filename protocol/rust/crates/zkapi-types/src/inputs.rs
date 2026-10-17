@@ -85,8 +85,13 @@ impl TryFrom<u8> for WithdrawalKind {
 }
 
 /// Public statement of a withdrawal proof for circuit
-/// `zkapi-v2-concession-v1`: 16 inputs, in exactly the order of
+/// `zkapi-v2-concession-v2`: 17 inputs, in exactly the order of
 /// [`Self::to_field_elements`] and of Solidity `Types.WithdrawalPublicInputs`.
+///
+/// The note is identified by what the vault stores for `note_id`:
+/// `registration_commitment` (input 3) and `deposit_amount` and `expiry`,
+/// packed as input 16 ([`Self::note_metadata`]). No tree root is involved, so
+/// a note can exit before it is activated in the request tree.
 ///
 /// Canonical values: `next_nullifier` is the successor nullifier for kind 0
 /// and 0 otherwise; `conceded` is 0 unless kind 0; `destination` is all zero
@@ -99,7 +104,7 @@ pub struct WithdrawalPublicInputsV2C {
     pub protocol_version: u16,
     pub chain_id: u64,
     pub contract_address: Felt252,
-    pub active_root: Felt252,
+    pub registration_commitment: Felt252,
     pub state_signing_key_x: Felt252,
     pub state_signing_key_y: Felt252,
     pub clearance_signing_key_x: Felt252,
@@ -112,11 +117,21 @@ pub struct WithdrawalPublicInputsV2C {
     pub next_nullifier: Felt252,
     pub conceded: u128,
     pub valid_until: u64,
+    /// The note's stored deposit amount (low 128 bits of input 16).
+    pub deposit_amount: u128,
+    /// The note's stored expiry (bits 128–191 of input 16).
+    pub expiry: u64,
 }
 
 impl WithdrawalPublicInputsV2C {
     /// Number of public inputs of the withdrawal statement.
-    pub const NUM_PUBLIC_INPUTS: usize = 16;
+    pub const NUM_PUBLIC_INPUTS: usize = 17;
+
+    /// Input 16: `deposit_amount + expiry · 2^128`, as the vault packs
+    /// `notes[noteId]` (Solidity `uint256(depositAmount) | uint256(expiryTs) << 128`).
+    pub fn note_metadata(&self) -> Felt252 {
+        note_metadata(self.deposit_amount, self.expiry)
+    }
 
     /// The 160-bit destination as a field element (left-padded big-endian),
     /// equal to Solidity `uint256(uint160(destination))`.
@@ -133,12 +148,12 @@ impl WithdrawalPublicInputsV2C {
 
     /// The public inputs in circuit order (also the ABI word order of the
     /// static Solidity tuple).
-    pub fn to_field_elements(&self) -> [Felt252; 16] {
+    pub fn to_field_elements(&self) -> [Felt252; 17] {
         [
             Felt252::from_u64(self.protocol_version as u64),
             Felt252::from_u64(self.chain_id),
             self.contract_address,
-            self.active_root,
+            self.registration_commitment,
             self.state_signing_key_x,
             self.state_signing_key_y,
             self.clearance_signing_key_x,
@@ -151,8 +166,18 @@ impl WithdrawalPublicInputsV2C {
             self.next_nullifier,
             Felt252::from_u128(self.conceded),
             Felt252::from_u64(self.valid_until),
+            self.note_metadata(),
         ]
     }
+}
+
+/// `deposit_amount + expiry · 2^128` (below 2^192, so always canonical): the
+/// packed note metadata of the withdrawal and insertion statements.
+pub fn note_metadata(deposit_amount: u128, expiry: u64) -> Felt252 {
+    let mut bytes = [0u8; 32];
+    bytes[8..16].copy_from_slice(&expiry.to_be_bytes());
+    bytes[16..32].copy_from_slice(&deposit_amount.to_be_bytes());
+    Felt252(bytes)
 }
 
 /// Hash the exact client request id and payload digest into the private context
@@ -222,7 +247,7 @@ mod tests {
             protocol_version: 2,
             chain_id: 11_155_111,
             contract_address: Felt252::from_u64(1),
-            active_root: Felt252::from_u64(2),
+            registration_commitment: Felt252::from_u64(2),
             state_signing_key_x: Felt252::from_u64(3),
             state_signing_key_y: Felt252::from_u64(4),
             clearance_signing_key_x: Felt252::from_u64(5),
@@ -235,6 +260,8 @@ mod tests {
             next_nullifier: Felt252::from_u64(9),
             conceded: 100,
             valid_until: 2_000_010_800,
+            deposit_amount: 1_000,
+            expiry: 2_000_086_400,
         }
     }
 
@@ -254,6 +281,13 @@ mod tests {
         assert_eq!(fields[13], Felt252::from_u64(9));
         assert_eq!(fields[14], Felt252::from_u64(100));
         assert_eq!(fields[15], Felt252::from_u64(2_000_010_800));
+        assert_eq!(fields[3], Felt252::from_u64(2));
+        // Input 16: the amount in the low 128 bits, the expiry above.
+        let mut metadata = [0u8; 32];
+        metadata[8..16].copy_from_slice(&2_000_086_400u64.to_be_bytes());
+        metadata[16..32].copy_from_slice(&1_000u128.to_be_bytes());
+        assert_eq!(fields[16], Felt252(metadata));
+        assert_eq!(note_metadata(u128::MAX, u64::MAX).as_bytes()[..8], [0u8; 8]);
     }
 
     #[test]
@@ -261,7 +295,7 @@ mod tests {
         let inputs = sample_withdrawal();
         let value = serde_json::to_value(&inputs).unwrap();
         let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 16);
+        assert_eq!(keys.len(), 18);
         assert_eq!(
             serde_json::from_value::<WithdrawalPublicInputsV2C>(value.clone()).unwrap(),
             inputs

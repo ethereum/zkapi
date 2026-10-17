@@ -1,4 +1,4 @@
-//! Browser-safe zkAPI wallet operations for circuit `zkapi-v2-concession-v1`.
+//! Browser-safe zkAPI wallet operations for circuit `zkapi-v2-concession-v2`.
 //!
 //! This crate deliberately owns neither storage nor transport. Every operation
 //! accepts an immutable state snapshot and returns the complete next snapshot,
@@ -23,11 +23,17 @@
 //! * Withdrawal kinds: an escape (kind 0) concedes at most `bound_at_state`;
 //!   a mutual close (kind 1) and an ownership proof (kind 2) concede nothing,
 //!   and an ownership proof has no destination ([`prepare_withdrawal`]).
+//!   Every exit names the note by what the vault records for it
+//!   ([`note_binding`]) and needs no Merkle path, so a note can exit before
+//!   it is activated.
+//! * Requests prove membership at the request root, which holds a note only
+//!   once the vault activated it ([`note_activation`]); [`tree_path`] and
+//!   [`NoteTree`] derive that path from the indexer's snapshot or the
+//!   vault's events, where a deposit records a note and `NotesActivated`
+//!   appends recorded notes in aligned batches of 1, 4 or 16.
 //! * Lost ε: a finalized response whose journal is lost is checked against
 //!   S1, S2, S4 and S6 ([`check_unrecoverable_response`]) before its charge
 //!   may lower an escape's concession.
-//! * A saved deposit-time path is kept only if it leads to its root
-//!   ([`note_path_matches`]); the vault accepts any root it ever held.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -39,6 +45,7 @@ use zkapi_proof::compact::{
     RequestWitnessData, WithdrawalProver, WithdrawalStatementParams, WithdrawalWitnessData,
     CEREMONY_SETUP_ID, CIRCUIT_ID, DEV_SETUP_ID,
 };
+use zkapi_types::inputs::note_metadata;
 use zkapi_types::wire::{
     ApiRequestV2, ClearanceResponseV2, CurvePointWire, Groth16ProofWire, ProofBackendWire,
     RequestResponseV2,
@@ -82,6 +89,11 @@ pub mod codes {
     pub const CLEARANCE_INVALID: &str = "clearance_invalid";
     /// A tree event is out of order or names an impossible leaf change.
     pub const TREE_EVENT_INVALID: &str = "tree_event_invalid";
+    /// The note is recorded but not activated: its leaf is not in the
+    /// request tree yet, so it cannot make requests (it can exit).
+    pub const NOTE_NOT_ACTIVATED: &str = "note_not_activated";
+    /// The vault records the note with other values than the deposit's.
+    pub const NOTE_BINDING_MISMATCH: &str = "note_binding_mismatch";
 }
 
 fn refusal(code: &str, detail: impl std::fmt::Display) -> anyhow::Error {
@@ -188,12 +200,48 @@ pub struct DepositParams {
     pub registration_commitment: Felt252,
 }
 
+/// Arguments of [`confirm_deposit`]. `recorded`, when given, is the vault's
+/// `notes(note_id)`, which must hold exactly this deposit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfirmDepositArgs {
     pub secret: Felt252,
     pub note_id: u32,
     pub amount: u128,
     pub expiry_ts: u64,
+    #[serde(default)]
+    pub recorded: Option<RecordedNote>,
+}
+
+/// What the vault's `notes(noteId)` returns for a note, its status aside.
+/// The amount travels as a decimal or 0x-hex string.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedNote {
+    pub commitment: Felt252,
+    #[serde(deserialize_with = "deserialize_u128_text")]
+    pub amount: u128,
+    pub expiry_ts: u64,
+}
+
+/// How the vault and the request tree identify a note: its registration
+/// commitment `C`, the packed amount and expiry `M` (the withdrawal
+/// statement's inputs 3 and 16) and its request-tree leaf.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteBinding {
+    pub registration_commitment: Felt252,
+    pub note_metadata: Felt252,
+    pub note_leaf: Felt252,
+}
+
+/// Where a note stands in the vault's activation queue ([`note_activation`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteActivation {
+    pub note_id: u32,
+    pub activation_cursor: u32,
+    pub activated: bool,
+    /// Notes activated before this one (0: it is next); `None` once it is
+    /// activated.
+    pub queue_position: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +282,8 @@ pub struct CompleteResponseArgs {
 ///   clearance, `conceded` absent or 0.
 ///
 /// `valid_until` is the last second at which the vault (kinds 0 and 1) or
-/// the server (kind 2) accepts the proof.
+/// the server (kind 2) accepts the proof. No root or path: the statement
+/// names the note by its recorded values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareWithdrawalArgs {
@@ -244,14 +293,12 @@ pub struct PrepareWithdrawalArgs {
     #[serde(default)]
     pub conceded: Option<u128>,
     pub valid_until: u64,
-    pub active_root: Felt252,
-    pub merkle_siblings: Vec<Felt252>,
     #[serde(default)]
     pub clearance: Option<ClearanceResponseV2>,
 }
 
-/// A withdrawal proof. Exits do no Merkle work on chain, so the plan carries
-/// no path: the calldata is the 16-word statement and the proof.
+/// A withdrawal proof. Exits do no Merkle work, so the plan carries no path:
+/// the calldata is the 17-word statement and the proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawalPlan {
     pub mode: String,
@@ -279,11 +326,17 @@ pub struct BrowserWalletStatus {
     pub note: Option<BrowserNoteStatus>,
 }
 
+/// The indexer's whole-tree snapshot: `leaves[i]` is note `i`'s leaf in the
+/// request tree (zero for a retired note and for every note at or above
+/// `activation_cursor`). A snapshot without `activation_cursor` has every
+/// recorded note in the tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeSnapshot {
     pub root: Felt252,
     pub next_note_id: u32,
     pub leaves: Vec<Felt252>,
+    #[serde(default)]
+    pub activation_cursor: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,7 +347,12 @@ pub struct BrowserTreePath {
 }
 
 /// Derive a path from the indexer's privacy-safe whole-tree snapshot and
-/// verify the advertised root before any proof uses it.
+/// verify the advertised root before any proof uses it. With
+/// `require_existing`, the request path of the activated note `note_id`
+/// (a recorded note that is not activated is refused with
+/// [`codes::NOTE_NOT_ACTIVATED`]); without it, the path of the empty slot
+/// the next activation fills (`note_id` must be the activation cursor), as
+/// `activateNotesOnChain` takes it.
 pub fn tree_path(
     snapshot: TreeSnapshot,
     note_id: u32,
@@ -303,9 +361,24 @@ pub fn tree_path(
     if snapshot.leaves.len() != snapshot.next_note_id as usize {
         anyhow::bail!("tree snapshot leaf count does not match next_note_id");
     }
-    if (require_existing && note_id >= snapshot.next_note_id)
-        || (!require_existing && note_id != snapshot.next_note_id)
+    let cursor = snapshot.activation_cursor.unwrap_or(snapshot.next_note_id);
+    if cursor > snapshot.next_note_id
+        || snapshot.leaves[cursor as usize..]
+            .iter()
+            .any(|leaf| !leaf.is_zero())
     {
+        anyhow::bail!("tree snapshot holds leaves of notes that are not activated");
+    }
+    if require_existing && note_id >= cursor && note_id < snapshot.next_note_id {
+        return Err(refusal(
+            codes::NOTE_NOT_ACTIVATED,
+            format!(
+                "note {note_id} is not activated yet ({} notes are activated before it)",
+                note_id - cursor
+            ),
+        ));
+    }
+    if (require_existing && note_id >= cursor) || (!require_existing && note_id != cursor) {
         anyhow::bail!("requested note index is inconsistent with the tree snapshot");
     }
     let mut tree = MerkleTree::new();
@@ -322,8 +395,9 @@ pub fn tree_path(
     })
 }
 
-/// The path of `note_id` in the tree whose leaf `i` is `leaves[i]` (zero for
-/// a retired leaf), and that tree's root. The note's leaf must be present.
+/// The path of `note_id` in the request tree whose leaf `i` is `leaves[i]`
+/// (zero for a note that is not activated or was retired), and that tree's
+/// root. The note's leaf must be present.
 pub fn tree_path_from_leaves(leaves: Vec<Felt252>, note_id: u32) -> Result<BrowserTreePath> {
     let leaf = leaves.get(note_id as usize).copied().ok_or_else(|| {
         refusal(
@@ -359,13 +433,14 @@ fn deserialize_u128_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u
     parsed.map_err(|_| serde::de::Error::custom("expected a decimal or 0x-hex u128 string"))
 }
 
-/// One leaf-changing vault event, in the vault's log order (§6.6). Amounts
+/// One tree-relevant vault event, in the vault's log order (§6.6). Amounts
 /// travel as strings because JavaScript numbers lose precision above 2^53.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TreeEvent {
-    /// `NoteDeposited(noteId, commitment, amount, expiryTs, newRoot)` sets
-    /// leaf `note_id` to `note_leaf(note_id, commitment, amount, expiry_ts)`.
+    /// `NoteDeposited(noteId, commitment, amount, expiryTs)` records the
+    /// note's leaf `note_leaf(note_id, commitment, amount, expiry_ts)`; the
+    /// tree and its root are unchanged (the event reports no root).
     NoteDeposited {
         note_id: u32,
         commitment: Felt252,
@@ -373,18 +448,25 @@ pub enum TreeEvent {
         amount: u128,
         expiry_ts: u64,
     },
+    /// `NotesActivated(firstNoteId, count, newRoot, proved)` appends the
+    /// recorded leaves of notes `first_note_id .. first_note_id + count`.
+    NotesActivated { first_note_id: u32, count: u32 },
     /// `ClosedLeafRetired(noteId, newRoot)` zeroes leaf `note_id`.
     ClosedLeafRetired { note_id: u32 },
 }
 
-/// The vault's note tree rebuilt from its logs. Deposits take consecutive
-/// note ids from 0; a retirement zeroes a deposited, not yet retired leaf.
-/// Each [`NoteTree::apply`] returns the new root, which the caller compares
-/// with the event's own root.
+/// The vault's request tree rebuilt from its logs. Deposits record notes at
+/// consecutive ids from 0; an activation appends the next `count` recorded
+/// notes (1, 4 or 16, aligned to `count`) at the activation cursor; a
+/// retirement zeroes an activated, not yet retired leaf. Each
+/// [`NoteTree::apply`] returns the root after the event, which the caller
+/// compares with the root an activation or retirement reports.
 #[derive(Clone)]
 pub struct NoteTree {
     tree: MerkleTree,
-    next_note_id: u32,
+    /// The leaf of every recorded note, by note id.
+    recorded: Vec<Felt252>,
+    activation_cursor: u32,
     retired: std::collections::BTreeSet<u32>,
 }
 
@@ -398,7 +480,8 @@ impl NoteTree {
     pub fn new() -> Self {
         Self {
             tree: MerkleTree::new(),
-            next_note_id: 0,
+            recorded: Vec::new(),
+            activation_cursor: 0,
             retired: Default::default(),
         }
     }
@@ -407,11 +490,18 @@ impl NoteTree {
         self.tree.root()
     }
 
+    /// The vault's `nextNoteId()`.
     pub fn next_note_id(&self) -> u32 {
-        self.next_note_id
+        self.recorded.len() as u32
+    }
+
+    /// The vault's `activationCursor()`.
+    pub fn activation_cursor(&self) -> u32 {
+        self.activation_cursor
     }
 
     pub fn apply(&mut self, event: &TreeEvent) -> Result<Felt252> {
+        let invalid = |detail: String| refusal(codes::TREE_EVENT_INVALID, detail);
         match *event {
             TreeEvent::NoteDeposited {
                 note_id,
@@ -419,30 +509,50 @@ impl NoteTree {
                 amount,
                 expiry_ts,
             } => {
-                if note_id != self.next_note_id {
-                    return Err(refusal(
-                        codes::TREE_EVENT_INVALID,
-                        format!(
-                            "deposit of note {note_id} out of order (next note id {})",
-                            self.next_note_id
-                        ),
-                    ));
+                if note_id != self.next_note_id() {
+                    return Err(invalid(format!(
+                        "deposit of note {note_id} out of order (next note id {})",
+                        self.next_note_id()
+                    )));
                 }
-                self.tree.set_leaf(
-                    note_id,
-                    core::note_leaf(note_id, &commitment, amount, expiry_ts),
-                );
-                self.next_note_id = self
-                    .next_note_id
-                    .checked_add(1)
-                    .ok_or_else(|| refusal(codes::TREE_EVENT_INVALID, "note ids exhausted"))?;
+                if note_id == u32::MAX {
+                    return Err(invalid("note ids exhausted".into()));
+                }
+                self.recorded
+                    .push(core::note_leaf(note_id, &commitment, amount, expiry_ts));
+            }
+            TreeEvent::NotesActivated {
+                first_note_id,
+                count,
+            } => {
+                if ![1, 4, 16].contains(&count) {
+                    return Err(invalid(format!(
+                        "notes are activated 1, 4 or 16 at a time, not {count}"
+                    )));
+                }
+                if first_note_id != self.activation_cursor {
+                    return Err(invalid(format!(
+                        "activation of note {first_note_id} out of order (activation cursor {})",
+                        self.activation_cursor
+                    )));
+                }
+                let end = u64::from(first_note_id) + u64::from(count);
+                if first_note_id % count != 0 || end > u64::from(self.next_note_id()) {
+                    return Err(invalid(format!(
+                        "notes {first_note_id} .. {end} are not an aligned batch of recorded notes ({} recorded)",
+                        self.next_note_id()
+                    )));
+                }
+                for note_id in first_note_id..first_note_id + count {
+                    self.tree.set_leaf(note_id, self.recorded[note_id as usize]);
+                }
+                self.activation_cursor = first_note_id + count;
             }
             TreeEvent::ClosedLeafRetired { note_id } => {
-                if note_id >= self.next_note_id || !self.retired.insert(note_id) {
-                    return Err(refusal(
-                        codes::TREE_EVENT_INVALID,
-                        format!("note {note_id} has no leaf to retire"),
-                    ));
+                if note_id >= self.activation_cursor || !self.retired.insert(note_id) {
+                    return Err(invalid(format!(
+                        "note {note_id} has no activated leaf to retire"
+                    )));
                 }
                 self.tree.set_leaf(note_id, Felt252::ZERO);
             }
@@ -450,9 +560,20 @@ impl NoteTree {
         Ok(self.tree.root())
     }
 
-    /// The path of a deposited, not retired note at the current root.
+    /// The path of an activated, not retired note at the current root. A
+    /// recorded note that is not activated is refused with
+    /// [`codes::NOTE_NOT_ACTIVATED`].
     pub fn path(&self, note_id: u32) -> Result<BrowserTreePath> {
-        if note_id >= self.next_note_id || self.retired.contains(&note_id) {
+        if note_id >= self.activation_cursor && note_id < self.next_note_id() {
+            return Err(refusal(
+                codes::NOTE_NOT_ACTIVATED,
+                format!(
+                    "note {note_id} is not activated yet ({} notes are activated before it)",
+                    note_id - self.activation_cursor
+                ),
+            ));
+        }
+        if note_id >= self.activation_cursor || self.retired.contains(&note_id) {
             return Err(refusal(
                 codes::TREE_EVENT_INVALID,
                 format!("note {note_id} has no leaf in the rebuilt tree"),
@@ -478,18 +599,42 @@ pub fn generate_deposit_params() -> DepositParams {
     }
 }
 
+/// The genesis state of the deposit recorded as `note_id`. No path is
+/// involved: the note can exit at once and makes requests once activated.
+/// With `recorded` (the vault's `notes(note_id)`), a record that is not
+/// exactly this deposit (this secret's commitment, amount and expiry) is
+/// refused with [`codes::NOTE_BINDING_MISMATCH`]: the vault would refuse
+/// every exit naming the deposit's values.
 pub fn confirm_deposit(
     config: &BrowserWalletConfig,
     args: ConfirmDepositArgs,
 ) -> Result<BrowserNoteState> {
     validate_state_identity(config, args.secret, args.amount)?;
+    let registration_commitment = core::registration_commitment(&args.secret);
+    if let Some(recorded) = &args.recorded {
+        if *recorded
+            != (RecordedNote {
+                commitment: registration_commitment,
+                amount: args.amount,
+                expiry_ts: args.expiry_ts,
+            })
+        {
+            return Err(refusal(
+                codes::NOTE_BINDING_MISMATCH,
+                format!(
+                    "the vault records note {} with other values than this deposit",
+                    args.note_id
+                ),
+            ));
+        }
+    }
     let blinding = random_scalar();
     let commitment = balance_commitment(
         args.amount,
         &blinding,
         &core::note_leaf(
             args.note_id,
-            &core::registration_commitment(&args.secret),
+            &registration_commitment,
             args.amount,
             args.expiry_ts,
         ),
@@ -532,6 +677,30 @@ pub fn wallet_status(
             current_commitment_y: state.current_commitment_y,
             bound_at_state: state.bound_at_state,
         }),
+    }
+}
+
+/// The values that identify the state's note to the vault (compare them
+/// with `notes(noteId)`) and in the request tree.
+pub fn note_binding(state: &BrowserNoteState) -> NoteBinding {
+    NoteBinding {
+        registration_commitment: core::registration_commitment(&state.secret_s),
+        note_metadata: note_metadata(state.deposit_amount, state.expiry_ts),
+        note_leaf: state_note_leaf(state),
+    }
+}
+
+/// The activation status of `note_id` under the vault's
+/// `activationCursor()`: notes are activated in id order, so the note is in
+/// the request tree exactly when `note_id < activation_cursor`, and until
+/// then `note_id - activation_cursor` notes are activated before it.
+pub fn note_activation(note_id: u32, activation_cursor: u32) -> NoteActivation {
+    let activated = note_id < activation_cursor;
+    NoteActivation {
+        note_id,
+        activation_cursor,
+        activated,
+        queue_position: (!activated).then(|| note_id - activation_cursor),
     }
 }
 
@@ -889,10 +1058,9 @@ pub struct NotePathArgs {
     pub siblings: Vec<Felt252>,
 }
 
-/// Whether `siblings` lead from `state`'s leaf to `active_root`. The wallet
-/// keeps a deposit-time path only when it does: the vault accepts any root it
-/// ever held, so that path proves exits for the note's whole life
-/// (Amendment A1).
+/// Whether `siblings` lead from `state`'s leaf to `active_root`: a request
+/// path for the note at that root (only an activated note has one). Exits
+/// need no path.
 pub fn note_path_matches(state: &BrowserNoteState, args: NotePathArgs) -> Result<bool> {
     let siblings = siblings_array(args.siblings)?;
     Ok(core::merkle_root(state.note_id, &state_note_leaf(state), &siblings) == args.active_root)
@@ -1014,8 +1182,9 @@ pub fn prepare_withdrawal(
 /// Prove an exit from `state`: kind 0 (`escape`), 1 (`mutual`) or 2
 /// (`ownership`), see [`PrepareWithdrawalArgs`]. The statement carries the
 /// canonical `withdrawal_nullifier`, `next_nullifier` (the successor
-/// nullifier for an escape, 0 otherwise), `final_balance = B − conceded` and
-/// `valid_until`. Exits never need `prev_anchor`.
+/// nullifier for an escape, 0 otherwise), `final_balance = B − conceded`,
+/// `valid_until`, and the note's recorded values ([`note_binding`]). Exits
+/// never need `prev_anchor`, a Merkle path or activation.
 pub fn prepare_withdrawal_with_prover(
     config: &BrowserWalletConfig,
     state: &BrowserNoteState,
@@ -1025,8 +1194,6 @@ pub fn prepare_withdrawal_with_prover(
     validate_state(config, state)?;
     require_bundle_setup(prover.setup_id(), "withdrawal proving key")?;
     let mode = parse_withdrawal_mode(&args, state)?;
-    let siblings = siblings_array(args.merkle_siblings)?;
-    require_path(state, &args.active_root, &siblings)?;
     let state_blinding = parse_scalar(&state.balance_blinding)?;
     stored_commitment(state, &state_blinding)?;
     let nullifier = withdrawal_nullifier(state);
@@ -1076,7 +1243,6 @@ pub fn prepare_withdrawal_with_prover(
         secret: state.secret_s,
         deposit_amount: state.deposit_amount,
         expiry: state.expiry_ts,
-        merkle_siblings: siblings,
         state_balance: state.current_balance,
         state_blinding,
         current_anchor: state.current_anchor,
@@ -1091,7 +1257,6 @@ pub fn prepare_withdrawal_with_prover(
             protocol_version: state.protocol_version,
             chain_id: state.chain_id,
             contract_address: state.contract_address,
-            active_root: args.active_root,
             state_signing_key: config.state_signing_key.clone(),
             clearance_signing_key: config.clearance_signing_key.clone(),
             note_id: state.note_id,
@@ -1368,6 +1533,23 @@ mod wasm {
         )
     }
 
+    /// `{registration_commitment, note_metadata, note_leaf}` (JSON) of the
+    /// state's note: compare the first two with the vault's `notes(noteId)`.
+    #[wasm_bindgen]
+    pub fn browser_note_binding(state_json: &str) -> std::result::Result<String, JsValue> {
+        encode(&note_binding(&decode(state_json)?))
+    }
+
+    /// `{note_id, activation_cursor, activated, queue_position}` (JSON) under
+    /// the vault's `activationCursor()`.
+    #[wasm_bindgen]
+    pub fn browser_note_activation(
+        note_id: u32,
+        activation_cursor: u32,
+    ) -> std::result::Result<String, JsValue> {
+        encode(&note_activation(note_id, activation_cursor))
+    }
+
     /// Whether `{active_root, siblings}` (JSON) is a path of the state's note.
     #[wasm_bindgen]
     pub fn browser_note_path_matches(
@@ -1404,8 +1586,9 @@ mod wasm {
         encode(&tree_path_from_leaves(decode(leaves_json)?, note_id).map_err(js_anyhow)?)
     }
 
-    /// The note tree rebuilt from vault logs (§6.6): `apply` one event, in log
-    /// order, and compare the returned root with the event's.
+    /// The request tree rebuilt from vault logs (§6.6): `apply` one event, in
+    /// log order, and compare the returned root with the root an activation
+    /// or retirement reports (a deposit reports none).
     #[wasm_bindgen]
     pub struct BrowserNoteTree {
         tree: NoteTree,
@@ -1432,6 +1615,10 @@ mod wasm {
 
         pub fn next_note_id(&self) -> u32 {
             self.tree.next_note_id()
+        }
+
+        pub fn activation_cursor(&self) -> u32 {
+            self.tree.activation_cursor()
         }
 
         pub fn path(&self, note_id: u32) -> std::result::Result<String, JsValue> {

@@ -5,7 +5,6 @@ import {Vm} from "forge-std/Vm.sol";
 import {console} from "forge-std/console.sol";
 import {ZkApiVault} from "../../src/ZkApiVault.sol";
 import {Types} from "../../src/libraries/Types.sol";
-import {Bn254Poseidon} from "../../src/libraries/Bn254Poseidon.sol";
 import {IAccount, IEntryPoint, IPaymaster, PackedUserOperation} from "../../src/gasless/IERC4337.sol";
 import {IZkApiProofAdapter} from "../../src/interfaces/IZkApiProofAdapter.sol";
 import {ZkApiWithdrawalAccount} from "../../src/gasless/ZkApiWithdrawalAccount.sol";
@@ -272,11 +271,6 @@ abstract contract GaslessTestBase is VaultTestBase {
         vm.warp(1_700_000_000);
         vm.fee(BASEFEE);
         _etchEntryPoint();
-        uint256 zero;
-        for (uint256 level = 0; level < 32; ++level) {
-            emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
-        }
         vm.setNonce(DEPLOYER, 0);
         vm.startPrank(DEPLOYER);
         adapter = new MockProofAdapter();
@@ -519,7 +513,7 @@ abstract contract GaslessTestBase is VaultTestBase {
     function _finalizeOpFor(address payee_, uint32 noteId) internal view returns (PackedUserOperation memory op) {
         address sender = _transit(ownerAddr, payee_);
         bool fresh = sender.code.length == 0;
-        (,, uint256 nullifier,,,) = vault.pendingWithdrawals(noteId);
+        (, uint256 nullifier,,,) = vault.pendingWithdrawals(noteId);
         op = _op(
             sender,
             _nonce(sender, uint192(nullifier)),

@@ -16,6 +16,7 @@ import {MockAdapterIdentity} from "./mocks/MockProofAdapters.sol";
 contract NativeProofFixture is MockAdapterIdentity {
     function assertValidRequest(Types.RequestPublicInputs calldata, bytes calldata) external pure {}
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {}
+    function assertValidInsertion(uint256, uint256[] calldata, bytes calldata) external pure {}
 }
 
 contract RejectNativePayout {
@@ -117,18 +118,19 @@ contract NativeEthVaultTest is Test {
         vault.deposit{value: uint256(UNITS) * 1 gwei}(bytes32(uint256(42)), UNITS);
     }
 
-    /// A close (kind 1) or an escape (kind 0, successor nullifier 100) from the state at
+    /// A close (kind 1) or an escape (kind 0, successor nullifier 100) of note 0 from the state at
     /// nullifier 99 with a 700,000 payout.
     function withdrawal(address destination, bool clearance)
         internal
         view
         returns (Types.WithdrawalPublicInputs memory)
     {
+        (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(0);
         return Types.WithdrawalPublicInputs(
             2,
             uint64(block.chainid),
             address(vault),
-            vault.currentRoot(),
+            uint256(commitment),
             11,
             12,
             13,
@@ -140,7 +142,8 @@ contract NativeEthVaultTest is Test {
             clearance ? 1 : 0,
             clearance ? 0 : 100,
             0,
-            uint64(vm.getBlockTimestamp()) + 3 hours
+            uint64(vm.getBlockTimestamp()) + 3 hours,
+            uint256(amount) | (uint256(expiryTs) << 128)
         );
     }
 
@@ -232,7 +235,7 @@ contract NativeEthVaultTest is Test {
         ToggleableDestination recipient = new ToggleableDestination();
         vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "");
         uint256 root = vault.currentRoot();
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(0);
         vm.warp(deadline);
         vm.expectEmit(address(vault));
         emit Events.EscapePayoutDeferred(0, address(recipient), 700_000);
@@ -247,7 +250,7 @@ contract NativeEthVaultTest is Test {
         assertEq(vault.currentRoot(), root);
         (,,, Types.NoteStatus status) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.Closed));
-        (bool exists,,,,,) = vault.pendingWithdrawals(0);
+        (bool exists,,,,) = vault.pendingWithdrawals(0);
         assertFalse(exists);
         vm.expectRevert(Errors.NotPendingWithdrawal.selector);
         vault.finalizeEscapeWithdrawal(0);
@@ -278,7 +281,7 @@ contract NativeEthVaultTest is Test {
         Types.WithdrawalPublicInputs memory inputs = withdrawal(address(adapter), false);
         inputs.finalBalance = 1;
         vault.initiateEscapeWithdrawal(inputs, "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(0);
         vm.warp(deadline);
         vault.finalizeEscapeWithdrawal(0);
         assertEq(treasury.balance, uint256(UNITS - 1) * 1 gwei);
@@ -298,7 +301,7 @@ contract NativeEthVaultTest is Test {
         vault.acceptTreasury();
         RejectNativePayout recipient = new RejectNativePayout();
         vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(0);
         vm.warp(deadline);
         vault.finalizeEscapeWithdrawal(0);
         assertEq(vault.escapePayoutCredits(address(recipient)), 700_000);
@@ -312,7 +315,7 @@ contract NativeEthVaultTest is Test {
         deposit();
         ReenteringClaimant recipient = new ReenteringClaimant(vault);
         vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(0);
         vm.warp(deadline);
         vault.finalizeEscapeWithdrawal(0);
         assertEq(vault.escapePayoutCredits(address(recipient)), 700_000);
@@ -352,28 +355,30 @@ contract NativeEthVaultTest is Test {
     }
 
     /// Clients hard-code these in calldata and receipt parsing (the SDK's wallet.js ABI table,
-    /// zkapi-clientd, the challenger, the signer allowlist and the indexer). Pinned so that a
-    /// signature change fails here instead of silently in a client. Values from the design
-    /// (circuit zkapi-v2-concession-v1, vault revision 3).
+    /// zkapi-clientd, the challenger, the activation worker, the signer allowlist and the
+    /// indexer). Pinned so that a signature change fails here instead of silently in a client.
+    /// Values from the design (circuit zkapi-v2-concession-v2, vault revision 4).
     function test_clientFacingSelectorsAndTopicsArePinned() public view {
         assertEq(vault.deposit.selector, bytes4(0x56d2e1ea));
-        assertEq(vault.mutualClose.selector, bytes4(0x72cd2e44));
-        assertEq(vault.initiateEscapeWithdrawal.selector, bytes4(0xa38d62aa));
+        assertEq(vault.mutualClose.selector, bytes4(0x5acd3b15));
+        assertEq(vault.initiateEscapeWithdrawal.selector, bytes4(0x8e110492));
         assertEq(vault.challengeEscapeWithdrawal.selector, bytes4(0xda0ce43d));
         assertEq(vault.raiseEscapeConcession.selector, bytes4(0xdd0064ba));
         assertEq(vault.finalizeEscapeWithdrawal.selector, bytes4(0xff8f5585));
         assertEq(vault.claimExpired.selector, bytes4(0xa940507e));
         assertEq(vault.retireClosedLeaf.selector, bytes4(0xe41f4c31));
+        assertEq(vault.activateNotes.selector, bytes4(0xa2b2c715));
+        assertEq(vault.activateNotesOnChain.selector, bytes4(0x027e21e9));
         assertEq(vault.claimEscapePayout.selector, bytes4(0x88c10aee));
         assertEq(vault.pendingWithdrawals.selector, bytes4(0xa2f9f1ce));
         assertEq(vault.pendingConcessions.selector, bytes4(0xf8ffe6e0));
         assertEq(vault.usedNullifiers.selector, bytes4(0xaad24061));
         assertEq(vault.challengedNullifiers.selector, bytes4(0x6cda756a));
-        assertEq(vault.knownRoots.selector, bytes4(0x12ad7381));
-        assertEq(vault.isKnownRoot.selector, bytes4(0xa6232a93));
+        assertEq(vault.activationCursor.selector, bytes4(0x93e0ce4e));
+        assertEq(vault.isActivated.selector, bytes4(0x5b78fd86));
         assertEq(vault.effectiveExpiry.selector, bytes4(0x7cb4a03c));
         assertEq(vault.CONCESSION_ESCAPE_VERSION.selector, bytes4(0x5e00b426));
-        assertEq(vault.ROOT_HISTORY_WINDOW.selector, bytes4(0x1fe72de0));
+        assertEq(vault.NOTE_BOUND_EXIT_VERSION.selector, bytes4(0x56853816));
         assertEq(vault.PAUSE_COOLDOWN.selector, bytes4(0xb5acb567));
         assertEq(vault.maxPauseDuration.selector, bytes4(0x64433d27));
         assertEq(vault.proofAdapter.selector, bytes4(0xefc91e58));
@@ -385,9 +390,19 @@ contract NativeEthVaultTest is Test {
         assertEq(IZkApiProofAdapter.CIRCUIT_ID_HASH.selector, bytes4(0xda0e8385));
         assertEq(IZkApiProofAdapter.REQUEST_VK_HASH.selector, bytes4(0xfe351488));
         assertEq(IZkApiProofAdapter.WITHDRAWAL_VK_HASH.selector, bytes4(0x7fcd0926));
+        assertEq(IZkApiProofAdapter.INSERTION1_VK_HASH.selector, bytes4(0x1c0bd503));
+        assertEq(IZkApiProofAdapter.INSERTION4_VK_HASH.selector, bytes4(0x85925b1a));
+        assertEq(IZkApiProofAdapter.INSERTION16_VK_HASH.selector, bytes4(0xc2b2d1a6));
         assertEq(IZkApiProofAdapter.assertValidRequest.selector, bytes4(0x69078eaf));
-        assertEq(IZkApiProofAdapter.assertValidWithdrawal.selector, bytes4(0x9ea31c77));
-        assertEq(Events.NoteDeposited.selector, 0x7c83dba8534bea9e30d6444f9ca6462dc906897f9938d220dbbe4358c1f7a063);
+        assertEq(IZkApiProofAdapter.assertValidWithdrawal.selector, bytes4(0x330fa82a));
+        assertEq(IZkApiProofAdapter.assertValidInsertion.selector, bytes4(0x116aef96));
+        assertEq(Errors.NoteBindingMismatch.selector, bytes4(0x41c6633b));
+        assertEq(Errors.StaleActivation.selector, bytes4(0x9c9413a1));
+        assertEq(Errors.InvalidActivation.selector, bytes4(0xe72f8984));
+        assertEq(Errors.NoteNotActivated.selector, bytes4(0x3d0439b5));
+        assertEq(Errors.StaleRoot.selector, bytes4(0x607447de));
+        assertEq(Events.NoteDeposited.selector, 0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36);
+        assertEq(Events.NotesActivated.selector, 0x2c5604373c15ade06913903b9f6fffb2f3b0a029d20dac56a6eeb7d8b1c11144);
         assertEq(Events.MutualClose.selector, 0x1f43fa4711ca18e1d26398f26bf598bd3a62992cdd0e84f055f2bb506e9d7031);
         assertEq(
             Events.EscapeWithdrawalInitiated.selector,
@@ -413,24 +428,47 @@ contract NativeEthVaultTest is Test {
         assertEq(Groth16ProofAdapter(address(0)).CIRCUIT_ID_HASH.selector, bytes4(0xda0e8385));
     }
 
-    /// The exit calldata sizes the Go and JS encoders reproduce: 16 tuple words, then the proof's
+    /// The receipt layouts clients decode: NoteDeposited carries (amount, expiryTs) after the
+    /// indexed note id and commitment, and NotesActivated (count, newRoot, proved) after the
+    /// indexed first note id.
+    function test_depositAndActivationLogLayoutsArePinned() public {
+        vm.recordLogs();
+        deposit();
+        (,, uint64 expiryTs,) = vault.notes(0);
+        vault.activateNotesOnChain(0, 1, siblings);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2);
+        assertEq(logs[0].emitter, address(vault));
+        assertEq(logs[0].topics.length, 3);
+        assertEq(logs[0].topics[0], Events.NoteDeposited.selector);
+        assertEq(logs[0].topics[1], bytes32(uint256(0)));
+        assertEq(logs[0].topics[2], bytes32(uint256(42)));
+        assertEq(logs[0].data, abi.encode(UNITS, expiryTs));
+        assertEq(logs[1].emitter, address(vault));
+        assertEq(logs[1].topics.length, 2);
+        assertEq(logs[1].topics[0], Events.NotesActivated.selector);
+        assertEq(logs[1].topics[1], bytes32(uint256(0)));
+        assertEq(logs[1].data, abi.encode(uint32(1), vault.currentRoot(), false));
+    }
+
+    /// The exit calldata sizes the Go and JS encoders reproduce: 17 tuple words, then the proof's
     /// offset and length and 8 proof words for a withdrawal; noteId, 12 words, offset (and the
     /// raise's amount), length and 8 proof words for a defeat or raise.
     function test_exitCalldataSizesArePinned() public view {
         bytes memory proof = new bytes(256);
         Types.WithdrawalPublicInputs memory w = withdrawal(user, false);
         Types.RequestPublicInputs memory r;
-        assertEq(abi.encodeCall(vault.initiateEscapeWithdrawal, (w, proof)).length, 836);
-        assertEq(abi.encodeCall(vault.mutualClose, (w, proof)).length, 836);
+        assertEq(abi.encodeCall(vault.initiateEscapeWithdrawal, (w, proof)).length, 868);
+        assertEq(abi.encodeCall(vault.mutualClose, (w, proof)).length, 868);
         assertEq(abi.encodeCall(vault.challengeEscapeWithdrawal, (0, r, proof)).length, 740);
         assertEq(abi.encodeCall(vault.raiseEscapeConcession, (0, r, proof, 1)).length, 772);
-        // The proof offset follows the static tuple: 17 words for a withdrawal.
+        // The proof offset follows the static tuple: 18 words for a withdrawal.
         bytes memory escape = abi.encodeCall(vault.initiateEscapeWithdrawal, (w, proof));
         uint256 offset;
         assembly ("memory-safe") {
-            offset := mload(add(escape, add(0x20, add(4, mul(16, 32)))))
+            offset := mload(add(escape, add(0x20, add(4, mul(17, 32)))))
         }
-        assertEq(offset, 17 * 32);
+        assertEq(offset, 18 * 32);
     }
 
     /// A destination that accepts ETH but needs more than ESCAPE_PAYOUT_GAS is not paid at
@@ -463,7 +501,7 @@ contract NativeEthVaultTest is Test {
 
     function _finalizeEscapeLogs(address destination) private returns (Vm.Log[] memory) {
         vault.initiateEscapeWithdrawal(withdrawal(destination, false), "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(0);
         vm.warp(deadline);
         vm.recordLogs();
         vault.finalizeEscapeWithdrawal(0);
@@ -482,7 +520,7 @@ contract NativeEthVaultTest is Test {
         deposit();
         ReenterNativePayout recipient = new ReenterNativePayout(vault);
         vault.initiateEscapeWithdrawal(withdrawal(address(recipient), false), "");
-        (bool exists,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        (bool exists,,,, uint64 deadline) = vault.pendingWithdrawals(0);
         assertTrue(exists);
         vm.warp(deadline);
         vault.finalizeEscapeWithdrawal(0);

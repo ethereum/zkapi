@@ -1,7 +1,7 @@
 # ZK API Usage Credits
 
 This note describes the active zkAPI v2 usage-credit protocol, circuit
-`zkapi-v2-concession-v1` (vault revision 3). The implementation uses BN254
+`zkapi-v2-concession-v2` (vault revision 4). The implementation uses BN254
 Groth16 proofs, BN254 Poseidon hashing, Baby-JubJub Schnorr signatures, and
 native ETH settlement in whole gwei. See [SPEC.md](SPEC.md) for exact public
 statements, the [concession exit design](../docs/design/concession-exit.md) for
@@ -87,7 +87,9 @@ $$
 
 into the smart contract.
 
-4. The contract records the deposit amount $D$ and expiry $T_{\text{exp}}$, then inserts the full note leaf $L$ into the on-chain Merkle tree at the note ID.
+4. The contract records the note: its commitment $C$, deposit amount $D$ and expiry $T_{\text{exp}}$ at the next note ID. The note can exit at once.
+
+5. **Activation.** Recorded notes are appended, in deposit order, to the on-chain request tree, whose leaf at the note ID is the full note leaf $L = H_{\text{leaf}}(\text{noteId}, C, D, T_{\text{exp}})$: in aligned batches of 1, 4 or 16 notes, either with a proof $\pi_{\text{ins}}$ that the batch's empty subtree under the old root becomes the subtree of exactly the recorded leaves under the new root, or hashed on chain from the batch's siblings. Anyone may activate; the operator does it in batches. A note can make requests only once it is activated.
 
 ## Request Generation
 
@@ -100,7 +102,7 @@ To make a request, the user sends:
 The proof $\pi_{\text{req}}$ proves:
 
 1. **Membership**  
-   $L = H_{\text{leaf}}(\text{noteId}, H(s, 0), D, T_{\text{exp}})$ is in the active Merkle tree.
+   $L = H_{\text{leaf}}(\text{noteId}, H(s, 0), D, T_{\text{exp}})$ is in the request tree at its current root (so the note is activated and its leaf not retired).
 
 2. **Secret knowledge**  
    The prover knows $s$.
@@ -232,7 +234,7 @@ No separate on-chain policy stake or `slashPolicyStake` function is required. Th
 
 Withdrawal is a **final spend** of a state. A withdrawal proof shows:
 
-1. membership for the full note leaf $L$ derived from $C = H(s, 0)$;
+1. that the note's public commitment is $C = H(s, 0)$ and the state commits to its full leaf $L$;
 2. knowledge of $s$;
 3. a valid state $(E(B), \tau, \sigma)$ of that note (genesis, or signed);
 4. knowledge of the opening of $E(B)$, with $B \leq D$;
@@ -247,12 +249,12 @@ There are three kinds. Only the first two settle on chain.
 | Mutual close | Instant exit with the operator's consent | $\sigma_{\text{clear}}(x)$; $c = 0$ |
 | Ownership | Prove ownership to the server | $\text{Dest} = 0$, $c = 0$, no $x^{+}$; the contract refuses it |
 
-No withdrawal changes the Merkle tree: notes are never removed by an exit, and a proof may use any root the contract ever held.
+A withdrawal proof is bound to the note as the contract stores it: the commitment $C$ and the packed amount and expiry $M = D + T_{\text{exp}} \cdot 2^{128}$ are public inputs, which the contract compares with its record of the note ID, and the proof shows that $C = H(s, 0)$ for the state's secret and that the state commits to the leaf of $(\text{noteId}, C, D, T_{\text{exp}})$. It proves no tree membership, so a note exits whether or not it was activated, with no root or path. No withdrawal changes the request tree: an exit never removes a leaf.
 
 ### Mutual Close (Instant Path)
 
 1. The user sends $x$ together with an ownership proof $\pi_{\text{own}}$ for the same $x$, valid for at most an hour.
-2. The server checks whether $x$ is already in `spent_nullifiers`, and verifies $\pi_{\text{own}}$ against its deployment, signing keys and a root the contract held. Only the note owner can produce it.
+2. The server checks whether $x$ is already in `spent_nullifiers`, and verifies $\pi_{\text{own}}$ against its deployment, signing keys and the contract's record of the note (its $C$ and $M$, and that it is active). Only the note owner can produce it.
 3. If both checks pass, the server signs:
 
 $$

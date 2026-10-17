@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
+import {MerkleUpdateLib} from "../src/libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
 import {VaultTestBase} from "./helpers/VaultTestBase.sol";
@@ -14,21 +15,16 @@ contract ZkApiVaultTest is VaultTestBase {
         _setUpVault();
     }
 
-    function test_depositInsertsTheLeafAndRecordsTheRoot() public {
-        uint256 emptyRoot = vault.currentRoot();
-        assertTrue(vault.isKnownRoot(emptyRoot));
+    /// A deposit records the note and nothing else: the request tree, its root and the activation
+    /// cursor are untouched until the note is activated.
+    function test_depositRecordsTheNoteWithoutTreeWork() public {
         uint256 depositedAt = 1_700_000_123;
         vm.warp(depositedAt);
         // Rounded up to the day (a literal expression would divide exactly).
         uint64 expiry = uint64(((depositedAt + 30 days + 1 days - 1) / 1 days) * 1 days);
         assertEq(expiry % 1 days, 0);
-        uint256 leaf = NoteLeafLib.computeLeaf(0, bytes32(uint256(42)), DEPOSIT, expiry);
-        uint256 root = leaf;
-        for (uint256 level = 0; level < 32; ++level) {
-            root = _hashNode(root, emptySiblings[level]);
-        }
         vm.expectEmit(address(vault));
-        emit Events.NoteDeposited(0, bytes32(uint256(42)), DEPOSIT, expiry, root);
+        emit Events.NoteDeposited(0, bytes32(uint256(42)), DEPOSIT, expiry);
         vm.prank(user);
         vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(42)), DEPOSIT);
         uint32 id = 0;
@@ -38,9 +34,19 @@ contract ZkApiVaultTest is VaultTestBase {
         assertEq(amount, DEPOSIT);
         assertEq(expiryTs, expiry);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
-        assertEq(vault.currentRoot(), root);
-        assertTrue(vault.knownRoots(root));
+        assertEq(vault.currentRoot(), MerkleUpdateLib.EMPTY_ROOT);
+        assertEq(vault.activationCursor(), 0);
+        assertFalse(vault.isActivated(id));
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
+
+        // Its activation appends exactly its recorded leaf to the empty tree.
+        uint256 root = NoteLeafLib.computeLeaf(id, bytes32(uint256(42)), DEPOSIT, expiry);
+        for (uint256 level = 0; level < 32; ++level) {
+            root = _hashNode(root, emptySiblings[level]);
+        }
+        assertEq(_activate(1), root);
+        assertEq(vault.currentRoot(), root);
+        assertTrue(vault.isActivated(id));
     }
 
     function test_depositRejectsBadInputs() public {
@@ -82,7 +88,7 @@ contract ZkApiVaultTest is VaultTestBase {
         assertEq(user.balance, 100 ether - 200_000 gwei);
         assertEq(treasury.balance, 200_000 gwei);
         assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Closed));
-        (bool exists,,,,,) = vault.pendingWithdrawals(id);
+        (bool exists,,,,) = vault.pendingWithdrawals(id);
         assertFalse(exists);
         vm.expectRevert(Errors.NotPendingWithdrawal.selector);
         vault.finalizeEscapeWithdrawal(id);

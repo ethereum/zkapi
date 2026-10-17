@@ -212,7 +212,7 @@ contract ZkApiVaultPauseTest is Test {
         assertFalse(vault.usedNullifiers(101));
         vm.revertToState(snapshot);
 
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(id);
         vm.warp(deadline);
         uint256 before = user.balance;
         vault.finalizeEscapeWithdrawal(id);
@@ -274,7 +274,7 @@ contract ZkApiVaultPauseTest is Test {
         assertGt(vm.getBlockTimestamp(), vault.lastUnpausedAt() + vault.unpauseClaimGrace() + 20 days);
         Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 101, false);
         vault.initiateEscapeWithdrawal(escape, "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(id);
         vm.warp(deadline - 1);
         _challengeAndAssertExactGrace(id);
     }
@@ -438,6 +438,9 @@ contract ZkApiVaultPauseTest is Test {
         uint32 defeated = _deposit(42);
         uint32 raised = _deposit(43);
         uint32 closed = _deposit(44);
+        for (uint256 i = 0; i < 3; ++i) {
+            _activateOnChain();
+        }
         vault.initiateEscapeWithdrawal(_withdrawal(defeated, 101, false), "");
         vault.initiateEscapeWithdrawal(_withdrawal(raised, 201, false), "");
         vault.mutualClose(_withdrawal(closed, 301, true), "");
@@ -449,10 +452,37 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(conceded, 50_000);
         uint256[32] memory path = _path(closed);
         vault.retireClosedLeaf(closed, path);
+        assertEq(vault.currentRoot(), _root(_leafAt(defeated), _leafAt(raised), 0, 0));
         vm.warp(_deadline(raised));
         vault.finalizeEscapeWithdrawal(raised);
         assertEq(uint256(_status(raised)), uint256(Types.NoteStatus.Closed));
         assertTrue(vault.paused());
+    }
+
+    /// Activation is blocked for the whole pause (a recorded note cannot become request-capable
+    /// while paused, though it can exit once exits reopen) and resumes after the unpause from
+    /// the same cursor and root.
+    function test_activationBlockedWhilePaused() public {
+        uint32 first = _deposit(42);
+        uint32 second = _deposit(43);
+        uint256 root = vault.currentRoot();
+        uint256[32] memory siblings = _path(first);
+        vault.pause();
+        vm.expectRevert(Errors.Paused.selector);
+        vault.activateNotesOnChain(first, 1, siblings);
+        vm.expectRevert(Errors.Paused.selector);
+        vault.activateNotes(first, 1, root, 12_345, "");
+        vm.warp(vm.getBlockTimestamp() + MAX_PAUSE);
+        vm.expectRevert(Errors.Paused.selector);
+        vault.activateNotesOnChain(first, 1, siblings);
+        vault.initiateEscapeWithdrawal(_withdrawal(second, 201, false), "");
+        assertEq(vault.activationCursor(), 0);
+        assertEq(vault.currentRoot(), root);
+        vault.unpause();
+        _activateOnChain();
+        _activateOnChain();
+        assertEq(vault.activationCursor(), 2);
+        assertEq(vault.currentRoot(), _root(_leafAt(first), _leafAt(second), 0, 0));
     }
 
     function test_pauseAndUnpauseEmitAndRejectRedundantCalls() public {
@@ -676,7 +706,7 @@ contract ZkApiVaultPauseTest is Test {
         address rejecting = address(new RejectingTreasury());
         _switchTreasury(rejecting);
         vault.initiateEscapeWithdrawal(_withdrawal(escaping, 101, false), "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(escaping);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(escaping);
         vm.warp(deadline);
         uint256 before = user.balance;
         vault.finalizeEscapeWithdrawal(escaping);
@@ -709,7 +739,7 @@ contract ZkApiVaultPauseTest is Test {
     function test_gasBurningTreasuryIsBoundedOnEscapeFinalization() public {
         uint32 id = _deposit(42);
         vault.initiateEscapeWithdrawal(_withdrawal(id, 101, false), "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(id);
         vm.warp(deadline);
         bytes memory finalize = abi.encodeCall(vault.finalizeEscapeWithdrawal, (id));
         _assertGasBurningTreasuryBounded("finalizeEscapeWithdrawal", finalize, 300_000);
@@ -771,7 +801,7 @@ contract ZkApiVaultPauseTest is Test {
         bytes memory finalize = abi.encodeCall(vault.finalizeEscapeWithdrawal, (id));
         uint256 snapshot = vm.snapshotState();
         vault.initiateEscapeWithdrawal(_withdrawal(id, 101, false), "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(id);
         vm.warp(deadline);
         uint256 baseline = _gasUsed(finalize, 30_000_000);
         assertEq(vault.escapePayoutCredits(user), 0, "baseline pays the destination");
@@ -804,7 +834,7 @@ contract ZkApiVaultPauseTest is Test {
         Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 101, false);
         escape.destination = address(costly);
         vault.initiateEscapeWithdrawal(escape, "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(id);
         vm.warp(deadline);
         bytes memory finalize = abi.encodeCall(vault.finalizeEscapeWithdrawal, (id));
         uint256 snapshot = vm.snapshotState();
@@ -843,7 +873,7 @@ contract ZkApiVaultPauseTest is Test {
         escape = _withdrawal(second, 102, false);
         escape.destination = address(recipient);
         vault.initiateEscapeWithdrawal(escape, "");
-        (,,,,, uint64 deadline) = vault.pendingWithdrawals(second);
+        (,,,, uint64 deadline) = vault.pendingWithdrawals(second);
         vm.warp(deadline);
         vault.pause();
         vault.finalizeEscapeWithdrawal(first);
@@ -869,8 +899,10 @@ contract ZkApiVaultPauseTest is Test {
     /// maxPauseDuration and not after; exempt ones (in-flight escape resolution, credited payout
     /// claims, leaf retirement and owner-recovery actions) stay open.
     function test_pauseGuardCoverage() public {
-        string[7] memory guarded = [
+        string[9] memory guarded = [
             "deposit",
+            "activateNotes",
+            "activateNotesOnChain",
             "claimExpired",
             "setTreasury",
             "acceptTreasury",
@@ -915,8 +947,10 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(mutating, guarded.length + bounded.length + exempt.length, "stale pause classification");
 
         // pause()'s NatSpec is the list operator docs quote; it must match the guards. Its three
-        // parts: blocked until unpause, blocked for at most maxPauseDuration, open.
-        string memory notice = vm.parseJsonString(artifact, ".metadata.output.userdoc.methods['pause()'].notice");
+        // parts: blocked until unpause, blocked for at most maxPauseDuration, open. The notice keeps
+        // each source line's indentation, so runs of whitespace are read as one space.
+        string memory notice =
+            _collapseWhitespace(vm.parseJsonString(artifact, ".metadata.output.userdoc.methods['pause()'].notice"));
         string[] memory parts = vm.split(notice, "Blocks for at most maxPauseDuration:");
         assertEq(parts.length, 2, "pause() notice must name the bounded functions");
         string[] memory rest = vm.split(parts[1], "Stay open while paused:");
@@ -1002,7 +1036,7 @@ contract ZkApiVaultPauseTest is Test {
     }
 
     function _deadline(uint32 id) private view returns (uint64 deadline) {
-        (,,,,, deadline) = vault.pendingWithdrawals(id);
+        (,,,, deadline) = vault.pendingWithdrawals(id);
     }
 
     /// Runs three unpaused-gap-then-pause rounds and deposits note `id` before round
@@ -1077,9 +1111,10 @@ contract ZkApiVaultPauseTest is Test {
         assertTrue(ok);
     }
 
-    /// Exits leave leaves in place (no test here retires one), so every deposited note's leaf.
+    /// The request tree's leaf at `index`: every activated note's (the one retirement here comes
+    /// last in its test).
     function _leafAt(uint32 index) private view returns (uint256) {
-        if (index >= vault.nextNoteId()) return 0;
+        if (index >= vault.activationCursor()) return 0;
         (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(index);
         return NoteLeafLib.computeLeaf(index, commitment, amount, expiry);
     }
@@ -1093,6 +1128,24 @@ contract ZkApiVaultPauseTest is Test {
         siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _leafAt(otherPair * 2), _leafAt(otherPair * 2 + 1));
     }
 
+    /// The root of the tree whose slots 0..3 hold `l0`..`l3` and whose other leaves are empty.
+    function _root(uint256 l0, uint256 l1, uint256 l2, uint256 l3) private view returns (uint256 root) {
+        root = Bn254Poseidon.compress(
+            DOMAIN_NODE, Bn254Poseidon.compress(DOMAIN_NODE, l0, l1), Bn254Poseidon.compress(DOMAIN_NODE, l2, l3)
+        );
+        for (uint256 level = 2; level < 32; ++level) {
+            root = Bn254Poseidon.compress(DOMAIN_NODE, root, emptySiblings[level]);
+        }
+    }
+
+    /// Activates the next recorded note with the on-chain fallback (the vault's adapter accepts any
+    /// insertion proof, so a proved activation could set any root).
+    function _activateOnChain() private {
+        uint32 first = vault.activationCursor();
+        uint256[32] memory siblings = _path(first);
+        vault.activateNotesOnChain(first, 1, siblings);
+    }
+
     /// A close (kind 1) or an escape (kind 0, successor nullifier + SUCCESSOR) with a 700,000
     /// payout. Valid for ten years: these tests build statements before long warps.
     function _withdrawal(uint32 id, uint256 nullifier, bool clearance)
@@ -1100,11 +1153,12 @@ contract ZkApiVaultPauseTest is Test {
         view
         returns (Types.WithdrawalPublicInputs memory)
     {
+        (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(id);
         return Types.WithdrawalPublicInputs(
             2,
             uint64(block.chainid),
             address(vault),
-            vault.currentRoot(),
+            uint256(commitment),
             11,
             12,
             13,
@@ -1116,7 +1170,8 @@ contract ZkApiVaultPauseTest is Test {
             clearance ? 1 : 0,
             clearance ? 0 : nullifier + SUCCESSOR,
             0,
-            uint64(vm.getBlockTimestamp()) + 3650 days
+            uint64(vm.getBlockTimestamp()) + 3650 days,
+            uint256(amount) | (uint256(expiryTs) << 128)
         );
     }
 
@@ -1144,6 +1199,21 @@ contract ZkApiVaultPauseTest is Test {
         bytes memory out = new bytes(end);
         for (uint256 i = 0; i < end; ++i) {
             out[i] = raw[i];
+        }
+        return string(out);
+    }
+
+    function _collapseWhitespace(string memory text) private pure returns (string memory) {
+        bytes memory raw = bytes(text);
+        bytes memory out = new bytes(raw.length);
+        uint256 length;
+        for (uint256 i = 0; i < raw.length; ++i) {
+            bool space = raw[i] == " " || raw[i] == "\n" || raw[i] == "\t";
+            if (space && (length == 0 || out[length - 1] == " ")) continue;
+            out[length++] = space ? bytes1(" ") : raw[i];
+        }
+        assembly ("memory-safe") {
+            mstore(out, length)
         }
         return string(out);
     }

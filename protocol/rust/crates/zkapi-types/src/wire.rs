@@ -195,12 +195,12 @@ mod tests {
         let zero_destination = [0u8; 20];
         let legacy_destination = [17u8; 20];
         let inputs = serde_json::json!({
-            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "active_root":"0x2",
+            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "registration_commitment":"0x2",
             "state_signing_key_x":"0x3", "state_signing_key_y":"0x4",
             "clearance_signing_key_x":"0x5", "clearance_signing_key_y":"0x6",
             "note_id":7, "final_balance":1950000, "destination":zero_destination,
             "withdrawal_nullifier":"0x7", "kind":2, "next_nullifier":"0x0", "conceded":0,
-            "valid_until":2000003600u64
+            "valid_until":2000003600u64, "deposit_amount":2000000, "expiry":2000086400u64
         });
         let proof = serde_json::json!({"backend":"groth16_bn254","proof":"AA=="});
         let body = serde_json::json!({"withdrawal_nullifier":"0x7",
@@ -239,6 +239,16 @@ mod tests {
         let mut legacy_body = body.clone();
         legacy_body["ownership_proof"]["public_inputs"] = legacy;
         assert!(serde_json::from_value::<ClearanceRequestV2C>(legacy_body).is_err());
+        // A revision-3 statement (a tree root instead of the stored note values) is rejected.
+        let mut rooted = body.clone();
+        let fields = rooted["ownership_proof"]["public_inputs"]
+            .as_object_mut()
+            .unwrap();
+        let commitment = fields.remove("registration_commitment").unwrap();
+        fields.remove("deposit_amount");
+        fields.remove("expiry");
+        fields.insert("active_root".into(), commitment);
+        assert!(serde_json::from_value::<ClearanceRequestV2C>(rooted).is_err());
         let request_statement = serde_json::json!({
             "protocol_version":2, "chain_id":1, "contract_address":"0x1", "active_root":"0x2",
             "state_signing_key_x":"0x3", "state_signing_key_y":"0x4", "request_time":5,

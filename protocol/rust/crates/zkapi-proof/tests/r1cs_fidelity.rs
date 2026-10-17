@@ -1,11 +1,12 @@
 //! R1CS export fidelity (G-SETUP step 2): the exported circom `.r1cs` files
-//! parse back (with `ark-circom`'s reader) to exactly the synthesized
+//! of the five circuits parse back (with `ark-circom`'s reader) to exactly the synthesized
 //! matrices, every honest assignment satisfies them, and every negative case's
 //! full assignment is rejected by an independent evaluator over the file.
 #![cfg(not(target_arch = "wasm32"))]
 
 mod common;
 
+use std::collections::HashMap;
 use std::io::Cursor;
 
 use ark_bn254::Fr;
@@ -77,9 +78,17 @@ fn assert_file_matches(file: &R1CSFile<Fr>, matrices: &ConstraintMatrices<Fr>, k
     );
 }
 
+/// The parsed export and the synthesized matrices of every circuit.
+fn exports() -> HashMap<KeyKind, (R1CSFile<Fr>, ConstraintMatrices<Fr>)> {
+    KeyKind::ALL
+        .into_iter()
+        .map(|kind| (kind, (parse(kind), circuit_matrices(kind).unwrap())))
+        .collect()
+}
+
 #[test]
 fn r1cs_export_roundtrip() {
-    for kind in [KeyKind::Request, KeyKind::Withdrawal] {
+    for kind in KeyKind::ALL {
         let matrices = circuit_matrices(kind).unwrap();
         let file = parse(kind);
         assert_file_matches(&file, &matrices, kind);
@@ -102,25 +111,18 @@ fn r1cs_export_roundtrip() {
 /// exported file; wires 1..=k carry the public inputs in statement order.
 #[test]
 fn honest_assignments_satisfy_the_exported_file() {
-    let request_file = parse(KeyKind::Request);
-    let withdrawal_file = parse(KeyKind::Withdrawal);
-    let request_matrices = circuit_matrices(KeyKind::Request).unwrap();
-    let withdrawal_matrices = circuit_matrices(KeyKind::Withdrawal).unwrap();
+    let exports = exports();
     let c = chain();
     let (request_public, _) = c.request_of(&c.s1, &c.r1);
     let (withdrawal_public, _) = c.withdrawal_of(
         &c.s1,
         &withdrawal(zkapi_types::WithdrawalKind::Escape, DESTINATION, 0),
     );
+    let insertion_public = second_batch(16).public;
     for case in positive_cases() {
         let name = case.name;
-        let is_withdrawal = case.is_withdrawal();
+        let (file, matrices) = &exports[&case.kind()];
         let cs = case.synthesize();
-        let (file, matrices) = if is_withdrawal {
-            (&withdrawal_file, &withdrawal_matrices)
-        } else {
-            (&request_file, &request_matrices)
-        };
         let prove_matrices = cs.to_matrices().unwrap();
         assert_eq!(prove_matrices.a, matrices.a, "{name}");
         assert_eq!(prove_matrices.b, matrices.b, "{name}");
@@ -145,24 +147,25 @@ fn honest_assignments_satisfy_the_exported_file() {
                 .iter()
                 .map(zkapi_core::v2::felt_to_field)
                 .collect();
-            assert_eq!(&assignment[1..17], inputs.as_slice());
+            assert_eq!(&assignment[1..18], inputs.as_slice());
+        }
+        if name == "insertion16_second_batch" {
+            assert_eq!(
+                &assignment[1..36],
+                insertion_public.to_field_elements().as_slice()
+            );
         }
     }
 }
 
 #[test]
 fn r1cs_negative_assignments() {
-    let request = parse(KeyKind::Request);
-    let withdrawal = parse(KeyKind::Withdrawal);
+    let exports = exports();
     let cases = negative_cases();
     let count = cases.len();
     for case in cases {
         let name = case.name;
-        let file = if case.is_withdrawal() {
-            &withdrawal
-        } else {
-            &request
-        };
+        let (file, _) = &exports[&case.kind()];
         let cs = case.synthesize();
         let assignment = full_assignment(&cs);
         let row = first_violated_row(file, &assignment);

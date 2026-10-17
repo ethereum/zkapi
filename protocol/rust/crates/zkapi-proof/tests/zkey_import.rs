@@ -18,6 +18,7 @@ mod common;
 #[path = "../examples/import_zkey.rs"]
 mod import_zkey;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -30,16 +31,20 @@ use ark_relations::r1cs::ConstraintMatrices;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use common::*;
-use import_zkey::{check_coefficients, check_proving, check_shape, check_zkey, import, ImportArgs};
+use import_zkey::{
+    check_coefficients, check_proving, check_shape, check_zkey, import, ImportArgs, KindPaths,
+};
 use zkapi_proof::ceremony::{
     check_key_binding, g1_to_lem, g2_to_lem, LagrangeBases, Ptau, PublicPtau, PUBLIC_PTAU,
 };
 use zkapi_proof::compact::{
     circuit_shape, decode_compressed, decode_compressed_for, sha256, write_setup_directory,
-    KeyKind, RequestProver, RequestVerifier, SetupManifest, SetupProvenance, WithdrawalProver,
-    WithdrawalVerifier, CEREMONY_SETUP_ID, DEV_SETUP_ID, REHEARSAL_SETUP_ID,
+    InsertionProver, InsertionVerifier, KeyKind, RequestProver, RequestVerifier, SetupKeys,
+    SetupManifest, SetupProvenance, WithdrawalProver, WithdrawalVerifier, CEREMONY_SETUP_ID,
+    DEV_SETUP_ID, REHEARSAL_SETUP_ID,
 };
-use zkapi_proof::r1cs::{circuit_matrices, r1cs_bytes};
+use zkapi_proof::insertion::INSERTION_SIZES;
+use zkapi_proof::r1cs::{circuit_matrices, r1cs_bytes, r1cs_file};
 use zkapi_types::WithdrawalKind;
 
 // ---- snarkjs file layouts ----
@@ -355,25 +360,20 @@ struct ToyCircuit {
 }
 
 /// The toy ceremony's powers of tau is shaped like Hermez's smallest public
-/// file that fits the circuits (power 15 since one-permutation tree nodes
-/// brought both under 2^15 rows, truncated from a larger one): both H
-/// queries use section 12's top block, computed with the power the file
-/// lacks.
+/// file that fits the circuits (power 15: all five have at most 2^15 rows;
+/// truncated from a larger one): every H query uses section 12's top block,
+/// computed with the power the file lacks.
 const TOY_POWER: u32 = 15;
 
 struct Toy {
     secrets: Secrets,
     scalars: PtauScalars,
-    request: ToyCircuit,
-    withdrawal: ToyCircuit,
+    circuits: HashMap<KeyKind, ToyCircuit>,
 }
 
 impl Toy {
     fn circuit(&self, kind: KeyKind) -> &ToyCircuit {
-        match kind {
-            KeyKind::Request => &self.request,
-            KeyKind::Withdrawal => &self.withdrawal,
-        }
+        &self.circuits[&kind]
     }
 }
 
@@ -458,6 +458,7 @@ fn toy() -> &'static Toy {
         let circuit = |kind| {
             let matrices = circuit_matrices(kind).unwrap();
             let n = circuit_shape(kind).unwrap().domain_size;
+            assert!(n <= 1 << TOY_POWER, "{kind}: a domain of {n} points");
             ToyCircuit {
                 bases: scalars.bases(n),
                 pk: toy_key(&secrets, &scalars, &matrices, n),
@@ -465,8 +466,10 @@ fn toy() -> &'static Toy {
             }
         };
         Toy {
-            request: circuit(KeyKind::Request),
-            withdrawal: circuit(KeyKind::Withdrawal),
+            circuits: KeyKind::ALL
+                .into_iter()
+                .map(|kind| (kind, circuit(kind)))
+                .collect(),
             secrets,
             scalars,
         }
@@ -531,7 +534,11 @@ const CEREMONY_CONTRIBUTIONS: &[u32] = &[0, 0, 0, 1];
 #[test]
 fn keys_set_up_from_another_c_matrix_are_refused() {
     let toy = toy();
-    for (kind, limit) in [(KeyKind::Request, usize::MAX), (KeyKind::Withdrawal, 1)] {
+    for (kind, limit) in [
+        (KeyKind::Request, usize::MAX),
+        (KeyKind::Withdrawal, 1),
+        (KeyKind::Insertion16, usize::MAX),
+    ] {
         let honest = toy.circuit(kind);
         let (weak, changed) = weaken(&honest.matrices, limit);
         assert!(changed > 0, "{kind}");
@@ -573,7 +580,7 @@ fn keys_set_up_from_another_c_matrix_are_refused() {
 #[test]
 fn binding_gate_checks_every_key_point() {
     let toy = toy();
-    let circuit = &toy.request;
+    let circuit = toy.circuit(KeyKind::Request);
     let check = |pk: &ProvingKey<Bn254>| {
         check_key_binding(pk, &circuit.matrices, &circuit.bases)
             .err()
@@ -619,21 +626,35 @@ fn binding_gate_checks_every_key_point() {
         let error = check(&pk).unwrap_or_else(|| panic!("{expected}: accepted"));
         assert!(error.contains(expected), "{expected}: {error}");
     }
-    // A key for one circuit over the other circuit's bases is refused.
-    assert!(check_key_binding(&toy.withdrawal.pk, &circuit.matrices, &circuit.bases).is_err());
+    // A key of another circuit over the same bases is refused.
+    for kind in [KeyKind::Withdrawal, KeyKind::Insertion1] {
+        assert!(
+            check_key_binding(&toy.circuit(kind).pk, &circuit.matrices, &circuit.bases).is_err(),
+            "{kind}"
+        );
+    }
 }
 
 #[test]
 fn foreign_or_recoefficiented_zkeys_are_refused() {
     let toy = toy();
-    let request = &toy.request;
-    // A request key offered as the withdrawal key fails the coefficient gate.
-    let zkey = write_zkey(&request.pk, &request.matrices, None);
-    let error = format!(
-        "{:#}",
-        check_zkey(&zkey, KeyKind::Withdrawal, &toy.withdrawal.bases).unwrap_err()
-    );
-    assert!(error.contains("withdrawal zkey has"), "{error}");
+    let request = toy.circuit(KeyKind::Request);
+    // A key offered as another circuit's key fails the coefficient gate: a
+    // request key as the withdrawal key, an insertion key of one batch size
+    // as another's.
+    for (key, offered) in [
+        (KeyKind::Request, KeyKind::Withdrawal),
+        (KeyKind::Insertion4, KeyKind::Insertion16),
+        (KeyKind::Insertion16, KeyKind::Insertion1),
+    ] {
+        let circuit = toy.circuit(key);
+        let zkey = write_zkey(&circuit.pk, &circuit.matrices, None);
+        let error = format!(
+            "{:#}",
+            check_zkey(&zkey, offered, &toy.circuit(offered).bases).unwrap_err()
+        );
+        assert!(error.contains(&format!("{offered} zkey has")), "{error}");
+    }
     // One changed A coefficient in section 4 fails it too.
     let mut matrices = request.matrices.clone();
     let row = matrices.a.iter().position(|row| !row.is_empty()).unwrap();
@@ -656,31 +677,27 @@ fn toy_ceremony_imports_end_to_end() {
         std::fs::write(&path, bytes).unwrap();
         path
     };
-    let ptau_bytes = write_ptau(
-        &toy.scalars,
-        &[
-            toy.request.bases.domain_size(),
-            toy.withdrawal.bases.domain_size(),
-        ],
-    );
+    let mut domains: Vec<usize> = KeyKind::ALL
+        .iter()
+        .map(|kind| toy.circuit(*kind).bases.domain_size())
+        .collect();
+    domains.sort();
+    domains.dedup();
+    assert_eq!(domains, [1 << 15]);
+    let ptau_bytes = write_ptau(&toy.scalars, &domains);
     let ptau_sha256 = hex::encode(sha256(&ptau_bytes));
     let ptau = write("toy.ptau", &ptau_bytes);
     drop(ptau_bytes);
-    // The file reader returns exactly the bases the keys were made from.
+    // The file reader returns exactly the bases the keys were made from: one
+    // domain, and every H query from section 12's top block.
     let opened = Ptau::open(&ptau).unwrap();
     assert_eq!(opened.power(), TOY_POWER);
     assert_eq!(hex::encode(opened.sha256()), ptau_sha256);
-    assert_eq!(
-        opened.lagrange_bases(1 << 15).unwrap(),
-        toy.request.bases,
-        "request bases"
-    );
-    // Both H queries come from section 12's top block.
-    assert_eq!(
-        opened.lagrange_bases(1 << 15).unwrap(),
-        toy.withdrawal.bases,
-        "withdrawal bases"
-    );
+    let bases = opened.lagrange_bases(1 << 15).unwrap();
+    for kind in KeyKind::ALL {
+        assert_eq!(bases, toy.circuit(kind).bases, "{kind} bases");
+    }
+    drop(bases);
     // A toy file is no public transcript.
     assert_eq!(opened.public_transcript(PUBLIC_PTAU), None);
     let toy_transcript = PublicPtau {
@@ -700,51 +717,41 @@ fn toy_ceremony_imports_end_to_end() {
         None,
         "the power must match too"
     );
-    let request_r1cs = write("request.r1cs", &r1cs_bytes(KeyKind::Request).unwrap());
-    let withdrawal_r1cs = write("withdrawal.r1cs", &r1cs_bytes(KeyKind::Withdrawal).unwrap());
+    let r1cs =
+        KindPaths::try_from_fn(|kind| Ok(write(&r1cs_file(kind), &r1cs_bytes(kind)?))).unwrap();
     let zkey = |name: &str, kind: KeyKind, contributions: Option<&[u32]>| {
         let circuit = toy.circuit(kind);
         let bytes = write_zkey(&circuit.pk, &circuit.matrices, contributions);
         let digest = hex::encode(sha256(&bytes));
         (write(name, &bytes), digest)
     };
-    let (request_zkey, request_digest) = zkey(
-        "request.zkey",
-        KeyKind::Request,
-        Some(CEREMONY_CONTRIBUTIONS),
-    );
-    let (withdrawal_zkey, withdrawal_digest) = zkey(
-        "withdrawal.zkey",
-        KeyKind::Withdrawal,
-        Some(CEREMONY_CONTRIBUTIONS),
-    );
+    let mut digests = HashMap::new();
+    let zkeys = KindPaths::try_from_fn(|kind| {
+        let (path, digest) = zkey(&format!("{kind}.zkey"), kind, Some(CEREMONY_CONTRIBUTIONS));
+        digests.insert(kind, digest);
+        Ok(path)
+    })
+    .unwrap();
     let args = ImportArgs {
         setup_id: REHEARSAL_SETUP_ID.to_string(),
         ptau: ptau.clone(),
         expected_ptau_sha256: None,
         public_ptau: PUBLIC_PTAU.to_vec(),
-        request_r1cs: request_r1cs.clone(),
-        withdrawal_r1cs: withdrawal_r1cs.clone(),
-        request_zkey: request_zkey.clone(),
-        withdrawal_zkey: withdrawal_zkey.clone(),
+        r1cs: r1cs.clone(),
+        zkeys: zkeys.clone(),
         transcript_sha256: None,
         output: dir.join("rehearsal"),
     };
     let manifest = import(&args).unwrap();
     assert_eq!(manifest.setup_id, REHEARSAL_SETUP_ID);
     assert_eq!(manifest.ptau_sha256.as_deref(), Some(ptau_sha256.as_str()));
-    let zkeys = manifest.zkey_sha256.clone().unwrap();
-    assert_eq!(
-        (zkeys.request, zkeys.withdrawal),
-        (request_digest, withdrawal_digest)
-    );
-    for (kind, path) in [
-        (KeyKind::Request, &request_r1cs),
-        (KeyKind::Withdrawal, &withdrawal_r1cs),
-    ] {
+    let zkey_sha256 = manifest.zkey_sha256.clone().unwrap();
+    for kind in KeyKind::ALL {
+        assert_eq!(zkey_sha256.get(kind), &digests[&kind], "{kind}");
         assert_eq!(
             manifest.r1cs_sha256.get(kind),
-            hex::encode(sha256(&std::fs::read(path).unwrap()))
+            &hex::encode(sha256(&std::fs::read(r1cs.get(kind)).unwrap())),
+            "{kind}"
         );
     }
     let written: SetupManifest =
@@ -753,18 +760,22 @@ fn toy_ceremony_imports_end_to_end() {
     // The directory loads (rehearsal keys load in dev-setup builds only) and
     // its keys prove.
     let output = &args.output;
-    let (pk, setup_id): (ProvingKey<Bn254>, _) = decode_compressed(
-        &std::fs::read(output.join("request.pk")).unwrap(),
-        KeyKind::Request,
-    )
-    .unwrap();
-    assert_eq!(
-        (pk, setup_id.as_str()),
-        (toy.request.pk.clone(), REHEARSAL_SETUP_ID)
-    );
+    for kind in KeyKind::ALL {
+        let (pk, setup_id): (ProvingKey<Bn254>, _) = decode_compressed(
+            &std::fs::read(output.join(kind.proving_key_file())).unwrap(),
+            kind,
+        )
+        .unwrap();
+        assert_eq!(
+            (pk, setup_id.as_str()),
+            (toy.circuit(kind).pk.clone(), REHEARSAL_SETUP_ID),
+            "{kind}"
+        );
+    }
     for (file, kind) in [
         ("request.vk", KeyKind::Request),
         ("withdrawal.pk", KeyKind::Withdrawal),
+        ("insertion16.vk", KeyKind::Insertion16),
     ] {
         let error = decode_compressed_for::<VerifyingKey<Bn254>>(
             &std::fs::read(output.join(file)).unwrap(),
@@ -796,11 +807,22 @@ fn toy_ceremony_imports_end_to_end() {
         .unwrap()
         .verify(&public, &proof)
         .unwrap());
+    for size in INSERTION_SIZES {
+        let circuit = second_batch(size);
+        let proof = InsertionProver::load(output, size)
+            .unwrap()
+            .prove(&circuit.public, &circuit.witness)
+            .unwrap();
+        assert!(InsertionVerifier::load(output, size)
+            .unwrap()
+            .verify(&circuit.public, &proof)
+            .unwrap());
+    }
 
     let refused = |args: &ImportArgs, expected: &str| {
         let error = format!("{:#}", import(args).unwrap_err());
         assert!(error.contains(expected), "{expected}: {error}");
-        for file in ["request.pk", "manifest.json"] {
+        for file in ["request.pk", "insertion16.pk", "manifest.json"] {
             assert!(
                 args.output == dir.join("rehearsal") || !args.output.join(file).exists(),
                 "{expected}: wrote {file}"
@@ -813,37 +835,29 @@ fn toy_ceremony_imports_end_to_end() {
         output: dir.join(name),
         ..args.clone()
     };
-    // The R1CS the ceremony used must be this build's export.
-    refused(
-        &ImportArgs {
-            request_r1cs: withdrawal_r1cs.clone(),
-            ..fresh("r1cs")
-        },
-        "is not this build's request R1CS export",
-    );
+    // The R1CS the ceremony used must be this build's export, for every
+    // circuit.
+    for (kind, other) in [
+        (KeyKind::Request, KeyKind::Withdrawal),
+        (KeyKind::Insertion4, KeyKind::Insertion16),
+    ] {
+        let mut wrong = fresh("r1cs");
+        *wrong.r1cs.get_mut(kind) = r1cs.get(other).to_path_buf();
+        refused(&wrong, &format!("is not this build's {kind} R1CS export"));
+    }
     // A key set up from a weakened R1CS is refused by the import too.
-    let (weak, _) = weaken(&toy.request.matrices, usize::MAX);
-    let weak_pk = toy_key(
-        &toy.secrets,
-        &toy.scalars,
-        &weak,
-        toy.request.bases.domain_size(),
-    );
-    let weak_zkey = write(
+    let (weak, _) = weaken(&toy.circuit(KeyKind::Request).matrices, usize::MAX);
+    let weak_pk = toy_key(&toy.secrets, &toy.scalars, &weak, 1 << 15);
+    let mut weak = fresh("weak");
+    *weak.zkeys.get_mut(KeyKind::Request) = write(
         "weak.zkey",
         &write_zkey(
             &weak_pk,
-            &toy.request.matrices,
+            &toy.circuit(KeyKind::Request).matrices,
             Some(CEREMONY_CONTRIBUTIONS),
         ),
     );
-    refused(
-        &ImportArgs {
-            request_zkey: weak_zkey,
-            ..fresh("weak")
-        },
-        "does not match the circuit",
-    );
+    refused(&weak, "does not match the circuit");
     // The ceremony setup id needs the pinned powers of tau, which must be a
     // public transcript, the ceremony transcript and zkeys that record the
     // ceremony's contributions.
@@ -878,34 +892,28 @@ fn toy_ceremony_imports_end_to_end() {
         "not the pinned",
     );
     let (single, _) = zkey("single.zkey", KeyKind::Request, Some(&[0, 1]));
-    refused(
-        &ImportArgs {
-            request_zkey: single,
-            ..ceremony("single")
-        },
-        "needs at least 3 contributions followed by a beacon",
-    );
-    let (bare, _) = zkey("bare.zkey", KeyKind::Withdrawal, None);
-    refused(
-        &ImportArgs {
-            withdrawal_zkey: bare,
-            ..ceremony("bare")
-        },
-        "no contributions section",
-    );
+    let mut few = ceremony("single");
+    *few.zkeys.get_mut(KeyKind::Request) = single;
+    refused(&few, "needs at least 3 contributions followed by a beacon");
+    let (bare, _) = zkey("bare.zkey", KeyKind::Insertion16, None);
+    let mut bare_args = ceremony("bare");
+    *bare_args.zkeys.get_mut(KeyKind::Insertion16) = bare;
+    refused(&bare_args, "no contributions section");
     let manifest = import(&ceremony("mpc")).unwrap();
     assert_eq!(manifest.setup_id, CEREMONY_SETUP_ID);
     assert_eq!(manifest.transcript_sha256, Some("ab".repeat(32)));
     // Labelled mpc-1 but not pinned: release builds still refuse it.
-    let error = decode_compressed_for::<VerifyingKey<Bn254>>(
-        &std::fs::read(dir.join("mpc").join("request.vk")).unwrap(),
-        KeyKind::Request,
-        false,
-        None,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("pinned"), "{error}");
+    for kind in [KeyKind::Request, KeyKind::Insertion1] {
+        let error = decode_compressed_for::<VerifyingKey<Bn254>>(
+            &std::fs::read(dir.join("mpc").join(kind.verifying_key_file())).unwrap(),
+            kind,
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pinned"), "{error}");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1082,8 +1090,8 @@ fn powers_of_tau_must_be_one_reference_string() {
 #[test]
 fn development_keys_round_trip_through_zkeys() {
     let dir = scratch("dev");
-    let mut keys = Vec::new();
-    for kind in [KeyKind::Request, KeyKind::Withdrawal] {
+    let mut keys = HashMap::new();
+    for kind in KeyKind::ALL {
         let bytes = std::fs::read(dev_setup_dir().join(kind.proving_key_file())).unwrap();
         let (pk, _): (ProvingKey<Bn254>, _) = decode_compressed(&bytes, kind).unwrap();
         let matrices = circuit_matrices(kind).unwrap();
@@ -1092,26 +1100,33 @@ fn development_keys_round_trip_through_zkeys() {
         assert_eq!(read, pk, "{kind}");
         check_coefficients(&coefficients, &read, kind, &matrices).unwrap();
         check_shape(&read, kind).unwrap();
-        keys.push(read);
+        keys.insert(kind, read);
     }
     let output = dir.join("setup");
     write_setup_directory(
         &output,
         DEV_SETUP_ID,
-        &keys[0],
-        &keys[1],
+        &SetupKeys {
+            request: &keys[&KeyKind::Request],
+            withdrawal: &keys[&KeyKind::Withdrawal],
+            insertion1: &keys[&KeyKind::Insertion1],
+            insertion4: &keys[&KeyKind::Insertion4],
+            insertion16: &keys[&KeyKind::Insertion16],
+        },
         &SetupProvenance::default(),
     )
     .unwrap();
-    for file in [
-        "request.pk",
-        "request.vk",
-        "withdrawal.pk",
-        "withdrawal.vk",
+    let mut files: Vec<&str> = KeyKind::ALL
+        .iter()
+        .flat_map(|kind| [kind.proving_key_file(), kind.verifying_key_file()])
+        .collect();
+    files.extend([
         "manifest.json",
         "Groth16ProofAdapter.sol",
         "Bn254Poseidon.sol",
-    ] {
+    ]);
+    assert_eq!(files.len(), 13);
+    for file in files {
         assert!(
             std::fs::read(output.join(file)).unwrap()
                 == std::fs::read(dev_setup_dir().join(file)).unwrap(),
@@ -1122,11 +1137,12 @@ fn development_keys_round_trip_through_zkeys() {
 }
 
 /// The import gates on real ceremony output, before running the import
-/// itself (README step 6):
-/// `ZKAPI_PTAU=... ZKAPI_REQUEST_ZKEY=... ZKAPI_WITHDRAWAL_ZKEY=... cargo test
-/// --release -p zkapi-proof --test zkey_import ceremony_zkeys_pass_the_import_gates -- --ignored`.
+/// itself (README step 2): `ZKAPI_PTAU=... ZKAPI_REQUEST_ZKEY=...
+/// ZKAPI_WITHDRAWAL_ZKEY=... ZKAPI_INSERTION1_ZKEY=... ZKAPI_INSERTION4_ZKEY=...
+/// ZKAPI_INSERTION16_ZKEY=... cargo test --release -p zkapi-proof --test
+/// zkey_import ceremony_zkeys_pass_the_import_gates -- --ignored`.
 #[test]
-#[ignore = "needs ceremony files in ZKAPI_PTAU, ZKAPI_REQUEST_ZKEY and ZKAPI_WITHDRAWAL_ZKEY"]
+#[ignore = "needs ceremony files in ZKAPI_PTAU and ZKAPI_<KIND>_ZKEY for every circuit"]
 fn ceremony_zkeys_pass_the_import_gates() {
     let variable = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
     let ptau = Ptau::open(variable("ZKAPI_PTAU")).unwrap();
@@ -1137,22 +1153,20 @@ fn ceremony_zkeys_pass_the_import_gates() {
         ptau.public_transcript(PUBLIC_PTAU)
             .map(|public| public.name)
     );
-    for (name, kind) in [
-        ("ZKAPI_REQUEST_ZKEY", KeyKind::Request),
-        ("ZKAPI_WITHDRAWAL_ZKEY", KeyKind::Withdrawal),
-    ] {
+    for kind in KeyKind::ALL {
+        let name = format!("ZKAPI_{}_ZKEY", kind.as_str().to_uppercase());
         let bases = ptau
             .lagrange_bases(circuit_shape(kind).unwrap().domain_size)
             .unwrap();
-        import_zkey::read_checked_zkey(Path::new(&variable(name)), kind, &bases)
+        import_zkey::read_checked_zkey(Path::new(&variable(&name)), kind, &bases)
             .unwrap_or_else(|error| panic!("{kind}: {error:#}"));
         println!("{kind} zkey passes the import gates");
     }
 }
 
 /// README steps 3 and 5: the powers of tau is a public transcript of
-/// [`PUBLIC_PTAU`] and passes the reference-string checks for both circuits'
-/// domains: `ZKAPI_PTAU=powersOfTau28_hez_final_16.ptau cargo test --release
+/// [`PUBLIC_PTAU`] and passes the reference-string checks for every circuit's
+/// domain: `ZKAPI_PTAU=powersOfTau28_hez_final_15.ptau cargo test --release
 /// -p zkapi-proof --test zkey_import public_powers_of_tau_passes_the_import_checks
 /// -- --ignored`.
 #[test]
@@ -1171,10 +1185,15 @@ fn public_powers_of_tau_passes_the_import_checks() {
         public.name,
         hex::encode(ptau.sha256())
     );
-    for kind in [KeyKind::Request, KeyKind::Withdrawal] {
-        let n = circuit_shape(kind).unwrap().domain_size;
+    let mut domains: Vec<usize> = KeyKind::ALL
+        .iter()
+        .map(|kind| circuit_shape(*kind).unwrap().domain_size)
+        .collect();
+    domains.sort();
+    domains.dedup();
+    for n in domains {
         ptau.lagrange_bases(n)
-            .unwrap_or_else(|error| panic!("{kind}: {error:#}"));
-        println!("{kind}: the domain of {n} points passes the reference-string checks");
+            .unwrap_or_else(|error| panic!("domain {n}: {error:#}"));
+        println!("the domain of {n} points passes the reference-string checks");
     }
 }

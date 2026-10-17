@@ -14,8 +14,9 @@
 //!    activates no dev-dependency, so it sees the library as a production
 //!    binary that does not enable `dev-setup` does. The check fails unless
 //!    the build accepts only `mpc-1`, and refuses the committed development
-//!    setup with every loader and development keys relabelled `rehearsal` or
-//!    `mpc-1`.
+//!    setup with every loader (the request and withdrawal provers and
+//!    verifiers, and the insertion prover and verifier of each batch size)
+//!    and development keys of every kind relabelled `rehearsal` or `mpc-1`.
 //! 2. **The production builds.** A production binary gets `dev-setup` when
 //!    any package of its build enables the feature on its normal dependency
 //!    on `zkapi-proof`, and building this crate alone cannot see that. So
@@ -40,7 +41,12 @@
 //! 3. **The ceremony setup.** `protocol/setup/v2-concession` must agree with
 //!    the pins. While `CEREMONY_VK_KECCAK256` is `None`, the directory holds
 //!    no keys (committed keys would be refused by every release build). Once
-//!    the pins are set, each of its keys loads under the release policy.
+//!    the pins are set, each of its ten keys loads under the release policy.
+//!
+//! The operator's activation worker loads the insertion keys with the same
+//! loaders, so it is held to the same pins. A worker built from a package
+//! that none of these production builds names needs its own entry in
+//! `PRODUCTION_BUILDS`.
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,10 +56,11 @@ use ark_bn254::Bn254;
 use ark_groth16::{ProvingKey, VerifyingKey};
 use zkapi_proof::compact::{
     accepted_setup_ids, decode_compressed_for, dev_setup_build, hex32, key_header, setup,
-    strip_key_header, KeyKind, RequestProver, RequestVerifier, SetupManifest, VkPins,
-    WithdrawalProver, WithdrawalVerifier, CEREMONY_SETUP_ID, CEREMONY_VK_KECCAK256,
-    REHEARSAL_SETUP_ID, RELEASE_SETUP_IDS, SETUP_MANIFEST_FILE,
+    strip_key_header, InsertionProver, InsertionVerifier, KeyKind, RequestProver, RequestVerifier,
+    SetupManifest, VkPins, WithdrawalProver, WithdrawalVerifier, CEREMONY_SETUP_ID,
+    CEREMONY_VK_KECCAK256, REHEARSAL_SETUP_ID, RELEASE_SETUP_IDS, SETUP_MANIFEST_FILE,
 };
+use zkapi_proof::insertion::INSERTION_SIZES;
 
 /// The feature a production build must not give `zkapi-proof`.
 const DEV_SETUP_FEATURE: &str = "dev-setup";
@@ -278,11 +285,11 @@ fn load_release_key<T: zkapi_proof::compact::SetupKey>(
 }
 
 /// The ceremony setup directory agrees with `pins`: without pins it holds no
-/// keys and no manifest; with pins its four keys load under the release
-/// policy, each proving key holds its verifying key, and `manifest.json`
-/// names the same keys.
+/// keys and no manifest; with pins its ten keys (every kind) load under the
+/// release policy, each proving key holds its verifying key, and
+/// `manifest.json` names the same keys.
 fn check_ceremony_directory(directory: &Path, pins: Option<&VkPins>) -> Result<()> {
-    let kinds = [KeyKind::Request, KeyKind::Withdrawal];
+    let kinds = KeyKind::ALL;
     let Some(pins) = pins else {
         for file in kinds
             .iter()
@@ -365,32 +372,60 @@ fn main() -> Result<()> {
         WithdrawalVerifier::load(&dev),
         "not accepted",
     )?;
+    for size in INSERTION_SIZES {
+        refused(
+            &format!("the development {size}-note insertion proving key"),
+            InsertionProver::load(&dev, size),
+            "not accepted",
+        )?;
+        refused(
+            &format!("the development {size}-note insertion verifying key"),
+            InsertionVerifier::load(&dev, size),
+            "not accepted",
+        )?;
+    }
 
-    let request_vk = std::fs::read(dev.join("request.vk"))?;
-    refused(
-        "a development key labelled rehearsal",
-        RequestVerifier::from_bytes(&relabel(&request_vk, REHEARSAL_SETUP_ID, KeyKind::Request)?),
-        "not accepted",
-    )?;
     let expected = if CEREMONY_VK_KECCAK256.is_some() {
         "not the pinned ceremony key"
     } else {
         "no mpc-1 verifying keys are pinned"
     };
-    refused(
-        "a development key labelled mpc-1",
-        RequestVerifier::from_bytes(&relabel(&request_vk, CEREMONY_SETUP_ID, KeyKind::Request)?),
-        expected,
-    )?;
+    for kind in KeyKind::ALL {
+        let vk = std::fs::read(dev.join(kind.verifying_key_file()))?;
+        for (setup_id, expected) in [
+            (REHEARSAL_SETUP_ID, "not accepted"),
+            (CEREMONY_SETUP_ID, expected),
+        ] {
+            let bytes = relabel(&vk, setup_id, kind)?;
+            let loaded = match kind {
+                KeyKind::Request => RequestVerifier::from_bytes(&bytes).map(drop),
+                KeyKind::Withdrawal => WithdrawalVerifier::from_bytes(&bytes).map(drop),
+                KeyKind::Insertion1 | KeyKind::Insertion4 | KeyKind::Insertion16 => {
+                    let size = kind.insertion_size().expect("insertion kind");
+                    InsertionVerifier::from_bytes(&bytes, size).map(drop)
+                }
+            };
+            refused(
+                &format!("a development {kind} key labelled {setup_id}"),
+                loaded,
+                expected,
+            )?;
+        }
+    }
 
     let ceremony: PathBuf = setup_root.join("v2-concession");
     check_ceremony_directory(&ceremony, CEREMONY_VK_KECCAK256.as_ref())?;
     if CEREMONY_VK_KECCAK256.is_some() {
-        // The loaders of this build, as the daemons and clients call them.
+        // The loaders of this build, as the daemons, clients and the
+        // activation worker call them.
         RequestProver::load(&ceremony)?;
         RequestVerifier::load(&ceremony)?;
         WithdrawalProver::load(&ceremony)?;
         WithdrawalVerifier::load(&ceremony)?;
+        for size in INSERTION_SIZES {
+            InsertionProver::load(&ceremony, size)?;
+            InsertionVerifier::load(&ceremony, size)?;
+        }
     }
 
     check_production_builds(&crate_dir.join("../../../.."), PRODUCTION_BUILDS)?;
@@ -411,7 +446,8 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use zkapi_proof::compact::{
-        decode_compressed, write_setup_directory, SetupProvenance, REQUEST_VERIFYING_KEY_FILE,
+        decode_compressed, write_setup_directory, SetupKeys, SetupProvenance,
+        INSERTION16_PROVING_KEY_FILE, INSERTION4_VERIFYING_KEY_FILE, REQUEST_VERIFYING_KEY_FILE,
         WITHDRAWAL_PROVING_KEY_FILE,
     };
 
@@ -563,7 +599,11 @@ mod tests {
         let dir = scratch("unpinned");
         std::fs::write(dir.join("README.md"), "keys come later\n").unwrap();
         check_ceremony_directory(&dir, None).unwrap();
-        for file in [REQUEST_VERIFYING_KEY_FILE, SETUP_MANIFEST_FILE] {
+        for file in [
+            REQUEST_VERIFYING_KEY_FILE,
+            INSERTION4_VERIFYING_KEY_FILE,
+            SETUP_MANIFEST_FILE,
+        ] {
             std::fs::write(dir.join(file), b"x").unwrap();
             let error = format!("{:#}", check_ceremony_directory(&dir, None).unwrap_err());
             assert!(error.contains("pins no ceremony keys"), "{file}: {error}");
@@ -582,44 +622,68 @@ mod tests {
             let bytes = std::fs::read(dev_setup().join(kind.proving_key_file())).unwrap();
             decode_compressed(&bytes, kind).unwrap().0
         };
+        let keys: Vec<ProvingKey<Bn254>> = KeyKind::ALL.into_iter().map(key).collect();
         let manifest = write_setup_directory(
             &dir,
             CEREMONY_SETUP_ID,
-            &key(KeyKind::Request),
-            &key(KeyKind::Withdrawal),
+            &SetupKeys {
+                request: &keys[0],
+                withdrawal: &keys[1],
+                insertion1: &keys[2],
+                insertion4: &keys[3],
+                insertion16: &keys[4],
+            },
             &SetupProvenance::default(),
         )
         .unwrap();
-        let pin = |hex: &str| -> [u8; 32] {
-            hex::decode(hex.trim_start_matches("0x"))
+        let pin = |kind: KeyKind| -> [u8; 32] {
+            hex::decode(manifest.vk_keccak256.get(kind).trim_start_matches("0x"))
                 .unwrap()
                 .try_into()
                 .unwrap()
         };
         let pins = VkPins {
-            request: pin(&manifest.vk_keccak256.request),
-            withdrawal: pin(&manifest.vk_keccak256.withdrawal),
+            request: pin(KeyKind::Request),
+            withdrawal: pin(KeyKind::Withdrawal),
+            insertion1: pin(KeyKind::Insertion1),
+            insertion4: pin(KeyKind::Insertion4),
+            insertion16: pin(KeyKind::Insertion16),
         };
         check_ceremony_directory(&dir, Some(&pins)).unwrap();
         // Keys committed without pins.
         assert!(check_ceremony_directory(&dir, None).is_err());
-        // Pins of other keys.
-        let swapped = VkPins {
-            request: pins.withdrawal,
-            withdrawal: pins.request,
-        };
-        let error = format!(
-            "{:#}",
-            check_ceremony_directory(&dir, Some(&swapped)).unwrap_err()
-        );
-        assert!(error.contains("not the pinned ceremony key"), "{error}");
-        // A missing key.
-        std::fs::remove_file(dir.join(WITHDRAWAL_PROVING_KEY_FILE)).unwrap();
-        let error = format!(
-            "{:#}",
-            check_ceremony_directory(&dir, Some(&pins)).unwrap_err()
-        );
-        assert!(error.contains(WITHDRAWAL_PROVING_KEY_FILE), "{error}");
+        // Pins of other keys: the request and withdrawal pins exchanged, and
+        // two insertion pins exchanged.
+        for swapped in [
+            VkPins {
+                request: pins.withdrawal,
+                withdrawal: pins.request,
+                ..pins
+            },
+            VkPins {
+                insertion4: pins.insertion16,
+                insertion16: pins.insertion4,
+                ..pins
+            },
+        ] {
+            let error = format!(
+                "{:#}",
+                check_ceremony_directory(&dir, Some(&swapped)).unwrap_err()
+            );
+            assert!(error.contains("not the pinned ceremony key"), "{error}");
+        }
+        // A missing key, of any kind.
+        for file in [WITHDRAWAL_PROVING_KEY_FILE, INSERTION16_PROVING_KEY_FILE] {
+            let bytes = std::fs::read(dir.join(file)).unwrap();
+            std::fs::remove_file(dir.join(file)).unwrap();
+            let error = format!(
+                "{:#}",
+                check_ceremony_directory(&dir, Some(&pins)).unwrap_err()
+            );
+            assert!(error.contains(file), "{error}");
+            std::fs::write(dir.join(file), bytes).unwrap();
+        }
+        check_ceremony_directory(&dir, Some(&pins)).unwrap();
         // The development setup itself, with its hashes as pins: refused,
         // because release builds accept only mpc-1.
         let error = format!(

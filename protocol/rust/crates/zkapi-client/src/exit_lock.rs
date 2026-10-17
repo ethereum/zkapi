@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use zkapi_types::wire::ClearanceOwnershipProofV2C;
 use zkapi_types::Felt252;
 
@@ -38,8 +38,23 @@ pub struct ReleasedProof {
     pub tx_hash: Option<String>,
     /// A kind-2 proof is kept so a clearance retry resends the same proof
     /// instead of releasing a second one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kept_ownership_proof"
+    )]
     pub ownership: Option<ClearanceOwnershipProofV2C>,
+}
+
+/// A kept ownership proof, or none when it was made for an earlier statement
+/// layout (one that proved tree membership at a root): no server accepts it
+/// any more, so it is never sent again, while the `valid_until` recorded
+/// beside it still holds back a second live proof of the state (C3).
+pub(crate) fn kept_ownership_proof<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ClearanceOwnershipProofV2C>, D::Error> {
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|kept| serde_json::from_value(kept).ok()))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,5 +153,46 @@ impl ExitLock {
     /// Remove the lock durably.
     pub fn remove(path: &Path) -> Result<(), ClientError> {
         crate::journal::remove_file_durably(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lock that kept an ownership proof of the earlier, root-bearing
+    /// statement still loads: the proof is dropped, its kind and lifetime
+    /// stay for C3 and E6.
+    #[test]
+    fn a_lock_with_an_earlier_statements_ownership_proof_loads_without_it() {
+        let dir = std::env::temp_dir().join(format!("zkapi-exit-lock-{}", uuid::Uuid::new_v4()));
+        let path = dir.join(EXIT_LOCK_FILE);
+        let rooted = serde_json::json!({
+            "public_inputs": {
+                "protocol_version": 2, "chain_id": 1, "contract_address": "0x1",
+                "active_root": "0x2", "state_signing_key_x": "0x3", "state_signing_key_y": "0x4",
+                "clearance_signing_key_x": "0x5", "clearance_signing_key_y": "0x6",
+                "note_id": 7, "final_balance": 1000, "destination": vec![0u8; 20],
+                "withdrawal_nullifier": "0x7", "kind": 2, "next_nullifier": "0x0",
+                "conceded": 0, "valid_until": 2_000_003_600u64
+            },
+            "proof": {"backend": "groth16_bn254", "proof": "AA=="}
+        });
+        let lock = serde_json::json!({
+            "version": 1, "noteId": 7, "anchor": "0x1", "mode": "mutual", "since": 5,
+            "released": [{"kind": 2, "valid_until": 2_000_003_600u64, "conceded": 0, "ownership": rooted}]
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&lock).unwrap()).unwrap();
+        let loaded = ExitLock::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.released.len(), 1);
+        assert_eq!(
+            (loaded.released[0].kind, loaded.released[0].valid_until),
+            (2, 2_000_003_600)
+        );
+        assert!(loaded.released[0].ownership.is_none());
+        assert!(loaded.ownership_proof_live(2_000_000_000));
+        assert!(loaded.live_ownership_proof(2_000_000_000, 0).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

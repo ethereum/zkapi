@@ -1,46 +1,56 @@
-//! Constraint-level tests of both circuits: every positive case of the WP-A
-//! plan is satisfied, every negative case is unsatisfiable, and the explicit
-//! prover-side rules reject the representable invalid statements.
+//! Constraint-level tests of the five circuits: every positive case of the
+//! WP-A plan is satisfied, every negative case is unsatisfiable, and the
+//! explicit prover-side rules reject the representable invalid statements.
 
 mod common;
 
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use common::*;
 use zkapi_core::v2 as core;
+use zkapi_core::MerkleTree;
 use zkapi_proof::compact::{
-    check_request_rules, check_withdrawal_rules, request_circuit, withdrawal_public_inputs,
-    WithdrawalStatementParams,
+    check_insertion_statement, check_request_rules, check_withdrawal_rules, request_circuit,
+    withdrawal_public_inputs, KeyKind, WithdrawalStatementParams,
 };
-use zkapi_proof::dev::DevState;
-use zkapi_proof::groth16::{
-    nullifier, REQUEST_PUBLIC_INPUTS, REQUEST_ROW_BUDGET, WITHDRAWAL_PUBLIC_INPUTS,
-};
+use zkapi_proof::dev::{tree_with, DevState};
+use zkapi_proof::groth16::{nullifier, REQUEST_ROW_BUDGET};
+use zkapi_proof::insertion::INSERTION_SIZES;
 use zkapi_types::{Felt252, WithdrawalKind};
 
 #[test]
 fn positive_cases_are_satisfied() {
+    let mut kinds = Vec::new();
     for case in positive_cases() {
         let name = case.name;
-        let withdrawal = case.is_withdrawal();
+        let kind = case.kind();
         let cs = case.synthesize();
         assert_eq!(
             cs.which_is_unsatisfied().unwrap(),
             None,
             "positive case {name} is unsatisfied"
         );
-        let inputs = if withdrawal {
-            WITHDRAWAL_PUBLIC_INPUTS
-        } else {
-            REQUEST_PUBLIC_INPUTS
-        };
-        assert_eq!(cs.num_instance_variables(), inputs + 1, "{name}");
+        assert_eq!(
+            cs.num_instance_variables(),
+            kind.public_inputs() + 1,
+            "{name}"
+        );
+        kinds.push(kind);
+    }
+    for kind in KeyKind::ALL {
+        assert!(kinds.contains(&kind), "no positive {kind} case");
     }
 }
 
 #[test]
 fn negative_cases_are_unsatisfiable() {
     let cases = negative_cases();
-    assert!(cases.len() >= 35, "{} negative cases", cases.len());
+    assert!(cases.len() >= 55, "{} negative cases", cases.len());
+    for kind in KeyKind::ALL {
+        assert!(
+            cases.iter().any(|case| case.kind() == kind),
+            "no negative {kind} case"
+        );
+    }
     for case in cases {
         let name = case.name;
         let cs = case.synthesize();
@@ -166,7 +176,6 @@ fn explicit_withdrawal_rules() {
         protocol_version: 2,
         chain_id: CHAIN_ID,
         contract_address: c.deployment.contract_address,
-        active_root: c.tree.root(),
         state_signing_key: c.deployment.state_key(),
         clearance_signing_key: c.deployment.clearance_key(),
         note_id: c.note.note_id,
@@ -180,6 +189,103 @@ fn explicit_withdrawal_rules() {
     witness.conceded = b1 + 1;
     params.destination = DESTINATION;
     assert!(withdrawal_public_inputs(&params, &witness).is_err());
+}
+
+/// The builder names the stored note values: the secret's registration
+/// commitment and the witness's amount and expiry, never a tree root. The
+/// rules refuse a statement naming other values.
+#[test]
+fn explicit_note_binding_rules() {
+    let c = chain();
+    for state in [&c.s0, &c.s1] {
+        let (public, witness) =
+            c.withdrawal_of(state, &withdrawal(WithdrawalKind::Escape, DESTINATION, 0));
+        assert_eq!(public.registration_commitment, c.note.registration());
+        assert_eq!(
+            (public.deposit_amount, public.expiry),
+            (c.note.deposit_amount, c.note.expiry)
+        );
+        assert_eq!(
+            public.note_metadata(),
+            zkapi_types::inputs::note_metadata(DEPOSIT, EXPIRY)
+        );
+        for (what, mutate) in [
+            (
+                "registration_commitment",
+                (|p: &mut zkapi_types::WithdrawalPublicInputsV2C| {
+                    p.registration_commitment =
+                        core::registration_commitment(&Felt252::from_u64(43))
+                }) as fn(&mut zkapi_types::WithdrawalPublicInputsV2C),
+            ),
+            ("deposit_amount or expiry", |p| p.deposit_amount += 1),
+            ("deposit_amount or expiry", |p| p.expiry += 1),
+        ] {
+            let mut wrong = public.clone();
+            mutate(&mut wrong);
+            let error = check_withdrawal_rules(&wrong, &witness)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(what), "{what}: {error}");
+        }
+    }
+}
+
+/// Activating A and then B (K = 1 each) reaches the root the request cases
+/// prove membership in, and one K = 4 batch reaches the same root as four
+/// singletons. The native statement checks refuse what the circuit refuses.
+#[test]
+fn activations_append_the_stored_notes() {
+    let c = chain();
+    let empty = MerkleTree::new();
+    let tree_a = tree_with(&[&c.note]);
+    let activate_a = activation(&empty, std::slice::from_ref(&c.note));
+    let activate_b = activation(&tree_a, std::slice::from_ref(&c.same_secret_note));
+    assert_eq!(
+        activate_a.public.old_root,
+        core::felt_to_field(&empty.root())
+    );
+    assert_eq!(activate_a.public.new_root, activate_b.public.old_root);
+    assert_eq!(
+        activate_b.public.new_root,
+        core::felt_to_field(&c.tree.root())
+    );
+    for circuit in [&activate_a, &activate_b] {
+        check_insertion_statement(&circuit.public, &circuit.witness, 1).unwrap();
+    }
+
+    let notes = batch_notes(0, 4);
+    let batch = activation(&empty, &notes);
+    let mut tree = MerkleTree::new();
+    for note in &notes {
+        let single = activation(&tree, std::slice::from_ref(note));
+        check_insertion_statement(&single.public, &single.witness, 1).unwrap();
+        tree.set_leaf(note.note_id, note.leaf());
+        assert_eq!(single.public.new_root, core::felt_to_field(&tree.root()));
+    }
+    assert_eq!(batch.public.new_root, core::felt_to_field(&tree.root()));
+    for size in INSERTION_SIZES {
+        let circuit = second_batch(size);
+        check_insertion_statement(&circuit.public, &circuit.witness, size).unwrap();
+    }
+
+    let refused = |circuit: &zkapi_proof::insertion::InsertionCircuit, size, expected: &str| {
+        let error = check_insertion_statement(&circuit.public, &circuit.witness, size)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{expected}: {error}");
+    };
+    refused(&batch, 1, "the circuit takes 1");
+    refused(&batch, 16, "the circuit takes 16");
+    refused(&activation(&empty, &batch_notes(2, 4)), 4, "not aligned");
+    let mut stale = activate_b.clone();
+    stale.public.old_root = activate_a.public.old_root;
+    refused(&stale, 1, "old root");
+    let mut occupied = activation(&c.tree, &batch_notes(1, 1));
+    occupied.public.old_root = core::felt_to_field(&c.tree.root());
+    refused(&occupied, 1, "old root");
+    let mut other = batch.clone();
+    other.public.notes.swap(0, 1);
+    refused(&other, 4, "new root");
 }
 
 /// Notes that share a secret have disjoint nullifier chains: neither note's

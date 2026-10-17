@@ -29,5 +29,6 @@ pub mod compact;
 #[cfg(feature = "dev-fixtures")]
 pub mod dev;
 pub mod groth16;
+pub mod insertion;
 pub mod r1cs;
 pub mod reduction;

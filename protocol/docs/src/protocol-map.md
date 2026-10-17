@@ -3,8 +3,9 @@
 | Behavior | Implementation |
 | --- | --- |
 | Registration, leaf, nullifiers, successor anchors, signature messages | [v2.rs](../../rust/crates/zkapi-core/src/v2.rs) |
-| Note tree and sibling paths | [merkle.rs](../../rust/crates/zkapi-core/src/merkle.rs) |
+| Request tree and sibling paths | [merkle.rs](../../rust/crates/zkapi-core/src/merkle.rs) |
 | Request and withdrawal constraints | [groth16.rs](../../rust/crates/zkapi-proof/src/groth16.rs) |
+| Insertion (activation) constraints | [insertion.rs](../../rust/crates/zkapi-proof/src/insertion.rs) |
 | Native proving, verification, signing, key headers and setup policy | [compact.rs](../../rust/crates/zkapi-proof/src/compact.rs) |
 | The `CircomReduction` QAP reduction every prover uses | [reduction.rs](../../rust/crates/zkapi-proof/src/reduction.rs) |
 | R1CS export and ceremony import checks | [r1cs.rs](../../rust/crates/zkapi-proof/src/r1cs.rs), [ceremony.rs](../../rust/crates/zkapi-proof/src/ceremony.rs) |
@@ -12,15 +13,19 @@
 | Native wallet and recovery | [wallet.rs](../../rust/crates/zkapi-client/src/wallet.rs) |
 | Exit rules (S1–S6, C1–C5, E0–E7) and the exit lock | [exit_policy.rs](../../rust/crates/zkapi-client/src/exit_policy.rs), [exit_lock.rs](../../rust/crates/zkapi-client/src/exit_lock.rs) |
 | Browser wallet | [zkapi-browser](../../rust/crates/zkapi-browser/src/lib.rs) |
-| Native ETH deposits, exits, defeats and raises | [ZkApiVault.sol](../../contracts/src/ZkApiVault.sol) |
+| Native ETH deposits, activations, exits, defeats and raises | [ZkApiVault.sol](../../contracts/src/ZkApiVault.sol) |
+| On-chain activation and retirement hashing | [MerkleUpdateLib.sol](../../contracts/src/libraries/MerkleUpdateLib.sol), [Bn254Poseidon.sol](../../contracts/src/libraries/Bn254Poseidon.sol) |
 | EVM verification | [Groth16ProofAdapter.sol](../../contracts/src/adapters/Groth16ProofAdapter.sol) |
 | HTTP processing, durable transcripts and request evidence | [Root server](../../../crates/zkapi-serverd) |
 | Defeats, raises and leaf retirement | [challenge_service.rs](../../../crates/zkapi-serverd/src/challenge_service.rs) |
-| Contract event indexing | [Root indexer](../../../crates/zkapi-indexerd) |
+| Contract event indexing: recorded notes, the activated tree, its paths | [Root indexer](../../../crates/zkapi-indexerd) |
+| Batch activation (insertion proofs) | the operator's activation worker ([docs/activation-worker.md](../../../docs/activation-worker.md)) |
 | Desktop wallet companion and exit kit | [zkapi-companion](../../../crates/zkapi-companion) |
 
 Registration commits to the user's secret. The leaf also commits to the note
-ID, deposit and expiry. Both circuits include that private leaf in the balance
-commitment, so a signed state remains bound to its original note. The
+ID, deposit and expiry. The request and withdrawal circuits include that
+private leaf in the balance commitment, so a signed state remains bound to its
+original note; the withdrawal statement makes the commitment and the packed
+deposit and expiry public, so the vault binds it to the note it stores. The
 nullifier includes the note ID, and each signed state's anchor is derived from
 the previous state's nullifier.

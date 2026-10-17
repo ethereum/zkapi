@@ -46,7 +46,8 @@ fn real_systems() -> Vec<ConstraintSystemRef<Fr>> {
         &withdrawal(WithdrawalKind::Escape, DESTINATION, 1_000),
     );
     let withdrawal = synthesize(withdrawal_circuit(&public, &witness).unwrap(), mode).unwrap();
-    vec![request, withdrawal]
+    let insertion = synthesize(second_batch(4), mode).unwrap();
+    vec![request, withdrawal, insertion]
 }
 
 #[test]
@@ -163,6 +164,20 @@ fn proofs_match_ark_circom_with_the_development_keys() {
     let theirs =
         Groth16::<Bn254, Upstream>::create_proof_with_reduction(circuit, &pk, r, s).unwrap();
     assert_eq!(ours, theirs);
+
+    let circuit = second_batch(16);
+    let (pk, _): (ProvingKey<Bn254>, _) = decode_compressed(
+        &std::fs::read(dir.join("insertion16.pk")).unwrap(),
+        KeyKind::Insertion16,
+    )
+    .unwrap();
+    let inputs = circuit.public.to_field_elements();
+    let ours = Groth16::<Bn254, Vendored>::create_proof_with_reduction(circuit.clone(), &pk, r, s)
+        .unwrap();
+    let theirs =
+        Groth16::<Bn254, Upstream>::create_proof_with_reduction(circuit, &pk, r, s).unwrap();
+    assert_eq!(ours, theirs);
+    assert!(verify_field_elements(&pk.vk, &inputs, &ours).unwrap());
 }
 
 /// `x * y = z` with public z and private x, y, plus three padding rows.
