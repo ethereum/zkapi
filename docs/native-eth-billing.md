@@ -39,9 +39,12 @@ share, or needs more than 100,000 gas to receive it, cannot block a close: the s
 `withdrawTreasuryArrears()`.
 
 The deployment manifest pins the vault address, native asset, and circuit
-`zkapi-v2-concession-v1` with its setup, its exact WASM and key hashes, and the
+`zkapi-v2-concession-v2` with its setup, its exact WASM and key hashes, and the
 runtime code hashes of the vault, adapter and Poseidon library. The circuit
-binds each signed balance to its deposit note. An escape concedes an amount up
+binds each signed balance to its deposit note, and each withdrawal to the note
+the vault stores. A deposit only records the note: it can exit at once, and
+makes requests (is billed at all) only once the operator's activation worker
+has appended it to the request tree. An escape concedes an amount up
 to its state's request budget; the challenger raises it to what the request at
 that state owes, or defeats it with a request proof at the state's successor.
 See [Note-bound commitments](note-bound-commitments.md) and the
@@ -65,7 +68,7 @@ The public deployment manifest and browser trust configuration must agree on:
 
 Pin the RPC URL, chain, vault and protocol/signing/proof-asset
 fields too. Both manifest `proof_setup.circuit_id` and browser
-`trusted_deployment.circuit_id` must equal `zkapi-v2-concession-v1`, the setup
+`trusted_deployment.circuit_id` must equal `zkapi-v2-concession-v2`, the setup
 IDs must agree, and all request/withdrawal proving and verifying key hashes
 must match that setup. The example feed is Sepolia; it does not select a production feed.
 The server checks chain ID, feed decimals and the vault's native-unit getter
@@ -248,10 +251,13 @@ require prompt-private leases with a proof-bound native quote.
 `POST /v2/withdraw/clearance` signs a mutual-close clearance only against a
 kind-2 ownership proof of the same nullifier (`ClearanceRequestV2C`): its
 destination, conceded amount and successor nullifier are zero, its
-`valid_until` lies between now and an hour ahead, and its root is one the
-server saw within `--clearance-root-window-seconds`, the vault's
-`currentRoot()`, or any root the vault ever held (`knownRoots`), so a wallet's
-deposit-time path serves. This circuit has no proof-less clearance: the
+`valid_until` lies between now and an hour ahead, and it names the note as the
+vault stores it: the server reads `notes(noteId)` at the latest block through
+`--native-billing-rpc-url` and requires status `Active`
+(`note_not_active`), the stored registration commitment and the stored amount
+and expiry (`note_binding_mismatch`); a note its RPC does not hold yet is
+retriable `note_not_recorded`. No root is checked, so neither a path nor the
+note's activation is needed. This circuit has no proof-less clearance: the
 legacy clearance budget is gone, and `--allow-legacy-clearance` refuses
 startup. A nullifier with any request row is refused (`nullifier_used`); a
 granted clearance reserves it for good, and asking again signs again. See the

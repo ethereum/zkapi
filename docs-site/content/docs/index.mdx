@@ -8,10 +8,11 @@ API usage with proofs generated in the browser. Each authorization consumes a
 state nullifier; after usage settles, the server signs the next private balance
 and anchor.
 
-These docs describe **protocol v2**, circuit `zkapi-v2-concession-v1` (vault
-revision 3): Groth16 over BN254, Poseidon hashes, and Baby-JubJub commitments
+These docs describe **protocol v2**, circuit `zkapi-v2-concession-v2` (vault
+revision 4): Groth16 over BN254, Poseidon hashes, and Baby-JubJub commitments
 with Schnorr signatures. Its concession exit lets a user leave without any
-cooperation from the operator.
+cooperation from the operator, bound to the note the vault recorded, with no
+Merkle path.
 
 ## What you get
 
@@ -41,7 +42,8 @@ cooperation from the operator.
 ## How the pieces fit
 
 **The wallet** keeps the secret, note metadata, balance, blinding, anchor, and
-server signature locally. It proves active membership and sufficient funds,
+server signature locally. Once its note is activated, it proves membership at
+the current root and sufficient funds,
 then sends a nullifier, a rerandomized note-bound commitment, an authorization
 tag, and a Groth16 proof. The browser SDK runs the prover in WASM, using the
 same cryptographic libraries as the native Rust wallet library.
@@ -52,7 +54,8 @@ It issues short-lived OpenRouter keys against proof-bound native ETH billing
 quotes and settles their measured usage. Prompts and responses pass directly
 between the client and OpenRouter.
 
-**The vault, indexer, and challenge service** maintain the note tree, verify
+**The vault, indexer, activation worker and challenge service** record
+deposits, append them to the request tree in proved batches, verify
 withdrawals on-chain, defeat escapes from states the user already spent, and
 raise escapes that concede less than the user's last request owes.
 
@@ -74,7 +77,7 @@ balance update and clearance, but cannot block an exit. See
 
 The current Groth16 and Baby-JubJub construction is not post-quantum. The
 checked-in proving keys are a single-party development setup; production keys
-come from a multi-party ceremony that has not run yet, and no revision-3 vault
+come from a multi-party ceremony that has not run yet, and no revision-4 vault
 is deployed. Artifact hashes establish identity, not setup security. See
 [Cryptography](/docs/cryptography) for setup trust and compatibility requirements.
 

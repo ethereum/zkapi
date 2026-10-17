@@ -2,8 +2,8 @@
 
 The hardened vault this guide described (`vault_revision` 2, circuit
 `zkapi-v2-note-bound-v1`) was built but never deployed. The concession-exit
-vault (revision 3, circuit `zkapi-v2-concession-v1`) replaces it, so users
-migrate once, from the legacy vault straight to revision 3.
+vault (revision 4, circuit `zkapi-v2-concession-v2`) replaces it, so users
+migrate once, from the legacy vault straight to revision 4.
 
 Follow [Migrating to the concession-exit vault](migration-concession-vault.md).
 Its Phase 0 is this guide's Phase 0, the in-place hardening of the legacy

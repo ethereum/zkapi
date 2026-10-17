@@ -70,8 +70,10 @@ network fee from the payout (`fees: 'payout'`, through an ERC-4337 paymaster),
 so the payout address needs no ETH; the vault is unchanged.
 
 The packaged WASM and proving keys support the current circuit
-`zkapi-v2-concession-v1` (vault revision 3), with the development setup until
-the multi-party ceremony has run. Until a revision-3 vault is deployed, the
+`zkapi-v2-concession-v2` (vault revision 4), with the development setup until
+the multi-party ceremony has run. A deposit can be withdrawn at once and
+makes requests once the operator has activated it (appended it to the request
+tree); the SDK shows such a note as activating. Until a revision-4 vault is deployed, the
 packaged network profiles are placeholders and `npm run build:browser` and
 `npm run build:mainnet` refuse them by design (`deployment_not_deployed`);
 `npm run verify:builds` checks exactly that. Notes of the earlier circuit
@@ -82,7 +84,7 @@ artifact hashes; `npm run verify:wasm` rebuilds it reproducibly and compares.
 
 ## Full local lifecycle acceptance
 
-Run `npm run test:e2e:v2` to build and test circuit `zkapi-v2-concession-v1`
+Run `npm run test:e2e:v2` to build and test circuit `zkapi-v2-concession-v2`
 end to end on a fresh local chain. It covers the honest flow and the Sepolia
 drill scenarios that run locally, and writes a gas report. The drill scenarios
 include withholding, bad successor anchors, a lying expiry check, forced and
@@ -99,13 +101,18 @@ withdrawal encoders' calldata to an Anvil vault.
 ## Operator services
 
 - `zkapi serverd`: native ETH lease authorization, settlement and Schnorr signing.
-- `zkapi-indexerd` / `zkapi indexer`: vault event indexing and Merkle paths
-  from a view verified against the vault.
+- `zkapi-indexerd` / `zkapi indexer`: vault event indexing (recorded notes,
+  activations, retirements) and request-tree paths from a view verified
+  against the vault.
+- `zkapi-activated`: the activation worker; appends recorded notes to the
+  request tree in proved batches of 1, 4 or 16 (`activateNotes`), so deposits
+  become request-capable ([activation worker](docs/activation-worker.md)).
 - `zkapi db init`: create the server database with its append-only request
   evidence and bind it to the deployment manifest, before any daemon starts.
 - `zkapi-challenged`: durable escape monitoring; defeats escapes from spent
   states, raises under-conceded escapes, and retires a closed note's leaf
-  after a missed defeat; private status endpoints.
+  after a missed defeat (once the note is activated); private status
+  endpoints.
 - `zkapi signing-keys`: derive deployment public keys from operator seeds
   (the published development keys are rejected).
 - `zkapi settlement reopen`: with the API server stopped, verify, repair and
@@ -119,7 +126,8 @@ are no default seeds. The server refuses to start unless their keys equal the
 vault's immutable keys and the vault, adapter and Poseidon library match the
 manifest. Use [deployment instructions](docs/deployment.md),
 [Docker operation](docker/aws/README.md),
-[challenge service operation](docs/challenge-service.md) and the
+[challenge service operation](docs/challenge-service.md),
+[activation worker operation](docs/activation-worker.md) and the
 [concession-vault migration runbook](docs/migration-concession-vault.md). The
 browser sends prompts directly to the inference provider; the server handles
 authorization and settlement.
@@ -136,9 +144,11 @@ it is not part of connecting a client to the configured vault.
 
 The active protocol uses Groth16 over BN254, Poseidon, note-bound Baby-JubJub
 commitments and Schnorr signatures, a nullifier chain whose successor anchors
-are derived from the spent nullifier, and a 32-level append-only Merkle tree.
-The ledger uses integer gwei. An escape concedes at most the request budget of
-the state it leaves and needs no operator cooperation. Production keys need
+are derived from the spent nullifier, and a 32-level append-only request tree
+whose root the vault keeps, updated by proved insertion batches. Withdrawals
+are bound to the note the vault records and need no Merkle path. The ledger
+uses integer gwei. An escape concedes at most the request budget of the state
+it leaves and needs no operator cooperation. Production keys need
 the multi-party setup described in
 [the ceremony setup](protocol/setup/v2-concession/README.md); the committed
 keys are a single-party development setup.

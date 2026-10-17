@@ -1,8 +1,8 @@
 # Operating the v2 escape challenge service
 
 `zkapi-challenged` is the operator's defence against stale and under-conceded
-escapes from the concession-exit vault (circuit `zkapi-v2-concession-v1`,
-vault revision 3). It follows every pending escape, reads the API server's
+escapes from the concession-exit vault (circuit `zkapi-v2-concession-v2`,
+vault revision 4). It follows every pending escape, reads the API server's
 append-only request evidence, and, before each escape's deadline:
 
 - **defeats** it with `challengeEscapeWithdrawal` when it holds a verified
@@ -11,7 +11,7 @@ append-only request evidence, and, before each escape's deadline:
 - otherwise **raises** its concession with `raiseEscapeConcession` to what the
   request at the escaped state owes;
 - after a missed defeat, **retires** the closed note's leaf with
-  `retireClosedLeaf`.
+  `retireClosedLeaf`, once the note is activated.
 
 It sends EIP-1559 transactions whose fees rise as the deadline approaches. It
 never signs a balance or changes usage accounting. The design is in §5.4 of
@@ -108,7 +108,7 @@ row that `zkapi db init` writes, and refuses an older database with "run
   circuit, setup and verifying-key hashes, and that its own proof setup's
   verifying keys hash to the same values;
 - the startup probes, over the RPC after an `eth_chainId` check: the vault's
-  `CONCESSION_ESCAPE_VERSION()` is 1 and `ROOT_HISTORY_WINDOW()` 86400, its
+  `CONCESSION_ESCAPE_VERSION()` and `NOTE_BOUND_EXIT_VERSION()` are 1, its
   `proofAdapter()` is the manifest's, the adapter's `CIRCUIT_ID_HASH()`,
   `REQUEST_VK_HASH()` and `WITHDRAWAL_VK_HASH()` equal the local values, and
   the runtime code hashes of the vault, adapter and Poseidon library equal the
@@ -127,7 +127,7 @@ the API server restarts and recovers the database.
 
 ## Evidence and decisions
 
-Each poll reads, for every pending escape, `pendingWithdrawals(noteId)` (6
+Each poll reads, for every pending escape, `pendingWithdrawals(noteId)` (5
 words) and `pendingConcessions(noteId)` (3 words) at the same block: the
 escaped nullifier `N`, the successor nullifier `N⁺`, the state balance `B`, the
 concession `c` and the deadline. Its evidence is the server's
@@ -198,7 +198,8 @@ deployment binding (its state key must be the vault's), and the complete call
 with `eth_call`. It never rewrites a historical public root: request evidence
 is valid at any root. A defeat's gas limit is 600,000 and a raise's 450,000,
 each raised to the estimate plus 20% when that is higher; a leaf retirement's
-is its estimate plus 20%, about 7.2M.
+is its estimate plus 20%, about 2.0M (CI's Forge measures the call at
+1,648,631 gas).
 
 A leaf retirement needs the indexer's path for the note at the vault's live
 root. A path whose siblings do not hash to it is `indexer_path_behind` (a
@@ -276,11 +277,16 @@ concession already covers the raise (`raised`, read again next poll);
 `NotSuccessorEvidence()`, `NotStateEvidence()` and `InvalidProof()` mean the
 evidence does not fit the vault's escape or verifier (`evidence_invalid`,
 critical at once).
-A leaf retirement reverts `StaleRoot()` (`0x607447de`) when an unrelated
-deposit or retirement changes the root first; it is blocked as
-`indexer_path_behind` and rebuilt from a fresh path. Anyone can cause such a
-race at their own gas cost, and a reverted retirement still pays most of its
-gas, so fund the sender for reverted attempts. Defeats and raises do no
+A leaf retirement reverts `StaleRoot()` (`0x607447de`) when an activation or
+another retirement changes the root first (deposits no longer do); it is
+blocked as `indexer_path_behind` and rebuilt from a fresh path. The
+operator's activation worker moves the root with every batch it lands, and
+anyone can activate or race at their own gas cost; a reverted retirement still
+pays most of its gas, so fund the sender for reverted attempts. A retirement
+of a note that is not activated yet reverts `NoteNotActivated()`
+(`0x3d0439b5`); the daemon checks the activation cursor first and waits for
+the activation instead of sending it (`awaiting_activation`, below), and a
+simulation that still reverts `NoteNotActivated()` is reported the same way. Defeats and raises do no
 Merkle work and never revert on a root change. The bundled signer does not
 forward revert data from its simulation, so through it these all appear as
 transient simulation failures and are retried.
@@ -304,7 +310,7 @@ every `--observe-interval-seconds`) and in its `tx_fee_above_cap` refusals, and
 a bound learned from the node's own refusals (`upstream_tx_fee_cap`, below). A
 signer that reports none leaves the daemon's own value. At 1 ETH the ceiling
 allows about 1,666 gwei for a 600,000-gas defeat, about 2,222 gwei for a
-450,000-gas raise, and about 138.9 gwei for a 7.2M-gas leaf retirement,
+450,000-gas raise, and about 500 gwei for a 2.0M-gas leaf retirement,
 whatever the fee cap. Set both
 variables to the RPC fee cap of the node behind the signer; in
 [the Docker deployment](../docker/aws/README.md#challenge-signer-and-daemon) the
@@ -368,7 +374,7 @@ only when it is created, so recreate it
 the ceiling as described above, starting with the node's RPC fee cap; raising
 only the fee cap changes nothing. Fund the sender for every transaction that may be pending at
 once plus reverted attempts: each needs gas limit x fee cap (600,000 gas for a
-defeat, 450,000 for a raise, about 7.2M for a leaf retirement), but never more
+defeat, 450,000 for a raise, about 2.0M for a leaf retirement), but never more
 than the ceiling. Size it for `⌈m/2⌉` defeats per note (a user holding `m`
 archived states can force that many, each about 375,000 gas), at most 64
 concurrent escapes, and a 20% margin. Status warns when the balance cannot
@@ -442,13 +448,39 @@ turns to `retiring_leaf` and the daemon calls
 That bounds the operator's loss: the API server admits requests only at the
 current root, so once the leaf is retired it refuses every request built on
 the note, including from the owner's newer state. The obligation stays a
-warning until the retirement mines; a zero leaf means it is done. Set
+warning until the retirement mines; a zero leaf in an activated slot means it
+is done.
+
+A note can exit before it is activated, and activation appends every
+recorded note's original leaf whatever its status, so a note whose missed
+defeat paid out before its activation has no leaf to retire yet and gets one
+when the activation worker reaches it. The daemon keeps such an obligation as
+`retiring_leaf`, blocked by `awaiting_activation`, and re-reads the vault's
+root and `activationCursor()` at one block every poll until
+`noteId < activationCursor()`, then retires the leaf the activation appended
+with the indexer's path. While it waits it sends nothing: a nonce reserved
+for the retirement on which nothing was broadcast is released, and one
+already broadcast is left to mine. Until the activation the note cannot make
+requests either, so the exposure is the same as before any retirement: it
+begins with the activation and ends when the retirement mines. Set
 `ZKAPI_CHALLENGE_RETIRE_ON_MISS` to the same value for the signer sidecar,
 which refuses every retirement when it is `false`.
 
+`awaiting_activation` is not critical at once: like the other waits it warns
+after `--blocked-warning-seconds` and turns critical after
+`--critical-blocked-seconds`, counted from when the obligation was first
+blocked. The activation worker normally activates a note within
+`--max-activation-wait-seconds` (30 by default) plus a proof and a block, so
+an obligation still waiting at the warning threshold points at the worker:
+check its `/status` and, if it cannot recover, activate with
+`activateNotesOnChain` from `activationCursor()` up to and including the note,
+one aligned batch at a time: the vault accepts only the batch at the cursor
+([the permissionless fallback](activation-worker.md#the-permissionless-fallback)'s
+loop, with `TARGET` set to the note).
+
 ### The signer's retirement budget
 
-A leaf retirement costs about 6M gas, far more than a defeat or a raise, so
+A leaf retirement costs about 1.65M gas, over four times a defeat, so
 the bundled signer bounds what a compromised daemon host could spend on it:
 
 - it signs `retireClosedLeaf` only while `ZKAPI_CHALLENGE_RETIRE_ON_MISS` is
@@ -692,8 +724,8 @@ critical at once when blocked by `evidence_invalid`, `evidence_db_error`,
 `base_fee_above_fee_cap`, `base_fee_above_max_fee`, `fee_cap_reached`,
 `tip_cap_reached`, `fee_reserve_held`, `tx_fee_cap_reached`,
 `tx_fee_above_cap`, `insufficient_balance`, `nonce_conflict`,
-`nonce_blocked`) warn after `--blocked-warning-seconds` and turn critical
-after `--critical-blocked-seconds`. Each obligation also shows its `evidence`
+`nonce_blocked`, `awaiting_activation`) warn after `--blocked-warning-seconds`
+and turn critical after `--critical-blocked-seconds`. Each obligation also shows its `evidence`
 kind (`successor`, `settled`, `unsettled`, `never_delivered`,
 `reserved_without_lease`, `clearance`, `unknown`, `corrupt`, `unavailable` or
 `leaf`) and, once known, what is owed.
@@ -729,11 +761,11 @@ when challenges are blocked.
 
 ## Indexer divergence
 
-Defeats and raises need no indexer. A diverged indexer still blocks leaf
-retirements, which need its path at the live root, weakens escape
-completeness (its pending-escapes list), stops the API server's admission
-(`root_unavailable`), and leaves deposits and clients without a deposit-time
-path or an exit RPC without Merkle paths. The daemon compares the indexer's
+Defeats and raises need no indexer, and neither do exits. A diverged indexer
+still blocks leaf retirements, which need its path at the live root, and the
+activation worker, which needs the siblings of the activation cursor's slot;
+weakens escape completeness (its pending-escapes list); and stops the API
+server's admission (`root_unavailable`) and clients' request paths. The daemon compares the indexer's
 `/v1/tree/root` with the vault's `currentRoot()`. When the indexer reports a
 block hash, it reads `currentRoot()` at that block (EIP-1898): equal roots mean
 the indexer is only lagging, different roots mean it diverged. Older indexers
@@ -753,8 +785,8 @@ replay takes about (head − deployment block) / 1000 log requests at 100 ms
 each plus verification; start it well before the nearest deadline that needs
 a retirement.
 
-The indexer verifies only its root and next note ID, and escape events change
-no leaf, so escape events its RPC's `eth_getLogs` dropped leave its `/health`
+The indexer verifies only its root, next note ID and activation cursor, and
+escape events change no leaf, so escape events its RPC's `eth_getLogs` dropped leave its `/health`
 `ok`. A later event of the note that the indexer applies without having seen
 its escape counts in `missed_re_escape_count` and
 `zkapi_indexer_missed_re_escapes_total` (logged at error level for a

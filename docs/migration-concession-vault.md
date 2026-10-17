@@ -2,11 +2,14 @@
 
 This is the operator runbook for moving a zkAPI deployment from the legacy
 vault (circuit `zkapi-v2-note-bound-v1`) to the concession-exit vault (circuit
-`zkapi-v2-concession-v1`, vault revision 3, capability `exit_concession: 1`).
+`zkapi-v2-concession-v2`, vault revision 4, capabilities `exit_concession: 1`
+and `NOTE_BOUND_EXIT_VERSION()` 1).
 The design and its security argument are in
 [the concession-exit design](design/concession-exit.md); its §10 is the plan
-this runbook carries out, with Amendment A1 (exits accept any root the vault
-ever held).
+this runbook carries out. On revision 4 every exit is bound to the note the
+vault records (no root, no path), and a deposit makes requests once the
+operator's activation worker has appended it to the request tree
+([activation worker](activation-worker.md)).
 
 On a legacy vault, an operator that finalizes a request but withholds its
 signed successor state can defeat every escape the owner can build, and then
@@ -32,7 +35,7 @@ and deposits into the new one. The migration runs in these phases:
 | Phase | What happens | Gate before it starts |
 | --- | --- | --- |
 | [0](#phase-0-harden-the-legacy-stack-in-place) | Upgrade the legacy stack's services in place, from `release/v2-note-bound` | None; do it now |
-| [A](#phase-a-freeze-review-and-trusted-setup) | Freeze the circuits, external review, multi-party setup (G-SETUP), regenerate and publish every pin | All suites green on the revision-3 source |
+| [A](#phase-a-freeze-review-and-trusted-setup) | Freeze the circuits, external review, multi-party setup (G-SETUP), regenerate and publish every pin | All suites green on the revision-4 source |
 | [B](#phase-b-sepolia) | Sepolia drill vault, then production Sepolia, then a 14-day soak | Phase A complete |
 | [C](#phase-c-mainnet) | Mainnet deployment, smoke tests, canary, legacy deposits closed (day 0), `X` announced | Phase B soak and drills green; the mainnet gates below |
 | [D](#phase-d-clientd-releases) | The legacy clientd point release 0.1.7, then the new clientd release | 0.1.7 before the new release; the new release after a Sepolia drill |
@@ -54,24 +57,25 @@ configuration, until the end of Phase E.
 - every drill passed on Sepolia, followed by 14 days of soak with weekly
   drills;
 - the daemons start in order, with the challenger healthy before the first
-  deposit;
+  deposit and the activation worker healthy before deposits are to make
+  requests;
 - the canary is configured (the SDK caps and the server's lease ceiling);
 - the legacy deposit routes are ready to close, the legacy re-cut is ready to publish, and day 0 and the cutoff `X` are announced at least 14 days ahead
   ([the 30-day transition](#the-30-day-transition-for-existing-users)).
 
 ## Compatibility
 
-| Component | Legacy vault (`zkapi-v2-note-bound-v1`) | Concession vault (revision 3, `zkapi-v2-concession-v1`) |
+| Component | Legacy vault (`zkapi-v2-note-bound-v1`) | Concession vault (revision 4, `zkapi-v2-concession-v2`) |
 | --- | --- | --- |
 | Legacy browser SDK re-cut (`v0.1.x`, existing `publicPath`, `/zkapi/`) | Requests and exits; deposits closed | Refused (`incompatible_proof_circuit`) |
 | Browser SDK from `main` (`0.2.x`, `/zkapi/v2c/`) | Refused (circuit mismatch) | Supported |
 | zkapi-clientd 0.1.7 (`release/v2-note-bound`) | Supported; deposits closed; mutual close and a fresh-state escape | Refused (pins) |
-| zkapi-clientd from `main` (`0.2.x`, `bridge_version` 5) | Warns and names the 0.1.7 release; never opens that wallet | Supported |
+| zkapi-clientd from `main` (`0.2.x`, `bridge_version` 6) | Warns and names the 0.1.7 release; never opens that wallet | Supported |
 | zkapi-clientd 0.1.6 and earlier | Supported, with the earlier releases' risks; no escape | Refused |
 | Legacy stack (`0.1.x`: serverd, indexer, challenger from `release/v2-note-bound`) | Supported | Refused (`deployment_binding`, circuit) |
 | New stack (`0.2.x`, from `main`) | Refused | Supported |
 | Request JSON (`ApiRequestV2`) | Same schema; legacy keys | Same schema; new keys |
-| Withdrawal and clearance wire | `WithdrawalPublicInputsV2` (14 fields) | `WithdrawalPublicInputsV2C` (16 fields), `deny_unknown_fields` |
+| Withdrawal and clearance wire | `WithdrawalPublicInputsV2` (14 fields) | `WithdrawalPublicInputsV2C` (17 statement fields, 18 JSON keys: the note's `registration_commitment`, `deposit_amount` and `expiry`, no root), `deny_unknown_fields` |
 | Challenge calldata | `0x8a43467c`, evidence at `N`, with siblings | Defeat `0xda0ce43d`, evidence at `N⁺`, no siblings; raise `0xdd0064ba` |
 | Proving keys and WebAssembly | `protocol/setup/v2` | `protocol/setup/v2-concession` (`mpc-1`), new key URLs |
 
@@ -438,8 +442,8 @@ ignore its Phases 1 to 4, which this runbook replaces.
 ## Phase A: freeze, review and trusted setup
 
 1. **Freeze** the circuits at a tagged revision (`circuit-freeze-v2c`) and
-   record the constraint counts (request 23,990, withdrawal 28,772 at the
-   current revision).
+   record the constraint counts (request 23,990, withdrawal 21,029, insertion
+   16,439, 18,941 and 31,847 for 1, 4 and 16 notes at the current revision).
 2. **External review** of the scope listed under the mainnet gates above.
    Fix forward on `main`; any circuit change returns to step 1.
 3. **G-SETUP**, as written step by step in
@@ -449,15 +453,16 @@ ignore its Phases 1 to 4, which this runbook replaces.
    - use a public powers of tau of at least 2^15 that is on
      `ceremony::PUBLIC_PTAU`, checked against its published Blake2b-512, and
      pin its SHA-256 before the ceremony starts;
-   - at least three phase-2 contributions, at least two of them by parties
-     the operator did not select, then a public random beacon fixed in
-     advance. Short of contributors, mainnet slips: no single-party setup
-     reaches mainnet or production Sepolia, and `Deploy.s.sol` refuses one
-     there;
+   - for each of the five zkeys, at least three phase-2 contributions, at
+     least two of them by parties the operator did not select, then a public
+     random beacon fixed in advance. Short of contributors, mainnet slips: no
+     single-party setup reaches mainnet or production Sepolia, and
+     `Deploy.s.sol` refuses one there;
    - publish the transcript, `r1cs-manifest.json` and every hash; each
      external reviewer downloads the powers of tau from its public source,
-     exports the R1CS themselves and runs `snarkjs zkey verify` on both
-     circuits;
+     exports the R1CS themselves and runs `snarkjs zkey verify` on each of
+     the five circuits (request, withdrawal, insertion1, insertion4 and
+     insertion16): `import_zkey` does not check their contribution chains;
    - import with `import_zkey --setup-id mpc-1` into
      `protocol/setup/v2-concession`, which runs every gate before writing
      anything;
@@ -504,7 +509,7 @@ The drill vault tests the adversarial cases with short timings. It uses the
    ```sh
    cargo build --locked --release --target-dir target/drill \
      --features zkapi-cli/adversary,zkapi-proof/dev-setup \
-     -p zkapi-cli --bin zkapi -p zkapi-serverd --bin zkapi-challenged \
+     -p zkapi-cli --bin zkapi -p zkapi-serverd --bin zkapi-challenged --bin zkapi-activated \
      -p zkapi-indexerd --bin zkapi-indexerd -p zkapi-companion --bin zkapi-walletd
    ```
 
@@ -549,11 +554,22 @@ The drill vault tests the adversarial cases with short timings. It uses the
    `docker/aws/signer.env.example`, its own key and
    `ZKAPI_CHALLENGE_VAULT` set to the drill vault); `zkapi-challenged` with
    `--deployment`, `--settlement-window-seconds 2105` and
-   `--raise-lead-seconds 1800`; then `zkapi [--adversary <mode>] serverd`
+   `--raise-lead-seconds 1800`; the activation signer (a second
+   `node docker/aws/signer/server.mjs`, with `ZKAPI_SIGNER_PROFILE=activation`
+   and only the variables of `docker/aws/activation-signer.env.example`: a key
+   and funded sender of its own, `ZKAPI_ACTIVATION_VAULT` set to the drill
+   vault and `ZKAPI_ACTIVATION_PORT` other than the challenge signer's);
+   `zkapi-activated` with `--deployment`, `--rpc-url` at the activation signer,
+   `--sender` its sender, `--indexer-url`, `--checkpoint`,
+   `--max-fee-per-gas-wei` and `--max-priority-fee-per-gas-wei` (within the
+   activation signer's caps); then `zkapi [--adversary <mode>] serverd`
    with `--deployment` and the drill lease timings. Restart serverd to change
-   its mode. `scripts/v2-acceptance.mjs` starts exactly this stack on Anvil:
-   read its `serverArgs`, `challengerArgs`, `indexerArgs` and signer
-   environment for every flag.
+   its mode, and stop `zkapi-activated` for the drills that need a note before
+   its activation. `scripts/v2-acceptance.mjs` starts the same stack on Anvil,
+   in this order, except that Anvil signs the activation worker's transactions
+   in place of the activation signer: read its `serverArgs`,
+   `challengerArgs`, `activatorArgs`, `indexerArgs` and signer environment
+   for every flag.
 3. Run the drills of design §10.7 B on it, each asserting the client's final
    state as well as balances: the honest flow; a withholding server
    (`--adversary withhold`) and the concession at `T`; `hang`, with the
@@ -569,8 +585,9 @@ The drill vault tests the adversarial cases with short timings. It uses the
    ETH and the credit's claim; a stale escape defeated, `SupersededState`,
    and a re-escape from an older state defeated again; the stale-device
    pre-check; a replay after `valid_until`; a late successor and the switch;
-   an ownership proof sent on chain (`WrongWithdrawalKind`); the indexer down
-   and the rebuild from logs; a pause with an escape pending, a pause past
+   an ownership proof sent on chain (`WrongWithdrawalKind`); a request refused
+   before its note's activation (`note_not_activated`) and served after it;
+   the indexer down and exits of notes never activated; a pause with an escape pending, a pause past
    `maxPauseDuration`, and the re-pause cooldown; a codehash-mismatch profile
    refusing deposits; and a missed defeat (challenger stopped) followed by
    `retireClosedLeaf`. There is no scripted Sepolia drill harness yet: run
@@ -645,8 +662,9 @@ republish them once the gates pass.
 ### B2. Production Sepolia
 
 The new deployment is a separate stack: new public manifest, hostname,
-signer key, exclusive sender and data directory. Prefer a separate VM; to
-share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
+signer keys and exclusive senders (the challenger's and the activation
+worker's) and data directory. Prefer a separate VM; to share one, see
+[Two stacks on one VM](#two-stacks-on-one-vm).
 
 1. **Keys.** Generate fresh state and clearance seeds into the new
    `server.env` and print the public keys
@@ -705,22 +723,25 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    for getter in 'owner()(address)' 'pendingOwner()(address)' 'treasury()(address)' 'paused()(bool)' \
        'challengePeriod()(uint64)' 'noteTtl()(uint64)' 'maxPauseDuration()(uint64)' \
        'requestChargeCap()(uint128)' 'PROTOCOL_VERSION()(uint16)' 'CONCESSION_ESCAPE_VERSION()(uint16)' \
-       'ROOT_HISTORY_WINDOW()(uint64)' 'PAUSE_COOLDOWN()(uint64)' 'ESCAPE_PAYOUT_GAS()(uint256)' \
-       'proofAdapter()(address)'; do
+       'NOTE_BOUND_EXIT_VERSION()(uint16)' 'PAUSE_COOLDOWN()(uint64)' 'ESCAPE_PAYOUT_GAS()(uint256)' \
+       'currentRoot()(uint256)' 'nextNoteId()(uint32)' 'activationCursor()(uint32)' 'proofAdapter()(address)'; do
      printf '%s ' "$getter"; cast call "$NEW_VAULT" "$getter" --rpc-url "$RPC_URL"
    done
    ADAPTER=$(cast call "$NEW_VAULT" 'proofAdapter()(address)' --rpc-url "$RPC_URL")
-   for getter in 'CIRCUIT_ID_HASH()(bytes32)' 'REQUEST_VK_HASH()(bytes32)' 'WITHDRAWAL_VK_HASH()(bytes32)'; do
+   for getter in 'CIRCUIT_ID_HASH()(bytes32)' 'REQUEST_VK_HASH()(bytes32)' 'WITHDRAWAL_VK_HASH()(bytes32)' \
+       'INSERTION1_VK_HASH()(bytes32)' 'INSERTION4_VK_HASH()(bytes32)' 'INSERTION16_VK_HASH()(bytes32)'; do
      printf '%s ' "$getter"; cast call "$ADAPTER" "$getter" --rpc-url "$RPC_URL"
    done
    ```
 
    Expect `owner()` the multisig and `pendingOwner()` zero,
    `PROTOCOL_VERSION` 2, `CONCESSION_ESCAPE_VERSION` 1,
-   `ROOT_HISTORY_WINDOW` 86400, `PAUSE_COOLDOWN` 86400,
-   `ESCAPE_PAYOUT_GAS` 100000, `CIRCUIT_ID_HASH`
-   `0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687`
-   (keccak256 of `zkapi-v2-concession-v1`), and the VK hashes of
+   `NOTE_BOUND_EXIT_VERSION` 1, `PAUSE_COOLDOWN` 86400,
+   `ESCAPE_PAYOUT_GAS` 100000, `currentRoot()` the empty tree's root
+   (`0x1eb94e909bac5b6e3331993876bdde00f84b31e0103a29af6617fc021318b81e`),
+   `nextNoteId()` and `activationCursor()` 0, `CIRCUIT_ID_HASH`
+   `0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1`
+   (keccak256 of `zkapi-v2-concession-v2`), and the five VK hashes of
    `protocol/setup/v2-concession/manifest.json`. Compare the four key getters
    with the printed keys as numbers, and the codehashes with the published
    expected values. Then read the paymaster's state:
@@ -784,20 +805,38 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    `ZKAPI_ALLOW_LEGACY_CLEARANCE` (serverd refuses it). Fund the sender for
    `⌈m/2⌉` defeats per note (a user holding `m` archived states can force that
    many), at most 64 concurrent escapes and a 20% margin, plus leaf
-   retirements: at 100 gwei, about 0.06 ETH per defeat and 0.72 ETH per
-   retirement. Run the operator's ERC-4337 bundler at `BUNDLER_HOST` with the
-   paymaster and the factory whitelisted, as
+   retirements: at 100 gwei, about 0.06 ETH per defeat and 0.2 ETH per
+   retirement. Configure the activation worker as in
+   [Activation worker and its signer](../docker/aws/README.md#activation-worker-and-its-signer):
+   `activation-signer.env` from
+   [`activation-signer.env.example`](../docker/aws/activation-signer.env.example)
+   with another new private key (never the challenge signer's), its
+   upstream RPC, `ZKAPI_ACTIVATION_VAULT` set to the new vault and its fee
+   cap, and `activation.env` with
+   `ZKAPI_ACTIVATION_RPC_URL=http://activation-signer:8547`,
+   `ZKAPI_ACTIVATION_SENDER` (the activation signer's sender) and the
+   worker's fee caps, at most the activation signer's. Fund that sender,
+   apart from the challenger's, for one pending activation (0.072 ETH for 16
+   notes at a 100 gwei cap) plus the activations expected until the next
+   top-up (about 277,000 gas each at low volume, where every deposit is
+   activated alone). Run the operator's ERC-4337 bundler at `BUNDLER_HOST`
+   with the paymaster and the factory whitelisted, as
    [Operating gasless withdrawals](deployment.md#operating-gasless-withdrawals)
    describes.
 7. **Start in this order:** the indexer from `DEPLOY_BLOCK`, `zkapi db init`
-   (the `db-init` service), the challenger, the API server, then the
-   gateway that publishes it (`up` never starts the services that depend on
-   the ones it names, so the gateway needs its own line).
+   (the `db-init` service), the challenger, the activation worker (the
+   `activator` service, which brings up its `activation-signer`), the API
+   server, then the gateway that publishes it (`up` never starts the services
+   that depend on the ones it names, so the gateway needs its own line). The
+   new deployment's `dc` carries both the `challenge` and the `activation`
+   profile; without the latter nothing starts the worker or its signer.
 
    ```sh
+   dc() { sudo docker compose -f docker/aws/compose.yml --profile challenge --profile activation "$@"; }
    dc up -d --wait indexer
    dc run --rm db-init
    dc up -d --wait challenger
+   dc up -d --wait activator
    dc up -d --wait server
    dc up -d --wait gateway
    ```
@@ -811,13 +850,17 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    cannot be read. Each daemon refuses a placeholder or provisional
    manifest, and checks the vault, the adapter and the library against it.
    **The challenger must be healthy, with its alerting armed, before the
-   first deposit.**
+   first deposit, and the activation worker before deposits are to make
+   requests.**
 8. **Acceptance.** Run the Docker guide's acceptance checks: `/health` and
-   `/v1/attestation` report `circuit_id` `zkapi-v2-concession-v1`,
+   `/v1/attestation` report `circuit_id` `zkapi-v2-concession-v2`,
    `setup_id` `mpc-1`, `exit_concession` 1 and the deployment's
    `settlement_window_seconds`; the server log shows
-   `the vault, adapter and Poseidon library match the deployment manifest`.
-   Then a funded lifecycle on Sepolia: deposit, a paid request, a mutual
+   `the vault, adapter and Poseidon library match the deployment manifest`,
+   and the activator's
+   `deployment verified: startup probes and insertion verifying keys`.
+   Then a funded lifecycle on Sepolia: deposit, its activation by the
+   activation worker (a `NotesActivated` with `proved` true), a paid request, a mutual
    close (which sends a kind-2 ownership proof), an escape with `c = 0` from a
    fresh state, and an escape from a served state that the challenger raises.
    Then a gasless close (`fees: 'payout'`) to a payout address with no ETH
@@ -857,8 +900,13 @@ during the soak, and all four again before mainnet.
    carry `--bundler-url`.
    Finalize with `--confirmations 64` and publish the manifest and the
    expected codehashes.
-2. **Start the daemons** in the order of B2, step 7.
-3. **Smoke tests with small notes:** deposit, request, settle, mutual close;
+2. **Start the daemons** in the order of B2, step 7, configured as in B2,
+   step 6 with mainnet values: new keys and exclusive, funded senders for the
+   challenge and the activation signer, whose fee caps
+   (`ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`, `ZKAPI_ACTIVATION_MAX_FEE_PER_GAS_WEI`)
+   are required on chain 1.
+3. **Smoke tests with small notes:** deposit, its activation by the worker (a
+   `NotesActivated` with `proved` true), request, settle, mutual close;
    an escape with `c = 0` from a fresh state, then finalize; a served
    request, then a deliberate escape with `c = 0`, which the challenger
    raises to the charge, then finalize, and check that the client state is
@@ -904,7 +952,7 @@ during the soak, and all four again before mainnet.
    protocol and `Cargo.lock` change, run `scripts/test-companion.sh` on a tree
    from `scripts/prepare-zkapi.sh` (with Foundry on `PATH`, so the companion's
    Anvil test runs) and the Go suite, run a Sepolia drill of its escape
-   route, then release it. It reports `bridge_version` 5 and
+   route, then release it. It reports `bridge_version` 6 and
    `exit_concession` 1, warns about an open legacy wallet without refusing to
    start, and keeps its payment state per deployment.
 3. **Users** close their legacy note with 0.1.7 (mutual close, or
@@ -931,10 +979,11 @@ during the soak, and all four again before mainnet.
    wallet prompt, and a deposit already started stays completable. Builds
    older than the legacy line ignore the flag: hosts remove their deposit
    action. `zkapi-clientd` deposits stop with 0.1.7; to stop older clientd
-   releases too, have the legacy gateway answer 410 on the two deposit-only
-   routes, `/v1/tree/next-note-id` and `/v1/tree/notes/{id}/zero-path`
-   (the legacy challenger reads zero-paths from the internal indexer, not
-   through the gateway):
+   releases too, have the legacy gateway answer 410 on the legacy indexer's
+   two deposit-only routes, `/v1/tree/next-note-id` and
+   `/v1/tree/notes/{id}/zero-path` (the legacy challenger reads zero-paths
+   from the internal indexer, not through the gateway; the new indexer has no
+   zero-path route, since a revision-4 deposit needs no path):
 
    ```nginx
    # Deposit cutoff: the drained vault no longer offers new deposit paths.
@@ -1201,7 +1250,7 @@ default, and `ZKAPI_CHALLENGE_RETIRE_ON_MISS` in both `deployment.env` and
 `retireClosedLeaf`, so the server, which admits only requests at the current
 root, refuses every later proof built on that note. The obligation shows
 `retiring_leaf` until the retirement mines; it needs the indexer's path at
-the live root, about 7.2M gas, and the signer's retirement budget
+the live root, about 1.65M gas, and the signer's retirement budget
 (`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`, default 2 per rolling day, counted
 per nonce). A refusal shows as `signer_refused`, and the signer's
 `challenge_refused` line names its reason:
@@ -1258,9 +1307,10 @@ concession vault, escapes, defeats, raises, closes and expiry claims change no
 leaf, so the indexer's `/v1/escapes/pending` is not covered by its root check
 at all: it is a hint. The challenger tracks escapes from its own event scan
 and reads `pendingWithdrawals` and `pendingConcessions` from the vault, and a
-defeat or a raise needs no indexer. A diverged indexer still blocks deposits,
-leaf retirements, the server's admission (`root_unavailable`) and clients
-without a saved deposit-time path or an exit RPC for a log rebuild.
+defeat or a raise needs no indexer, and neither does any exit. A diverged
+indexer still blocks the activation worker (it needs the activation cursor's
+siblings), leaf retirements, the server's admission (`root_unavailable`) and
+clients' request paths; deposits and exits go on.
 
 ### Gasless withdrawals
 
@@ -1357,11 +1407,16 @@ addresses for new proofs.
 
 **Escape exposure.** Sponsored escape initiations stay disabled in every
 published profile. Each defeated sponsored escape costs the float the
-initiation (about 1.25M gas) on top of the operator's challenge (about 435k
-gas), against the attacker's deposit gas (about 0.3M, recovered later):
-about 5:1 against the operator. Enable them only on the Sepolia drill, and
-decide for mainnet from the `EscapeInitiationOwed` and `owedPaid` data.
-Without them, escapes are sponsored at finalization only.
+initiation (about 1.19M gas) on top of the operator's defeat (357,330 gas)
+and the note's activation (about 37,500 gas in a batch of 16, 276,800
+alone), against the attacker's deposit gas (77,140; the deposit itself comes
+back by a later exit): about 21:1 to 24:1 against the operator (the
+arithmetic is in [Operating gasless withdrawals](deployment.md#operating-gasless-withdrawals)).
+A dust note cannot start a sponsored escape, whose payout must cover its
+costs and `minEscapeNetWei`, but the vault has no minimum deposit, so each
+dust deposit still costs an activation. Enable them only on the Sepolia
+drill, and decide for mainnet from the `EscapeInitiationOwed` and `owedPaid`
+data. Without them, escapes are sponsored at finalization only.
 
 **Uneconomic floor per network.** Clients refuse a sponsored withdrawal whose
 `maxCost + flatFee` exceeds 25% of the payout (`gasless_uneconomic`, unless
@@ -1399,7 +1454,8 @@ when created: use `dc up -d --no-deps --wait signer`, then `challenger`. For
 node's `--rpc.txfeecap` first, then `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` in both
 files. At the default 1 ETH ceiling a 600,000-gas defeat can bid about 1,666
 gwei and a 450,000-gas raise about 2,222 gwei, so fee spikes threaten mostly
-leaf retirements and legacy challenges (about 7.53M gas, about 132 gwei). See
+legacy challenges (about 7.53M gas, about 132 gwei) and leaf retirements
+(about 2.0M gas with the challenger's margin, about 500 gwei). See
 the [fee-spike runbook](../docker/aws/signer/README.md#fee-spike-runbook) and
 [challenge operation](challenge-service.md#when-no-valid-bid-remains).
 
@@ -1410,7 +1466,7 @@ the [fee-spike runbook](../docker/aws/signer/README.md#fee-spike-runbook) and
 | Phase 0 | Roll forward where possible. The previous image tags bring back the defects the hardening fixed: the previous signer needs `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` and refuses the new challenger's fee fields; the previous challenger treats reserved leases as evidence, which burns nullifiers on a legacy vault; the previous server restores the seed fallback and proof-less clearance; the previous indexer needs `indexer.cursor` moved aside and replays from `DEPLOY_BLOCK` (never restore a `.v1-*.bak`). Never restore an older database over newer wallet activity. |
 | Before Phase C, step 4 | Do not publish; the contracts stay unused. An unannounced deployment can be abandoned before anyone deposits. |
 | After new deposits; a client or server bug | Fix forward. Exits never depend on server or client cooperation. Optionally close deposits as in the next row. |
-| After new deposits; a vault or circuit bug that leaves exits sound | Close deposits: set the new SDK profiles to `"deposits": "closed"`, and have the new stack's gateway answer 410 on its two deposit-only routes, `/v1/tree/next-note-id` and `/v1/tree/notes/{id}/zero-path` (the snippet of [Phase E, step 1](#phase-e-drain-and-retire-the-legacy-vault), in this checkout's `nginx.conf`, under a new `ZKAPI_IMAGE_TAG`). The profile flag reaches only the SDK: clientd's profile is compiled in and has no deposits switch, but its companion takes every deposit path from those two routes, so the gateway stops clientd deposits at once. Then ship a clientd release that refuses deposits. Reopen the legacy profiles only while the legacy stack runs, before `X`. Keep the new stack running until the new vault drains. Deploy a corrected vault with a new circuit ID if needed. |
+| After new deposits; a vault or circuit bug that leaves exits sound | Close deposits: set the new SDK profiles to `"deposits": "closed"`, and have the new stack's gateway answer 410 on its deposit-only route, `/v1/tree/next-note-id` (as in the snippet of [Phase E, step 1](#phase-e-drain-and-retire-the-legacy-vault), in this checkout's `nginx.conf`, under a new `ZKAPI_IMAGE_TAG`). The profile flag reaches only the SDK: clientd's profile is compiled in and has no deposits switch, but its companion predicts every deposit's note ID from that route, so the gateway stops clientd deposits at once. Then ship a clientd release that refuses deposits. Reopen the legacy profiles only while the legacy stack runs, before `X`. Keep the new stack running until the new vault drains. Deploy a corrected vault with a new circuit ID if needed. |
 | An exit-soundness bug (forgery) | Pausing stops only new escapes and closes, and only for up to `maxPauseDuration`. Pending escapes finalize at their deadlines unless defeated or raised, and the challenger must act in each window; a forged escape with no successor evidence cannot be defeated. Decide in advance: pause, publish, keep the challengers running, and let honest users exit when exits reopen. The vault has no upgrade path. The canary caps bound honest SDK users' exposure, and the server's lease ceiling bounds per-request service. |
 | The server signs non-derived anchors (a bug) | Clients reject such successors (S4), and the request circuit makes them unspendable. Fix the server; nothing on chain changes. |
 | A clientd release | The new line never reads or changes the legacy wallet and payment files, so reinstalling 0.1.7 finds them as it left them. Each line withdraws only its own vault's notes. |
@@ -1445,11 +1501,21 @@ refuses them everywhere.
 - **Chain censorship** and **operator liveness**: the challenger must land one
   cheap transaction for each escape that needs a defeat or a raise. If it
   misses a defeat, the operator loses at most the stale payout plus service
-  from the owner's newest state until `retireClosedLeaf` lands.
+  from the owner's newest state until `retireClosedLeaf` lands; a note that
+  was not activated when its escape paid out is retired once an activation
+  appends its leaf, and serves no request before that.
 - **The retirement budget.** The signer bounds leaf retirements per rolling
   day, counted per nonce. Anyone who forces root races by front-running
-  deposits can spend it and delay a retirement after a missed defeat; the
+  activations can spend it and delay a retirement after a missed defeat; the
   miss itself is already critical.
+- **Activation liveness.** A deposit makes requests only once activated. If
+  the operator's activation worker stops, deposits wait (anyone can still
+  activate with `activateNotesOnChain`, at far higher gas); exits never wait.
+  A pause also stops activations.
+- **Insertion keys.** Whoever can forge an insertion proof can set the request
+  tree's root: requests without a deposit, and a root nobody else can extend
+  or retire under. Exits do not depend on these keys, so funds stay safe; the
+  ceremony covers the insertion circuits like the others.
 - **Strategic under-conceding.** A raise costs about 335,000 gas, more than
   small request tiers; a modified client may bet that the operator does not
   raise. `ZKAPI_CHALLENGE_RAISE_MIN_UNITS` sets the smallest raise worth it.

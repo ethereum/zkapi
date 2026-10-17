@@ -23,6 +23,23 @@ Folded into 0.2.0's notes at release.
   for the operator. The wallet-pays path is unchanged and remains the
   default. The local acceptance runs the gasless scenarios through a mini
   bundler ([v2 acceptance](docs/v2-acceptance.md), rows 24 to 31).
+- **Activation signer and Compose services.** The signer sidecar takes
+  `ZKAPI_SIGNER_PROFILE`: `challenge` (the default, the challenger's three
+  calls as before) or `activation`, which signs only aligned `activateNotes`
+  batches of 1, 4 or 16 notes to its vault, reads only `ZKAPI_ACTIVATION_`
+  variables (`ZKAPI_ACTIVATION_MAX_GAS` 1,000,000 by default, no retirement
+  settings) and refuses every other call, the challenger's and
+  `activateNotesOnChain` included. A signer refuses to start while its
+  environment holds a variable of the other profile's prefix
+  (`ZKAPI_ACTIVATION_` for a challenge signer, `ZKAPI_CHALLENGE_` for an
+  activation signer). `GET /health`, `zkapi_signerStatus` and the startup
+  line report `profile` (an activation signer omits the retirement fields).
+  `docker/aws/compose.yml` adds, under the Compose profile `activation`, the
+  services `activator` (the launcher's new `zkapi-run activator` role, which
+  runs `zkapi-activated` with `deployment.env` and `activation.env`) and
+  `activation-signer` (with `activation-signer.env`, from the new
+  `docker/aws/activation-signer.env.example`)
+  ([activation profile](docker/aws/signer/README.md#activation-profile)).
 - **Single-party vaults on any chain.** `Deploy.s.sol` no longer refuses a
   `dev` or `rehearsal` setup on Mainnet: off local chains, Mainnet included,
   it needs `ALLOW_DEV_SETUP=1` as before. The operator images
@@ -37,6 +54,68 @@ Folded into 0.2.0's notes at release.
 
 ### Changed
 
+- **Note-bound exits and a request tree updated by proved batches (design C:
+  vault revision 4, circuit `zkapi-v2-concession-v2`, every setup
+  regenerated).** Measured with CI's pinned Forge against revision 3:
+  `deposit` ~1,000,000 gas → 77,140 (on Anvil, in steady state: it only
+  records the note); `mutualClose` 387,321 → 395,591;
+  `initiateEscapeWithdrawal` 495,463 → 481,688; `retireClosedLeaf`
+  1,648,631 (newly pinned; the challenger's gas limit, its estimate plus 20%,
+  is about 2.0M, not the 7.2M the operator docs gave);
+  `activateNotes` 270,403 (1 note), 332,701 (4 notes), 589,430 (16 notes),
+  that is about 36,839 per note at 16 (end to end on Anvil, intrinsic gas and
+  calldata included, about 276,800, 343,200 and 599,900);
+  `activateNotesOnChain` 1,654,441 (1 note); the paymaster's floors
+  `callFloor` 550,000 for a close (escape, finalization and forward
+  unchanged) and `pmVerificationFloor` 410,000 (the profile defaults and
+  `finalizeReserveGas`, now 1,000,000, follow). What changed:
+  - A deposit only records its note (`notes(noteId)`: commitment, amount,
+    expiry, status; `NoteDeposited(noteId, commitment, amount, expiryTs)`)
+    and does no tree work. This replaces the frontier insertion below.
+  - Every withdrawal (escape, mutual close, ownership proof) is bound to the
+    note as stored: the statement's input 3 is the registration commitment
+    `C` and a new input 16 the packed amount and expiry `M = amount +
+    expiry * 2^128` (17 inputs). The vault compares both with `notes(noteId)`
+    before it verifies the proof (`NoteBindingMismatch()`), and the circuit
+    proves `H_reg(secret, 0) = C` instead of tree membership (withdrawal
+    21,029 constraints). A note can exit as soon as it is recorded, and no
+    exit needs a root, a Merkle path, an indexer or a log rebuild.
+  - The vault keeps only the request tree's root. Recorded notes are appended
+    in deposit order, as aligned batches of 1, 4 or 16, by
+    `activateNotes(firstNoteId, count, expectedRoot, newRoot, proof)` with an
+    insertion proof whose inputs the vault builds from its own state (three
+    new verifying keys in the same adapter: 16,439, 18,941 and 31,847
+    constraints), or by the permissionless no-prover
+    `activateNotesOnChain(firstNoteId, count, siblings)`. New:
+    `NotesActivated(firstNoteId, count, newRoot, proved)`, `activationCursor()`,
+    `isActivated(noteId)`, `NOTE_BOUND_EXIT_VERSION()` (1), the errors
+    `StaleActivation()`, `InvalidActivation()` and `NoteNotActivated()`.
+    Activations are paused with deposits.
+  - The operator runs an activation worker, the new `zkapi-activated` binary
+    of zkapi-serverd, that proves the batches: the largest size the recorded
+    notes fill at an aligned cursor, after a bounded wait for a fuller one
+    (`--max-activation-wait-seconds`, 30 by default), sent from a dedicated
+    sender with a signer of its own
+    ([activation worker](docs/activation-worker.md)).
+    Requests are unchanged (12 inputs, the exact current root) and need an
+    activated note: the SDK, the companion and zkapi-clientd report
+    `note_not_activated` and show the note as activating until then.
+  - serverd checks a clearance's ownership proof against the vault's
+    `notes(noteId)` (status `Active`, `C`, `M`) instead of a root window; the
+    challenger retires a missed-defeat note's leaf once the note is activated
+    (blocked meanwhile as `awaiting_activation`, which escalates with time).
+  - serverd's, the challenger's and the activation worker's startup probes
+    require `NOTE_BOUND_EXIT_VERSION() == 1` instead of
+    `ROOT_HISTORY_WINDOW() == 86400`; the indexer and zkapi-clientd require
+    it too, with `CONCESSION_ESCAPE_VERSION() == 1`.
+  - The indexer mirrors recorded notes and activations and verifies its view
+    against `currentRoot()`, `nextNoteId()` and `activationCursor()`; its
+    snapshot adds `activation_cursor`, `note_leaves` and `notes`, and a path
+    adds `activated` and `activation_cursor`.
+  - `Deploy.s.sol` checks all five verifying-key hashes of the adapter and
+    the fresh vault's `NOTE_BOUND_EXIT_VERSION`, root and cursor, and an
+    `mpc-1` setup must match all five ceremony keys; CI also requires
+    `Bn254Poseidon.sol` to be the setup's generated copy.
 - **Network fees cut across the board (vault revision 3, circuit setup
   regenerated).** Measured with CI's pinned Forge against the previous
   revision: `deposit` ~6,000,000 gas → ~1,000,000; `mutualClose` 427,837 →
@@ -77,29 +156,104 @@ Folded into 0.2.0's notes at release.
     (`ReentrancyGuardTransient`, EIP-1153), same error selector.
 
 ### Breaking
+
+- **Vault revision 4, circuit `zkapi-v2-concession-v2`.** New vault, adapter,
+  `Bn254Poseidon` library (`compressPairPath`, `compressSubtree`; a
+  revision-3 `POSEIDON_ADDRESS` cannot be linked) and keys; the
+  never-deployed revision 3 does not carry over. Deployment manifests drop
+  `rootHistoryWindow` and add `noteBoundExitVersion` and
+  `insertion{1,4,16}VkKeccak256`; profiles say `vault_revision` 4 and pin
+  `insertion{1,4,16}_vk_keccak256`. The operator image requires
+  `CIRCUIT_ID=zkapi-v2-concession-v2`, and `docker/aws/compose.yml` tags
+  its images `concession-v2` by default (`ZKAPI_IMAGE_TAG`, was
+  `concession-v1`). Every service refuses a vault whose
+  `NOTE_BOUND_EXIT_VERSION()` is not 1.
+- **Exit wire and calldata.** `WithdrawalPublicInputsV2C` has 17 statement
+  fields in 18 JSON keys: `registration_commitment` replaces `active_root`,
+  and `deposit_amount` and `expiry` are added. `mutualClose` is
+  `0x5acd3b15`, `initiateEscapeWithdrawal` `0x8e110492` and the adapter's
+  `assertValidWithdrawal` `0x330fa82a`; an exit's calldata is 868 bytes (a
+  sponsored `withdraw(bytes)` 964). `pendingWithdrawals` returns 5 words (no
+  `activeRoot`). `NoteDeposited` loses `newRoot` (topic `0x3d5756e3…`).
+  `knownRoots`, `isKnownRoot` and `ROOT_HISTORY_WINDOW` are removed, and
+  neither the vault nor the paymaster raises `UnknownRoot` any more
+  (`NoteBindingMismatch`, `0x41c6633b`, instead).
+- **Deposits make requests only once activated.** Run the activation worker,
+  `zkapi-activated`, with its own sender, signer and insertion proving keys
+  (or activate with `activateNotesOnChain`), or no deposit ever becomes
+  request-capable; exits are unaffected. With Docker, start the Compose
+  profile `activation` (`activator` and `activation-signer`) with
+  `/etc/zkapi/activation.env` and `/etc/zkapi/activation-signer.env`.
+- **No deposit paths.** Clients no longer save a deposit-time path, the
+  companion's `/oa/v1/deposit/path` is removed, its deposit plan drops
+  `zero_path` and `active_root`, and its confirmation ignores
+  `deposit_root` and `deposit_siblings`. Exit kits stay
+  `zkapi-exit-kit-v1`; `merkle_path` and `deposit_path` are optional and
+  ignored.
+- **serverd** drops `--clearance-root-window-seconds`
+  (`ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS`): `zkapi serverd` refuses the flag
+  and ignores the variable. A clearance's `stale_root` is replaced by
+  `400 note_binding_mismatch` and `409 note_not_active` (refusals) and
+  `409 note_not_recorded` (retriable), none of which carries `latest_root`.
+- **Indexer HTTP API.** `/v1/tree/notes/{id}/zero-path` and
+  `/v1/tree/roots/{root}` are removed, `/v1/tree/root` adds
+  `activation_cursor`, `/v1/tree/snapshot` adds `activation_cursor`,
+  `note_leaves` and `notes` (its `leaves` are the tree's: 0 until a note is
+  activated), a path adds `activated` and `activation_cursor`, `/health`
+  reports `activation_cursor` instead of `known_root_count`, and the
+  checkpoint version changes to 4, so an indexer replays from the deployment
+  block. `/v1/tree/snapshot?parts=tree` (the header and `leaves`) and
+  `?parts=records` (the header, `note_leaves` and `notes`) each serve only
+  part of the larger payload; without `parts` it is served whole, and any
+  other value is `400 invalid_request`. The browser SDK asks for `tree` and zkapi-clientd for
+  `records`, and both accept a whole snapshot from an older indexer.
+- **Companion bridge 6.** The companion reports `bridge_version` 6, which
+  zkapi-clientd requires (`withdrawal_bridge_version` stays 1): exit plans
+  carry the 17-input statement and 868-byte calldata, deposits carry no path,
+  `/wallet/status` reports `activated` and `activation_cursor` (from a
+  cached reading, so status never waits on a slow RPC or indexer), a request
+  for a note not activated yet is refused with `note_not_activated`, and one
+  for a note the vault activated before the operator's indexer caught up
+  with `503 indexer_root_lag` (retriable).
+- **SDK deposit recovery.** A pending deposit whose predicted note slot
+  another note took is found by its commitment wherever it was recorded, and
+  is never given up while its transaction may still land; recovery no longer
+  returns `slot_consumed` or `slot_conflict_unconfirmed`. An exact retry of
+  a deposit whose send is unknown reuses that send's sender and nonce, so at
+  most one of the two can be mined (`deposit_retry_nonce_unknown` when the
+  nonce was never saved). A clearance answered `note_not_recorded` is retried
+  with a bounded backoff instead of turning the exit into an escape.
+- **Activation waits.** The SDK waits up to 90 s for a note's activation,
+  extended while the vault's cursor advances (at most 5 minutes), and reports
+  a paused vault (`vault_paused`, `exits_reopen_at`) instead of waiting for an
+  activation that cannot happen. zkapi-clientd saves a deposit the operator's
+  indexer does not record once the owner's exit RPC (`--exit-rpc-url`) shows
+  its final receipt and the same note, so the note can always be escaped;
+  requests still wait for the activation. The exit RPC also confirms a
+  withdrawal's completion, an exit RPC that cannot answer is named in the
+  status (`exit_rpc_unusable`), and a plain-HTTP exit RPC on this machine is
+  dialed directly (loopback addresses only) instead of through the relay.
 - **`deposit(bytes32 commitment, uint128 amount)`** (selector `0x56d2e1ea`)
   replaces `deposit(bytes32,uint128,uint256[32])`: the siblings argument is
-  gone. The SDK (`encodeDeposit`) and zkapi-clientd send the new calldata and
-  keep the deposit-time path locally for the note's exit proof; clientd ties
-  a prepared deposit slot to its signed transaction by nonce
+  gone. The SDK (`encodeDeposit`) and zkapi-clientd send the new calldata;
+  clientd ties a prepared deposit slot to its signed transaction by nonce
   (`signed_nonce`) rather than by the calldata's sibling words.
 - **The note tree's roots change** (see Changed): proofs, paths and roots
   from any earlier deployment or fixture do not carry over, and the browser
   bundle (`sdk/wasm`) must be rebuilt with `scripts/build-browser-client.sh
   --setup dev` for the new node hash before it computes correct roots.
 - **`rootRetiredAt(uint256)` is removed** from the vault (informational, never
-  read on chain; `NoteDeposited` and `ClosedLeafRetired` carry every root
+  read on chain; `NotesActivated` and `ClosedLeafRetired` carry every root
   change).
-
-- None: the change is additive. Profiles without `gasless` (or with
+- Gasless withdrawals are additive: profiles without `gasless` (or with
   `gasless: null`) keep working with the wallet-pays path.
 
 ## [0.2.0] - not yet released
 
-The concession-exit line: circuit `zkapi-v2-concession-v1`, vault revision 3,
-capability `exit_concession: 1`. The release needs a new vault, adapter and
-trusted setup, and none is deployed yet; the gates are in
-[the migration runbook](docs/migration-concession-vault.md).
+The concession-exit line: circuit `zkapi-v2-concession-v2`, vault revision 4,
+capabilities `exit_concession: 1` and `NOTE_BOUND_EXIT_VERSION()` 1. The
+release needs a new vault, adapter and trusted setup, and none is deployed
+yet; the gates are in [the migration runbook](docs/migration-concession-vault.md).
 
 ### Breaking
 
@@ -109,10 +263,11 @@ trusted setup, and none is deployed yet; the gates are in
   request proof at the successor defeats it. Notes cannot move between
   vaults; each owner withdraws from the legacy vault and deposits into the new
   one. Design: [concession-exit](docs/design/concession-exit.md).
-- **Wire formats.** `WithdrawalPublicInputsV2C` has 16 fields
-  (`next_nullifier`, `conceded`, `valid_until`, withdrawal `kind`), challenge
-  calldata is `0xda0ce43d` (defeat) and `0xdd0064ba` (raise), and a request
-  carries the anchor chain. Request JSON keeps its schema and its keys change.
+- **Wire formats.** `WithdrawalPublicInputsV2C` has 17 fields
+  (`registration_commitment`, `next_nullifier`, `conceded`, `valid_until`,
+  withdrawal `kind`, and the note's packed `deposit_amount` and `expiry`),
+  challenge calldata is `0xda0ce43d` (defeat) and `0xdd0064ba` (raise), and a
+  request carries the anchor chain. Request JSON keeps its schema and its keys change.
 - **Services refuse the legacy vault.** serverd, indexerd and the challenger
   read the deployment manifest and refuse another circuit, setup or vault
   (`deployment_binding`). Use a new database, indexer checkpoint, challenge
@@ -123,7 +278,7 @@ trusted setup, and none is deployed yet; the gates are in
   profile of another circuit (`incompatible_proof_circuit`) or setup
   (`setup_mismatch`). Profiles are `not_deployed` placeholders until a vault
   exists.
-- **zkapi-clientd** reports `bridge_version` 5. It warns about an open legacy
+- **zkapi-clientd** reports `bridge_version` 6. It warns about an open legacy
   wallet and names the legacy release, `0.1.7`; it never opens that wallet.
 - **Version numbers.** Every shipped component now carries one version,
   `0.2.0` (the crates were `0.1.0`, the SDK and signer sidecar `0.2.0`,
@@ -133,8 +288,9 @@ trusted setup, and none is deployed yet; the gates are in
 ### Added
 
 - Escape payout credits (`escapePayoutCredits`, `claimEscapePayout`),
-  `raiseEscapeConcession`, an append-only tree with `retireClosedLeaf`, exits
-  against any root the vault ever held (Amendment A1), a bounded pause
+  `raiseEscapeConcession`, exits bound to the recorded note (no root or
+  path), an append-only request tree updated by proved activations (the
+  operator's `zkapi-activated`) with `retireClosedLeaf`, a bounded pause
   (`maxPauseDuration`, a one-day cooldown), and codehash and verifying-key
   pins checked by every service and client.
 - An exit kit (`zkapi-exit-kit-v1`) for the browser SDK, `--exit-rpc-url` for

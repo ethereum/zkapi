@@ -1,7 +1,7 @@
 # Native ETH deployment
 
-The source supports native ETH vaults of circuit `zkapi-v2-concession-v1`
-(vault revision 3). The committed keys are the single-party development setup
+The source supports native ETH vaults of circuit `zkapi-v2-concession-v2`
+(vault revision 4). The committed keys are the single-party development setup
 `dev`, which release builds refuse; production keys come from the multi-party
 ceremony in [the ceremony setup](../protocol/setup/v2-concession/README.md),
 which has not run yet. Publishing code does not establish an independent
@@ -11,7 +11,7 @@ Configure the exact circuit artifacts, contract, code-hash and signing-key
 pins, oracle feed, and denomination for the vault. Preserve persistent
 operator state and keep wallet journals bound to their configuration. A
 deployment of the legacy circuit `zkapi-v2-note-bound-v1` keeps running from
-the release line `release/v2-note-bound`; moving its users to a revision-3
+the release line `release/v2-note-bound`; moving its users to a revision-4
 vault is described in
 [the concession-vault migration runbook](migration-concession-vault.md).
 
@@ -102,10 +102,15 @@ its vault's, treat it as compromised and follow
 ## Contracts
 
 `demo/contracts/script/Deploy.s.sol` links (or deploys) the `Bn254Poseidon`
-library, deploys the circuit's Groth16 adapter and the native-only vault with
-its 11 constructor arguments, and checks the adapter's circuit and
-verifying-key hashes against the setup manifest and the vault's getters
-against the inputs. Unless `GASLESS=0`, the same broadcast then deploys the
+library, deploys the circuit's Groth16 adapter (one contract for the request,
+withdrawal and 1-, 4- and 16-note insertion verifying keys) and the
+native-only vault with its 11 constructor arguments, and checks the adapter's
+circuit and five verifying-key hashes against the setup manifest and the
+vault's getters against the inputs: `PROTOCOL_VERSION` 2,
+`CONCESSION_ESCAPE_VERSION` and `NOTE_BOUND_EXIT_VERSION` 1, the empty tree's
+`currentRoot()`, and `nextNoteId()` and `activationCursor()` 0. The manifest
+records `vaultRevision` 4, `noteBoundExitVersion` and the five
+`*VkKeccak256` hashes. Unless `GASLESS=0`, the same broadcast then deploys the
 gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint
 v0.7.0, stakes it and its transit-account factory, funds its deposit and
 checks its getters ([below](#gasless-withdrawals)). Its header lists the
@@ -124,9 +129,9 @@ with `forge script`. The script links the library itself; no
 | `NOTE_TTL_SECONDS` | Note lifetime; default 30 days |
 | `MAX_PAUSE_DURATION_SECONDS` | Longest a pause blocks escapes and closes; at least twice the challenge period. Required except on local chains (default 7 days). Plan 3,888,000 (45 days) on Mainnet |
 | `REQUEST_CHARGE_CAP` | Per-request gwei limit; the script default is 1,000,000, the published deployments use 50,000, so pass it explicitly |
-| `SETUP_MANIFEST` | The setup's `manifest.json`; the adapter's hashes must match it. Required except on local chains (default `protocol/setup/v2-concession-dev`) |
+| `SETUP_MANIFEST` | The setup's `manifest.json`; the adapter's circuit and five verifying-key hashes must match it. Required except on local chains (default `protocol/setup/v2-concession-dev`) |
 | `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains, Mainnet included ([Single-party setup](#single-party-setup)). Recorded as `allowDevSetup`; default 0 |
-| `POSEIDON_ADDRESS` | An already deployed `Bn254Poseidon` to link; its runtime code hash must equal the compiled library's. Unset deploys a fresh library |
+| `POSEIDON_ADDRESS` | An already deployed `Bn254Poseidon` to link; its runtime code hash must equal the compiled library's (a library deployed for revision 3 does not). Unset deploys a fresh library |
 | `CHAIN_ID` | Optional expected chain ID; a mismatch aborts |
 | `GASLESS` | `1` (default) deploys the gasless-withdrawal paymaster after the vault; `0` skips the block and writes `withdrawalPaymaster: null`. A `forge script` dry run without an RPC has no EntryPoint code, so it needs `GASLESS=0`. An Anvil started with a public chain ID (for example Sepolia's 11155111, as the acceptance harness does) is a public chain to the script: it needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI`, or `GASLESS=0` |
 | `ENTRY_POINT` | The ERC-4337 EntryPoint v0.7.0; default the canonical `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Its runtime must hash to `0x8db5ff69…fc58`, and the SenderCreator at `0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C` to `0x283c9d14…a7689`; on Anvil etch both first (`cast rpc anvil_setCode` from `protocol/contracts/test/fixtures/*.runtime.hex`, as CI does) |
@@ -143,9 +148,11 @@ with `forge script`. The script links the library itself; no
 
 The setup policy is enforced by the script: off local chains (Mainnet
 included) a single-party setup needs `ALLOW_DEV_SETUP=1`, and an `mpc-1` setup
-must have the verifying keys of the committed
+must have all five verifying keys of the committed
 `protocol/setup/v2-concession/manifest.json`, which the ceremony commits with
-its keys. Local chains accept any setup id.
+its keys: a forged insertion proof would set the request tree's root, so the
+insertion keys count as much as the request and withdrawal keys. Local chains
+accept any setup id.
 
 ```sh
 cd demo/contracts
@@ -198,8 +205,10 @@ or fragment; [below](#operating-gasless-withdrawals)). The
 The owner controls an emergency pause and the treasury address. Use a multisig,
 ideally behind a timelock, never a single deployer key:
 
-- `pause()` stops `deposit`, `claimExpired`, `setTreasury`, `acceptTreasury`,
-  `withdrawTreasuryArrears` and `renounceOwnership` until `unpause()`, and
+- `pause()` stops `deposit`, `activateNotes`, `activateNotesOnChain`,
+  `claimExpired`, `setTreasury`, `acceptTreasury`, `withdrawTreasuryArrears`
+  and `renounceOwnership` until `unpause()` (so no note becomes
+  request-capable during a pause; exits stay as below), and
   `mutualClose` and `initiateEscapeWithdrawal` for at most
   `maxPauseDuration()`: from `pausedAt() + maxPauseDuration()` they reopen
   while the vault is still paused. `challengeEscapeWithdrawal`,
@@ -248,9 +257,14 @@ ideally behind a timelock, never a single deployer key:
   A mutual close to a destination that rejects ETH reverts, and withdrawals to
   the zero address or the vault itself revert `InvalidDestination()`.
 
-Withdrawal proofs may use any root the vault ever held (`knownRoots`); no
-withdrawal needs Merkle siblings, and an unknown root reverts `UnknownRoot()`.
-An escape consumes its nullifier and its successor's; a request proof at the
+A deposit only records its note; the note can exit at once and makes requests
+once activated (`activateNotes` with an insertion proof, or the
+permissionless `activateNotesOnChain`; `NotesActivated` events,
+`activationCursor()`, `isActivated(noteId)`). A withdrawal proof names its
+note by the registration commitment and the packed amount and expiry the vault
+stores, which the vault compares before the proof (`NoteBindingMismatch()`);
+no withdrawal needs a root or Merkle siblings. `retireClosedLeaf` needs the
+note activated (`NoteNotActivated()`). An escape consumes its nullifier and its successor's; a request proof at the
 successor defeats it and marks the escaped nullifier in
 `challengedNullifiers`, and a request proof at the escaped nullifier raises
 its concession. The legacy vaults have none of these rules; see
@@ -399,11 +413,16 @@ The [Docker guide](../docker/aws/README.md) configures API, indexer, gateway,
 challenger and a restricted private signer. Start them in this order: the
 indexer, `zkapi db init` (which creates the database with its append-only
 request evidence and binds it to the deployment manifest), the challenger,
-then the API server; the challenger must be healthy before the first deposit.
+the activation worker, then the API server; the challenger must be healthy
+before the first deposit, and deposits wait for the activation worker before
+they can make requests. The worker proves insertions with the setup's
+insertion keys from a funded account of its own and needs the indexer's paths
+([activation worker](activation-worker.md)); without it, anyone can still
+activate with `activateNotesOnChain`, at far higher gas.
 The challenger needs a funded exclusive account, EIP-1559 fee caps whose bids
 fit the transaction fee cap of the node behind its signer
 (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, default 1 ETH, which allows about 1,666 gwei
-for a 600,000-gas defeat and about 138.9 gwei for a leaf retirement), and the
+for a 600,000-gas defeat and about 500 gwei for a leaf retirement), and the
 API server's database: it defeats and raises with the request evidence the
 server records. Keep the API running for every challenge window; see
 [challenge operation](challenge-service.md).
@@ -422,8 +441,9 @@ The indexer (`zkapi-indexerd` or `zkapi indexer`) needs an RPC with EIP-1898
 depth (`--confirmations`, default 12), plus an NTP-synchronized clock
 (`--max-head-age-secs`, default 180; 0 disables it for chains that mine on
 demand). Use a provider other than the `rpc_url` that client manifests pin:
-`zkapi-clientd` corroborates deposits and withdrawals against this indexer's
-tree, and that check is only as independent as the indexer's RPC. That pinned
+`zkapi-clientd` corroborates deposits (the indexer's recorded note leaves) and
+withdrawals against this indexer, and that check is only as independent as the
+indexer's RPC. That pinned
 `rpc_url` must itself serve `eth_getBlockByHash` for recent blocks, which
 `zkapi-clientd` uses to date its deposit search on chain time, and `eth_call`
 for the vault's `currentRoot()`, which it reads before setting a request
@@ -450,7 +470,13 @@ for. It then:
 4. starts the daemons in order: the indexer
    (`--from-block deployBlock --max-head-age-secs 0`), `zkapi db init`, the
    signer sidecar, `zkapi-challenged` (`--deployment`,
-   `--settlement-window-seconds`), then serverd (`--deployment`).
+   `--settlement-window-seconds`), `zkapi-activated` (`--deployment`,
+   `--proof-setup-dir`), then serverd (`--deployment`).
+
+It runs the activation worker (`zkapi-activated`, from an Anvil account of its
+own) after the challenger and waits for it before each note's first request;
+one drill stops it and activates with `activateNotesOnChain` and the siblings
+the indexer serves for the activation cursor.
 
 Its native billing RPC is a loopback mock price feed that forwards every other
 read to Anvil. Use [`scripts/v2-acceptance.mjs`](../scripts/v2-acceptance.mjs)
@@ -460,7 +486,7 @@ demo deployment to Anvil and finalizes its manifest.
 The host application packages the SDK assets for the selected network. Review
 its trusted config against the finalized deployment manifest, on-chain state,
 the published expected code hashes and the selected proof hashes before
-enabling funding. Until a revision-3 vault exists on a network, its packaged
+enabling funding. Until a revision-4 vault exists on a network, its packaged
 profile is a `not_deployed` placeholder that the SDK build refuses.
 
 ### Operating gasless withdrawals
@@ -571,9 +597,29 @@ are too high raise that griefing exposure linearly.
 
 **Escapes.** `escapesEnabled` is false in every published profile
 (`PAYMASTER_ESCAPES=0`). Enabling it means the float pays each sponsored
-initiation (about 1.25M gas) on top of the existing challenge (about 435k
-gas) when the escape is defeated, against the attacker's deposit gas (about
-0.3M, recovered later): about 5:1 against the operator. Enable it on the
+initiation that is defeated, unless a later payout to the same `S` repays
+it, which an attacker avoids. Per defeated escape the operator pays, in gas:
+
+- the sponsored initiation, about 1.19M: `handleOpsEscape` (594,222,
+  measured with a mock adapter) plus two real proof verifications, the
+  paymaster's and the vault's, of about 297,800 each
+  (`paymasterValidationEscapeCold` 397,336 − `validationEscapeMockCold`
+  99,511, in `protocol/contracts/snapshots/gasless-gas.json`);
+- the defeat, 357,330 (`challengeEscapeWithdrawal`);
+- the note's activation, which every deposit costs and a defeat presupposes
+  (the request at the escape's successor needs an activated note): about
+  37,500 in a batch of 16 (599,900 / 16) up to 276,800 for a note activated
+  alone.
+
+That is about 1.58M to 1.82M gas against the 77,140 of the attacker's
+deposit (an Anvil receipt): about 21:1 to 24:1 against the operator. The
+note must hold the payout the paymaster requires (the operation, a gasless
+finalization, `minEscapeNetWei` and both flat fees), which the attacker gets
+back by a later exit, so a dust note cannot start a sponsored escape. Dust
+still costs activation: the vault has no minimum deposit (one unit, 1 gwei)
+and the worker activates every recorded note, so each deposit costs the
+operator 37,500 to 276,800 gas against the depositor's 77,140, up to about
+3.6:1 at low volume, where every deposit is activated alone. Enable it on the
 Sepolia drill, and decide for mainnet from the `EscapeInitiationOwed` and
 `owedPaid` data. Keep `minEscapeNetWei` at least 10 × a typical initiation
 plus finalization cost. While it is disabled, escapes are sponsored only at

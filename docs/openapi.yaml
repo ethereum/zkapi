@@ -4,12 +4,15 @@ info:
   version: 0.2.0
   description: >-
     Native ETH lease, settlement and withdrawal Groth16 protocol API of
-    circuit zkapi-v2-concession-v1 (vault revision 3). Sepolia deployments may
+    circuit zkapi-v2-concession-v2 (vault revision 4). Sepolia deployments may
     require a shared password, advertised by public /health
     testnet_password_required. All service routes then require the
     TestnetPassword header and return 401 testnet_password_required when absent
     or incorrect. Mainnet does not use this gate. Mutual-close clearance
-    requires a kind-2 ownership proof of the note.
+    requires a kind-2 ownership proof of the note, bound to the note the vault
+    stores. A request proves membership of an activated note at the current
+    root; a wallet refuses to prepare one for a note not activated yet
+    (note_not_activated, a client code the server never sends).
 security:
   - TestnetPassword: []
   - {}
@@ -219,22 +222,27 @@ paths:
             clearance_ownership_required (no ownership_proof; nothing
             reserved; not retriable), invalid_proof, invalid_request (a body
             that does not parse, or a nullifier, kind, zero field, validity
-            window or signing-key mismatch), or protocol_mismatch
+            window or signing-key mismatch), protocol_mismatch, or
+            note_binding_mismatch (not retriable; the proof's
+            registration_commitment, deposit_amount or expiry is not what the
+            vault's notes(note_id) stores). Clearance errors carry no
+            latest_root.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "409":
           description: >-
-            stale_root (retriable; the root is not one the server saw within
-            its window, the vault's currentRoot(), or any root the vault ever
-            held; latest_root is the vault's currentRoot()) or nullifier_used
-            (the nullifier has a request row)
+            note_not_active (not retriable; the stored note is pending
+            withdrawal or closed), note_not_recorded (retriable: the vault, as
+            the server's RPC reads it, has no note at note_id yet, for example
+            a deposit it has not seen; retry the same body later), or
+            nullifier_used (the nullifier has a request row)
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "429": {$ref: "#/components/responses/GatewayRateLimited"}
         "500":
-          description: internal_error (retriable), for example a failed vault root read
+          description: internal_error (retriable), for example a failed vault read
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
@@ -329,6 +337,65 @@ paths:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "500": {$ref: "#/components/responses/DatabaseError"}
         "503": {$ref: "#/components/responses/ChainReadUnavailable"}
+  /v1/tree/snapshot:
+    get:
+      security: []
+      summary: Whole-tree snapshot of the indexer's verified view
+      description: >-
+        Served by zkapi-indexerd; the reference gateway publishes /v1/tree/
+        without the Sepolia password. The answer depends only on the view,
+        never on which note a client cares about. The browser SDK asks for
+        parts=tree and zkapi-clientd for parts=records; each also accepts the
+        full snapshot from an indexer that ignores the parameter.
+      parameters:
+        - in: query
+          name: parts
+          required: false
+          description: >-
+            Absent: the header, leaves, note_leaves and notes. tree: the
+            header and leaves only. records: the header, note_leaves and notes
+            only. The fields a part leaves out are absent. The header is root,
+            next_note_id, activation_cursor, block_number and block_hash.
+          schema: {type: string, enum: [tree, records]}
+      responses:
+        "200":
+          description: The requested part of one verified view
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TreeSnapshot"}
+        "400":
+          description: >-
+            invalid_request: parts is neither tree nor records, or is given
+            more than once
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/IndexerError"}
+                  - type: object
+                    properties:
+                      status: {const: error}
+                      error_code: {const: invalid_request}
+                      error_message: {const: parts must be tree or records}
+                      retriable: {const: false}
+        "503":
+          description: >-
+            indexer_unavailable (retriable): the indexer has no verified view
+            of the vault state; retry after Retry-After
+          headers:
+            Retry-After:
+              schema: {const: 5}
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/IndexerError"}
+                  - type: object
+                    properties:
+                      status: {const: unavailable}
+                      error_code: {const: indexer_unavailable}
+                      retriable: {const: true}
+                      retry_after_seconds: {const: 5}
 components:
   securitySchemes:
     TestnetPassword:
@@ -449,13 +516,17 @@ components:
         proof: {$ref: "#/components/schemas/Groth16Proof"}
     WithdrawalPublicInputsV2C:
       type: object
-      description: The 16 withdrawal public inputs, in circuit order. Unknown fields are refused.
+      description: >-
+        The 17 withdrawal public inputs, in circuit order; deposit_amount and
+        expiry are input 17, packed as deposit_amount + expiry * 2^128. The
+        statement names the note as the vault stores it (no root). Unknown
+        fields are refused.
       additionalProperties: false
       required:
         - protocol_version
         - chain_id
         - contract_address
-        - active_root
+        - registration_commitment
         - state_signing_key_x
         - state_signing_key_y
         - clearance_signing_key_x
@@ -468,11 +539,13 @@ components:
         - next_nullifier
         - conceded
         - valid_until
+        - deposit_amount
+        - expiry
       properties:
         protocol_version: {const: 2}
         chain_id: {type: integer, minimum: 1}
         contract_address: {$ref: "#/components/schemas/Felt"}
-        active_root: {$ref: "#/components/schemas/Felt"}
+        registration_commitment: {$ref: "#/components/schemas/Felt", description: "The note's registration commitment H_reg(secret, 0), as notes(note_id) stores it"}
         state_signing_key_x: {$ref: "#/components/schemas/Felt"}
         state_signing_key_y: {$ref: "#/components/schemas/Felt"}
         clearance_signing_key_x: {$ref: "#/components/schemas/Felt"}
@@ -490,6 +563,8 @@ components:
         next_nullifier: {$ref: "#/components/schemas/Felt", description: "The successor's nullifier for kind 0; zero otherwise"}
         conceded: {type: integer, minimum: 0, description: "Amount an escape gives up, in gwei; zero unless kind 0"}
         valid_until: {type: integer, minimum: 0, description: "Last UNIX second at which the vault (kinds 0 and 1) or the server (kind 2) accepts the proof"}
+        deposit_amount: {type: integer, minimum: 0, description: "The note's stored deposit, in gwei"}
+        expiry: {type: integer, minimum: 0, maximum: 18446744073709551615, description: "The note's stored expiry (UNIX seconds)"}
     ClearanceOwnershipProofV2C:
       type: object
       description: >-
@@ -622,6 +697,49 @@ components:
           description: >-
             Write-once UNIX time by which the lease is finalized, at worst at
             the request's solvency bound; absent once terminal
+    TreeSnapshot:
+      type: object
+      description: >-
+        The header (root, next_note_id, activation_cursor, block_number,
+        block_hash) with leaves (absent for parts=records) and note_leaves and
+        notes (absent for parts=tree).
+      required: [root, next_note_id, activation_cursor, block_number, block_hash]
+      properties:
+        root: {$ref: "#/components/schemas/Felt"}
+        next_note_id: {type: integer, minimum: 0}
+        leaves:
+          type: array
+          description: >-
+            The tree leaves of note IDs 0 .. next_note_id - 1, exactly the
+            leaves under root (0 for a note not activated yet and for a
+            retired one)
+          items: {$ref: "#/components/schemas/Felt"}
+        block_number: {type: integer, minimum: 0}
+        block_hash: {type: string, pattern: "^0x[0-9a-f]{64}$"}
+        activation_cursor: {type: integer, minimum: 0}
+        note_leaves:
+          type: array
+          description: The recorded leaf of every recorded note, activated or not
+          items: {$ref: "#/components/schemas/Felt"}
+        notes:
+          type: array
+          items:
+            type: object
+            required: [note_id, commitment, amount, expiry_ts]
+            properties:
+              note_id: {type: integer, minimum: 0}
+              commitment: {$ref: "#/components/schemas/Felt"}
+              amount: {type: integer, minimum: 0}
+              expiry_ts: {type: integer, minimum: 0}
+    IndexerError:
+      type: object
+      required: [status, error_code, error_message, retriable]
+      properties:
+        status: {type: string, enum: [error, unavailable]}
+        error_code: {type: string}
+        error_message: {type: string}
+        retriable: {type: boolean}
+        retry_after_seconds: {type: integer, minimum: 0}
     ErrorResponse:
       type: object
       required: [status, client_request_id, error_code, error_message, retriable]
@@ -634,14 +752,21 @@ components:
             Stable machine code. OA limits use oa_minute_request_limit,
             oa_hourly_issuance_budget, or oa_rate_limited. Admission adds
             root_unavailable (503) and request_limit_exceeded (400). Clearance
-            adds clearance_ownership_required, nullifier_used and
-            capacity_exhausted. Recovery and evidence
+            adds clearance_ownership_required, note_binding_mismatch (400),
+            note_not_active (409), note_not_recorded (409, retriable: the
+            server's RPC has not seen the deposit yet), nullifier_used and
+            capacity_exhausted, and never stale_root. Recovery and evidence
             add chain_read_unavailable (503) and published (410). Lease routes
             add lease_record_unreadable (HTTP 404, not retriable). The
             reference gateway uses gateway_rate_limited.
         error_message: {type: string}
         retriable: {type: boolean}
-        latest_root: {type: string, pattern: "^0x[0-9a-f]+$"}
+        latest_root:
+          type: string
+          pattern: "^0x[0-9a-f]+$"
+          description: >-
+            Only with stale_root: the exact current root admission accepts.
+            Clearance errors carry none.
         server_time_ms: {type: integer}
         retry_after_seconds:
           type: integer

@@ -5,8 +5,8 @@ description: Note-bound private balances, request authorization, settlement and 
 
 zkAPI v2 uses a **state-anchor chain**: each accepted authorization consumes
 the user's current private spend state and leads to a fresh state signed by
-the server. The current circuit is `zkapi-v2-concession-v1`, used by vault
-revision 3, with Groth16 proofs on BN254 and Schnorr signatures on
+the server. The current circuit is `zkapi-v2-concession-v2`, used by vault
+revision 4, with Groth16 proofs on BN254 and Schnorr signatures on
 Baby-JubJub. Its exit, the **concession exit**, lets an owner leave without
 any cooperation from the operator.
 
@@ -15,9 +15,10 @@ any cooperation from the operator.
 | Symbol | Meaning |
 |---|---|
 | `s` | User secret |
-| `n` | Note ID, the note's leaf index in the vault's tree |
+| `n` | Note ID: the note's index in the vault's records and its leaf index in the request tree |
 | `R` | Registration commitment `Poseidon("zkapi.v2.reg", s, 0)` |
 | `D` | Native ETH deposit in integer gwei |
+| `M` | The note's packed amount and expiry, `D + expiry · 2^128` |
 | `L` | Note leaf `Poseidon("zkapi.v2.leaf", n, R, D, expiry)` |
 | `B` | Current private available balance |
 | `C(B, r, L)` | Note-bound commitment `B·G + r·H + L·J` |
@@ -39,13 +40,21 @@ the note ID, so two notes with the same secret never share a nullifier.
 ## Registration
 
 1. The wallet samples `s` and computes `R`.
-2. The user deposits `D` into the vault with a Merkle path for its next empty slot.
-3. The vault records the deposit and expiry, and inserts the full note leaf `L`
-   into its depth-32 Poseidon tree.
+2. The user deposits `D` into the vault under `R`.
+3. The vault records the note, `R`, `D` and the expiry, at the next note ID
+   and does no tree work. The note can exit at once.
 4. The wallet initializes `B = D`, `τ = 1`, and a random blinding `r`. Genesis
    requires no server signature; the circuit enforces the initial balance and
-   anchor. The wallet also keeps the deposit's Merkle path: the vault accepts
-   proofs at that root for good.
+   anchor. The wallet keeps no Merkle path.
+5. **Activation.** Recorded notes are appended in deposit order to the vault's
+   depth-32 Poseidon request tree, as aligned batches of 1, 4 or 16 leaves `L`:
+   with an insertion proof whose inputs the vault reads from its own records
+   (`activateNotes`), or hashed on chain without a proof by anyone
+   (`activateNotesOnChain`). The operator's activation worker proves the
+   batches, waiting a bounded time (30 seconds by default) for a fuller one.
+   The note can make requests once it is activated
+   (`noteId < activationCursor()`); until then the wallet reports it as
+   activating, with its queue position `noteId − activationCursor()`.
 
 Deposits use integer gwei and require exactly `D × 1 gwei` in transaction
 value. The current SDK and vault support native ETH only. Before every
@@ -56,8 +65,9 @@ the deposit.
 
 ## Why the commitment includes the note
 
-Both request and withdrawal circuits compute `L` from the same values used
-for Merkle membership, then require the signed commitment to open as
+The request circuit computes `L` from the same values it proves membership
+of, and the withdrawal circuit from the values the vault compares with its
+record of the note; both then require the signed commitment to open as
 `B·G + r·H + L·J`. The independently derived generator `J` binds that state to
 one note, preventing a signed balance from being transplanted to another
 active note.
@@ -72,7 +82,8 @@ alone do not establish circuit compatibility.
 The wallet generates a fresh rerandomization `ε`, yielding
 `C_anon = C(B, r, L) + ε·H`. Its Groth16 request proof establishes:
 
-- membership of the note in the supplied active root;
+- membership of the note's leaf at the supplied root, which the server
+  requires to be the vault's current root, so the note must be activated;
 - a genesis state (`τ = 1` and `B = D`), or a server-signed state for that
   note whose anchor is the successor of the previous state's nullifier,
   `τ = succ(N(τ_prev))`; a signed state at anchor 1 is unprovable;
@@ -152,15 +163,20 @@ A withdrawal proof has a **kind**: 0 is an escape, 1 a mutual close, and 2 an
 ownership proof, which goes only to the server and which every vault entry
 point refuses. Every withdrawal proof carries a `valid_until` time; the vault
 refuses an escape or close proof after it, and the server refuses an
-ownership proof that expires more than an hour ahead. Withdrawals do no Merkle
-work: the vault accepts a proof at any root it ever held, and the note's leaf
-stays in the tree.
+ownership proof that expires more than an hour ahead. A withdrawal proof is
+bound to the note as the vault records it: its public inputs carry the note's
+`R` and `M`, which the vault compares with `notes(noteId)`
+(`NoteBindingMismatch()`), and the circuit proves that the state's secret
+opens `R`. Withdrawals do no Merkle work and need no root or path, so a note
+can exit before it is activated, and an exit leaves an activated note's leaf
+in the tree.
 
 **Mutual close.** The wallet proves note ownership with a kind-2 proof for its
 current nullifier: its destination and conceded amount are zero, and it names
 no successor. It sends it to `POST /v2/withdraw/clearance`. The server checks
-the proof, its deployment and keys, its freshness and its root, then reserves
-the nullifier and returns a Schnorr signature under its separate clearance
+the proof, its deployment and keys, its freshness, and that the vault's
+record of the note matches the proof and is active, then reserves the
+nullifier and returns a Schnorr signature under its separate clearance
 key. The wallet includes that signature as a private witness to a kind-1
 proof and submits `mutualClose(inputs, proof)`. The vault checks its immutable
 deployment keys and the proof, consumes the nullifier, closes the note and
@@ -229,18 +245,18 @@ during an exit has a 20-second limit, and none can delay the exit past
   `c = min(charge, bound_at_state)`. A successor at the wrong anchor counts
   as withheld.
 
-Merkle paths come from the deposit-time path, the indexer, or a rebuild from
-the vault's logs, read through the user's own exit RPC when one is set. Just
-before proving, the wallet asks the server for a request proof at
-`N_{k+1}`; one that verifies means another device holds a newer state, and
-the wallet refuses (`device_not_newest`). The browser SDK can also export an
+An exit needs no Merkle path: the wallet reads its note's record from the
+vault, through the user's own exit RPC when one is set. Just before proving,
+the wallet asks the server for a request proof at `N_{k+1}`; one that
+verifies means another device holds a newer state, and the wallet refuses
+(`device_not_newest`). The browser SDK can also export an
 encrypted exit kit, from which the companion CLI escapes without the host.
 
 **Guarantee.** An honest wallet obtains at least `B_k − b_k`, where `S_k` is
 its newest installed state and `b_k` its `bound_at_state`, whatever the
 operator and owner do. This holds as long as the chain includes one
 transaction before `must_initiate_by`, the setup is sound, and the wallet's
-storage is durable. The payout is gross of the escape's gas, about 575,000.
+storage is durable. The payout is gross of the escape's gas, about 482,000.
 
 An active note that is not withdrawn can be claimed for the treasury with
 `claimExpired(noteId)` once its effective expiry has passed, while the vault
@@ -265,7 +281,7 @@ from a multi-party ceremony that has not run yet, and release builds load no
 other keys. Read the [setup and compatibility requirements](/docs/cryptography#setup-and-compatibility)
 before choosing deployment artifacts.
 
-The vault rules on this page are those of vault revision 3. No revision-3
+The vault rules on this page are those of vault revision 4. No revision-4
 vault is deployed yet: the packaged SDK and `zkapi-clientd` profiles are
 placeholders that refuse to fund a note. The deployed vaults run an earlier
 revision of circuit `zkapi-v2-note-bound-v1`, served by the release line
@@ -283,8 +299,9 @@ adapter, signing keys, challenge period, note lifetime and maximum pause are
 immutable, and the vault has no upgrade path. The deployment script requires
 an explicit `OWNER` outside local chains; use a multisig or timelock.
 
-- **Pause.** `pause()` stops deposits, `claimExpired`, scheduling or accepting
-  a treasury change, `withdrawTreasuryArrears` and `renounceOwnership`. It
+- **Pause.** `pause()` stops deposits, activations, `claimExpired`,
+  scheduling or accepting a treasury change, `withdrawTreasuryArrears` and
+  `renounceOwnership`. It
   stops `initiateEscapeWithdrawal` and `mutualClose` for at most
   `maxPauseDuration`, at least twice the challenge period (45 days on the
   planned mainnet deployment): from `pausedAt + maxPauseDuration` they reopen
@@ -318,10 +335,12 @@ an explicit `OWNER` outside local chains; use a multisig or timelock.
   (see the [owner key rotation runbook](https://github.com/ethereum/zkapi/blob/main/docs/migration-concession-vault.md#owner-key-rotation)).
   `renounceOwnership` reverts while paused and clears any nomination.
 
-The operator runs the API server, indexer and challenge service. It signs
-every successor state and every clearance, so it can refuse service or a
-mutual close, but it cannot block an exit: an escape needs no operator call,
-and its Merkle path comes from the deposit or from the vault's own logs. The
+The operator runs the API server, indexer, activation worker and challenge
+service. It signs every successor state and every clearance, so it can refuse
+service or a mutual close, but it cannot block an exit: an escape needs no
+operator call and no path. It can delay a note's activation, and so its first
+request, but anyone can activate with `activateNotesOnChain` at their own gas
+cost. The
 operator must keep its challenger running through every challenge window to
 be paid for service an escaping owner used. The server refuses to start unless
 its signing seeds derive the vault's immutable keys and are not the published
@@ -332,7 +351,9 @@ deployment manifest.
 
 - **Challenger liveness.** If the challenger misses a defeat, the stale escape
   pays out; the challenger then retires the closed note's leaf
-  (`retireClosedLeaf`), so the server refuses later requests built on it.
+  (`retireClosedLeaf`), so the server refuses later requests built on it. A
+  note that was not activated yet is retired once an activation appends its
+  leaf; until then it cannot make requests either.
 - **Exit-time linkage.** An escape from a state that served a request links
   that last request to the note and destination for the server and gateway,
   and a raise publishes its public inputs on chain. Waiting for settlement
@@ -340,7 +361,9 @@ deployment manifest.
 - **Owner pause.** Up to `maxPauseDuration` per pause.
 - **Setup trust.** Soundness rests on the multi-party setup: an honest public
   phase 1 that the ceremony used, and at least one honest phase-2
-  contributor.
+  contributor. That covers the insertion keys too: a forged insertion proof
+  could set the request tree's root (requests without a deposit), though
+  exits do not depend on it.
 - **Leaked keys.** A leaked state-signing key can forge states, each capped at
   its note's deposit; a leaked clearance key lets a dishonest owner close at
   a spent state.

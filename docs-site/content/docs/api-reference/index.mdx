@@ -8,8 +8,8 @@ integration contract are documented in `sdk/README.md` in the repository.
 
 <Cards>
   <Card title="serverd" description="v2 requests, OpenRouter leases, recovery, and withdrawal clearance." href="/docs/api-reference/serverd" />
-  <Card title="indexer" description="Current roots, note snapshots, and depth-32 Merkle paths." href="/docs/api-reference/indexer" />
-  <Card title="ZkApiVault" description="Native ETH deposits, mutual close, escapes, and challenges." href="/docs/api-reference/vault" />
+  <Card title="indexer" description="Current roots, recorded notes, tree snapshots, and depth-32 Merkle paths." href="/docs/api-reference/indexer" />
+  <Card title="ZkApiVault" description="Native ETH deposits, activations, mutual close, escapes, and challenges." href="/docs/api-reference/vault" />
 </Cards>
 
 ```text
@@ -20,6 +20,8 @@ Browser SDK -> WASM prover -> server -> usage settlement and signed next state
      |
      v
 Native ETH vault <-------- challenge service
+     ^
+     +-------------------- activation worker (insertion proofs)
 ```
 
 `protocol/rust/crates/zkapi-types/src/wire.rs` defines the protocol's JSON
@@ -27,14 +29,18 @@ messages. Runtime handlers in `crates/zkapi-serverd/src/routes.rs` and
 `crates/zkapi-indexerd/src/http.rs` define the supported routes. The challenge
 service reads the server's append-only request evidence and the vault's
 pending escapes, and submits defeats, raises and leaf retirements through a
-restricted signer.
+restricted signer. The activation worker reads recorded notes from the vault
+and the activation cursor's siblings from the indexer, and submits proved
+`activateNotes` batches from a sender of its own.
 
 ## Proof and field encoding
 
-The active circuit is `zkapi-v2-concession-v1`. Requests keep the v2 JSON
-shapes and public-input order; withdrawals and clearances use the 16-input
-`WithdrawalPublicInputsV2C`. The proving/verifying keys and the vault's Groth16
-adapter must match that circuit and setup. Pin the circuit ID, setup ID,
+The active circuit is `zkapi-v2-concession-v2`. Requests keep the v2 JSON
+shapes and public-input order; withdrawals and clearances use the 17-input
+`WithdrawalPublicInputsV2C` (18 JSON keys), which names the note by its
+`registration_commitment`, `deposit_amount` and `expiry` instead of a root.
+The proving/verifying keys, including the operator's insertion keys, and the
+vault's Groth16 adapter must match that circuit and setup. Pin the circuit ID, setup ID,
 artifact hashes, vault address, contract code hashes and server signing keys
 for the configured deployment.
 

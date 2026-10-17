@@ -29,7 +29,7 @@ assumptions. Groth16/BN254 and Baby-JubJub are not post-quantum.
 
 ## The nullifier chain is note-bound too
 
-Circuit `zkapi-v2-concession-v1` also binds each state's nullifier and the
+Circuit `zkapi-v2-concession-v2` also binds each state's nullifier and the
 anchors of its successors to the note:
 
 ```text
@@ -52,11 +52,12 @@ make, defeats the escape. See the
 
 ## Compatibility and setup
 
-The circuit identifier is `zkapi-v2-concession-v1`. Proving and verifying key
-files carry the header `zkapi-v2-concession-v1/<setup_id>/<kind>\0`; loaders
+The circuit identifier is `zkapi-v2-concession-v2`. Proving and verifying key
+files (request, withdrawal, and insertion for batches of 1, 4 and 16 notes)
+carry the header `zkapi-v2-concession-v2/<setup_id>/<kind>\0`; loaders
 reject a key of another circuit, of the other kind, or of a setup the build
 does not accept, before decoding. Release builds accept only the ceremony
-setup `mpc-1` with its pinned verifying-key hashes. Public deployment
+setup `mpc-1` with its five pinned verifying-key hashes. Public deployment
 manifests must advertise `proof_setup.circuit_id` and the setup ID, and
 clients must pin the matching key hashes, the vault address and the runtime
 code hashes of the vault, adapter and Poseidon library. The header guards

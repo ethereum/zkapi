@@ -9,66 +9,119 @@ Groth16 proof adapter, state-signing key, clearance-signing key, challenge
 period, note lifetime and maximum pause as immutable constructor parameters
 (11 in all). It has no upgrade path.
 
-This page describes vault revision 3 (`CONCESSION_ESCAPE_VERSION() == 1`),
-circuit `zkapi-v2-concession-v1`, which client profiles declare as
-`vault_revision: 3` and `exit_concession: 1`. No revision-3 vault is deployed
-yet. The deployed vaults run an earlier revision with other rules; see
-[Protocol](/docs/protocol#compatibility-and-trust).
+This page describes vault revision 4 (`CONCESSION_ESCAPE_VERSION() == 1`,
+`NOTE_BOUND_EXIT_VERSION() == 1`), circuit `zkapi-v2-concession-v2`, which
+client profiles declare as `vault_revision: 4` and `exit_concession: 1`. No
+revision-4 vault is deployed yet. The deployed vaults run an earlier revision
+with other rules; see [Protocol](/docs/protocol#compatibility-and-trust).
 
-The note tree is append-only: deposits insert leaves, and only
-`retireClosedLeaf` removes one, a closed note's. Exits, defeats, raises,
-closes and expiry claims do no Merkle work, and a withdrawal proof may use any
-root the vault ever held (`isKnownRoot`).
+A deposit only records its note. Every withdrawal is bound to the note as
+recorded, so exits, defeats, raises, closes and expiry claims do no Merkle
+work and need no root. The vault keeps one tree, the request tree, of which it
+stores only the root (`currentRoot`): recorded notes are appended to it in
+deposit order by activations, and only `retireClosedLeaf` removes a leaf, a
+closed note's. A request proves membership at the current root, so a note can
+make anonymous API requests only once it is activated
+(`noteId < activationCursor()`).
 
 ## Deposit
 
 | Field | Value |
 |---|---|
-| Method | `deposit(bytes32 commitment, uint128 amount, uint256[32] siblings)` (payable, `0xc588341c`) |
+| Method | `deposit(bytes32 commitment, uint128 amount)` (payable, `0x56d2e1ea`) |
 | Caller | User's wallet, while not paused |
-| Effect | Checks the empty-slot path against `currentRoot`, adds the note leaf, records the new root in `knownRoots`, escrows the native ETH, and emits `NoteDeposited(noteId, commitment, amount, expiryTs, newRoot)` |
+| Effect | Records the note at `noteId = nextNoteId()` as `notes(noteId)` (`commitment, depositAmount, expiryTs`, status `Active`), escrows the native ETH, and emits `NoteDeposited(noteId, commitment, amount, expiryTs)`; no tree work |
+| Reverts | `InvalidNativeValue()` (a value other than `amount` gwei, or `amount` above `MAX_NATIVE_UNITS`), `ZeroAmount()`, `InvalidCommitment()` (zero), `InvalidFelt()` (at or above the field modulus) |
 
 Here `commitment` is the Poseidon registration derived from the note secret,
-not the anonymous balance commitment signed by the server. The deposited leaf
-binds that registration, note ID, amount, and expiry. The circuits include
-this same leaf in each private balance commitment.
+not the anonymous balance commitment signed by the server. The note's leaf,
+`L = Poseidon("zkapi.v2.leaf", noteId, commitment, amount, expiry)`, is fixed
+by the record: the circuits include it in each private balance commitment,
+and activation appends it to the request tree. The note can exit as soon as
+it is recorded; it can make requests once activated.
 
 The transaction must send exactly `amount * nativeAssetWeiPerUnit` wei;
 `nativeAssetWeiPerUnit` is one gwei and `billingToken` is the zero-address
 native-asset sentinel. Only deposits carry transaction value. The on-chain
 event supplies the actual expiry, rounded up to the vault's one-day expiry
-bucket. A wallet that keeps the deposit's path can exit with it for good.
+bucket. The wallet confirms its note from the receipt's `NoteDeposited` and
+`notes(noteId)`; it keeps no path, and deposits never race each other.
+
+## Activate notes
+
+| Field | Value |
+|---|---|
+| Method | `activateNotes(uint32 firstNoteId, uint256 count, uint256 expectedRoot, uint256 newRoot, bytes proof)` (`0xa2b2c715`) |
+| Caller | Anyone, while not paused; the operator's activation worker |
+| Effect | Verifies an insertion proof of size `count` through the adapter's `assertValidInsertion`, against inputs the vault builds from its own state; sets `currentRoot` to `newRoot`, advances `activationCursor` by `count`, and emits `NotesActivated(firstNoteId, count, newRoot, true)` |
+
+| Field | Value |
+|---|---|
+| Method | `activateNotesOnChain(uint32 firstNoteId, uint256 count, uint256[32] siblings)` (`0x027e21e9`) |
+| Caller | Anyone, while not paused; the no-prover fallback |
+| Effect | Hashes the batch's leaves, its subtree and the path above it on chain, from `siblings`, the 32 siblings of slot `firstNoteId` at `currentRoot` (entries below the batch's height are ignored); then as above, with `proved = false` |
+
+Both take the next `count` recorded notes, `count` 1, 4 or 16, as one aligned
+subtree: `firstNoteId` must be `activationCursor()` (else
+`StaleActivation()`), a multiple of `count`, and `firstNoteId + count` at most
+`nextNoteId()` (else `InvalidActivation()`, also for another `count`).
+`activateNotes` also requires `expectedRoot == currentRoot()`
+(`StaleActivation()`, checked before any verification). Its statement is
+`[expectedRoot, newRoot, firstNoteId, C_0, M_0, …, C_{count-1}, M_{count-1}]`
+with each note's commitment `C_j` and packed amount and expiry
+`M_j = depositAmount + expiryTs · 2^128` read from `notes`, so a proof can
+neither skip, reorder nor alter a recorded note; a proof that does not verify
+reverts `InvalidProof()`. `activateNotesOnChain` reverts `StaleRoot()` when
+the siblings do not reproduce `currentRoot`.
+
+Activation appends each note's original leaf whatever its status: a note that
+closed before its activation still gets its leaf, and its status does not
+change. An activation or a retirement landing first makes a prepared
+activation revert `StaleActivation()` or `StaleRoot()`; deposits landing
+meanwhile do not. See the
+[activation worker](https://github.com/ethereum/zkapi/blob/main/docs/activation-worker.md)
+guide.
 
 ## Withdrawal statement
 
-`WithdrawalPublicInputs` contains these 16 fields in order, the Groth16
+`WithdrawalPublicInputs` contains these 17 fields in order, the Groth16
 public-input order (a static tuple, so its ABI words are the public inputs):
 
 ```text
-protocolVersion, chainId, contractAddress, activeRoot,
+protocolVersion, chainId, contractAddress, registrationCommitment,
 stateSigningKeyX, stateSigningKeyY,
 clearanceSigningKeyX, clearanceSigningKeyY,
 noteId, finalBalance, destination, withdrawalNullifier,
-kind, nextNullifier, conceded, validUntil
+kind, nextNullifier, conceded, validUntil, noteMetadata
 ```
+
+`registrationCommitment` and
+`noteMetadata = depositAmount + expiryTs · 2^128` name the note as the vault
+records it. Every exit compares them with `notes(noteId)` before it verifies
+the proof (`NoteBindingMismatch()`), and the circuit proves that the state's
+secret opens `registrationCommitment` and that the state commits to the
+note's leaf. An exit therefore needs no root and no Merkle path, and works
+whether or not the note is activated; an unrecorded note stores zeros, which
+no secret opens.
 
 `kind` is 0 for an escape, 1 for a mutual close and 2 for an ownership proof,
 which only the server accepts: every vault entry point refuses it. The proof
 binds `finalBalance + conceded` to the state's balance `B`, and `B` to at most
 the deposit. `proof` is the decoded 256-byte Groth16 artifact described in the
-[API overview](/docs/api-reference). Every call checks the protocol version,
-chain, vault and all four key coordinates (`InvalidDeploymentBinding()`),
-refuses a proof after `validUntil` (`ProofExpired()`), a zero destination or
-the vault itself (`InvalidDestination()`) and an unknown root
-(`UnknownRoot()`).
+[API overview](/docs/api-reference); an exit's calldata is 868 bytes. Every
+call checks the protocol version, chain, vault and all four key coordinates
+(`InvalidDeploymentBinding()`), and refuses a proof after `validUntil`
+(`ProofExpired()`), a zero destination or the vault itself
+(`InvalidDestination()`) and a note other than the recorded one
+(`NoteBindingMismatch()`).
 
 ## Mutual close
 
 | Field | Value |
 |---|---|
-| Method | `mutualClose(WithdrawalPublicInputs inputs, bytes proof)` (`0x72cd2e44`) |
+| Method | `mutualClose(WithdrawalPublicInputs inputs, bytes proof)` (`0x5acd3b15`) |
 | Caller | User's wallet or another transaction submitter, while exits are open |
-| Effect | Requires `kind == 1` (else `WrongWithdrawalKind()`), verifies the proof (whose circuit checks the server's clearance signature), requires an `Active` note and `finalBalance` at most the deposit, consumes the nullifier, closes the note, and pays the user and the treasury; emits `MutualClose(noteId, nullifier, finalBalance, destination)` |
+| Effect | Requires `kind == 1` (else `WrongWithdrawalKind()`) and the recorded note, verifies the proof (whose circuit checks the server's clearance signature), requires an `Active` note and `finalBalance` at most the deposit, consumes the nullifier, closes the note, and pays the user and the treasury; emits `MutualClose(noteId, nullifier, finalBalance, destination)` |
 
 The user receives `finalBalance` billing units and the treasury
 `depositAmount - finalBalance`; the vault multiplies both by
@@ -81,7 +134,7 @@ consult `challengedNullifiers`: the operator's clearance is its consent.
 
 | Field | Value |
 |---|---|
-| Method | `initiateEscapeWithdrawal(WithdrawalPublicInputs inputs, bytes proof)` (`0xa38d62aa`) |
+| Method | `initiateEscapeWithdrawal(WithdrawalPublicInputs inputs, bytes proof)` (`0x8e110492`) |
 | Caller | User's wallet or another transaction submitter, while exits are open |
 | Effect | Records an escape that pays `finalBalance` after `challengePeriod` unless defeated, consumes both `withdrawalNullifier` (`N`) and `nextNullifier` (`N⁺`), and emits `EscapeWithdrawalInitiated` then `EscapeConcessionRecorded` |
 
@@ -89,15 +142,16 @@ The checks run in this order: the deployment binding; `kind == 0`
 (`WrongWithdrawalKind()`); `validUntil`; the destination; `N⁺` neither zero
 nor `N` (`InvalidDeploymentBinding()`); `N` not in `challengedNullifiers`
 (`ChallengedNullifier()`); `N⁺` not in `challengedNullifiers`
-(`SupersededState()`: the state's successor was already spent); a known root;
-the proof; an `Active` note (`NoteNotActive()`) with
-`finalBalance + conceded` at most the deposit (`InvalidBalance()`); and both
-nullifiers unused (`ReplayedNullifier()`, `InvalidFelt()` for a value at or
-above the field modulus). The vault then stores the 6-word pending record
-(`pendingWithdrawals`) and the concession record (`pendingConcessions`:
-`nextNullifier`, `stateBalance = finalBalance + conceded`, `conceded`), with
-`challengeDeadline = now + challengePeriod`. No root changes, so an unrelated
-deposit cannot invalidate an escape.
+(`SupersededState()`: the state's successor was already spent); the note
+binding (`NoteBindingMismatch()`); the proof; an `Active` note
+(`NoteNotActive()`) with `finalBalance + conceded` at most the deposit
+(`InvalidBalance()`); and both nullifiers unused (`ReplayedNullifier()`, `InvalidFelt()` for a value at or
+above the field modulus). The vault then stores the pending record
+(`pendingWithdrawals`, 5 words) and the concession record
+(`pendingConcessions`: `nextNullifier`,
+`stateBalance = finalBalance + conceded`, `conceded`), with
+`challengeDeadline = now + challengePeriod`. No root is involved, so neither
+a deposit nor an activation can invalidate an escape.
 
 ## Defeat an escape
 
@@ -167,7 +221,7 @@ credited, not returned, and offers this claim. See
 |---|---|
 | Method | `claimExpired(uint32 noteId)` (`0xa940507e`) |
 | Caller | Anyone at or after `effectiveExpiry(noteId)`, while not paused |
-| Effect | Closes an `Active` note and pays its full deposit to the treasury; the leaf stays, and the request circuit already refuses requests after the note's expiry. Emits `ExpiredClaimed(noteId, depositAmount, currentRoot)` |
+| Effect | Closes an `Active` note and pays its full deposit to the treasury; its leaf, once activated, stays, and the request circuit already refuses requests after the note's expiry. Emits `ExpiredClaimed(noteId, depositAmount, currentRoot)` |
 
 `notes(noteId)` keeps the nominal `expiryTs` used by the request proof.
 `effectiveExpiry(noteId)` adds all paused time since the deposit and any
@@ -182,18 +236,21 @@ further pause and returns zero for an unknown note.
 |---|---|
 | Method | `retireClosedLeaf(uint32 noteId, uint256[32] siblings)` (`0xe41f4c31`) |
 | Caller | Anyone, including while paused |
-| Effect | For a `Closed` note (else `NoteNotClosed()`), replaces its leaf with zero at the current root, records the new root, and emits `ClosedLeafRetired(noteId, newRoot)` |
+| Effect | For a `Closed` note (else `NoteNotClosed()`) that is activated (else `NoteNotActivated()`), replaces its leaf with zero at the current root, sets the new root, and emits `ClosedLeafRetired(noteId, newRoot)` |
 
-This is an operator tool, about 6M gas. The challenger calls it after a missed
+This is an operator tool, and it costs far more gas than an exit: it hashes
+the note's path twice on chain. The challenger calls it after a missed
 defeat, so that proofs built on later roots no longer contain the note; the
-server admits requests only at the current root. Stale siblings, including a
-second call for the same note, revert `StaleRoot()`.
+server admits requests only at the current root. A note that closed before
+its activation has no leaf yet; activation appends it, and the challenger
+retires it then. Stale siblings, including a second call for the same note,
+revert `StaleRoot()`: an activation or another retirement changes the root.
 
 ## Owner controls
 
 | Method | Caller | Effect |
 |---|---|---|
-| `pause()` | Owner, while not paused, at least `PAUSE_COOLDOWN` (1 day) after the latest unpause (else `PauseCooldown()`) | Blocks `deposit`, `claimExpired`, `setTreasury`, `acceptTreasury`, `withdrawTreasuryArrears` and `renounceOwnership`; blocks `mutualClose` and `initiateEscapeWithdrawal` until `pausedAt() + maxPauseDuration()`; emits `Paused(account)` |
+| `pause()` | Owner, while not paused, at least `PAUSE_COOLDOWN` (1 day) after the latest unpause (else `PauseCooldown()`) | Blocks `deposit`, `activateNotes`, `activateNotesOnChain`, `claimExpired`, `setTreasury`, `acceptTreasury`, `withdrawTreasuryArrears` and `renounceOwnership`; blocks `mutualClose` and `initiateEscapeWithdrawal` until `pausedAt() + maxPauseDuration()`; emits `Paused(account)` |
 | `unpause()` | Owner, while paused (else `NotPaused()`) | Adds the pause to `totalPausedDuration`, sets `lastUnpausedAt`, and emits `Unpaused(account)` |
 | `setTreasury(address)` | Owner, while not paused | Schedules a nonzero `pendingTreasury` other than the vault, ready at `pendingTreasuryReadyAt`; emits `TreasuryChangeScheduled(newTreasury, readyAt)` |
 | `acceptTreasury()` | Owner, while not paused | Applies the scheduled treasury once ready; emits `TreasurySet(newTreasury)` |
@@ -232,18 +289,19 @@ that deferral by limiting gas; the whole transaction reverts instead.
 
 | View | Selector | Returns |
 |---|---|---|
-| `isKnownRoot(uint256)` | `0xa6232a93` | Whether the vault ever held the root, so that a withdrawal may use it |
-| `knownRoots(uint256)` | `0x12ad7381` | The same, as the public mapping |
-| `currentRoot()` | `0xfdab463d` | The live root |
-| `rootRetiredAt(uint256)` | `0x7600ff88` | When the root was last replaced; informational |
-| `notes(uint32)` | `0x9f18e4ed` | `commitment, depositAmount, expiryTs, status` (0 none, 1 active, 2 pending withdrawal, 3 closed) |
-| `pendingWithdrawals(uint32)` | `0xa2f9f1ce` | `exists, activeRoot, withdrawalNullifier, finalBalance, destination, challengeDeadline`; `finalBalance` is the current payout |
+| `currentRoot()` | `0xfdab463d` | The request tree's live root |
+| `nextNoteId()` | `0x7a2043a3` | The ID the next deposit records |
+| `activationCursor()` | `0x93e0ce4e` | Notes below it are activated; notes from it to `nextNoteId() - 1` are recorded and wait |
+| `isActivated(uint32)` | `0x5b78fd86` | `noteId < activationCursor()`: whether the note can make requests (it can exit either way) |
+| `notes(uint32)` | `0x9f18e4ed` | `commitment, depositAmount, expiryTs, status` (0 none, 1 active, 2 pending withdrawal, 3 closed); a recorded note is active whether or not it is activated |
+| `pendingWithdrawals(uint32)` | `0xa2f9f1ce` | `exists, withdrawalNullifier, finalBalance, destination, challengeDeadline`; `finalBalance` is the current payout |
 | `pendingConcessions(uint32)` | `0xf8ffe6e0` | `nextNullifier, stateBalance, conceded` |
 | `usedNullifiers(uint256)` | `0xaad24061` | Whether a nullifier is consumed; `false` again after a defeat |
 | `challengedNullifiers(uint256)` | `0x6cda756a` | Whether an escape from that state was defeated by successor evidence |
 | `effectiveExpiry(uint32)` | `0x7cb4a03c` | Earliest wall-clock `claimExpired` time |
 | `escapePayoutCredits(address)` | `0x91f6e93a` | Credited escape payouts for a destination, in gwei units |
 | `CONCESSION_ESCAPE_VERSION()` | `0x5e00b426` | `1` |
+| `NOTE_BOUND_EXIT_VERSION()` | `0x56853816` | `1`: exits bound to the recorded note, activated request tree |
 | `maxPauseDuration()` | `0x64433d27` | Longest a pause blocks escapes and closes |
 | `PAUSE_COOLDOWN()` | `0xb5acb567` | `86400` |
 | `pausedAt()` | `0x2e55d0f2` | Start of the current pause; zero while unpaused |
@@ -255,17 +313,16 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `pendingTreasuryReadyAt()` | `0x6bd6351e` | Active-clock time from which it can be accepted |
 | `treasuryChangeDelay()` | `0x65e9b869` | `max(challengePeriod, 2 days)` |
 | `treasuryArrears()` | `0x94990c08` | Deferred treasury payments, in gwei units |
-| `ROOT_HISTORY_WINDOW()` | `0x1fe72de0` | `86400`; the root window of off-chain services, not of the vault |
 | `MIN_TREASURY_CHANGE_DELAY()` | `0x1fe63b96` | `172800` |
 | `TREASURY_PAYOUT_GAS()` | `0x2fa3037e` | `100000` |
 | `ESCAPE_PAYOUT_GAS()` | `0x3e210f18` | `100000` |
-| `proofAdapter()` | `0xefc91e58` | The adapter, whose `CIRCUIT_ID_HASH()` (`0xda0e8385`), `REQUEST_VK_HASH()` (`0xfe351488`) and `WITHDRAWAL_VK_HASH()` (`0x7fcd0926`) identify the circuit and setup |
+| `proofAdapter()` | `0xefc91e58` | The adapter, whose `CIRCUIT_ID_HASH()` (`0xda0e8385`), `REQUEST_VK_HASH()` (`0xfe351488`), `WITHDRAWAL_VK_HASH()` (`0x7fcd0926`), `INSERTION1_VK_HASH()` (`0x1c0bd503`), `INSERTION4_VK_HASH()` (`0x85925b1a`) and `INSERTION16_VK_HASH()` (`0xc2b2d1a6`) identify the circuit and setup |
 
 | Error | Selector | Meaning |
 |---|---|---|
 | `WrongWithdrawalKind()` | `0x06868d53` | The proof's kind does not fit the call (kind 2 never does) |
 | `ProofExpired()` | `0xb67a7713` | The block time is past the proof's `validUntil` |
-| `UnknownRoot()` | `0x8c520116` | The vault never held the proof's `activeRoot` |
+| `NoteBindingMismatch()` | `0x41c6633b` | The proof's `registrationCommitment` or `noteMetadata` differs from `notes(noteId)` |
 | `ChallengedNullifier()` | `0x2845df70` | An escape from this state was defeated; exit from the newer state |
 | `SupersededState()` | `0x4e8225b5` | This state's successor was spent; exit from the newer state |
 | `ReplayedNullifier()` | `0x947e59c5` | A nullifier the call would consume is already used |
@@ -278,11 +335,16 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `ChallengeExpired()` | `0xf06506c5` | A defeat or raise at or after the deadline |
 | `ChallengeNotExpired()` | `0x151f07fe` | A finalization before the deadline |
 | `NoteNotClosed()` | `0xb91b2a5d` | `retireClosedLeaf` for a note that is not closed |
-| `StaleRoot()` | `0x607447de` | A deposit's or retirement's siblings do not reproduce the current root |
+| `NoteNotActivated()` | `0x3d0439b5` | `retireClosedLeaf` for a note that is not activated yet |
+| `StaleActivation()` | `0x9c9413a1` | An activation's `firstNoteId` is not `activationCursor()` or its `expectedRoot` not `currentRoot()`; rebuild it from fresh state |
+| `InvalidActivation()` | `0xe72f8984` | An activation's `count` is not 1, 4 or 16, its `firstNoteId` is not aligned to it, or it names notes not recorded yet |
+| `StaleRoot()` | `0x607447de` | The siblings of `activateNotesOnChain` or of a retirement do not reproduce the current root |
 | `InvalidDeploymentBinding()` | `0x9722445b` | Another protocol version, chain, vault or key, or an invalid `nextNullifier` |
 | `InvalidProof()` | `0x09bde339` | The Groth16 proof does not verify |
 | `InvalidFelt()` | `0x2ab898cc` | A value at or above the BN254 scalar field modulus |
 | `InvalidDestination()` | `0xac6b05f5` | The withdrawal destination is the zero address or the vault |
+| `InvalidNativeValue()` | `0x2723e9c2` | A deposit's value is not `amount` gwei, or `amount` exceeds `MAX_NATIVE_UNITS` |
+| `InvalidCommitment()` | `0xc06789fa` | A zero deposit commitment |
 | `ZeroAmount()` | `0x1f2a2005` | A zero deposit, `withdrawTreasuryArrears()` without arrears, or `claimEscapePayout` for a destination without a credit |
 | `NativeTransferFailed()` | `0xf4b3b1bc` | A payout that must succeed failed: a mutual close's destination, a `claimEscapePayout` destination or the treasury in `withdrawTreasuryArrears()` rejected ETH |
 | `Paused()` | `0x9e87fac8` | The vault is paused (for escapes and closes, within `maxPauseDuration`) |
@@ -294,9 +356,10 @@ that deferral by limiting gas; the whole transaction reverts instead.
 
 | Event | Topic 0 |
 |---|---|
-| `NoteDeposited(uint32,bytes32,uint128,uint64,uint256)` | `0x7c83dba8534bea9e30d6444f9ca6462dc906897f9938d220dbbe4358c1f7a063` |
+| `NoteDeposited(uint32,bytes32,uint128,uint64)` | `0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36` (`noteId` and `commitment` indexed; `amount, expiryTs`) |
+| `NotesActivated(uint32,uint32,uint256,bool)` | `0x2c5604373c15ade06913903b9f6fffb2f3b0a029d20dac56a6eeb7d8b1c11144` (`firstNoteId` indexed; `count, newRoot, proved`) |
 | `MutualClose(uint32,uint256,uint128,address)` | `0x1f43fa4711ca18e1d26398f26bf598bd3a62992cdd0e84f055f2bb506e9d7031` |
-| `EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)` | `0xb0d1eb7131bcf3c6dd53517f6fa90bf7cc94178eb0eb5e0a1f204abe3b839cdf` (the last word is the unchanged current root) |
+| `EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)` | `0xb0d1eb7131bcf3c6dd53517f6fa90bf7cc94178eb0eb5e0a1f204abe3b839cdf` (the last word is the current root, which an escape does not change) |
 | `EscapeConcessionRecorded(uint32,uint256,uint128,uint128)` | `0x2254ee827bce198564720fe77733ebfab1a49361cd4f050f107445241b560b4d` (`nextNullifier, stateBalance, conceded`) |
 | `EscapeConcessionRaised(uint32,uint256,uint128,uint128)` | `0x3faf5608f821061643ff6fdfe6dd0f6d7fb074bb565f35e3537a86ac08f0897c` (`nullifier, conceded, finalBalance`) |
 | `EscapeWithdrawalChallenged(uint32,uint256,uint256)` | `0x5cc5343b84cd949969f3ccc4ea44315630280857b9e591cc1ab48dbb9e6a3581` |
@@ -313,19 +376,25 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `EscapePayoutDeferred(uint32,address,uint128)` | `0x1bd006afb1f419c06bdcfcba16d47a9c4c8569f843228da165bdaec644bfa942` (`noteId` and `destination` indexed) |
 | `EscapePayoutClaimed(address,uint128)` | `0x6bf75371d42e9753c0913bf8fcecb651e8db173d99d7da0e4d836e91512bbe27` (`destination` indexed) |
 
-`noteId` is indexed in every note event.
+`noteId` (`firstNoteId` for an activation) is indexed in every note event.
 
 ## Gas
 
-Measured transaction gas with the development setup: escape 574,544; defeat
-374,881; raise 335,128; mutual close 427,837; finalization 91,898; expiry
-claim 77,509; leaf retirement about 5.95M. The runtime code is 17,431 bytes.
+Measured transaction gas (21,000, calldata and execution, with cold
+contracts) with the development setup and the CI-pinned Forge: escape
+481,688; defeat 357,330; raise 319,928; mutual close 395,591; finalization
+80,412; expiry claim 72,747; `activateNotes` 270,403 for 1 note, 332,701 for
+4 and 589,430 for 16 (about 36,800 per note); `activateNotesOnChain` 1,654,441
+for 1 note, 1,888,530 for 4 and 3,075,015 for 16. A deposit costs about
+77,100 gas on Anvil once the vault holds notes. The runtime code is 20,260
+bytes.
 
 ## Deployment compatibility
 
-The adapter must match circuit `zkapi-v2-concession-v1` and the selected
-setup; its `CIRCUIT_ID_HASH` is
-`0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687`. The
+The adapter must match circuit `zkapi-v2-concession-v2` and the selected
+setup, with all five verifying keys (request, withdrawal and the 1-, 4- and
+16-note insertions); its `CIRCUIT_ID_HASH` is
+`0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1`. The
 vault's adapter, keys and parameters are immutable. The server, frontend,
 deployment manifest and proof assets must match these deployed values, and
 clients pin the runtime code hashes of the vault, adapter and Poseidon library

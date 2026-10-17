@@ -7,16 +7,16 @@ description: Note-bound Groth16 proofs, derived state anchors, Baby-JubJub commi
 
 The active v2 implementation uses **Groth16 over BN254**, with Poseidon hashes
 and Baby-JubJub commitments and signatures. The circuit is
-`zkapi-v2-concession-v1`. The browser SDK proves native ETH lease
+`zkapi-v2-concession-v2`. The browser SDK proves native ETH lease
 authorizations and withdrawals locally using the packaged WASM and matching
-proving keys.
+proving keys; the operator's activation worker proves the insertions.
 
 | Component | Current implementation |
 |---|---|
-| Proof system | Separate request and withdrawal Groth16 circuits over BN254; every prover uses the `CircomReduction` QAP reduction |
+| Proof system | Separate request, withdrawal and insertion (1, 4 and 16 notes) Groth16 circuits over BN254; every prover uses the `CircomReduction` QAP reduction |
 | Circuit field | BN254 scalar field |
 | Hash function | Poseidon: exponent 5, 8 full rounds, 57 partial rounds, rate 2, capacity 1 |
-| Note tree | Depth-32 Merkle tree with domain-separated Poseidon nodes and zero leaf 0; append-only except for retired leaves of closed notes |
+| Request tree | Depth-32 Merkle tree with domain-separated Poseidon nodes and zero leaf 0; recorded notes are appended by activation, and only closed notes' leaves are ever retired |
 | Balance commitment | Note-bound Pedersen commitment on Baby-JubJub |
 | State and clearance signatures | Poseidon-challenged Schnorr on Baby-JubJub, with separate signing keys |
 | Nullifiers, anchors and authorization tags | Domain-separated Poseidon of fixed arity |
@@ -42,10 +42,13 @@ L = Poseidon(domain("zkapi.v2.leaf"), n, registration, D, expiry)
 C = B·G + r·H + L·J
 ```
 
-The request and withdrawal circuits compute `L` from the same note values used
-in the Merkle-membership proof, then use that leaf in the signed balance
-commitment. Binding the signed balance to `L` prevents a signature from being
-transplanted to a different note.
+The request circuit computes `L` from the same note values it proves
+membership of in the request tree. The withdrawal circuit proves that the
+secret opens the public `registration` and computes `L` from it, the note ID
+and the public packed amount and expiry `M = D + expiry · 2^128`, which the
+vault compares with its record of the note. Both use that leaf in the signed
+balance commitment. Binding the signed balance to `L` prevents a signature
+from being transplanted to a different note.
 
 `G` is the standard Baby-JubJub generator. `H` and `J` are independently derived
 by Keccak-256 try-and-increment, selecting even `y` and clearing the cofactor,
@@ -169,28 +172,52 @@ anonymous_commitment_x, anonymous_commitment_y
 
 Its private witness contains the secret, request context, note ID, deposit,
 expiry, Merkle siblings, balance, blinding, rerandomization, anchor, the
-previous state's anchor and the state signature. The circuit checks
+previous state's anchor and the state signature. Membership at `active_root`,
+which the server requires to be the vault's current root, needs an activated
+note. The circuit checks
 `D ≥ B ≥ solvency_bound`, that the note expiry is at least `request_time`,
 and, for a signed state, that the anchor is `succ(N(previous anchor))`.
 Genesis is `τ = 1`; there is no separate genesis flag.
 
-The withdrawal proof has **16 public field elements**, in this exact order:
+The withdrawal proof has **17 public field elements**, in this exact order:
 
 ```text
-protocol_version, chain_id, contract_address, active_root,
+protocol_version, chain_id, contract_address, registration_commitment,
 state_signing_key_x, state_signing_key_y,
 clearance_signing_key_x, clearance_signing_key_y,
 note_id, final_balance, destination, withdrawal_nullifier,
-kind, next_nullifier, conceded, valid_until
+kind, next_nullifier, conceded, valid_until, note_metadata
 ```
 
-Its private witness contains the secret, deposit, expiry, Merkle siblings,
-state balance, state blinding, anchor, state signature and clearance
-signature. It needs no previous anchor, so losing it never blocks an exit.
+`registration_commitment` and `note_metadata = deposit + expiry · 2^128`
+(a u128 amount and a u64 expiry, unique below 2^192) are the note as the
+vault records it; the JSON form carries the metadata as `deposit_amount` and
+`expiry` (18 keys). Its private witness contains the secret, state balance,
+state blinding, anchor, state signature and clearance signature, and no
+Merkle path: an exit works before the note is activated and needs no root.
+It needs no previous anchor, so losing it never blocks an exit.
 Withdrawal reveals the note ID, balance and nullifier: an ownership proof
 shows them to the server when a mutual close requests clearance, and a close
 or an escape publishes them, with the destination, on chain. An escape also
 publishes its successor's nullifier, its concession and its validity time.
+
+The insertion proof of `K` notes (`K` = 1, 4 or 16) has **3 + 2K public field
+elements**, exactly what the vault builds from its own state when it
+activates them:
+
+```text
+old_root, new_root, first_note_id, C_0, M_0, …, C_{K-1}, M_{K-1}
+```
+
+`C_j` and `M_j` are the registration commitment and packed amount and expiry
+the vault records for note `first_note_id + j`. The circuit requires
+`first_note_id` to be a multiple of `K`, computes each leaf
+`L_j = Poseidon("zkapi.v2.leaf", first_note_id + j, C_j, D_j, expiry_j)` and
+the subtree they form, and, with one private path above that subtree, that
+the empty subtree hashes to `old_root` and the new one to `new_root`. No
+occupied leaf is overwritten and every other node, retired leaves included,
+is preserved. The statement binds no deployment; the vault accepts it only at
+its own root, activation cursor and records.
 
 “Private witness” describes what the proof reveals, not all surrounding
 activity: deposits are on-chain, and the server receives the prompt-free lease
@@ -205,8 +232,10 @@ mutual close avoid this.
 ## Setup and compatibility
 
 Proving and verifying key files start with a header naming the circuit, the
-setup and the key kind, `zkapi-v2-concession-v1/<setup_id>/<request|withdrawal>\0`.
-Loaders refuse a key of another circuit (including `zkapi-v2-note-bound-v1`),
+setup and the key kind,
+`zkapi-v2-concession-v2/<setup_id>/<request|withdrawal|insertion1|insertion4|insertion16>\0`.
+Loaders refuse a key of another circuit (including `zkapi-v2-note-bound-v1`
+and `zkapi-v2-concession-v1`),
 of the other kind, or of a setup the build does not accept. The setup ids are:
 
 - `mpc-1`: the production setup from a multi-party phase-2 ceremony over a
@@ -233,11 +262,15 @@ can audit it, is in the
 [ceremony setup README](https://github.com/ethereum/zkapi/blob/main/protocol/setup/v2-concession/README.md).
 
 The deployed adapter carries `CIRCUIT_ID_HASH` (keccak256 of the circuit ID)
-and `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH` (keccak256 of each verifying
+and `REQUEST_VK_HASH`, `WITHDRAWAL_VK_HASH`, `INSERTION1_VK_HASH`,
+`INSERTION4_VK_HASH` and `INSERTION16_VK_HASH` (keccak256 of each verifying
 key without its header), which tell a development setup from the ceremony's.
+The insertion keys need the ceremony like the others: a forged insertion
+proof could set the request tree's root, though exits do not depend on it.
 Clients pin those hashes and the runtime code hashes of the vault, adapter and
 Poseidon library, and check them on chain before every deposit; the server
-and the challenger check them at startup. Because the vault's runtime code
+and the challenger check them at startup, and the activation worker also
+checks each insertion key it proves with. Because the vault's runtime code
 depends only on its source, the pinned compiler settings, its constructor
 arguments and the linked library, `scripts/expected-codehashes.mjs` recomputes
 the expected code hashes of any deployment from source, so anyone can audit a
@@ -249,6 +282,7 @@ client's deployment pins before funding a wallet.
 
 Implementation references: [v2 primitives](https://github.com/ethereum/zkapi/blob/main/protocol/rust/crates/zkapi-core/src/v2.rs),
 [Groth16 circuits](https://github.com/ethereum/zkapi/blob/main/protocol/rust/crates/zkapi-proof/src/groth16.rs),
+[insertion circuits](https://github.com/ethereum/zkapi/blob/main/protocol/rust/crates/zkapi-proof/src/insertion.rs),
 [key loading and setup policy](https://github.com/ethereum/zkapi/blob/main/protocol/rust/crates/zkapi-proof/src/compact.rs),
 and [Solidity verifier](https://github.com/ethereum/zkapi/blob/main/protocol/contracts/src/adapters/Groth16ProofAdapter.sol).
 The [note-bound commitments](https://github.com/ethereum/zkapi/blob/main/docs/note-bound-commitments.md)
