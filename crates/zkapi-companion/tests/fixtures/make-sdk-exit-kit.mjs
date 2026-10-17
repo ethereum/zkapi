@@ -22,8 +22,7 @@ const payload = buildExitKitPayload({
     trustedDeployment: inputs.trusted_deployment,
     state: inputs.state,
     stateSeq: inputs.state_seq,
-    exportedAt: inputs.exported_at,
-    merklePath: inputs.state.deposit_path
+    exportedAt: inputs.exported_at
 });
 // The SDK's minimum for openExitKit; the shipped count is 600,000.
 const kit = await sealExitKit(payload, 'zkapi exit kit fixture', { crypto: webcrypto, iterations: 100_000 });

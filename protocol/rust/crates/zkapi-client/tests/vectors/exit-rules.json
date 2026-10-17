@@ -1612,7 +1612,7 @@
     ]
   },
   "exit_kit": {
-    "description": "E7: a zkapi-exit-kit-v1 the browser SDK sealed (buildExitKitPayload and sealExitKit, crates/zkapi-companion/tests/fixtures/make-sdk-exit-kit.mjs). Every client opens `fixture` with `passphrase`, refuses `wrong_passphrase`, and reads `expected`. The kit predates note-bound exits and still carries the deposit-time `merkle_path` (`merkle_path_root`, `merkle_path_siblings`): a reader accepts a kit with or without it (or with the older `deposit_path`) and ignores it, since an exit needs no path.",
+    "description": "E7: a zkapi-exit-kit-v1 the browser SDK sealed (buildExitKitPayload and sealExitKit, crates/zkapi-companion/tests/fixtures/make-sdk-exit-kit.mjs). Every client opens `fixture` with `passphrase`, refuses `wrong_passphrase`, and reads `expected`. The kit carries no Merkle path, since an exit needs none; a reader also accepts an older kit that carries a deposit-time `merkle_path` (or `deposit_path`) and ignores it.",
     "fixture": "crates/zkapi-companion/tests/fixtures/sdk-exit-kit-v1.json",
     "passphrase": "zkapi exit kit fixture",
     "wrong_passphrase": "not the passphrase",
@@ -1626,9 +1626,7 @@
       "current_anchor": "0x1",
       "bound_at_state": "1000000",
       "state_seq": 1,
-      "exported_at": 1800000000,
-      "merkle_path_root": "0x18bb7959b7676a4a4b9404dc4c4d65ada97ec901d26d4719ff4fc64e2a851eb6",
-      "merkle_path_siblings": 32
+      "exported_at": 1800000000
     }
   }
 }

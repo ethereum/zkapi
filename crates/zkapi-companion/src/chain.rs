@@ -8,14 +8,15 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 use zkapi_client::exit_policy::CALL_TIMEOUT_SECONDS;
+use zkapi_client::note_state::RecordedNote;
 use zkapi_client::tree::{collect_logs, LogFetchError};
 use zkapi_types::Felt252;
 
 use crate::error::AuthError;
 
-/// `isKnownRoot(uint256)` (Amendment A1: any root the vault ever held).
-pub const IS_KNOWN_ROOT: &str = "a6232a93";
 pub const CURRENT_ROOT: &str = "fdab463d";
+/// `activationCursor()`: notes below it are in the request tree.
+pub const ACTIVATION_CURSOR: &str = "93e0ce4e";
 pub const NOTES: &str = "9f18e4ed";
 pub const PENDING_WITHDRAWALS: &str = "a2f9f1ce";
 pub const PENDING_CONCESSIONS: &str = "f8ffe6e0";
@@ -23,15 +24,19 @@ pub const CHALLENGED_NULLIFIERS: &str = "6cda756a";
 pub const EFFECTIVE_EXPIRY: &str = "7cb4a03c";
 pub const PROOF_ADAPTER: &str = "efc91e58";
 pub const CONCESSION_ESCAPE_VERSION: &str = "5e00b426";
-/// `initiateEscapeWithdrawal((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)`.
-pub const INITIATE_ESCAPE: &str = "a38d62aa";
+/// `NOTE_BOUND_EXIT_VERSION()`: 1 on a vault whose exits name the note by its
+/// recorded values (revision 4).
+pub const NOTE_BOUND_EXIT_VERSION: &str = "56853816";
+/// `initiateEscapeWithdrawal((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256),bytes)`.
+pub const INITIATE_ESCAPE: &str = "8e110492";
 /// `mutualClose(<the same tuple>,bytes)`.
-pub const MUTUAL_CLOSE: &str = "72cd2e44";
+pub const MUTUAL_CLOSE: &str = "5acd3b15";
 pub const FINALIZE_ESCAPE: &str = "ff8f5585";
 pub const CLAIM_ESCAPE_PAYOUT: &str = "88c10aee";
 
-/// The withdrawal tuple, in public-input order (design §6.7).
-pub const WITHDRAWAL_INPUTS_ABI: &str = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)";
+/// The withdrawal tuple, in public-input order (design §6.7): word 3 is the
+/// registration commitment and word 16 the packed note metadata.
+pub const WITHDRAWAL_INPUTS_ABI: &str = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64,uint256)";
 
 pub fn topic(signature: &str) -> String {
     format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())))
@@ -69,13 +74,13 @@ pub fn word_address(address: &[u8; 20]) -> String {
     format!("{}{}", "0".repeat(24), hex::encode(address))
 }
 
-/// The ABI words of the 16-field withdrawal tuple, in order.
+/// The ABI words of the 17-field withdrawal tuple, in order.
 pub fn withdrawal_words(inputs: &zkapi_types::WithdrawalPublicInputsV2C) -> Vec<String> {
     vec![
         word_u64(inputs.protocol_version.into()),
         word_u64(inputs.chain_id),
         word_felt(&inputs.contract_address),
-        word_felt(&inputs.active_root),
+        word_felt(&inputs.registration_commitment),
         word_felt(&inputs.state_signing_key_x),
         word_felt(&inputs.state_signing_key_y),
         word_felt(&inputs.clearance_signing_key_x),
@@ -88,11 +93,12 @@ pub fn withdrawal_words(inputs: &zkapi_types::WithdrawalPublicInputsV2C) -> Vec<
         word_felt(&inputs.next_nullifier),
         format!("{:064x}", inputs.conceded),
         word_u64(inputs.valid_until),
+        word_felt(&inputs.note_metadata()),
     ]
 }
 
-/// `selector | 16 tuple words | offset 0x220 | len 256 | 8 proof words`:
-/// 836 bytes, the calldata of `initiateEscapeWithdrawal` or `mutualClose`.
+/// `selector | 17 tuple words | offset 0x240 | len 256 | 8 proof words`:
+/// 868 bytes, the calldata of `initiateEscapeWithdrawal` or `mutualClose`.
 pub fn withdrawal_calldata(
     selector: &str,
     inputs: &zkapi_types::WithdrawalPublicInputsV2C,
@@ -105,7 +111,7 @@ pub fn withdrawal_calldata(
         .filter(|bytes| bytes.len() == 256)
         .ok_or_else(|| AuthError::Wallet("the withdrawal proof is not 256 bytes".into()))?;
     let mut words = withdrawal_words(inputs);
-    words.push(word_u64(17 * 32));
+    words.push(word_u64(18 * 32));
     words.push(word_u64(256));
     words.push(hex::encode(proof));
     Ok(format!("0x{selector}{}", words.concat()))
@@ -387,14 +393,14 @@ pub struct PendingEscape {
     pub conceded: u128,
 }
 
-/// Read a note and its pending escape at `block`, both getters at the same
-/// block (design §5.4).
-pub async fn read_note(
+/// `notes(noteId)` at `block`: the record and the status (0 for a note the
+/// vault never recorded).
+pub async fn read_note_record(
     rpc: &Rpc,
     vault: &[u8; 20],
     note_id: u32,
     block: &str,
-) -> Result<NoteView, AuthError> {
+) -> Result<(RecordedNote, u8), AuthError> {
     let note = rpc
         .call_words(
             vault,
@@ -403,9 +409,53 @@ pub async fn read_note(
             4,
         )
         .await?;
+    let invalid = || failure("invalid note record");
+    let recorded = RecordedNote {
+        registration_commitment: Felt252::try_from_bytes_be(note[0]).map_err(|_| invalid())?,
+        deposit_amount: word_to_u128(&note[1]).ok_or_else(invalid)?,
+        expiry_ts: word_to_u64(&note[2]).ok_or_else(invalid)?,
+    };
     let status = word_to_u64(&note[3])
         .and_then(|value| u8::try_from(value).ok())
         .ok_or_else(|| failure("invalid note status"))?;
+    Ok((recorded, status))
+}
+
+/// E4's advisory binding check: what `rpc` reports for `notes(note_id)`
+/// against `expected`, the values the wallet's exit statements name. The
+/// vault refuses an exit naming other values (`NoteBindingMismatch`), and
+/// one for a note it never recorded. `None` when they agree; a warning
+/// otherwise, never a refusal: the reading is the RPC's, and an exit stays
+/// allowed whatever it answers.
+pub async fn binding_warning(
+    rpc: &Rpc,
+    vault: &[u8; 20],
+    note_id: u32,
+    expected: &RecordedNote,
+) -> Option<String> {
+    match read_note_record(rpc, vault, note_id, "latest").await {
+        Ok((_, 0)) => Some(format!(
+            "{} has no record of note {note_id}; an exit reverts until the vault records its deposit",
+            rpc.url()
+        )),
+        Ok((recorded, _)) if recorded != *expected => Some(format!(
+            "note_binding_mismatch: {} records note {note_id} with another commitment, amount or expiry than this wallet's; the vault refuses its exits",
+            rpc.url()
+        )),
+        Ok(_) => None,
+        Err(error) => Some(format!("notes({note_id}) could not be read: {error}")),
+    }
+}
+
+/// Read a note and its pending escape at `block`, both getters at the same
+/// block (design §5.4).
+pub async fn read_note(
+    rpc: &Rpc,
+    vault: &[u8; 20],
+    note_id: u32,
+    block: &str,
+) -> Result<NoteView, AuthError> {
+    let (_, status) = read_note_record(rpc, vault, note_id, block).await?;
     if status != 2 {
         return Ok(NoteView {
             status,
@@ -417,7 +467,7 @@ pub async fn read_note(
             vault,
             &format!("0x{PENDING_WITHDRAWALS}{}", word_u64(note_id.into())),
             block,
-            6,
+            5,
         )
         .await?;
     let concession = rpc
@@ -430,14 +480,14 @@ pub async fn read_note(
         .await?;
     let invalid = || failure("invalid pending escape");
     let mut destination = [0u8; 20];
-    destination.copy_from_slice(&pending[4][12..]);
+    destination.copy_from_slice(&pending[3][12..]);
     Ok(NoteView {
         status,
         pending: Some(PendingEscape {
-            nullifier: Felt252(pending[2]),
-            final_balance: word_to_u128(&pending[3]).ok_or_else(invalid)?,
+            nullifier: Felt252(pending[1]),
+            final_balance: word_to_u128(&pending[2]).ok_or_else(invalid)?,
             destination,
-            deadline: word_to_u64(&pending[5]).ok_or_else(invalid)?,
+            deadline: word_to_u64(&pending[4]).ok_or_else(invalid)?,
             next_nullifier: Felt252(concession[0]),
             state_balance: word_to_u128(&concession[1]).ok_or_else(invalid)?,
             conceded: word_to_u128(&concession[2]).ok_or_else(invalid)?,
@@ -463,22 +513,14 @@ pub async fn challenged(
     Ok(word[0][31] == 1 && word[0][..31].iter().all(|byte| *byte == 0))
 }
 
-/// `isKnownRoot(root)`.
-pub async fn known_root(
-    rpc: &Rpc,
-    vault: &[u8; 20],
-    root: &Felt252,
-    block: &str,
-) -> Result<bool, AuthError> {
+/// `activationCursor()`: notes below it are in the request tree.
+pub async fn activation_cursor(rpc: &Rpc, vault: &[u8; 20], block: &str) -> Result<u32, AuthError> {
     let word = rpc
-        .call_words(
-            vault,
-            &format!("0x{IS_KNOWN_ROOT}{}", word_felt(root)),
-            block,
-            1,
-        )
+        .call_words(vault, &format!("0x{ACTIVATION_CURSOR}"), block, 1)
         .await?;
-    Ok(word[0][31] == 1 && word[0][..31].iter().all(|byte| *byte == 0))
+    word_to_u64(&word[0])
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| failure("invalid activation cursor"))
 }
 
 /// `effectiveExpiry(noteId)`.
@@ -603,7 +645,9 @@ mod tests {
             FINALIZE_ESCAPE
         );
         assert_eq!(selector("claimEscapePayout(address)"), CLAIM_ESCAPE_PAYOUT);
-        assert_eq!(selector("isKnownRoot(uint256)"), IS_KNOWN_ROOT);
+        assert_eq!(selector("activationCursor()"), ACTIVATION_CURSOR);
+        assert_eq!(selector("notes(uint32)"), NOTES);
+        assert_eq!(selector("currentRoot()"), CURRENT_ROOT);
         assert_eq!(selector("pendingConcessions(uint32)"), PENDING_CONCESSIONS);
         assert_eq!(selector("pendingWithdrawals(uint32)"), PENDING_WITHDRAWALS);
         assert_eq!(
@@ -614,6 +658,13 @@ mod tests {
             selector("CONCESSION_ESCAPE_VERSION()"),
             CONCESSION_ESCAPE_VERSION
         );
+        assert_eq!(
+            selector("NOTE_BOUND_EXIT_VERSION()"),
+            NOTE_BOUND_EXIT_VERSION
+        );
+        // Pinned in the design C spec (section 1).
+        assert_eq!(INITIATE_ESCAPE, "8e110492");
+        assert_eq!(MUTUAL_CLOSE, "5acd3b15");
         assert_eq!(selector("proofAdapter()"), PROOF_ADAPTER);
         assert_eq!(
             escape_concession_raised_topic(),
@@ -690,13 +741,13 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_calldata_is_836_bytes_with_the_proof_at_word_eighteen() {
+    fn withdrawal_calldata_is_868_bytes_with_the_proof_at_word_nineteen() {
         use base64::Engine;
         let inputs = zkapi_types::WithdrawalPublicInputsV2C {
             protocol_version: 2,
             chain_id: 11_155_111,
             contract_address: Felt252::from_u64(0x1234),
-            active_root: Felt252::from_u64(5),
+            registration_commitment: Felt252::from_u64(5),
             state_signing_key_x: Felt252::from_u64(6),
             state_signing_key_y: Felt252::from_u64(7),
             clearance_signing_key_x: Felt252::from_u64(8),
@@ -709,6 +760,8 @@ mod tests {
             next_nullifier: Felt252::from_u64(11),
             conceded: 100,
             valid_until: 1_800_000_000,
+            deposit_amount: 1_000,
+            expiry: 1_900_000_000,
         };
         let proof = zkapi_types::wire::Groth16ProofWire {
             backend: zkapi_types::wire::ProofBackendWire::Groth16Bn254,
@@ -717,14 +770,21 @@ mod tests {
         };
         let data = withdrawal_calldata(INITIATE_ESCAPE, &inputs, &proof).unwrap();
         let bytes = hex::decode(&data[2..]).unwrap();
-        assert_eq!(bytes.len(), 836);
+        assert_eq!(bytes.len(), 868);
+        assert_eq!(&data[2..10], "8e110492");
         let word = |index: usize| hex::encode(&bytes[4 + index * 32..4 + (index + 1) * 32]);
+        assert_eq!(word(3), format!("{:064x}", 5));
         assert_eq!(word(9), format!("{:064x}", 900));
         assert_eq!(word(14), format!("{:064x}", 100));
         assert_eq!(word(15), format!("{:064x}", 1_800_000_000u64));
-        assert_eq!(word(16), format!("{:064x}", 17 * 32));
-        assert_eq!(word(17), format!("{:064x}", 256));
-        assert_eq!(&bytes[4 + 18 * 32..], (0..=255u8).collect::<Vec<_>>());
+        // uint256(depositAmount) | uint256(expiryTs) << 128.
+        assert_eq!(
+            word(16),
+            format!("{:032x}{:032x}", 1_900_000_000u64, 1_000u128)
+        );
+        assert_eq!(word(17), "0".repeat(61) + "240");
+        assert_eq!(word(18), format!("{:064x}", 256));
+        assert_eq!(&bytes[4 + 19 * 32..], (0..=255u8).collect::<Vec<_>>());
         assert_eq!(finalize_calldata(3), format!("0xff8f5585{:064x}", 3));
     }
 }

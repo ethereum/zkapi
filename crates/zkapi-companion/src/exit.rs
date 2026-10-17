@@ -6,9 +6,10 @@
 //! lock is set, the request journal and archive are read and the server is
 //! asked, with no request preparation in between. Operator calls are bounded
 //! (E0: 20 s each, 120 s per recovery pass, none after `must_initiate_by`);
-//! the escape needs no operator at all: its Merkle path is the one saved at
-//! deposit (Amendment A1), else the indexer's at a root the vault knows, else
-//! a rebuild from the vault's logs (§6.6).
+//! the escape needs no operator and no Merkle path at all: its statement
+//! names the note by its registration commitment, amount and expiry, which
+//! the vault compares with `notes(noteId)`, so a recorded note exits whether
+//! or not it is activated.
 
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use zkapi_client::exit_policy::{
     self, EarlyExit, ExitDecision, ExitFacts, MutualOutcome, NoteChainStatus, PayoutMatch, Reading,
     ServerReading,
 };
+use zkapi_client::note_state::RecordedNote;
 use zkapi_client::wallet::Wallet;
 use zkapi_proof::compact::RequestVerifier;
 use zkapi_types::wire::{Groth16ProofWire, RecoveryResponseV2};
@@ -31,7 +33,6 @@ use super::{
 use crate::chain::{self, Rpc};
 use crate::config::AuthConfig;
 use crate::error::AuthError;
-use crate::indexer::IndexerClient;
 
 pub(crate) const ESCAPE_RECORD_FILE: &str = "escape_withdrawal.json";
 
@@ -388,77 +389,6 @@ fn wallet_holds_request(wallet: &Wallet, client_request_id: &str) -> Result<bool
         .any(|record| record.journal.client_request_id == client_request_id))
 }
 
-/// Where an escape's Merkle path came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PathSource {
-    Deposit,
-    Indexer,
-    Rebuild,
-}
-
-/// E4 step 1: a path at a root the vault knows, without the operator when
-/// possible.
-pub(crate) async fn escape_path(
-    config: &AuthConfig,
-    indexer: &IndexerClient,
-    wallet: &Wallet,
-) -> Result<(Felt252, Vec<Felt252>, PathSource), AuthError> {
-    if let Some(path) = wallet.deposit_path() {
-        return Ok((path.root, path.siblings.clone(), PathSource::Deposit));
-    }
-    let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
-    let leaf = wallet.current_note_leaf().ok_or(AuthError::NoActiveNote)?;
-    let vault = chain::vault_address(&config.contract_address)?;
-    let rpcs: Vec<Rpc> = deciding_rpc(config).into_iter().collect();
-    // The indexer's path, at a root the vault confirms it held.
-    let from_indexer = async {
-        let root = indexer.root().await.ok()?;
-        let siblings = indexer.note_path(state.note_id).await.ok()?;
-        let array: [Felt252; zkapi_types::MERKLE_DEPTH] = siblings.clone().try_into().ok()?;
-        if zkapi_core::v2::merkle_root(state.note_id, &leaf, &array) != root {
-            return None;
-        }
-        for rpc in &rpcs {
-            if matches!(
-                chain::known_root(rpc, &vault, &root, "latest").await,
-                Ok(true)
-            ) {
-                return Some((root, siblings));
-            }
-        }
-        None
-    };
-    if let Ok(Some((root, siblings))) = tokio::time::timeout(CALL_TIMEOUT * 2, from_indexer).await {
-        return Ok((root, siblings, PathSource::Indexer));
-    }
-    // §6.6: rebuild from the vault's logs up to the finalized block.
-    let mut last_error = AuthError::Wallet(
-        "no Merkle path: no saved deposit path, the indexer's path is not at a root the vault knows, and no RPC is configured for a rebuild".into(),
-    );
-    for rpc in &rpcs {
-        let rebuilt = async {
-            let (finalized, _) = rpc.block("finalized").await?;
-            let logs = rpc
-                .logs(
-                    &vault,
-                    json!([zkapi_client::tree::TREE_TOPICS]),
-                    config.deploy_block,
-                    finalized,
-                )
-                .await?;
-            zkapi_client::tree::path_from_logs(&logs, &vault, state.note_id, &leaf)
-                .map_err(|error| AuthError::Wallet(error.to_string()))
-        }
-        .await;
-        match rebuilt {
-            Ok((root, siblings)) => return Ok((root, siblings, PathSource::Rebuild)),
-            Err(error) => last_error = error,
-        }
-    }
-    Err(last_error)
-}
-
 /// E4 step 2: the stale-device pre-check. A request proof at `N⁺` that
 /// verifies under the pinned request key means another device spent this
 /// state; anything else (errors, refusals, unverifiable answers) is ignored.
@@ -503,12 +433,17 @@ pub(crate) async fn stale_device_check(
     Ok(())
 }
 
-/// E4 step 5: advisory reads. They never block the escape.
-async fn advisory_warnings(
-    config: &AuthConfig,
-    nullifier: &Felt252,
-    successor: &Felt252,
-) -> Vec<String> {
+/// E4 step 5: advisory reads. They never block the escape: the nullifiers'
+/// challenge flags, and the vault's record of the note against the values
+/// the escape names (its registration commitment, amount and expiry).
+async fn advisory_warnings(config: &AuthConfig, inputs: &WithdrawalPublicInputsV2C) -> Vec<String> {
+    let nullifier = &inputs.withdrawal_nullifier;
+    let successor = &inputs.next_nullifier;
+    let named = RecordedNote {
+        registration_commitment: inputs.registration_commitment,
+        deposit_amount: inputs.deposit_amount,
+        expiry_ts: inputs.expiry,
+    };
     let mut warnings = Vec::new();
     let Ok(vault) = chain::vault_address(&config.contract_address) else {
         return warnings;
@@ -523,6 +458,7 @@ async fn advisory_warnings(
         let Ok(rpc) = Rpc::new(url).map(|rpc| rpc.on_chain(config.chain_id)) else {
             continue;
         };
+        warnings.extend(chain::binding_warning(&rpc, &vault, inputs.note_id, &named).await);
         for (label, value) in [("nullifier", nullifier), ("successor nullifier", successor)] {
             match chain::challenged(&rpc, &vault, value, "latest").await {
                 Ok(true) => warnings.push(format!(
@@ -620,7 +556,6 @@ impl AuthService {
         let mut lease = self.direct_lease.lock().await;
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
-        let indexer = self.indexer.clone();
         let early_exit = request.early_exit;
         let result = spawn_blocking(move || {
             let _guard = wallet_mutex
@@ -630,7 +565,6 @@ impl AuthService {
             let mut wallet = load_wallet(&config)?;
             current_thread_runtime()?.block_on(prepare_escape_locked(
                 &config,
-                &indexer,
                 &mut wallet,
                 destination,
                 confirmed,
@@ -763,7 +697,6 @@ impl AuthService {
 
 async fn prepare_escape_locked(
     config: &AuthConfig,
-    indexer: &IndexerClient,
     wallet: &mut Wallet,
     destination: [u8; 20],
     confirmed: Option<u128>,
@@ -792,7 +725,6 @@ async fn prepare_escape_locked(
     }
     let result = decide_and_prove_escape(
         config,
-        indexer,
         wallet,
         destination,
         destination_hex,
@@ -813,7 +745,6 @@ async fn prepare_escape_locked(
 
 async fn decide_and_prove_escape(
     config: &AuthConfig,
-    indexer: &IndexerClient,
     wallet: &mut Wallet,
     destination: [u8; 20],
     destination_hex: String,
@@ -859,7 +790,6 @@ async fn decide_and_prove_escape(
             return Err(AuthError::ConcededMismatch(value));
         }
         wallet.set_exit_lock(ExitMode::Escape)?;
-        let (root, siblings, path_source) = escape_path(config, indexer, wallet).await?;
         let successor = wallet
             .current_successor_nullifier()
             .ok_or(AuthError::NoActiveNote)?;
@@ -877,14 +807,8 @@ async fn decide_and_prove_escape(
             }
         }
         let bound = wallet.state().map_or(0, |state| state.bound_at_state);
-        let (public_inputs, proof) =
-            wallet.withdrawal_escape_hatch(destination, conceded, root, siblings)?;
-        let mut warnings = advisory_warnings(
-            config,
-            &public_inputs.withdrawal_nullifier,
-            &public_inputs.next_nullifier,
-        )
-        .await;
+        let (public_inputs, proof) = wallet.withdrawal_escape_hatch(destination, conceded)?;
+        let mut warnings = advisory_warnings(config, &public_inputs).await;
         // E4 step 6: a successor arriving now is archived as late.
         if recovery_pass(wallet, decided.facts.must_initiate_by).await == Recovered::Late {
             warnings.push(
@@ -915,7 +839,6 @@ async fn decide_and_prove_escape(
         };
         save_record(config, &record)?;
         let mut plan = plan_json(&record, config, &warnings);
-        plan["path_source"] = serde_json::to_value(path_source).unwrap_or_default();
         plan["must_initiate_by"] = json!(decided.facts.must_initiate_by);
         return Ok(plan);
     }

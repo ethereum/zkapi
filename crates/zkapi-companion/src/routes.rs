@@ -97,7 +97,6 @@ pub fn build_router_with_token(service: Arc<AuthService>, token: Option<String>)
         .route("/oa/v1/withdraw/escape/status", get(oa_escape_status))
         .route("/oa/v1/withdraw/escape/finalize", post(oa_escape_finalize))
         .route("/oa/v1/withdraw/escape/cancel", post(oa_escape_cancel))
-        .route("/oa/v1/deposit/path", get(oa_deposit_path))
         .route("/healthz", get(healthz))
         .route("/request", post(core_request))
         .route("/status", get(wallet_status))
@@ -184,13 +183,6 @@ async fn oa_session_events(
         return StatusCode::FORBIDDEN.into_response();
     }
     Json(service.oa_session_events()).into_response()
-}
-
-async fn oa_deposit_path(State(service): State<Arc<AuthService>>) -> Response {
-    match service.oa_deposit_path().await {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => generic_error(error),
-    }
 }
 
 async fn oa_billing_quote(State(service): State<Arc<AuthService>>) -> Response {
@@ -684,7 +676,7 @@ async fn tags(State(service): State<Arc<AuthService>>) -> Json<Value> {
 }
 
 async fn wallet_status(State(service): State<Arc<AuthService>>) -> Response {
-    match service.status().await {
+    match service.status_with_activation().await {
         Ok(status) => Json(status).into_response(),
         Err(err) => generic_error(err),
     }
@@ -902,7 +894,7 @@ fn generic_error(err: AuthError) -> Response {
         body["error"]["nullifier"] = json!(nullifier);
     }
     if let Some(detail) = err.detail() {
-        body["error"]["detail"] = detail.clone();
+        body["error"]["detail"] = detail;
     }
     (status, Json(body)).into_response()
 }
@@ -1052,7 +1044,6 @@ mod tests {
             "/oa/v1/session-events",
             "/oa/v1/lease",
             "/oa/v1/billing/quote",
-            "/oa/v1/deposit/path",
             "/oa/v1/withdraw/status",
             "/oa/v1/withdraw/prepare",
             "/oa/v1/withdraw/confirm",
@@ -1076,7 +1067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oa_status_advertises_the_concession_exit_and_bridge_version_5() {
+    async fn oa_status_advertises_the_concession_exit_and_bridge_version_6() {
         let directory = tempfile::tempdir().unwrap();
         let service = AuthService::new(AuthConfig {
             state_dir: directory.path().to_path_buf(),
@@ -1106,12 +1097,37 @@ mod tests {
         assert_eq!(value["clearance_ownership_proof_version"], 1);
         assert_eq!(value["unsettled_request_override_version"], 1);
         assert_eq!(value["withdrawal_bridge_version"], 1);
-        assert_eq!(value["bridge_version"], 5);
+        assert_eq!(value["bridge_version"], 6);
         assert_eq!(value["exit_concession"], 1);
         assert_eq!(value["escape_routes_version"], 2);
         assert_eq!(value["setup_id"], "dev");
         assert_eq!(value["settlement_window_seconds"], 21_905);
-        assert_eq!(value["circuit_id"], "zkapi-v2-concession-v1");
+        assert_eq!(value["circuit_id"], "zkapi-v2-concession-v2");
+    }
+
+    /// Deposits take no path: `/oa/v1/deposit/path` is gone, behind the same
+    /// authentication as every route.
+    #[tokio::test]
+    async fn the_deposit_path_route_is_gone() {
+        let service = AuthService::new(AuthConfig::default()).unwrap();
+        let router = build_router_with_token(
+            service,
+            Some("companion-test-token-thirty-two-characters".into()),
+        );
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/oa/v1/deposit/path")
+                    .header(
+                        "Authorization",
+                        "Bearer companion-test-token-thirty-two-characters",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

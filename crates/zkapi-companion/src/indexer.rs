@@ -1,8 +1,9 @@
 //! The operator's indexer. Every call is bounded (design §6.4 E0): the
-//! indexer is operator-run, and the mutual close and request preparation
-//! read it while holding the wallet's locks, which every exit route takes
-//! too. A call that connects and never answers, or drips its body, fails
-//! after `CALL_TIMEOUT` instead of holding those locks.
+//! indexer is operator-run, and request preparation reads it while holding
+//! the wallet's locks, which every exit route takes too. A call that
+//! connects and never answers, or drips its body, fails after
+//! `CALL_TIMEOUT` instead of holding those locks. Exits never read it: they
+//! name the note by its recorded values, with no Merkle path.
 
 use std::time::Duration;
 
@@ -28,21 +29,27 @@ pub struct IndexerClient {
 #[derive(Debug, Deserialize)]
 struct TreeRootResponse {
     root: Felt252,
-}
-
-#[derive(Debug, Deserialize)]
-struct TreePathResponse {
-    siblings: Vec<Felt252>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TreeLeafResponse {
-    leaf: Option<Felt252>,
+    #[serde(default)]
+    activation_cursor: u32,
 }
 
 #[derive(Debug, Deserialize)]
 struct NextNoteIdResponse {
     next_note_id: u32,
+}
+
+/// A note's slot in the indexer's tree, from one view: the slot's tree leaf
+/// (zero until the note is activated), its siblings and the root they hash
+/// to, and the activation cursor of that view.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotePath {
+    pub leaf: Felt252,
+    pub siblings: Vec<Felt252>,
+    pub root: Felt252,
+    #[serde(default)]
+    pub activated: bool,
+    #[serde(default)]
+    pub activation_cursor: u32,
 }
 
 impl IndexerClient {
@@ -64,20 +71,10 @@ impl IndexerClient {
         }
     }
 
-    pub async fn root(&self) -> Result<Felt252, AuthError> {
+    /// The root and the activation cursor of one view.
+    pub async fn root_view(&self) -> Result<(Felt252, u32), AuthError> {
         let payload: TreeRootResponse = self.get(format!("{}/v1/tree/root", self.base_url)).await?;
-        Ok(payload.root)
-    }
-
-    /// The root and `note_id`'s path, read together within one
-    /// `CALL_TIMEOUT` (E0): the pair the mutual close and a request prove
-    /// against.
-    pub async fn root_and_path(&self, note_id: u32) -> Result<(Felt252, Vec<Felt252>), AuthError> {
-        tokio::time::timeout(CALL_TIMEOUT, async {
-            Ok::<_, AuthError>((self.root().await?, self.note_path(note_id).await?))
-        })
-        .await
-        .map_err(|_| AuthError::Indexer("the indexer did not answer in time".into()))?
+        Ok((payload.root, payload.activation_cursor))
     }
 
     pub async fn next_note_id(&self) -> Result<u32, AuthError> {
@@ -87,33 +84,20 @@ impl IndexerClient {
         Ok(payload.next_note_id)
     }
 
-    pub async fn note_path(&self, note_id: u32) -> Result<Vec<Felt252>, AuthError> {
-        self.path(format!("{}/v1/tree/notes/{note_id}/path", self.base_url))
-            .await
-    }
-
-    pub async fn zero_path(&self, note_id: u32) -> Result<Vec<Felt252>, AuthError> {
-        self.path(format!(
-            "{}/v1/tree/notes/{note_id}/zero-path",
-            self.base_url
-        ))
-        .await
-    }
-
-    /// The leaf the indexer's tree holds at `note_id`, from the same view as
-    /// its path; zero where no note is.
-    pub async fn note_leaf(&self, note_id: u32) -> Result<Felt252, AuthError> {
-        let payload: TreeLeafResponse = self
+    /// `note_id`'s path, with the root it hashes to, in one call (E0): the
+    /// pair a request proves against comes from one indexer view, which
+    /// activations and retirements move.
+    pub async fn note_path(&self, note_id: u32) -> Result<NotePath, AuthError> {
+        let path: NotePath = self
             .get(format!("{}/v1/tree/notes/{note_id}/path", self.base_url))
             .await?;
-        payload
-            .leaf
-            .ok_or_else(|| AuthError::Indexer("the indexer's note path carries no leaf".into()))
-    }
-
-    async fn path(&self, url: String) -> Result<Vec<Felt252>, AuthError> {
-        let payload: TreePathResponse = self.get(url).await?;
-        Ok(payload.siblings)
+        if path.siblings.len() != zkapi_types::MERKLE_DEPTH {
+            return Err(AuthError::Indexer(format!(
+                "the indexer's path of note {note_id} has {} siblings",
+                path.siblings.len()
+            )));
+        }
+        Ok(path)
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, url: String) -> Result<T, AuthError> {

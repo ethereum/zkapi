@@ -68,6 +68,21 @@ pub enum AuthError {
     DeviceNotNewest,
     #[error("exit_lock_conflict: {0}")]
     ExitLockConflict(String),
+    #[error("note_not_activated: the deposit is recorded but the note is not in the request tree yet ({queue_position} notes are activated before it), so it cannot pay for requests; retry once the operator's batch activates it (withdrawals are available now)")]
+    NoteNotActivated {
+        queue_position: u32,
+        /// The vault's `activationCursor()` the refusal was decided at.
+        activation_cursor: Option<u32>,
+    },
+    #[error("indexer_root_lag: the vault activated the note (its activation cursor is {activation_cursor}), but the operator's indexer has not caught up with that activation yet, so no request can be proved against its tree; retry in a few seconds")]
+    IndexerRootLag {
+        /// The vault's `activationCursor()`, past the note.
+        activation_cursor: u32,
+    },
+    #[error("note_binding_mismatch: {0}")]
+    NoteBindingMismatch(String),
+    #[error("note_not_recorded: the operator has not observed this note's deposit yet; retry the withdrawal shortly")]
+    NoteNotRecorded,
     #[error("this note state is reserved for a withdrawal: the server holds a clearance for its nullifier (an earlier withdrawal reserved it, or the operator released a stuck state) and refuses every request at it as a replay, so no chat request can settle this state; withdraw the balance by mutual close (in zkapi-clientd: config --menu, then withdraw), which sets the refused request aside first")]
     ClearanceReservedState,
 }
@@ -91,8 +106,12 @@ impl AuthError {
             | Self::EscapeRequired(_)
             | Self::ConcededMismatch(_)
             | Self::DeviceNotNewest
-            | Self::ExitLockConflict(_) => StatusCode::CONFLICT,
+            | Self::ExitLockConflict(_)
+            | Self::NoteNotActivated { .. }
+            | Self::NoteBindingMismatch(_)
+            | Self::NoteNotRecorded => StatusCode::CONFLICT,
             Self::NoActiveNote | Self::InsufficientBalance => StatusCode::PAYMENT_REQUIRED,
+            Self::IndexerRootLag { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::PendingRequest
             | Self::LeasePending(_)
             | Self::WithdrawalPending(_)
@@ -136,14 +155,34 @@ impl AuthError {
             Self::ConcededMismatch(_) => "conceded_mismatch",
             Self::DeviceNotNewest => "device_not_newest",
             Self::ExitLockConflict(_) => "exit_lock_conflict",
+            Self::NoteNotActivated { .. } => "note_not_activated",
+            Self::IndexerRootLag { .. } => "indexer_root_lag",
+            Self::NoteBindingMismatch(_) => "note_binding_mismatch",
+            Self::NoteNotRecorded => "note_not_recorded",
         }
     }
 
     /// Structured detail for the bridge: the exit decision behind
-    /// `escape_required` and `conceded_mismatch`.
-    pub fn detail(&self) -> Option<&serde_json::Value> {
+    /// `escape_required` and `conceded_mismatch`, the activation queue
+    /// behind `note_not_activated`, and the vault's cursor behind
+    /// `indexer_root_lag`.
+    pub fn detail(&self) -> Option<serde_json::Value> {
         match self {
-            Self::EscapeRequired(detail) | Self::ConcededMismatch(detail) => Some(detail),
+            Self::EscapeRequired(detail) | Self::ConcededMismatch(detail) => Some(detail.clone()),
+            Self::NoteNotActivated {
+                queue_position,
+                activation_cursor,
+            } => Some(serde_json::json!({
+                "activated": false,
+                "queue_position": queue_position,
+                "activation_cursor": activation_cursor,
+                "retriable": true,
+            })),
+            Self::IndexerRootLag { activation_cursor } => Some(serde_json::json!({
+                "activated": true,
+                "activation_cursor": activation_cursor,
+                "retriable": true,
+            })),
             _ => None,
         }
     }
@@ -178,6 +217,12 @@ impl From<ClientError> for AuthError {
             ClientError::InvalidSuccessor(reason) => Self::InvalidSuccessor(reason),
             ClientError::LateSuccessor => Self::LateSuccessor,
             ClientError::ExitLockConflict(reason) => Self::ExitLockConflict(reason),
+            ClientError::NoteNotActivated { queue_position } => Self::NoteNotActivated {
+                queue_position,
+                activation_cursor: None,
+            },
+            ClientError::NoteBindingMismatch(reason) => Self::NoteBindingMismatch(reason),
+            ClientError::NoteNotRecorded => Self::NoteNotRecorded,
             other => Self::Wallet(other.to_string()),
         }
     }
@@ -193,6 +238,42 @@ mod tests {
         assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
         assert_eq!(error.code(), "testnet_password_required");
         assert_eq!(error.funding_url(), None);
+    }
+
+    #[test]
+    fn activation_and_binding_refusals_have_their_own_codes() {
+        let error = AuthError::from(ClientError::NoteNotActivated { queue_position: 3 });
+        assert_eq!(error.code(), "note_not_activated");
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.detail().unwrap()["queue_position"], 3);
+        assert_eq!(error.detail().unwrap()["retriable"], true);
+        let error = AuthError::NoteNotActivated {
+            queue_position: 0,
+            activation_cursor: Some(7),
+        };
+        assert_eq!(error.detail().unwrap()["activation_cursor"], 7);
+        assert!(error.to_string().contains("withdrawals are available"));
+        let error = AuthError::from(ClientError::NoteBindingMismatch("other values".into()));
+        assert_eq!(error.code(), "note_binding_mismatch");
+        assert!(error.to_string().contains("other values"));
+        assert_eq!(
+            AuthError::from(ClientError::NoteNotRecorded).code(),
+            "note_not_recorded"
+        );
+    }
+
+    #[test]
+    fn an_indexer_behind_the_vaults_activation_is_retriable() {
+        let error = AuthError::IndexerRootLag {
+            activation_cursor: 9,
+        };
+        assert_eq!(error.code(), "indexer_root_lag");
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        let detail = error.detail().unwrap();
+        assert_eq!(detail["activated"], true);
+        assert_eq!(detail["activation_cursor"], 9);
+        assert_eq!(detail["retriable"], true);
+        assert!(error.to_string().contains("retry"));
     }
 
     #[test]

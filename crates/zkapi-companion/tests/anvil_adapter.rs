@@ -23,7 +23,7 @@ use zkapi_proof::compact::{
     withdrawal_public_inputs, CompactSigner, WithdrawalProver, WithdrawalStatementParams,
     WithdrawalWitnessData,
 };
-use zkapi_types::{Felt252, WithdrawalKind, MERKLE_DEPTH};
+use zkapi_types::{Felt252, WithdrawalKind};
 
 const SETUP_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -31,8 +31,8 @@ const SETUP_DIR: &str = concat!(
 );
 /// Anvil's first default account.
 const ANVIL_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-/// `assertValidWithdrawal(<the 16-field tuple>,bytes)`.
-const ASSERT_VALID_WITHDRAWAL: &str = "9ea31c77";
+/// `assertValidWithdrawal(<the 17-field tuple>,bytes)`.
+const ASSERT_VALID_WITHDRAWAL: &str = "330fa82a";
 
 struct Anvil(Child);
 
@@ -160,9 +160,10 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
         serde_json::from_slice(&std::fs::read(Path::new(SETUP_DIR).join("manifest.json")).unwrap())
             .unwrap();
     let circuit = rpc.call(&adapter, "0xda0e8385", "latest").await.unwrap();
+    // keccak256("zkapi-v2-concession-v2").
     assert_eq!(
         circuit,
-        "0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687"
+        "0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1"
     );
     let withdrawal_vk = rpc.call(&adapter, "0x7fcd0926", "latest").await.unwrap();
     assert_eq!(
@@ -173,7 +174,9 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
             .trim_start_matches("0x")
     );
 
-    // Proofs from the companion's wallet for a note in a non-trivial tree.
+    // Proofs from the companion's wallet for a note, named by its recorded
+    // values; the request it made first proves its leaf in a non-trivial
+    // tree.
     let vault = [0x42u8; 20];
     let contract = zkapi_types::serialization::address_to_felt(&vault);
     let secret = Felt252::from_u64(777);
@@ -202,16 +205,14 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
         )
         .unwrap();
     wallet.set_exit_lock(ExitMode::Escape).unwrap();
-    let (escape, escape_proof) = wallet
-        .withdrawal_escape_hatch([0x99; 20], 1_000, root_felt, siblings.clone())
-        .unwrap();
+    let (escape, escape_proof) = wallet.withdrawal_escape_hatch([0x99; 20], 1_000).unwrap();
     let mutual_dir = directory.path().join("mutual");
     let mut mutual = Wallet::new(wallet_config(&mutual_dir, contract)).unwrap();
     mutual
         .confirm_deposit(secret, 6, 3_000_000, 4_000_000_000)
         .unwrap();
     mutual.set_exit_lock(ExitMode::Mutual).unwrap();
-    let ownership = mutual.ownership_proof(root_felt, siblings.clone()).unwrap();
+    let ownership = mutual.ownership_proof().unwrap();
     // A close (kind 1) under a clearance signature, proved directly.
     let state = mutual.state().unwrap().clone();
     let nullifier = core::nullifier(&secret, 6, &state.current_anchor);
@@ -221,7 +222,6 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
         protocol_version: 2,
         chain_id: 31_337,
         contract_address: contract,
-        active_root: root_felt,
         state_signing_key: CompactSigner::from_seed(&Felt252::from_u64(11)).public_key(),
         clearance_signing_key: CompactSigner::from_seed(&Felt252::from_u64(12)).public_key(),
         note_id: 6,
@@ -231,7 +231,6 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
         secret,
         deposit_amount: 3_000_000,
         expiry: 4_000_000_000,
-        merkle_siblings: <[Felt252; MERKLE_DEPTH]>::try_from(siblings.clone()).unwrap(),
         state_balance: 3_000_000,
         state_blinding: Felt252::from_hex(&state.balance_blinding).unwrap(),
         current_anchor: state.current_anchor,
@@ -253,20 +252,29 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
         ("close", &close, &close_proof),
         ("ownership", &ownership.public_inputs, &ownership.proof),
     ] {
+        assert_eq!(
+            inputs.registration_commitment,
+            core::registration_commitment(&secret),
+            "{label}"
+        );
         let data = chain::withdrawal_calldata(chain::INITIATE_ESCAPE, inputs, proof).unwrap();
-        assert_eq!(data.len(), 2 + 836 * 2, "{label}");
+        assert_eq!(data.len(), 2 + 868 * 2, "{label}");
         let result = rpc.call(&adapter, &as_assert(data.clone()), "latest").await;
         assert_eq!(result.unwrap(), "0x", "{label} verifies");
-        // Any changed public input fails.
+        // Any changed public input fails, the note's metadata included.
         let mut changed = inputs.clone();
         changed.valid_until += 1;
-        let data = chain::withdrawal_calldata(chain::INITIATE_ESCAPE, &changed, proof).unwrap();
-        assert!(
-            rpc.call(&adapter, &as_assert(data), "latest")
-                .await
-                .is_err(),
-            "{label}: a changed valid_until must not verify"
-        );
+        let mut other_note = inputs.clone();
+        other_note.deposit_amount += 1;
+        for (field, changed) in [("valid_until", changed), ("note metadata", other_note)] {
+            let data = chain::withdrawal_calldata(chain::INITIATE_ESCAPE, &changed, proof).unwrap();
+            assert!(
+                rpc.call(&adapter, &as_assert(data), "latest")
+                    .await
+                    .is_err(),
+                "{label}: a changed {field} must not verify"
+            );
+        }
     }
 
     // The exit kit's signer: a mined EIP-1559 transaction.

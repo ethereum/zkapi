@@ -1,6 +1,6 @@
 //! `zkapi-walletd`: the wallet and prover companion that `zkapi-clientd`
 //! runs. It keeps the private note state, proves requests and withdrawals for
-//! circuit `zkapi-v2-concession-v1`, and serves the local bridge API.
+//! circuit `zkapi-v2-concession-v2`, and serves the local bridge API.
 //!
 //! `zkapi-clientd` starts it as
 //!
@@ -48,8 +48,9 @@ struct Cli {
     /// Require verifier-backed OA-org keys and reject direct/legacy leases.
     #[arg(long, env = "ZKAPI_REQUIRE_OA_ORG_KEY_SOURCE", default_value_t = false)]
     require_oa_org_key_source: bool,
-    /// The user's own Ethereum RPC for exits: the latest exit time, Merkle
-    /// path checks and log rebuilds also read through it (design §6.4 E0).
+    /// The user's own Ethereum RPC for exits: the latest exit time, the
+    /// escape's chain readings and the note's activation also read through
+    /// it (design §6.4 E0).
     #[arg(long, env = "ZKAPI_EXIT_RPC_URL", global = true)]
     exit_rpc_url: Option<String>,
     #[command(subcommand)]
@@ -117,8 +118,8 @@ enum ExitKitAction {
         /// The payout address.
         #[arg(long)]
         destination: String,
-        /// Your Ethereum RPC: codehash checks, a Merkle path rebuild when the
-        /// kit holds none, advisory reads and submission.
+        /// Your Ethereum RPC: codehash checks, the vault's record of the
+        /// note, advisory reads and submission.
         #[arg(long)]
         rpc: Option<String>,
         /// The amount to concede, at most the kit's bound_at_state.
@@ -181,7 +182,7 @@ struct DeploymentManifest {
     /// `not_deployed` for a placeholder profile (design §10.5).
     #[serde(default)]
     deployment_status: Option<String>,
-    /// 1 for a vault with the concession exit (revision 3).
+    /// 1 for a vault with the concession exit (revision 3 and later).
     #[serde(default)]
     exit_concession: u8,
     /// W, the build-pinned settlement window (design §6.4 E0).
@@ -577,9 +578,9 @@ fn validate_deployment_manifest(manifest: &DeploymentManifest) -> anyhow::Result
             manifest.deployment_id
         ),
     }
-    if manifest.exit_concession != 1 || manifest.vault_revision < 3 {
+    if manifest.exit_concession != 1 || manifest.vault_revision < 4 {
         anyhow::bail!(
-            "deployment {} has no concession exit (exit_concession 1, vault_revision 3); this companion serves only such a vault",
+            "deployment {} has no concession exit with note-bound withdrawals (exit_concession 1, vault_revision 4); this companion serves only such a vault",
             manifest.deployment_id
         );
     }
@@ -876,7 +877,7 @@ mod tests {
             "protocol_server_url": "https://server.example",
             "indexer_url": "https://indexer.example", "request_charge_cap": 1,
             "proof_backend": "groth16_bn254",
-            "vault_revision": 3, "exit_concession": 1,
+            "vault_revision": 4, "exit_concession": 1,
             "settlement_window_seconds": 21905,
             "state_signing_key": {"x": "0x1", "y": "0x2"},
             "clearance_signing_key": {"x": "0x3", "y": "0x4"}
@@ -899,7 +900,7 @@ mod tests {
         for circuit in [
             None,
             Some(""),
-            Some("zkapi-v2-note-bound-v1"),
+            Some("zkapi-v2-concession-v1"),
             Some("unknown-future-circuit"),
         ] {
             json.as_object_mut().unwrap().remove("proof_setup");
@@ -912,10 +913,10 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("incompatible proof circuit"), "{error}");
-            assert!(error.contains("zkapi-v2-concession-v1"), "{error}");
+            assert!(error.contains("zkapi-v2-concession-v2"), "{error}");
         }
         json["proof_setup"] =
-            serde_json::json!({"circuit_id": "zkapi-v2-concession-v1", "setup_id": "dev"});
+            serde_json::json!({"circuit_id": "zkapi-v2-concession-v2", "setup_id": "dev"});
         let manifest: DeploymentManifest = serde_json::from_value(json.clone()).unwrap();
         validate_deployment_manifest(&manifest).unwrap();
         // The keys must be the pinned setup.
@@ -931,7 +932,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("pins zkapi-v2-concession-v1 / mpc-1"),
+            error.contains("pins zkapi-v2-concession-v2 / mpc-1"),
             "{error}"
         );
     }
@@ -942,7 +943,7 @@ mod tests {
     fn deployment_manifest_requires_a_deployed_concession_vault() {
         let mut base = manifest_json();
         base["proof_setup"] =
-            serde_json::json!({"circuit_id": "zkapi-v2-concession-v1", "setup_id": "dev"});
+            serde_json::json!({"circuit_id": "zkapi-v2-concession-v2", "setup_id": "dev"});
         for (field, value, needle) in [
             (
                 "deployment_status",
@@ -961,6 +962,12 @@ mod tests {
             ),
             ("exit_concession", serde_json::json!(0), "concession exit"),
             ("vault_revision", serde_json::json!(2), "concession exit"),
+            // A revision-3 vault's exits prove tree membership at a root.
+            (
+                "vault_revision",
+                serde_json::json!(3),
+                "note-bound withdrawals",
+            ),
             (
                 "settlement_window_seconds",
                 serde_json::json!(0),

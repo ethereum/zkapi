@@ -14,7 +14,6 @@ use zkapi_types::Felt252;
 
 use crate::config::AuthConfig;
 use crate::error::AuthError;
-use crate::indexer::IndexerClient;
 use crate::service::{WithdrawalMode, WithdrawalPlan};
 
 const FILE: &str = "oa-withdrawal.json";
@@ -30,8 +29,8 @@ pub(crate) struct Reservation {
     pub transaction_hash: Option<String>,
     /// Written by earlier builds: the owner acknowledged sending an ownership
     /// proof from an expired note's unsettled state on a legacy vault. Kept
-    /// so such a reservation still loads; every clearance request of a
-    /// `zkapi-v2-concession-v1` companion carries the ownership proof.
+    /// so such a reservation still loads; every clearance request since
+    /// circuit `zkapi-v2-concession-v1` carries the ownership proof.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unsettled_request_risk_accepted: bool,
     /// Whether a clearance request carrying this state's ownership proof may
@@ -64,37 +63,12 @@ pub(crate) struct Reservation {
 impl Reservation {
     /// Whether this reservation's ownership proof may have left the
     /// companion. A reservation saved before `ownership_proof_sent` existed
-    /// does not say. No build could send a proof it could not build, and
-    /// building one needs the reserved state's note leaf in the vault's tree
-    /// at its note id (`leaf_in_tree`, asked only for such a reservation).
-    /// A wrongly bound note, the case release exists for, fails that, so its
-    /// reservation releases whichever build saved it.
-    pub(crate) fn ownership_proof_may_have_left(
-        &self,
-        leaf_in_tree: impl FnOnce() -> Result<bool, AuthError>,
-    ) -> Result<bool, AuthError> {
-        match self.ownership_proof_sent {
-            Some(sent) => Ok(sent),
-            None => leaf_in_tree(),
-        }
+    /// does not say, and is taken as one whose proof may have left: an
+    /// ownership proof names the note by its recorded values, with no Merkle
+    /// path, so nothing on chain tells whether one was ever built.
+    pub(crate) fn ownership_proof_may_have_left(&self) -> bool {
+        self.ownership_proof_sent != Some(false)
     }
-}
-
-/// Whether `state`'s note leaf is in the vault's tree at its note id, as the
-/// indexer reports it. Every withdrawal or request proof from the state
-/// proves exactly that membership: without it no ownership proof was ever
-/// built from the state, and no request proof can be built from it either.
-pub(crate) async fn note_leaf_in_tree(
-    indexer: &IndexerClient,
-    state: &NoteState,
-) -> Result<bool, AuthError> {
-    let leaf = v2::note_leaf(
-        state.note_id,
-        &v2::registration_commitment(&state.secret_s),
-        state.deposit_amount,
-        state.expiry_ts,
-    );
-    Ok(indexer.note_leaf(state.note_id).await? == leaf)
 }
 
 /// Recorded, before the request leaves, that a clearance request carrying
@@ -225,26 +199,6 @@ pub(crate) fn load(config: &AuthConfig) -> Result<Option<Reservation>, AuthError
     Ok(Some(record))
 }
 
-/// Whether `reserve` would refuse `state` and `destination` with a
-/// conflict, without changing anything: checked before any operator call,
-/// so a conflicting request fails the same way whatever the operator does.
-pub(crate) fn check_reservable(
-    config: &AuthConfig,
-    state: &NoteState,
-    destination: [u8; 20],
-) -> Result<(), AuthError> {
-    if let Some(previous) = load(config)? {
-        let replaced = (previous.complete && previous.snapshot.note_id != state.note_id)
-            || superseded(&previous, state, crate::service::now_seconds());
-        if !replaced
-            && (previous.destination != destination || !same_state(&previous.snapshot, state))
-        {
-            return Err(AuthError::WithdrawalConflict);
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn reserve(
     config: &AuthConfig,
     state: &NoteState,
@@ -346,7 +300,9 @@ pub(crate) fn validate_plan(record: &Reservation, plan: &WithdrawalPlan) -> Resu
         || inputs.final_balance != record.snapshot.current_balance
         || inputs.destination != record.destination
         || inputs.withdrawal_nullifier != record.nullifier
-        || plan.siblings.len() != 32
+        || inputs.registration_commitment != v2::registration_commitment(&record.snapshot.secret_s)
+        || inputs.deposit_amount != record.snapshot.deposit_amount
+        || inputs.expiry != record.snapshot.expiry_ts
     {
         return Err(AuthError::WithdrawalConflict);
     }
@@ -432,20 +388,18 @@ fn archive(
 /// Only an incomplete reservation without a plan, for the unchanged active
 /// note, may be released: it never produced a mutual-close proof. It also
 /// must not have sent an ownership proof (C5): no request is made from a
-/// state whose ownership proof left, so releasing it would gain nothing.
-/// `leaf_in_tree` is `note_leaf_in_tree` for the active note (see
-/// `Reservation::ownership_proof_may_have_left`).
+/// state whose ownership proof left, so releasing it would gain nothing
+/// (see `Reservation::ownership_proof_may_have_left`).
 pub(crate) fn check_release(
     config: &AuthConfig,
     record: &Reservation,
     active: &NoteState,
-    leaf_in_tree: impl FnOnce() -> Result<bool, AuthError>,
 ) -> Result<(), AuthError> {
     if record.complete || record.plan.is_some() || !same_state(active, &record.snapshot) {
         return Err(AuthError::WithdrawalConflict);
     }
     let _ = config;
-    if record.ownership_proof_may_have_left(leaf_in_tree)? {
+    if record.ownership_proof_may_have_left() {
         return Err(AuthError::OwnershipProofSent);
     }
     Ok(())
@@ -458,9 +412,8 @@ pub(crate) fn release(
     config: &AuthConfig,
     record: &Reservation,
     active: &NoteState,
-    leaf_in_tree: impl FnOnce() -> Result<bool, AuthError>,
 ) -> Result<(), AuthError> {
-    check_release(config, record, active, leaf_in_tree)?;
+    check_release(config, record, active)?;
     archive(
         config,
         record,
@@ -954,12 +907,11 @@ pub(crate) mod tests {
     pub(crate) fn plan(record: &Reservation) -> WithdrawalPlan {
         WithdrawalPlan {
             mode: WithdrawalMode::Mutual,
-            siblings: vec![Felt252::ZERO; 32],
             public_inputs: zkapi_types::WithdrawalPublicInputsV2C {
                 protocol_version: 2,
                 chain_id: record.snapshot.chain_id,
                 contract_address: record.snapshot.contract_address,
-                active_root: Felt252::ONE,
+                registration_commitment: v2::registration_commitment(&record.snapshot.secret_s),
                 state_signing_key_x: Felt252::ZERO,
                 state_signing_key_y: Felt252::ONE,
                 clearance_signing_key_x: Felt252::ZERO,
@@ -972,6 +924,8 @@ pub(crate) mod tests {
                 next_nullifier: Felt252::ZERO,
                 conceded: 0,
                 valid_until: 4_000_000_000,
+                deposit_amount: record.snapshot.deposit_amount,
+                expiry: record.snapshot.expiry_ts,
             },
             proof: zkapi_types::wire::Groth16ProofWire {
                 backend: zkapi_types::wire::ProofBackendWire::Groth16Bn254,
@@ -998,10 +952,6 @@ pub(crate) mod tests {
         first.plan = Some(plan(&first));
         save(&config, &first).unwrap();
         assert!(matches!(
-            check_reservable(&config, &next, [2; 20]),
-            Err(AuthError::WithdrawalConflict)
-        ));
-        assert!(matches!(
             reserve(&config, &next, [2; 20]),
             Err(AuthError::WithdrawalConflict)
         ));
@@ -1011,7 +961,6 @@ pub(crate) mod tests {
             plan.public_inputs.valid_until = crate::service::now_seconds() - 1_000;
         }
         save(&config, &first).unwrap();
-        check_reservable(&config, &next, [2; 20]).unwrap();
         let replaced = reserve(&config, &next, [2; 20]).unwrap();
         assert_eq!(replaced.snapshot.current_anchor, next.current_anchor);
         assert_eq!(replaced.destination, [2; 20]);
@@ -1468,25 +1417,24 @@ pub(crate) mod tests {
 
     /// Release is refused, on every vault (C5), for a reservation whose
     /// ownership proof may have left. A reservation saved before
-    /// `ownership_proof_sent` existed says nothing: builds sent one only when
-    /// they could build it, which needs the state's note leaf in the vault's
-    /// tree.
+    /// `ownership_proof_sent` existed says nothing, and is refused too: an
+    /// ownership proof names the note by its recorded values, so no chain
+    /// reading tells whether one could have been built.
     #[test]
     fn release_is_refused_once_the_ownership_proof_may_have_left() {
         let (_directory, mut config, note) = fixture();
         let mut record = reserve(&config, &note, [1; 20]).unwrap();
         assert_eq!(record.ownership_proof_sent, Some(false));
-        let unasked = || -> Result<bool, AuthError> { panic!("the note leaf is not asked") };
-        check_release(&config, &record, &note, unasked).unwrap();
+        check_release(&config, &record, &note).unwrap();
         record_ownership_proof_sent(&config, &mut record).unwrap();
         let saved = load(&config).unwrap().unwrap();
         assert_eq!(saved.ownership_proof_sent, Some(true));
         assert!(matches!(
-            check_release(&config, &saved, &note, unasked),
+            check_release(&config, &saved, &note),
             Err(AuthError::OwnershipProofSent)
         ));
         assert!(matches!(
-            release(&config, &saved, &note, unasked),
+            release(&config, &saved, &note),
             Err(AuthError::OwnershipProofSent)
         ));
         assert!(load(&config).unwrap().is_some(), "the reservation stays");
@@ -1507,27 +1455,18 @@ pub(crate) mod tests {
         .unwrap();
         let legacy = load(&config).unwrap().unwrap();
         assert_eq!(legacy.ownership_proof_sent, None);
-        // The note leaf decides: in the tree, a proof could have been built
-        // and sent; not in it (a wrongly bound note), none ever was.
+        assert!(legacy.ownership_proof_may_have_left());
         assert!(matches!(
-            check_release(&config, &legacy, &note, || Ok(true)),
+            check_release(&config, &legacy, &note),
             Err(AuthError::OwnershipProofSent)
-        ));
-        check_release(&config, &legacy, &note, || Ok(false)).unwrap();
-        // A leaf that cannot be read releases nothing.
-        assert!(matches!(
-            check_release(&config, &legacy, &note, || Err(AuthError::Indexer(
-                "down".into()
-            ))),
-            Err(AuthError::Indexer(_))
         ));
 
         // C5 holds on every vault revision: earlier builds released such a
         // reservation on a vault with vault_revision 2.
-        for revision in [2, 3] {
+        for revision in [2, 3, 4] {
             config.vault_revision = revision;
             assert!(matches!(
-                check_release(&config, &saved, &note, unasked),
+                check_release(&config, &saved, &note),
                 Err(AuthError::OwnershipProofSent)
             ));
         }
@@ -1539,12 +1478,11 @@ pub(crate) mod tests {
         let mut record = reserve(&config, &note, [1; 20]).unwrap();
         let mut changed = note.clone();
         changed.current_balance -= 1;
-        let unasked = || -> Result<bool, AuthError> { panic!("the note leaf is not asked") };
-        assert!(release(&config, &record, &changed, unasked).is_err());
+        assert!(release(&config, &record, &changed).is_err());
         record.plan = Some(plan(&record));
-        assert!(release(&config, &record, &note, unasked).is_err());
+        assert!(release(&config, &record, &note).is_err());
         record.plan = None;
-        release(&config, &record, &note, unasked).unwrap();
+        release(&config, &record, &note).unwrap();
         assert!(load(&config).unwrap().is_none());
         assert!(check_spending(&config, Some(note.note_id)).is_ok());
         let archived = config.state_dir.join("archive").join(format!(
@@ -1556,18 +1494,26 @@ pub(crate) mod tests {
         let mut completed = reserve(&config, &note, [1; 20]).unwrap();
         completed.plan = Some(plan(&completed));
         complete(&config, &mut completed, &hex(&[4; 32])).unwrap();
-        assert!(release(&config, &completed, &note, unasked).is_err());
+        assert!(release(&config, &completed, &note).is_err());
     }
 
     /// A saved mutual plan is a kind-1 close of the reserved state: no other
-    /// kind, no concession and no successor nullifier.
+    /// kind, no concession and no successor nullifier, naming the reserved
+    /// note's registration commitment, amount and expiry.
     #[test]
     fn a_plan_must_be_the_reserved_states_mutual_close() {
         let (_directory, config, note) = fixture();
         let record = reserve(&config, &note, [1; 20]).unwrap();
         validate_plan(&record, &plan(&record)).unwrap();
         type Mutation = (&'static str, fn(&mut WithdrawalPlan));
-        let mutations: [Mutation; 7] = [
+        let mutations: [Mutation; 10] = [
+            ("registration commitment", |plan| {
+                plan.public_inputs.registration_commitment = Felt252::ONE
+            }),
+            ("deposit amount", |plan| {
+                plan.public_inputs.deposit_amount += 1
+            }),
+            ("expiry", |plan| plan.public_inputs.expiry += 1),
             ("escape kind", |plan| plan.public_inputs.kind = 0),
             ("ownership kind", |plan| plan.public_inputs.kind = 2),
             ("unknown kind", |plan| plan.public_inputs.kind = 3),
