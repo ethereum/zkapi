@@ -100,6 +100,7 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///                         not). Unset deploys a fresh library.
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
 ///         Gasless withdrawals (ERC-4337):
+///           PAYMASTER_GAS_SCHEDULE – 0 Original (default), 1 Glamsterdam; choose explicitly for the chain.
 ///           GASLESS     – 1 (default) deploys ZkApiWithdrawalPaymaster after the vault; 0 skips
 ///                         the block and writes withdrawalPaymaster: null.
 ///           ENTRY_POINT – the EntryPoint v0.7.0; defaults to the canonical
@@ -196,6 +197,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         ZkApiWithdrawalPaymaster.Policy policy;
         uint256 maxFeeCeiling;
         uint256 priorityFeeCeiling;
+        ZkApiWithdrawalPaymaster.GasSchedule gasSchedule;
     }
 
     struct Deployed {
@@ -433,6 +435,9 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             sponsorshipPaused: false
         });
         // forge-lint: disable-end(unsafe-typecast)
+        uint256 schedule = vm.envOr("PAYMASTER_GAS_SCHEDULE", uint256(0));
+        require(schedule <= 1, "PAYMASTER_GAS_SCHEDULE must be 0 (Original) or 1 (Glamsterdam)");
+        g.gasSchedule = ZkApiWithdrawalPaymaster.GasSchedule(schedule);
         g.maxFeeCeiling = vm.envOr("PAYMASTER_MAX_FEE_CEILING_WEI", uint256(100 gwei));
         g.priorityFeeCeiling = vm.envOr("PAYMASTER_PRIORITY_FEE_CEILING_WEI", uint256(3 gwei));
         require(
@@ -466,7 +471,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     function _deployGasless(Deployed memory d, Params memory p, Gasless memory g) internal {
         bool handover = g.owner != p.deployer;
         d.paymaster = new ZkApiWithdrawalPaymaster(
-            g.entryPoint, d.vault, handover ? p.deployer : g.owner, g.policy, g.maxFeeCeiling, g.priorityFeeCeiling
+            g.entryPoint, d.vault, handover ? p.deployer : g.owner, g.policy, g.maxFeeCeiling, g.priorityFeeCeiling, g.gasSchedule
         );
         d.factory = d.paymaster.factory();
         d.implementation = address(d.factory.implementation());
@@ -666,6 +671,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     /// numbers.
     function _serializeGasless(string memory m, Deployed memory d, Params memory p, Gasless memory g) internal {
         ZkApiWithdrawalPaymaster pm = d.paymaster;
+        vm.serializeUint(m, "paymasterGasSchedule", uint256(g.gasSchedule));
         vm.serializeAddress(m, "entryPoint", address(g.entryPoint));
         vm.serializeBytes32(m, "entryPointRuntimeCodehash", address(g.entryPoint).codehash);
         vm.serializeAddress(m, "senderCreator", SENDER_CREATOR);

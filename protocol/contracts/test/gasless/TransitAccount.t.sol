@@ -58,7 +58,7 @@ contract TransitAccountTest is GaslessTestBase {
     function test_createAccountIsDeterministicAndIdempotent() public {
         address predicted = factory.getAddress(ownerAddr, payee);
         bytes memory creationCode = factory.accountCreationCode();
-        assertEq(creationCode.length, 74, "creation code bytes");
+        assertEq(creationCode.length, 77, "creation code bytes");
         assertEq(keccak256(creationCode), factory.accountCreationCodeHash(), "creation code hash");
         assertEq(factory.accountCreationCodeHash(), paymaster.accountCreationCodeHash(), "paymaster pin");
         bytes memory initCode = abi.encodePacked(
@@ -70,19 +70,19 @@ contract TransitAccountTest is GaslessTestBase {
         vm.recordLogs();
         address created = factory.createAccount(ownerAddr, payee);
         assertEq(created, predicted);
-        assertEq(created.code.length, 221, "proxy bytes");
+        assertEq(created.code.length, 93, "proxy bytes");
         Vm.Log[] memory logs = vm.getRecordedLogs();
         assertEq(_count(logs, address(factory), ZkApiWithdrawalAccountFactory.AccountCreated.selector), 1);
-        // the proxy's code is the logic (61 bytes, with the implementation address) then the arguments
+        // the proxy's code is the logic (53 bytes, with the implementation address) then the arguments
         bytes memory code = created.code;
-        bytes memory args = new bytes(160);
-        for (uint256 i = 0; i < 160; ++i) {
-            args[i] = code[61 + i];
+        bytes memory args = new bytes(40);
+        for (uint256 i = 0; i < 40; ++i) {
+            args[i] = code[53 + i];
         }
-        assertEq(args, abi.encode(ENTRY_POINT, address(vault), address(paymaster), ownerAddr, payee), "embedded args");
-        assertEq(creationCode.length - 13, 61, "stub then logic");
-        for (uint256 i = 0; i < 61; ++i) {
-            assertEq(code[i], creationCode[13 + i], "logic bytes");
+        assertEq(args, abi.encodePacked(ownerAddr, payee), "embedded args");
+        assertEq(creationCode.length - 24, 53, "stub then logic");
+        for (uint256 i = 0; i < 53; ++i) {
+            assertEq(code[i], creationCode[24 + i], "logic bytes");
         }
 
         vm.recordLogs();
@@ -99,7 +99,7 @@ contract TransitAccountTest is GaslessTestBase {
         assertEq(s.owner(), ownerAddr);
         assertEq(s.payee(), payee);
         assertEq(s.SELECTOR_WITHDRAW(), ZkApiWithdrawalAccount.withdraw.selector);
-        assertEq(s.ARGS_LENGTH(), 160);
+        assertEq(s.ARGS_LENGTH(), 40);
         // the logic contract itself has no arguments
         vm.expectRevert(ZkApiWithdrawalAccount.NotProxy.selector);
         impl.owner();
@@ -128,7 +128,7 @@ contract TransitAccountTest is GaslessTestBase {
             );
         assertFalse(ok);
         assertEq(ret, abi.encodeWithSelector(ZkApiWithdrawalAccount.NotProxy.selector), "sweep with a tail");
-        (ok, ret) = address(impl).call{value: 1}(new bytes(160));
+        (ok, ret) = address(impl).call{value: 1}(new bytes(40));
         assertFalse(ok);
         assertEq(ret, abi.encodeWithSelector(ZkApiWithdrawalAccount.NotProxy.selector), "the fallback with a tail");
         assertEq(address(impl).balance, 1 ether, "nothing left the logic contract");

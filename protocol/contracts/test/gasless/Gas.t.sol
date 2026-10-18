@@ -231,7 +231,8 @@ contract GasTest is GaslessTestBase {
     function _prepRevertedFinalize(uint8 id, bool writeOff) internal {
         _prepFinalize(id);
         if (writeOff) paymaster.writeOffDebt(prepared[id].sender);
-        prepared[id].context = _runPrepared(id, 0, 0).context;
+        // Execution receipts are transient and must be produced in the measured transaction,
+        // not in setUp (which is a separate transaction).
     }
 
     function _prepForward(uint8 id) internal {
@@ -445,15 +446,19 @@ contract GasTest is GaslessTestBase {
     function test_measure_postOpRevertedWithDebt() public {
         uint256 cold = vm.snapshotState();
         Prepared storage p = prepared[SC_REVERTED_WITH_DEBT];
-        assertEq(paymaster.received(p.sender), uint256(BIG - 2_000_000) * 1 gwei, "the finalization reached S and P");
-        assertGt(paymaster.owed(p.sender), 0);
-        uint256 withDebt = driver.postOpReverted(paymaster, p.context, PRE_GAS * FEE, FEE);
+        PackedUserOperation memory op = _op(SC_REVERTED_WITH_DEBT);
+        (uint256 withDebt, uint256 got, uint256 debtBefore, uint256 debtAfter) =
+            driver.runReverted(paymaster, op, p.hash, _maxCostOf(op), p.vaultCall, PRE_GAS * FEE, FEE);
+        assertEq(got, uint256(BIG - 2_000_000) * 1 gwei, "the finalization reached S and P");
+        assertGt(debtBefore, 0);
         _snap("postOpRevertedWithDebt", withDebt);
-        assertEq(paymaster.owed(p.sender), 0, "the debt is settled on the reverted path too");
+        assertEq(debtAfter, 0, "the debt is settled on the reverted path too");
         vm.revertToState(cold);
         p = prepared[SC_REVERTED_NO_DEBT];
-        assertEq(paymaster.owed(p.sender), 0, "written off");
-        uint256 noDebt = driver.postOpReverted(paymaster, p.context, PRE_GAS * FEE, FEE);
+        op = _op(SC_REVERTED_NO_DEBT);
+        (uint256 noDebt,, uint256 writtenOff,) =
+            driver.runReverted(paymaster, op, p.hash, _maxCostOf(op), p.vaultCall, PRE_GAS * FEE, FEE);
+        assertEq(writtenOff, 0, "written off");
         _snap("postOpRevertedNoDebt", noDebt);
         // FAILURE_POSTOP_GAS (70,000) + FAILURE_DEBT_DEPOSIT_GAS (20,000) + CREDIT_GAS bound the path.
         assertLe(withDebt - noDebt, 20_000, "the debt settlement within FAILURE_DEBT_DEPOSIT_GAS");

@@ -612,7 +612,7 @@ contract GriefingTest is GaslessTestBase {
         assertEq(info.unstakeDelaySec, UNSTAKE_DELAY / 2);
         // A fresh paymaster and its factory: nobody can pick their delay before the owner does.
         ZkApiWithdrawalPaymaster fresh = new ZkApiWithdrawalPaymaster(
-            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
+            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING, ZkApiWithdrawalPaymaster.GasSchedule.Original
         );
         ZkApiWithdrawalAccountFactory freshFactory = fresh.factory();
         vm.prank(user);

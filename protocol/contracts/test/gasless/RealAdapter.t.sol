@@ -17,7 +17,7 @@ import {GaslessTestBase, EntryPointDriver} from "./GaslessTestBase.sol";
 contract ProvenanceOverrideFactory {
     bytes32 private immutable c0;
     bytes32 private immutable c1;
-    bytes10 private immutable c2;
+    bytes13 private immutable c2;
     address private immutable entryPoint;
     address private immutable vault;
     address private immutable paymaster;
@@ -34,7 +34,7 @@ contract ProvenanceOverrideFactory {
         address payeeX_,
         address target_
     ) {
-        require(creationCode.length == 74, "creation code");
+        require(creationCode.length == 77, "creation code");
         bytes32 a;
         bytes32 b;
         bytes32 c;
@@ -45,7 +45,7 @@ contract ProvenanceOverrideFactory {
         }
         c0 = a;
         c1 = b;
-        c2 = bytes10(c);
+        c2 = bytes13(c);
         entryPoint = entryPoint_;
         vault = vault_;
         paymaster = paymaster_;
@@ -135,7 +135,7 @@ contract RealAdapterTest is GaslessTestBase {
         assertEq(escapeInputs.registrationCommitment, commitment, "golden escape names its note");
         assertEq(escapeInputs.noteMetadata, metadata, "golden escape names its note");
         paymaster = new ZkApiWithdrawalPaymaster(
-            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
+            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING, ZkApiWithdrawalPaymaster.GasSchedule.Original
         );
         factory = paymaster.factory();
         gp = paymaster.gasPolicy();
@@ -233,7 +233,7 @@ contract RealAdapterTest is GaslessTestBase {
         assertLt(escapeWarm, escapeCold, "warm cheaper");
         uint256 need = escapeCold > cold ? escapeCold : cold;
         assertGe(gp.pmVerificationFloor, need + 4_000, "floor above the larger cold need plus VALIDATION_GAS_SLACK");
-        assertLt(gp.pmVerificationFloor, need + 14_000, "floor is that need rounded up to 10k");
+        assertLt(gp.pmVerificationFloor, need + 20_000, "bounded allowance for rounding and a reused escape record");
         // The cold/warm gap is the ~25 cold storage and account accesses of the checks (about 15%);
         // a bundler's simulations and the inclusion all run cold, so it never changes an outcome.
         assertLt(cold - warm, 70_000, "cold/warm gap");

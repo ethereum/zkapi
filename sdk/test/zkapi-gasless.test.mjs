@@ -62,9 +62,10 @@ test('the transit account is the CREATE2 of the pinned creation code and the fiv
     assert.equal(transitAccountAddress(args), low(V.transit_account));
     assert.equal(create2TransitAccount({ ...args, creationCode: V.account_creation_code }), low(V.transit_account), 'the independent CREATE2');
     assert.equal(codehash(V.account_creation_code), low(V.account_creation_code_keccak256));
-    // The proxy's runtime is the creation code after its 13-byte stub, then the arguments.
-    assert.equal(`0x${V.account_creation_code.slice(2 + 26)}${[V.entry_point, V.vault, V.paymaster, V.owner, V.payee]
-        .map(address => BigInt(address).toString(16).padStart(64, '0')).join('')}`, low(V.transit_runtime_code));
+    // The 24-byte stub retains only the packed owner/payee in each proxy; the shared
+    // implementation fixes EntryPoint/vault/paymaster, while CREATE2 still commits all five.
+    assert.equal(`0x${V.account_creation_code.slice(2 + 48)}${[V.owner, V.payee]
+        .map(address => address.slice(2).toLowerCase()).join('')}`, low(V.transit_runtime_code));
     // Another payee or owner is another account; a bad argument is refused.
     assert.notEqual(transitAccountAddress({ ...args, payee: V.owner }), low(V.transit_account));
     assert.notEqual(transitAccountAddress({ ...args, owner: V.payee }), low(V.transit_account));

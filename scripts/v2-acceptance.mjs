@@ -233,7 +233,7 @@ export function isProfileBundlerUrl(value) {
 
 // The `gasless` object of a profile (gasless withdrawals over ERC-4337,
 // design §4.3): the pins of the EntryPoint, its SenderCreator, the paymaster,
-// the transit-account factory and the account logic, the 74-byte creation
+// the transit-account factory and the account logic, the 77-byte creation
 // code clients derive transit accounts from, the operator's bundler (null
 // when none is published), the paymaster's pinned gas policy with the
 // defaults clients sign (each inside its [floor, cap], as
@@ -273,7 +273,7 @@ export function gaslessProfile(finalized, bundlerUrl = null) {
     const addr = name => pinned(name, /^0x[0-9a-fA-F]{40}$/, 'an address');
     const hash = name => pinned(name, /^0x[0-9a-fA-F]{64}$/, 'a keccak256');
     const implementation = addr('withdrawalAccountImplementation');
-    const creation = pinned('accountCreationCode', /^0x[0-9a-fA-F]{148}$/, 'the 74-byte creation code');
+    const creation = pinned('accountCreationCode', /^0x[0-9a-fA-F]{154}$/, 'the 77-byte creation code');
     assert.equal(creation, accountCreationCode(implementation), 'accountCreationCode is not the factory\'s creation code for the account logic');
     assert.equal(hash('accountCreationCodeKeccak256'), keccak256(hexToBytes(creation)), 'accountCreationCodeKeccak256 is not keccak256 of the creation code');
     return {
@@ -289,6 +289,7 @@ export function gaslessProfile(finalized, bundlerUrl = null) {
         withdrawal_account_implementation_runtime_codehash: hash('accountImplementationRuntimeCodehash'),
         account_creation_code: creation,
         account_creation_code_keccak256: hash('accountCreationCodeKeccak256'),
+        gas_schedule: Number(finalized.paymasterGasSchedule ?? 0),
         bundler_url: bundlerUrl,
         gas_policy: {
             call_floor: floors,
@@ -301,13 +302,13 @@ export function gaslessProfile(finalized, bundlerUrl = null) {
             verification_floor_init: scalar('verificationFloorInit'),
             verification_cap: scalar('verificationCap'),
             verification_default: within(scalar('verificationFloor') + 20_000, scalar('verificationFloor'), scalar('verificationCap'), 'verification'),
-            verification_default_init: within(scalar('verificationFloorInit') + 40_000, scalar('verificationFloorInit'), scalar('verificationCap'),
+            verification_default_init: within(Math.min(scalar('verificationFloorInit') + 40_000, scalar('verificationCap')), scalar('verificationFloorInit'), scalar('verificationCap'),
                 'verification_init'),
             pvg_floor: scalar('pvgFloor'),
             pvg_cap: scalar('pvgCap'),
             pm_verification_floor: scalar('pmVerificationFloor'),
             pm_verification_cap: scalar('pmVerificationCap'),
-            pm_verification_default: within(scalar('pmVerificationFloor') + 30_000, scalar('pmVerificationFloor'), scalar('pmVerificationCap'),
+            pm_verification_default: within(Math.min(scalar('pmVerificationFloor') + 30_000, scalar('pmVerificationCap')), scalar('pmVerificationFloor'), scalar('pmVerificationCap'),
                 'pm_verification'),
             postop_base_gas: scalar('postOpBaseGas'),
             postop_escape_gas: scalar('postOpEscapeGas'),

@@ -9,7 +9,7 @@ import {GaslessTestBase} from "./GaslessTestBase.sol";
 
 /// @dev The transit vectors the JS (sdk/services/zkapiGasless.mjs) and Go (internal/zkapi/gasless.go)
 ///      clients are checked against: a fixed deployment (deployer 0xDE91 at nonces 0, 1, 2 on chain
-///      31337), the transit account of a fixed owner key and payee, the 74-byte creation code, a
+///      31337), the transit account of a fixed owner key and payee, the 77-byte creation code, a
 ///      complete first-use CLOSE operation of a mock-adapter close with every field packed and
 ///      unpacked, its userOpHash from the etched EntryPoint, the EIP-191 digest and signature, the
 ///      nonce keys, the attempt keys, chargeFor samples and every gas constant. The test checks the

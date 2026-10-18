@@ -28,6 +28,7 @@ import {
     finalizeDeployment,
     gasPolicyWords,
     gaslessImmutables,
+    gasScheduleImmutables,
     hexToBytes,
     keccak256,
     parseDeployment,
@@ -404,10 +405,14 @@ test('the paymaster, factory and account logic runtime code fills exactly their 
         }
     }
     // The paymaster's immutables are the deployment's pins, in the words the contract stores.
-    assert.equal(immutables.paymaster.entryPoint, word(CANONICAL_ENTRY_POINT).slice(2));
+    assert.equal(immutables.paymaster.entryPoint, undefined, "EntryPoint is the canonical address constant");
+    assert.throws(() => expectedCodehashes(ARTIFACTS, deploymentInputs({ ...deployment, entryPoint: FACTORY })), /canonical v0.7 address/);
     assert.equal(immutables.paymaster.accountCreationCodeHash, deployment.accountCreationCodeKeccak256.slice(2));
     assert.equal(immutables.factory.implementation, word(IMPLEMENTATION).slice(2));
     assert.equal(immutables.implementation.self, word(IMPLEMENTATION).slice(2));
+    assert.equal(immutables.implementation.fixedEntryPoint, word(CANONICAL_ENTRY_POINT).slice(2));
+    assert.equal(immutables.implementation.fixedVault, word(deployment.vault).slice(2));
+    assert.equal(immutables.implementation.fixedPaymaster, word(deployment.withdrawalPaymaster).slice(2));
     // The vectors' creation code is the factory's constants around its account logic.
     assert.equal(accountCreationCode(VECTORS.implementation), VECTORS.account_creation_code.toLowerCase());
     assert.equal(keccak256(hexToBytes(VECTORS.account_creation_code)), VECTORS.account_creation_code_keccak256.toLowerCase());
@@ -576,4 +581,14 @@ test('--check re-audits every recorded codehash, the gasless ones included', { s
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+
+test('the reviewed gas schedule is an explicit immutable deployment choice', () => {
+    const original = gasScheduleImmutables(0);
+    const glamsterdam = gasScheduleImmutables(1);
+    assert.notDeepEqual(original, glamsterdam);
+    assert.equal(BigInt(`0x${glamsterdam.VERIFICATION_CAP}`), 496000n);
+    assert.equal(BigInt(`0x${glamsterdam.NEW_ACCOUNT_GAS}`), 183600n);
+    assert.throws(() => gasScheduleImmutables(2), /Original.*Glamsterdam/);
 });

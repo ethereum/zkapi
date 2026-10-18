@@ -167,7 +167,7 @@ test('a sponsored close creates the transit account, signs the hash once, journa
     assert.equal(BigInt(op.maxFeePerGas), 2n * chain.baseFee + chain.priorityFee);
     assert.equal(BigInt(op.maxPriorityFeePerGas), chain.priorityFee);
     assert.equal(BigInt(op.callGasLimit), CLOSE_CALL_DEFAULT, 'the profile default, not the bundler estimate');
-    assert.equal(BigInt(op.verificationGasLimit), 180_000n, 'verification_default_init');
+    assert.equal(BigInt(op.verificationGasLimit), 150_000n, 'verification_default_init');
     assert.equal(BigInt(op.paymasterPostOpGasLimit), 270_000n);
     assert.equal(BigInt(op.paymasterVerificationGasLimit), PM_VERIFICATION_DEFAULT);
     // Journaled before eth_sendUserOperation, with the signature; two dry runs (unsigned, then signed) and the EntryPoint hash cross-check.

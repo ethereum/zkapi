@@ -16,6 +16,12 @@ funded activation and challenge signers. Indexer/challenger RPC uses Sepolia Ten
 browser profile use PublicNode. The indexer polls every six seconds. Shared public RPC rate limits must be
 checked against actual worker health, not only container liveness.
 
+The revision-3 Sepolia indexer also uses Tenderly and a six-second poll after
+live legacy-client checks found repeated PublicNode 429s. Its deployment keeps
+`/etc/zkapi/sepolia-v2r3/indexer-poll.override.yml` in the Compose file list;
+that indexer-only override mounts the preserved launcher with the polling
+argument added. The verified checkpoint and older vault binding are unchanged.
+
 Sepolia's October 2026 state-creation gas repricing makes older local Forge
 estimates unsuitable for contract deployment. The first library attempt ran
 out of gas; the subsequent three deployments succeeded using RPC-checked
@@ -535,6 +541,20 @@ and a few incident levers. The vault does not depend on any of them: a dead,
 paused or underfunded paymaster only removes the option to pay the fee from
 the payout. Wallet-paid exits and `S.sweep()` need no paymaster policy.
 
+**Gas schedule.** Deployment explicitly chooses `PAYMASTER_GAS_SCHEDULE=0`
+(Original) or `1` (Glamsterdam); the manifest records `paymasterGasSchedule`
+and profiles carry `gasless.gas_schedule`. Choose from the chain's active
+rules, not its chain ID. The local `gasless-gas.json` snapshots measure the
+Original schedule. Sepolia's EIP-8037/8038 schedule needs separate live-chain
+measurements: its larger state-creation costs change account deployment,
+validation, execution and post-operation limits. Both validation caps remain
+496,000; post-operation gas has its own larger bound. Clients use the
+profile's measured gas policy, not a fixed total.
+
+The restricted Sepolia deployment, float and bundler settings are documented
+in the [staging bundler guide](../docker/aws/bundler/README.md). Those settings
+are specific to the testnet deployment and do not change mainnet defaults.
+
 **Bundler.** Run an ERC-4337 v0.7 bundler (the eth-infinitism reference
 bundler, Rundler or Alto) against the operator's RPC. Whitelist the paymaster
 and the factory (both are staked) so the bundler exempts them from
@@ -583,27 +603,29 @@ the threshold alerts on the first of them. Anyone can top it up with
 `P.deposit{value}()`.
 
 The float replenishes itself on success: each settled operation re-deposits
-its measured charge, which covers the EntryPoint's cost within
-`MARGIN_GAS`. It shrinks only by failed sponsorships (`SponsorshipFailed`,
+its estimated charge, bounded by the signed maximum network fee plus flat
+fee. Ordinary tested paths are calibrated within `MARGIN_GAS`; contract-payee
+credits and unusual balances already held by a reused transit account can
+conservatively charge more than that margin. The fee shown for approval is
+a maximum, not an exact-cost promise. Existing escape debt remains separately
+disclosed and repayable. The float shrinks by failed sponsorships (`SponsorshipFailed`,
 `lostWei`), shortfalls (`Shortfall`, `shortfallWei`) and open escape debt
 (`owed`).
 
-`maxSponsoredCost` also bounds the fees the paymaster sponsors. A close or
-escape that creates `S` signs about 1.7 million gas of limits, and its
-`maxCost` is those limits times `maxFeePerGas`. Both clients choose it by
-one rule: `min(2 × base fee + tip, maxFeeCeiling)`, with the tip capped at
-`priorityFeeCeiling`, refused (`gas_above_paymaster_ceiling`, before any
-proof) only when `base fee + tip` exceeds `maxFeeCeiling`.
-At the default 0.05 ETH, operations
-are refused above a `maxFeePerGas` of about 28 gwei (`max_cost_above_policy`,
-before any proof). Raise the policy toward `1.8M × maxFeeCeiling` to sponsor
-up to the ceiling, and fund the float to match, within the immutable hard
-cap of 0.25 ETH per operation (`setPolicy` reverts `PolicyOutOfBounds`
-above it, and `Deploy.s.sol` refuses a larger
-`PAYMASTER_MAX_SPONSORED_COST_WEI`). That cap stops sponsorship above a
-`maxFeePerGas` of about 139 gwei (0.25 ETH / 1.8M gas) whatever the
-ceiling: a ceiling above that, such as Sepolia's 200 gwei, matters only for
-operations with smaller limits.
+`maxSponsoredCost` also bounds the fees the paymaster sponsors. Each
+operation's `maxCost` is the sum of its five gas limits times `maxFeePerGas`.
+The former approximately 1.7M-gas example applies to the Original schedule;
+Glamsterdam has larger limits, and calldata also affects the total. Size the
+policy from the actual profile limits at the desired fee ceiling, and fund
+the float to match. The immutable maximum remains 0.25 ETH per operation
+(`setPolicy` and `Deploy.s.sol` reject a larger value).
+
+Both clients choose `maxFeePerGas` by
+`min(2 × base fee + tip, maxFeeCeiling)`, with the tip capped at
+`priorityFeeCeiling`. They refuse before proving when `base fee + tip`
+exceeds the ceiling (`gas_above_paymaster_ceiling`), or when the resulting
+operation prefund exceeds policy (`max_cost_above_policy`). The effective
+fee limit is therefore also bounded by `maxSponsoredCost / sum(gas limits)`.
 
 **Stakes.** Never `unlockStake` the paymaster while it sponsors. The
 factory's stake only lifts the public mempool's per-factory limits for
@@ -633,10 +655,14 @@ the hard caps. Ceilings that are too low refuse sponsorship during fee spikes
 (`gas_above_paymaster_ceiling`), and users keep the wallet path. Ceilings that
 are too high raise that griefing exposure linearly.
 
-**Escapes.** `escapesEnabled` is false in every published profile
-(`PAYMASTER_ESCAPES=0`). Enabling it means the float pays each sponsored
+**Escapes.** The deployment default is `PAYMASTER_ESCAPES=0`. The restricted
+Sepolia staging profile enables sponsored initiations for acceptance testing;
+its bounds and funded float are in the [staging bundler guide](../docker/aws/bundler/README.md).
+Enabling it means the float pays each sponsored
 initiation that is defeated, unless a later payout to the same `S` repays
-it, which an attacker avoids. Per defeated escape the operator pays, in gas:
+it, which an attacker avoids. The following historical Original-schedule
+measurements illustrate the exposure; they are not Glamsterdam estimates.
+Per defeated escape the operator pays, in gas:
 
 - the sponsored initiation, about 1.19M: `handleOpsEscape` (594,763,
   measured with a mock adapter) plus two real proof verifications, the

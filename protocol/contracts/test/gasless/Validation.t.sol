@@ -125,11 +125,32 @@ contract ValidationTest is GaslessTestBase {
             address(this),
             _defaultPolicy(),
             MAX_FEE_CEILING,
-            PRIORITY_CEILING
+            PRIORITY_CEILING,
+            ZkApiWithdrawalPaymaster.GasSchedule.Original
         );
     }
 
-    /// The EntryPoint is pinned by runtime codehash: an address without code or with other code is
+    function test_explicitGasScheduleKeepsCanonicalValidationCaps() public {
+        ZkApiWithdrawalPaymaster repriced = new ZkApiWithdrawalPaymaster(
+            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING,
+            ZkApiWithdrawalPaymaster.GasSchedule.Glamsterdam
+        );
+        ZkApiWithdrawalPaymaster.GasPolicy memory g = repriced.gasPolicy();
+        assertEq(uint8(paymaster.gasSchedule()), 0);
+        assertEq(uint8(repriced.gasSchedule()), 1);
+        assertEq(g.verificationCap, 496_000);
+        assertEq(g.pmVerificationCap, 496_000);
+        assertGe(g.verificationFloorInit, 482_000 + 4_000);
+        assertEq(g.pmVerificationFloor, g.pmVerificationCap, "reused escape includes EntryPoint accounting");
+        assertGe(g.postOpFloor, 492_747 + 60_000);
+        assertEq(g.newAccountGas, 183_600);
+        assertGe(g.creditGas, 222_238);
+        vm.chainId(1);
+        assertEq(uint8(repriced.gasSchedule()), 1, "schedule is deployment policy, independent of chain id");
+        assertEq(repriced.gasPolicy().newAccountGas, 183_600);
+    }
+
+    /// The EntryPoint is pinned by canonical address and runtime codehash: an address without code or with other code is
     /// refused, so a deployment against the wrong EntryPoint (or a wrong chain) cannot happen.
     function test_constructorRefusesABadEntryPoint() public {
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadEntryPoint.selector);
@@ -138,6 +159,10 @@ contract ValidationTest is GaslessTestBase {
         _deploy(address(vault), address(vault));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadEntryPoint.selector);
         _deploy(SENDER_CREATOR, address(vault));
+        address clone = address(0xC10e);
+        vm.etch(clone, ENTRY_POINT.code);
+        vm.expectRevert(ZkApiWithdrawalPaymaster.BadEntryPoint.selector);
+        _deploy(clone, address(vault));
         assertEq(address(_deploy(ENTRY_POINT, address(vault)).entryPoint()), ENTRY_POINT, "the pinned runtime");
     }
 

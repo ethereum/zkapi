@@ -60,7 +60,8 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     uint256 private constant PROOF_LENGTH = 0x100;
 
     // ------------------------------------------------------------------------------ gas constants
-    // Measured by test/gasless/Gas.t.sol and RealAdapter.t.sol with every account and slot cold (a
+    // Original schedule measured by test/gasless/Gas.t.sol and RealAdapter.t.sol; Glamsterdam
+    // separately measured on Sepolia with EIP-8037/8038 active. Every account and slot is cold (a
     // bundler's simulation and the inclusion both run cold) and pinned in snapshots/gasless-gas.json,
     // whose entry names the comments below quote; every floor exceeds the measured need by at least
     // ERC-7562's VALIDATION_GAS_SLACK (4,000), and every cap stays below MAX_VERIFICATION_GAS where
@@ -71,50 +72,49 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     ///         the real Groth16 adapter (adapterVerifyCold), a treasury that uses its whole
     ///         100,000-gas push and a never-used treasury or destination (25,000, EIP-161), under
     ///         the 63/64 rule, plus 20,000.
-    uint256 internal constant CALL_FLOOR_CLOSE = 550_000;
-    uint256 internal constant CALL_FLOOR_ESCAPE = 540_000;
-    uint256 internal constant CALL_FLOOR_FINALIZE = 250_000;
+    uint256 internal immutable CALL_FLOOR_CLOSE;
+    uint256 internal immutable CALL_FLOOR_ESCAPE;
+    uint256 internal immutable CALL_FLOOR_FINALIZE;
     uint256 internal constant CALL_FLOOR_FORWARD = 80_000;
     /// @notice Upper bounds of callGasLimit per kind; the owner's callCap may only sit at or below.
-    uint256 internal constant CALL_HARD_CAP_CLOSE = 950_000;
-    uint256 internal constant CALL_HARD_CAP_ESCAPE = 1_100_000;
-    uint256 internal constant CALL_HARD_CAP_FINALIZE = 400_000;
+    uint256 internal immutable CALL_HARD_CAP_CLOSE;
+    uint256 internal immutable CALL_HARD_CAP_ESCAPE;
+    uint256 internal immutable CALL_HARD_CAP_FINALIZE;
     uint256 internal constant CALL_HARD_CAP_FORWARD = 150_000;
     /// @notice paymasterPostOpGasLimit bounds: the worst postOp path is a 100,000-gas push that
     ///         burns everything, then the credit bookkeeping (postOpWorst), and a finalization with
     ///         a debt adds POSTOP_FINALIZE_EXTRA_GAS; Gas.t.sol asserts the floor at least 60,000
     ///         above their sum, and at least 30,000 above the reverted path with a debt to settle
     ///         (postOpRevertedWithDebt).
-    uint256 internal constant POSTOP_FLOOR = 250_000;
-    uint256 internal constant POSTOP_CAP = 350_000;
-    /// @notice verificationGasLimit bounds without and with initCode (the CREATE2 of the 221-byte
+    uint256 internal immutable POSTOP_FLOOR;
+    uint256 internal immutable POSTOP_CAP;
+    /// @notice verificationGasLimit bounds without and with initCode (the CREATE2 of the 93-byte
     ///         proxy): the least limit the EntryPoint accepts (minVerificationGasWithoutInitCode /
     ///         minVerificationGasWithInitCode) plus VALIDATION_GAS_SLACK, rounded up to 10,000.
-    uint256 internal constant VERIFICATION_FLOOR = 50_000;
-    uint256 internal constant VERIFICATION_FLOOR_INIT = 140_000;
-    uint256 internal constant VERIFICATION_CAP = 400_000;
+    uint256 internal immutable VERIFICATION_FLOOR;
+    uint256 internal immutable VERIFICATION_FLOOR_INIT;
+    uint256 internal immutable VERIFICATION_CAP;
     /// @notice preVerificationGas bounds.
     uint256 internal constant PVG_FLOOR = 40_000;
     uint256 internal constant PVG_CAP = 150_000;
-    /// @notice paymasterVerificationGasLimit bounds: the floor is the larger cold measurement with the
-    ///         real Groth16 adapter (paymasterValidationEscapeCold, the shape that reads the most
-    ///         vault state, or paymasterValidationCold) plus VALIDATION_GAS_SLACK, rounded up to
-    ///         10,000; both measurements fit under the cap with 20,000 to spare; the cap is
-    ///         MAX_VERIFICATION_GAS minus VALIDATION_GAS_SLACK.
-    uint256 internal constant PM_VERIFICATION_FLOOR = 410_000;
+    /// @notice paymasterVerificationGasLimit bounds. The Original floor includes measured cold
+    ///         Groth16 validation plus slack for a reused escape record. Glamsterdam also includes
+    ///         repriced EntryPoint deposit accounting and uses the full allowed 496k budget. Its
+    ///         first and repeated escape shapes are measured against the live chain schedule.
+    uint256 internal immutable PM_VERIFICATION_FLOOR;
     uint256 internal constant PM_VERIFICATION_CAP = 496_000;
     /// @notice postOp's own gas on a CLOSE or FORWARD settling path with a plain transfer to a
     ///         funded EOA (postOpEoa): POSTOP_BASE_GAS + EOA_PUSH_GAS is pinned at or under the
     ///         measurement and within 10,000 of it, like POSTOP_ESCAPE_GAS under postOpEscape, so
     ///         that the end-to-end charge sits under MARGIN_GAS over the real cost and the margin,
     ///         not the estimate, absorbs cold/warm variance in both directions.
-    uint256 internal constant POSTOP_BASE_GAS = 17_000;
+    uint256 internal immutable POSTOP_BASE_GAS;
     /// @notice postOp's whole gas on an ESCAPE initiation (the debt and the two escape records).
-    uint256 internal constant POSTOP_ESCAPE_GAS = 71_200;
+    uint256 internal immutable POSTOP_ESCAPE_GAS;
     /// @notice What a FINALIZE adds to the settling path: the debt deduction and the escape record.
     ///         Pinned between the two measured differences, postOpFinalizeNoDebt − postOpEoa and
     ///         postOpFinalize − postOpEoa.
-    uint256 internal constant POSTOP_FINALIZE_EXTRA_GAS = 5_000;
+    uint256 internal immutable POSTOP_FINALIZE_EXTRA_GAS;
     /// @notice What a balance S forwards adds to an ESCAPE initiation's charge: the deposit of the
     ///         debt it settles and the credit of the rest (CREDIT_GAS of it). In isolation the path
     ///         costs postOpEscapeWithBalance − postOpEscape more than a plain initiation, but end to
@@ -122,21 +122,23 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     ///         that difference so that the charge sits within MARGIN_GAS + CREDIT_GAS of the real
     ///         cost on the dearest variant (the first escape of S, every slot cold and zero;
     ///         overchargeEscapeWithBalance), as on the credit path of a close.
-    uint256 internal constant POSTOP_ESCAPE_FORWARD_GAS = 30_000;
+    uint256 internal immutable POSTOP_ESCAPE_FORWARD_GAS;
+    /// @notice Extra cost of depositing a partial balance that only pays down escape debt.
+    uint256 internal immutable POSTOP_ESCAPE_DEPOSIT_GAS;
     /// @notice The push to a payee: a plain transfer (EOA_PUSH_GAS), the EIP-161 surcharge of a
     ///         never-used address (NEW_ACCOUNT_GAS, postOpEmptyEoa − postOpEoa), the gas forwarded
     ///         to a payee with code (PAYOUT_PUSH_GAS, charged in full because the push cannot measure
     ///         what it used) and, only when the push fails, the credit bookkeeping (CREDIT_GAS,
     ///         postOpRejecter − postOpEoa).
-    uint256 internal constant EOA_PUSH_GAS = 9_100;
-    uint256 internal constant NEW_ACCOUNT_GAS = 25_000;
+    uint256 internal immutable EOA_PUSH_GAS;
+    uint256 internal immutable NEW_ACCOUNT_GAS;
     uint256 internal constant PAYOUT_PUSH_GAS = 100_000;
-    uint256 internal constant CREDIT_GAS = 46_000;
+    uint256 internal immutable CREDIT_GAS;
     /// @notice The EntryPoint's call into S, the proxy, S's dispatch and its repay call: execution gas
     ///         outside the window S measures (accountCall* − accountMeasured*, with and without a
     ///         value to forward), pinned at or above the measurement and within 4,000 of it.
-    uint256 internal constant ACCOUNT_CALL_OVERHEAD_GAS = 55_500;
-    uint256 internal constant ACCOUNT_CALL_OVERHEAD_ESCAPE_GAS = 28_900;
+    uint256 internal immutable ACCOUNT_CALL_OVERHEAD_GAS;
+    uint256 internal immutable ACCOUNT_CALL_OVERHEAD_ESCAPE_GAS;
     /// @notice Covers cold/warm variance; the measured charge exceeds the real cost by at most this
     ///         on every settling path with an EOA payee (the handleOps* entries), and by at most
     ///         this plus CREDIT_GAS when a payout is credited.
@@ -145,12 +147,15 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     ///      path (the EntryPoint adds it and the 10% penalty on the unused limits after this call),
     ///      and what settling a debt out of a balance an earlier operation forwarded adds to it (the
     ///      debt's slot and the deposit); Gas.t.sol measures both paths (postOpReverted*).
-    uint256 internal constant FAILURE_POSTOP_GAS = 70_000;
-    uint256 internal constant FAILURE_DEBT_DEPOSIT_GAS = 20_000;
+    uint256 internal immutable FAILURE_POSTOP_GAS;
+    uint256 internal immutable FAILURE_DEBT_DEPOSIT_GAS;
     /// @notice The finalization reserve an escape initiation must leave: the finalize shape's minimum
     ///         limits, charged at the initiation's maxFeePerGas.
-    uint256 internal constant FINALIZE_RESERVE_GAS =
-        PVG_FLOOR + VERIFICATION_FLOOR + CALL_FLOOR_FINALIZE + PM_VERIFICATION_FLOOR + POSTOP_FLOOR;
+    uint256 internal immutable FINALIZE_RESERVE_GAS;
+
+    enum GasSchedule { Original, Glamsterdam }
+    /// @notice Explicit deployment gas schedule; never inferred from a mutable chain identifier.
+    GasSchedule public immutable gasSchedule;
     /// @notice Sponsorships per key, success or failure, before the owner must release the key.
     uint8 internal constant MAX_ATTEMPTS = 3;
 
@@ -163,7 +168,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
 
     // ---------------------------------------------------------------------------------- immutables
 
-    IEntryPoint public immutable entryPoint;
+    IEntryPoint public constant entryPoint = IEntryPoint(0x0000000071727De22E5E9d8BAf0edAc6f37da032);
     ZkApiVault public immutable vault;
     IZkApiProofAdapter public immutable adapter;
     ZkApiWithdrawalAccountFactory public immutable factory;
@@ -212,10 +217,10 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     mapping(address => uint256) public escapeNotePlusOne;
     /// @notice S whose sponsored CLOSE or FINALIZE reverted: the payout may sit in S.
     mapping(address => bool) public stranded;
-    /// @notice Wei S forwarded during the current operation.
-    mapping(address => uint256) public received;
-    /// @notice The execution gas S reported during the current operation.
-    mapping(address => uint256) public receivedGas;
+    // Operation-local receipts must not allocate persistent slots in execution then clear them in
+    // postOp: EIP-8037 can refill gas across those frames, invalidating EntryPoint v0.7's gas delta.
+    bytes32 private constant RECEIVED_DOMAIN = keccak256("zkapi.gasless.received");
+    bytes32 private constant RECEIVED_GAS_DOMAIN = keccak256("zkapi.gasless.receivedGas");
     /// @notice Payouts whose push failed, claimable by anyone for the payee.
     mapping(address => uint256) public credits;
     uint256 public totalCredits;
@@ -403,16 +408,43 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         address owner_,
         Policy memory policy_,
         uint256 maxFeeCeiling_,
-        uint256 priorityFeeCeiling_
+        uint256 priorityFeeCeiling_,
+        GasSchedule gasSchedule_
     ) Ownable(owner_) {
-        if (address(entryPoint_).codehash != ENTRY_POINT_V070_CODEHASH) revert BadEntryPoint();
+        gasSchedule = gasSchedule_;
+        bool glamsterdam = gasSchedule_ == GasSchedule.Glamsterdam;
+        CALL_FLOOR_CLOSE = glamsterdam ? 850_000 : 550_000;
+        CALL_FLOOR_ESCAPE = glamsterdam ? 1_100_000 : 540_000;
+        CALL_FLOOR_FINALIZE = glamsterdam ? 500_000 : 250_000;
+        CALL_HARD_CAP_CLOSE = glamsterdam ? 1_400_000 : 950_000;
+        CALL_HARD_CAP_ESCAPE = glamsterdam ? 1_800_000 : 1_100_000;
+        CALL_HARD_CAP_FINALIZE = glamsterdam ? 750_000 : 400_000;
+        POSTOP_FLOOR = glamsterdam ? 560_000 : 250_000;
+        POSTOP_CAP = glamsterdam ? 700_000 : 350_000;
+        VERIFICATION_FLOOR = glamsterdam ? 140_000 : 50_000;
+        VERIFICATION_FLOOR_INIT = glamsterdam ? 490_000 : 110_000;
+        VERIFICATION_CAP = glamsterdam ? 496_000 : 400_000;
+        PM_VERIFICATION_FLOOR = glamsterdam ? 496_000 : 410_000;
+        POSTOP_BASE_GAS = glamsterdam ? 23_000 : 17_000;
+        POSTOP_ESCAPE_GAS = glamsterdam ? 339_000 : 71_200;
+        POSTOP_FINALIZE_EXTRA_GAS = glamsterdam ? 20_000 : 5_000;
+        POSTOP_ESCAPE_FORWARD_GAS = glamsterdam ? 145_000 : 30_000;
+        POSTOP_ESCAPE_DEPOSIT_GAS = glamsterdam ? 9_000 : 15_000;
+        EOA_PUSH_GAS = glamsterdam ? 11_400 : 9_100;
+        NEW_ACCOUNT_GAS = glamsterdam ? 183_600 : 25_000;
+        CREDIT_GAS = glamsterdam ? 223_000 : 46_000;
+        ACCOUNT_CALL_OVERHEAD_GAS = glamsterdam ? 16_000 : 13_000;
+        ACCOUNT_CALL_OVERHEAD_ESCAPE_GAS = glamsterdam ? 8_000 : 6_000;
+        FAILURE_POSTOP_GAS = glamsterdam ? 250_000 : 70_000;
+        FAILURE_DEBT_DEPOSIT_GAS = glamsterdam ? 30_000 : 20_000;
+        FINALIZE_RESERVE_GAS = PVG_FLOOR + VERIFICATION_FLOOR + CALL_FLOOR_FINALIZE + PM_VERIFICATION_FLOOR + POSTOP_FLOOR;
+        if (address(entryPoint_) != address(entryPoint) || address(entryPoint_).codehash != ENTRY_POINT_V070_CODEHASH) revert BadEntryPoint();
         if (
             vault_.PROTOCOL_VERSION() != 2 || vault_.CONCESSION_ESCAPE_VERSION() != 1
                 || vault_.NOTE_BOUND_EXIT_VERSION() != 1
         ) revert BadVault();
         IZkApiProofAdapter adapter_ = vault_.proofAdapter();
         if (address(adapter_).code.length == 0) revert BadVault();
-        entryPoint = entryPoint_;
         vault = vault_;
         adapter = adapter_;
         WEI_PER_UNIT = vault_.nativeAssetWeiPerUnit();
@@ -700,10 +732,16 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
 
     /// @dev A factory-created transit account: its immutables reproduce its CREATE2 address.
     function _transitPayee(address account) private view returns (bool ok, address payee) {
-        if (account.code.length == 0) return (false, address(0));
-        ZkApiWithdrawalAccount s = ZkApiWithdrawalAccount(payable(account));
-        address owner_ = s.owner();
-        payee = s.payee();
+        if (account.code.length != 93) return (false, address(0));
+        address owner_;
+        // Factory proxies have 53 forwarding bytes followed by packed owner/payee. The
+        // CREATE2 comparison authenticates these bytes rather than trusting arbitrary getters.
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            extcodecopy(account, ptr, 53, 40)
+            owner_ := shr(96, mload(ptr))
+            payee := shr(96, mload(add(ptr, 20)))
+        }
         ok = factory.getAddress(owner_, payee) == account;
     }
 
@@ -721,8 +759,15 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
             inFlight := tload(s)
         }
         if (inFlight == 0) revert NotRepayable();
-        received[s] += msg.value;
-        receivedGas[s] = executionGasUsed;
+        bytes32 valueSlot = _operationSlot(RECEIVED_DOMAIN, s);
+        bytes32 gasSlot = _operationSlot(RECEIVED_GAS_DOMAIN, s);
+        uint256 total;
+        assembly ("memory-safe") { total := tload(valueSlot) }
+        total += msg.value;
+        assembly ("memory-safe") {
+            tstore(valueSlot, total)
+            tstore(gasSlot, executionGasUsed)
+        }
     }
 
     /// @notice Called by S.sweep() outside an operation: deducts what S owes first, pushes the rest to
@@ -764,10 +809,16 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
             let inFlight := tload(sender)
             if inFlight { tstore(sender, sub(inFlight, 1)) }
         }
-        uint256 got = received[sender];
-        uint256 execUsed = receivedGas[sender];
-        if (got != 0) delete received[sender];
-        if (execUsed != 0) delete receivedGas[sender];
+        uint256 got;
+        uint256 execUsed;
+        bytes32 valueSlot = _operationSlot(RECEIVED_DOMAIN, sender);
+        bytes32 gasSlot = _operationSlot(RECEIVED_GAS_DOMAIN, sender);
+        assembly ("memory-safe") {
+            got := tload(valueSlot)
+            execUsed := tload(gasSlot)
+            tstore(valueSlot, 0)
+            tstore(gasSlot, 0)
+        }
         uint256 debt = owed[sender];
         if (mode != PostOpMode.opSucceeded) {
             // The vault call reverted and its state rolled back, so this operation forwarded
@@ -811,20 +862,24 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         uint256 chargeWei = chargeFor(
             c.kind, actualGas, execUsed, c.callGasLimit, c.postOpGasLimit, payeeHasCode, payeeIsEmpty, feePerGas
         ) + c.flatFee;
+        chargeWei = _adjustResetCharge(chargeWei, c, debt, got, feePerGas);
         // The EntryPoint never charges more than the prefund.
-        if (chargeWei > c.maxCost + c.flatFee) chargeWei = c.maxCost + c.flatFee;
+        uint256 feeLimit = c.maxCost + c.flatFee;
+        if (chargeWei > feeLimit) chargeWei = feeLimit;
         if (c.kind == KIND_ESCAPE) {
             // Nothing is paid at initiation: the charge joins S's debt, collected on every later
             // path. A balance S happened to hold (a direct payout that reached it earlier) settles
             // the debt first, like every other path; what is left is credited to the payee (the
             // escape's postOp has no push). The deposit and the credit bookkeeping are charged to
-            // the balance as well; when nothing is left to credit, half of that covers the deposit.
+            // the balance as well; a separate smaller estimate covers a deposit without a credit.
             uint256 escapeDebt = debt + chargeWei;
             uint256 taken;
             if (got != 0) {
                 taken = got < escapeDebt ? got : escapeDebt;
                 uint256 rest = got - taken;
-                uint256 extra = (rest != 0 ? POSTOP_ESCAPE_FORWARD_GAS : POSTOP_ESCAPE_FORWARD_GAS / 2) * feePerGas;
+                uint256 extra = (rest != 0 ? POSTOP_ESCAPE_FORWARD_GAS : POSTOP_ESCAPE_DEPOSIT_GAS) * feePerGas;
+                uint256 headroom = feeLimit - chargeWei;
+                if (extra > headroom) extra = headroom;
                 chargeWei += extra;
                 escapeDebt += extra;
                 if (rest != 0) {
@@ -862,6 +917,8 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         if (payout != 0 && !_push(c.payee, payout)) {
             // A payee that refused or burned the push pays for the credit bookkeeping too.
             uint256 surcharge = CREDIT_GAS * feePerGas;
+            uint256 headroom = feeLimit - chargeWei;
+            if (surcharge > headroom) surcharge = headroom;
             if (surcharge > payout) surcharge = payout;
             chargeWei += surcharge;
             keep += surcharge;
@@ -870,6 +927,36 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         // The float replenishes itself; the flat fee stays in the deposit as revenue.
         if (keep != 0) entryPoint.depositTo{value: keep}(address(this));
         emit Settled(c.key, sender, c.payee, c.kind, c.noteId, got, chargeWei, owedPaid, got - keep);
+    }
+
+    /// @dev Repriced persistent resets cost 10k each, net 9k after the unused-gas penalty.
+    ///      FINALIZE's public estimate includes both; other settling estimates include neither.
+    function _adjustResetCharge(uint256 chargeWei, Ctx memory c, uint256 debt, uint256 got, uint256 feePerGas)
+        private view returns (uint256)
+    {
+        if (gasSchedule == GasSchedule.Glamsterdam) {
+            uint256 kind = c.kind;
+            uint256 recorded = kind == KIND_FORWARD ? 0 : escapeNotePlusOne[c.sender];
+            if (kind == KIND_ESCAPE) {
+                // Existing slots save 97,920 allocation gas, net of the 10% unused-gas penalty.
+                // Forwarded-balance estimates already account for an owed slot ending at zero;
+                // leave that case conservative within the credit allowance instead of deducting twice.
+                unchecked {
+                    uint256 oldSlots = recorded != 0 ? 1 : 0;
+                    if (debt != 0 && got == 0) ++oldSlots;
+                    chargeWei -= oldSlots * 88_128 * feePerGas;
+                }
+            } else {
+                // The base exceeds the maximum 18k deduction; fees and limits are validated.
+                uint256 notePlusOne = uint256(c.noteId) + 1;
+                assembly ("memory-safe") {
+                    let resets := add(iszero(iszero(debt)), eq(recorded, notePlusOne))
+                    let delta := mul(sub(resets, mul(eq(kind, 3), 2)), 9000)
+                    chargeWei := add(chargeWei, mul(delta, feePerGas))
+                }
+            }
+        }
+        return chargeWei;
     }
 
     /// @dev Sends `amount` with at most PAYOUT_PUSH_GAS and copies no return data.
@@ -899,9 +986,26 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
 
     // -------------------------------------------------------------------------------------- views
 
-    /// @notice The charge formula postOp applies, in wei, before the flat fee, the cap at
-    ///         maxCost + flatFee and the CREDIT_GAS surcharge of a failed push: the EntryPoint's gas
-    ///         so far, the pinned postOp and push gas of the kind and payee, the 10% penalty on the
+    /// @notice Wei S forwarded during the current operation (transient; zero after settlement).
+    function received(address sender) public view returns (uint256 value) {
+        bytes32 slot = _operationSlot(RECEIVED_DOMAIN, sender);
+        assembly ("memory-safe") { value := tload(slot) }
+    }
+
+    /// @notice Execution gas S reported during the current operation (transient).
+    function receivedGas(address sender) public view returns (uint256 value) {
+        bytes32 slot = _operationSlot(RECEIVED_GAS_DOMAIN, sender);
+        assembly ("memory-safe") { value := tload(slot) }
+    }
+
+    function _operationSlot(bytes32 domain, address sender) private pure returns (bytes32) {
+        return keccak256(abi.encode(domain, sender));
+    }
+
+
+    /// @notice Base charge estimate in wei, before state-dependent allocation/reset adjustments,
+    ///         the flat fee and any forwarding or failed-push bookkeeping. postOp caps their sum
+    ///         at maxCost + flatFee. This estimate includes the EntryPoint's gas so far, the pinned postOp and push gas of the kind and payee, the 10% penalty on the
     ///         unused call and postOp limits, and the margin.
     function chargeFor(
         uint8 kind,
@@ -912,7 +1016,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         bool payeeHasCode,
         bool payeeIsEmpty,
         uint256 feePerGas
-    ) public pure returns (uint256 chargeWei) {
+    ) public view returns (uint256 chargeWei) {
         uint256 postOpGas;
         uint256 overhead;
         if (kind == KIND_ESCAPE) {
@@ -965,12 +1069,26 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     }
 
     /// @notice The key the attempts of a sponsorship are counted under.
-    function keyFor(uint8 kind, uint256 nullifier, uint32 noteId, address sender) public pure returns (bytes32) {
-        if (kind == KIND_CLOSE) return keccak256(abi.encode("close", nullifier));
-        if (kind == KIND_ESCAPE) return keccak256(abi.encode("escape", noteId));
-        if (kind == KIND_FINALIZE) return keccak256(abi.encode("finalize", noteId));
-        if (kind == KIND_FORWARD) return keccak256(abi.encode("forward", sender));
-        revert InvalidKind();
+    function keyFor(uint8 kind, uint256 nullifier, uint32 noteId, address sender) public pure returns (bytes32 key) {
+        uint32 invalidKind = uint32(InvalidKind.selector);
+        // Exact abi.encode(string(tag), value), shared across all four domains.
+        assembly ("memory-safe") {
+            let tag
+            let length
+            let value
+            switch kind
+            case 1 { tag := 0x636c6f7365 length := 5 value := nullifier }
+            case 2 { tag := 0x657363617065 length := 6 value := and(noteId, 0xffffffff) }
+            case 3 { tag := 0x66696e616c697a65 length := 8 value := and(noteId, 0xffffffff) }
+            case 4 { tag := 0x666f7277617264 length := 7 value := and(sender, 0xffffffffffffffffffffffffffffffffffffffff) }
+            default { mstore(0, invalidKind) revert(0x1c, 4) }
+            let ptr := mload(0x40)
+            mstore(ptr, 0x40)
+            mstore(add(ptr, 0x20), value)
+            mstore(add(ptr, 0x40), length)
+            mstore(add(ptr, 0x60), shl(sub(256, mul(length, 8)), tag))
+            key := keccak256(ptr, 0x80)
+        }
     }
 
     /// @dev The transient slot of a note's in-flight lock (see SponsorshipInFlight). A hash, so it
@@ -984,7 +1102,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     }
 
     /// @notice The pinned gas policy, for the profile and the clients' cross-check.
-    function gasPolicy() external pure returns (GasPolicy memory g) {
+    function gasPolicy() external view returns (GasPolicy memory g) {
         g.callFloor = [CALL_FLOOR_CLOSE, CALL_FLOOR_ESCAPE, CALL_FLOOR_FINALIZE, CALL_FLOOR_FORWARD];
         g.callHardCap = [CALL_HARD_CAP_CLOSE, CALL_HARD_CAP_ESCAPE, CALL_HARD_CAP_FINALIZE, CALL_HARD_CAP_FORWARD];
         g.postOpFloor = POSTOP_FLOOR;
@@ -1012,7 +1130,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     }
 
     /// @dev The callGasLimit floor of a kind.
-    function _callFloor(uint8 kind) private pure returns (uint256) {
+    function _callFloor(uint8 kind) private view returns (uint256) {
         if (kind == KIND_CLOSE) return CALL_FLOOR_CLOSE;
         if (kind == KIND_ESCAPE) return CALL_FLOOR_ESCAPE;
         if (kind == KIND_FINALIZE) return CALL_FLOOR_FINALIZE;
@@ -1021,7 +1139,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     }
 
     /// @dev The callGasLimit hard cap of a kind.
-    function _callHardCap(uint8 kind) private pure returns (uint256) {
+    function _callHardCap(uint8 kind) private view returns (uint256) {
         if (kind == KIND_CLOSE) return CALL_HARD_CAP_CLOSE;
         if (kind == KIND_ESCAPE) return CALL_HARD_CAP_ESCAPE;
         if (kind == KIND_FINALIZE) return CALL_HARD_CAP_FINALIZE;

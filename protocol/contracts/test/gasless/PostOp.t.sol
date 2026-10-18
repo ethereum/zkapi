@@ -138,6 +138,38 @@ contract PostOpTest is GaslessTestBase {
         _assertSettledCleanly(logs);
     }
 
+    function test_escapeForwardingNeverExceedsTheApprovedFeeCap() public {
+        factory.createAccount(ownerAddr, payee);
+        uint32 id = _bigNote(42);
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs) =
+            _escapeOp(id, 2001, 2002, BIG - 2_000_000, 1_000_000);
+        vm.deal(op.sender, 1 ether);
+        uint256 prefund = _maxCostOf(op);
+        vm.recordLogs();
+        _run(op, _escapeCall(inputs), prefund, MAX_FEE);
+        SettledEvent memory e = _settled(vm.getRecordedLogs());
+        assertTrue(e.found);
+        assertEq(e.charged, prefund + FLAT_FEE, "forward accounting stays within the reviewed fee");
+        assertEq(e.paidOut, 1 ether - e.charged);
+        assertEq(paymaster.owed(op.sender), 0);
+        assertEq(paymaster.credits(payee), e.paidOut);
+    }
+
+    function test_failedPushNeverExceedsTheApprovedFeeCap() public {
+        GasBurner burner = new GasBurner();
+        factory.createAccount(ownerAddr, address(burner));
+        uint32 id = _bigNote(42);
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs) =
+            _closeOpFor(address(burner), id, 2001, BIG - 1_000_000);
+        uint256 prefund = _maxCostOf(op);
+        vm.recordLogs();
+        _run(op, _closeCall(inputs), prefund, MAX_FEE);
+        SettledEvent memory e = _settled(vm.getRecordedLogs());
+        assertTrue(e.found);
+        assertEq(e.charged, prefund + FLAT_FEE, "credit bookkeeping stays inside the approved fee");
+        assertEq(paymaster.credits(address(burner)), e.received - e.charged);
+    }
+
     function test_theOtherModesAreFailures() public {
         uint32 id = _bigNote(42);
         (PackedUserOperation memory op,) = _closeOp(id, 1001, BIG - 1_000_000);
