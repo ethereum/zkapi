@@ -122,10 +122,18 @@ struct Args {
     min_sender_balance_wei: Option<u128>,
 }
 
+fn daemon_log_filter(filter: tracing_subscriber::EnvFilter) -> tracing_subscriber::EnvFilter {
+    // ark-r1cs-std's INFO spans Debug-format field gadgets, including their
+    // entire constraint system. A normal daemon INFO subscriber otherwise
+    // makes proving consume gigabytes before it finishes. Never collect these
+    // spans, including when an operator enables global debug/trace logging.
+    filter.add_directive("r1cs=off".parse().expect("fixed tracing directive"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(daemon_log_filter(tracing_subscriber::EnvFilter::from_default_env()))
         .init();
     let args = Args::parse();
     anyhow::ensure!(args.poll_interval_ms > 0, "poll interval must be positive");
@@ -235,6 +243,32 @@ async fn main() -> anyhow::Result<()> {
             _ = ticker.tick() => if let Err(error) = service.poll_once().await {
                 tracing::error!(error = %error, "activation poll failed; durable work will retry");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::daemon_log_filter;
+
+    #[test]
+    fn daemon_logging_never_formats_constraint_witnesses() {
+        struct ConstraintWitness;
+        impl std::fmt::Debug for ConstraintWitness {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("constraint witnesses must never reach the formatter");
+            }
+        }
+        for directives in ["info", "trace,r1cs=trace"] {
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(daemon_log_filter(tracing_subscriber::EnvFilter::new(directives)))
+                .with_writer(std::io::sink)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(tracing::enabled!(target: "zkapi_activated", tracing::Level::INFO));
+                assert!(!tracing::enabled!(target: "r1cs", tracing::Level::INFO));
+                let _span = tracing::info_span!(target: "r1cs", "field_arithmetic", witness = ?ConstraintWitness);
+            });
         }
     }
 }

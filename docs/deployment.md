@@ -12,8 +12,8 @@ profile remains `not_deployed`. This is a single-party `dev` proof setup, and
 sponsored withdrawals are disabled.
 
 The operator runs isolated `zkapi-r4-sepolia` containers and data, with separate
-funded activation and challenge signers. Backend RPC uses Sepolia Tenderly;
-the browser profile retains PublicNode. Shared public RPC rate limits must be
+funded activation and challenge signers. Indexer/challenger RPC uses Sepolia Tenderly; the API, activation signer and
+browser profile use PublicNode. The indexer polls every six seconds. Shared public RPC rate limits must be
 checked against actual worker health, not only container liveness.
 
 Sepolia's October 2026 state-creation gas repricing makes older local Forge

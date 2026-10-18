@@ -40,6 +40,16 @@ operator more than 1.2M gas beyond that one batch; an early
 `activateNotesOnChain` would do the same, hence its delay (below). Exits never
 depend on activation, so this is about the operator's gas, never about funds.
 
+## Constraint tracing
+
+The activation binary always disables the `r1cs` tracing target, even if the
+operator enables global INFO/debug/trace logging. Arkworks' arithmetic spans
+otherwise Debug-format and retain entire constraint systems, making a singleton
+proof consume gigabytes and minutes. This filter changes neither the circuit nor
+the keys. Older binaries must use `RUST_LOG=info,r1cs=off`. The Sepolia staging
+worker also has a 2 GiB memory limit so a prover failure cannot exhaust the shared
+host. Keep normal worker status and error logs enabled.
+
 ## Running it
 
 ```sh
