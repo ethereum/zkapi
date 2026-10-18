@@ -53,7 +53,10 @@ Follow [development builds and validation](docs/DEVELOPMENT.md). Published
 protocol selector; do not use their installer to update this build.
 
 The examples below assume `zkapi-clientd` refers to the newly built
-`bin/zkapi-clientd-concession-tor` entry point. Global `--config-dir DIR` belongs
+`bin/zkapi-clientd-concession-tor` entry point. The [local Sepolia bundle setup](docs/DEVELOPMENT.md#sepolia-acceptance)
+adds workspace-only `bin/zkapi-clientd` and `bin/zkapi-walletd` aliases, the proving
+asset link, and the required current-shell PATH; it leaves global installations
+and existing profiles intact. Global `--config-dir DIR` belongs
 **before** the command. Select the correct existing profile/protocol before any
 wallet operation; revision-4 funding is available on Sepolia; its Mainnet profile remains unavailable.
 

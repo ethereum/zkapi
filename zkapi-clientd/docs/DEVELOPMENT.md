@@ -60,7 +60,9 @@ is not overwritten.
 
 ## Companion and proving assets
 
-The concession Rust companion can be compiled from the repository root:
+For a runnable local Sepolia bundle, use [Sepolia acceptance](#sepolia-acceptance)
+below, including the local aliases and PATH. The generic companion build
+without development keys can be compiled from the repository root:
 
 ```sh
 cargo build --release --locked -p zkapi-companion --bin zkapi-walletd
@@ -138,10 +140,27 @@ Build a separate Sepolia companion; keep Mainnet and historical executables inta
 cargo build --release --locked -p zkapi-companion --bin zkapi-walletd --features zkapi-proof/dev-setup
 install -m 755 target/release/zkapi-walletd zkapi-clientd/bin/zkapi-walletd-sepolia-r4
 cd zkapi-clientd
+# In a fresh local bundle; these links stay inside this workspace.
+ln -s zkapi-clientd-concession-tor bin/zkapi-clientd
+ln -s zkapi-walletd-sepolia-r4 bin/zkapi-walletd
+mkdir -p share/zkapi-clientd
+ln -s ../../../protocol/setup/v2-concession-dev share/zkapi-clientd/proof-setup
+export PATH="$PWD/bin:$PATH"
+zkapi-clientd version
 ZKAPI_TEST_SEPOLIA=1 go test -v ./internal/zkapi -run '^TestLiveSepoliaDeployment$'
 ZKAPI_TEST_SEPOLIA=1 ZKAPI_TEST_COMPANION="$PWD/bin/zkapi-walletd-sepolia-r4" \
   go test -v ./internal/zkapi -run '^TestLiveSepoliaCompanion$'
 ```
+
+Default companion discovery uses `zkapi-walletd` from PATH. With no
+`--proof-setup-dir`, it resolves `../share/zkapi-clientd/proof-setup` relative
+to the companion's real executable and checks all four proving-key hashes.
+The local links above therefore support an ordinary Sepolia profile without
+binary/setup overrides. The primary executable's absolute path alone does
+not add its directory to PATH. Keep this PATH change in the current shell;
+do not replace a globally installed Mainnet daemon or its profile. If a link
+already exists, inspect its target rather than replacing another protocol's
+bundle. Historical profiles keep their explicitly pinned companion/setup paths.
 
 These checks read the live contract and server pins, verify installed proving
 keys, and optionally start the real Go/Rust bridge with an empty temporary
