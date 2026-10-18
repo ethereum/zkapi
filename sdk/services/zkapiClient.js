@@ -2547,6 +2547,8 @@ class ZkapiClient extends EventTarget {
         concede = 'zero',
         fees = 'wallet',
         feeCapWei = null,
+        maxCostWei: approvedMaxCostWei = null,
+        maxTotalFeeWei = null,
         bundlerUrl = null,
         allowExpensiveGas = false,
         selfBundle = false,
@@ -2571,7 +2573,7 @@ class ZkapiClient extends EventTarget {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const options = { destination, concede, fees, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle,
+        const options = { destination, concede, fees, feeCapWei, maxCostWei: approvedMaxCostWei, maxTotalFeeWei, bundlerUrl, allowExpensiveGas, selfBundle,
             expectedWithdrawalOperationId };
         const operation = (async () => {
             try {
@@ -2611,6 +2613,8 @@ class ZkapiClient extends EventTarget {
         concede = 'zero',
         fees = 'wallet',
         feeCapWei = null,
+        maxCostWei: approvedMaxCostWei = null,
+        maxTotalFeeWei = null,
         bundlerUrl = null,
         allowExpensiveGas = false,
         selfBundle = false,
@@ -2630,7 +2634,7 @@ class ZkapiClient extends EventTarget {
             // bound to a transit account, every read goes to the read RPC and
             // no transaction is ever sent from the wallet.
             return this.performGaslessWithdrawal(mode, onStatus, {
-                requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from, note,
+                requestedDestination, concede, feeCapWei, approvedMaxCostWei, maxTotalFeeWei, bundlerUrl, allowExpensiveGas, selfBundle, from, note,
                 expectedWithdrawalOperationId,
                 durablePrepared: await browserWalletRuntime.currentPreparedWithdrawal()
             });
@@ -3486,6 +3490,7 @@ class ZkapiClient extends EventTarget {
             op: sizedOp });
         const op = draft(gas);
         const maxCost = maxCostWei(gas, selectedFees.maxFeePerGas);
+        this.assertGaslessCostApproved(context, maxCost);
         if (maxCost > state.policy.maxSponsoredCostWei) {
             throw gaslessError('max_cost_above_policy', { maxCost, cap: state.policy.maxSponsoredCostWei });
         }
@@ -3494,8 +3499,17 @@ class ZkapiClient extends EventTarget {
             throw gaslessError('paymaster_underfunded', { depositWei: state.depositWei, maxCost });
         }
         const finalizeReserveWei = kind === KIND.escape ? pins.gasPolicy.finalizeReserveGas * selectedFees.maxFeePerGas : 0n;
+        // A failed contract payout costs credit bookkeeping beyond the normal
+        // gas+flat-fee cap. Include that contingency in the disclosed net.
+        const payoutCode = await reader({ method: 'eth_getCode', params: [transit.payee, 'latest'] });
+        const payoutHasCode = Boolean(payoutCode && payoutCode !== '0x');
+        const creditSurchargeWei = payoutHasCode ? pins.gasPolicy.creditGas * selectedFees.maxFeePerGas : 0n;
+        if (context.approvedTotalFeeWei != null && maxCost + flatFee + creditSurchargeWei > context.approvedTotalFeeWei) {
+            throw gaslessError('gasless_cost_above_cap', { maxCost: maxCost + flatFee + creditSurchargeWei, cap: context.approvedTotalFeeWei },
+                'Network fees changed above the amount you approved. Check the fee again before continuing.');
+        }
         const amounts = gaslessAmounts({
-            kind, payoutWei, maxCost, flatFee, owed: state.owed, finalizeReserveWei, minEscapeNetWei: state.policy.minEscapeNetWei,
+            kind, payoutWei, maxCost, flatFee, owed: state.owed, finalizeReserveWei, creditSurchargeWei, minEscapeNetWei: state.policy.minEscapeNetWei,
             uneconomicFractionPercent: pins.uneconomicFractionPercent, allowExpensiveGas
         });
         const quote = decodeQuote(await this.gaslessCall(reader, pins.paymaster, encodeQuote({
@@ -3515,7 +3529,24 @@ class ZkapiClient extends EventTarget {
         if (String(onChainHash || '').toLowerCase() !== hash) {
             throw gaslessError('entry_point_hash_mismatch', { local: hash, entryPoint: onChainHash || null });
         }
-        return { op, hash, key, sequence, withInitCode: created, gas, fees: selectedFees, maxCost, amounts, quote, payoutWei };
+        return { op, hash, key, sequence, withInitCode: created, gas, fees: selectedFees, maxCost, amounts, quote, payoutWei, payoutHasCode };
+    }
+
+    /** The person approved this maximum gas reservation, not merely the flat fee. */
+    assertGaslessCostApproved(context, maxCost) {
+        if (context.approvedMaxCostWei != null && maxCost > context.approvedMaxCostWei) {
+            throw gaslessError('gasless_cost_above_cap', { maxCost, cap: context.approvedMaxCostWei },
+                'Network fees changed above the amount you approved. Check the fee again before continuing.');
+        }
+    }
+
+    async assertGaslessTotalFeeApproved(context, maxCost, maxFeePerGas) {
+        if (context.approvedTotalFeeWei == null) return;
+        const code = await context.reader({ method: 'eth_getCode', params: [context.transit.payee, 'latest'] });
+        const credit = code && code !== '0x' ? context.pins.gasPolicy.creditGas * maxFeePerGas : 0n;
+        const total = maxCost + context.state.policy.flatFeeWei + credit;
+        if (total > context.approvedTotalFeeWei) throw gaslessError('gasless_cost_above_cap', { maxCost: total, cap: context.approvedTotalFeeWei },
+            'Network fees changed above the amount you approved. Check the fee again before continuing.');
     }
 
     /** A bundler's estimate is a cross-check only: above a cap it is refused, below the defaults ignored (§3.1). */
@@ -3882,6 +3913,8 @@ class ZkapiClient extends EventTarget {
             // must not lose a settlement the bundle already carries.
             const found = await this.findUserOperationInclusion(context, lookupHashes(), fromBlock) || await inclusionByNonce();
             if (found) return settleInclusion(found);
+            this.assertGaslessCostApproved(context, maxCostWei(built.op, built.op.maxFeePerGas));
+            await this.assertGaslessTotalFeeApproved(context, maxCostWei(built.op, built.op.maxFeePerGas), built.op.maxFeePerGas);
         } else {
             // An operation released earlier (an expiry stop before this
             // re-proof) may have landed meanwhile: it is looked for (by its
@@ -4129,7 +4162,8 @@ class ZkapiClient extends EventTarget {
             return `The escape is sponsored: nothing is paid now. Its finalization deducts at most ${eth(amounts.initiationDebtMax)} ETH for this start (its network fee and the paymaster’s flat fee), plus the finalization’s own fee and flat fee, measured when the finalization is sent; at current fees the payout address would receive about ${eth(amounts.estimatedReceived)} ETH. The guaranteed minimum is shown when the finalization is signed.`;
         }
         return `The payout address receives at least ${eth(amounts.minimumReceived)} ETH: the sponsored network fee is at most ${eth(amounts.maxCost)} ETH`
-            + `${amounts.flatFee ? ` plus a ${eth(amounts.flatFee)} ETH flat fee` : ''}${amounts.owed ? ` and ${eth(amounts.owed)} ETH of earlier debt` : ''}; the exact charge is measured on chain.`;
+            + `${amounts.flatFee ? ` plus a ${eth(amounts.flatFee)} ETH flat fee` : ''}${amounts.owed ? ` and ${eth(amounts.owed)} ETH of earlier debt` : ''}`
+            + `${amounts.creditSurchargeWei ? `, allowing ${eth(amounts.creditSurchargeWei)} ETH extra if the receiving contract refuses payment` : ''}; the exact charge is measured on chain.`;
     }
 
     gaslessSettledMessage(amounts, credited) {
@@ -4144,6 +4178,8 @@ class ZkapiClient extends EventTarget {
         return {
             rememberBuilt: async built => browserWalletRuntime.rememberPreparedWithdrawalUserOp(submission, {
                 userOp: userOperationJson(built.op), userOpHash: built.hash, userOpNonce: built.op.nonce.toString(),
+                gaslessMaxCostWei: context.approvedMaxCostWei?.toString() ?? null,
+                gaslessMaxTotalFeeWei: context.approvedTotalFeeWei?.toString() ?? null,
                 userOpInitCode: built.withInitCode === true, bundlerUrl: context.bundlerUrl, submittedAtBlock: await this.gaslessBlockNumber(context)
             }),
             rememberSubmission: details => browserWalletRuntime.rememberPreparedWithdrawalUserOpSubmission(submission, details),
@@ -4231,8 +4267,12 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async followGaslessWithdrawal(mode, onStatus, { requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from,
+    async followGaslessWithdrawal(mode, onStatus, { requestedDestination, concede, feeCapWei, approvedMaxCostWei = null, maxTotalFeeWei = null, bundlerUrl, allowExpensiveGas, selfBundle, from,
         durablePrepared, note, claimed, expectedWithdrawalOperationId = null }) {
+        const changed = () => Object.assign(new Error('This withdrawal was replaced in another tab. Review it again before continuing.'), { code: 'withdrawal_note_changed' });
+        if (expectedWithdrawalOperationId != null && durablePrepared?.operationId !== expectedWithdrawalOperationId) throw changed();
+        const reviewedPlan = durablePrepared ? { operationId: durablePrepared.operationId, statement: JSON.stringify(durablePrepared.public_inputs),
+            userOpHash: durablePrepared.userOpHash ?? null } : null;
         if (durablePrepared && !isGaslessWithdrawal(durablePrepared)) throw gaslessError('gasless_plan_mismatch');
         if (requestedDestination && durablePrepared?.payout && durablePrepared.payout.toLowerCase() !== requestedDestination) {
             throw new Error('This withdrawal is already bound to a different destination. Resume it with its saved address.');
@@ -4248,6 +4288,16 @@ class ZkapiClient extends EventTarget {
             from, payout, owner, expectedAccount: durablePrepared?.transit?.account || null,
             bundlerUrl: bundlerUrl || durablePrepared?.bundlerUrl || null, kind, record: durablePrepared || null
         });
+        // A resumed plan keeps its earlier approval unless the caller passes
+        // a newly reviewed cap explicitly. Fee replacement never changes it.
+        const savedCap = durablePrepared?.gaslessMaxCostWei;
+        const cap = approvedMaxCostWei ?? savedCap;
+        feeCapWei ??= durablePrepared?.gaslessFlatFeeCapWei ?? null;
+        context.approvedMaxCostWei = cap == null ? null : toBigInt(cap, 'maxCostWei');
+        if (context.approvedMaxCostWei != null && context.approvedMaxCostWei < 0n) throw new TypeError('maxCostWei must be non-negative.');
+        const totalCap = maxTotalFeeWei ?? durablePrepared?.gaslessMaxTotalFeeWei;
+        context.approvedTotalFeeWei = totalCap == null ? null : toBigInt(totalCap, 'maxTotalFeeWei');
+        if (context.approvedTotalFeeWei != null && context.approvedTotalFeeWei < 0n) throw new TypeError('maxTotalFeeWei must be non-negative.');
         const S = context.transit.account;
         if (!durablePrepared) {
             onStatus(owner === payout ? GASLESS_PRIVACY_NOTE : GASLESS_PRIVACY_NOTE_SEPARATE_PAYOUT);
@@ -4264,7 +4314,11 @@ class ZkapiClient extends EventTarget {
             kind, key: kind === KIND.close ? attemptsKey(KIND.close, { nullifier: nullifierHint }) : attemptsKey(KIND.escape, { noteId })
         });
         if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
+        // Reject changed fees before reserving a cooperative close.
+        // Resumes may already have a cheaper signed operation to follow.
+        if (!durablePrepared?.userOp) this.assertGaslessCostApproved(context, preflight.maxCost);
         context.state = preflight.state;
+        if (!durablePrepared?.userOp) await this.assertGaslessTotalFeeApproved(context, preflight.maxCost, preflight.fees.maxFeePerGas);
 
         const withdrawal = { phase: 'prepared', mode, noteId, destination: S, payout, feePayer: 'payout', transit: context.transit };
         let plan;
@@ -4287,10 +4341,14 @@ class ZkapiClient extends EventTarget {
                 // as it is (identical bytes, no new proof); its claim, held by
                 // this or a crashed tab, is taken over below.
                 const journaled = attempt === 0 ? await browserWalletRuntime.currentPreparedWithdrawal() : null;
+                if (attempt === 0 && reviewedPlan && (journaled?.operationId !== reviewedPlan.operationId
+                    || JSON.stringify(journaled?.public_inputs) !== reviewedPlan.statement
+                    || (journaled?.userOpHash ?? null) !== reviewedPlan.userOpHash)) throw changed();
                 const resumable = isGaslessWithdrawal(journaled) && journaled.userOp && !journaled.transactionHash
                     && journaled.mode === mode && journaled.transit.account === S
                     && Number(journaled.public_inputs?.valid_until || 0) - this.gaslessTiming.stopBeforeValidUntilSeconds > Date.now() / 1_000;
                 if (resumable) {
+                    if (!reviewedPlan) throw changed();
                     plan = journaled;
                 } else {
                     plan = await browserWalletRuntime.prepareWithdrawal(mode, S, {
@@ -4298,8 +4356,10 @@ class ZkapiClient extends EventTarget {
                         earlyConcession: concede,
                         walletRequest,
                         expectedNoteId: note.note_id,
-                        expectedWithdrawalOperationId: attempt === 0 ? expectedWithdrawalOperationId : null,
-                        gasless: { payout, transit: context.transit },
+                        expectedWithdrawalOperationId: attempt === 0 ? (expectedWithdrawalOperationId ?? reviewedPlan?.operationId ?? null) : null,
+                        gasless: { payout, transit: context.transit, maxCostWei: context.approvedMaxCostWei?.toString() ?? null,
+                            maxTotalFeeWei: context.approvedTotalFeeWei?.toString() ?? null,
+                            flatFeeCapWei: feeCapWei == null ? null : String(feeCapWei) },
                         onProgress: (_phase, message) => onStatus(message)
                     });
                 }
@@ -4327,13 +4387,18 @@ class ZkapiClient extends EventTarget {
                     clearanceReserved: plan.clearanceReserved === true || mode === 'mutual' });
                 if (this.config) {
                     this.config.prepared_withdrawal = {
+                        operation_id: plan.operationId || null,
                         mode, phase: knownHash ? 'submitted' : 'prepared', note_id: noteId, destination: S, payout, fee_payer: 'payout',
                         transaction_hash: knownHash, clearance_reserved: plan.clearanceReserved === true || mode === 'mutual',
+                        max_cost_wei: plan.gaslessMaxCostWei ?? null, flat_fee_cap_wei: plan.gaslessFlatFeeCapWei ?? null,
+                        max_total_fee_wei: plan.gaslessMaxTotalFeeWei ?? null,
                         clearance_granted: mode === 'mutual' && Boolean(plan.clearance?.signature), user_op_hash: plan.userOpHash || null
                     };
                 }
                 const vaultCall = encodeWithdrawal(plan, mode, S, vault, { conceded: plan.public_inputs.conceded });
-                const claim = await browserWalletRuntime.claimPreparedWithdrawalUserOp({ liveWindowMs: this.gaslessTiming.resendAfterMs });
+                const claim = await browserWalletRuntime.claimPreparedWithdrawalUserOp({ liveWindowMs: this.gaslessTiming.resendAfterMs,
+                    expected: { operationId: plan.operationId, noteId, mode: plan.mode, destination: plan.destination,
+                        statement: JSON.stringify(plan.public_inputs), userOpHash: plan.userOpHash ?? null } });
                 if (claim?.submissionId) claimed.add(claim.submissionId);
                 submission = claim;
                 if (claim.transactionHash) {
@@ -5132,14 +5197,14 @@ class ZkapiClient extends EventTarget {
             const built = await this.buildGaslessOperation(context, {
                 kind, vaultCall: WORST_CASE_EXIT_CALL, nullifier: nullifier ?? 0n, noteId, payoutWei, feeCapWei, allowExpensiveGas, state: preflight.state
             });
-            const code = await context.reader({ method: 'eth_getCode', params: [payout, 'latest'] }).catch(() => '0x');
             return {
                 ...base, available: true, reason: null, message: null, transitExists: !built.withInitCode,
                 amounts: journalValue(built.amounts), fees: journalValue(built.fees), gas: journalValue(built.gas), maxCost: built.maxCost.toString(),
                 flatFeeWei: built.amounts.flatFee.toString(), owedWei: built.amounts.owed.toString(), minimumReceivedWei: weiString(built.amounts.minimumReceived),
+                creditSurchargeWei: built.amounts.creditSurchargeWei.toString(),
                 estimatedReceivedWei: weiString(built.amounts.estimatedReceived),
-                uneconomic: built.amounts.uneconomic, payoutHasCode: Boolean(code && code !== '0x'),
-                ...(code && code !== '0x' ? { payoutWarning: GASLESS_PAYOUT_CONTRACT_WARNING } : {})
+                uneconomic: built.amounts.uneconomic, payoutHasCode: built.payoutHasCode,
+                ...(built.payoutHasCode ? { payoutWarning: GASLESS_PAYOUT_CONTRACT_WARNING } : {})
             };
         } catch (error) {
             return { ...base, available: false, reason: error?.code || 'gasless_unavailable', message: error?.shortMessage || error?.message,
@@ -5197,58 +5262,75 @@ class ZkapiClient extends EventTarget {
             if (!context) throw error;
             unpinned = true;
         }
+        context.approvedMaxCostWei = prepared.gaslessMaxCostWei == null ? null : toBigInt(prepared.gaslessMaxCostWei, 'maxCostWei');
+        context.approvedTotalFeeWei = prepared.gaslessMaxTotalFeeWei == null ? null : toBigInt(prepared.gaslessMaxTotalFeeWei, 'maxTotalFeeWei');
         // From the earliest block any of the plan's operations was tracked from.
         const fromBlock = earliestBlock(prepared.submittedAtBlock, prepared.staleSubmittedAtBlock);
         let found = await this.findUserOperationInclusion(context, hashes, fromBlock);
         // Without an operation to re-send there is nothing to claim unless an inclusion was found.
         if (!found && !prepared.userOp) return null;
-        const submission = prepared.submissionId ? {
+        let submission = prepared.submissionId ? {
             operationId: prepared.operationId, submissionId: prepared.submissionId, noteId: Number(prepared.noteId ?? prepared.public_inputs?.note_id),
             mode: prepared.mode, destination: prepared.destination, deploymentId: browserWalletRuntime.manifest.deployment_id,
             chainId: Number(this.config.funding.chain_id), contractAddress: this.config.funding.contract_address
-        } : (await browserWalletRuntime.claimPreparedWithdrawalUserOp({ liveWindowMs: timing.resendAfterMs }));
-        // The background pass follows the claim only for these few calls.
-        if (!prepared.submissionId) browserWalletRuntime.endGaslessClaim(submission?.submissionId);
-        if (!found && prepared.userOp) {
-            const op = userOperationFromJson(prepared.userOp);
-            const { key, sequence } = unpackNonce(op.nonce);
-            const current = unpackNonce(decodeWord(await this.gaslessCall(context.reader, context.pins.entryPoint,
-                encodeGetNonce(context.transit.account, key)), 'getNonce')).sequence;
-            if (current > sequence) {
-                found = await this.findUserOperationInclusion(context, null, fromBlock, { sender: context.transit.account, nonce: op.nonce });
-            } else if (context.bundler && Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds > Date.now() / 1_000) {
-                try {
-                    const bundlerHash = await context.bundler.sendUserOperation(userOperationJson(op), context.pins.entryPoint);
-                    await browserWalletRuntime.rememberPreparedWithdrawalUserOpSubmission(submission, { hash: bundlerHash, ambiguous: bundlerHash !== prepared.userOpHash });
-                    onStatus(`The sponsored operation ${this.compact(prepared.userOpHash)} was sent to the bundler again.`);
-                } catch (error) {
-                    if (!this.gaslessAlreadyKnown(error)) onStatus(`The bundler did not take the sponsored operation again (${error?.shortMessage || error?.message}).`);
+        } : null;
+        // Before any replay take a fresh claim for precisely the plan read
+        // above, including when an earlier crashed tab left a submission ID.
+        if ((!found && prepared.userOp) || !submission) submission = await browserWalletRuntime.claimPreparedWithdrawalUserOp({
+            liveWindowMs: timing.resendAfterMs,
+            expected: { operationId: prepared.operationId, noteId: Number(prepared.noteId ?? prepared.public_inputs?.note_id),
+                mode: prepared.mode, destination: prepared.destination, statement: JSON.stringify(prepared.public_inputs),
+                userOpHash: prepared.userOpHash ?? null }
+        });
+        try {
+            if (!found && prepared.userOp) {
+                const op = userOperationFromJson(prepared.userOp);
+                const { key, sequence } = unpackNonce(op.nonce);
+                const current = unpackNonce(decodeWord(await this.gaslessCall(context.reader, context.pins.entryPoint,
+                    encodeGetNonce(context.transit.account, key)), 'getNonce')).sequence;
+                if (current > sequence) {
+                    found = await this.findUserOperationInclusion(context, null, fromBlock, { sender: context.transit.account, nonce: op.nonce });
+                } else if (context.bundler && Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds > Date.now() / 1_000) {
+                    try {
+                        this.assertGaslessCostApproved(context, maxCostWei(op, op.maxFeePerGas));
+                        if (context.approvedTotalFeeWei != null) {
+                            context.state = await this.readPaymasterState(context.pins, context.reader, { kind, account: context.transit.account });
+                            await this.assertGaslessTotalFeeApproved(context, maxCostWei(op, op.maxFeePerGas), op.maxFeePerGas);
+                        }
+                        const bundlerHash = await context.bundler.sendUserOperation(userOperationJson(op), context.pins.entryPoint);
+                        await browserWalletRuntime.rememberPreparedWithdrawalUserOpSubmission(submission, { hash: bundlerHash, ambiguous: bundlerHash !== prepared.userOpHash });
+                        onStatus(`The sponsored operation ${this.compact(prepared.userOpHash)} was sent to the bundler again.`);
+                    } catch (error) {
+                        if (!this.gaslessAlreadyKnown(error)) onStatus(`The bundler did not take the sponsored operation again (${error?.shortMessage || error?.message}).`);
+                    }
                 }
             }
-        }
-        if (!found && unpinned) {
-            // Not re-sent under a profile that no longer pins its paymaster:
-            // once a bundler would have included it (the re-send window from
-            // its last activity), or its proof is about to expire, it is
-            // released with the plan's claim, so the wallet-paid close or
-            // escape (fees: 'wallet') can proceed. Its hashes stay in
-            // staleUserOpHashes: a late inclusion is still settled.
-            const lastActiveAt = Math.max(Number(prepared.submissionStartedAt || 0), Number(prepared.userOpBuiltAt || 0),
-                Number(prepared.userOpSubmittedAt || 0), Number(prepared.userOpFollowedAt || 0));
-            const expiring = Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds <= Date.now() / 1_000;
-            if (expiring || Date.now() - lastActiveAt >= timing.resendAfterMs) {
-                await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission);
-                if (submission?.operationId && submission.submissionId) {
-                    await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
+            if (!found && unpinned) {
+                // Not re-sent under a profile that no longer pins its paymaster:
+                // once a bundler would have included it (the re-send window from
+                // its last activity), or its proof is about to expire, it is
+                // released with the plan's claim, so the wallet-paid close or
+                // escape (fees: 'wallet') can proceed. Its hashes stay in
+                // staleUserOpHashes: a late inclusion is still settled.
+                const lastActiveAt = Math.max(Number(prepared.submissionStartedAt || 0), Number(prepared.userOpBuiltAt || 0),
+                    Number(prepared.userOpSubmittedAt || 0), Number(prepared.userOpFollowedAt || 0));
+                const expiring = Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds <= Date.now() / 1_000;
+                if (expiring || Date.now() - lastActiveAt >= timing.resendAfterMs) {
+                    await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission);
+                    if (submission?.operationId && submission.submissionId) {
+                        await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
+                    }
+                    onStatus('The sponsored operation sent earlier was not included and is no longer sponsored; it was released. Pay the fee from a wallet to finish this withdrawal.');
                 }
-                onStatus('The sponsored operation sent earlier was not included and is no longer sponsored; it was released. Pay the fee from a wallet to finish this withdrawal.');
+                return null;
             }
-            return null;
+            if (!found) return null;
+            await browserWalletRuntime.rememberPreparedWithdrawalTransaction(found.transactionHash, submission, null);
+            onStatus(`The sponsored operation was included in ${this.compact(found.transactionHash)}.`);
+            return found.transactionHash;
+        } finally {
+            browserWalletRuntime.endGaslessClaim(submission?.submissionId);
         }
-        if (!found) return null;
-        await browserWalletRuntime.rememberPreparedWithdrawalTransaction(found.transactionHash, submission, null);
-        onStatus(`The sponsored operation was included in ${this.compact(found.transactionHash)}.`);
-        return found.transactionHash;
     }
 
     /**

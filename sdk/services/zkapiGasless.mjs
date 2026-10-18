@@ -100,6 +100,7 @@ export const GASLESS_MESSAGES = Object.freeze({
     gasless_uneconomic: 'The sponsored network fee would take more than a quarter of this payout. Pay the fee from a wallet, or allow the expensive fee explicitly.',
     gasless_attempts_exhausted: 'This balance state used its sponsored attempts. Pay the network fee from a wallet.',
     gasless_fee_above_cap: 'The paymaster’s flat fee is above the fee cap you accepted. Accept the current fee or pay the fee from a wallet.',
+    gasless_cost_above_cap: 'Network fees changed above the amount you approved. Check the fee again before continuing.',
     gasless_estimate_above_cap: 'The bundler estimates more gas than the paymaster’s policy allows, which this app does not sign. Use another bundler, or pay the fee from a wallet.',
     wrong_owner_account: 'Connect the account that owns this withdrawal’s transit account to sign its operation.',
     entry_point_hash_mismatch: 'The EntryPoint computes a different operation hash than this app. Nothing was signed; update this app.',
@@ -571,7 +572,7 @@ export function bumpFees({ maxFeePerGas, maxPriorityFeePerGas }, { maxFeeCeiling
  * `allowExpensiveGas`.
  */
 export function gaslessAmounts({ kind, payoutWei, maxCost, flatFee = 0n, owed = 0n, finalizeReserveWei = 0n, minEscapeNetWei = 0n,
-    uneconomicFractionPercent = UNECONOMIC_FRACTION_PERCENT, allowExpensiveGas = false }) {
+    creditSurchargeWei = 0n, uneconomicFractionPercent = UNECONOMIC_FRACTION_PERCENT, allowExpensiveGas = false }) {
     const payout = toBigInt(payoutWei, 'payout');
     const cost = toBigInt(maxCost, 'maxCost');
     const fee = toBigInt(flatFee, 'flatFee');
@@ -579,6 +580,7 @@ export function gaslessAmounts({ kind, payoutWei, maxCost, flatFee = 0n, owed = 
     const reserve = toBigInt(finalizeReserveWei, 'finalizeReserveWei');
     const minimumNet = toBigInt(minEscapeNetWei, 'minEscapeNetWei');
     const fraction = toBigInt(uneconomicFractionPercent, 'uneconomicFractionPercent');
+    const credit = toBigInt(creditSurchargeWei, 'creditSurchargeWei');
     const escape = kind === KIND.escape;
     const requiredWei = escape ? cost + fee + debt + reserve + minimumNet + fee : cost + fee + debt;
     // An escape's net is not a floor: its finalization is charged at its own
@@ -586,22 +588,23 @@ export function gaslessAmounts({ kind, payoutWei, maxCost, flatFee = 0n, owed = 
     // operation's maxCost. It is an estimate at today's fees
     // (`estimatedReceived`); the guaranteed `minimumReceived` of the payout
     // is the finalization's, computed and shown when it is signed.
-    const net = escape ? payout - cost - fee - debt - reserve - fee : payout - requiredWei;
+    const net = (escape ? payout - cost - fee - debt - reserve - fee : payout - requiredWei) - credit;
     const result = {
         kind,
         payoutWei: payout,
         maxCost: cost,
         flatFee: fee,
         owed: debt,
+        creditSurchargeWei: credit,
         requiredWei,
         minimumReceived: escape ? null : net,
         estimatedReceived: escape ? net : null,
         finalizeReserveWei: escape ? reserve : 0n,
         minEscapeNetWei: escape ? minimumNet : 0n,
         initiationDebtMax: escape ? cost + fee : 0n,
-        sponsoredCostWei: cost + fee,
+        sponsoredCostWei: cost + fee + credit,
         uneconomicFractionPercent: fraction,
-        uneconomic: (cost + fee) * 100n > payout * fraction
+        uneconomic: (cost + fee + credit) * 100n > payout * fraction
     };
     if (payout < requiredWei || net <= 0n) {
         throw gaslessError('payout_below_gas', { ...result, requiredWei, available: payout });

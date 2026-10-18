@@ -1,0 +1,41 @@
+# Additional compose file for the existing revision-4 Sepolia stack only.
+# Both env files are root-owned 0600. Never publish the raw Alto port.
+services:
+  bundler:
+    image: ghcr.io/pimlicolabs/alto@sha256:b37c5697bc5331391cb8bc5ac6e828d15019fc786c58a33a8650ff3c434ac2aa
+    entrypoint: ["node", "/app/src/esm/cli/alto.js"]
+    command: ["run"]
+    env_file: ["${ZKAPI_CONFIG_DIR}/bundler.env"]
+    restart: unless-stopped
+    read_only: true
+    user: "1000:1000"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+    mem_limit: 768m
+    memswap_limit: 768m
+    networks: [backend]
+    logging: {driver: none}
+  bundler-guard:
+    image: ghcr.io/pimlicolabs/alto@sha256:b37c5697bc5331391cb8bc5ac6e828d15019fc786c58a33a8650ff3c434ac2aa
+    entrypoint: ["node", "/srv/guard.mjs"]
+    command: []
+    env_file: ["${ZKAPI_CONFIG_DIR}/bundler-guard.env"]
+    volumes:
+      - ${ZKAPI_CONFIG_DIR}/bundler-guard.mjs:/srv/guard.mjs:ro
+    ports: ["127.0.0.1:4338:3002"]
+    restart: unless-stopped
+    read_only: true
+    user: "1000:1000"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    mem_limit: 128m
+    memswap_limit: 128m
+    networks: [backend]
+    logging: {driver: none}
+    healthcheck:
+      test: ["CMD", "node", "--input-type=module", "-e", "const r=await fetch('http://127.0.0.1:3002/health',{signal:AbortSignal.timeout(6000)});if(!r.ok)process.exit(1)"]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 120s
