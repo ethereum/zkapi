@@ -156,11 +156,11 @@ test('static proof keys are the concession development setup and match its manif
 });
 
 for (const network of ['sepolia', 'mainnet']) {
-    test(`the ${network} profile is a not_deployed placeholder pinning the shipped circuit, setup and keys`, () => {
+    test(`the ${network} profile pins its deployment status, circuit, setup and keys`, () => {
         const config = JSON.parse(fs.readFileSync(path.join(__dirname, `assets/config/${network}.json`), 'utf8'));
         const manifest = JSON.parse(fs.readFileSync(path.join(root, 'assets/manifest.json'), 'utf8'));
         const trusted = config.trusted_deployment;
-        assert.equal(trusted.deployment_status, 'not_deployed');
+        assert.equal(trusted.deployment_status, network === 'sepolia' ? 'deployed' : 'not_deployed');
         assert.equal(trusted.chain_id, network === 'mainnet' ? 1 : 11155111);
         assert.equal(trusted.circuit_id, 'zkapi-v2-concession-v2');
         assert.equal(trusted.setup_id, manifest.setupId);
@@ -172,11 +172,20 @@ for (const network of ['sepolia', 'mainnet']) {
         assert.equal(trusted.vault_revision, 4);
         assert.equal(trusted.exit_concession, 1);
         assert.equal(trusted.clearance_ownership_proof, 'required');
-        // Nothing that only a deployment determines is pinned yet.
+        // Only Sepolia is deployed; Mainnet remains an unusable placeholder.
         for (const field of ['deployment_id', 'contract_address', 'deploy_block', 'protocol_server_url', 'indexer_url',
             'state_signing_key', 'clearance_signing_key', 'vault_runtime_codehash', 'proof_adapter_address',
             'adapter_runtime_codehash', 'poseidon_library_address', 'poseidon_runtime_codehash', 'verifier_url']) {
-            assert.equal(trusted[field], null, field);
+            if (network === 'mainnet') assert.equal(trusted[field], null, field);
+            else assert.notEqual(trusted[field], null, field);
+        }
+        if (network === 'sepolia') {
+            assert.equal(trusted.contract_address, '0x7ff4ba0662a8218d0954c1a11ae61df6c3548ea4');
+            assert.equal(trusted.deploy_block, 11937653);
+            assert.equal(trusted.protocol_server_url, 'https://zkapi-sepolia.openanonymity.ai/v0.3');
+            assert.equal(trusted.indexer_url, trusted.protocol_server_url);
+            assert.equal(trusted.activator, '0x26090c66f7f47e2900ee3905ad010b5c8e70eaa7');
+            assert.equal(trusted.gasless, null);
         }
         assert.equal(config.deployment_manifest_url, null);
         assert.deepEqual(config.allowed_deployment_manifest_urls, []);

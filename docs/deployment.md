@@ -1,5 +1,28 @@
 # Native ETH deployment
 
+## October 17, 2026 staging Sepolia deployment
+
+Revision 4 is deployed on Sepolia only at
+`0x7ff4ba0662a8218d0954c1a11ae61df6c3548ea4`, creation block 11937653.
+The public [deployment manifest](deployments/sepolia-r4-20261017.json) pins
+the three runtime code hashes, verification keys, signing keys and activator.
+The browser profile uses `/v0.3` on `zkapi-sepolia.openanonymity.ai`; the older
+services and vaults remain available for existing balances. Mainnet's revision-4
+profile remains `not_deployed`. This is a single-party `dev` proof setup, and
+sponsored withdrawals are disabled.
+
+The operator runs isolated `zkapi-r4-sepolia` containers and data, with separate
+funded activation and challenge signers. Backend RPC uses Sepolia Tenderly;
+the browser profile retains PublicNode. Shared public RPC rate limits must be
+checked against actual worker health, not only container liveness.
+
+Sepolia's October 2026 state-creation gas repricing makes older local Forge
+estimates unsuitable for contract deployment. The first library attempt ran
+out of gas; the subsequent three deployments succeeded using RPC-checked
+limits. Historical deposit gas benchmarks also need fresh network measurements.
+No Mainnet or production frontend deployment accompanies this rollout.
+
+
 The source supports native ETH vaults of circuit `zkapi-v2-concession-v2`
 (vault revision 4). The committed keys are the single-party development setup
 `dev`, which release builds refuse; production keys come from the multi-party

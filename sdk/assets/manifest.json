@@ -2,7 +2,7 @@
   "schema": 2,
   "circuitId": "zkapi-v2-concession-v2",
   "setupId": "dev",
-  "sourceRevision": "7ccd395cc97048fda259699389fbc46509de9d20",
+  "sourceRevision": "8f64e7c335e6a19a1180865a7835044d706bfade",
   "toolchain": {
     "rustc": "1.99.0",
     "wasmBindgen": "0.2.117"
@@ -19,7 +19,7 @@
     "assets/proofs/request.pk": "a265fdbf2f19a7208bda87d8a7ca6e5c3b8423207eaa13198bc7fafda5b03b9f",
     "assets/proofs/withdrawal.pk": "cf5b86c0a77fd7b277bb5644e86497e69905992c90a5a03f061b8c8415f3ffd0",
     "assets/proofs/request.vk": "45befacf21c0a369132538eebf054077c1bf2d3089e6189f6786c52d34f1f7ee",
-    "assets/config/sepolia.json": "c212ff9d821f088f5c69532042e4393b2045a74796685eb7e74fc6f07d4320ea",
+    "assets/config/sepolia.json": "5d685183d59e69219e015a9cbdbcef8def83f6d67a41838edd0f0b5736f18b50",
     "assets/config/mainnet.json": "8ffab77b8eddc280c4f4da6e8901c3073932cf59794a0c08055a9a40ebe7824d"
   }
 }
