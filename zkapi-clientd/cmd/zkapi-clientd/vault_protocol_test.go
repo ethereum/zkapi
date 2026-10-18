@@ -17,7 +17,7 @@ func legacySelectionConfig() config.Config {
 	return config.Config{ZKAPI: config.ZKAPI{Binary: "/bundle/bin/zkapi-walletd", ProofSetupDir: "/bundle/share/proof-setup"}}
 }
 func TestVaultProtocolSelection(t *testing.T) {
-	for input, want := range map[string]string{"": "concession", "legacy": "legacy", "concession": "concession"} {
+	for input, want := range map[string]string{"": "concession", "legacy": "legacy", "concession": "concession", "concession-v1": "concession-v1"} {
 		got, err := vaultProtocol(input)
 		if err != nil || got != want {
 			t.Fatal(input, got, err)
@@ -73,6 +73,12 @@ func TestProtocolArtifactPins(t *testing.T) {
 	pin := hex.EncodeToString(hash[:])
 	if err := checkProtocolArtifact(path, pin); err != nil {
 		t.Fatal(err)
+	}
+	if err := checkProtocolArtifact(path, legacyCompanionHash, pin); err != nil {
+		t.Fatal("reviewed rebuilt companion rejected", err)
+	}
+	if checkProtocolArtifact(path, legacyCompanionHash, "") == nil {
+		t.Fatal("unknown companion accepted by additional pin")
 	}
 	if checkProtocolArtifact(path, legacyClientHash) == nil {
 		t.Fatal("unknown binary accepted")

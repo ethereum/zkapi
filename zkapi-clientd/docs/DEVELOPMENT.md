@@ -8,10 +8,11 @@ model defaults, funding/withdrawal UI and saved vault-stack selection.
 
 It is **development source, not a production wallet release**:
 
-- Shipping concession manifests are `not_deployed`; production ceremony keys
-  are missing. Never use development keys or legacy addresses to bypass this.
+- Sepolia pins the deployed revision-4 vault and its development setup.
+  Mainnet remains `not_deployed`; production ceremony keys are missing.
 - Legacy uses historical protocol source plus current shared privacy code.
-  Live legacy deposit/admission availability has not been established.
+  Isolated Sepolia tests cover both historical deployments; this does not
+  establish current Mainnet admission or production deployment readiness.
 - Wallets, journals, installed proving assets and local binaries are not tracked.
   A clone contains source, not an existing wallet or complete working bundle.
 - Protocol selection does not migrate notes, translate signed transactions or
@@ -19,7 +20,7 @@ It is **development source, not a production wallet release**:
 
 ## Prerequisites
 
-Use the Go version required by `go.mod` (currently Go 1.26), Git, and standard
+Use the Go version required by `go.mod` (Go 1.25 or newer), Git, and standard
 POSIX build utilities (`bash`, `tar`, `install`, `sha256sum`). Rust companion
 builds also need the repository's pinned Rust toolchain, pkg-config and OpenSSL
 development libraries. Dependency downloads may require network access.
@@ -28,12 +29,14 @@ Use a full clone: the legacy build reconstructs checkpoint
 `be04d85dac5b27c4f54fa296f0735f02319c98a5`, an ancestor of this branch. A shallow
 clone must fetch that history before building. No separate worktree is required.
 
-## Build both Go engines
+## Build the protocol engines
 
 From the repository root, with the daemon stopped:
 
 ```sh
 bash zkapi-clientd/scripts/build-legacy-privacy.sh
+bash zkapi-clientd/scripts/build-legacy-companion.sh
+bash zkapi-clientd/scripts/build-concession-v1.sh
 
 cd zkapi-clientd
 go test -race ./...
@@ -67,14 +70,15 @@ install -m 755 target/release/zkapi-walletd zkapi-clientd/bin/zkapi-walletd-conc
 Do not enable `dev-setup` for a production companion. Compiling it does not supply
 reviewed deployed manifests or production proving keys.
 
-The local legacy selector separately pins the historical `zkapi-walletd`
-companion hash in `cmd/zkapi-clientd/vault_protocol.go`. A new clone does not
-include that artifact or its original verifying/proving assets. Recover them
-from your reviewed legacy installation; they must match the existing wallet's
-protocol. The checkpoint retains historical companion source-preparation scripts,
-but obtaining/rebuilding that bundle is not an automated production release
-process here. A mismatched or absent companion is an explicit blocker, not a
-reason to substitute the concession companion or disable verification.
+The legacy selector accepts its original companion hash and the reviewed
+rebuild pin in `cmd/zkapi-clientd/legacy_companion_rebuilt.sha256`.
+`build-legacy-companion.sh` fetches the exact original companion/protocol commits,
+applies the original bridge patches, verifies both complete source diffs, and
+installs `bin/zkapi-walletd-legacy` with `share/legacy` proving assets. Review
+generated binary-pin changes before rebuilding the primary dispatcher.
+Revision 3 similarly has an isolated engine, companion and proving setup built
+by `build-concession-v1.sh`. Neither build converts existing wallets or changes
+the original accepted legacy companion pin.
 
 ## Run and configure
 
@@ -112,8 +116,11 @@ ZKAPI_TEST_REWRITER=1 go test -v ./internal/rewriter -run '^TestLive'
 
 Unit/local-fixture tests do not demonstrate Tor circuit construction, anonymity,
 live provider acceptance, on-chain proof verification or deployment readiness.
-Foundry/Anvil tests and a separately approved live end-to-end exercise are still
-needed for those applicable checks. No transaction is sent by the build scripts.
+Foundry/Anvil and live checks establish different properties. An isolated
+Sepolia exercise on 2026-10-17 verified revision-4 deposit, activation, real
+inference and settlement, plus revision-3 and legacy deposit, inference,
+settlement and wallet-paid withdrawal. No production wallet was used. No
+transaction is sent by the build scripts or read-only opt-in live tests.
 
 ## Repository hygiene
 
@@ -122,3 +129,23 @@ captures, binaries and installed proving assets out of commits. Root-level ad ho
 shell/Python chat wrappers and scratch research/output files are no longer part
 of this branch's source tree. Supported CLI code lives in `cmd/zkapi-clientd`;
 necessary build, test and packaging scripts remain under `scripts`/`packaging`.
+
+## Sepolia acceptance
+
+Build a separate Sepolia companion; keep Mainnet and historical executables intact:
+
+```sh
+cargo build --release --locked -p zkapi-companion --bin zkapi-walletd --features zkapi-proof/dev-setup
+install -m 755 target/release/zkapi-walletd zkapi-clientd/bin/zkapi-walletd-sepolia-r4
+cd zkapi-clientd
+ZKAPI_TEST_SEPOLIA=1 go test -v ./internal/zkapi -run '^TestLiveSepoliaDeployment$'
+ZKAPI_TEST_SEPOLIA=1 ZKAPI_TEST_COMPANION="$PWD/bin/zkapi-walletd-sepolia-r4" \
+  go test -v ./internal/zkapi -run '^TestLiveSepoliaCompanion$'
+```
+
+These checks read the live contract and server pins, verify installed proving
+keys, and optionally start the real Go/Rust bridge with an empty temporary
+wallet. They do not submit a proof, inference request or transaction. For a
+funded exercise, use an isolated Sepolia profile and retain all recovery files.
+The historical revision-3 build and selection are documented in
+[protocol selection](VAULT_PROTOCOL.md).

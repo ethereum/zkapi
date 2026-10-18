@@ -16,11 +16,14 @@ support, and payout-funded withdrawals where a deployed manifest enables
 them. The Rust
 companion is `crates/zkapi-companion`, not the removed legacy companion patch.
 
-**Both shipping networks remain `not_deployed`.** There is no configured vault,
-indexer or protocol-server address. The production setup directory
-`protocol/setup/v2-concession` also has no ceremony keys. The CLI checks its
-embedded manifest before attaching to a daemon or starting funding. It must
-not fall back to the old vault, test fixtures, or development proving keys.
+**Sepolia is deployed:** `zkapi-native-eth-sepolia-concession-v2-r4-20261017`,
+vault `0x7ff4ba0662a8218d0954c1a11ae61df6c3548ea4`, API path `/v0.3`.
+The packaged profile pins its contract, signing keys, runtime code and proving
+assets. It uses `protocol/setup/v2-concession-dev` and requires a Sepolia
+companion built with `--features zkapi-proof/dev-setup`.
+
+**Mainnet remains `not_deployed`** for the new protocol. The production ceremony
+keys are not present. Neither selection nor Sepolia setup can bypass that gate.
 
 Tor SOCKS authentication isolation, conversation key rotation, diagnostics,
 saved default models, compact funding display, deposit-all-minus-fees and
@@ -35,10 +38,10 @@ still requires Tor's `IsolateSOCKSAuth` configuration.
 - `zkapi-clientd/bin/zkapi-walletd-concession`: new Rust companion compiled
   in release mode without `dev-setup`.
 
-These binaries alone are **not an installable working wallet bundle**: pinned
-production proving assets and reviewed deployed manifests are still missing.
-Do not point the new daemon at the old companion/proving setup. No home-profile
-configuration, wallet record, or running service was changed for this migration.
+A Sepolia bundle includes the Go executable, its matching Rust companion and
+all four pinned request/withdrawal key files plus the setup manifest. The
+historical `concession-v1` engine and setup are separate from the current ones;
+`legacy` keeps the earlier note-bound-v1 engine. No live wallet is converted.
 
 ## Withdrawal interface
 
@@ -53,12 +56,16 @@ configuration, wallet record, or running service was changed for this migration.
 - Use `withdraw --help` for all explicit options. Configure an independent RPC
   with `config --exit-rpc-url URL`.
 
-Legacy notes require the legacy release and their original state directories.
+Revision-3 notes use `--vault-protocol concession-v1` and the original profile.
+Earlier note-bound-v1 notes use `--vault-protocol legacy`. Both require their
+matching pinned companions and original state directories.
 This migration does not convert notes or send transactions.
 
 ## Validation
 
 Go race tests and vet; Rust companion/auth and protocol-client release tests.
 The upstream Anvil adapter test skips on hosts without Foundry; a passing Rust
-test command alone is not evidence of on-chain verification. Live Tor/provider,
-new-vault deposit, and withdrawal tests remain unperformed.
+test command alone is not evidence of on-chain verification. Isolated Sepolia
+tests on 2026-10-17 exercised revision-4 deposit/activation/inference/settlement
+and both historical deployments' deposit/inference/settlement/withdrawal flows.
+These direct-HTTPS checks do not test live Tor circuit isolation or Mainnet.

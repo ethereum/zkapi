@@ -24,7 +24,7 @@ CLIENT=$HOME/zkapi/zkapi-clientd/bin/zkapi-clientd-concession-tor
 # Existing old-vault profile: old stack's automatic funding and inference flow.
 $CLIENT --vault-protocol legacy --config-dir /absolute/path/to/legacy-profile serve
 
-# New-vault profile: new stack. Currently refuses undeployed networks.
+# New-vault profile: revision 4 on Sepolia; Mainnet remains unavailable.
 $CLIENT --vault-protocol concession --config-dir /absolute/path/to/concession-profile serve
 
 # Withdrawal must use the same protocol/profile that owns the note.
@@ -55,7 +55,8 @@ Legacy dispatch verifies SHA-256 pins for the local historical executables:
 - sibling `bin/zkapi-clientd-legacy-privacy`, legacy protocol source checkpoint
   `be04d85` plus current shared privacy code (not upstream 0.1.7);
 - the legacy profile's explicitly configured absolute companion path, matching
-  the preserved `bin/zkapi-walletd` artifact.
+  the preserved `bin/zkapi-walletd` artifact or the exact-source rebuilt
+  `bin/zkapi-walletd-legacy` pin.
 
 The profile must also explicitly name its absolute original proving-setup path;
 the old companion validates its own proving/deployment pins. External companions
@@ -78,6 +79,13 @@ afterward to embed that pin. The script uses the local Git checkpoint and curren
 Go toolchain; it never touches live profiles or starts a wallet. Run it after
 shared privacy changes so both protocol engines stay in sync.
 
+`bash zkapi-clientd/scripts/build-legacy-companion.sh` reconstructs the original
+companion and protocol commits with their historical bridge patches, verifies
+the complete source diffs, and installs the isolated legacy companion and
+`share/legacy` proving assets. It writes the additional rebuild pin; the
+original companion pin stays accepted. Review pin changes and rebuild the
+primary dispatcher before selecting the rebuilt companion.
+
 Switching protocols therefore preserves rewriter URL/key/model, exact saved
 rewrites during each process lifetime, conversation-aware OR-key reuse rules,
 Tor isolation, preview mode, and cover rate/targets/concurrency. Stopping and
@@ -92,8 +100,8 @@ by itself, add approval flags, call raw contracts, or modify transaction journal
 
 ## Important current limits
 
-- **Concession remains `not_deployed`** on both shipping networks, with missing
-  production proving keys. Selection does not make it available.
+- **The new Mainnet protocol remains `not_deployed`.** Sepolia revision 4 is
+  deployed with development keys; selection cannot change a vault's circuit.
 - The new legacy engine implements native rewriting and cover traffic, with the
   same default 5/s when cover is enabled. New concession exit/bundler settings
   are still incompatible with the old on-chain exit protocol and are refused;
@@ -114,10 +122,45 @@ by itself, add approval flags, call raw contracts, or modify transaction journal
 - Configuration/profile edits do not migrate notes. A note remains withdrawable
   only through its matching protocol and original state/proving assets.
 
-No service is restarted or live deposit attempted by implementing this option.
-Both engines run the shared privacy regression tests, including no raw user
+All engines run the shared privacy regression tests, including no raw user
 history at the target, OR-key continuity, rewrite/route failure before payment,
 SSE previews, bounded cover workers and SOCKS/TLS fail-closed behavior. Dispatcher
 tests verify privacy settings are accepted unchanged and only the privacy-enabled
-legacy artifact is selected. No live legacy deposit acceptance or new-vault
-availability has been verified.
+legacy artifact is selected. Isolated Sepolia tests on 2026-10-17 also verified
+both historical vaults through deposit, real inference, settlement and
+wallet-paid withdrawal. Original user notes and Mainnet services were untouched.
+
+## Existing revision-3 Sepolia balances
+
+The browser's Version 2 vault is revision 3, circuit `zkapi-v2-concession-v1`,
+contract `0x1670d773eccd74a13d9b3faa68a5a0bae8eee292`. Its statement differs
+from revision 4, so it uses an isolated client and companion, reconstructed from
+checkpoint `0fb263b0da04986cfe5c63b12340c1581018ae9b` with the current shared
+privacy implementation and the reviewed historical Sepolia profile. The small
+`packaging/concession-v1/compatibility.patch` lets final withdrawal bookkeeping
+finish when the vault shows the note Closed at the canonical payout block.
+Revision 3 keeps that note in its Merkle tree until a separate retirement;
+waiting for a zero indexer leaf incorrectly left successful withdrawals pending.
+The patch preserves finality, exact payout matching and the vault-state check;
+it does not change the old circuit, contract, or signed transaction.
+
+Build that pair before building the primary dispatcher:
+
+```sh
+ZKAPI_TEST_SEPOLIA=1 bash zkapi-clientd/scripts/build-concession-v1.sh
+```
+
+The optional environment flag runs read-only live deployment checks. The script
+writes `bin/zkapi-clientd-concession-v1`, `bin/zkapi-walletd-concession-v1`,
+`share/concession-v1/`, and the two SHA-256 pins embedded by the dispatcher.
+It does not read or change existing wallets. Its `dev-setup` companion is for
+this Sepolia deployment only. Rebuild the primary Go executable afterward.
+
+Keep the original revision-3 profile and its wallet directory. Configure that
+profile's absolute companion and proving-setup paths to this matching pair,
+then select it once with `config --vault-protocol concession-v1`. Existing
+`serve`, withdrawal, escape and pending-transaction recovery then use revision 3.
+The selector refuses Mainnet, external companions and unknown binaries; it does
+not silently fall back to revision 4. New deposits should use the current
+revision-4 profile. ERC-4337 is available only in deployments publishing the
+corresponding paymaster, not automatically for every historical vault.

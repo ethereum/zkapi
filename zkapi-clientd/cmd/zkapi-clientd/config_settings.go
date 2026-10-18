@@ -14,7 +14,7 @@ import (
 )
 
 const settingsHelp = `Saved settings (stop serve before edits; no setup or payment):
-  config --vault-protocol legacy|concession|default  (use alone)
+  config --vault-protocol legacy|concession-v1|concession|default  (use alone)
   config --model MODEL | --clear-model
   config --rewriter-url URL --rewriter-model MODEL
          [--rewriter-api-key-env ENV | --rewriter-clear-api-key]

@@ -31,8 +31,10 @@
  		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
  		defer cancel()
  		ui := &terminalSetupPrompter{out: os.Stdout}
-@@ -93,8 +96,8 @@
- 		fmt.Println("Usage: zkapi-clientd withdraw [--public]\nWithdraw private balance, then return leftover public ETH to the same destination with a separate fee approval. Includes saved transaction recovery. Use --public for a standalone public return. Requires a terminal for destination and approval. Starts a temporary daemon if needed; never stops an existing daemon.")
+@@ -93,8 +96,9 @@
+-		fmt.Println("Usage: zkapi-clientd withdraw [--public]\nWithdraw private balance, then return leftover public ETH to the same destination with a separate fee approval. Includes saved transaction recovery. Use --public for a standalone public return. Requires a terminal for destination and approval. Starts a temporary daemon if needed; never stops an existing daemon.")
++		fmt.Println("Usage: zkapi-clientd withdraw [--public | OPTIONS]\nWithout options: guided private withdrawal followed by public ETH return with separate approval. Explicit options retain the original protocol quote/approval and recovery flow; no automatic funding or public sweep.")
++		_ = runWithdrawal(context.Background(), config.Config{}, []string{"--help"}, os.Stdout)
  		return nil
  	}
 -	if (args[0] == "list-models" || args[0] == "set-model") && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
@@ -51,6 +53,15 @@
  		return runModels(ctx, dir, c, args[0], args[1:], os.Stdout)
  	}
  	if args[0] == "withdraw" {
+@@ -111,7 +114,7 @@
+ 		if len(args) == 2 && args[1] == "--public" {
+ 			action = "return"
+ 		} else if len(args) != 1 {
+-			return errors.New("use withdraw or withdraw --public; destination and approval are prompted")
++			return runConfiguredWithdrawal(ctx, dir, c, args[1:], os.Stdout)
+ 		}
+ 		ui := &terminalSetupPrompter{out: os.Stdout}
+ 		defer ui.Close()
 @@ -160,7 +163,6 @@
    serve [--model MODEL]  Open a missing note when funded, then serve inference
    withdraw [--public]    Withdraw private balance or return public funding ETH

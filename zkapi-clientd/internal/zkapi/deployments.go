@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 )
 
@@ -23,9 +24,8 @@ import (
 //
 // This release serves only the concession-exit vault (revision 4, circuit
 // zkapi-v2-concession-v2: note-bound exits and operator-activated
-// deposits). Until it is deployed on a network, the network's
-// manifest is a "not_deployed" placeholder that pins only the circuit, the
-// setup and the vault parameters, and nothing starts against it.
+// deposits). Sepolia pins the reviewed deployment. Mainnet remains a
+// "not_deployed" placeholder and cannot start this protocol stack.
 //
 //go:embed deployments/*.json
 var deploymentFiles embed.FS
@@ -313,11 +313,12 @@ func writeDeploymentManifest(dir string, raw []byte) (string, error) {
 		if err != nil {
 			return "", errors.New("deployment manifest does not match this client's pinned configuration")
 		}
-		if bytes.Equal(saved, raw) {
+		if bytes.Equal(saved, raw) || sameCompanionDeployment(saved, raw) {
 			return path, nil
 		}
-		// No exception: a saved manifest is never rebound or rewritten. The
-		// earlier vaults' origin migrations do not apply to this deployment.
+		// Saved companion manifests are never rewritten. Gasless sponsorship
+		// lives in Go's current pinned profile; the Rust companion does not
+		// consume those fields. Every core deployment field must still agree.
 		return "", errors.New("deployment manifest does not match this client's pinned configuration")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", errors.New("cannot read saved zkAPI deployment")
@@ -344,6 +345,32 @@ func writeDeploymentManifest(dir string, raw []byte) (string, error) {
 		err = syncDirectoryChain(dir)
 	}
 	return path, err
+}
+
+// A release may add or retire a paymaster without changing the note's vault,
+// statement or endpoints. Keep the original companion manifest (and all wallet
+// files) intact while Go uses the newly reviewed gasless profile. Comparing all
+// remaining JSON fields also catches changes to unknown future core fields.
+func sameCompanionDeployment(saved, current []byte) bool {
+	var manifests [2]map[string]any
+	for i, raw := range [][]byte{saved, current} {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		if decoder.Decode(&manifests[i]) != nil || manifests[i] == nil {
+			return false
+		}
+		var trailing any
+		if decoder.Decode(&trailing) != io.EOF {
+			return false
+		}
+		delete(manifests[i], "gasless")
+		if evidence, ok := manifests[i]["deployment_evidence"].(map[string]any); ok {
+			for _, key := range []string{"entry_point_runtime_keccak256", "sender_creator_runtime_keccak256", "paymaster_runtime_keccak256", "factory_runtime_keccak256", "account_implementation_runtime_keccak256"} {
+				delete(evidence, key)
+			}
+		}
+	}
+	return reflect.DeepEqual(manifests[0], manifests[1])
 }
 
 // Validate the installed proving assets before the companion opens its wallet.

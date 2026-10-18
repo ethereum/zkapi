@@ -26,18 +26,24 @@ var legacyClientHash = strings.TrimSpace(legacyClientPin)
 
 const legacyCompanionHash = "84d57456c3cdea682e5201d1bb29a5219753404d390140c30897fe0b3cf06909"
 
+// The preserved original binary remains valid. This second pin is produced by
+// build-legacy-companion.sh from the exact historical sources and bridge patch.
+//
+//go:embed legacy_companion_rebuilt.sha256
+var rebuiltLegacyCompanionPin string
+
 func vaultProtocol(flagValue string) (string, error) {
 	switch flagValue {
 	case "", "concession":
 		return "concession", nil
-	case "legacy":
-		return "legacy", nil
+	case "legacy", "concession-v1":
+		return flagValue, nil
 	default:
-		return "", errors.New("vault protocol must be legacy or concession (no automatic fallback)")
+		return "", errors.New("vault protocol must be legacy, concession-v1 or concession (no automatic fallback)")
 	}
 }
 
-func checkProtocolArtifact(path, expected string) error {
+func checkProtocolArtifact(path string, expected ...string) error {
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0022 != 0 || info.Mode().Perm()&0111 == 0 {
 		return errors.New("protocol executable missing or unsafe; use the matching pinned local build")
@@ -51,10 +57,13 @@ func checkProtocolArtifact(path, expected string) error {
 	if _, err := io.Copy(h, file); err != nil {
 		return errors.New("cannot verify protocol executable")
 	}
-	if hex.EncodeToString(h.Sum(nil)) != expected {
-		return errors.New("protocol executable does not match the pinned legacy build; refusing mixed or unknown protocol code")
+	actual := hex.EncodeToString(h.Sum(nil))
+	for _, pin := range expected {
+		if actual == pin {
+			return nil
+		}
 	}
-	return nil
+	return errors.New("protocol executable does not match the pinned build; refusing mixed or unknown protocol code")
 }
 
 func legacyDispatchPlan(dir string, explicitDir bool, c config.Config, args []string, executable string) (string, []string, error) {
@@ -118,7 +127,7 @@ func dispatchLegacy(dir string, explicitDir bool, args []string) error {
 	if err := checkProtocolArtifact(binary, legacyClientHash); err != nil {
 		return err
 	}
-	if err := checkProtocolArtifact(c.ZKAPI.Binary, legacyCompanionHash); err != nil {
+	if err := checkProtocolArtifact(c.ZKAPI.Binary, legacyCompanionHash, strings.TrimSpace(rebuiltLegacyCompanionPin)); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Vault protocol: legacy (zkapi-v2-note-bound-v1), using pinned legacy protocol engine and companion; shared rewriter/cover settings preserved. Historical deposit gas is high; legacy admission may be closed or retired. Selection is not funding approval or proof of live availability.")

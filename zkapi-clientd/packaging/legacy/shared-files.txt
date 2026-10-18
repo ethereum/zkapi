@@ -1,4 +1,5 @@
 cmd/zkapi-clientd/config_display.go
+cmd/zkapi-clientd/withdraw_protocol.go
 internal/config/vault_protocol.go
 internal/config/inspect.go
 cmd/zkapi-clientd/access_errors.go
@@ -30,3 +31,4 @@ internal/zkapi/rewriter.go
 internal/zkapi/rewriter_reuse_test.go
 internal/zkapi/rewriter_safety_test.go
 internal/zkapi/rewriter_test.go
+internal/activity/activity.go

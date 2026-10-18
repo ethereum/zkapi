@@ -48,7 +48,7 @@ once it is activated. Until then the funding status reports deposit stage
 `activation_cursor` and the note's `activation_queue_position` (the notes
 activated before it), as the wallet companion reads them from the vault;
 `zkapi-clientd status` reports the same `activated`, `activation_cursor` and
-`activation_queue_position`. A request in the meantime waits up to two
+`activation_queue_position`. A request in the meantime waits up to five
 minutes for the activation, then fails with `note_not_activated` (no key is
 issued; retry later).
 
@@ -282,16 +282,17 @@ do not attach to or reconfigure an already-running daemon.
 
 ## Deployment origins
 
-This release serves only the concession-exit vault (circuit
-`zkapi-v2-concession-v2`, vault revision 4: note-bound exits and
-operator-activated deposits). Its embedded profiles are
-`zkapi-native-eth-mainnet-concession-v1` and
-`zkapi-native-eth-sepolia-concession-v1`. Until that vault is deployed on a
-network, its profile ships as a placeholder (`"deployment_status":
-"not_deployed"`, no contract, adapter, endpoints or signing keys) and the
-client refuses to fund, use or withdraw a note there with
-`deployment_not_deployed`. A release that pins the deployed vault replaces
-the placeholder.
+The default protocol stack serves circuit `zkapi-v2-concession-v2`, vault
+revision 4, with note-bound exits and operator-activated deposits. Sepolia pins
+`zkapi-native-eth-sepolia-concession-v2-r4-20261017`, vault
+`0x7ff4ba0662a8218d0954c1a11ae61df6c3548ea4`, and the `/v0.3` protocol API.
+Its keys are the testnet-only development setup. Mainnet's new-protocol profile
+remains `not_deployed` and refuses funding, requests and withdrawals.
+
+Existing revision-3 Sepolia notes use the pinned `concession-v1` engine and
+original profile; note-bound-v1 notes use `legacy`. See
+[protocol selection](VAULT_PROTOCOL.md). Neither path rewrites a note or uses
+revision-4 proof keys for an older vault.
 
 The embedded profiles pin the deployment IDs, contracts, the proof adapter
 and Poseidon library, their runtime-code hashes, signing keys, oracle,
@@ -679,6 +680,14 @@ wallet-paid path; a rerun without `--fees` keeps a saved withdrawal's mode
 `--fee-cap-gwei` bounds what the payout may lose: the sponsored fee's maximum
 plus, for a destination with code, the paymaster's credit surcharge of a
 failed push.
+
+The fee quote prefers the bundler's suggested priority fee (Pimlico's
+standard tier, fast if standard is absent, or Rundler's priority-fee method).
+An unsupported or malformed hint falls back to validated chain fee history.
+The maximum fee still uses the current chain base fee and the paymaster's
+live ceilings; a later hint cannot change an approved or journaled operation's
+fee bounds. This avoids pricing a cheap Sepolia bundle from unrelated
+transactions' much higher tips.
 
 How it works. Before anything is reserved, the client checks the gasless
 contracts against this release's pins (the runtime code of the EntryPoint,

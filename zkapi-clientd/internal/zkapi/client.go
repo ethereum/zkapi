@@ -26,7 +26,7 @@ import (
 
 const (
 	MainnetManifest         = "https://zkapi-mainnet.openanonymity.ai/config.json"
-	SepoliaManifest         = "https://zkapi-sepolia.openanonymity.ai/config.json"
+	SepoliaManifest         = "https://zkapi-sepolia.openanonymity.ai/v0.3/config.json"
 	DefaultClientURL        = "http://127.0.0.1:43134"
 	DefaultInferenceBaseURL = "https://openrouter.ai/api/v1"
 )
@@ -242,7 +242,7 @@ func New(config Config) (*Client, error) {
 	inference.CheckRedirect = noRedirect
 	inference.Jar = nil
 	local := &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}, CheckRedirect: noRedirect, Timeout: 4 * time.Minute}
-	return &Client{config: config, local: local, inference: &inference, usedLeases: make(map[[32]byte]uint64), requestSlot: make(chan struct{}, 1), settlementPoll: 5 * time.Second, activationWait: 2 * time.Minute, settlementWake: make(chan struct{}, 1), now: time.Now}, nil
+	return &Client{config: config, local: local, inference: &inference, usedLeases: make(map[[32]byte]uint64), requestSlot: make(chan struct{}, 1), settlementPoll: 5 * time.Second, activationWait: 5 * time.Minute, settlementWake: make(chan struct{}, 1), now: time.Now}, nil
 }
 
 func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -603,8 +603,9 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 		if isAwaitingActivation(err) {
 			// The note was recorded but no operator batch has activated it
 			// yet, or the operator's indexer has not caught up with the
-			// activation. Activation takes about a batch interval, so wait a
-			// bounded time, then report it; nothing was issued.
+			// activation. Confirmation depth, the batch interval and indexer
+			// catch-up can exceed two minutes, so allow five minutes while
+			// remaining cancellable and bounded; nothing was issued.
 			if activationWaitStarted.IsZero() {
 				activationWaitStarted = time.Now()
 				var refused *Error

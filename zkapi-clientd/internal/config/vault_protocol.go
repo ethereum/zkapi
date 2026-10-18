@@ -34,15 +34,15 @@ func LoadVaultProtocol(dir string) (string, error) {
 		return "", errors.New("cannot read saved vault protocol")
 	}
 	value := strings.TrimSpace(string(raw))
-	if value != "legacy" && value != "concession" {
-		return "", errors.New("invalid saved vault protocol; expected legacy or concession")
+	if value != "legacy" && value != "concession" && value != "concession-v1" {
+		return "", errors.New("invalid saved vault protocol; expected legacy, concession-v1 or concession")
 	}
 	return value, nil
 }
 
 func UpdateVaultProtocol(dir string, previous Config, expected, next string) error {
-	if next != "" && next != "legacy" && next != "concession" {
-		return errors.New("vault protocol must be legacy or concession")
+	if next != "" && next != "legacy" && next != "concession" && next != "concession-v1" {
+		return errors.New("vault protocol must be legacy, concession-v1 or concession")
 	}
 	if err := EnsureDir(dir); err != nil {
 		return err

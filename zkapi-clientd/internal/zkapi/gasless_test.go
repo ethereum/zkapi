@@ -1537,6 +1537,36 @@ func TestGaslessWithdrawalPreflightRefusesBeforeReserving(t *testing.T) {
 // contracts: a profile without its address or runtime codehash, or whose
 // account creation code embeds another implementation, disables --fees
 // payout (gasless_unavailable) before any chain read.
+func TestGaslessDeploymentChecksOptionalGasSchedule(t *testing.T) {
+	for _, schedule := range []uint64{0, 1, 2} {
+		t.Run(fmt.Sprint(schedule), func(t *testing.T) {
+			f, g := newGaslessWithdrawalFixture(t)
+			installGaslessProfile(t, func(profile map[string]any) any {
+				profile["gas_schedule"] = schedule
+				return profile
+			})
+			g.gasSchedule = schedule
+			err := f.h.client.CheckGaslessDeployment(context.Background())
+			if schedule > 1 {
+				if !errors.Is(err, errGaslessUnavailable) {
+					t.Fatal("unknown gas schedule accepted", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal("matching gas schedule rejected", err)
+			}
+			g.gasSchedule = 1 - schedule
+			if err := f.h.client.CheckGaslessDeployment(context.Background()); !errors.Is(err, errGaslessUnavailable) || !strings.Contains(err.Error(), "gasSchedule()") {
+				t.Fatal("different on-chain gas schedule accepted", err)
+			}
+			if err := f.h.client.CheckDeployment(context.Background()); err != nil {
+				t.Fatal("gas schedule mismatch disabled normal vault access", err)
+			}
+		})
+	}
+}
+
 func TestGaslessProfileRequiresTheAccountImplementationPin(t *testing.T) {
 	for name, edit := range map[string]func(map[string]any){
 		"no implementation address":  func(g map[string]any) { delete(g, "withdrawal_account_implementation_address") },

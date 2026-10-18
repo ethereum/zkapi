@@ -40,7 +40,7 @@ func run(args []string) error {
 	var err error
 	global := flag.NewFlagSet("zkapi-clientd", flag.ContinueOnError)
 	global.StringVar(&dir, "config-dir", dir, "private configuration and wallet directory")
-	protocolFlag := global.String("vault-protocol", os.Getenv("ZKAPI_VAULT_PROTOCOL"), "override saved vault stack: concession or legacy")
+	protocolFlag := global.String("vault-protocol", os.Getenv("ZKAPI_VAULT_PROTOCOL"), "override saved vault stack: concession, concession-v1 or legacy")
 	showVersion := global.Bool("version", false, "print version")
 	global.Usage = help
 	if err := global.Parse(args); err != nil {
@@ -103,6 +103,9 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+	}
+	if protocol == "concession-v1" {
+		return dispatchConcessionV1(dir, explicitDir || savedProtocol == "concession-v1", args)
 	}
 	if protocol == "legacy" {
 		// A saved legacy choice explicitly binds the resolved profile; no need
@@ -186,7 +189,7 @@ func run(args []string) error {
 }
 
 func help() {
-	fmt.Fprintln(os.Stderr, `Usage: zkapi-clientd [--config-dir DIR] [--vault-protocol concession|legacy] COMMAND
+	fmt.Fprintln(os.Stderr, `Usage: zkapi-clientd [--config-dir DIR] [--vault-protocol concession|concession-v1|legacy] COMMAND
 
   config                 Print saved config as JSON; --help for settings
                          --setup: prepare wallet; --menu: wallet actions

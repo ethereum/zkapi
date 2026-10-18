@@ -12,11 +12,11 @@ import (
 
 func runSetVaultProtocol(dir string, args []string, out io.Writer) error {
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
-		fmt.Fprintln(out, "Usage: zkapi-clientd set-vault-protocol [legacy | concession | --clear]\nShow/save this profile's vault stack. Default: concession. Stop serve before edits. No wallet migration or payment. Both protocols preserve native rewriter/cover settings.")
+		fmt.Fprintln(out, "Usage: zkapi-clientd set-vault-protocol [legacy | concession-v1 | concession | --clear]\nShow/save this profile's vault stack. Default: concession. Stop serve before edits. No wallet migration or payment. Both protocols preserve native rewriter/cover settings.")
 		return nil
 	}
 	if len(args) > 1 {
-		return errors.New("use set-vault-protocol [legacy | concession | --clear]")
+		return errors.New("use set-vault-protocol [legacy | concession-v1 | concession | --clear]")
 	}
 	c, err := config.Load(dir)
 	if err != nil {
@@ -37,8 +37,13 @@ func runSetVaultProtocol(dir string, args []string, out io.Writer) error {
 	next := args[0]
 	if next == "--clear" {
 		next = ""
-	} else if next != "legacy" && next != "concession" {
-		return errors.New("vault protocol must be legacy or concession")
+	} else if next != "legacy" && next != "concession" && next != "concession-v1" {
+		return errors.New("vault protocol must be legacy, concession-v1 or concession")
+	}
+	if next == "concession-v1" {
+		if _, _, err := concessionV1DispatchPlan(dir, true, c, []string{"serve"}, filepath.Join(dir, "client")); err != nil {
+			return err
+		}
 	}
 	if next == "legacy" {
 		// Check profile compatibility before persisting a selection. Artifact pins

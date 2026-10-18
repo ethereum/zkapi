@@ -2,11 +2,11 @@
 
 A local OpenAI-compatible API, paid from your private ETH balance. No OA account or OpenRouter API key needed.
 
-> **Local migration build:** this worktree targets the new concession protocol,
-> but Mainnet and Sepolia are not deployed in its shipping manifests and production
-> proving keys are not available. Do not use the older installer below to obtain
-> this build. See [local migration status](docs/LOCAL_PROTOCOL_MIGRATION.md) for
-> binary paths, preserved Tor features, withdrawal options and deployment blockers.
+> **Sepolia development build:** this worktree pins the deployed revision-4
+> Sepolia vault. Its proving keys are for testnet development. Mainnet's new
+> protocol remains unavailable. Build this branch as described below; older
+> published installers do not contain these changes. See
+> [deployment and recovery status](docs/LOCAL_PROTOCOL_MIGRATION.md).
 
 ## Configuration
 
@@ -17,12 +17,14 @@ removed. See [configuration reference](docs/CONFIGURATION.md).
 
 ## Vault protocol selection
 
-`config --vault-protocol legacy|concession` saves this profile's protocol stack;
+`config --vault-protocol legacy|concession-v1|concession` saves this profile's protocol stack;
 `config` prints all saved settings as JSON; `config --vault-protocol default`
 restores the concession default. Subsequent
 commands use the saved choice without exports or repeated flags. Optional
 `--vault-protocol` overrides it for one command. Legacy requires a compatible
-existing profile and uses a pinned legacy protocol engine/companion. Both stacks
+existing profile and uses a pinned legacy protocol engine/companion.
+`concession-v1` selects the original revision-3 Sepolia engine for existing
+balances. The default `concession` selects revision 4. All stacks
 use the same native rewriting, target-transcript and cover-traffic source code;
 selecting a vault preserves those settings. No address swap,
 state conversion, deposit-closure bypass, or fallback from undeployed concession
@@ -53,7 +55,7 @@ protocol selector; do not use their installer to update this build.
 The examples below assume `zkapi-clientd` refers to the newly built
 `bin/zkapi-clientd-concession-tor` entry point. Global `--config-dir DIR` belongs
 **before** the command. Select the correct existing profile/protocol before any
-wallet operation; concession funding currently refuses undeployed networks.
+wallet operation; revision-4 funding is available on Sepolia; its Mainnet profile remains unavailable.
 
 ## Usage
 

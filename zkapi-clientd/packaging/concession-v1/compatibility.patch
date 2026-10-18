@@ -1,0 +1,116 @@
+--- a/zkapi-clientd/internal/zkapi/chain_verify.go
++++ b/zkapi-clientd/internal/zkapi/chain_verify.go
+@@ -65,7 +65,7 @@
+ 	errDepositVerificationPending    = errors.New("the deposit is mined; waiting for the zkAPI indexer to confirm it before activation")
+ 	errDepositVerificationConflict   = errors.New("the payment RPC, the vault state, and the zkAPI indexer disagree about this deposit; its private note was not activated")
+ 	errRevertVerificationPending     = errors.New("waiting for the zkAPI indexer to confirm the revert")
+-	errWithdrawalVerificationPending = errors.New("the withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed")
++	errWithdrawalVerificationPending = errors.New("the withdrawal is final on Ethereum; waiting for the vault state to confirm the note is closed")
+ )
+ 
+ const conflictGuidance = " Checking again re-verifies automatically. If this persists, compare the transaction on a block explorer and run zkapi-clientd config --menu, then choose repair."
+@@ -847,9 +847,11 @@
+ }
+ 
+ // corroborateWithdrawalClosed requires the vault, read at the payout receipt's
+-// canonical block, and the indexer snapshot at or after it to show the
+-// reserved note closed before the companion deletes its note state. A forged
+-// payout receipt therefore never retires a live note; disagreement waits.
++// canonical block, to show the reserved note closed before the companion
++// deletes its note state. Revision 3 retains a closed note's Merkle leaf until
++// a separate retirement; that leaf is not evidence that the note is still open.
++// The caller already checked finality and the exact payout event. A receipt
++// without matching closed vault state never retires a live note.
+ func (h *FundingHandler) corroborateWithdrawalClosed(ctx context.Context, config fundingConfig, noteID uint64, receipt *addressReceipt) error {
+ 	pending := func(reason string) error { return fmt.Errorf("%w (%s)", errWithdrawalVerificationPending, reason) }
+ 	if noteID > 0xffffffff {
+@@ -866,13 +868,5 @@
+ 	if err != nil || note.Status != noteClosed {
+ 		return pending("the vault does not show the note closed at the payout block")
+ 	}
+-	snapshot, err := h.confirmedSnapshot(ctx, config, block.Uint64())
+-	if err != nil {
+-		return pending(err.Error())
+-	}
+-	leaf, present, err := snapshot.leaf(uint32(noteID))
+-	if err != nil || !present || leaf.Sign() != 0 {
+-		return pending("the zkAPI indexer still shows the note in the tree")
+-	}
+ 	return nil
+ }
+--- a/zkapi-clientd/internal/zkapi/address_withdrawal.go
++++ b/zkapi-clientd/internal/zkapi/address_withdrawal.go
+@@ -370,7 +370,7 @@
+ 	return credits, nil
+ }
+ 
+-const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed before finishing local bookkeeping."
++const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state to confirm the note is closed before finishing local bookkeeping."
+ 
+ // requireClearanceOwnershipCapability runs only before a companion reserves a
+ // note for a new withdrawal. Where the pinned deployment's server may require
+--- a/zkapi-clientd/internal/zkapi/withdrawal_corroboration_test.go
++++ b/zkapi-clientd/internal/zkapi/withdrawal_corroboration_test.go
+@@ -59,25 +59,23 @@
+ 	}
+ }
+ 
+-// Review root cause on the withdrawal side: one RPC must not decide that the
+-// note closed. A forged MutualClose receipt never deletes the companion's
+-// note state or archives the deposit recovery file.
++// Review root cause on the withdrawal side: a receipt alone must not decide
++// that the note closed. A forged MutualClose receipt never deletes the
++// companion's note state or archives the deposit recovery file while the
++// vault, read at the receipt's canonical block, shows the note open.
+ func TestForgedMutualCloseReceiptNeverClosesNote(t *testing.T) {
+-	for _, vault := range []string{"forged closed", "honest active"} {
++	for _, vault := range []string{"active", "pending withdrawal"} {
+ 		t.Run(vault, func(t *testing.T) {
+ 			f := newWithdrawalFixture(t)
+ 			hash := f.withdraw(t)
+-			f.mu.Lock()
+-			leaf := new(big.Int).Set(f.leaves[12])
+-			f.mu.Unlock()
+ 			f.mineWithdrawal(t, hash, withdrawalTestDestination, false)
+ 			f.mu.Lock()
+-			f.setLeaf(12, leaf) // The indexer never saw a close.
+-			if vault == "honest active" {
+-				note := f.vaultNotes[12]
+-				note.status = noteActive
+-				f.vaultNotes[12] = note
+-			}
++			note := f.vaultNotes[12]
++			note.status = noteActive
++			if vault == "pending withdrawal" {
++				note.status = notePendingWithdrawal
++			}
++			f.vaultNotes[12] = note
+ 			f.mu.Unlock()
+ 			for range 2 {
+ 				status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+@@ -456,3 +454,25 @@
+ 		t.Fatalf("own mutual close was saved as credited: %+v %v", read, err)
+ 	}
+ }
++
++// Revision 3 closes the stored note without automatically retiring its Merkle
++// leaf. A final exact payout plus Closed at the receipt's block must finish
++// recovery even while the indexer legitimately retains that historical leaf.
++func TestRevisionThreeCloseCompletesWithRetainedTreeLeaf(t *testing.T) {
++	f := newWithdrawalFixture(t)
++	hash := f.withdraw(t)
++	f.mu.Lock()
++	leaf := new(big.Int).Set(f.leaves[12])
++	f.mu.Unlock()
++	f.mineWithdrawal(t, hash, withdrawalTestDestination, false)
++	f.mu.Lock()
++	f.setLeaf(12, leaf)
++	f.mu.Unlock()
++	status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
++	if err != nil || status.Phase != "complete" || f.confirmCalls != 1 || f.active {
++		t.Fatalf("final closed note with retained leaf did not complete: %+v %v", status, err)
++	}
++	if f.journal(t).Pending != nil || f.journal(t).Withdrawal.Phase != "complete" {
++		t.Fatal("the finalized withdrawal was not archived locally")
++	}
++}
