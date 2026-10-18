@@ -74,6 +74,15 @@ must match that setup. The example feed is Sepolia; it does not select a product
 The server checks chain ID, feed decimals and the vault's native-unit getter
 before answering or accepting a quote. There is no symbol-only fallback.
 
+Read-only oracle and vault RPC calls retry transport failures, HTTP 408/429
+and HTTP 5xx up to four attempts, with backoff and a shared 15-second deadline.
+Exhausted transient reads return retriable `chain_read_unavailable` (HTTP 503),
+not `invalid_request`. HTTP refusals such as 401/403, malformed responses and
+contract reverts are not automatically retried. No retry caches or substitutes
+a price, root or nullifier result. In the Docker launcher,
+`ROOT_POLL_INTERVAL_MS` controls background root refreshes (default 1000 ms);
+keep it well below the root freshness limit when tuning shared RPC traffic.
+
 Chainlink's reference directory lists the ordinary ETH/USD proxies as
 `0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419` on Mainnet and
 `0x694AA1769357215DE4FAC081bf1f309aDC325306` on Sepolia, both eight decimals

@@ -118,6 +118,7 @@ test('server forwards the settlement deadline and native price policy defaults',
     assert.equal(flag(result.args, '--openrouter-lease-ttl-seconds'), '300');
     assert.equal(flag(result.args, '--openrouter-settlement-grace-seconds'), '5');
     assert.equal(flag(result.args, '--indexer-url'), 'http://indexer:3001');
+    assert.equal(flag(result.args, '--root-poll-interval-ms'), '1000');
     assert.equal(flag(result.args, '--db-path'), '/data/server.db');
     assert.equal(flag(result.args, '--chain-id'), BASE_ENV.CHAIN_ID);
     assert.equal(flag(result.args, '--contract-address'), BASE_ENV.VAULT_ADDRESS);
@@ -133,6 +134,7 @@ test('server forwards explicit settlement and native price overrides', async () 
             LEASE_TTL_SECONDS: '600',
             SETTLEMENT_GRACE_SECONDS: '10',
             OA_ORG_URL: 'https://org.example',
+            ROOT_POLL_INTERVAL_MS: '4000',
         },
     });
     assert.equal(result.status, 0, result.stderr);
@@ -142,6 +144,7 @@ test('server forwards explicit settlement and native price overrides', async () 
     assert.equal(flag(result.args, '--openrouter-lease-ttl-seconds'), '600');
     assert.equal(flag(result.args, '--openrouter-settlement-grace-seconds'), '10');
     assert.equal(flag(result.args, '--oa-org-url'), 'https://org.example');
+    assert.equal(flag(result.args, '--root-poll-interval-ms'), '4000');
 });
 
 test('server leaves seed validation to zkapi serverd and keeps seeds out of argv', async () => {

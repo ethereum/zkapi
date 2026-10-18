@@ -47,6 +47,29 @@ pub const PUBLICATION_SCAN_CHUNK_BLOCKS: u64 = 1_000;
 /// header with its transaction hashes, or a chunk of logs.
 const MAX_RESPONSE_BYTES: usize = 65_536;
 const MAX_BLOCK_OR_LOGS_RESPONSE_BYTES: usize = 4 << 20;
+const RPC_READ_ATTEMPTS: usize = 4;
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+enum RpcReadFailure {
+    Transient {
+        message: String,
+        retry_after: Duration,
+    },
+    Terminal(ServerError),
+}
+
+impl From<ServerError> for RpcReadFailure {
+    fn from(error: ServerError) -> Self {
+        Self::Terminal(error)
+    }
+}
+
+fn unavailable(message: &str) -> RpcReadFailure {
+    RpcReadFailure::Transient {
+        message: message.to_owned(),
+        retry_after: Duration::ZERO,
+    }
+}
 
 #[derive(Clone)]
 pub struct NativeBillingConfig {
@@ -571,27 +594,89 @@ impl NativeBillingOracle {
         params: Value,
         limit: usize,
     ) -> Result<Value, ServerError> {
+        // These are reads only. Retry transient transport/rate-limit failures
+        // without caching any root, price or nullifier result. The deadline is
+        // shared by all attempts, including Retry-After, not reset per attempt.
+        tokio::time::timeout(RPC_READ_TIMEOUT, async {
+            for attempt in 0..RPC_READ_ATTEMPTS {
+                match self.rpc_read_once(method, &params, limit).await {
+                    Ok(value) => return Ok(value),
+                    Err(RpcReadFailure::Terminal(error)) => return Err(error),
+                    Err(RpcReadFailure::Transient {
+                        message,
+                        retry_after,
+                    }) => {
+                        if attempt + 1 == RPC_READ_ATTEMPTS {
+                            return Err(ServerError::ChainReadUnavailable(message));
+                        }
+                        let delay = Duration::from_millis(500 << attempt).max(retry_after);
+                        tracing::warn!(method, attempt = attempt + 1, %message,
+                            "transient chain RPC read failed; retrying");
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+            unreachable!("the final attempt returns")
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(ServerError::ChainReadUnavailable(
+                "native billing oracle RPC read timed out".into(),
+            ))
+        })
+    }
+
+    async fn rpc_read_once(
+        &self,
+        method: &str,
+        params: &Value,
+        limit: usize,
+    ) -> Result<Value, RpcReadFailure> {
         let response = self
             .http
             .post(&self.config.rpc_url)
             .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
             .send()
             .await
-            .map_err(|_| invalid("native billing oracle RPC unavailable"))?;
-        if !response.status().is_success()
-            || response.content_length().is_some_and(|n| n > limit as u64)
-        {
-            return Err(invalid("native billing oracle RPC rejected the read"));
+            .map_err(|_| unavailable("native billing oracle RPC unavailable"))?;
+        let status = response.status();
+        if status.as_u16() == 429 || status.as_u16() == 408 || status.is_server_error() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| Duration::from_secs(seconds).min(RPC_READ_TIMEOUT))
+                .unwrap_or_default();
+            return Err(RpcReadFailure::Transient {
+                message: format!(
+                    "native billing oracle RPC returned HTTP {}",
+                    status.as_u16()
+                ),
+                retry_after,
+            });
+        }
+        if !status.is_success() {
+            // A provider refusal is not a malformed client request. Do not
+            // hammer permanent HTTP failures (auth, wrong URL, redirects).
+            return Err(ServerError::ChainReadUnavailable(format!(
+                "native billing oracle RPC returned HTTP {}",
+                status.as_u16(),
+            ))
+            .into());
+        }
+        if response.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(invalid("native billing oracle RPC response too large").into());
         }
         let mut response = response;
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| invalid("native billing oracle RPC unavailable"))?
+            .map_err(|_| unavailable("native billing oracle RPC unavailable"))?
         {
             if body.len().saturating_add(chunk.len()) > limit {
-                return Err(invalid("native billing oracle RPC response too large"));
+                return Err(invalid("native billing oracle RPC response too large").into());
             }
             body.extend_from_slice(&chunk);
         }
@@ -600,17 +685,15 @@ impl NativeBillingOracle {
         if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
             || value.get("id").and_then(Value::as_u64) != Some(1)
         {
-            return Err(invalid(
-                "native billing oracle RPC response identity mismatch",
-            ));
+            return Err(invalid("native billing oracle RPC response identity mismatch").into());
         }
         if value.get("error").is_some() {
-            return Err(invalid("native billing oracle RPC call failed"));
+            return Err(invalid("native billing oracle RPC call failed").into());
         }
         value
             .get("result")
             .cloned()
-            .ok_or_else(|| invalid("missing native billing oracle RPC result"))
+            .ok_or_else(|| invalid("missing native billing oracle RPC result").into())
     }
 
     async fn call(&self, address: &str, data: &str) -> Result<String, ServerError> {
@@ -1526,6 +1609,127 @@ mod tests {
         assert!(q.validate_identity(&c, 11155111).is_ok());
         q.expires_at += 1;
         assert!(q.validate_identity(&c, 11155111).is_err());
+    }
+
+    async fn scripted_read_rpc(
+        replies: Vec<(u16, String)>,
+    ) -> (
+        NativeBillingOracle,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let last = replies.last().unwrap().clone();
+        let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(replies)));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/",
+            post({
+                let calls = calls.clone();
+                move |Json(request): Json<Value>| {
+                    calls.lock().unwrap().push(request);
+                    let (status, body) = replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| last.clone());
+                    async move { (axum::http::StatusCode::from_u16(status).unwrap(), body) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let oracle = NativeBillingOracle::new(
+            NativeBillingConfig {
+                rpc_url,
+                feed_address: quote().feed_address,
+                decimals: 8,
+                max_age_seconds: 3600,
+            },
+            11155111,
+            "0x0000000000000000000000000000000000000001".into(),
+        )
+        .unwrap();
+        (oracle, calls, task)
+    }
+
+    fn rpc_reply(value: Value) -> (u16, String) {
+        (
+            200,
+            json!({"jsonrpc":"2.0","id":1,"result":value}).to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn rpc_reads_retry_transient_failures_without_changing_the_read() {
+        let (oracle, calls, task) = scripted_read_rpc(vec![
+            (429, "rate limited".into()),
+            (503, "unavailable".into()),
+            rpc_reply(json!("0x1234")),
+        ])
+        .await;
+        let params = json!([{"to": oracle.config.feed_address, "data":"0xfeaf968c"}, "finalized"]);
+        assert_eq!(
+            oracle.rpc("eth_call", params.clone()).await.unwrap(),
+            json!("0x1234")
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        for call in calls.iter() {
+            assert_eq!(call["method"], "eth_call");
+            assert_eq!(call["params"], params);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rpc_read_retry_exhaustion_is_bounded_and_retriable() {
+        let (oracle, calls, task) = scripted_read_rpc(vec![(429, "rate limited".into())]).await;
+        let error = oracle.rpc_chain_id().await.unwrap_err();
+        assert!(matches!(error, ServerError::ChainReadUnavailable(_)));
+        assert!(error.is_retriable());
+        assert!(error.to_string().contains("HTTP 429"));
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rpc_reads_do_not_retry_permanent_or_malformed_responses() {
+        for reply in [
+            (403, "provider auth failure".into()),
+            (
+                200,
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"revert"}}).to_string(),
+            ),
+            (
+                200,
+                json!({"jsonrpc":"2.0","id":2,"result":"0xaa36a7"}).to_string(),
+            ),
+            (200, "x".repeat(MAX_RESPONSE_BYTES + 1)),
+        ] {
+            let (oracle, calls, task) = scripted_read_rpc(vec![reply]).await;
+            assert!(oracle.rpc_chain_id().await.is_err());
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_retry_cannot_authorize_a_spent_note() {
+        let (oracle, calls, task) = scripted_read_rpc(vec![
+            rpc_reply(json!("0xaa36a7")),
+            (429, "rate limited".into()),
+            rpc_reply(json!(format!("0x{:064x}", 1))),
+        ])
+        .await;
+        assert!(matches!(
+            oracle.assert_request_unspent(&Felt252::from_u64(123)).await,
+            Err(ServerError::NullifierUsed)
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        task.abort();
     }
 
     #[tokio::test]
