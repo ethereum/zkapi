@@ -4909,6 +4909,10 @@ class BrowserWalletRuntime extends EventTarget {
         walletRequest = null,
         signal = null,
         gasless = null,
+        // The note and the prepared operation the person was shown. Compared
+        // inside the wallet lock, before any reservation or proof.
+        expectedNoteId = null,
+        expectedWithdrawalOperationId = null,
         onProgress = () => {}
     } = {}) {
         await this.init();
@@ -4939,7 +4943,8 @@ class BrowserWalletRuntime extends EventTarget {
                 // there (E1, E3.2, E4.3, E6).
                 for (let pass = 0; pass < 4; pass += 1) {
                     const plan = await this.prepareExitLocked(mode, destination, {
-                        reprove, earlyConcession, walletRequest, signal, gasless, onProgress
+                        reprove, earlyConcession, walletRequest, signal, gasless, onProgress,
+                        expectedNoteId, expectedWithdrawalOperationId
                     });
                     if (plan !== WITHDRAWAL_RESTART) return plan;
                 }
@@ -4971,10 +4976,29 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     async prepareExitLocked(requested, destination, { reprove, earlyConcession, walletRequest = null, signal, gasless = null,
+        expectedNoteId = null, expectedWithdrawalOperationId = null,
         onProgress }) {
         await this.reload();
         const state = this.runtime.state;
         if (!state) throw new Error('There is no active private note to withdraw.');
+        // The person confirmed one note and one prepared operation; another
+        // tab may have replaced either since. Refuse before any network
+        // read, reservation or proof (the lock is held by the caller).
+        if (expectedNoteId != null && Number(state.note_id) !== Number(expectedNoteId)) {
+            throw new BrowserWalletHttpError(
+                'The private balance changed after this withdrawal was shown. Review the current balance before continuing.',
+                409,
+                'withdrawal_note_changed'
+            );
+        }
+        if (expectedWithdrawalOperationId != null
+            && this.runtime.preparedWithdrawal?.operationId !== expectedWithdrawalOperationId) {
+            throw new BrowserWalletHttpError(
+                'This withdrawal was replaced in another tab after it was shown. Review it again before continuing.',
+                409,
+                'withdrawal_note_changed'
+            );
+        }
         if (unresolvedLateWithdrawalForNote(this.runtime, state.note_id)) {
             throw new BrowserWalletHttpError(
                 'A withdrawal from another tab may already be on-chain. Check its status before starting another withdrawal.',
@@ -5584,11 +5608,28 @@ class BrowserWalletRuntime extends EventTarget {
         return this.deploymentVerification;
     }
 
-    async claimPreparedWithdrawalSubmission() {
+    async claimPreparedWithdrawalSubmission(expected = null) {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             let prepared = this.runtime.preparedWithdrawal;
             if (!prepared) throw new Error('The durable prepared withdrawal is missing.');
+            // The caller names the plan it just prepared (after any
+            // mutual-to-escape conversion). Another tab may have replaced it.
+            if (expected != null) {
+                const mismatch = (expected.operationId != null && prepared.operationId !== expected.operationId)
+                    || (expected.noteId != null
+                        && Number(prepared.noteId ?? prepared.public_inputs?.note_id) !== Number(expected.noteId))
+                    || (expected.mode != null && prepared.mode !== expected.mode)
+                    || (expected.destination != null
+                        && String(prepared.destination || '').toLowerCase() !== String(expected.destination).toLowerCase());
+                if (mismatch) {
+                    throw new BrowserWalletHttpError(
+                        'This withdrawal was replaced in another tab. Review it again before continuing.',
+                        409,
+                        'withdrawal_note_changed'
+                    );
+                }
+            }
             if (!prepared.operationId) {
                 prepared = { ...prepared, operationId: uuid() };
                 await this.commit({ ...this.runtime, preparedWithdrawal: prepared });

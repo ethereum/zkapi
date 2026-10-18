@@ -8,6 +8,13 @@ act on.
 
 ## [Unreleased]
 
+### Sepolia staging integration
+
+Carry the existing staging client's wallet withdrawal fee quote and confirmed
+withdrawal identity checks into revision 4. Preparation and submission recheck
+the displayed note and operation under the wallet lock, including after a
+mutual close converts to an escape. No contract or proof artifact changes.
+
 Folded into 0.2.0's notes at release.
 
 ### Added

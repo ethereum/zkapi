@@ -3,7 +3,7 @@ import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateN
 import { beginBrowserSdkInitialization } from '../configure.js';
 import browserWalletRuntime, { pausedWithdrawalNotice } from './browserWalletRuntime.js';
 import { ENTRY_POINT_ERRORS, contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
-import { EXIT_FALLBACK_GAS_LIMIT, bufferedGasLimit } from './zkapiGas.mjs';
+import { EXIT_FALLBACK_GAS_LIMIT, MAX_TRANSACTION_GAS_LIMIT, bufferedGasLimit } from './zkapiGas.mjs';
 import { normalizeWalletError, walletErrorMessage } from './zkapiWalletError.mjs';
 import { backgroundWithdrawalClaims, isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHistory.mjs';
@@ -2492,6 +2492,50 @@ class ZkapiClient extends EventTarget {
     }
 
     /**
+     * What a wallet-paid withdrawal can cost, before any clearance exists.
+     * Calldata is unknown then, so the supported transaction gas ceiling is
+     * reserved at twice the current gas price (an escape needs a second,
+     * later transaction). Read-only: it never closes or prepares a note, and
+     * MetaMask still reviews the real fee. `shortfallWei` is what the connected
+     * account lacks, and the page shows it as a top-up rather than an error.
+     */
+    async getWithdrawalFeeBudget(mode = 'mutual') {
+        if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a withdrawal method.');
+        if (!this.config?.funding || !this.ethereum?.request) {
+            throw Object.assign(new Error('Connect MetaMask to check the network fee.'), { code: 'withdrawal_wallet_disconnected' });
+        }
+        const quantity = value => {
+            if (typeof value !== 'string' || !/^0x(?:0|[1-9a-f][0-9a-f]{0,63})$/i.test(value)) throw new Error('Invalid wallet fee data.');
+            return BigInt(value);
+        };
+        const accounts = await this.ethereum.request({ method: 'eth_accounts' });
+        const address = accounts?.[0]?.toLowerCase();
+        if (!/^0x[0-9a-f]{40}$/.test(address || '') || /^0x0{40}$/.test(address)) {
+            throw Object.assign(new Error('Connect MetaMask to check the network fee.'), { code: 'withdrawal_wallet_disconnected' });
+        }
+        await this.assertFundingChain();
+        const gasPrice = quantity(await this.ethereum.request({ method: 'eth_gasPrice' }));
+        if (gasPrice <= 0n) throw new Error('Invalid wallet fee data.');
+        const transactionFee = MAX_TRANSACTION_GAS_LIMIT * gasPrice * 2n;
+        const reserve = transactionFee * (mode === 'escape' ? 2n : 1n);
+        if (reserve >= 1n << 256n) throw new Error('Invalid wallet fee data.');
+        const balance = quantity(await this.ethereum.request({ method: 'eth_getBalance', params: [address, 'pending'] }));
+        await this.assertFundingChain();
+        const current = await this.ethereum.request({ method: 'eth_accounts' });
+        if (current?.[0]?.toLowerCase() !== address) throw new Error('MetaMask account changed. Check the fee again.');
+        return {
+            address,
+            chainId: Number(this.config.funding.chain_id),
+            mode,
+            balanceWei: balance.toString(),
+            feeReserveWei: reserve.toString(),
+            transactionFeeWei: transactionFee.toString(),
+            shortfallWei: (reserve > balance ? reserve - balance : 0n).toString(),
+            expiresAt: Date.now() + 30_000
+        };
+    }
+
+    /**
      * Withdraw the selected balance. `mode` 'mutual' asks for a cooperative
      * close where the exit rules allow one (design §6.4 E2); the rules may
      * turn it into an escape. 'escape' exits unilaterally now. `concede`
@@ -2505,7 +2549,8 @@ class ZkapiClient extends EventTarget {
         feeCapWei = null,
         bundlerUrl = null,
         allowExpensiveGas = false,
-        selfBundle = false
+        selfBundle = false,
+        expectedWithdrawalOperationId = null
     } = {}) {
         // The password dialog must not transfer an earlier withdrawal click
         // to a successor note installed by another tab while it was open.
@@ -2526,7 +2571,8 @@ class ZkapiClient extends EventTarget {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const options = { destination, concede, fees, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle };
+        const options = { destination, concede, fees, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle,
+            expectedWithdrawalOperationId };
         const operation = (async () => {
             try {
                 return await this.performWithdrawal(mode, onStatus, options);
@@ -2567,7 +2613,8 @@ class ZkapiClient extends EventTarget {
         feeCapWei = null,
         bundlerUrl = null,
         allowExpensiveGas = false,
-        selfBundle = false
+        selfBundle = false,
+        expectedWithdrawalOperationId = null
     } = {}) {
         const requestedDestination = normalizeWithdrawalDestination(requested, this.config?.funding);
         const note = this.note;
@@ -2584,6 +2631,7 @@ class ZkapiClient extends EventTarget {
             // no transaction is ever sent from the wallet.
             return this.performGaslessWithdrawal(mode, onStatus, {
                 requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from, note,
+                expectedWithdrawalOperationId,
                 durablePrepared: await browserWalletRuntime.currentPreparedWithdrawal()
             });
         }
@@ -2690,6 +2738,8 @@ class ZkapiClient extends EventTarget {
                     reprove,
                     earlyConcession: concede,
                     walletRequest,
+                    expectedNoteId: note.note_id,
+                    expectedWithdrawalOperationId: attempt === 0 ? expectedWithdrawalOperationId : null,
                     onProgress: (_phase, message) => onStatus(message)
                 });
                 for (const warning of plan.warnings || []) {
@@ -2731,7 +2781,12 @@ class ZkapiClient extends EventTarget {
                     this.config.funding.contract_address,
                     { conceded: plan.public_inputs.conceded }
                 );
-                const claim = await browserWalletRuntime.claimPreparedWithdrawalSubmission();
+                const claim = await browserWalletRuntime.claimPreparedWithdrawalSubmission({
+                    operationId: plan.operationId ?? null,
+                    noteId: plan.noteId ?? plan.public_inputs?.note_id ?? null,
+                    mode: plan.mode,
+                    destination
+                });
                 submission = claim;
                 submittedHash = claim.transactionHash || submittedHash;
                 if (submittedHash) {
@@ -4177,7 +4232,7 @@ class ZkapiClient extends EventTarget {
     }
 
     async followGaslessWithdrawal(mode, onStatus, { requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from,
-        durablePrepared, note, claimed }) {
+        durablePrepared, note, claimed, expectedWithdrawalOperationId = null }) {
         if (durablePrepared && !isGaslessWithdrawal(durablePrepared)) throw gaslessError('gasless_plan_mismatch');
         if (requestedDestination && durablePrepared?.payout && durablePrepared.payout.toLowerCase() !== requestedDestination) {
             throw new Error('This withdrawal is already bound to a different destination. Resume it with its saved address.');
@@ -4242,6 +4297,8 @@ class ZkapiClient extends EventTarget {
                         reprove,
                         earlyConcession: concede,
                         walletRequest,
+                        expectedNoteId: note.note_id,
+                        expectedWithdrawalOperationId: attempt === 0 ? expectedWithdrawalOperationId : null,
                         gasless: { payout, transit: context.transit },
                         onProgress: (_phase, message) => onStatus(message)
                     });
