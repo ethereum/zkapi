@@ -1,4 +1,5 @@
-//! Nullifier computation for circuit `zkapi-v2-concession-v1`.
+//! Nullifier computation of the concession circuits (`zkapi-v2-concession-v1`
+//! and `zkapi-v2-concession-v2`, whose nullifiers are the same).
 //!
 //! N = Poseidon(domain("zkapi.v2c.null"), s, note_id, tau)
 //! For genesis: tau = 1
