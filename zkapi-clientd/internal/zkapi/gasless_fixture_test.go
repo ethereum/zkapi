@@ -40,6 +40,7 @@ type gaslessFixture struct {
 	flatFee, minEscapeNet, maxSponsoredCost, maxFeeCeiling, priorityCeiling, deposit *big.Int
 	escapesEnabled, sponsorshipPaused, vaultPaused                                   bool
 	pausedAt                                                                         uint64
+	gasSchedule                                                                      uint64
 	attempts                                                                         map[string]uint64
 	owed, credits, balances                                                          map[string]*big.Int
 	stranded                                                                         map[string]bool
@@ -68,6 +69,8 @@ type gaslessFixture struct {
 	wrongChain               bool
 	forgedReceiptTransaction string
 	estimate                 map[string]string
+	pimlicoFees              any
+	rundlerTip               any
 	ops                      map[string]gaslessUserOpJSON
 	sends                    []string
 	known                    map[string]bool
@@ -302,6 +305,8 @@ func (g *gaslessFixture) view(t *testing.T, to, data string) (any, map[string]an
 				out += uintWord(value)
 			}
 			return out, nil, true
+		case selectorGasSchedule:
+			return "0x" + uintWord(g.gasSchedule), nil, true
 		case selectorPaymasterVault:
 			return "0x" + addressWord(g.vault), nil, true
 		case selectorPaymasterFactory:
@@ -448,6 +453,18 @@ func (g *gaslessFixture) serveBundler(t *testing.T, w http.ResponseWriter, r *ht
 			return
 		}
 		reply([]string{g.entryPoint.Hex()})
+	case "pimlico_getUserOperationGasPrice":
+		if g.pimlicoFees == nil {
+			fail(-32601, "unknown method")
+			return
+		}
+		reply(g.pimlicoFees)
+	case "rundler_maxPriorityFeePerGas":
+		if g.rundlerTip == nil {
+			fail(-32601, "unknown method")
+			return
+		}
+		reply(g.rundlerTip)
 	case "eth_estimateUserOperationGas":
 		if g.estimate != nil {
 			reply(g.estimate)

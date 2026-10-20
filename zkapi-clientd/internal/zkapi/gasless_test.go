@@ -245,7 +245,7 @@ func TestGaslessDerivationsFollowTheTransitVectors(t *testing.T) {
 	if err := json.Unmarshal(v.GasPolicy, &policy); err != nil {
 		t.Fatal(err)
 	}
-	if policy.CallFloor != [4]uint64{210000, 160000, 200000, 30000} || policy.CallCap != [4]uint64{950000, 1100000, 400000, 150000} || policy.PostOpFloor != 250000 || policy.MaxAttempts != 3 || policy.PMVerificationFloor != 340000 || policy.FinalizeReserveGas != 880000 {
+	if policy.CallFloor != [4]uint64{220000, 160000, 200000, 30000} || policy.CallCap != [4]uint64{950000, 1100000, 400000, 150000} || policy.PostOpFloor != 250000 || policy.MaxAttempts != 3 || policy.PMVerificationFloor != 340000 || policy.FinalizeReserveGas != 880000 {
 		t.Fatalf("gas policy parsed as %+v", policy)
 	}
 	for i, sample := range v.ChargeSamples {
@@ -264,7 +264,7 @@ func TestGaslessDerivationsFollowTheTransitVectors(t *testing.T) {
 		t.Fatalf("derived defaults %+v differ from the vector's limits %+v", filled, op)
 	}
 	// The policy words are what gasPolicy() returns, in its order.
-	if words := filled.words(); len(words) != 30 || words[0] != 210000 || words[8] != 250000 || words[29] != 3 {
+	if words := filled.words(); len(words) != 30 || words[0] != 220000 || words[8] != 250000 || words[29] != 3 {
 		t.Fatalf("policy words %v", words)
 	}
 }
@@ -287,7 +287,7 @@ func TestGaslessUserOpJSONRoundTripsWithTheBundlerFieldNames(t *testing.T) {
 			t.Errorf("field %s missing from %s", name, encoded)
 		}
 	}
-	if len(fields) != 15 || fields["factory"] != common.HexToAddress(v.Factory).Hex() || fields["nonce"] != "0x"+vectorUint(t, v.Close.Nonce).Text(16) || fields["callGasLimit"] != "0x606f8" || fields["paymasterData"] != "0x00000000000009184e72a000" {
+	if len(fields) != 15 || fields["factory"] != common.HexToAddress(v.Factory).Hex() || fields["nonce"] != "0x"+vectorUint(t, v.Close.Nonce).Text(16) || fields["callGasLimit"] != "0x"+vectorUint(t, v.Close.CallGasLimit).Text(16) || fields["paymasterData"] != "0x00000000000009184e72a000" {
 		t.Fatalf("unexpected encoding %s", encoded)
 	}
 	var decoded gaslessUserOpJSON
@@ -1527,6 +1527,36 @@ func TestGaslessWithdrawalPreflightRefusesBeforeReserving(t *testing.T) {
 	_, err := f.h.QuoteAddressWithdrawal(payoutContext(payoutFees), withdrawalTestDestination, f.noteID, "", false)
 	if GaslessRefusalCode(err) != "gasless_attempts_exhausted" || f.journal(t).Withdrawal.Phase != "gasless_refused" {
 		t.Fatalf("attempts: %v %+v", err, f.journal(t).Withdrawal)
+	}
+}
+
+func TestGaslessDeploymentChecksOptionalGasSchedule(t *testing.T) {
+	for _, schedule := range []uint64{0, 1, 2} {
+		t.Run(fmt.Sprint(schedule), func(t *testing.T) {
+			f, g := newGaslessWithdrawalFixture(t)
+			installGaslessProfile(t, func(profile map[string]any) any {
+				profile["gas_schedule"] = schedule
+				return profile
+			})
+			g.gasSchedule = schedule
+			err := f.h.client.CheckGaslessDeployment(context.Background())
+			if schedule > 1 {
+				if !errors.Is(err, errGaslessUnavailable) {
+					t.Fatal("unknown gas schedule accepted", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal("matching gas schedule rejected", err)
+			}
+			g.gasSchedule = 1 - schedule
+			if err := f.h.client.CheckGaslessDeployment(context.Background()); !errors.Is(err, errGaslessUnavailable) || !strings.Contains(err.Error(), "gasSchedule()") {
+				t.Fatal("different on-chain gas schedule accepted", err)
+			}
+			if err := f.h.client.CheckDeployment(context.Background()); err != nil {
+				t.Fatal("gas schedule mismatch disabled normal vault access", err)
+			}
+		})
 	}
 }
 

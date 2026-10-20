@@ -716,8 +716,9 @@ func (h *FundingHandler) checkBundler(ctx context.Context, env *gaslessEnvironme
 
 // ----------------------------------------------------------------- fees and gas
 
-// gaslessFees picks the operation's fees from the latest base fee and the
-// chain's median tip by selectGaslessFees.
+// gaslessFees uses the bundler's suggested tip when available, as the SDK
+// does. The chain's validated median is the fallback; the current chain base
+// fee and the paymaster's ceilings always determine the final fee bounds.
 func (h *FundingHandler) gaslessFees(ctx context.Context, env *gaslessEnvironment, live gaslessLive) (maxFee, priority *big.Int, err error) {
 	var block struct {
 		Number string `json:"number"`
@@ -731,15 +732,56 @@ func (h *FundingHandler) gaslessFees(ctx context.Context, env *gaslessEnvironmen
 	if e1 != nil || e2 != nil || !number.IsUint64() {
 		return nil, nil, errAddressFeeData
 	}
-	var history addressFeeHistory
-	if h.addressRPC(ctx, env.config, "eth_feeHistory", []any{"0x14", block.Number, []int{50}}, &history) != nil {
-		return nil, nil, errAddressFeeData
-	}
-	tip, err := lowPriorityFee(history, number.Uint64(), base)
-	if err != nil {
-		return nil, nil, err
+	tip := h.bundlerPriorityFee(ctx, env)
+	if tip == nil {
+		var history addressFeeHistory
+		if h.addressRPC(ctx, env.config, "eth_feeHistory", []any{"0x14", block.Number, []int{50}}, &history) != nil {
+			return nil, nil, errAddressFeeData
+		}
+		tip, err = lowPriorityFee(history, number.Uint64(), base)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	return selectGaslessFees(base, tip, live.MaxFeeCeiling, live.PriorityFeeCeiling)
+}
+
+// Optional bundler extensions quote that service's tip, which can differ
+// greatly from unrelated transactions in eth_feeHistory. Only the tip is a
+// hint: never accept its maxFeePerGas instead of checking the chain's base
+// fee. Missing or malformed extensions fall back to validated chain history.
+func (h *FundingHandler) bundlerPriorityFee(ctx context.Context, env *gaslessEnvironment) *big.Int {
+	for _, method := range []string{"pimlico_getUserOperationGasPrice", "rundler_maxPriorityFeePerGas"} {
+		result, refused, err := h.bundlerCall(ctx, env.bundler, method, []any{})
+		if err != nil || refused != nil {
+			continue
+		}
+		var encoded string
+		if method == "pimlico_getUserOperationGasPrice" {
+			var tiers struct {
+				Standard struct {
+					Tip string `json:"maxPriorityFeePerGas"`
+				} `json:"standard"`
+				Fast struct {
+					Tip string `json:"maxPriorityFeePerGas"`
+				} `json:"fast"`
+			}
+			if json.Unmarshal(result, &tiers) != nil {
+				continue
+			}
+			encoded = tiers.Standard.Tip
+			if encoded == "" {
+				encoded = tiers.Fast.Tip
+			}
+		} else if json.Unmarshal(result, &encoded) != nil {
+			continue
+		}
+		tip, err := feeQuantity(encoded)
+		if err == nil && tip.BitLen() <= 128 {
+			return tip
+		}
+	}
+	return nil
 }
 
 // selectGaslessFees is the fee rule both clients share (the SDK's
