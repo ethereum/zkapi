@@ -1,7 +1,7 @@
-# Ceremony setup for `zkapi-v2-concession-v1` (setup id `mpc-1`)
+# Ceremony setup for `zkapi-v2-concession-v2` (setup id `mpc-1`)
 
 This directory will hold the production Groth16 keys of circuit
-`zkapi-v2-concession-v1`, produced by a snarkjs multi-party phase-2 ceremony
+`zkapi-v2-concession-v2`, produced by a snarkjs multi-party phase-2 ceremony
 (gate **G-SETUP**). **It holds no keys yet.** Until the ceremony is complete,
 CI, tests and the drill vault use the development setup in
 [`../v2-concession-dev`](../v2-concession-dev/README.md), which release builds
@@ -62,12 +62,16 @@ All commands run from `protocol/rust` at the frozen circuit revision
      shapes. Publish it: everyone who checks the ceremony compares their own
      export with it.
 
-   At the WP-A revision the shapes and SHA-256 are:
+   For the leaf-bound statement (vault revision 4: one-permutation leaf,
+   no Merkle path in the withdrawal circuit) the shapes and SHA-256 are:
 
    | Circuit | Constraints | Public inputs | Witnesses | QAP domain | `.r1cs` SHA-256 |
    | --- | --- | --- | --- | --- | --- |
-   | request | 23,990 | 12 | 23,698 | 2^15 | `704d4ede…1b23d3f6` |
-   | withdrawal | 28,772 | 16 | 28,321 | 2^15 | `c25d5c4e…2cbc13a4` |
+   | request | 23,507 | 12 | 23,215 | 2^15 | `28067d5f…d4820cfd` |
+   | withdrawal | 20,545 | 16 | 20,062 | 2^15 | `cd332f7b…4f485401` |
+
+   (`zkapi-v2-concession-v1` was 23,990 and 28,772 constraints, `.r1cs`
+   `704d4ede…1b23d3f6` and `c25d5c4e…2cbc13a4`; its keys are refused.)
 
 2. **Fidelity gate** (in CI, and again on the frozen circuit):
    - (a) `r1cs_export_roundtrip`: the files parse back with `ark-circom`'s
@@ -212,7 +216,7 @@ All commands run from `protocol/rust` at the frozen circuit revision
 
    | File | Content |
    | --- | --- |
-   | `request.pk`, `request.vk`, `withdrawal.pk`, `withdrawal.vk` | arkworks keys with headers `zkapi-v2-concession-v1/mpc-1/<kind>\0` |
+   | `request.pk`, `request.vk`, `withdrawal.pk`, `withdrawal.vk` | arkworks keys with headers `zkapi-v2-concession-v2/mpc-1/<kind>\0` |
    | `manifest.json` | See below |
    | `Groth16ProofAdapter.sol` | the regenerated adapter with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH`, `WITHDRAWAL_VK_HASH` (then `forge fmt` into `protocol/contracts/src/adapters`) |
    | `Bn254PoseidonRuntime.sol`, `poseidon-runtime.json` | the vault's Poseidon contract and its pins (source hash, runtime codehash); identical to the development setup's |
