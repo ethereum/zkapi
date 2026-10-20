@@ -413,8 +413,7 @@ pub(crate) async fn escape_path(
     let rpcs: Vec<Rpc> = deciding_rpc(config).into_iter().collect();
     // The indexer's path, at a root the vault confirms it held.
     let from_indexer = async {
-        let root = indexer.root().await.ok()?;
-        let siblings = indexer.note_path(state.note_id).await.ok()?;
+        let (root, siblings) = indexer.root_and_path(state.note_id).await.ok()?;
         let array: [Felt252; zkapi_types::MERKLE_DEPTH] = siblings.clone().try_into().ok()?;
         if zkapi_core::v2::merkle_root(state.note_id, &leaf, &array) != root {
             return None;

@@ -46,7 +46,7 @@ struct World {
     request_calls: usize,
     // Indexer.
     indexer_root: Felt252,
-    indexer_path: Vec<Felt252>,
+    indexer_leaves: Vec<Felt252>,
     indexer_hang: bool,
     // RPCs: the pinned one (`/rpc`) and the owner's exit RPC (`/exit-rpc`).
     pinned_down: bool,
@@ -381,17 +381,15 @@ impl Harness {
             .route("/v2/requests/{id}", get(request_route))
             .route("/v2/withdraw/clearance", post(clearance_route))
             .route(
-                "/v1/tree/root",
+                "/v1/tree/snapshot",
                 get(|State(world): State<Shared>| async move {
                     indexer_pause(&world).await;
-                    Json(json!({"root": world.lock().unwrap().indexer_root}))
-                }),
-            )
-            .route(
-                "/v1/tree/notes/{note}/path",
-                get(|State(world): State<Shared>| async move {
-                    indexer_pause(&world).await;
-                    Json(json!({"siblings": world.lock().unwrap().indexer_path}))
+                    let world = world.lock().unwrap();
+                    Json(json!({
+                        "root": world.indexer_root,
+                        "next_note_id": world.indexer_leaves.len(),
+                        "leaves": world.indexer_leaves,
+                    }))
                 }),
             )
             .with_state(world.clone());
@@ -446,7 +444,7 @@ impl Harness {
             world.logs = logs;
             world.known_roots.insert(deposit_root);
             world.indexer_root = deposit_root;
-            world.indexer_path = deposit_siblings.clone();
+            world.indexer_leaves = (0..=NOTE_ID).map(|id| tree.leaf(id)).collect();
         }
         let service = AuthService::new(config.clone()).unwrap();
         let (root, siblings) = match choice {
@@ -1084,9 +1082,7 @@ async fn without_a_deposit_path_the_escape_uses_a_known_root_or_rebuilds() {
         let mut world = harness.world.lock().unwrap();
         // The indexer reports a root the vault never held (a lying or
         // diverged indexer).
-        let mut lying = world.indexer_path.clone();
-        lying[0] = Felt252::from_u64(5);
-        world.indexer_path = lying;
+        world.indexer_leaves[0] = Felt252::from_u64(5);
         world.indexer_root = Felt252::from_u64(6);
     }
     let plan = harness.prepare(Some("0"), None).await.unwrap();
@@ -1352,12 +1348,7 @@ impl AuthService {
             let mut wallet = super::super::load_wallet(&config)?;
             let runtime = super::super::current_thread_runtime()?;
             let state = wallet.state().unwrap().clone();
-            let (root, siblings) = runtime.block_on(async {
-                Ok::<_, AuthError>((
-                    indexer.root().await?,
-                    indexer.note_path(state.note_id).await?,
-                ))
-            })?;
+            let (root, siblings) = runtime.block_on(indexer.root_and_path(state.note_id))?;
             wallet
                 .prepare_request_with_bound(
                     "{}",
@@ -1823,11 +1814,12 @@ async fn an_indexer_path_at_a_root_the_vault_never_held_is_rebuilt() {
     {
         let mut world = harness.world.lock().unwrap();
         // A tree with one more note than the vault ever recorded.
-        let mut path = world.indexer_path.clone();
-        path[1] = Felt252::from_u64(31);
-        let array: [Felt252; MERKLE_DEPTH] = path.clone().try_into().unwrap();
-        world.indexer_root = core::merkle_root(NOTE_ID, &harness.leaf, &array);
-        world.indexer_path = path;
+        world.indexer_leaves.push(Felt252::from_u64(31));
+        let mut tree = zkapi_core::merkle::MerkleTree::new();
+        for (id, leaf) in world.indexer_leaves.iter().enumerate() {
+            tree.set_leaf(id as u32, *leaf);
+        }
+        world.indexer_root = tree.root();
         assert!(!world.known_roots.contains(&world.indexer_root));
     }
     let plan = harness.prepare(Some("0"), None).await.unwrap();

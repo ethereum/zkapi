@@ -1066,8 +1066,7 @@ impl AuthService {
     }
 
     pub async fn oa_deposit_path(&self) -> Result<serde_json::Value, AuthError> {
-        let note_id = self.indexer.next_note_id().await?;
-        let siblings = self.indexer.zero_path(note_id).await?;
+        let (_, _, siblings) = self.indexer.next_deposit_path().await?;
         Ok(serde_json::json!({"zero_path": siblings}))
     }
 
@@ -1267,9 +1266,7 @@ impl AuthService {
 
             let runtime = current_thread_runtime()?;
             runtime.block_on(async move {
-                let next_note_id = indexer.next_note_id().await?;
-                let active_root = indexer.root().await?;
-                let zero_path = indexer.zero_path(next_note_id).await?;
+                let (next_note_id, active_root, zero_path) = indexer.next_deposit_path().await?;
                 let (secret, commitment) = wallet.generate_deposit_params();
 
                 Ok(DepositPlan {
@@ -4903,17 +4900,9 @@ mod oa_withdrawal_tests {
         let bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
         let router = Router::new()
             .route(
-                "/v1/tree/root",
-                get(move || async move { Json(serde_json::json!({"root": root})) }),
-            )
-            .route(
-                "/v1/tree/notes/0/path",
-                get({
-                    let siblings = siblings.clone();
-                    move || {
-                        let siblings = siblings.clone();
-                        async move { Json(serde_json::json!({"siblings": siblings})) }
-                    }
+                "/v1/tree/snapshot",
+                get(move || async move {
+                    Json(serde_json::json!({"root": root, "next_note_id": 1, "leaves": [leaf]}))
                 }),
             )
             .route(
@@ -5341,10 +5330,8 @@ mod oa_withdrawal_tests {
                 let root = if vault_root_moved { 5 } else { 1 };
                 Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":format!("0x{root:064x}")}))
             }))
-            .route("/v1/tree/root", get(move || async move { Json(serde_json::json!({"root": root})) }))
-            .route("/v1/tree/notes/0/path", get({
-                let siblings = siblings.clone();
-                move || { let siblings = siblings.clone(); async move { Json(serde_json::json!({"siblings": siblings})) } }
+            .route("/v1/tree/snapshot", get(move || async move {
+                Json(serde_json::json!({"root": root, "next_note_id": 1, "leaves": [leaf]}))
             }))
             .route("/v2/withdraw/clearance", post(move |State(seen): State<Seen>, Json(body): Json<Value>| {
                 let requested: Felt252 = serde_json::from_value(body["withdrawal_nullifier"].clone()).unwrap();
@@ -5976,7 +5963,7 @@ mod oa_withdrawal_tests {
     /// A reservation saved before `ownership_proof_sent` existed, by
     /// zkapi-clientd 0.1.6 (whose clearance requests carried no ownership
     /// proof) or a development build after it (which sent one whenever it
-    /// could build it). Release asks the indexer for the note's leaf: a
+    /// could build it). Release finds the note's leaf in a verified snapshot: a
     /// wrongly bound note, whose leaf is not in the tree, never had a proof
     /// built and is released on the server's unknown reading; a note whose
     /// leaf is there stays reserved before any server read.
@@ -6002,12 +5989,12 @@ mod oa_withdrawal_tests {
             note.deposit_amount,
             note.expiry_ts,
         );
-        // What the indexer answers for the note's path, and the reads made.
+        // What the indexer answers for the whole tree, and the reads made.
         type Seen = Arc<Mutex<(Value, usize, usize)>>;
         let seen: Seen = Arc::new(Mutex::new((Value::Null, 0, 0)));
         let router = Router::new()
             .route(
-                &format!("/v1/tree/notes/{}/path", note.note_id),
+                "/v1/tree/snapshot",
                 get(|State(seen): State<Seen>| async move {
                     let mut seen = seen.lock().unwrap();
                     seen.1 += 1;
@@ -6024,25 +6011,18 @@ mod oa_withdrawal_tests {
             .with_state(seen.clone());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let service = AuthService::new(config.clone()).unwrap();
-        let siblings = vec![Felt252::ZERO; zkapi_types::MERKLE_DEPTH];
+        let snapshot = |leaf| {
+            let mut tree = zkapi_core::merkle::MerkleTree::new();
+            tree.set_leaf(note.note_id, leaf);
+            let leaves: Vec<_> = (0..=note.note_id).map(|id| tree.get_leaf(id)).collect();
+            serde_json::json!({"root": tree.root(), "next_note_id": leaves.len(), "leaves": leaves})
+        };
         let mut other_leaf = note_leaf;
         other_leaf.0[31] ^= 1;
         for (case, answer, released) in [
-            (
-                "leaf in the tree",
-                serde_json::json!({"siblings": siblings, "leaf": note_leaf}),
-                false,
-            ),
-            (
-                "no leaf field",
-                serde_json::json!({"siblings": siblings}),
-                false,
-            ),
-            (
-                "another note's leaf",
-                serde_json::json!({"siblings": siblings, "leaf": other_leaf}),
-                true,
-            ),
+            ("leaf in the tree", snapshot(note_leaf), false),
+            ("missing snapshot", serde_json::json!({}), false),
+            ("another note's leaf", snapshot(other_leaf), true),
         ] {
             std::fs::write(&reservation, &legacy).unwrap();
             assert_eq!(
@@ -6065,7 +6045,7 @@ mod oa_withdrawal_tests {
             } else {
                 match result {
                     Err(AuthError::OwnershipProofSent) => assert_eq!(case, "leaf in the tree"),
-                    Err(AuthError::Indexer(_)) => assert_eq!(case, "no leaf field"),
+                    Err(AuthError::Indexer(_)) => assert_eq!(case, "missing snapshot"),
                     other => panic!("{case}: {other:?}"),
                 }
                 assert_eq!(server_reads, 0, "{case}: refused before asking the server");
@@ -6276,7 +6256,7 @@ mod oa_stale_root_tests {
                         status => (StatusCode::OK, Json(json!({"status":"ok","nullifier_status":status}))),
                     }
                 }))
-                .route("/v1/tree/root", get(|State(events): State<Events>| async move {
+                .route("/v1/tree/snapshot", get(|State(events): State<Events>| async move {
                     events.lock().unwrap().push("indexer");
                     StatusCode::SERVICE_UNAVAILABLE
                 }))
@@ -6689,10 +6669,10 @@ mod oa_stale_root_tests {
                 }),
             )
             .route(
-                "/v1/tree/root",
+                "/v1/tree/snapshot",
                 get(|State(events): State<Events>| async move {
-                    // Every new request proof starts by reading the root.
-                    events.lock().unwrap().push("root");
+                    // Every new request proof starts by reading a snapshot.
+                    events.lock().unwrap().push("snapshot");
                     StatusCode::SERVICE_UNAVAILABLE
                 }),
             )
@@ -6787,7 +6767,7 @@ mod oa_stale_root_tests {
             "{:?}",
             issued.err()
         );
-        assert_eq!(*events.lock().unwrap(), ["nullifier", "root"]);
+        assert_eq!(*events.lock().unwrap(), ["nullifier", "snapshot"]);
         server.abort();
     }
 }
@@ -7525,7 +7505,7 @@ mod oa_request_archive_tests {
             .route(&format!("/v2/nullifiers/{nullifier}"), get(|State(reply): State<Arc<Mutex<RequestResponseV2>>>| async move {
                 Json(json!({"status":"ok","nullifier_status":"finalized","request_response":*reply.lock().unwrap()}))
             }))
-            .route("/v1/tree/root", get(|| async { StatusCode::SERVICE_UNAVAILABLE }))
+            .route("/v1/tree/snapshot", get(|| async { StatusCode::SERVICE_UNAVAILABLE }))
             .with_state(reply.clone());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let service = AuthService::new(config.clone()).unwrap();

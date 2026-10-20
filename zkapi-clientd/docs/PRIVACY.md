@@ -7,6 +7,16 @@ The wallet/prover helper receives neither prompts nor responses nor model IDs.
 The provider sees the inference content. Client applications may store their
 own transcripts; the daemon cannot hide content already given to that UI.
 
+The wallet companion fetches `/v1/tree/snapshot` and derives note paths locally,
+as the web client does. It checks the leaf count and recomputed Merkle root
+before using the snapshot for requests, deposits or withdrawal checks. These
+lookups send no note ID to the indexer. An unavailable or invalid snapshot
+never triggers a per-note lookup; request preparation fails, while escape
+withdrawals can still use a saved deposit path or rebuild from vault logs.
+This requires an indexer with the snapshot endpoint and downloads the whole
+leaf vector, including retired leaves. The indexer still sees the connection
+and lookup timing.
+
 Web search is enabled by default through OpenRouter's web plugin. OpenRouter
 or its search provider processes search queries derived from the inference
 content, and search charges apply to every completion, including background UI
