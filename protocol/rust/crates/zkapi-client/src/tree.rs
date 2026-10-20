@@ -552,10 +552,8 @@ pub async fn note_leaves_at<R: JsonRpc>(
     if bytes.len() != 64 + 32 * count as usize {
         return Err(malformed());
     }
-    let head: Vec<[u8; 32]> = bytes
-        .chunks_exact(32)
-        .map(|chunk| chunk.try_into().expect("32-byte chunk"))
-        .collect();
+    // The length check above makes every word whole: no remainder.
+    let head: Vec<[u8; 32]> = bytes.as_chunks::<32>().0.to_vec();
     if small(&head[0], 8) != Some(32) || small(&head[1], 8) != Some(u128::from(count)) {
         return Err(malformed());
     }
