@@ -510,10 +510,10 @@ reverts `BatchOutOfGas`. So `eth_estimateGas` of the exact batch already
 covers destinations that burn their gas at inclusion. It is stateless,
 holds no ETH, takes no admin and is bound to one vault, so it can be
 redeployed at will. `gasBound(kinds)` returns an upper bound of a batch's
-execution gas (`VERIFY_BASE_GAS + n · VERIFY_ITEM_GAS` for the
-verification, measured on the worst case with 10% to spare, plus the
-reserve); a relayer sends at least that and never less than
-`eth_estimateGas`. The challenger batches defeats and raises through it
+execution gas (the call's entry, `VERIFY_BASE_GAS + n · VERIFY_ITEM_GAS` for
+the verification, measured on the worst case with 10% to spare, and the
+reserve; a call given exactly that lands every kind); a relayer sends at
+least that and never less than `eth_estimateGas`. The challenger batches defeats and raises through it
 ([challenge operation](challenge-service.md)), and serverd's close relay
 lands cooperative closes through it ([API](api-spec.md)).
 
@@ -529,10 +529,17 @@ close one plus, for a never-used destination, the account. The defaults are
 therefore 250,000 (close), 250,000 (escape), 150,000 (defeat), 150,000
 (raise) and 300,000 (finalize) under EIP-2929 pricing, and 500,000, 600,000,
 150,000, 150,000 and 400,000 under EIP-8037. The script measures a fresh
-slot (`FRESH_SLOT_PROBE`, through the RPC when there is one) to choose
-between them, and `EXIT_BATCHER_*_GAS` overrides either. A cap too small for
-a kind only skips its items (their owners can always submit them alone); a
-larger cap only raises the reserve a batch must carry.
+slot (`FRESH_SLOT_PROBE`, through the RPC) to choose between them, and
+`EXIT_BATCHER_*_GAS` overrides either; a broadcast whose RPC does not answer
+the probe needs all five set, since forge's own EVM always prices state as
+EIP-2929 does (a dry run without an RPC falls back to it). A cap too small
+for a kind only skips its items (their owners can always submit them alone):
+a close cap below about 160,000 skips closes whose treasury takes its whole
+100,000-gas push, a finalization cap below about 250,000 those whose
+destination and treasury both do. A larger cap only raises the reserve a
+batch must carry. A proof whose destination is the batcher itself is the
+prover's own mistake: its close is skipped (the batcher refuses ETH), and an
+escape's payout would be credited to the batcher, which can never claim it.
 
 Measured transaction gas per exit on this tree (21,000 + calldata +
 execution, every account cold, refunds capped at a fifth; `snapshots/exit-batcher-gas.json`):
@@ -540,10 +547,10 @@ execution, every account cold, refunds capped at a fifth; `snapshots/exit-batche
 | Exit | Single | Batch of 1 | 2 | 4 | 8 | 16 |
 |---|---|---|---|---|---|---|
 | close | 307,710 | 322,077 | 231,114 | 172,960 | 143,909 | 129,395 |
-| escape | 367,185 | 381,998 | 284,908 | 226,768 | 197,723 | 183,212 |
-| defeat | 286,960 | 301,972 | 198,426 | 140,315 | 111,272 | 96,765 |
-| raise | 277,479 | 292,546 | 191,970 | 135,353 | 107,069 | 92,932 |
-| finalize | 45,063 | 49,814 | 37,520 | 32,514 | 30,011 | 28,759 |
+| escape | 367,185 | 382,020 | 284,919 | 226,773 | 197,726 | 183,214 |
+| defeat | 286,960 | 301,994 | 198,437 | 140,320 | 111,274 | 96,766 |
+| raise | 277,479 | 292,568 | 191,981 | 135,359 | 107,072 | 92,933 |
+| finalize | 45,063 | 49,836 | 37,528 | 32,518 | 30,013 | 28,760 |
 
 A batch of one costs 5,000 to 15,000 more than the single call, so a relayer
 with one item calls the vault directly. Manifest fields: `exitBatcher`,

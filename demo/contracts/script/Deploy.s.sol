@@ -543,9 +543,6 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     /// schedule, which a fresh storage slot's measured price decides (EIP-8037 above
     /// FRESH_SLOT_GAS_BOUND).
     function _batcher() internal returns (Batcher memory b) {
-        b.freshSlotGas = _freshSlotGas();
-        bool repriced = b.freshSlotGas > FRESH_SLOT_GAS_BOUND;
-        b.schedule = repriced ? "eip8037" : "eip2929";
         string[5] memory names = [
             "EXIT_BATCHER_CLOSE_GAS",
             "EXIT_BATCHER_ESCAPE_GAS",
@@ -553,6 +550,13 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             "EXIT_BATCHER_RAISE_GAS",
             "EXIT_BATCHER_FINALIZE_GAS"
         ];
+        bool explicit = true;
+        for (uint256 k = 0; k < 5; ++k) {
+            if (!vm.envExists(names[k])) explicit = false;
+        }
+        b.freshSlotGas = _freshSlotGas(explicit);
+        bool repriced = b.freshSlotGas > FRESH_SLOT_GAS_BOUND;
+        b.schedule = repriced ? "eip8037" : "eip2929";
         for (uint256 k = 0; k < 5; ++k) {
             uint256 fallbackGas = repriced ? BATCHER_GAS_EIP8037[k] : BATCHER_GAS_MAINNET[k];
             b.itemGas[k] = vm.envOr(names[k], fallbackGas);
@@ -565,14 +569,23 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
 
     /// What one write of a nonzero word to a cold, zero slot costs on the target chain:
     /// FRESH_SLOT_PROBE's creation through the RPC (eth_call), or, without one (a dry run), on
-    /// forge's own EVM, where the probe's runtime code is the 32-byte measurement.
-    function _freshSlotGas() internal returns (uint256 freshSlotGas) {
+    /// forge's own EVM, where the probe's runtime code is the 32-byte measurement. A broadcast
+    /// needs the RPC's answer, unless every EXIT_BATCHER_*_GAS is set (`explicit`): forge's own EVM
+    /// prices state as EIP-2929 does, so falling back to it on an EIP-8037 chain would deploy the
+    /// batcher with caps its escapes cannot meet.
+    function _freshSlotGas(bool explicit) internal returns (uint256 freshSlotGas) {
         try vm.rpc("eth_call", string.concat('[{"data":"', vm.toString(FRESH_SLOT_PROBE), '"},"latest"]')) returns (
             bytes memory result
         ) {
             require(result.length == 32, "fresh-slot probe: unexpected eth_call result");
             return abi.decode(result, (uint256));
         } catch {
+            require(
+                explicit
+                    || !(vm.isContext(VmSafe.ForgeContext.ScriptBroadcast)
+                        || vm.isContext(VmSafe.ForgeContext.ScriptResume)),
+                "the exit batcher's caps follow the chain's gas schedule, which the RPC did not answer (eth_call of a creation): set every EXIT_BATCHER_*_GAS"
+            );
             address probe = _create(FRESH_SLOT_PROBE);
             bytes memory measured = probe.code;
             require(measured.length == 32, "fresh-slot probe: unexpected local result");

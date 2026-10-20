@@ -13,7 +13,10 @@ import {Types} from "../libraries/Types.sol";
 ///      each eight words A.x, A.y, B.x.c0, B.x.c1, B.y.c0, B.y.c1, C.x, C.y. A batch must revert
 ///      exactly when one of its items, verified alone by IZkApiProofAdapter's assertValid* (never
 ///      through a record), would revert, up to a soundness error of about 2^-128 per batch, and
-///      also for an empty batch or a proofs length other than 256 · n. It must refuse what a single
+///      also for an empty batch or a proofs length other than 256 · n. Only acceptance is
+///      equivalent: when a batch holds several faults, which revert it gives (an empty one for a
+///      dirty narrow field, InvalidProof() otherwise) follows the order of its checks, so it can
+///      differ from the first failing item's single verification. It must refuse what a single
 ///      verification refuses, in particular any public input at or above the BN254 scalar field
 ///      order (the vault keys nullifiers on raw words, so an input must never verify in a
 ///      non-canonical form, value + r) and any coordinate at or above the base field order.

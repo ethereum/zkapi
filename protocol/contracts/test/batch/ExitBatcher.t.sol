@@ -368,6 +368,58 @@ contract ExitBatcherTest is BatcherTestBase {
         assertEq(address(batcher).balance, 0);
     }
 
+    /// A batch of every kind, sent with exactly gasBound of its kinds (the execution gas: the
+    /// test's call frame stands in for the transaction), lands every item, at 1 and 16 items.
+    function test_gasBoundLandsEveryKind() public {
+        uint256 snapshot = vm.snapshotState();
+        for (uint256 size = 0; size < 2; ++size) {
+            uint256 n = size == 0 ? 1 : N;
+            uint8[] memory kinds = new uint8[](n);
+            (Types.WithdrawalPublicInputs[] memory ins, bytes memory prs) = _closes(0, n);
+            uint256 bound = batcher.gasBound(kinds);
+            (bool ok, bytes memory out) =
+                address(batcher).call{gas: bound}(abi.encodeCall(batcher.mutualCloseBatch, (ins, prs)));
+            assertTrue(ok && abi.decode(out, (uint256)) == _all(n), "closes at the bound");
+            vm.revertToState(snapshot);
+            for (uint256 i = 0; i < n; ++i) {
+                kinds[i] = 1;
+            }
+            (ins, prs) = _escapes(0, n);
+            bound = batcher.gasBound(kinds);
+            (ok, out) = address(batcher).call{gas: bound}(abi.encodeCall(batcher.initiateEscapeBatch, (ins, prs)));
+            assertTrue(ok && abi.decode(out, (uint256)) == _all(n), "escapes at the bound");
+            // the pending escapes: defeats and raises, then finalizations
+            uint256 pending = vm.snapshotState();
+            for (uint256 raise = 0; raise < 2; ++raise) {
+                for (uint256 i = 0; i < n; ++i) {
+                    kinds[i] = raise == 0 ? 2 : 3;
+                }
+                (
+                    uint32[] memory ids,
+                    uint128[] memory amounts,
+                    Types.RequestPublicInputs[] memory rins,
+                    bytes memory rprs
+                ) = _challenges(0, n, raise == 1);
+                bound = batcher.gasBound(kinds);
+                (ok, out) = address(batcher).call{gas: bound}(
+                    abi.encodeCall(batcher.challengeBatch, (ids, amounts, rins, rprs))
+                );
+                assertTrue(ok && abi.decode(out, (uint256)) == _all(n), "challenges at the bound");
+                vm.revertToState(pending);
+            }
+            vm.warp(block.timestamp + 1 days);
+            uint32[] memory fin = new uint32[](n);
+            for (uint256 i = 0; i < n; ++i) {
+                fin[i] = uint32(i);
+                kinds[i] = 4;
+            }
+            bound = batcher.gasBound(kinds);
+            (ok, out) = address(batcher).call{gas: bound}(abi.encodeCall(batcher.finalizeBatch, (fin)));
+            assertTrue(ok && abi.decode(out, (uint256)) == _all(n), "finalizations at the bound");
+            vm.revertToState(snapshot);
+        }
+    }
+
     /// gasBound adds the verification bound only when proofs are verified, and each kind's reserve.
     function test_gasBound() public view {
         uint8[] memory kinds = new uint8[](3);
@@ -376,7 +428,7 @@ contract ExitBatcherTest is BatcherTestBase {
         kinds[2] = 2;
         uint256 expected = batcher.VERIFY_BASE_GAS() + 3 * batcher.VERIFY_ITEM_GAS() + 2
             * ((DEFEAT_GAS * 64) / 63 + batcher.ITEM_OVERHEAD_GAS()) + (RAISE_GAS * 64) / 63
-            + batcher.ITEM_OVERHEAD_GAS() + batcher.RESERVE_MARGIN_GAS();
+            + batcher.ITEM_OVERHEAD_GAS() + batcher.RESERVE_MARGIN_GAS() + batcher.ENTRY_OVERHEAD_GAS();
         assertEq(batcher.gasBound(kinds), expected);
         uint8[] memory finals = new uint8[](2);
         finals[0] = 4;
@@ -384,6 +436,7 @@ contract ExitBatcherTest is BatcherTestBase {
         assertEq(
             batcher.gasBound(finals),
             2 * ((FINALIZE_GAS * 64) / 63 + batcher.ITEM_OVERHEAD_GAS()) + batcher.RESERVE_MARGIN_GAS()
+                + batcher.ENTRY_OVERHEAD_GAS()
         );
     }
 }

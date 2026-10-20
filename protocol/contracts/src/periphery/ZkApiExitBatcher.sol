@@ -58,6 +58,10 @@ contract ZkApiExitBatcher {
     uint256 public constant ITEM_OVERHEAD_GAS = 15_000;
     /// @notice The reserve's slack for the loop's own bookkeeping and the return.
     uint256 public constant RESERVE_MARGIN_GAS = 20_000;
+    /// @notice What a batch call spends before its reserve check besides the verification: the
+    ///         dispatch, the decoding of its arrays and the size checks (about 1,100 measured for 16
+    ///         finalizations; gasBound counts it so that the bound lands every kind).
+    uint256 public constant ENTRY_OVERHEAD_GAS = 10_000;
     /// @notice ItemSkipped carries at most this many bytes of a refused call's revert data.
     uint256 public constant MAX_REASON_BYTES = 256;
     /// @notice Bounds of a per-kind cap at construction.
@@ -222,16 +226,17 @@ contract ZkApiExitBatcher {
     }
 
     /// @notice An upper bound of a batch call's execution gas (without the transaction's 21,000
-    ///         and its calldata) for items of these kinds, kinds[i] item i's: the verification bound
-    ///         (none for finalizations) plus the reserve the call requires. A relayer sends at
-    ///         least this, and never less than eth_estimateGas of the exact batch.
+    ///         and its calldata) for items of these kinds, kinds[i] item i's: the call's entry, the
+    ///         verification bound (none for finalizations) and the reserve the call requires; a
+    ///         call given this much lands (test/batch/ExitBatcher.t.sol). A relayer sends at least
+    ///         this, and never less than eth_estimateGas of the exact batch.
     function gasBound(uint8[] calldata kinds) external view returns (uint256 gas) {
         uint256 proofs;
         for (uint256 i = 0; i < kinds.length; ++i) {
             gas += _itemReserve(itemGas(kinds[i]));
             if (kinds[i] != KIND_FINALIZE) ++proofs;
         }
-        gas += RESERVE_MARGIN_GAS;
+        gas += RESERVE_MARGIN_GAS + ENTRY_OVERHEAD_GAS;
         if (proofs != 0) gas += VERIFY_BASE_GAS + proofs * VERIFY_ITEM_GAS;
     }
 
