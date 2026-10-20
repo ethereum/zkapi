@@ -166,9 +166,18 @@ struct VaultRoots {
     last_read_at: Option<u64>,
     /// The removal fence read at the same block as the latest root.
     retirement_epoch: Option<[u8; 32]>,
+    latest_block_timestamp: Option<u64>,
 }
 
 impl VaultRoots {
+    fn is_fresh(&self, now: u64, max_age: u64) -> bool {
+        self.last_read_at
+            .is_some_and(|at| now.saturating_sub(at) <= max_age)
+            && self
+                .latest_block_timestamp
+                .is_none_or(|at| now.saturating_sub(at) <= max_age)
+    }
+
     fn latest(&self) -> Option<&VaultRootEntry> {
         self.entries.back()
     }
@@ -753,6 +762,7 @@ impl RequestProcessor {
                 reorg || retirement,
             );
             roots.retirement_epoch = Some(read.retirement_epoch);
+            roots.latest_block_timestamp = Some(read.block_timestamp);
         }
         if let Some(url) = indexer_url {
             let status = self.check_indexer_root(url, &read).await;
@@ -823,11 +833,11 @@ impl RequestProcessor {
             .lock()
             .map_err(|_| ServerError::Internal("root state lock poisoned".into()))?;
         let max = self.config.root_max_staleness_seconds;
-        let latest = match (roots.last_read_at, roots.latest()) {
-            (Some(at), Some(latest)) if now.saturating_sub(at) <= max => latest.root,
+        let latest = match roots.latest() {
+            Some(latest) if roots.is_fresh(now, max) => latest.root,
             _ => {
                 return Err(ServerError::RootUnavailable(format!(
-                    "no currentRoot() read from the vault in the last {max} s"
+                    "no currentRoot() read from a fresh vault block in the last {max} s"
                 )))
             }
         };
@@ -852,7 +862,7 @@ impl RequestProcessor {
     /// The root state for `/health` and `/metrics`.
     pub fn root_health(&self) -> RootHealth {
         let now = current_timestamp();
-        let (vault_root, vault_root_block, last_read_at, window_roots) = self
+        let (vault_root, vault_root_block, last_read_at, window_roots, fresh) = self
             .vault_roots
             .lock()
             .map(|roots| {
@@ -868,6 +878,7 @@ impl RequestProcessor {
                         .iter()
                         .filter(|entry| roots.admits(&entry.root, now, grace))
                         .count(),
+                    roots.is_fresh(now, self.config.root_max_staleness_seconds),
                 )
             })
             .unwrap_or_default();
@@ -881,8 +892,7 @@ impl RequestProcessor {
             vault_root,
             vault_root_block,
             vault_root_age_seconds,
-            vault_root_stale: vault_root_age_seconds
-                .is_none_or(|age| age > self.config.root_max_staleness_seconds),
+            vault_root_stale: !fresh,
             window_roots,
             indexer,
             indexer_disagreements,
@@ -7519,6 +7529,17 @@ mod tests {
         processor
             .admissible_root(&Felt252::from_u64(0xa), current_timestamp())
             .unwrap();
+        // A successful read of a nearly stale block must not buy another
+        // full freshness window while the next RPC attempt is stalled.
+        let now = current_timestamp();
+        chain.lock().unwrap().head_timestamp = Some(now - 59);
+        processor.refresh_roots(None).await.unwrap();
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xa), now + 2),
+            Err(ServerError::RootUnavailable(_))
+        ));
+        processor.vault_roots.lock().unwrap().latest_block_timestamp = Some(now - 61);
+        assert!(processor.root_health().vault_root_stale);
         server.abort();
     }
 
