@@ -8,10 +8,11 @@ API usage with proofs generated in the browser. Each authorization consumes a
 state nullifier; after usage settles, the server signs the next private balance
 and anchor.
 
-These docs describe **protocol v2**, circuit `zkapi-v2-concession-v1` (vault
-revision 3): Groth16 over BN254, Poseidon hashes, and Baby-JubJub commitments
+These docs describe **protocol v2**, circuit `zkapi-v2-concession-v2` (vault
+revision 4, leaf-bound exits): Groth16 over BN254, Poseidon hashes, and Baby-JubJub commitments
 with Schnorr signatures. Its concession exit lets a user leave without any
-cooperation from the operator.
+cooperation from the operator, and an exit needs only the note's own data: no
+Merkle path, root or indexer.
 
 ## What you get
 
@@ -46,7 +47,8 @@ then sends a nullifier, a rerandomized note-bound commitment, an authorization
 tag, and a Groth16 proof. The browser SDK runs the prover in WASM, using the
 same cryptographic libraries as the native Rust wallet library.
 
-**`serverd`** verifies proofs, checks the deployment and active root, rejects
+**`serverd`** verifies proofs, checks the deployment and a recent active root
+read from the vault, rejects
 conflicting nullifier reuse, and signs balance updates with its Schnorr key.
 It issues short-lived OpenRouter keys against proof-bound native ETH billing
 quotes and settles their measured usage. Prompts and responses pass directly
@@ -74,7 +76,7 @@ balance update and clearance, but cannot block an exit. See
 
 The current Groth16 and Baby-JubJub construction is not post-quantum. The
 checked-in proving keys are a single-party development setup; production keys
-come from a multi-party ceremony that has not run yet, and no revision-3 vault
+come from a multi-party ceremony that has not run yet, and no revision-4 vault
 is deployed. Artifact hashes establish identity, not setup security. See
 [Cryptography](/docs/cryptography) for setup trust and compatibility requirements.
 

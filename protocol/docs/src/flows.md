@@ -7,8 +7,9 @@
    signed state at the successor anchor of an earlier nullifier), solvency
    with the balance at most the deposit, rerandomization, and authorization
    for the exact request context.
-2. The server verifies deployment, signing keys, time, the exact current
-   root, bound and proof.
+2. The server verifies deployment, signing keys, time, the active root (the
+   vault's current root, or one the server read from the vault no more than
+   `request_root_grace_seconds` ago), bound and proof.
 3. A durable nullifier reservation, written with an append-only copy of the
    request proof, prevents competing spends.
 4. A short-lived OpenRouter lease determines usage.
@@ -26,18 +27,22 @@
 
 The client sends a kind-2 ownership proof of its current state (no
 destination, no successor nullifier, valid for at most an hour) with its
-clearance request. The server verifies it, reserves the nullifier and returns
-a clearance signature. The client proves a kind-1 close with that signature,
-and the vault consumes the nullifier and settles native ETH to the user and
-treasury. No Merkle work is done, and any root the vault ever held is
-accepted.
+clearance request. The server verifies it, reads the note's
+`noteRecord` from the vault (the stored leaf must equal the proof's note leaf
+and the note must be active), reserves the nullifier and returns a clearance
+signature. The client proves a kind-1 close with that signature, and the vault
+consumes the nullifier and settles native ETH to the user and treasury. No
+Merkle work is done and no root is involved: the vault compares the
+statement's note leaf with the one it stores for the note.
 
 ## Escape, defeat and raise
 
 The client proves a kind-0 escape from its newest state `S_k`. It publishes
 `N_k`, the successor's nullifier `N_{k+1}`, a conceded amount `c` up to the
 state's `bound_at_state`, and a `valid_until`. Initiation consumes both
-nullifiers and starts the challenge period; the leaf stays in the tree.
+nullifiers and starts the challenge period; the leaf stays in the tree. Like
+a close, it needs only the note's secret, ID, deposit and expiry and the
+newest state: no path, root or indexer.
 
 - A request proof at `N_{k+1}` shows the owner spent the successor, so the
   escape was stale. The challenge service submits it from the server's
@@ -54,7 +59,8 @@ the destination rejects the payout or needs more than 100,000 gas, the vault
 still closes the note and pays the treasury share, and credits the payout to
 that destination; anyone can deliver it later with
 `claimEscapePayout(destination)`. After a missed defeat, the challenge service
-retires the closed note's leaf (`retireClosedLeaf`).
+retires the closed note's leaf (`retireClosedLeaf`, with the siblings below
+the leaf's level and the rest zero-filled).
 
 If an active note is not withdrawn, its deposit can be claimed for the
 treasury after its effective expiry, which paused time and a defeat extend.

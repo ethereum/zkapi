@@ -599,7 +599,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     /// @notice The request tree's leaves start .. start + count - 1 (zero for a retired note), for a
     ///         rebuild of the tree from state. Reverts InvalidNoteRange unless start + count is at most
     ///         nextNoteId. A rebuild reads every page, nextNoteId() and currentRoot() at one block hash
-    ///         (EIP-1898); pages of 2,048 leaves cost about 4.5M gas each.
+    ///         (EIP-1898); pages of 2,048 leaves cost about 5.2M gas each.
     function noteLeaves(uint32 start, uint32 count) external view returns (uint256[] memory leaves) {
         if (uint256(start) + count > nextNoteId) revert Errors.InvalidNoteRange();
         leaves = new uint256[](count);

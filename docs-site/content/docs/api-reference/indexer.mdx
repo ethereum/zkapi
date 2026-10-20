@@ -3,11 +3,14 @@ title: indexer
 description: Contract-event mirror and depth-32 Merkle paths
 ---
 
-The indexer applies native vault events to a local Merkle tree. The browser
-uses it for deposits and, when it has no deposit-time path, for proving; the
-server uses it to confirm the current root and to learn which nullifiers are
-public; the challenge service uses it for a leaf retirement's path and as a
-hint of pending escapes. Defeats and raises need no indexer.
+The indexer applies native vault events to a local copy of the request tree.
+Clients use it for request-proof paths (or rebuild the tree from the vault's
+state instead); the server compares its root with the vault's as a health
+signal and uses it to learn which nullifiers are public; the challenge service
+uses it for a leaf retirement's path and as a hint of pending escapes;
+operators use it for the deposit preimages of expiry sweeps. Exits, defeats
+and raises need no indexer, and request admission never waits for it: the
+server reads its roots from the vault.
 
 | Method and path | Result |
 | --- | --- |
@@ -16,9 +19,8 @@ hint of pending escapes. Defeats and raises need no indexer.
 | `GET /v1/tree/root` | `{ root, next_note_id, block_number, block_hash }` |
 | `GET /v1/tree/next-note-id` | `{ next_note_id, root, block_number, block_hash }` |
 | `GET /v1/tree/snapshot` | `{ root, next_note_id, leaves, block_number, block_hash }` |
-| `GET /v1/tree/notes/{note_id}/path` | Occupied leaf, 32 siblings, `root`, `block_number`, `block_hash` |
-| `GET /v1/tree/notes/{note_id}/zero-path` | Empty-slot path for a deposit, with the same fields; deprecated (`Deprecation: true`) |
-| `GET /v1/tree/roots/{root}` | `{ root, known, current_root, block_number, block_hash }`: whether the vault ever set `root` |
+| `GET /v1/tree/notes/{note_id}/path` | `{ note_id, leaf, siblings, root, block_number, block_hash }`: the leaf and its 32 siblings |
+| `GET /v1/notes/{note_id}/deposit` | `{ note_id, leaf, status, deposit, block_number, block_hash }`: the note's `NoteDeposited` preimage (`deposit: { commitment, amount, expiry_ts }`, `null` for a note from before a state bootstrap) for `claimExpired` and `effectiveExpiry`, with its current leaf and a status hint (`active`, `pending_withdrawal`, `closed`, `unknown`); `404 unknown_note` for a note not deposited in the view (internal) |
 | `GET /v1/nullifiers/{nullifier}/published` | `{ nullifier, published, block_number, block_hash }`: whether a vault event named it as an exit's nullifier or successor nullifier |
 | `GET /v1/escapes/pending` | Pending escape withdrawals in the served view, with their concessions (internal) |
 
@@ -28,12 +30,14 @@ parameter that is not one answers `400 invalid_request`. The indexer decodes
 `EscapeConcessionRecorded`, `EscapeConcessionRaised`,
 `EscapeWithdrawalChallenged`, `EscapeWithdrawalFinalized`, `ExpiredClaimed`
 and `ClosedLeafRetired` strictly from Ethereum JSON-RPC and ignores other
-vault events. The tree is append-only: only `NoteDeposited` sets a leaf and
-only `ClosedLeafRetired` zeroes one, and every other event's root must equal
-the computed root. The indexer also keeps every root the vault ever set (the
-vault accepts withdrawal proofs at any of them) and every nullifier a vault
+vault events. The tree is append-only: only `NoteDeposited` sets a leaf
+(recomputed from the event's commitment, amount and expiry, which the indexer
+keeps) and only `ClosedLeafRetired` zeroes one. No event carries a root, and
+the vault keeps no root history; the indexer keeps every nullifier a vault
 event published. The block fields name the block whose vault state the
-response describes; a path's siblings hash to its `root`.
+response describes; a path's siblings hash to its `root`. The
+`/v1/tree/roots/{root}` and `/v1/tree/notes/{note_id}/zero-path` routes of
+earlier releases are gone (`404`): deposits need no path and exits no root.
 
 An indexer cannot forge membership: clients and contracts recompute roots from
 the supplied paths. Incorrect or stale paths can cause proving or transaction
@@ -45,25 +49,30 @@ responses.
 Every tree response comes from one verified view: the chain head, or the
 newest recent block whose vault state the indexer could confirm. The indexer
 applies each batch of events with consistency checks, then reads the vault's
-`currentRoot()` and `nextNoteId()` at that block hash and publishes the view
-only when both match its mirror. It persists a checkpoint only at
+`currentRoot()` (a computed view of up to about 0.5M gas, so the RPC's
+`eth_call` gas cap must allow at least 0.6M) and `nextNoteId()` at that block
+hash and publishes the view only when both match its mirror. It persists a checkpoint only at
 `--confirmations` blocks behind the head (default 12), and re-derives the head
 view from that checkpoint on every new head, so a shallower reorganization is
 absorbed. A checkpoint restored at startup is served only once this process
 has verified it, or a view built on it, against the vault. A deeper
 reorganization that changed the vault state, or a mirror that keeps
 disagreeing with the vault, takes the tree routes out of service and rebuilds
-the mirror from the deployment block. Automatic rebuilds are rate-limited.
+the mirror from the deployment block (or from the vault's state with
+`--bootstrap-from-state`). Automatic rebuilds are rate-limited.
 
 A shallow reorganization can also orphan the block of the view being served.
 The indexer keeps serving that view, with `/health` `ok`, until it publishes a
 new one: while its RPC cannot verify the new head, for up to
 `--stale-after-secs` (120 s) before it reports `stale`; while the re-derived
 view disagrees with the vault, until it declares the mirror diverged, after
-three polls and at least 30 seconds. A deposit built from such a view reverts
-`StaleRoot()`, and a withdrawal at a root the vault never held
-`UnknownRoot()`; build them again from a fresh path. The challenger checks a
-retirement's path against the vault's live root and is not misled.
+three polls and at least 30 seconds. A request proof built from such a view
+is refused `stale_root` by the server once its root is neither the vault's
+current root nor within the server's grace window (a reorganization drops
+every non-current root from that window), and a retirement from it reverts
+`StaleRoot()`; build them again from a fresh path. The challenger checks a
+retirement's path against the vault's `currentRoot()` at the path's block hash
+(`IndexerDiverged` otherwise) and is not misled.
 
 While no verified view is available, every tree route,
 `/v1/nullifiers/{nullifier}/published` and `/v1/escapes/pending` return `503`
@@ -78,7 +87,8 @@ tree. The public body never reveals the indexer's internal state.
 `GET /health` returns `200` only with status `ok`; otherwise it returns `503`
 with status `syncing`, `stale`, `diverged`, or `rebuilding`. Its body reports
 the head, served and confirmed blocks, roots, lag, failures, divergence and
-rebuild counts, `known_root_count`, `published_nullifier_count`, and
+rebuild counts, `state_note_count` (notes read from the vault's state at a
+bootstrap, whose history the mirror lacks), `published_nullifier_count`, and
 `missed_re_escape_count` with its subsets `missed_re_escape_finalized_count`
 and `missed_re_escape_raised_count`, exported as
 `zkapi_indexer_missed_re_escapes_total{event="challenged"}`,
@@ -91,8 +101,8 @@ a finalization at ERROR. The counts restart with the process. The view becomes
 `stale` after `--stale-after-secs` (default 120) without a verified poll, or
 when the RPC's head block is older than `--max-head-age-secs` (default 180;
 `0` disables the check for chains that mine on demand). Keep `/health`,
-`/metrics`, `/v1/nullifiers/` and `/v1/escapes/pending` internal; the
-reference gateway proxies only `/v1/tree/` to the indexer.
+`/metrics`, `/v1/notes/`, `/v1/nullifiers/` and `/v1/escapes/pending`
+internal; the reference gateway proxies only `/v1/tree/` to the indexer.
 
 `GET /v1/escapes/pending` returns
 `{ block_number, block_hash, root, escapes: [{ note_id, withdrawal_nullifier, challenge_deadline, final_balance, next_nullifier, state_balance, conceded }] }`
@@ -109,11 +119,25 @@ Both `zkapi-indexerd` and `zkapi indexer` accept `--confirmations`,
 `--chain-id`, `--resync`, `--stale-after-secs`, `--max-block-range` (default
 1000, above `--confirmations`) and `--max-head-age-secs`. `--resync`, or a
 `<cursor>.resync` file, archives the checkpoint and replays from
-`--from-block`. A checkpoint (version 3) is bound to one chain, vault and
-circuit, and records the last block with a lifecycle event, so a deep
-reorganization near one rebuilds the mirror. A version-2 checkpoint, whose
-tree removed leaves on exits, is archived and replayed. At startup the
-indexer requires the vault's `CONCESSION_ESCAPE_VERSION()` to be 1. The RPC must
+`--from-block`. `--bootstrap-from-state` (off by default; recommended for a
+new deployment) instead builds the mirror, only when there is no checkpoint
+(a first start or a resync) and on every automatic rebuild, from the vault's
+state: `noteLeaves` pages
+of 2,048 leaves, `nextNoteId()` and `currentRoot()`, all pinned to one block
+hash `--confirmations` below the head; the rebuilt tree must reproduce that
+root, and logs are followed from the next block. It needs no archive or log
+history, but the notes deposited before that block have no preimage, escape or
+published-nullifier history in the mirror: `deposit` is `null` for them,
+`/health` reports a nonzero `state_note_count`, and a published-nullifier
+query for a nullifier the table lacks answers `503` (never a false "not
+published"), on which serverd falls back to its own scan of the vault's
+logs. Bootstrapping a vault that has no notes yet loses nothing. A checkpoint (version 4) is bound to one chain, vault and
+circuit, keeps each note's leaf and deposit preimage, and records the last
+block with a lifecycle event, so a deep reorganization near one rebuilds the
+mirror. A version-3 checkpoint mirrors a revision-3 vault and is refused
+(restart with `--resync`); versions 1 and 2 are archived and replayed. At
+startup the indexer requires the vault's `CONCESSION_ESCAPE_VERSION()` and
+`LEAF_BOUND_EXIT_VERSION()` to be 1, so it refuses a revision-3 vault. The RPC must
 support `eth_getBlockByHash`, `eth_getLogs` results with block hashes and log
 indexes, and EIP-1898 `eth_call` by `{ blockHash, requireCanonical: true }`
 with state for at least the confirmation depth; archive state is not required.
@@ -121,9 +145,11 @@ with state for at least the confirmation depth; archive state is not required.
 ## Leaf binding and private path lookup
 
 The tree uses Poseidon over the BN254 scalar field with 32 sibling levels.
-Each occupied leaf binds the note ID, secret-derived registration, deposit,
-and expiry. The note-bound request and withdrawal circuits use this exact
-leaf in both membership verification and the signed balance commitment.
+Each occupied leaf is `P("zkapi.v2c.leaf", R, F)[1]`, one permutation over the
+secret-derived registration `R` and the packed fields `F = noteId·2^192 +
+deposit·2^64 + expiry`. The request circuit proves this leaf's membership; the
+withdrawal circuit binds an exit to the leaf itself, with no path. Both use it
+in the signed balance commitment.
 The indexer's `/v1` URLs are independent of the proof protocol's v2 version.
 
 `GET /v1/tree/snapshot` returns the whole tree's leaves for the served view.
@@ -131,9 +157,9 @@ Clients can rebuild the tree and derive paths locally without revealing a
 particular note ID in a request URL. Every client receives the same snapshot
 for the same view.
 
-Use current-root sibling paths when submitting a deposit or a leaf
-retirement. A withdrawal proof may use any root the vault ever held, including
-the one of the wallet's deposit-time path, and needs no siblings at
-submission. A defeat or raise supplies the original request proof with its
-historical root; do not rewrite its public inputs to the indexer's latest
-root.
+Use a current-root sibling path for a request proof (the server admits a
+replaced root for at most `request_root_grace_seconds`, 60 by default) and for
+a leaf retirement, which reads only the siblings below the leaf's level
+(zero-fill the rest). A deposit and a withdrawal need no path. A defeat or
+raise supplies the original request proof with its historical root; do not
+rewrite its public inputs to the indexer's latest root.

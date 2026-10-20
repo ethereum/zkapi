@@ -4,7 +4,7 @@ info:
   version: 0.2.0
   description: >-
     Native ETH lease, settlement and withdrawal Groth16 protocol API of
-    circuit zkapi-v2-concession-v1 (vault revision 3). Sepolia deployments may
+    circuit zkapi-v2-concession-v2 (vault revision 4). Sepolia deployments may
     require a shared password, advertised by public /health
     testnet_password_required. All service routes then require the
     TestnetPassword header and return 401 testnet_password_required when absent
@@ -21,11 +21,35 @@ paths:
       responses:
         "200":
           description: >-
-            Public health, including chain_id, current_root,
+            Public health, including status (ok, or degraded while still
+            serving: no vault root read within root_max_staleness_seconds, or
+            an indexer root that disagrees with the vault or cannot be read),
+            chain_id, current_root, request_root_grace_seconds,
+            vault_root_age_seconds, indexer_root (agrees, disagrees,
+            unavailable, unchecked or not_configured; health only),
             testnet_password_required, clearance_ownership_proof_required
             (always true), and the served statement: circuit_id, setup_id,
-            exit_concession (1) and settlement_window_seconds. The statement
-            fields are informational; clients use their build-pinned values.
+            exit_concession (1), leaf_bound_exit (1), vault_revision (4) and
+            settlement_window_seconds. The statement fields are
+            informational; clients use their build-pinned values. Always
+            HTTP 200, degraded included.
+  /metrics:
+    get:
+      security: []
+      summary: Request-root metrics (Prometheus text format)
+      responses:
+        "200":
+          description: >-
+            Prometheus text (version 0.0.4): zkapi_indexer_root_disagreement
+            (1 while the indexer's root differs from the vault's currentRoot()
+            at the indexer's block), zkapi_indexer_root_disagreements_total,
+            zkapi_indexer_root_unavailable, zkapi_vault_root_stale (1 while
+            requests are refused root_unavailable), zkapi_vault_root_age_seconds
+            and zkapi_vault_root_block (after a first vault read), and
+            zkapi_request_root_window_roots (the roots admission accepts now).
+          content:
+            text/plain:
+              schema: {type: string}
   /v2/auth:
     get:
       summary: Validate the Sepolia service password without side effects
@@ -61,7 +85,7 @@ paths:
               schema: {$ref: "#/components/schemas/OpenRouterLease"}
         "400": {description: "Invalid request, proof, or disabled lease mode, or request_limit_exceeded: the lease budget exceeds the server's per-request ceiling (nothing reserved)"}
         "404": {$ref: "#/components/responses/LeaseRecordUnreadable"}
-        "409": {description: "Existing active or settling lease, a used nullifier, or stale_root: the request's root is not the exact current root"}
+        "409": {description: "Existing active or settling lease, a used nullifier, or stale_root (retriable): the request's root is neither the vault's latest root nor a vault root the server read that was replaced within request_root_grace_seconds; latest_root is the latest"}
         "429":
           description: >-
             OA key capacity is temporarily limited, or the reference gateway
@@ -76,8 +100,9 @@ paths:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "503":
           description: >-
-            root_unavailable (retriable): the indexer's root and the vault's
-            currentRoot() disagree, or have not agreed recently enough
+            root_unavailable (retriable): the server has not read the vault's
+            currentRoot() within root_max_staleness_seconds. The indexer never
+            causes it
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
@@ -225,16 +250,18 @@ paths:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "409":
           description: >-
-            stale_root (retriable; the root is not one the server saw within
-            its window, the vault's currentRoot(), or any root the vault ever
-            held; latest_root is the vault's currentRoot()) or nullifier_used
-            (the nullifier has a request row)
+            note_leaf_mismatch (the vault's noteRecord(note_id) leaf, read
+            fresh after the proof verifies, is not the proof's note_leaf: a
+            wrong leaf, or an unknown or retired note; not retriable),
+            note_not_active (the note has a pending escape or is closed; not
+            retriable) or
+            nullifier_used (the nullifier has a request row)
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "429": {$ref: "#/components/responses/GatewayRateLimited"}
         "500":
-          description: internal_error (retriable), for example a failed vault root read
+          description: internal_error (retriable), for example a failed noteRecord read
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
@@ -449,18 +476,24 @@ components:
         proof: {$ref: "#/components/schemas/Groth16Proof"}
     WithdrawalPublicInputsV2C:
       type: object
-      description: The 16 withdrawal public inputs, in circuit order. Unknown fields are refused.
+      description: >-
+        The 16 withdrawal public inputs, in circuit order, as 18 fields:
+        note_leaf is input 4, and note_id, deposit_amount and expiry_ts pack
+        into input 9 (note_id·2^192 + deposit_amount·2^64 + expiry_ts).
+        Unknown fields, including active_root, are refused.
       additionalProperties: false
       required:
         - protocol_version
         - chain_id
         - contract_address
-        - active_root
+        - note_leaf
         - state_signing_key_x
         - state_signing_key_y
         - clearance_signing_key_x
         - clearance_signing_key_y
         - note_id
+        - deposit_amount
+        - expiry_ts
         - final_balance
         - destination
         - withdrawal_nullifier
@@ -472,12 +505,14 @@ components:
         protocol_version: {const: 2}
         chain_id: {type: integer, minimum: 1}
         contract_address: {$ref: "#/components/schemas/Felt"}
-        active_root: {$ref: "#/components/schemas/Felt"}
+        note_leaf: {$ref: "#/components/schemas/Felt", description: "The note's leaf, the word the vault stores for it"}
         state_signing_key_x: {$ref: "#/components/schemas/Felt"}
         state_signing_key_y: {$ref: "#/components/schemas/Felt"}
         clearance_signing_key_x: {$ref: "#/components/schemas/Felt"}
         clearance_signing_key_y: {$ref: "#/components/schemas/Felt"}
         note_id: {type: integer, minimum: 0, maximum: 4294967295}
+        deposit_amount: {type: integer, minimum: 0, description: "The note's deposit in gwei, from NoteDeposited"}
+        expiry_ts: {type: integer, minimum: 0, maximum: 18446744073709551615, description: "The note's bucketed expiry, from NoteDeposited"}
         final_balance: {type: integer, minimum: 0, description: "Payout in gwei: the state balance minus conceded"}
         destination:
           type: array
@@ -634,8 +669,8 @@ components:
             Stable machine code. OA limits use oa_minute_request_limit,
             oa_hourly_issuance_budget, or oa_rate_limited. Admission adds
             root_unavailable (503) and request_limit_exceeded (400). Clearance
-            adds clearance_ownership_required, nullifier_used and
-            capacity_exhausted. Recovery and evidence
+            adds clearance_ownership_required, note_leaf_mismatch and
+            note_not_active (409), nullifier_used and capacity_exhausted. Recovery and evidence
             add chain_read_unavailable (503) and published (410). Lease routes
             add lease_record_unreadable (HTTP 404, not retriable). The
             reference gateway uses gateway_rate_limited.

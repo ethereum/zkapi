@@ -2,12 +2,13 @@
 
 The browser SDK sends prompt-free proof authorizations to `zkapi-serverd`.
 Inference runs directly against the issued provider key. This is the API of
-circuit `zkapi-v2-concession-v1` (vault revision 3); [openapi.yaml](openapi.yaml)
+circuit `zkapi-v2-concession-v2` (vault revision 4, leaf-bound exits); [openapi.yaml](openapi.yaml)
 has the schemas.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/health` | Process and deployment summary, with `circuit_id`, `setup_id`, `exit_concession` and `settlement_window_seconds` |
+| GET | `/health` | Process and deployment summary, always HTTP 200: `status` `ok`, or `degraded` (still serving) while the indexer disagrees with the vault or cannot be read, or no vault root read is recent; the request-root state (`request_root_grace_seconds`, `vault_root_age_seconds`, `indexer_root`: `agrees`, `disagrees`, `unavailable`, `unchecked` or `not_configured`) and `circuit_id`, `setup_id`, `exit_concession`, `leaf_bound_exit`, `vault_revision` and `settlement_window_seconds` |
+| GET | `/metrics` | Operator route (the reference gateway does not proxy it): Prometheus text of the request-root state: `zkapi_indexer_root_disagreement`, `zkapi_indexer_root_disagreements_total`, `zkapi_indexer_root_unavailable`, `zkapi_vault_root_stale`, `zkapi_vault_root_age_seconds`, `zkapi_vault_root_block`, `zkapi_request_root_window_roots` |
 | GET | `/v1/attestation` | Public signing keys and protocol pins, with the same statement fields |
 | GET | `/v2/auth` | Validate the configured Sepolia shared password without side effects |
 | GET | `/v2/billing/quote` | Pinned finalized native ETH billing quote |
@@ -61,7 +62,8 @@ event as an exit's nullifier or successor nullifier), recovery returns the
 status only, without `request_response` or `settlement_deadline`. The server
 reads publication from the vault's `usedNullifiers` and `challengedNullifiers`,
 then its indexer's `/v1/nullifiers/{N}/published`; when that table cannot be
-read or no indexer is configured, it scans the vault's
+read or answers 503 (an indexer bootstrapped from state lacks the earlier
+events), or no indexer is configured, it scans the vault's
 `EscapeConcessionRecorded` logs from an hour before the reservation, over at
 most 50,000 blocks. When it still cannot tell, it answers retriable
 `503 chain_read_unavailable`, which clients treat as an unreachable server.
@@ -89,11 +91,22 @@ The authorization payload includes mode/version and its frozen `billing_quote`.
 The server recomputes payload/request binding, validates the native quote and
 verifies the proof. Proof bytes contain eight canonical 32-byte coordinates
 (256 bytes total). The request public inputs and their order are those of the
-earlier circuit; the circuit ID and keys are `zkapi-v2-concession-v1`'s.
+earlier circuit; the circuit ID and keys are `zkapi-v2-concession-v2`'s.
 
-Admission accepts only the exact current root, while the indexer's root and the
-vault's `currentRoot()` agreed within `--root-max-staleness-seconds` (default
-60; otherwise retriable `503 root_unavailable`). With
+Admission (O5') accepts a request whose `active_root` is the vault's latest
+`currentRoot()`, read by the server at the latest block hash, or a root the
+server read from the vault that the vault replaced no more than
+`--request-root-grace-seconds` ago (`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`,
+default 60, 0 to 600; 0 accepts only the latest root). Any other root answers
+retriable `409 stale_root` with the latest root in `latest_root`. Only roots
+read from the vault enter that window; when a recorded block hash is no longer
+canonical, the server keeps only the latest root. Without a successful vault
+read within `--root-max-staleness-seconds` (default 60) every request answers
+retriable `503 root_unavailable`. The indexer is a health signal only: a
+disagreement between its root and `currentRoot()` at its block hash is a
+warning, the `zkapi_indexer_root_disagreement` metric and a `degraded`
+`/health`, never a refusal. `stale_root` applies to requests only; clearance
+has its own errors (below). With
 `--request-limit-max-usd-micros`, a request whose lease budget exceeds that
 ceiling is refused before anything is reserved (`400 request_limit_exceeded`).
 Every reservation also stores an append-only copy of the request's public
@@ -139,8 +152,10 @@ operator assumption for direct mode.
 `POST /v2/withdraw/clearance` takes `ClearanceRequestV2C`,
 `{withdrawal_nullifier, ownership_proof: {public_inputs, proof}}`, and refuses
 unknown fields. The ownership proof is a kind-2 withdrawal proof for the same
-nullifier: `public_inputs` is `WithdrawalPublicInputsV2C` (16 fields, with
-`destination` as 20 byte values) with `kind: 2`, a zero destination,
+nullifier: `public_inputs` is `WithdrawalPublicInputsV2C` (the 16 statement
+inputs as 18 JSON fields: `note_leaf`, and `note_id`, `deposit_amount` and
+`expiry_ts`, which the statement packs into `note_fields`; `destination` as 20
+byte values; `active_root` is refused) with `kind: 2`, a zero destination,
 `conceded: 0`, `next_nullifier: 0`, and a `valid_until` no earlier than now and
 at most 3,600 seconds ahead; `proof` is
 `{backend: "groth16_bn254", proof: "base64..."}`. The vault refuses kind 2
@@ -149,10 +164,13 @@ proof from a state after sending its ownership proof, and sends at most one
 live ownership proof per state.
 
 The server requires the matching nullifier, kind and zero fields, its own
-deployment and both signing keys, a valid proof, and a root it observed within
-`--clearance-root-window-seconds` (default 3600), the vault's current root, or
-any root the vault ever held (`knownRoots`), such as the root of the wallet's
-deposit-time path. A request proof is never accepted. Errors:
+deployment and both signing keys, and a valid proof. It then reads the
+vault's `noteRecord(note_id)` at `latest`, fresh for every clearance and never
+cached: the stored leaf must equal the proof's `note_leaf` and the note must be
+`Active`. No root is involved; `--clearance-root-window-seconds` and
+`ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS` were removed in vault revision 4 and fail
+startup ("removed in vault revision 4: clearance checks the note leaf; delete
+this setting"). A request proof is never accepted. Errors:
 
 | Status | `error_code` | Meaning |
 | --- | --- | --- |
@@ -160,9 +178,10 @@ deposit-time path. A request proof is never accepted. Errors:
 | 400 | `invalid_proof` | The proof does not verify |
 | 400 | `invalid_request` | A body that does not parse, or a nullifier, kind, zero field, validity window or signing-key mismatch |
 | 400 | `protocol_mismatch` | Another protocol version, chain or vault |
-| 409 | `stale_root` | A root the vault never held; `latest_root` is the vault's `currentRoot()` |
+| 409 | `note_leaf_mismatch` | The vault's stored leaf for `note_id` is not the proof's `note_leaf` (a wrong leaf, or an unknown or retired note); not retriable |
+| 409 | `note_not_active` | The note has a pending escape or is closed (its leaf still stored); not retriable |
 | 409 | `nullifier_used` | The nullifier already authorized a request |
-| 500 | `internal_error` | Retriable; for example a failed vault root read |
+| 500 | `internal_error` | Retriable; for example a failed `noteRecord` read |
 | 503 | `capacity_exhausted` | Ownership-proof verification capacity is busy; retry the same body |
 
 A clearance reservation is permanent and its signature has no expiry; asking
@@ -174,33 +193,55 @@ ownership proofs. This circuit has no proof-less clearance:
 ## Indexer
 
 The indexer provides `/v1/tree/root`, `/v1/tree/snapshot`,
-`/v1/tree/notes/{note_id}/path`, `/v1/tree/notes/{note_id}/zero-path`
-(deprecated: it answers with `Deprecation: true`; exits need no zero-slot
-path), `/v1/tree/next-note-id` and `/v1/tree/roots/{root}`
-(`{root, known, current_root, block_number, block_hash}`: whether the vault
-ever set the root). Each response comes from one head view verified against
+`/v1/tree/notes/{note_id}/path` and `/v1/tree/next-note-id`, for request-proof
+paths; deposits and exits need none. The `/v1/tree/notes/{note_id}/zero-path`
+and `/v1/tree/roots/{root}` routes of vault revision 3 are removed (`404`).
+Each response comes from one head view verified against
 the vault's `currentRoot()` and `nextNoteId()` and carries that view's `root`,
-`block_number` and `block_hash`; `/v1/tree/root` also returns `next_note_id`.
+`block_number` and `block_hash`; `/v1/tree/root` answers
+`{root, next_note_id, block_number, block_hash}`.
 Without a verified view, these routes return `503` with `Retry-After: 5` and
 the constant body
 `{"status":"unavailable","error_code":"indexer_unavailable",...,"retriable":true,"retry_after_seconds":5}`.
 A path parameter that is not a canonical field element answers
 `400 invalid_request`.
 
-`/health` (`200` only when `ok`), `/metrics`,
-`/v1/nullifiers/{nullifier}/published` and `/v1/escapes/pending` are internal.
+`/health` (`200` only when `ok`; it reports `state_note_count`, the notes of
+the served view read from state at a bootstrap, in place of the former
+`known_root_count`), `/metrics`, `/v1/notes/{note_id}/deposit`,
+`/v1/nullifiers/{nullifier}/published` and `/v1/escapes/pending` are internal;
+`/v1/notes/{note_id}/deposit` is outside `/v1/tree/`, so the reference gateway
+does not expose it.
+`/v1/notes/{note_id}/deposit` answers
+`{note_id, leaf, status, deposit, block_number, block_hash}`, where `deposit`
+is the note's `NoteDeposited` preimage `{commitment, amount, expiry_ts}` (the
+arguments of `claimExpired` and `effectiveExpiry`; `null` for a note from
+before a state bootstrap) and `status` a hint (`noteRecord` is
+authoritative); `404 unknown_note` for a note the view has not seen.
 `/v1/nullifiers/{nullifier}/published` answers
 `{nullifier, published, block_number, block_hash}`: whether a vault event
-named the nullifier as an exit's nullifier or successor nullifier. serverd
-reads it before serving recovery or evidence. `/v1/escapes/pending` lists
+named the nullifier as an exit's nullifier or successor nullifier. A view
+bootstrapped from state answers only for a nullifier its table holds and
+`503` for any other, never a false "not published". serverd reads it before
+serving recovery or evidence. `/v1/escapes/pending` lists
 `{note_id, withdrawal_nullifier, challenge_deadline, final_balance, next_nullifier, state_balance, conceded}`
 for each open escape in the same view. Escapes change no leaf, so the root
 check does not cover the list: each entry is the last one applied from the
 vault's logs, a hint. Consumers must read `pendingWithdrawals(noteId)` and
 `pendingConcessions(noteId)` from the vault.
 
-The indexer's checkpoint is version 3, bound to one chain, vault and circuit;
-a version-2 checkpoint is archived and replayed from the deployment block, as
-is any checkpoint after `--resync` or a `<cursor>.resync` file. On-chain mutual
+The indexer's checkpoint is version 4, bound to one chain, vault and circuit,
+with each note's leaf and deposit preimage; a version-3 checkpoint (a
+revision-3 vault) is refused at startup with an instruction to restart with
+`--resync`, and versions 1 and 2 are archived and replayed from the
+deployment block, as is any checkpoint after `--resync` or a
+`<cursor>.resync` file. `--bootstrap-from-state` (off by default; recommended
+for a new deployment) builds the mirror from the vault's state instead
+(`noteLeaves` pages of 2,048, `nextNoteId()` and `currentRoot()` at one block
+hash), and only when there is no checkpoint (a first start or `--resync`) and
+on automatic rebuilds. On a vault that already has notes it loses their
+deposit preimages, the escapes and the published nullifiers from before that
+block (`deposit: null`, a nonzero `state_note_count`). The
+indexer refuses a vault whose `LEAF_BOUND_EXIT_VERSION()` is not 1. On-chain mutual
 close, escape and expiry recovery use the native vault ABI through the browser
 SDK.

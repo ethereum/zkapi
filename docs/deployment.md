@@ -1,7 +1,7 @@
 # Native ETH deployment
 
-The source supports native ETH vaults of circuit `zkapi-v2-concession-v1`
-(vault revision 3). The committed keys are the single-party development setup
+The source supports native ETH vaults of circuit `zkapi-v2-concession-v2`
+(vault revision 4, leaf-bound exits). The committed keys are the single-party development setup
 `dev`, which release builds refuse; production keys come from the multi-party
 ceremony in [the ceremony setup](../protocol/setup/v2-concession/README.md),
 which has not run yet. Publishing code does not establish an independent
@@ -11,9 +11,10 @@ Configure the exact circuit artifacts, contract, code-hash and signing-key
 pins, oracle feed, and denomination for the vault. Preserve persistent
 operator state and keep wallet journals bound to their configuration. A
 deployment of the legacy circuit `zkapi-v2-note-bound-v1` keeps running from
-the release line `release/v2-note-bound`; moving its users to a revision-3
+the release line `release/v2-note-bound`; moving its users to a revision-4
 vault is described in
-[the concession-vault migration runbook](migration-concession-vault.md).
+[the concession-vault migration runbook](migration-concession-vault.md), which
+also covers a vault of revision 3 ([Migrating from revision 3](#migrating-from-revision-3)).
 
 ## Build services
 
@@ -104,8 +105,8 @@ its vault's, treat it as compromised and follow
 `demo/contracts/script/Deploy.s.sol` deploys (or reuses) the vault's Poseidon,
 `Bn254PoseidonRuntime`, after requiring its runtime code hash to be the
 `runtime_codehash` of the setup's `poseidon-runtime.json`, deploys the circuit's
-Groth16 adapter and the native-only vault with its 12 constructor arguments
-(the Poseidon runtime's address last), and checks the adapter's circuit and
+Groth16 adapter and the native-only vault with its 13 constructor arguments
+(the Poseidon runtime's address and `minDeposit` last), and checks the adapter's circuit and
 verifying-key hashes against the setup manifest and the vault's getters
 against the inputs. The adapter is folded for its vault: its constructor takes
 the vault's address (the deployer's next creation, predicted with its nonce)
@@ -144,6 +145,7 @@ name the runtime contract.
 | `NOTE_TTL_SECONDS` | Note lifetime; default 30 days |
 | `MAX_PAUSE_DURATION_SECONDS` | Longest a pause blocks escapes and closes; at least twice the challenge period. Required except on local chains (default 7 days). Plan 3,888,000 (45 days) on Mainnet |
 | `REQUEST_CHARGE_CAP` | Per-request gwei limit; the script default is 1,000,000, the published deployments use 50,000, so pass it explicitly |
+| `MIN_DEPOSIT` | The smallest deposit in gwei (the vault's immutable `minDeposit()`, 1 to 2^53 - 1); default 1,000,000 (0.001 ETH). Every leaf of the request tree locks at least this much, so spam leaves lock capital; `deposit` reverts `DepositTooSmall()` below it. Recorded as `minDeposit` in the manifest and `min_deposit_units` in the profiles |
 | `SETUP_MANIFEST` | The setup's `manifest.json`; the adapter's hashes must match it. Required except on local chains (default `protocol/setup/v2-concession-dev`) |
 | `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains, Mainnet included ([Single-party setup](#single-party-setup)). Recorded as `allowDevSetup`; default 0 |
 | `POSEIDON_ADDRESS` | An already deployed `Bn254PoseidonRuntime` to reuse (it holds no state and no address of its own, so one deployment serves every vault on a chain); its runtime code hash must equal `runtime_codehash` in the `poseidon-runtime.json` next to `SETUP_MANIFEST`. Unset deploys a fresh one |
@@ -251,8 +253,15 @@ ideally behind a timelock, never a single deployer key:
 - Paused time extends every note's claim time, and after any unpause
   `claimExpired` waits at least `unpauseClaimGrace()`, the larger of
   `challengePeriod()` and one day. `effectiveExpiry(noteId)` returns the
-  earliest claim time assuming no further pause; `notes(noteId)` keeps the
-  nominal expiry. Inference ends at the nominal expiry regardless.
+  earliest claim time assuming no further pause; `noteRecord(noteId)` holds
+  only the note's leaf and status, so `effectiveExpiry` and `claimExpired`
+  take the note's commitment, amount and nominal expiry
+  (`effectiveExpiry(uint32,bytes32,uint128,uint64)`,
+  `claimExpired(uint32,bytes32,uint128,uint64)`), which must reproduce the
+  stored leaf (`effectiveExpiry` returns 0, and `claimExpired` reverts
+  `NoteLeafMismatch()`, otherwise). The indexer's checkpoint keeps each note's
+  `NoteDeposited` preimage for these sweeps. Inference ends at the nominal
+  expiry regardless.
 - `setTreasury(address)` only schedules a change (`TreasuryChangeScheduled`).
   `acceptTreasury()` applies it (`TreasurySet`) after `treasuryChangeDelay()`,
   the larger of `challengePeriod()` and two days, counted in unpaused time;
@@ -268,8 +277,20 @@ ideally behind a timelock, never a single deployer key:
   A mutual close to a destination that rejects ETH reverts, and withdrawals to
   the zero address or the vault itself revert `InvalidDestination()`.
 
-Withdrawal proofs may use any root the vault ever held (`knownRoots`); no
-withdrawal needs Merkle siblings, and an unknown root reverts `UnknownRoot()`.
+Withdrawals are bound to the note's leaf, not to a root: a withdrawal
+statement names the note's leaf and its packed fields (`noteId·2^192 +
+depositAmount·2^64 + expiryTs`), and the vault requires the note to be
+`Active` (`NoteNotActive()`) with that stored leaf (`NoteLeafMismatch()`)
+before it verifies the proof. No withdrawal needs Merkle siblings, a root or
+an indexer. The vault keeps no root history (`knownRoots`, `isKnownRoot` and
+`ROOT_HISTORY_WINDOW` are gone): `currentRoot()` computes the request tree's
+root from its frontier, and `noteLeaves(start, count)` and `frontier()` expose
+the state for rebuilds. `recordRoot()` is an optional, permissionless audit
+trail that nothing depends on. Because the deposit an exit settles comes from
+the proof-bound fields, a broken verifier or setup can drain the whole vault
+in one forged transaction rather than one per note; see
+[Amendment A3](design/concession-exit.md#amendment-a3-leaf-bound-exits) for
+the argument and the mitigations (the ceremony and the pins checked here).
 An escape consumes its nullifier and its successor's; a request proof at the
 successor defeats it and marks the escaped nullifier in
 `challengedNullifiers`, and a request proof at the escaped nullifier raises
@@ -280,6 +301,65 @@ and the migration runbook.
 Use a fresh directory when intentionally generating a new Groth16 setup.
 Keep challenger coverage and persistent server/indexer state available whenever
 the vault holds funds.
+
+### Deposit gas limit
+
+A deposit's gas depends on its note ID `n`: the vault stores the note's leaf
+(one fresh storage slot), hashes it into the request tree's frontier once per
+trailing one of `n` (none for an even `n`, one on average), and the first time
+a frontier level `t` is written, at `n = 2^t - 1` (31 times in the vault's
+life), writes one more fresh slot. Measured in separate cold transactions
+under mainnet pricing (`protocol/contracts/test/GasBaseline.t.sol`):
+
+| Note ID | Gas |
+| --- | --- |
+| 0, 2, 8 (even IDs) | 68,327 |
+| 1 (first write of level 1) | 105,980 |
+| 3 / 7 | 121,314 / 136,648 |
+| 255 / 1,023 | 213,318 / 243,986 |
+| 1,535 / 1,791 | 211,552 / 196,218 |
+| 2^31 - 1 (the deepest) | 566,000 (741,800 where a fresh slot costs about 110,000) |
+| average of the first 64 | 87,633 |
+
+An `eth_estimateGas` covers only the index it was estimated at, and a deposit
+that lands after others (or is front-run) may land on a dearer one; a deposit
+that runs out of gas reverts with nothing deposited. The SDK and zkapi-clientd
+(the companion sends no deposits) therefore set an explicit gas limit:
+
+- `m` = `nextNoteId()` and `E` = `eth_estimateGas`, both at `latest`; `W` = 64;
+- `t_now = trailing_ones(m)` and `t_max` the largest `trailing_ones(k)` for
+  `k` in `[m, m + W)`;
+- `extra = 16,500 × (t_max − t_now)`, plus 7,500 when `t_now = 0` and
+  `t_max > 0`, plus `fresh_slot_gas − 5,000` when some `2^j − 1` (`j ≥ 1`)
+  lies in `(m, m + W)` (a first write of a frontier level);
+- gas limit `= min(ceil(1.2 × (E + extra)), 1,500,000)`.
+
+`fresh_slot_gas` is the network's price of a fresh storage slot, pinned in
+the deployment profile: `scripts/deployment-profile.mjs` writes 22,100 for
+mainnet rules (chain 1 and the local chains 31337 and 1337) and 110,000 for
+Sepolia (EIP-8037), and needs `--fresh-slot-gas N` on any other chain. The
+profiles also pin `min_deposit_units` (the vault's `minDeposit()`), and both
+clients refuse a smaller deposit before sending it. Unused gas is refunded, so
+the margin costs nothing when it is not used.
+
+A depositor without that policy (a third-party wallet or contract) should send
+at least 650,000 gas under mainnet pricing, or 850,000 where a fresh slot costs
+about 110,000 gas: enough for every index, including `2^31 - 1`.
+
+### Migrating from revision 3
+
+A revision-4 vault is not an upgrade of a revision-3 one: it is a new
+deployment with a new circuit (`zkapi-v2-concession-v2`), new keys, a new
+manifest and profiles (`vault_revision` 4, `leaf_bound_exit` 1,
+`min_deposit_units`, `fresh_slot_gas`), a new database and new indexer and
+challenger checkpoints (indexer checkpoint v4; a v3 checkpoint is refused).
+This release refuses revision-3 keys, statements, manifests and profiles, and
+its clients never deposit into a revision-3 vault. The revision-3 vault keeps
+running with the stack it was deployed with for the notes it holds, which exit
+there; its operator closes its deposits, keeps its challenger and server up
+while it holds funds, and drains it (closes, escapes, then `claimExpired` at
+expiry) before retiring that stack. The order of the move is in
+[Moving from revision 3 to revision 4](migration-concession-vault.md#moving-from-revision-3-to-revision-4).
 
 ### Single-party setup
 
@@ -479,7 +559,8 @@ then the API server; the challenger must be healthy before the first deposit.
 The challenger needs a funded exclusive account, EIP-1559 fee caps whose bids
 fit the transaction fee cap of the node behind its signer
 (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, default 1 ETH, which allows about 1,666 gwei
-for a 600,000-gas defeat and about 138.9 gwei for a leaf retirement), and the
+for a 600,000-gas defeat and about 900 gwei for a leaf retirement, whose gas
+limit is its estimate plus 20%, at most about 1.1M), and the
 API server's database: it defeats and raises with the request evidence the
 server records. Keep the API running for every challenge window; see
 [challenge operation](challenge-service.md).
@@ -493,8 +574,42 @@ manifest's `settlement_window_seconds`; the challenger also checks that its
 raise lead fits the challenge period. See
 [settlement terminality](native-eth-billing.md#settlement-terminality).
 
+The server admits a request proof at the vault's current root or at any root
+it read from the vault's `currentRoot()` (at a block hash it fetched) and the
+vault replaced no more than `--request-root-grace-seconds`
+(`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`, default 60, 0 to 600; 0 admits only the
+current root) ago, and refuses every request `root_unavailable` only after
+`--root-max-staleness-seconds` (default 60) without a successful vault read.
+The indexer's root is a health signal, never an admission gate: a
+disagreement with `currentRoot()` at the indexer's block hash logs a warning,
+sets `zkapi_indexer_root_disagreement` on the server's `/metrics` (with
+`zkapi_indexer_root_disagreements_total`, `zkapi_indexer_root_unavailable`,
+`zkapi_vault_root_stale`, `zkapi_vault_root_age_seconds`,
+`zkapi_vault_root_block` and `zkapi_request_root_window_roots`; an operator
+route the reference gateway does not proxy) and reports `/health` `status`
+`degraded`, still with HTTP 200, as do an unreadable indexer and a vault read
+older than the staleness bound; `/health` also reports `indexer_root`,
+`vault_root_age_seconds`, `request_root_grace_seconds`, `leaf_bound_exit` and
+`vault_revision`. Alert on `degraded` and on `zkapi_vault_root_stale`.
+Clearance reads `noteRecord(note_id)` from the vault for every request,
+without a cache, and answers `409 note_leaf_mismatch` (a wrong leaf, or an
+unknown or retired note) or `409 note_not_active` (a pending escape or a
+closed note). `--clearance-root-window-seconds`
+(`ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS`) was removed in vault revision 4: it is
+hidden, and the server refuses to start while it is set ("removed in vault
+revision 4: clearance checks the note leaf; delete this setting"). The
+deployment manifest the server reads must carry, when it has those fields,
+`vault_revision` 4, `leaf_bound_exit` 1 and a `min_deposit_units` equal to
+the vault's `minDeposit()`; the profiles `deployment-profile.mjs` writes have
+all three.
+The native billing RPC must serve `eth_call` by block hash (EIP-1898) with a
+gas cap of at least 0.6M, because `currentRoot()` is a computed view of up to
+about 0.5M gas; see
+[request roots and clearance](../docker/aws/README.md#request-roots-and-clearance).
+
 The indexer (`zkapi-indexerd` or `zkapi indexer`) needs an RPC with EIP-1898
-`eth_call` by block hash, `eth_getBlockByHash`, and state for its confirmation
+`eth_call` by block hash (with a gas cap of at least 0.6M for the computed
+`currentRoot()`), `eth_getBlockByHash`, and state for its confirmation
 depth (`--confirmations`, default 12), plus an NTP-synchronized clock
 (`--max-head-age-secs`, default 180; 0 disables it for chains that mine on
 demand). Use a provider other than the `rpc_url` that client manifests pin:
@@ -506,7 +621,20 @@ for the vault's `currentRoot()`, which it reads before setting a request
 aside. Pass
 `--chain-id`. It serves only a view verified against the vault and
 answers 503 otherwise; `--resync`, or a `<cursor>.resync` file before a restart,
-rebuilds it from `--from-block`. The reference gateway limits POST requests per
+rebuilds it from `--from-block`. With `--bootstrap-from-state` (off by
+default; recommended for a new deployment) a start without a checkpoint (the
+first one, or after `--resync`) and every automatic rebuild read the tree from
+the vault's state instead: `noteLeaves` in pages of 2,048, then `nextNoteId()`
+and `currentRoot()`, all at one block hash `--confirmations` below the head,
+and it follows logs from that block. On a vault that already has notes, their
+`NoteDeposited` preimages (which operator expiry sweeps need), escapes and
+published nullifiers from before that block are then absent: the indexer's
+`/health` reports a nonzero `state_note_count`, its internal
+`/v1/notes/{id}/deposit` answers `deposit: null` for those notes, and its
+published-nullifier table answers 503 for a nullifier it lacks, on which the
+server falls back to its own scan of the vault's logs. Checkpoints are format
+v4; a v3 checkpoint is refused with an instruction to restart with
+`--resync`. The indexer's `/v1/tree/root` names its view's `block_hash`. The reference gateway limits POST requests per
 source; see [request limits](../docker/aws/README.md#request-limits).
 
 For a local chain, `npm run test:e2e:v2` runs the complete stack and the
@@ -536,7 +664,7 @@ demo deployment to Anvil and finalizes its manifest.
 The host application packages the SDK assets for the selected network. Review
 its trusted config against the finalized deployment manifest, on-chain state,
 the published expected code hashes and the selected proof hashes before
-enabling funding. Until a revision-3 vault exists on a network, its packaged
+enabling funding. Until a revision-4 vault exists on a network, its packaged
 profile is a `not_deployed` placeholder that the SDK build refuses.
 
 ### Operating gasless withdrawals
@@ -612,22 +740,22 @@ its measured charge, which covers the EntryPoint's cost within
 (`owed`).
 
 `maxSponsoredCost` also bounds the fees the paymaster sponsors. A close or
-escape that creates `S` signs about 1.41 million gas of limits with the
+escape that creates `S` signs about 1.40 million gas of limits with the
 default fields (`gasFields` in `sdk/services/zkapiGasless.mjs`: call 395,000,
-verification 300,000, paymaster verification 380,000, postOp 275,000 and a
-preVerificationGas of about 59,000; up to 1.5 million at `pvgCap`), and its
+verification 300,000, paymaster verification 370,000, postOp 275,000 and a
+preVerificationGas of about 59,000; up to about 1.49 million at `pvgCap`), and its
 `maxCost` is those limits times `maxFeePerGas`. Both clients choose it by
 one rule: `min(2 × base fee + tip, maxFeeCeiling)`, with the tip capped at
 `priorityFeeCeiling`, refused (`gas_above_paymaster_ceiling`, before any
 proof) only when `base fee + tip` exceeds `maxFeeCeiling`.
 At the default 0.05 ETH, operations
-are refused above a `maxFeePerGas` of about 35 gwei (`max_cost_above_policy`,
-before any proof; 0.05 ETH / 1.41M gas). Raise the policy toward
+are refused above a `maxFeePerGas` of about 36 gwei (`max_cost_above_policy`,
+before any proof; 0.05 ETH / 1.40M gas). Raise the policy toward
 `1.5M × maxFeeCeiling` to sponsor up to the ceiling, and fund the float to
 match, within the immutable hard cap of 0.25 ETH per operation (`setPolicy`
 reverts `PolicyOutOfBounds` above it, and `Deploy.s.sol` refuses a larger
 `PAYMASTER_MAX_SPONSORED_COST_WEI`). That cap stops sponsorship above a
-`maxFeePerGas` of about 177 gwei (0.25 ETH / 1.41M gas; 167 gwei at
+`maxFeePerGas` of about 179 gwei (0.25 ETH / 1.40M gas; 168 gwei at
 `pvgCap`) whatever the ceiling: a ceiling above that, such as a testnet's 200 gwei, matters only
 for operations with smaller limits. These figures follow the pinned gas
 policy: recompute them with `gasFields` whenever it changes.
@@ -675,11 +803,13 @@ initiation (about 643,000 gas, `handleOpsRealEscape` in
 `protocol/contracts/snapshots/gasless-gas.json`) on top of the existing
 challenge (about 284,000 gas, `challengeEscapeWithdrawal` in
 `snapshots/concession-exit-gas.json`) when the escape is defeated, against
-the attacker's deposit gas (about 0.58M per transaction, 573,516 to 609,678
-in `GasBaseline.t.sol`, recovered later): about 0.93M of the operator's gas per
-0.58M of the attacker's, roughly 1.6:1 against the operator. The Poseidon
-runtime made deposits about 40% cheaper and moved this ratio from about 1:1;
-review it, and if needed raise `minEscapeNetWei` or the deposit floor, before
+the attacker's deposit gas (68,327 for most note IDs and 87,633 on average
+over the first 64 in `GasBaseline.t.sol`, against about 0.58M in revision 3):
+about 0.93M of the operator's gas per 0.07M to 0.09M of the attacker's, roughly
+10:1 or more against the operator. Each such deposit also locks at least
+`minDeposit` (0.001 ETH by default), recovered only through an exit. Revision
+4's cheap deposits moved this ratio from about 1.6:1; review it, and if needed
+raise `minEscapeNetWei` or deploy with a higher `MIN_DEPOSIT`, before
 enabling sponsored escapes anywhere but a drill. Enable it on the
 Sepolia drill, and decide for mainnet from the `EscapeInitiationOwed` and
 `owedPaid` data. Keep `minEscapeNetWei` at least 10 × a typical initiation

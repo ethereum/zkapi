@@ -1,15 +1,19 @@
 # Note-bound commitments
 
-A signed balance commitment binds to the same note used by the Merkle-membership
-proof:
+A signed balance commitment binds to the same note leaf the request proof
+proves in the tree and the withdrawal proof publishes:
 
 ```text
-L = Poseidon(leaf_domain, note_id, registration(secret), deposit, expiry)
+F = note_id * 2^192 + deposit * 2^64 + expiry            // note fields, < 2^224
+L = P(leaf_domain, registration(secret), F)[1]            // one permutation, zkapi.v2c.leaf
 C = balance * G + blinding * H + L * J
 ```
 
 Both request and withdrawal circuits compute `L` from the exact private values
-used by the Merkle-membership proof. They use that same `L` to open the signed
+(range-checked note ID, deposit and expiry) they use elsewhere: the request
+circuit proves `L`'s membership in the request tree, and the withdrawal
+circuit publishes `L` and `F`, which the vault compares with the leaf it
+stores for the note. They use that same `L` to open the signed
 commitment. `J` is independently derived with Keccak try-and-increment from
 `zkapi.v2.note-binding.generator.v1`, choosing even y and clearing the cofactor.
 No known scalar relation to `G` or `H` is introduced. The full canonical BN254
@@ -29,7 +33,7 @@ assumptions. Groth16/BN254 and Baby-JubJub are not post-quantum.
 
 ## The nullifier chain is note-bound too
 
-Circuit `zkapi-v2-concession-v1` also binds each state's nullifier and the
+Circuit `zkapi-v2-concession-v2` also binds each state's nullifier and the
 anchors of its successors to the note:
 
 ```text
@@ -52,8 +56,8 @@ make, defeats the escape. See the
 
 ## Compatibility and setup
 
-The circuit identifier is `zkapi-v2-concession-v1`. Proving and verifying key
-files carry the header `zkapi-v2-concession-v1/<setup_id>/<kind>\0`; loaders
+The circuit identifier is `zkapi-v2-concession-v2`. Proving and verifying key
+files carry the header `zkapi-v2-concession-v2/<setup_id>/<kind>\0`; loaders
 reject a key of another circuit, of the other kind, or of a setup the build
 does not accept, before decoding. Release builds accept only the ceremony
 setup `mpc-1` with its pinned verifying-key hashes. Public deployment
@@ -84,8 +88,8 @@ Operate `zkapi-challenged` alongside the server and indexer, with durable
 retries and an explicit restricted signer. It defeats an escape with any
 verified request proof at the escape's successor nullifier, from the server's
 append-only request evidence, and otherwise raises the escape's concession to
-what the request at the escaped state owes. Neither needs the live root: a
-request proof keeps its historical root. Keep the API server available
+what the request at the escaped state owes. Neither needs the live root: the
+vault does not check a defeat's or raise's request root. Keep the API server available
 through every challenge window. See [service operation](challenge-service.md).
 
 Direct OpenRouter retirement persists disable, grace, usage capture and

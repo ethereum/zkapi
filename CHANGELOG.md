@@ -37,6 +37,33 @@ Folded into 0.2.0's notes at release.
 
 ### Changed
 
+- **Leaf-bound exits (circuit `zkapi-v2-concession-v2`, vault revision 4).**
+  An exit proves no Merkle path: the withdrawal statement publishes the
+  note's leaf (input 3, was `activeRoot`) and its packed fields
+  `noteId·2^192 + depositAmount·2^64 + expiryTs` (input 8, was `noteId`), and
+  the vault compares the leaf with the one word it stores per note
+  (`leaf | status << 254`). The leaf is one Poseidon permutation with the
+  capacity domain `zkapi.v2c.leaf`; the withdrawal circuit drops from 28,772
+  to 20,545 constraints (request 23,990 → 23,507), its proving key from 5.58
+  to 4.26 MB. The vault keeps only the request tree's frontier
+  (`currentRoot()` is now computed; `noteLeaves` and `frontier` expose the
+  state for rebuilds), retires a closed leaf over the sub-path below its
+  level, and replaces the per-note active expiry with pause epochs and
+  `graceUntil`. Measured in separate cold transactions against the previous
+  revision (`test/GasBaseline.t.sol`): a deposit 573,516 → 68,327 gas
+  (average of the first 64: 579,889 → 87,633), retiring the same closed note
+  939,846 → 71,960; an escape, a close and a defeat stay within ±5,000 for
+  the fixture's notes 0 and 1 (whose old statements skipped a scalar
+  multiplication that `noteFields` always takes) and are cheaper for any
+  other note; `claimExpired` 50,503 → 62,361 (it recomputes the leaf). The
+  server admits request proofs at any root it read from the vault within
+  `request_root_grace_seconds` (default 60) and treats the indexer as a health
+  signal only; clearance reads `noteRecord` fresh. A new `minDeposit` (default
+  0.001 ETH) makes every leaf lock capital, and `recordRoot()` is an optional
+  audit trail nothing depends on. See
+  [Amendment A3](docs/design/concession-exit.md#amendment-a3-leaf-bound-exits),
+  including its statement that a broken verifier or setup can now drain the
+  vault in one transaction.
 - **Network fees cut across the board (vault revision 3, circuit setup
   regenerated).** Measured with CI's pinned Forge against the previous
   revision: `deposit` ~6,000,000 gas → ~1,000,000; `mutualClose` 427,837 →
@@ -198,10 +225,10 @@ Folded into 0.2.0's notes at release.
 ### Breaking
 - **`deposit(bytes32 commitment, uint128 amount)`** (selector `0x56d2e1ea`)
   replaces `deposit(bytes32,uint128,uint256[32])`: the siblings argument is
-  gone. The SDK (`encodeDeposit`) and zkapi-clientd send the new calldata and
-  keep the deposit-time path locally for the note's exit proof; clientd ties
-  a prepared deposit slot to its signed transaction by nonce
-  (`signed_nonce`) rather than by the calldata's sibling words.
+  gone. The SDK (`encodeDeposit`) and zkapi-clientd send the new calldata
+  (revision 4's exits, below, need no path at all); clientd ties a prepared
+  deposit slot to its signed transaction by nonce (`signed_nonce`) rather
+  than by the calldata's sibling words.
 - **The note tree's roots change** (see Changed): proofs, paths and roots
   from any earlier deployment or fixture do not carry over, and the browser
   bundle (`sdk/wasm`) must be rebuilt with `scripts/build-browser-client.sh
@@ -219,9 +246,10 @@ Folded into 0.2.0's notes at release.
   `supportsInterface` (ERC-165), and the paymaster refuses a vault whose
   adapter lacks them (`BadVault`).
 - **`pendingWithdrawals` word 1 (`activeRoot`) is always zero.** The vault
-  never read the escape proof's root and no longer stores it; the escape's
-  calldata carries it. The getter keeps its 6 words and selector. The SDK's
-  `readBrowserWithdrawalStatus` no longer returns `active_root`.
+  never read the escape proof's root and no longer stores it (revision 4's
+  escape statement carries no root at all). The getter keeps its 6 words and
+  selector. The SDK's `readBrowserWithdrawalStatus` no longer returns
+  `active_root`.
 - **Gasless withdrawals are not deployed on Sepolia** for now: it prices state
   creation under EIP-8037, and the paymaster refuses that schedule (see
   Changed). Deploy Sepolia vaults with `GASLESS=0`, and run the gasless drills
@@ -247,6 +275,48 @@ Folded into 0.2.0's notes at release.
   storage layout changed (the merged nullifier words). No client reads either
   through `eth_getStorageAt`.
 
+- **Vault revision 4 and circuit `zkapi-v2-concession-v2` replace revision 3
+  and `zkapi-v2-concession-v1`.** Keys, statements, fixtures and profiles of
+  the previous circuit are refused (key headers, `CIRCUIT_ID_HASH`, adapter
+  selectors `assertValidWithdrawal` `0xa730baaa` and `verifyWithdrawalOnce`
+  `0x04f7ff68`, interface ID `0x90c99ce1`); a revision-3 deposit exits from
+  its own vault. Withdrawal statements (`WithdrawalPublicInputsV2C` JSON)
+  carry `note_leaf`, `deposit_amount` and `expiry_ts` instead of
+  `active_root`, and exits take no Merkle path (`deposit_path` /
+  `merkle_path` are read and ignored where old data has them).
+- **Vault interface.** `mutualClose` is `0xbce12a6c`, `initiateEscapeWithdrawal`
+  `0x8cd67c60`, `claimExpired(uint32,bytes32,uint128,uint64)` `0xad610550` and
+  `effectiveExpiry(uint32,bytes32,uint128,uint64)` `0x5a747a98` (both take the
+  note's commitment, amount and expiry, and `effectiveExpiry` returns 0 for a
+  retired or mismatched note). `notes()`, `knownRoots`, `isKnownRoot`,
+  `ROOT_HISTORY_WINDOW` and `UnknownRoot` are gone; use `noteRecord(uint32)`
+  (`0xd154f5bf`, leaf and status), `noteLeaves`, `pausedBefore`, `graceUntil`,
+  `pauseEpochCount`, `minDeposit` and `LEAF_BOUND_EXIT_VERSION()` (`1`). The
+  constructor takes a 13th argument, `uint128 minDeposit_` (`MIN_DEPOSIT` in
+  `Deploy.s.sol`, default 1,000,000 gwei); `deposit` reverts `DepositTooSmall`
+  below it and `TreeFull` at note ID 2^32 − 1. `retireClosedLeaf` reads only
+  the siblings below the leaf's level (callers zero-fill the rest).
+- **Events carry no root.** `NoteDeposited` has 2 data words (amount,
+  expiry); `EscapeWithdrawalInitiated`, `EscapeWithdrawalChallenged`,
+  `ExpiredClaimed` and `ClosedLeafRetired` lose their root word (new topics
+  in `vault_calldata_golden.json`); `RootRecorded` is new.
+- **Manifests and profiles.** The deployment manifest drops
+  `rootHistoryWindow` and adds `minDeposit`, `leafBoundExitVersion` and
+  `vaultRevision: 4`; profiles carry `vault_revision: 4`, `leaf_bound_exit: 1`,
+  `min_deposit_units` and `fresh_slot_gas` (`deployment-profile.mjs
+  --fresh-slot-gas` on chains other than mainnet, Sepolia and local).
+- **Server configuration.** `--clearance-root-window-seconds` /
+  `ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS` are removed and fail startup with a
+  migration message; `--request-root-grace-seconds` /
+  `ZKAPI_REQUEST_ROOT_GRACE_SECONDS` (default 60, 0 to 600) is new. Clearance
+  answers 409 `note_leaf_mismatch` or `note_not_active` from a fresh
+  `noteRecord` read.
+- **Indexer.** Checkpoints are format v4 (v3 is refused: rebuild);
+  `/v1/tree/roots/{root}` and `/v1/tree/notes/{id}/zero-path` are gone.
+- **Gasless paymaster.** `PM_VERIFICATION_FLOOR` is 340,000 (was 350,000);
+  `NoteLeafMismatch` and `InvalidNoteFields` replace `UnknownRoot`.
+- **Challenge signer.** `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` defaults to
+  4 (was 2).
 - None: the change is additive. Profiles without `gasless` (or with
   `gasless: null`) keep working with the wallet-pays path.
 

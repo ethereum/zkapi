@@ -1,10 +1,12 @@
-# zkAPI concession exit: final specification (circuit `zkapi-v2-concession-v1`, vault revision 3), red-team revision
+# zkAPI concession exit: final specification (circuit `zkapi-v2-concession-v1`, vault revision 3), red-team revision, with Amendment A3 (leaf-bound exits: circuit `zkapi-v2-concession-v2`, vault revision 4)
 
 > **Status:** design and migration plan for circuit `zkapi-v2-concession-v1` (vault revision 3). Implemented with the `dev` setup in `protocol/setup/v2-concession-dev`; no revision-3 vault is deployed, and the packaged profiles are `not_deployed` placeholders. The multi-party setup, external review, Sepolia drill and mainnet rollout in §10 are operational gates, not yet run. Where the implementation differs from this text, [Implementation status](#implementation-status) records it. The operator runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
 >
 > **Amendment A1 (any known root).** §4.2 step 6 and §4.5 accept any root the vault ever held, not only the current root or one retired within 1 day. The tree is append-only for every note that is not `Closed` (`retireClosedLeaf` only removes a `Closed` note's leaf), so every root recorded since a note's deposit contains that note's leaf, and `initiateEscapeWithdrawal` and `mutualClose` require `Active`. The vault records every root it sets (`knownRoots[root] = true`, one extra SSTORE per deposit and per retirement), and a client can exit with the Merkle path it saved at deposit, with no indexer and no log rebuild. §6.6's rebuild remains the fallback for a client that has no saved path.
 >
 > **Amendment A2 (the 30-day transition).** §10.7 C5 and E2 to E3 are read with this. The deployed legacy vaults give a note a 30-day life (rounded up to a UTC midnight) and a 24-hour challenge period, and the owner never pauses them, so the drain is bounded by the note life. **Day 0** is the moment the legacy deposit routes close, in the same change window as the new vault's go-live. `N_C = nextNoteId()` read then separates transition notes (ID below `N_C`) from late notes (direct deposits after day 0). **`X` is the expiry of note `N_C - 1`**, before day 31, not Phase C + 30 days: every transition note has expired or exited by `X`, so closing legacy admission at `X` costs no owner who acted in time any service. The legacy stack retires about a day after `X` (about day 32), or, with late notes, when they too are closed or swept (before day 63). A legacy server cannot tell the two kinds of note apart, because a request hides its note ID. The runbook's [30-day transition](../migration-concession-vault.md#the-30-day-transition-for-existing-users) is the schedule.
+
+> **Amendment A3 (leaf-bound exits; circuit `zkapi-v2-concession-v2`, vault revision 4).** Supersedes Amendment A1 and, where they conflict, §3.3 W5, §4.1 to §4.5, §4.9, §5.2 O5, §5.3, §5.5, §6.4 E4, §6.6, §7.1 O5, §7.3, §7.4 and §8. Exits no longer prove Merkle membership: the withdrawal statement publishes the note's leaf `L` (input 3, was `activeRoot`) and its packed fields `F = noteId·2^192 + D·2^64 + e` (input 8, was `noteId`), the leaf is one Poseidon permutation `P("zkapi.v2c.leaf", R, F)[1]` in both circuits, and the vault stores one word per note (`leaf | status << 254`) and compares it with `L` before verifying. The vault keeps no root and no root history; the request tree is its frontier and `currentRoot()` is a computed view. The server admits request proofs at any root it read from the vault within `request_root_grace_seconds` (O5'), clearance reads `noteRecord` fresh, and a new `minDeposit` makes leaves lock capital. A broken verifier or setup can now drain the vault in **one** forged transaction (§A3.7). The full text is [Amendment A3](#amendment-a3-leaf-bound-exits) below.
 
 
 Baseline: repository at `ac9be63`, circuit `zkapi-v2-note-bound-v1`. Every "today" figure comes from the five maps in `scratchpad/circuit`. I computed the selectors and topics below with Foundry `cast` against the exact signatures given; implementers must re-derive them and pin them in tests. This revision answers the red-team findings. The appendix records what was done with each one.
@@ -1377,6 +1379,93 @@ decide S1 + CircomReduction ─► WP-A ──► WP-B ─┐
 | 35 | low | Tree rebuild needs per-event checks and realistic RPC limits | **Fixed** | Per-event root equality, scan only to the finalized block, comparison to the last event's root (no archive reads), adaptive chunking, retirement fixture. §6.6 |
 | 36 | low | For a forced early exit, conceding 0 dominates | **Fixed** | Forced early exits default to `c = 0` (the user may pick `b_k` for privacy). E2-unreachable also uses `c = 0`. `c = b_k` only at or after `T`. §6.4 E2, E3; §9.2 |
 | 37 | low | Startup self-test signs with the production key | **Fixed** | The self-test uses an ephemeral in-memory key. The production path asserts anchor derivation before the signing call. §5.1 |
+---
+
+## Amendment A3: leaf-bound exits
+
+Circuit `zkapi-v2-concession-v2`, vault revision 4, capability `LEAF_BOUND_EXIT_VERSION() == 1`. Adopted before the ceremony; the development setup was regenerated once for it. Where this section and the text above disagree, this section holds.
+
+### A3.1 The leaf and the withdrawal statement (supersedes §3.3 W5 and the leaf of §3.1)
+
+- **Leaf.** `L = P(d_leaf', R, F)[1]`: one width-3 Poseidon permutation of `(d_leaf', R, F)`, output lane 1, the same compression as a tree node with another capacity domain. `d_leaf' = "zkapi.v2c.leaf"` (`0x7a6b6170692e7632632e6c656166`); the retired `"zkapi.v2.leaf"` sponge domain is not reused. `R = H(d_reg, s, 0)` is unchanged, and `F = n·2^192 + D·2^64 + e` packs the note ID (u32), the deposit (u128) and the bucketed expiry (u64), so `F < 2^224 < p` and the packing is injective over integers and field elements. The capacity domains are `{0 (every sponge), d_node, d_leaf'}`. Vectors: `P(d_leaf', 1, 2^64 + 1)[1] = 0x0038…6d42`; `s = 42, n = 7, D = 5,000,000, e = 4,000,000,000` gives `L = 0x1698…395f` (pinned in zkapi-core, the circuits, Solidity, Go and the SDK).
+- **Withdrawal statement.** Still 16 public inputs (17 IC points), same order; input 3 is `noteLeaf`, input 8 is `noteFields`. The circuit range-checks `n`, `D` and `e`, requires `n·2^192 + D·2^64 + e == input 8`, and `P(d_leaf', H(d_reg, s, 0), input 8)[1] == input 3`; the nullifiers use `n` and W4 uses `D`. There is no path and no root. Kind 2 is the same statement.
+- **Request statement.** Unchanged public inputs; only the leaf inside its membership proof changes.
+- **Shapes.** Request 23,990 → 23,507 constraints, withdrawal 28,772 → 20,545 (both in the 2^15 domain); the withdrawal proving key 5.58 → 4.26 MB.
+
+### A3.2 Vault storage and exits (supersedes §4.1 to §4.5 and Amendment A1)
+
+- **One word per note**, `leaf | status << 254` (`noteRecord(noteId)` reads it): the only fresh slot a deposit writes. A retired note is `Closed` with leaf 0.
+- **Exit checks, before the proof:** `noteFields < 2^224` (`InvalidNoteFields`); the note named by `noteFields >> 192` is `Active` (`NoteNotActive`); its stored leaf equals `inputs.noteLeaf` (`NoteLeafMismatch`); `D ≤ MAX_NATIVE_UNITS` (`InvalidBalance`). After verification `D` and `e` are the note's: the proof binds `L` to `(R(s), F)` and the vault computed `L` from the note's own `(R, F)`. Amounts are narrowed with checked casts.
+- **The escape record** keeps `D` (with the deadline, payout and concession, 64 bits each, in one slot) and `N_{k+1}`'s word keeps `e` above the destination, so an initiation still writes four fresh slots. Finalization pays the treasury `D − finalBalance`.
+- **Expiry.** `claimExpired(noteId, commitment, amount, expiryTs)` and `effectiveExpiry(noteId, commitment, amount, expiryTs)` take the note's preimage and recompute the leaf (`effectiveExpiry` returns 0 for an unknown, retired or mismatched note). The pause adjustment comes from **pause epochs** (`{firstNoteId, totalPausedDuration}` per unpause that followed a deposit; `pausedBefore(n)`), and a defeat's grace from `graceUntil[n]`: the active-clock expiry is `max(e − pausedBefore(n), graceUntil[n])`, the same function as revision 3's override. A defeat first compares with `max(e − totalPausedDuration, graceUntil[n])` and reads no epoch when that already covers the grace (the common case).
+- **Deposit floor.** `minDeposit` is a constructor immutable (1 to 2^53 − 1; `Deploy.s.sol` default 1,000,000 gwei); `deposit` reverts `DepositTooSmall` below it.
+- **Removed:** `knownRoots`, `isKnownRoot`, `ROOT_HISTORY_WINDOW`, `notes()`, `UnknownRoot`; the events carry no root word. The old exit, `claimExpired` and `effectiveExpiry` selectors are gone, so stale clients fail closed.
+
+### A3.3 The request tree (supersedes §4.5's tree text and §6.6)
+
+- The vault keeps the frontier only: an append at index `k` hashes `trailing_ones(k)` times (one on average; none for even `k`), and `filled[t]` is first written at `k = 2^t − 1`. `currentRoot()` keeps its selector and is computed (at most 32 compressions, about 0.5M gas in an `eth_call`); a historical root is that call at the block.
+- `noteLeaves(start, count)` and `frontier()` let anyone rebuild the tree from state. A multi-page read, the closing `nextNoteId()` and `currentRoot()` must all be pinned to one block hash (EIP-1898); pages of 2,048 leaves cost about 5.2M gas each. The request-path rebuild (indexer `--bootstrap-from-state`, zkapi-client, the SDK) reads a recent `latest`/`safe` block: it is a state read within the node's recent-state window, not an archive read.
+- `retireClosedLeaf(noteId, siblings)` keeps its ABI but reads only `siblings[0..ℓ)`, `ℓ = msb(noteId XOR nextNoteId)`, and checks them against `filled[ℓ]` (`StaleRoot` otherwise); at `ℓ = 0` it reads none. Callers zero-fill the rest. A retirement elsewhere in the same subtree makes a pending one revert `StaleRoot`: the challenger refreshes the path and retries once at once, then backs off.
+- `recordRoot()` is an optional, permissionless audit trail: it stores the computed root with the note count and block (`recordedRoot(root)`, first record kept) and emits `RootRecorded`. Nothing in exits, requests, clearance, the paymaster, the server or the clients depends on it.
+
+### A3.4 Request admission O5' (supersedes §5.2 O5 and §7.1 O5)
+
+A root change now costs a deposit (about 68k–137k gas for the common indices) or a cheap retirement, so the exact-current-root rule would let one deposit per block starve requests. The server instead:
+
+- polls the latest block every `root_poll_interval_ms`, reads `currentRoot()` and `nextNoteId()` at that block hash, and keeps every distinct vault root with its block and the time it was replaced;
+- admits a request whose `active_root` is the latest vault root, or a vault-read root replaced no more than `request_root_grace_seconds` ago (default 60, range 0 to 600; 0 restores the exact rule); otherwise `StaleRoot` with the latest root;
+- answers `RootUnavailable` only when it has had no successful vault read for `root_max_staleness_seconds` (60);
+- admits only roots it read from the vault, drops every non-current root when a recorded block hash is no longer canonical, and caps the window at `grace / poll + 1` entries (at most 1,024);
+- treats the indexer as health only: a disagreement between the indexer's `(root, block_hash)` and `currentRoot()` at that hash is a warning, the `zkapi_indexer_root_disagreement` metric and a degraded `/health`, never a refusal.
+
+Clients still check their path's root against `currentRoot()` through their own provider before proving, so the window absorbs only in-flight lag. The root a request uses reveals the time its path was fetched to within G seconds, which is weaker than the public `requestTime`.
+
+### A3.5 Clearance (supersedes §5.3)
+
+After the Groth16 verification of the kind-2 proof, the server reads `noteRecord(note_id)` fresh on every clearance (one `eth_call`, no cache): the leaf must equal the statement's `note_leaf` (else 409 `note_leaf_mismatch`) and the status must be `Active` (else 409 `note_not_active`). The clearance root window and its flag are gone; the old `--clearance-root-window-seconds` / `ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS` fail startup with a migration message.
+
+### A3.6 Clients (supersedes §6.4 E4 and §6.6)
+
+- An exit needs only `s, n, D, e` (every wallet and exit kit persists them), the newest state and the vault's current flags: no path, root, indexer, log scan or known-root read. Old persisted deposit-time paths are read and ignored.
+- Request paths come from the indexer or from a `noteLeaves` rebuild at a pinned recent block, checked against `currentRoot()`.
+- Deposits refuse amounts below `minDeposit()` and set an explicit gas limit: `E = eth_estimateGas` at the current `nextNoteId = m`, plus `16,500` per extra trailing-ones level within the next 64 indices, `7,500` when `t(m) = 0` and some index in the window has `t ≥ 1`, and `fresh_slot_gas − 5,000` when the window contains a first write (`2^j − 1` in `(m, m+64)`), times 1.2, capped at 1.5M. `fresh_slot_gas` is pinned per network in the deployment profile (22,100 on mainnet rules, 110,000 on Sepolia). Third-party depositors without that policy send at least 650,000 gas on mainnet pricing and 850,000 where a fresh slot costs about 110,000; the deepest index (`2^31 − 1`) measures 566,000 and 741,800 respectively.
+- Recovery without `notes()`: from `(s, n, D)` the client tries each day-bucketed expiry from the plan's creation time to now and accepts the candidate whose leaf equals `noteRecord(n).leaf`; a receipt's `NoteDeposited` gives `e` directly (still checked). A slot whose status is not 0 and whose leaf matches no candidate is a slot conflict.
+
+### A3.7 Security (amends §7.3, §7.4 and §8)
+
+- **Soundness.** If the vault accepts an exit for note `n`, Groth16 knowledge soundness (A1, A2) extracts `L_n = P(d_leaf', reg(s), F')` with `F'` the packing of range-checked `(n', D', e')`; collision resistance of one permutation with a fixed capacity domain gives `reg(s) = R_n` and `F' = F_n`, and injective packing gives `n' = n`, `D' = D_n`, `e' = e_n`. W3/W4, W7 and W8/W10 hold as before. Retirement zeroes only Closed leaves; a zero leaf never matches and deposits revert on a zero leaf.
+- **Withholding.** Exits depend on no operator data. Clearance cannot be refused on root grounds (the operator can still refuse outright, and the user escapes). Request admission no longer depends on the indexer.
+- **Request-root barrier (§7.4).** After `retireClosedLeaf` lands, roots that still contain the retired leaf stay admissible for at most `request_root_grace_seconds`. Service in that interval is still charged along the user's state chain, so G2's A4-failure bound (post-exit service at most `B_m`) is unchanged; a reorg drops the non-current roots.
+- **Blast radius under a broken verifier or setup (A2).** In revision 3 a forged exit paid at most the stored `D_n` of its note, so draining the vault took one forged exit per Active note (about 150 per 60M-gas block), and the owner's pause stopped `mutualClose` and initiations for up to `maxPauseDuration`. **In revision 4, `D` comes from the proof-bound `noteFields`, so one forged `mutualClose` with `D = finalBalance = the vault's balance` drains everything in a single transaction.** Either way a broken verifier also forges request proofs and defeats and the vault has no rescue path, so the eventual loss is total in both; revision 4 removes the rate limit. Mitigations: the ceremony, the VK, codehash and setup pins every client and `Deploy.s.sol` check, `release_policy_check`, the `D ≤ MAX_NATIVE_UNITS` bound and checked casts. A per-note cap can be restored without touching the circuit by passing the commitment `R` to exits and recomputing the leaf on chain (about +17k gas per exit and in paymaster validation; not adopted).
+- **Privacy.** The request inputs are unchanged and the anonymity set is the non-retired leaves at an admitted root. Withdrawals and kind-2 proofs reveal `n, D, e, L`, all public through `NoteDeposited`. With no `knownRoots`, an operator cannot partition users by historical roots.
+- **Liveness and griefing.** Churn no longer starves admission (O5'); each spam leaf locks at least `minDeposit` (0.001 ETH by default), forfeited at expiry or recovered only through an exit. A front-run can push a deposit onto a dearer index, which the gas policy and the static floors cover; an out-of-gas deposit reverts with no state change. Retirement contention is bounded by the number of Closed notes in the subtree, each griefing retirement consuming one; the signer's retirement budget is 4 per day.
+- **History expiry.** Exits need no history given `(s, n, D, e)`. A holder of only `(s, n)` needs `D` from the receipt, the log or the operator (revision 3's `notes(n)` supplied it). Operator sweeps need `(R, D, e)` per note, which the indexer's checkpoint v4 keeps from `NoteDeposited`; a state-only bootstrap cannot recover them for older notes.
+
+### A3.8 Measured (dev setup, EIP-2929 pricing)
+
+Separate cold transactions (`protocol/contracts/test/GasBaseline.t.sol`), revision 3 on the left:
+
+| Operation | Revision 3 | Revision 4 |
+|---|---|---|
+| `deposit` #0 / #2 | 605,598 / 573,516 | 68,327 / 68,327 |
+| `deposit` #255 / #1023 (first writes of `filled[8]`, `filled[10]`) | 605,442 / 609,678 | 213,318 / 243,986 |
+| `deposit`, average of the first 64 | 579,889 | 87,633 |
+| `mutualClose` (relayed) | 307,547 | 312,073 |
+| `initiateEscapeWithdrawal` | 367,002 | 369,651 |
+| `challengeEscapeWithdrawal` (no grace / grace written) | 286,403 | 284,299 / 309,220 |
+| `raiseEscapeConcession` | 276,913 | 277,437 |
+| `finalizeEscapeWithdrawal` (net of refunds) | 56,613 | 56,681 |
+| `claimExpired` (no epoch / 1 / 32 epochs) | 50,503 | 62,361 / 64,862 / 76,642 |
+| `retireClosedLeaf` (the same closed note) | 939,846 | 71,960 (level 1) |
+| `retireClosedLeaf`, levels 0 / 4 / 8 / 16, unused siblings zero-filled | n/a | 37,678 / 151,928 / 258,540 / 471,788 |
+| `recordRoot` | n/a | 465,036 (2 notes) to 542,904 |
+
+The exits above are of the fixture's notes 0 and 1, whose revision-3 statements skipped a scalar multiplication (a `noteId` input of 0 or 1); `noteFields` always takes one (about 6,200 gas), so for any note ID of 3 or more the revision-3 exits were about 6,200 gas dearer than listed and revision 4 is cheaper by the removed `knownRoots` read. The pinned snapshot (`snapshots/concession-exit-gas.json`, deposits inside the measured test) is 366,851 (escape), 282,199 (defeat), 272,137 (raise), 331,773 (close), 80,381 (finalize) and 84,561 (claim). The vault's runtime is 20,810 bytes (18,833 in revision 3).
+
+### A3.9 Migration
+
+Revision 4 is a new vault with a new setup; revision-3 keys, statements and profiles are refused. Revision-3 deposits stay in the revision-3 vault and exit there. The runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
+
 ---
 
 ## Implementation status
