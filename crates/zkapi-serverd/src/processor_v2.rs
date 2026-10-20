@@ -6335,6 +6335,9 @@ mod tests {
                 now,
                 1_000,
             );
+            // This in-memory fixture has no background root poller. Proving
+            // the signed chain can exceed its normal freshness window.
+            processor.update_root(prepared.request.public_inputs.active_root);
             let nullifier = prepared.request.public_inputs.request_nullifier;
             let response = processor
                 .finalize_test_lease(&prepared.request, 100 + step)
@@ -6355,6 +6358,7 @@ mod tests {
             now,
             1_000,
         );
+        processor.update_root(prepared.request.public_inputs.active_root);
         let mut response = processor.finalize_test_lease(&prepared.request, 1).unwrap();
         response.next_anchor = random_field_for_test();
         assert!(note.clone().complete(&prepared, &response).is_err());
