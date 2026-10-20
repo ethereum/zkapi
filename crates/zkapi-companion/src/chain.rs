@@ -1,7 +1,11 @@
 //! Ethereum JSON-RPC reads and vault ABI helpers for exits (design §6.4 E0,
-//! E4, E5, §6.6, §6.7). Every call has the exit-mode timeout and is made to
-//! an RPC the deployment pins or the user configured, never one an operator
-//! answer names.
+//! E4, E5, §6.6, §6.7) and request roots. Every call has the exit-mode
+//! timeout and is made to an RPC the deployment pins or the user configured,
+//! never one an operator answer names.
+//!
+//! Vault revision 4 (leaf-bound exits): a note is one word, its leaf and
+//! status (`noteRecord`), an exit carries the note's leaf and packed fields
+//! instead of a root, and the request root is the computed `currentRoot()`.
 
 use std::time::Duration;
 
@@ -13,25 +17,76 @@ use zkapi_types::Felt252;
 
 use crate::error::AuthError;
 
-/// `isKnownRoot(uint256)` (Amendment A1: any root the vault ever held).
-pub const IS_KNOWN_ROOT: &str = "a6232a93";
 pub const CURRENT_ROOT: &str = "fdab463d";
-pub const NOTES: &str = "9f18e4ed";
+/// `noteRecord(uint32) → (uint256 leaf, uint8 status)`: the one stored word
+/// of a note (vault revision 4; `notes(uint32)` is gone).
+pub const NOTE_RECORD: &str = "d154f5bf";
 pub const PENDING_WITHDRAWALS: &str = "a2f9f1ce";
 pub const PENDING_CONCESSIONS: &str = "f8ffe6e0";
 pub const CHALLENGED_NULLIFIERS: &str = "6cda756a";
-pub const EFFECTIVE_EXPIRY: &str = "7cb4a03c";
+/// `effectiveExpiry(uint32 noteId, bytes32 commitment, uint128 amount,
+/// uint64 expiryTs)`: 0 unless the preimage reproduces the stored leaf.
+pub const EFFECTIVE_EXPIRY: &str = "5a747a98";
 pub const PROOF_ADAPTER: &str = "efc91e58";
 pub const CONCESSION_ESCAPE_VERSION: &str = "5e00b426";
-/// `initiateEscapeWithdrawal((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)`.
-pub const INITIATE_ESCAPE: &str = "a38d62aa";
+/// `LEAF_BOUND_EXIT_VERSION()`: 1 on vault revision 4; a revision-3 vault
+/// has no such function and reverts.
+pub const LEAF_BOUND_EXIT_VERSION: &str = "c0baafb1";
+/// `minDeposit() → uint128`.
+pub const MIN_DEPOSIT: &str = "41b3d185";
+/// `initiateEscapeWithdrawal((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)`.
+pub const INITIATE_ESCAPE: &str = "8cd67c60";
 /// `mutualClose(<the same tuple>,bytes)`.
-pub const MUTUAL_CLOSE: &str = "72cd2e44";
+pub const MUTUAL_CLOSE: &str = "bce12a6c";
 pub const FINALIZE_ESCAPE: &str = "ff8f5585";
 pub const CLAIM_ESCAPE_PAYOUT: &str = "88c10aee";
 
-/// The withdrawal tuple, in public-input order (design §6.7).
-pub const WITHDRAWAL_INPUTS_ABI: &str = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)";
+/// The withdrawal tuple, in public-input order (design §6.7): word 3 is the
+/// note's leaf (`noteLeaf`), word 8 its packed fields (`noteFields`).
+pub const WITHDRAWAL_INPUTS_ABI: &str = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64)";
+
+/// The vault's custom errors an exit may revert with, by selector.
+pub const VAULT_ERRORS: [(&str, &str); 14] = [
+    (
+        "f2b1d50f",
+        "NoteLeafMismatch: the note's secret, id, amount and expiry do not reproduce the leaf the vault stored at deposit",
+    ),
+    (
+        "aa6aef76",
+        "InvalidNoteFields: the packed note fields do not fit 224 bits",
+    ),
+    ("61a83aab", "NoteNotActive: the note is not active"),
+    (
+        "cb1a072e",
+        "NotePendingWithdrawal: an escape of the note is pending",
+    ),
+    ("1e9a749a", "NoteExpired: the note has expired"),
+    ("09bde339", "InvalidProof: the withdrawal proof does not verify"),
+    ("b67a7713", "ProofExpired: the proof's valid_until has passed"),
+    ("947e59c5", "ReplayedNullifier: the nullifier was already used"),
+    (
+        "2845df70",
+        "ChallengedNullifier: a newer state of the note exists",
+    ),
+    ("9e87fac8", "Paused: the vault is paused"),
+    ("c52e3eff", "InvalidBalance: the amounts are out of range"),
+    ("ac6b05f5", "InvalidDestination: the payout address is refused"),
+    ("06868d53", "WrongWithdrawalKind: the proof is of another kind"),
+    (
+        "9722445b",
+        "InvalidDeploymentBinding: the proof is bound to another deployment",
+    ),
+];
+
+/// The vault error a JSON-RPC error message carries as revert data, if any
+/// (`eth_call` / `eth_estimateGas` include the 4-byte selector in `data`).
+pub fn vault_error(message: &str) -> Option<&'static str> {
+    let lowered = message.to_ascii_lowercase();
+    VAULT_ERRORS
+        .iter()
+        .find(|(selector, _)| lowered.contains(&format!("0x{selector}")))
+        .map(|(_, name)| *name)
+}
 
 pub fn topic(signature: &str) -> String {
     format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())))
@@ -49,12 +104,14 @@ pub fn escape_payout_deferred_topic() -> String {
     topic("EscapePayoutDeferred(uint32,address,uint128)")
 }
 
+/// `EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier)`:
+/// one data word since vault revision 4 (no root).
 pub fn escape_challenged_topic() -> String {
-    topic("EscapeWithdrawalChallenged(uint32,uint256,uint256)")
+    topic("EscapeWithdrawalChallenged(uint32,uint256)")
 }
 
 pub fn escape_initiated_topic() -> String {
-    topic("EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)")
+    topic("EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64)")
 }
 
 pub fn word_u64(value: u64) -> String {
@@ -69,18 +126,19 @@ pub fn word_address(address: &[u8; 20]) -> String {
     format!("{}{}", "0".repeat(24), hex::encode(address))
 }
 
-/// The ABI words of the 16-field withdrawal tuple, in order.
+/// The ABI words of the 16-field withdrawal tuple, in order: word 3 is the
+/// note's leaf and word 8 `noteFields = noteId·2^192 + D·2^64 + expiryTs`.
 pub fn withdrawal_words(inputs: &zkapi_types::WithdrawalPublicInputsV2C) -> Vec<String> {
     vec![
         word_u64(inputs.protocol_version.into()),
         word_u64(inputs.chain_id),
         word_felt(&inputs.contract_address),
-        word_felt(&inputs.active_root),
+        word_felt(&inputs.note_leaf),
         word_felt(&inputs.state_signing_key_x),
         word_felt(&inputs.state_signing_key_y),
         word_felt(&inputs.clearance_signing_key_x),
         word_felt(&inputs.clearance_signing_key_y),
-        word_u64(inputs.note_id.into()),
+        word_felt(&inputs.note_fields()),
         format!("{:064x}", inputs.final_balance),
         word_address(&inputs.destination),
         word_felt(&inputs.withdrawal_nullifier),
@@ -329,23 +387,22 @@ impl Rpc {
                     Ok(_) => Err(LogFetchError::Other(
                         "eth_getLogs result is not a list".into(),
                     )),
-                    Err(error) => {
-                        let message = error.to_string();
-                        let lowered = message.to_ascii_lowercase();
-                        if ["range", "limit", "too many", "too large", "exceed", "size"]
-                            .iter()
-                            .any(|needle| lowered.contains(needle))
-                        {
-                            Err(LogFetchError::RangeTooLarge)
-                        } else {
-                            Err(LogFetchError::Other(message))
-                        }
-                    }
+                    Err(error) => Err(LogFetchError::from_message(error.to_string())),
                 }
             }
         })
         .await
         .map_err(|error| failure(error.to_string()))
+    }
+}
+
+/// The request-tree rebuild (`zkapi_client::tree`) reads through the same
+/// client: the chain check, the timeout and the size bound apply to it too.
+impl zkapi_client::tree::JsonRpc for Rpc {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        Rpc::request(self, method, params)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -368,10 +425,14 @@ pub fn word_to_u64(word: &[u8; 32]) -> Option<u64> {
     word_to_u128(word).and_then(|value| u64::try_from(value).ok())
 }
 
-/// The vault's view of one note: status (`notes(noteId)` word 3), and for a
-/// pending escape the current payout, deadline and concession.
+/// The vault's view of one note: its stored leaf and status
+/// (`noteRecord(noteId)`), and for a pending escape the current payout,
+/// deadline and concession.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoteView {
+    /// The leaf the vault stored at deposit; zero for an unknown or retired
+    /// note.
+    pub leaf: Felt252,
     pub status: u8,
     pub pending: Option<PendingEscape>,
 }
@@ -387,6 +448,40 @@ pub struct PendingEscape {
     pub conceded: u128,
 }
 
+/// Decode `noteRecord(noteId)`: exactly two words, the leaf (a field
+/// element) and the status (0 Uninitialized, 1 Active, 2 PendingWithdrawal,
+/// 3 Closed; a retired note is Closed with leaf 0).
+pub fn decode_note_record(words: &[[u8; 32]]) -> Result<(Felt252, u8), AuthError> {
+    let [leaf, status] = words else {
+        return Err(failure("noteRecord() is not two words"));
+    };
+    let leaf = Felt252::try_from_bytes_be(*leaf)
+        .map_err(|_| failure("noteRecord() leaf is not a field element"))?;
+    let status = word_to_u64(status)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|status| *status <= 3)
+        .ok_or_else(|| failure("invalid note status"))?;
+    Ok((leaf, status))
+}
+
+/// `noteRecord(noteId)` at `block`: the note's stored leaf and status.
+pub async fn note_record(
+    rpc: &Rpc,
+    vault: &[u8; 20],
+    note_id: u32,
+    block: &str,
+) -> Result<(Felt252, u8), AuthError> {
+    let words = rpc
+        .call_words(
+            vault,
+            &format!("0x{NOTE_RECORD}{}", word_u64(note_id.into())),
+            block,
+            2,
+        )
+        .await?;
+    decode_note_record(&words)
+}
+
 /// Read a note and its pending escape at `block`, both getters at the same
 /// block (design §5.4).
 pub async fn read_note(
@@ -395,19 +490,10 @@ pub async fn read_note(
     note_id: u32,
     block: &str,
 ) -> Result<NoteView, AuthError> {
-    let note = rpc
-        .call_words(
-            vault,
-            &format!("0x{NOTES}{}", word_u64(note_id.into())),
-            block,
-            4,
-        )
-        .await?;
-    let status = word_to_u64(&note[3])
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or_else(|| failure("invalid note status"))?;
+    let (leaf, status) = note_record(rpc, vault, note_id, block).await?;
     if status != 2 {
         return Ok(NoteView {
+            leaf,
             status,
             pending: None,
         });
@@ -432,6 +518,7 @@ pub async fn read_note(
     let mut destination = [0u8; 20];
     destination.copy_from_slice(&pending[4][12..]);
     Ok(NoteView {
+        leaf,
         status,
         pending: Some(PendingEscape {
             nullifier: Felt252(pending[2]),
@@ -463,35 +550,99 @@ pub async fn challenged(
     Ok(word[0][31] == 1 && word[0][..31].iter().all(|byte| *byte == 0))
 }
 
-/// `isKnownRoot(root)`.
-pub async fn known_root(
+/// `effectiveExpiry(noteId, commitment, amount, expiryTs)` at latest: the
+/// note's expiry with pauses added, or 0 when the preimage does not
+/// reproduce the stored leaf (or the note is unknown or retired).
+pub async fn effective_expiry(
     rpc: &Rpc,
     vault: &[u8; 20],
-    root: &Felt252,
-    block: &str,
-) -> Result<bool, AuthError> {
+    note_id: u32,
+    commitment: &Felt252,
+    amount: u128,
+    expiry_ts: u64,
+) -> Result<u64, AuthError> {
     let word = rpc
         .call_words(
             vault,
-            &format!("0x{IS_KNOWN_ROOT}{}", word_felt(root)),
-            block,
-            1,
-        )
-        .await?;
-    Ok(word[0][31] == 1 && word[0][..31].iter().all(|byte| *byte == 0))
-}
-
-/// `effectiveExpiry(noteId)`.
-pub async fn effective_expiry(rpc: &Rpc, vault: &[u8; 20], note_id: u32) -> Result<u64, AuthError> {
-    let word = rpc
-        .call_words(
-            vault,
-            &format!("0x{EFFECTIVE_EXPIRY}{}", word_u64(note_id.into())),
+            &format!(
+                "0x{EFFECTIVE_EXPIRY}{}{}{amount:064x}{}",
+                word_u64(note_id.into()),
+                word_felt(commitment),
+                word_u64(expiry_ts)
+            ),
             "latest",
             1,
         )
         .await?;
     word_to_u64(&word[0]).ok_or_else(|| failure("invalid effective expiry"))
+}
+
+/// What the deployment check found at a vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultCheck {
+    /// `LEAF_BOUND_EXIT_VERSION()` is 1 (and `minDeposit()` the pinned value).
+    LeafBound,
+    /// The vault answered, and it is not the vault this build serves: a
+    /// revision-3 vault (the probe reverts or answers another version), or
+    /// another `minDeposit()` than the deployment pins.
+    Refused(String),
+    /// The RPC could not be asked.
+    Unreachable(String),
+}
+
+/// Whether an RPC error is the vault's answer (a revert) rather than a
+/// transport failure.
+fn reverted(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("revert") || lowered.contains("execution error")
+}
+
+/// The deployment check of vault revision 4: `LEAF_BOUND_EXIT_VERSION()`
+/// must be 1 (a revision-3 vault has no such function), and when the
+/// deployment pins `min_deposit_units`, `minDeposit()` must equal it. The
+/// companion sends no deposits; the pin only has to describe this vault.
+pub async fn check_leaf_bound_vault(
+    rpc: &Rpc,
+    vault: &[u8; 20],
+    min_deposit_units: Option<u128>,
+) -> VaultCheck {
+    let version = match rpc
+        .call(vault, &format!("0x{LEAF_BOUND_EXIT_VERSION}"), "latest")
+        .await
+    {
+        Ok(result) => result,
+        Err(error) if reverted(&error.to_string()) => {
+            return VaultCheck::Refused(
+                "the vault has no LEAF_BOUND_EXIT_VERSION(): it is not a vault revision 4 (leaf-bound exits) vault".into(),
+            )
+        }
+        Err(error) => return VaultCheck::Unreachable(error.to_string()),
+    };
+    let one = format!("0x{}", word_u64(1));
+    if !version.eq_ignore_ascii_case(&one) {
+        return VaultCheck::Refused(format!(
+            "the vault's LEAF_BOUND_EXIT_VERSION() is {version}, not 1: this companion serves only vault revision 4 (leaf-bound exits)"
+        ));
+    }
+    let Some(pinned) = min_deposit_units else {
+        return VaultCheck::LeafBound;
+    };
+    match rpc
+        .call_words(vault, &format!("0x{MIN_DEPOSIT}"), "latest", 1)
+        .await
+    {
+        Ok(words) => match word_to_u128(&words[0]) {
+            Some(found) if found == pinned => VaultCheck::LeafBound,
+            found => VaultCheck::Refused(format!(
+                "the vault's minDeposit() is {}, but the deployment pins min_deposit_units {pinned}",
+                found.map_or_else(|| "out of range".to_string(), |value| value.to_string())
+            )),
+        },
+        Err(error) if reverted(&error.to_string()) => {
+            VaultCheck::Refused("the vault has no minDeposit()".into())
+        }
+        Err(error) => VaultCheck::Unreachable(error.to_string()),
+    }
 }
 
 /// The concessions `EscapeConcessionRaised` recorded for `note_id` at
@@ -565,7 +716,7 @@ pub async fn escape_defeat(
         let data = log["data"]
             .as_str()
             .and_then(|text| text.strip_prefix("0x"))
-            .filter(|digits| digits.len() == 2 * 64)
+            .filter(|digits| digits.len() == 64)
             .ok_or_else(|| failure("invalid EscapeWithdrawalChallenged log"))?;
         if data[..64].eq_ignore_ascii_case(&word_felt(nullifier)) {
             let hash = log["transactionHash"]
@@ -603,7 +754,22 @@ mod tests {
             FINALIZE_ESCAPE
         );
         assert_eq!(selector("claimEscapePayout(address)"), CLAIM_ESCAPE_PAYOUT);
-        assert_eq!(selector("isKnownRoot(uint256)"), IS_KNOWN_ROOT);
+        assert_eq!(selector("noteRecord(uint32)"), NOTE_RECORD);
+        assert_eq!(
+            selector("effectiveExpiry(uint32,bytes32,uint128,uint64)"),
+            EFFECTIVE_EXPIRY
+        );
+        assert_eq!(
+            selector("LEAF_BOUND_EXIT_VERSION()"),
+            LEAF_BOUND_EXIT_VERSION
+        );
+        assert_eq!(selector("minDeposit()"), MIN_DEPOSIT);
+        assert_eq!(selector("currentRoot()"), CURRENT_ROOT);
+        // The pins of vault revision 4 (vault_calldata_golden.json).
+        assert_eq!(
+            (INITIATE_ESCAPE, MUTUAL_CLOSE, NOTE_RECORD),
+            ("8cd67c60", "bce12a6c", "d154f5bf")
+        );
         assert_eq!(selector("pendingConcessions(uint32)"), PENDING_CONCESSIONS);
         assert_eq!(selector("pendingWithdrawals(uint32)"), PENDING_WITHDRAWALS);
         assert_eq!(
@@ -621,12 +787,64 @@ mod tests {
         );
         assert_eq!(
             escape_initiated_topic(),
-            "0xb0d1eb7131bcf3c6dd53517f6fa90bf7cc94178eb0eb5e0a1f204abe3b839cdf"
+            "0x5ad24b4d5235cdf161caf23bb21550824a1be902576056f666b56ac6c424f4b1"
         );
         assert_eq!(
             escape_challenged_topic(),
-            "0x5cc5343b84cd949969f3ccc4ea44315630280857b9e591cc1ab48dbb9e6a3581"
+            "0x4bffb77581f1706ad6afe03cd651fb25b1b485f7eaef1826e2cc6f420f532161"
         );
+        // Each named error is the selector of its signature.
+        for (selector_hex, description) in VAULT_ERRORS {
+            let name = description.split(':').next().unwrap();
+            assert_eq!(selector(&format!("{name}()")), selector_hex, "{name}");
+        }
+        assert_eq!(
+            (VAULT_ERRORS[0].0, VAULT_ERRORS[1].0),
+            ("f2b1d50f", "aa6aef76")
+        );
+    }
+
+    /// The revert data a JSON-RPC error carries names the vault's error.
+    #[test]
+    fn vault_errors_are_read_from_revert_data() {
+        let message = r#"RPC eth_estimateGas error: {"code":3,"message":"execution reverted","data":"0xF2B1D50F"}"#;
+        assert!(vault_error(message)
+            .unwrap()
+            .starts_with("NoteLeafMismatch"));
+        assert!(vault_error(r#"{"data":"0xaa6aef76"}"#)
+            .unwrap()
+            .starts_with("InvalidNoteFields"));
+        assert_eq!(vault_error("execution reverted"), None);
+        // UnknownRoot (vault revision 3) is gone.
+        assert_eq!(vault_error(r#"{"data":"0x8c520116"}"#), None);
+    }
+
+    /// `noteRecord` is exactly two words: a field-element leaf and a status
+    /// of at most 3.
+    #[test]
+    fn note_records_decode_to_a_leaf_and_a_status() {
+        let mut leaf = [0u8; 32];
+        leaf[31] = 7;
+        let status = |value: u8| {
+            let mut word = [0u8; 32];
+            word[31] = value;
+            word
+        };
+        assert_eq!(
+            decode_note_record(&[leaf, status(1)]).unwrap(),
+            (Felt252::from_u64(7), 1)
+        );
+        assert_eq!(
+            decode_note_record(&[[0; 32], status(3)]).unwrap(),
+            (Felt252::ZERO, 3)
+        );
+        assert!(decode_note_record(&[leaf, status(4)]).is_err());
+        assert!(decode_note_record(&[[0xff; 32], status(1)]).is_err());
+        assert!(decode_note_record(&[leaf]).is_err());
+        assert!(decode_note_record(&[leaf, status(1), status(1)]).is_err());
+        let mut wide = status(1);
+        wide[0] = 1;
+        assert!(decode_note_record(&[leaf, wide]).is_err());
     }
 
     /// One URL rule for every RPC the companion reads: HTTPS, or plain HTTP
@@ -696,12 +914,14 @@ mod tests {
             protocol_version: 2,
             chain_id: 11_155_111,
             contract_address: Felt252::from_u64(0x1234),
-            active_root: Felt252::from_u64(5),
+            note_leaf: Felt252::from_u64(5),
             state_signing_key_x: Felt252::from_u64(6),
             state_signing_key_y: Felt252::from_u64(7),
             clearance_signing_key_x: Felt252::from_u64(8),
             clearance_signing_key_y: Felt252::from_u64(9),
             note_id: 3,
+            deposit_amount: 1_000,
+            expiry_ts: 4_000_000_000,
             final_balance: 900,
             destination: [0x22; 20],
             withdrawal_nullifier: Felt252::from_u64(10),
@@ -719,6 +939,12 @@ mod tests {
         let bytes = hex::decode(&data[2..]).unwrap();
         assert_eq!(bytes.len(), 836);
         let word = |index: usize| hex::encode(&bytes[4 + index * 32..4 + (index + 1) * 32]);
+        assert_eq!(word(3), format!("{:064x}", 5));
+        // noteFields = noteId·2^192 + D·2^64 + expiryTs.
+        assert_eq!(
+            word(8),
+            format!("{:016x}{:032x}{:016x}", 3, 1_000, 4_000_000_000u64)
+        );
         assert_eq!(word(9), format!("{:064x}", 900));
         assert_eq!(word(14), format!("{:064x}", 100));
         assert_eq!(word(15), format!("{:064x}", 1_800_000_000u64));

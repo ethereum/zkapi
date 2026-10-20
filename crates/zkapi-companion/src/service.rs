@@ -3,8 +3,9 @@
 //! [`AuthService`] is the central handle behind every clientd HTTP route. It
 //! owns the wallet lifecycle — deposit preparation/confirmation, request
 //! execution, status reporting, crash recovery, and withdrawal-proof
-//! generation — and talks to the indexer for tree state and to serverd for
-//! request processing.
+//! generation — and talks to serverd for request processing. Request paths
+//! come from the indexer, confirmed against the vault's `currentRoot()`, or a
+//! rebuild from the vault (`crate::request_path`); exits need no path.
 //!
 //! All wallet access is serialized by an in-process mutex and guarded by an
 //! exclusive on-disk lock file (`.wallet.lock`), so concurrent requests and a
@@ -145,6 +146,7 @@ fn compute_payload_hash(payload: impl AsRef<[u8]>) -> Felt252 {
 use crate::config::{AuthConfig, ModelDescriptor, RequestMode};
 use crate::error::AuthError;
 use crate::indexer::IndexerClient;
+use crate::request_path::RequestPaths;
 
 const DIRECT_REMOTE_MAX_ATTEMPTS: usize = 3;
 const DIRECT_REMOTE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -398,8 +400,6 @@ pub struct DepositPlan {
     pub secret: Felt252,
     pub commitment: Felt252,
     pub next_note_id: u32,
-    pub active_root: Felt252,
-    pub zero_path: Vec<Felt252>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -408,13 +408,9 @@ pub struct ConfirmDepositRequest {
     pub note_id: u32,
     pub amount: u128,
     pub expiry_ts: u64,
-    /// Amendment A1: the root the deposit set (`NoteDeposited.newRoot`) and
-    /// the note's siblings at it (the zero path the deposit was made with).
-    /// Kept for every later exit when they prove the note's leaf.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deposit_root: Option<Felt252>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deposit_siblings: Option<Vec<Felt252>>,
+    // A `deposit_root` and `deposit_siblings` (the deposit-time path that
+    // callers before vault revision 4 send) are read and ignored: the note's
+    // exits are bound to the leaf the vault stored at deposit.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -729,10 +725,9 @@ pub enum WithdrawalMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WithdrawalPlan {
     pub mode: WithdrawalMode,
+    /// The statement: its `note_leaf` and the note's fields are all the
+    /// vault needs besides the proof (vault revision 4: no Merkle path).
     pub public_inputs: WithdrawalPublicInputsV2C,
-    /// The note's Merkle sibling path, so the on-chain submitter (cast or the
-    /// browser wallet) can call `mutualClose`/escape without a per-slot lookup.
-    pub siblings: Vec<Felt252>,
     /// Complete opaque proof artifact, including backend and public-output hash.
     pub proof: Groth16ProofWire,
 }
@@ -750,6 +745,7 @@ pub struct AuthService {
     config: AuthConfig,
     wallet_mutex: Arc<Mutex<()>>,
     indexer: IndexerClient,
+    paths: RequestPaths,
     direct_lease: tokio::sync::Mutex<Option<ActiveOpenRouterLease>>,
     direct_request_mutex: Arc<tokio::sync::RwLock<()>>,
     prepared_withdrawal: tokio::sync::Mutex<Option<WithdrawalPlan>>,
@@ -764,8 +760,10 @@ impl AuthService {
         let prepared_withdrawal = load_prepared_withdrawal(&config.state_dir)?;
         // C1: the one process-wide lock of this wallet.
         let wallet_mutex = crate::wallet_lock::WalletLock::for_state_dir(&config.state_dir);
+        let indexer = IndexerClient::new(config.indexer_url.clone());
         Ok(Arc::new(Self {
-            indexer: IndexerClient::new(config.indexer_url.clone()),
+            paths: RequestPaths::new(&config, indexer.clone()),
+            indexer,
             config,
             wallet_mutex,
             direct_lease: tokio::sync::Mutex::new(None),
@@ -776,15 +774,57 @@ impl AuthService {
         }))
     }
 
+    /// The deployment check of vault revision 4 at startup, through the
+    /// deployment's RPC and the owner's exit RPC when one is configured:
+    /// `LEAF_BOUND_EXIT_VERSION()` must be 1 (a revision-3 vault is refused)
+    /// and `minDeposit()` the pinned `min_deposit_units`. An RPC that cannot
+    /// be asked is only logged: exits must stay possible, and requests check
+    /// again before their first proof.
+    pub async fn check_vault(&self) -> Result<(), AuthError> {
+        let vault = crate::chain::vault_address(&self.config.contract_address)?;
+        let pinned = self.config.demo_rpc_url.as_deref();
+        let exit = self.config.exit_rpc_url.as_deref();
+        for (label, url) in [("deployment", pinned), ("exit", exit)] {
+            let Some(url) = url else { continue };
+            let rpc = crate::chain::Rpc::new(url)?.on_chain(self.config.chain_id);
+            match crate::chain::check_leaf_bound_vault(&rpc, &vault, self.config.min_deposit_units)
+                .await
+            {
+                crate::chain::VaultCheck::LeafBound => {
+                    if label == "deployment" {
+                        self.paths.mark_checked();
+                    }
+                }
+                crate::chain::VaultCheck::Refused(reason) => {
+                    return Err(AuthError::InvalidInput(format!(
+                        "deployment check failed through the {label} RPC: {reason}"
+                    )))
+                }
+                crate::chain::VaultCheck::Unreachable(error) => tracing::warn!(
+                    rpc = label,
+                    %error,
+                    "the vault could not be checked at startup; requests check it before their first proof"
+                ),
+            }
+        }
+        Ok(())
+    }
+
     // The Go gateway receives only an admitted provider lease with explicit verification status. Prompt content
     // never enters the wallet/prover bridge or the zkAPI payment server.
     pub fn oa_bridge_status(&self) -> serde_json::Value {
         serde_json::json!({
-            // 5: circuit zkapi-v2-concession-v1 with the escape routes
+            // 5: the concession exit with the escape routes
             // /oa/v1/withdraw/escape/{prepare,submit,status,finalize};
             // escape_routes_version 2 adds /oa/v1/withdraw/escape/cancel.
+            // The circuit (zkapi-v2-concession-v2 on vault revision 4) is
+            // `circuit_id`, pinned by the deployment.
             "bridge_version": 5,
             "exit_concession": 1,
+            // Vault revision 4: exits are bound to the note's stored leaf
+            // and carry no Merkle path.
+            "leaf_bound_exit": 1,
+            "vault_revision": self.config.vault_revision,
             "setup_id": self.config.setup_id,
             "settlement_window_seconds": self.config.settlement_window_seconds,
             "escape_routes_version": 2,
@@ -795,8 +835,7 @@ impl AuthService {
             "billing_unit": self.config.billing_unit,
             "circuit_id": zkapi_proof::compact::CIRCUIT_ID,
             "withdrawal_bridge_version": 1,
-            // Clearance requests carry an ownership proof (kind 2 on
-            // circuit zkapi-v2-concession-v1).
+            // Clearance requests carry an ownership proof (kind 2).
             "clearance_ownership_proof_version": 1,
             // /oa/v1/withdraw/prepare accepts accept_unsettled_request_risk
             // (ignored: the exit rules of §6.4 decide).
@@ -842,7 +881,7 @@ impl AuthService {
 
     /// Reserve the note and obtain a mutual close (kind 1). The clearance
     /// request always carries the state's ownership proof (kind 2), which a
-    /// `zkapi-v2-concession-v1` server requires and no vault entry point
+    /// concession-exit server requires and no vault entry point
     /// accepts. `_accept_unsettled_request_risk` is accepted for the bridge's
     /// request shape and ignored: it only chose between a proof-less and a
     /// proof-carrying clearance on a legacy vault.
@@ -876,7 +915,6 @@ impl AuthService {
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
         let session_events = self.oa_session_events.clone();
-        let indexer = self.indexer.clone();
         let result = spawn_blocking(move || {
             let _guard = wallet_mutex
                 .lock()
@@ -906,7 +944,8 @@ impl AuthService {
                 // again while it stays valid. A close nearer its valid_until
                 // is proved again (the vault refuses it afterwards, L6): from
                 // the kept clearance signature, which signs only the
-                // nullifier, at the plan's own root and path. A reservation
+                // nullifier (no path: the close is bound to the note's
+                // stored leaf). A reservation
                 // saved before the signature was kept asks for the clearance
                 // again below (the server signs a reserved nullifier again).
                 // Only a close of the wallet's current state: a reservation
@@ -932,14 +971,8 @@ impl AuthService {
                         }
                     }
                 }
-                let result = mutual_close_locked(
-                    &config,
-                    &indexer,
-                    &mut wallet,
-                    &session_events,
-                    destination,
-                )
-                .await;
+                let result =
+                    mutual_close_locked(&config, &mut wallet, &session_events, destination).await;
                 // E3's wait, a refusal or a failure before any proof left
                 // releases nothing: the lock this attempt set is removed and
                 // chats resume. A lock that released a proof stays.
@@ -1063,11 +1096,6 @@ impl AuthService {
             *lease = None;
         }
         result
-    }
-
-    pub async fn oa_deposit_path(&self) -> Result<serde_json::Value, AuthError> {
-        let (_, _, siblings) = self.indexer.next_deposit_path().await?;
-        Ok(serde_json::json!({"zero_path": siblings}))
     }
 
     pub async fn oa_billing_quote(&self) -> Result<serde_json::Value, AuthError> {
@@ -1244,7 +1272,20 @@ impl AuthService {
         .await
     }
 
+    /// A deposit's secret and commitment, and the note id the indexer
+    /// expects it to get. No Merkle path: the vault appends the leaf itself
+    /// (vault revision 4) and exits need none. An amount below the
+    /// deployment's `min_deposit_units` (the vault's `minDeposit()`) is
+    /// refused: the vault would revert it (`DepositTooSmall`).
     pub async fn prepare_deposit(&self, amount: u128) -> Result<DepositPlan, AuthError> {
+        if let Some(minimum) = self.config.min_deposit_units {
+            if amount < minimum {
+                return Err(AuthError::InvalidInput(format!(
+                    "deposit_too_small: the vault accepts deposits of at least {minimum} {}",
+                    self.config.billing_unit
+                )));
+            }
+        }
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
         let indexer = self.indexer.clone();
@@ -1266,7 +1307,7 @@ impl AuthService {
 
             let runtime = current_thread_runtime()?;
             runtime.block_on(async move {
-                let (next_note_id, active_root, zero_path) = indexer.next_deposit_path().await?;
+                let next_note_id = indexer.next_note_id().await?;
                 let (secret, commitment) = wallet.generate_deposit_params();
 
                 Ok(DepositPlan {
@@ -1274,18 +1315,29 @@ impl AuthService {
                     secret,
                     commitment,
                     next_note_id,
-                    active_root,
-                    zero_path,
                 })
             })
         })
         .await
     }
 
+    /// Install a deposited note. Its exits are bound to the leaf the vault
+    /// stored at deposit, which the secret, note id, amount and expiry must
+    /// reproduce: when the deployment's RPC answers, `noteRecord(note_id)`
+    /// holding another leaf refuses the note (with a wrong amount or expiry
+    /// every exit would revert `NoteLeafMismatch`). An unreadable or not yet
+    /// visible record confirms the note as given.
     pub async fn confirm_deposit(
         &self,
         request: ConfirmDepositRequest,
     ) -> Result<WalletStatus, AuthError> {
+        let leaf = core_v2::note_leaf(
+            request.note_id,
+            &core_v2::registration_commitment(&request.secret),
+            request.amount,
+            request.expiry_ts,
+        );
+        self.check_deposited_leaf(request.note_id, &leaf).await?;
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
         spawn_blocking(move || {
@@ -1299,42 +1351,51 @@ impl AuthService {
                 wallet.state().map(|state| state.note_id),
             )?;
             crate::oa_withdrawal::check_spending(&config, Some(request.note_id))?;
-            let path = match (request.deposit_root, request.deposit_siblings) {
-                (Some(root), Some(siblings)) => {
-                    let leaf = core_v2::note_leaf(
-                        request.note_id,
-                        &core_v2::registration_commitment(&request.secret),
-                        request.amount,
-                        request.expiry_ts,
-                    );
-                    let proves = <[Felt252; zkapi_types::MERKLE_DEPTH]>::try_from(siblings.clone())
-                        .is_ok_and(|array| {
-                            core_v2::merkle_root(request.note_id, &leaf, &array) == root
-                        });
-                    if proves {
-                        Some(zkapi_client::note_state::DepositPath { root, siblings })
-                    } else {
-                        // The note is still confirmed; exits then find their
-                        // path through the indexer or a log rebuild.
-                        tracing::warn!(
-                            note_id = request.note_id,
-                            "the deposit path does not prove the note's leaf at the deposit root; not kept"
-                        );
-                        None
-                    }
-                }
-                _ => None,
-            };
-            wallet.confirm_deposit_with_path(
+            wallet.confirm_deposit(
                 request.secret,
                 request.note_id,
                 request.amount,
                 request.expiry_ts,
-                path,
             )?;
             Ok(wallet_status(&wallet))
         })
         .await
+    }
+
+    /// `noteRecord(note_id)` through the deployment's RPC: a nonzero stored
+    /// leaf other than `leaf` is refused; no RPC, a failed read or an empty
+    /// slot (the RPC may lag the deposit) is not.
+    async fn check_deposited_leaf(&self, note_id: u32, leaf: &Felt252) -> Result<(), AuthError> {
+        let Some(url) = self.config.demo_rpc_url.as_deref() else {
+            return Ok(());
+        };
+        let vault = crate::chain::vault_address(&self.config.contract_address)?;
+        let read = async {
+            let rpc = crate::chain::Rpc::new(url)?.on_chain(self.config.chain_id);
+            crate::chain::note_record(&rpc, &vault, note_id, "latest").await
+        };
+        match read.await {
+            Ok((stored, _)) if stored == *leaf => Ok(()),
+            Ok((stored, status)) if stored.is_zero() => {
+                tracing::warn!(
+                    note_id,
+                    status,
+                    "the vault holds no leaf at this note id yet; the note is confirmed as given"
+                );
+                Ok(())
+            }
+            Ok(_) => Err(AuthError::InvalidInput(format!(
+                "note_leaf_mismatch: the vault's note {note_id} holds another leaf than this secret, amount and expiry make; every exit of the note would revert. Check the deposit's NoteDeposited amount and expiryTs"
+            ))),
+            Err(error) => {
+                tracing::warn!(
+                    note_id,
+                    %error,
+                    "the vault's note record could not be read; the note is confirmed as given"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Install a finalized response for the pending request, or else for a
@@ -2724,7 +2785,7 @@ impl AuthService {
     ) -> Result<ApiRequestV2, AuthError> {
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
-        let indexer = self.indexer.clone();
+        let paths = self.paths.clone();
         spawn_blocking(move || {
             let _guard = wallet_mutex
                 .lock()
@@ -2783,8 +2844,9 @@ impl AuthService {
                     }
                 }
             }
+            let leaf = wallet.current_note_leaf().ok_or(AuthError::NoActiveNote)?;
             let (active_root, siblings) =
-                runtime.block_on(async move { indexer.root_and_path(note_id).await })?;
+                runtime.block_on(async move { paths.path(note_id, &leaf).await })?;
             let mut solvency_bound = wallet.configured_solvency_bound();
             let authorization = if config.billing_asset == "native_eth" {
                 let quote = runtime.block_on(crate::oa_native::verified_quote(&config))?;
@@ -3156,7 +3218,7 @@ impl AuthService {
     pub async fn preview_request(&self, request: CoreRequest) -> Result<RequestPreview, AuthError> {
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
-        let indexer = self.indexer.clone();
+        let paths = self.paths.clone();
         spawn_blocking(move || {
             let _guard = wallet_mutex
                 .lock()
@@ -3165,7 +3227,7 @@ impl AuthService {
             let wallet = load_wallet(&config)?;
             let runtime = current_thread_runtime()?;
             runtime.block_on(async move {
-                build_request_preview(&config, &indexer, &wallet, request).await
+                build_request_preview(&config, &paths, &wallet, request).await
             })
         })
         .await
@@ -3179,7 +3241,7 @@ impl AuthService {
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
         let session_events = self.oa_session_events.clone();
-        let indexer = self.indexer.clone();
+        let paths = self.paths.clone();
         spawn_blocking(move || {
             let _guard = wallet_mutex
                 .lock()
@@ -3215,7 +3277,7 @@ impl AuthService {
                 );
                 for attempt in 0..2 {
                     let preview =
-                        build_request_preview(&config, &indexer, &wallet, request.clone()).await?;
+                        build_request_preview(&config, &paths, &wallet, request.clone()).await?;
                     match wallet
                         .request_flow(
                             &payload,
@@ -3310,7 +3372,6 @@ impl AuthService {
 
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
-        let indexer = self.indexer.clone();
         let session_events = self.oa_session_events.clone();
         let plan = spawn_blocking(move || {
             let _guard = wallet_mutex
@@ -3343,31 +3404,25 @@ impl AuthService {
                 if wallet.get_pending_journal()?.is_some() {
                     return Err(AuthError::PendingSettlement);
                 }
-                let note_id = wallet.state().ok_or(AuthError::NoActiveNote)?.note_id;
-                let (root, siblings) = indexer.root_and_path(note_id).await?;
-                let plan_siblings = siblings.clone();
                 // The exit lock is durable before any exit proof exists; the
                 // wallet records each proof as released before returning it
                 // and marks the state for C5 when an ownership proof leaves.
                 let (public_inputs, proof) = match mode {
                     WithdrawalMode::Mutual => {
                         wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Mutual)?;
-                        wallet
-                            .withdrawal_mutual_close(destination, root, siblings)
-                            .await?
+                        wallet.withdrawal_mutual_close(destination).await?
                     }
                     // Concedes nothing. The concession rules of an exit from
                     // a state with a released request are the exit routes'.
                     WithdrawalMode::Escape => {
                         wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Escape)?;
-                        wallet.withdrawal_escape_hatch(destination, 0, root, siblings)?
+                        wallet.withdrawal_escape_hatch(destination, 0)?
                     }
                 };
 
                 Ok(WithdrawalPlan {
                     mode,
                     public_inputs,
-                    siblings: plan_siblings,
                     proof,
                 })
             })
@@ -3436,15 +3491,16 @@ impl AuthService {
         &self,
         note_id: u32,
     ) -> Result<(String, Option<u64>), AuthError> {
-        let notes_data = format!("0x9f18e4ed{:064x}", note_id);
-        let encoded_note = self.vault_eth_call(&notes_data).await?;
-        let note_words = abi_words(&encoded_note)?;
-        if note_words.len() < 4 {
+        // `noteRecord(noteId) → (leaf, status)` (vault revision 4).
+        let record_data = format!("0x{}{:064x}", crate::chain::NOTE_RECORD, note_id);
+        let encoded_record = self.vault_eth_call(&record_data).await?;
+        let record_words = abi_words(&encoded_record)?;
+        if record_words.len() != 2 {
             return Err(AuthError::Wallet(
-                "vault notes() returned a truncated response".to_string(),
+                "vault noteRecord() did not return two words".to_string(),
             ));
         }
-        let raw_status = abi_word_u64(note_words[3])?;
+        let raw_status = abi_word_u64(record_words[1])?;
         match raw_status {
             1 => Ok(("active".to_string(), None)),
             2 => {
@@ -3824,7 +3880,7 @@ fn retry_fits_lease(expires_at: u64, delay: Duration) -> bool {
 
 async fn build_request_preview(
     config: &AuthConfig,
-    indexer: &IndexerClient,
+    paths: &RequestPaths,
     wallet: &Wallet,
     request: CoreRequest,
 ) -> Result<RequestPreview, AuthError> {
@@ -3832,7 +3888,6 @@ async fn build_request_preview(
         serde_json::to_string(&request).map_err(|err| AuthError::Serialization(err.to_string()))?;
     let payload_hash = hash_payload(&payload);
     let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
-    let (active_root, merkle_siblings) = indexer.root_and_path(state.note_id).await?;
     let registration_commitment = core_v2::registration_commitment(&state.secret_s);
     let note_leaf = core_v2::note_leaf(
         state.note_id,
@@ -3840,6 +3895,7 @@ async fn build_request_preview(
         state.deposit_amount,
         state.expiry_ts,
     );
+    let (active_root, merkle_siblings) = paths.path(state.note_id, &note_leaf).await?;
     let request_nullifier =
         core_v2::nullifier(&state.secret_s, state.note_id, &state.current_anchor);
     let solvency_bound = state.solvency_bound(
@@ -3881,7 +3937,6 @@ async fn build_request_preview(
 /// released nothing when this fails.
 async fn mutual_close_locked(
     config: &AuthConfig,
-    indexer: &IndexerClient,
     wallet: &mut Wallet,
     session_events: &crate::oa_events::SessionEvents,
     destination: [u8; 20],
@@ -3911,83 +3966,71 @@ async fn mutual_close_locked(
     }
     let state = wallet.state().ok_or(AuthError::NoActiveNote)?.clone();
     crate::oa_withdrawal::check_reservable(config, &state, destination)?;
-    // The path first, bounded (E0): the indexer is the operator's, these
-    // locks are the ones every exit route takes, and an indexer that does
-    // not answer leaves no reservation behind.
-    let mut path = Some(indexer.root_and_path(state.note_id).await?);
+    // No Merkle path (vault revision 4): the close is bound to the note's
+    // stored leaf, so no indexer is asked under these locks.
     let mut record = crate::oa_withdrawal::reserve(config, &state, destination)?;
     if record.complete {
         return record.plan.ok_or(AuthError::WithdrawalConflict);
     }
     // E2 step 3: ownership proof, clearance, close. A retry resends the
     // ownership proof still valid from an earlier attempt (at most one is
-    // live, C3).
-    let mut reproved = false;
-    let (public_inputs, proof, siblings, signature) = loop {
-        let (root, siblings) = match path.take() {
-            Some(path) => path,
-            None => indexer.root_and_path(state.note_id).await?,
-        };
-        // Saved before the request leaves: whatever answer follows (a
-        // gateway 429, a 5xx, none at all), the ownership proof may have
-        // reached someone, and it names this state's nullifier.
-        let mut storage_failure = None;
-        let closed = wallet
-            .withdrawal_mutual_close_cleared(destination, root, siblings.clone(), || {
-                crate::oa_withdrawal::record_ownership_proof_sent(config, &mut record).map_err(
-                    |error| {
-                        let message = error.to_string();
-                        storage_failure = Some(error);
-                        ClientError::Serialization(message)
-                    },
-                )
-            })
-            .await;
-        if let Some(error) = storage_failure {
-            return Err(error);
-        }
-        let outcome = match closed {
-            Ok((public_inputs, proof, signature)) => {
-                break (public_inputs, proof, siblings, signature)
-            }
-            Err(ClientError::StaleRoot) if !reproved => {
-                reproved = true;
-                continue;
-            }
-            // E2 step 4: the server claims a reservation.
-            Err(ClientError::ClearanceRefused(code)) if code == "nullifier_used" => {
-                MutualOutcome::NullifierUsed
-            }
-            // Not the operator's answer.
-            Err(
+    // live, C3). The server checks the ownership proof's leaf against the
+    // vault's `noteRecord` (409 `note_leaf_mismatch` / `note_not_active`).
+    // Saved before the request leaves: whatever answer follows (a gateway
+    // 429, a 5xx, none at all), the ownership proof may have reached
+    // someone, and it names this state's nullifier.
+    let mut storage_failure = None;
+    let closed = wallet
+        .withdrawal_mutual_close_cleared(destination, || {
+            crate::oa_withdrawal::record_ownership_proof_sent(config, &mut record).map_err(
+                |error| {
+                    let message = error.to_string();
+                    storage_failure = Some(error);
+                    ClientError::Serialization(message)
+                },
+            )
+        })
+        .await;
+    if let Some(error) = storage_failure {
+        return Err(error);
+    }
+    let (public_inputs, proof, signature) = match closed {
+        Ok(closed) => closed,
+        Err(error) => {
+            let outcome = match error {
+                // E2 step 4: the server claims a reservation.
+                ClientError::ClearanceRefused(code) if code == "nullifier_used" => {
+                    MutualOutcome::NullifierUsed
+                }
+                // Not the operator's answer.
                 error @ (ClientError::TestnetPasswordRequired
                 | ClientError::ProofGeneration(_)
                 | ClientError::Io(_)
                 | ClientError::Serialization(_)
                 | ClientError::ExitLockConflict(_)
-                | ClientError::NoActiveNote),
-            ) => return Err(error.into()),
-            // E2 step 5: any other refusal, or unreachable.
-            Err(error) => {
-                tracing::warn!(%error, "the clearance was refused or unreachable; the exit continues as an escape");
-                MutualOutcome::RefusedOrUnreachable
+                | ClientError::NoActiveNote) => return Err(error.into()),
+                // E2 step 5: any other refusal (`note_leaf_mismatch` and
+                // `note_not_active` among them), or unreachable.
+                error => {
+                    tracing::warn!(%error, "the clearance was refused or unreachable; the exit continues as an escape");
+                    MutualOutcome::RefusedOrUnreachable
+                }
+            };
+            record.clearance_outcome = Some(outcome);
+            crate::oa_withdrawal::save(config, &record)?;
+            if outcome == MutualOutcome::RefusedOrUnreachable {
+                wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Escape)?;
             }
-        };
-        record.clearance_outcome = Some(outcome);
-        crate::oa_withdrawal::save(config, &record)?;
-        if outcome == MutualOutcome::RefusedOrUnreachable {
-            wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Escape)?;
+            let decided = exit::decide(config, wallet, Some(outcome), None, false).await?;
+            return Err(match decided.decision {
+                ExitDecision::Wait { .. } => AuthError::PendingSettlement,
+                _ => AuthError::EscapeRequired(decided.to_json()),
+            });
         }
-        let decided = exit::decide(config, wallet, Some(outcome), None, false).await?;
-        return Err(match decided.decision {
-            ExitDecision::Wait { .. } => AuthError::PendingSettlement,
-            _ => AuthError::EscapeRequired(decided.to_json()),
-        });
     };
     let plan = WithdrawalPlan {
         mode: WithdrawalMode::Mutual,
         public_inputs,
-        siblings,
         proof,
     };
     crate::oa_withdrawal::validate_plan(&record, &plan)?;
@@ -3998,8 +4041,8 @@ async fn mutual_close_locked(
 }
 
 /// A close of `record`'s state proved again from its kept clearance
-/// signature, with a new `valid_until`, at the saved plan's root and path
-/// (any root the vault ever held stays known, Amendment A1). Needs the exit
+/// signature, with a new `valid_until` (no path: the close is bound to the
+/// note's stored leaf). Needs the exit
 /// lock in mutual mode at that state: an escape released since keeps the
 /// exit in escape mode.
 fn reprove_close(
@@ -4008,21 +4051,18 @@ fn reprove_close(
     mut record: crate::oa_withdrawal::Reservation,
     signature: &zkapi_types::SchnorrSignature,
 ) -> Result<WithdrawalPlan, AuthError> {
-    let saved = record.plan.clone().ok_or(AuthError::WithdrawalConflict)?;
+    if record.plan.is_none() {
+        return Err(AuthError::WithdrawalConflict);
+    }
     if wallet.current_nullifier() != Some(record.nullifier) {
         return Err(AuthError::WithdrawalConflict);
     }
     // The lock is durable before the proof (§6.2): still held in mutual mode
     // here, unless E6 released it once the earlier closes were dead.
     let locked = wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Mutual);
-    let (public_inputs, proof) = match locked.and_then(|_| {
-        wallet.mutual_close_from_clearance(
-            record.destination,
-            saved.public_inputs.active_root,
-            saved.siblings.clone(),
-            signature,
-        )
-    }) {
+    let (public_inputs, proof) = match locked
+        .and_then(|_| wallet.mutual_close_from_clearance(record.destination, signature))
+    {
         Ok(built) => built,
         Err(zkapi_client::error::ClientError::ExitLockConflict(_)) => {
             return Err(AuthError::EscapeRequired(serde_json::json!({
@@ -4034,7 +4074,6 @@ fn reprove_close(
     let plan = WithdrawalPlan {
         mode: WithdrawalMode::Mutual,
         public_inputs,
-        siblings: saved.siblings,
         proof,
     };
     crate::oa_withdrawal::validate_plan(&record, &plan)?;
@@ -4503,8 +4542,6 @@ mod wallet_lifecycle_tests {
                 note_id: 18,
                 amount: balance,
                 expiry_ts: 4_000_000_000,
-                deposit_root: None,
-                deposit_siblings: None,
             })
             .await
             .unwrap();
@@ -4626,16 +4663,12 @@ mod oa_withdrawal_tests {
     async fn reservation_survives_failed_prepare_and_blocks_all_spending_paths() {
         let (_directory, config, note) = fixture();
         let service = AuthService::new(config.clone()).unwrap();
-        // The indexer fixture is unreachable: the mutual close fails before
-        // anything is reserved or proved (its path is read first, E0).
-        assert!(matches!(
-            service.oa_prepare_withdrawal([1; 20], false).await,
-            Err(AuthError::Indexer(_))
-        ));
-        assert_eq!(
-            service.oa_withdrawal_status().await.unwrap()["phase"],
-            "none"
-        );
+        // The operator is unreachable and no proving keys are installed. The
+        // mutual close reads no path (vault revision 4): it reserves the
+        // note, then fails at its ownership proof, so nothing was proved or
+        // sent and no lock is left.
+        let failed = service.oa_prepare_withdrawal([1; 20], false).await;
+        assert!(matches!(failed, Err(AuthError::Wallet(_))), "{failed:?}");
         assert!(load_wallet(&config).unwrap().exit_lock().unwrap().is_none());
         // A reservation, once made, blocks every spending path.
         oa_withdrawal::reserve(&config, &note, [1; 20]).unwrap();
@@ -4653,8 +4686,6 @@ mod oa_withdrawal_tests {
                     note_id: note.note_id + 1,
                     amount: 1,
                     expiry_ts: 4_000_000_000,
-                    deposit_root: None,
-                    deposit_siblings: None,
                 })
                 .await
                 .map(|_| ()),
@@ -4712,8 +4743,8 @@ mod oa_withdrawal_tests {
         let (_directory, config, _note) = fixture();
         let service = AuthService::new(config.clone()).unwrap();
         let vault = zkapi_types::serialization::felt_to_address(&config.contract_address).unwrap();
-        // The indexer fixture is unreachable, so a withdrawal that got past
-        // the destination would fail later, after reserving the note.
+        // No proving keys are installed, so a withdrawal that got past the
+        // destination would fail later, after reserving the note.
         let refused = service.oa_prepare_withdrawal(vault, false).await;
         assert!(
             matches!(refused, Err(AuthError::InvalidInput(_))),
@@ -4727,17 +4758,19 @@ mod oa_withdrawal_tests {
                 "{mode:?}: {refused:?}"
             );
         }
-        // Any other address still reaches the indexer.
-        assert!(matches!(
+        // Any other address gets past the check, to the proof.
+        for refused in [
             service
                 .create_withdrawal(WithdrawalMode::Escape, [1; 20])
-                .await,
-            Err(AuthError::Indexer(_))
-        ));
-        assert!(matches!(
-            service.oa_prepare_withdrawal([1; 20], false).await,
-            Err(AuthError::Indexer(_))
-        ));
+                .await
+                .map(|_| ()),
+            service
+                .oa_prepare_withdrawal([1; 20], false)
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(matches!(refused, Err(AuthError::Wallet(_))), "{refused:?}");
+        }
     }
 
     #[tokio::test]
@@ -4847,11 +4880,7 @@ mod oa_withdrawal_tests {
 
     #[tokio::test]
     async fn prepare_proves_note_ownership_with_a_kind_2_proof_before_clearance() {
-        use axum::{
-            extract::State,
-            routing::{get, post},
-            Json, Router,
-        };
+        use axum::{extract::State, routing::post, Json, Router};
         use zkapi_proof::compact::{CompactSigner, WithdrawalVerifier};
         let directory = tempfile::tempdir().unwrap();
         let setup_dir = concat!(
@@ -4884,8 +4913,6 @@ mod oa_withdrawal_tests {
             note.deposit_amount,
             note.expiry_ts,
         );
-        let siblings = core_v2::zero_hashes()[..zkapi_types::MERKLE_DEPTH].to_vec();
-        let root = core_v2::merkle_root(0, &leaf, &siblings.clone().try_into().unwrap());
         let nullifier = core_v2::nullifier(&note.secret_s, note.note_id, &note.current_anchor);
         let clearance = zkapi_types::wire::ClearanceResponseV2 {
             status: "ok".into(),
@@ -4898,13 +4925,8 @@ mod oa_withdrawal_tests {
             )),
         };
         let bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        // No indexer route: a close needs no Merkle path (vault revision 4).
         let router = Router::new()
-            .route(
-                "/v1/tree/snapshot",
-                get(move || async move {
-                    Json(serde_json::json!({"root": root, "next_note_id": 1, "leaves": [leaf]}))
-                }),
-            )
             .route(
                 "/v2/withdraw/clearance",
                 post(
@@ -4944,7 +4966,15 @@ mod oa_withdrawal_tests {
         expected.destination = [0; 20];
         expected.valid_until = ownership.public_inputs.valid_until;
         assert_eq!(ownership.public_inputs, expected);
-        assert_eq!(ownership.public_inputs.active_root, root);
+        // Bound to the note's leaf and fields, not to a root.
+        assert_eq!(ownership.public_inputs.note_leaf, leaf);
+        assert_eq!(
+            (
+                ownership.public_inputs.deposit_amount,
+                ownership.public_inputs.expiry_ts
+            ),
+            (1_500_000, 4_000_000_000)
+        );
         assert!(ownership.public_inputs.valid_until <= now_seconds() + 3_600);
         let verifier = WithdrawalVerifier::load(setup_dir).unwrap();
         assert!(verifier
@@ -4989,7 +5019,7 @@ mod oa_withdrawal_tests {
     enum Clearance {
         Grant,
         NullifierUsed,
-        /// A `zkapi-v2-concession-v1` server: grants only a request that
+        /// A concession-exit server: grants only a request that
         /// carries a kind-2 ownership proof.
         RequireProof,
         /// A gateway in front of the server answers 429 to every request.
@@ -5492,7 +5522,7 @@ mod oa_withdrawal_tests {
             .is_some_and(|(_, lease, _)| lease.is_some())
     }
 
-    /// A `zkapi-v2-concession-v1` server grants a clearance only against an
+    /// A concession-exit server grants a clearance only against an
     /// ownership proof, which no vault entry point accepts. Every clearance
     /// request therefore carries one, also from a state with a request that
     /// was set aside unsettled (the legacy proof-less clearance is gone).
@@ -6138,6 +6168,45 @@ mod oa_withdrawal_tests {
     }
 }
 
+/// A vault revision 4 behind JSON-RPC, for tests that prove requests.
+#[cfg(test)]
+pub(crate) mod tests {
+    use serde_json::{json, Value};
+
+    /// The JSON-RPC answer to the calls a request path makes before it reads
+    /// the vault's root (chain 1): `eth_chainId`, `eth_getBlockByNumber` and
+    /// `LEAF_BOUND_EXIT_VERSION()` answer; the vault's state reads
+    /// (`nextNoteId`, `noteLeaves`) and `eth_getLogs` fail, so no tree is
+    /// rebuilt. `None` for every other call (`currentRoot()` among them).
+    pub(crate) fn vault_rpc_answer(body: &Value) -> Option<Value> {
+        let ok =
+            |result: Value| Some(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}));
+        let refused = || {
+            Some(json!({"jsonrpc": "2.0", "id": body["id"],
+                "error": {"code": -32000, "message": "unavailable in this test"}}))
+        };
+        match body["method"].as_str()? {
+            "eth_chainId" => ok(json!("0x1")),
+            "eth_getBlockByNumber" => ok(json!({
+                "number": "0x64", "timestamp": "0x1", "hash": format!("0x{}", "33".repeat(32)),
+            })),
+            "eth_getLogs" => refused(),
+            "eth_call" => match body["params"][0]["data"].as_str()?.get(2..10)? {
+                crate::chain::LEAF_BOUND_EXIT_VERSION => ok(json!(format!("0x{:064x}", 1))),
+                zkapi_client::tree::NEXT_NOTE_ID_SELECTOR
+                | zkapi_client::tree::NOTE_LEAVES_SELECTOR => refused(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether `error` is a request preparation stopped at its path.
+    pub(crate) fn no_request_path(error: &crate::error::AuthError) -> bool {
+        matches!(error, crate::error::AuthError::Wallet(message) if message.starts_with("no request path"))
+    }
+}
+
 #[cfg(test)]
 mod oa_stale_root_tests {
     use super::*;
@@ -6238,6 +6307,12 @@ mod oa_stale_root_tests {
                         "error_code":"stale_root","error_message":"stale root","retriable":true,"latest_root":"0x5"})))
                 }))
                 .route("/rpc", post(move |State(events): State<Events>, Json(body): Json<Value>| async move {
+                    // A new request's path: the chain, the deployment check
+                    // and the pinned block answer; the vault's state and logs
+                    // do not, so no tree is rebuilt.
+                    if let Some(result) = super::tests::vault_rpc_answer(&body) {
+                        return (StatusCode::OK, Json(result));
+                    }
                     events.lock().unwrap().push("rpc");
                     assert_eq!(body["method"], "eth_call");
                     assert_eq!(body["params"][0]["data"], VAULT_CURRENT_ROOT_SELECTOR);
@@ -6277,8 +6352,13 @@ mod oa_stale_root_tests {
                 (Chain::RootMoved, "unknown") => {
                     // Corroborated by the chain and the server: the journal is
                     // set aside into the archive, whole, and the next attempt
-                    // proves afresh at the indexer's current root.
-                    assert!(matches!(result, Err(AuthError::Indexer(_))), "{case}");
+                    // proves afresh at a root the vault reports (here the
+                    // indexer and the vault's state are unavailable).
+                    assert!(
+                        result.as_ref().is_err_and(super::tests::no_request_path),
+                        "{case}: {:?}",
+                        result.as_ref().err()
+                    );
                     assert!(!journal_path.exists(), "{case}");
                     assert_eq!(events, ["lease", "rpc", "nullifier", "indexer"], "{case}");
                     assert_eq!(archived.len(), 1, "{case}");
@@ -6642,11 +6722,18 @@ mod oa_stale_root_tests {
             )
             .route(
                 "/rpc",
-                post(|State(events): State<Events>| async move {
-                    // The vault still has the retry's root.
-                    events.lock().unwrap().push("rpc");
-                    Json(json!({"jsonrpc":"2.0","id":1,"result":format!("0x{:064x}", 1)}))
-                }),
+                post(
+                    |State(events): State<Events>, Json(body): Json<Value>| async move {
+                        // A new request's path: the deployment check answers, the
+                        // vault's state and logs do not.
+                        if let Some(answer) = super::tests::vault_rpc_answer(&body) {
+                            return Json(answer);
+                        }
+                        // The vault still has the retry's root.
+                        events.lock().unwrap().push("rpc");
+                        Json(json!({"jsonrpc":"2.0","id":1,"result":format!("0x{:064x}", 1)}))
+                    },
+                ),
             )
             .route(
                 &format!("/v2/nullifiers/{nullifier}"),
@@ -6763,7 +6850,7 @@ mod oa_stale_root_tests {
             .issue_direct_openrouter_lease("chat".into(), None)
             .await;
         assert!(
-            matches!(issued, Err(AuthError::Indexer(_))),
+            issued.as_ref().is_err_and(super::tests::no_request_path),
             "{:?}",
             issued.err()
         );
@@ -7514,7 +7601,7 @@ mod oa_request_archive_tests {
                 Driver::Recover => service.recover().await.map(|_| ()),
                 Driver::SettleForWithdrawal => service.settle_for_withdrawal().await.map(|_| ()),
                 // After the receipt installs, the fresh proof at the new state
-                // stops at the unreachable indexer.
+                // stops at its path: no RPC to read the vault's root.
                 Driver::LeaseReplay => service
                     .issue_direct_openrouter_lease("chat".into(), None)
                     .await
@@ -7541,7 +7628,10 @@ mod oa_request_archive_tests {
         let result = drive().await;
         match driver {
             Driver::LeaseReplay => {
-                assert!(matches!(result, Err(AuthError::Indexer(_))), "{result:?}")
+                assert!(
+                    result.as_ref().is_err_and(super::tests::no_request_path),
+                    "{result:?}"
+                )
             }
             _ => assert!(result.is_ok(), "{driver:?}: {result:?}"),
         }
@@ -8637,12 +8727,10 @@ mod oa_native_recovery_tests {
                 "{case}"
             );
             if retired {
-                // The next proof starts from the unchanged note; the fixture's
-                // unreachable indexer stops it before any new quote.
-                assert!(
-                    matches!(failure, AuthError::Indexer(_)),
-                    "{case}: {failure}"
-                );
+                // The next proof starts from the unchanged note; the fixture
+                // names no RPC for its path, which stops it before any new
+                // quote.
+                assert!(super::tests::no_request_path(&failure), "{case}: {failure}");
                 assert!(
                     PendingRequestJournal::read(&journal).unwrap().is_none(),
                     "{case}"

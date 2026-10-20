@@ -1,10 +1,15 @@
-//! The operator's indexer. Every call is bounded (design §6.4 E0): the
-//! indexer is operator-run, and the mutual close and request preparation
-//! read it while holding the wallet's locks, which every exit route takes
-//! too. A call that connects and never answers, or drips its body, fails
-//! after `CALL_TIMEOUT` instead of holding those locks. Note lookups download
-//! the same whole-tree snapshot as the browser and derive paths locally;
-//! no note ID is sent to the indexer, even if the snapshot is unavailable.
+//! The operator's indexer. Since vault revision 4 only requests read it: an
+//! exit is bound to the note's stored leaf and needs no path. Its answers
+//! are untrusted; a request path from it is used only once the vault's
+//! `currentRoot()` confirms its root (`crate::request_path`). Note lookups
+//! download the same whole-tree snapshot as the browser and derive paths
+//! and leaves locally; no note ID is sent to the indexer, even if the
+//! snapshot is unavailable.
+//!
+//! Every call is bounded (design §6.4 E0): request preparation reads it
+//! while holding the wallet's locks, which every exit route takes too. A
+//! call that connects and never answers, or drips its body, fails after
+//! `CALL_TIMEOUT` instead of holding those locks.
 
 use std::time::{Duration, Instant};
 
@@ -37,16 +42,35 @@ struct TreeRootResponse {
     root: Felt252,
 }
 
+/// `/v1/tree/snapshot`: the whole tree in one view, with the block it was
+/// read at (the indexer of vault revision 4 names its hash).
 #[derive(Debug, Deserialize)]
 struct TreeSnapshotResponse {
     root: Felt252,
     next_note_id: u32,
     leaves: Vec<Felt252>,
+    #[serde(default)]
+    block_number: Option<u64>,
+    #[serde(default)]
+    block_hash: Option<String>,
 }
 
 struct TreeSnapshot {
     tree: MerkleTree,
     next_note_id: u32,
+    block: Option<(u64, [u8; 32])>,
+}
+
+/// A note's path as derived from the indexer's snapshot. The snapshot's
+/// leaves reproduce its root, but nothing says the vault ever held that
+/// root: `crate::request_path` asks the vault before proving against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexerPath {
+    pub leaf: Option<Felt252>,
+    pub siblings: Vec<Felt252>,
+    pub root: Felt252,
+    /// The block the indexer's view is at, when it names one.
+    pub block: Option<(u64, [u8; 32])>,
 }
 
 impl TreeSnapshotResponse {
@@ -56,6 +80,10 @@ impl TreeSnapshotResponse {
                 "tree snapshot leaf count does not match next_note_id".into(),
             ));
         }
+        let block = match (self.block_number, self.block_hash.as_deref()) {
+            (Some(number), Some(hash)) => Some((number, block_hash(hash)?)),
+            _ => None,
+        };
         let mut tree = MerkleTree::new();
         for (index, leaf) in self.leaves.into_iter().enumerate() {
             // Reconstruction runs off the async executor. Stop the blocking
@@ -77,12 +105,20 @@ impl TreeSnapshotResponse {
         Ok(TreeSnapshot {
             tree,
             next_note_id: self.next_note_id,
+            block,
         })
     }
 }
 
 fn indexer_timeout() -> AuthError {
     AuthError::Indexer("the indexer did not answer in time".into())
+}
+
+fn block_hash(text: &str) -> Result<[u8; 32], AuthError> {
+    text.strip_prefix("0x")
+        .and_then(|digits| hex::decode(digits).ok())
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| AuthError::Indexer("the indexer's block hash is not 32 bytes".into()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,19 +151,22 @@ impl IndexerClient {
         Ok(payload.root)
     }
 
-    /// The root and `note_id`'s path from one verified snapshot, within one
-    /// call timeout (E0). The note ID is used only locally.
-    pub async fn root_and_path(&self, note_id: u32) -> Result<(Felt252, Vec<Felt252>), AuthError> {
+    /// `note_id`'s path, leaf and root from one verified snapshot, with the
+    /// block the snapshot names, within one call timeout (E0). The note ID
+    /// is used only locally.
+    pub async fn path_view(&self, note_id: u32) -> Result<IndexerPath, AuthError> {
         let snapshot = self.snapshot().await?;
         if note_id >= snapshot.next_note_id {
             return Err(AuthError::Indexer(
                 "requested note index is inconsistent with the tree snapshot".into(),
             ));
         }
-        Ok((
-            snapshot.tree.root(),
-            snapshot.tree.get_siblings(note_id).to_vec(),
-        ))
+        Ok(IndexerPath {
+            leaf: Some(snapshot.tree.get_leaf(note_id)),
+            siblings: snapshot.tree.get_siblings(note_id).to_vec(),
+            root: snapshot.tree.root(),
+            block: snapshot.block,
+        })
     }
 
     pub async fn next_note_id(&self) -> Result<u32, AuthError> {
@@ -135,16 +174,6 @@ impl IndexerClient {
             .get(format!("{}/v1/tree/next-note-id", self.base_url))
             .await?;
         Ok(payload.next_note_id)
-    }
-
-    /// The next deposit slot and its empty path, from the same verified view.
-    pub async fn next_deposit_path(&self) -> Result<(u32, Felt252, Vec<Felt252>), AuthError> {
-        let snapshot = self.snapshot().await?;
-        Ok((
-            snapshot.next_note_id,
-            snapshot.tree.root(),
-            snapshot.tree.get_siblings(snapshot.next_note_id).to_vec(),
-        ))
     }
 
     /// Read a leaf locally from the verified snapshot; zero where no note is.
@@ -277,42 +306,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paths_leaves_and_deposits_never_disclose_the_selected_note() {
+    async fn paths_and_leaves_never_disclose_the_selected_note() {
         let leaves = vec![Felt252::from_u64(41), Felt252::ZERO, Felt252::from_u64(43)];
-        let (payload, tree) = snapshot(leaves.clone());
+        let (mut payload, tree) = snapshot(leaves.clone());
+        payload["block_number"] = json!(7);
+        payload["block_hash"] = json!(format!("0x{}", "ab".repeat(32)));
         let server = Server::json(payload).await;
         for (id, leaf) in leaves.iter().enumerate() {
-            let (root, siblings) = server.client.root_and_path(id as u32).await.unwrap();
-            assert_eq!(root, tree.root());
-            assert_eq!(siblings, tree.get_siblings(id as u32));
+            let view = server.client.path_view(id as u32).await.unwrap();
+            assert_eq!(view.root, tree.root());
+            assert_eq!(view.leaf, Some(*leaf));
+            assert_eq!(view.siblings, tree.get_siblings(id as u32));
+            assert_eq!(view.block, Some((7, [0xab; 32])));
             assert_eq!(
-                compute_root(id as u32, leaf, &siblings.try_into().unwrap()),
-                root
+                compute_root(id as u32, leaf, &view.siblings.try_into().unwrap()),
+                view.root
             );
             assert_eq!(server.client.note_leaf(id as u32).await.unwrap(), *leaf);
         }
         // The retired leaf stays at its original index; absent leaves are zero.
         assert_eq!(server.client.note_leaf(99).await.unwrap(), Felt252::ZERO);
-        let (id, root, siblings) = server.client.next_deposit_path().await.unwrap();
-        assert_eq!(id, 3);
-        assert_eq!(
-            compute_root(id, &Felt252::ZERO, &siblings.try_into().unwrap()),
-            root
-        );
-        assert_eq!(root, tree.root());
-        assert!(server.client.root_and_path(3).await.is_err());
-        server.assert_only_snapshots(9);
+        assert!(server.client.path_view(3).await.is_err());
+        server.assert_only_snapshots(8);
     }
 
     #[tokio::test]
-    async fn empty_snapshot_provides_the_first_deposit_path() {
-        let (payload, tree) = snapshot(vec![]);
+    async fn a_snapshot_without_a_block_gives_a_path_without_one() {
+        let (payload, tree) = snapshot(vec![Felt252::from_u64(41)]);
         let server = Server::json(payload).await;
-        let (id, root, siblings) = server.client.next_deposit_path().await.unwrap();
-        assert_eq!(id, 0);
-        assert_eq!(root, tree.root());
-        assert_eq!(siblings, tree.get_siblings(0));
-        assert!(server.client.root_and_path(0).await.is_err());
+        let view = server.client.path_view(0).await.unwrap();
+        assert_eq!((view.root, view.block), (tree.root(), None));
+        server.assert_only_snapshots(1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_snapshot_has_no_note_path() {
+        let (payload, _) = snapshot(vec![]);
+        let server = Server::json(payload).await;
+        assert!(server.client.path_view(0).await.is_err());
+        assert_eq!(server.client.note_leaf(0).await.unwrap(), Felt252::ZERO);
         server.assert_only_snapshots(2);
     }
 
@@ -325,29 +357,29 @@ mod tests {
         wrong_root["root"] = json!(Felt252::ONE);
         let mut wrong_leaf = valid.clone();
         wrong_leaf["leaves"][0] = json!(Felt252::from_u64(2));
+        let mut short_block_hash = valid.clone();
+        short_block_hash["block_number"] = json!(7);
+        short_block_hash["block_hash"] = json!("0xabcd");
         let mut noncanonical_leaf = valid;
         noncanonical_leaf["leaves"][0] = json!(zkapi_types::FIELD_MODULUS_HEX);
         for payload in [
             wrong_count,
             wrong_root,
             wrong_leaf,
+            short_block_hash,
             noncanonical_leaf,
             json!({}),
         ] {
             let server = Server::json(payload).await;
             assert!(matches!(
-                server.client.root_and_path(0).await,
+                server.client.path_view(0).await,
                 Err(AuthError::Indexer(_))
             ));
             assert!(matches!(
                 server.client.note_leaf(0).await,
                 Err(AuthError::Indexer(_))
             ));
-            assert!(matches!(
-                server.client.next_deposit_path().await,
-                Err(AuthError::Indexer(_))
-            ));
-            server.assert_only_snapshots(3);
+            server.assert_only_snapshots(2);
         }
     }
 
@@ -355,10 +387,9 @@ mod tests {
     async fn unavailable_snapshot_never_falls_back_to_note_endpoints() {
         for status in [StatusCode::NOT_FOUND, StatusCode::SERVICE_UNAVAILABLE] {
             let server = Server::new(move || status.into_response()).await;
-            assert!(server.client.root_and_path(7).await.is_err());
+            assert!(server.client.path_view(7).await.is_err());
             assert!(server.client.note_leaf(7).await.is_err());
-            assert!(server.client.next_deposit_path().await.is_err());
-            server.assert_only_snapshots(3);
+            server.assert_only_snapshots(2);
         }
     }
 
@@ -373,7 +404,7 @@ mod tests {
         .await;
         let client =
             IndexerClient::with_timeout(&server.client.base_url, Duration::from_millis(50));
-        let result = tokio::time::timeout(Duration::from_secs(1), client.root_and_path(0))
+        let result = tokio::time::timeout(Duration::from_secs(1), client.path_view(0))
             .await
             .expect("an indexer that never finishes its body must time out");
         assert!(matches!(result, Err(AuthError::Indexer(_))));
@@ -401,7 +432,7 @@ mod tests {
                 response
             })
             .await;
-            let error = server.client.root_and_path(0).await.unwrap_err();
+            let error = server.client.path_view(0).await.unwrap_err();
             assert!(error.to_string().contains("too large"), "{error}");
             server.assert_only_snapshots(1);
         }
