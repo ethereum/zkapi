@@ -221,27 +221,37 @@ func TestFundingUsesPackagedRPCInsteadOfCompanionString(t *testing.T) {
 	}
 }
 
+// noteRecord(uint32) answers exactly two words, (uint256 leaf, uint8
+// status), as a revision-4 vault stores them.
 func TestVaultNoteDecodingIsStrict(t *testing.T) {
-	commitment := strings.Repeat("ab", 32)
+	leaf := strings.Repeat("0", 2) + strings.Repeat("ab", 31)
 	word := func(value string) string { return strings.Repeat("0", 64-len(value)) + value }
-	valid := "0x" + commitment + word("186a0") + word("6a6b1a00") + word("1")
+	valid := "0x" + leaf + word("1")
 	note, err := decodeVaultNote(valid)
-	if err != nil || note.Commitment != "0x"+commitment || note.Amount != 100000 || note.ExpiryTs != 0x6a6b1a00 || note.Status != noteActive {
+	if err != nil || fieldWord(note.Leaf) != "0x"+leaf || note.Status != noteActive {
 		t.Fatalf("valid note rejected: %+v %v", note, err)
 	}
-	if note, err := decodeVaultNote("0x" + strings.Repeat("0", 256)); err != nil || note.Status != noteUninitialized {
+	if note, err := decodeVaultNote("0x" + strings.Repeat("0", 128)); err != nil || note.Status != noteUninitialized || note.Leaf.Sign() != 0 {
 		t.Fatalf("uninitialized note rejected: %+v %v", note, err)
 	}
+	if note, err := decodeVaultNote("0x" + word("0") + word("3")); err != nil || note.Status != noteClosed || note.Leaf.Sign() != 0 {
+		t.Fatalf("retired note rejected: %+v %v", note, err)
+	}
+	if note, err := decodeVaultNote("0x" + leaf + word("3")); err != nil || note.Status != noteClosed || note.Leaf.Sign() == 0 {
+		t.Fatalf("closed note rejected: %+v %v", note, err)
+	}
 	for name, encoded := range map[string]string{
-		"short":               valid[:len(valid)-2],
-		"long":                valid + "00",
-		"no prefix":           "00" + valid[2:],
-		"not hex":             "0x" + commitment + word("186a0") + word("6a6b1a00") + word("zz"),
-		"amount high bytes":   "0x" + commitment + "1" + word("186a0")[1:] + word("6a6b1a00") + word("1"),
-		"amount above 2^53-1": "0x" + commitment + word("20000000000000") + word("6a6b1a00") + word("1"),
-		"expiry high bytes":   "0x" + commitment + word("186a0") + "1" + word("6a6b1a00")[1:] + word("1"),
-		"status high bytes":   "0x" + commitment + word("186a0") + word("6a6b1a00") + word("101"),
-		"status 4":            "0x" + commitment + word("186a0") + word("6a6b1a00") + word("4"),
+		"short":                 valid[:len(valid)-2],
+		"long":                  valid + "00",
+		"four words (notes())":  valid + word("6a6b1a00") + word("1"),
+		"no prefix":             "00" + valid[2:],
+		"not hex":               "0x" + leaf + word("zz"),
+		"leaf not a field":      "0x" + strings.Repeat("f", 64) + word("1"),
+		"status high bytes":     "0x" + leaf + word("101"),
+		"status 4":              "0x" + leaf + word("4"),
+		"active without leaf":   "0x" + word("0") + word("1"),
+		"pending without leaf":  "0x" + word("0") + word("2"),
+		"unused ID with a leaf": "0x" + leaf + word("0"),
 	} {
 		if _, err := decodeVaultNote(encoded); err == nil {
 			t.Errorf("%s note state accepted", name)

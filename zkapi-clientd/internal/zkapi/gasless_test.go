@@ -245,7 +245,7 @@ func TestGaslessDerivationsFollowTheTransitVectors(t *testing.T) {
 	if err := json.Unmarshal(v.GasPolicy, &policy); err != nil {
 		t.Fatal(err)
 	}
-	if policy.CallFloor != [4]uint64{210000, 160000, 200000, 30000} || policy.CallCap != [4]uint64{950000, 1100000, 400000, 150000} || policy.PostOpFloor != 250000 || policy.MaxAttempts != 3 || policy.FinalizeReserveGas != 890000 {
+	if policy.CallFloor != [4]uint64{210000, 160000, 200000, 30000} || policy.CallCap != [4]uint64{950000, 1100000, 400000, 150000} || policy.PostOpFloor != 250000 || policy.MaxAttempts != 3 || policy.PMVerificationFloor != 340000 || policy.FinalizeReserveGas != 880000 {
 		t.Fatalf("gas policy parsed as %+v", policy)
 	}
 	for i, sample := range v.ChargeSamples {
@@ -355,6 +355,18 @@ func TestGaslessSelectorsAndTopicsMatchTheContracts(t *testing.T) {
 	}
 	if gaslessErrorNames[selectorOf("NoteNotActive()")] != "NoteNotActive" || gaslessErrorNames[selectorOf("PayoutBelowCost(uint256,uint256)")] != "PayoutBelowCost" {
 		t.Fatal("error names missing")
+	}
+	// Vault revision 4 and its paymaster refuse an exit whose note leaf or
+	// fields do not match before verifying; UnknownRoot is gone.
+	for selector, name := range map[string]string{"f2b1d50f": "NoteLeafMismatch", "aa6aef76": "InvalidNoteFields", "6ba4a1c7": "DepositTooSmall", "b48f2cf8": "TreeFull", "9fe6fd7a": "InvalidNoteRange"} {
+		if gaslessErrorNames[selector] != name {
+			t.Errorf("error 0x%s is %q, want %s", selector, gaslessErrorNames[selector], name)
+		}
+	}
+	for _, name := range gaslessErrorNames {
+		if name == "UnknownRoot" {
+			t.Error("the removed UnknownRoot is still decoded")
+		}
 	}
 }
 

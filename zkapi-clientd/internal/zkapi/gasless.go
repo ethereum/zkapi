@@ -144,7 +144,7 @@ var gaslessErrorNames = func() map[string]string {
 		// ZkApiWithdrawalPaymaster
 		"NotEntryPoint()", "SponsorshipPaused()", "SponsorshipInFlight(bytes32)", "BadPaymasterData()", "FeeAboveCap(uint256,uint256)", "FeeAboveCeiling()",
 		"GasLimitOutOfRange(uint8,uint256,uint256,uint256)", "MaxCostAbovePolicy(uint256,uint256)", "NotTransitAccount()", "UnsupportedCall()", "WrongNonceKey()",
-		"AttemptsExhausted(bytes32)", "BindingMismatch()", "DestinationNotSender()", "InvalidValidUntil()", "UnknownRoot()", "NoteNotActive()", "NullifierUsed()",
+		"AttemptsExhausted(bytes32)", "BindingMismatch()", "DestinationNotSender()", "InvalidValidUntil()", "NoteLeafMismatch()", "InvalidNoteFields()", "NoteNotActive()", "NullifierUsed()",
 		"InvalidFelt()", "WrongKind()", "InvalidBalance()", "BadSuccessor()", "ChallengedNullifier()", "SupersededState()", "EscapesDisabled()",
 		"EscapeAlreadySponsored(uint32)", "EscapeEvidencePending(uint32)", "PayoutBelowCost(uint256,uint256)", "ExitsPaused(uint64)", "NotPendingEscape()",
 		"NotStranded()", "NotRepayable()", "ZeroAmount()", "NativeTransferFailed()", "CreditsReserved()", "InvalidKind()",
@@ -154,7 +154,7 @@ var gaslessErrorNames = func() map[string]string {
 		"InvalidProof()", "InvalidNativeValue()", "StaleRoot()", "ReplayedNullifier()", "InvalidDestination()", "NotePendingWithdrawal()", "NoteExpired()",
 		"NoteNotExpired()", "InsufficientDeposit()", "InvalidCommitment()", "ChallengeExpired()", "ChallengeNotExpired()", "NotPendingWithdrawal()",
 		"InvalidDeploymentBinding()", "InvalidSiblings()", "Paused()", "NotPaused()", "Unauthorized()", "WrongWithdrawalKind()", "NotSuccessorEvidence()",
-		"NotStateEvidence()", "NotARaise()", "ProofExpired()", "PauseCooldown()", "NoteNotClosed()",
+		"NotStateEvidence()", "NotARaise()", "ProofExpired()", "PauseCooldown()", "NoteNotClosed()", "TreeFull()", "DepositTooSmall()", "InvalidNoteRange()",
 	} {
 		names[selectorOf(signature)] = signature[:strings.Index(signature, "(")]
 	}

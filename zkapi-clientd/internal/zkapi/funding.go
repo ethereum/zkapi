@@ -18,7 +18,10 @@ import (
 	"time"
 )
 
-const depositEventTopic = "0x7c83dba8534bea9e30d6444f9ca6462dc906897f9938d220dbbe4358c1f7a063"
+// depositEventTopic is NoteDeposited(uint32 indexed noteId, bytes32 indexed
+// commitment, uint128 amount, uint64 expiryTs) of vault revision 4: two data
+// words, and no root (the vault's root is the computed currentRoot() view).
+const depositEventTopic = "0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36"
 
 type FundingHandler struct {
 	client    *Client
@@ -67,18 +70,17 @@ func (c fundingConfig) exitConfig() fundingConfig {
 }
 
 type depositRecord struct {
-	DeploymentID    string   `json:"deployment_id,omitempty"`
-	BillingAsset    string   `json:"billing_asset,omitempty"`
-	BillingUnit     string   `json:"billing_unit,omitempty"`
-	WeiPerUnit      string   `json:"native_asset_wei_per_unit,omitempty"`
-	ChainID         uint64   `json:"chain_id"`
-	Contract        string   `json:"contract_address"`
-	Amount          uint64   `json:"amount"`
-	Secret          string   `json:"secret"`
-	Commitment      string   `json:"commitment"`
-	ZeroPath        []string `json:"zero_path"`
-	TransactionHash string   `json:"transaction_hash,omitempty"`
-	Active          bool     `json:"active,omitempty"`
+	DeploymentID    string `json:"deployment_id,omitempty"`
+	BillingAsset    string `json:"billing_asset,omitempty"`
+	BillingUnit     string `json:"billing_unit,omitempty"`
+	WeiPerUnit      string `json:"native_asset_wei_per_unit,omitempty"`
+	ChainID         uint64 `json:"chain_id"`
+	Contract        string `json:"contract_address"`
+	Amount          uint64 `json:"amount"`
+	Secret          string `json:"secret"`
+	Commitment      string `json:"commitment"`
+	TransactionHash string `json:"transaction_hash,omitempty"`
+	Active          bool   `json:"active,omitempty"`
 	// Additive recovery fields; older releases ignore them.
 	Binding *depositBinding `json:"binding,omitempty"`
 	Rebind  *depositRebind  `json:"rebind,omitempty"`
@@ -89,8 +91,9 @@ type depositRecord struct {
 	SignedSlots []depositSlot `json:"signed_slots,omitempty"`
 }
 
-// depositBinding is the note identity both the vault and the indexer agreed
-// on before the note secret was handed to the companion.
+// depositBinding is the note identity the vault's stored leaf confirmed
+// before the note secret was handed to the companion. IndexerBlock is the
+// indexer view that corroborated it, or zero when none answered.
 type depositBinding struct {
 	NoteID       uint32 `json:"note_id"`
 	ExpiryTs     uint64 `json:"expiry_ts"`
@@ -281,6 +284,9 @@ func (h *FundingHandler) prepare(ctx context.Context, amount uint64) (any, error
 	if amount == 0 || amount > 1_000_000_000_000 {
 		return nil, errors.New("invalid deposit amount")
 	}
+	if err := h.checkMinimumDeposit(amount); err != nil {
+		return nil, err
+	}
 	config, err := h.config(ctx)
 	if err != nil {
 		return nil, err
@@ -364,21 +370,17 @@ func (h *FundingHandler) prepare(ctx context.Context, amount uint64) (any, error
 	}
 	// Only the note material comes from the companion. Activation, transaction
 	// and binding fields are Go's own journal and are never seeded remotely.
+	// A deposit carries no Merkle path (vault revisions 3 and 4), so a
+	// zero_path an earlier companion still returns is ignored.
 	var plan struct {
-		Amount     uint64   `json:"amount"`
-		Secret     string   `json:"secret"`
-		Commitment string   `json:"commitment"`
-		ZeroPath   []string `json:"zero_path"`
+		Amount     uint64 `json:"amount"`
+		Secret     string `json:"secret"`
+		Commitment string `json:"commitment"`
 	}
-	if json.Unmarshal(raw, &plan) != nil || plan.Amount != amount || !isField(plan.Secret) || !isField(plan.Commitment) || len(plan.ZeroPath) != 32 {
+	if json.Unmarshal(raw, &plan) != nil || plan.Amount != amount || !isField(plan.Secret) || !isField(plan.Commitment) {
 		return nil, errors.New("invalid deposit preparation")
 	}
-	record = depositRecord{Amount: plan.Amount, Secret: plan.Secret, Commitment: plan.Commitment, ZeroPath: plan.ZeroPath}
-	for _, sibling := range record.ZeroPath {
-		if !isField(sibling) {
-			return nil, errors.New("invalid deposit path")
-		}
-	}
+	record = depositRecord{Amount: plan.Amount, Secret: plan.Secret, Commitment: plan.Commitment}
 	record.ChainID, record.Contract = config.ChainID, config.Contract
 	record.DeploymentID, record.BillingAsset, record.BillingUnit, record.WeiPerUnit = config.DeploymentID, config.BillingAsset, config.BillingUnit, config.WeiPerUnit
 	if err := h.save(record); err != nil {
@@ -387,8 +389,24 @@ func (h *FundingHandler) prepare(ctx context.Context, amount uint64) (any, error
 	return publicDeposit(record), nil
 }
 
+// errDepositTooSmall refuses a deposit below the vault's minDeposit(), which
+// would revert (DepositTooSmall). The deployment checks pin minDeposit() to
+// the profile's min_deposit_units before every deposit.
+var errDepositTooSmall = errors.New("deposit_too_small")
+
+func (h *FundingHandler) checkMinimumDeposit(amount uint64) error {
+	deployment, _, err := deployedDeployment(h.client.config.Network)
+	if err != nil {
+		return err
+	}
+	if amount < deployment.MinDepositUnits {
+		return fmt.Errorf("%w: the vault accepts deposits of at least %d %s; no deposit was prepared", errDepositTooSmall, deployment.MinDepositUnits, deployment.Unit)
+	}
+	return nil
+}
+
 func publicDeposit(r depositRecord) any {
-	return map[string]any{"amount": r.Amount, "commitment": r.Commitment, "zero_path": r.ZeroPath, "transaction_hash": r.TransactionHash, "active": r.Active}
+	return map[string]any{"amount": r.Amount, "commitment": r.Commitment, "transaction_hash": r.TransactionHash, "active": r.Active}
 }
 func isHex(s string, n int) bool {
 	if len(s) != 2+n*2 || !strings.HasPrefix(s, "0x") {
@@ -496,9 +514,10 @@ func (h *FundingHandler) confirm(ctx context.Context, tx string) (any, error) {
 	if err := h.save(record); err != nil {
 		return nil, err
 	}
-	// The receipt alone is one third-party RPC's claim. The vault state at the
-	// receipt block and the indexer's snapshot must agree before the secret
-	// leaves this process; disagreement and lag keep the saved transaction.
+	// The receipt alone is one third-party RPC's claim. The vault's stored
+	// leaf at the receipt block must be this note's, and an indexer view of
+	// that block must not disagree, before the secret leaves this process;
+	// disagreement and lag keep the saved transaction.
 	binding, err := h.corroborateDeposit(ctx, config, record, receipt, noteID, expiry)
 	if err != nil {
 		return nil, err
@@ -544,10 +563,9 @@ func (h *FundingHandler) confirm(ctx context.Context, tx string) (any, error) {
 	if record.Active {
 		return nil, errors.New("this deposit was already activated; restore its wallet state instead of reinitializing it")
 	}
+	// The note's exits need only the note itself (vault revision 4): no
+	// deposit-time path or root is handed over.
 	activation := map[string]any{"secret": record.Secret, "note_id": noteID, "amount": record.Amount, "expiry_ts": expiry}
-	if root, siblings, ok := depositTimePath(receipt, record, noteID, expiry); ok {
-		activation["deposit_root"], activation["deposit_siblings"] = root, siblings
-	}
 	body, _ := json.Marshal(activation)
 	_, err = h.client.request(ctx, http.MethodPost, "/funding/api/deposit/confirm", body)
 	if err != nil {
@@ -628,7 +646,7 @@ func matchDepositEvent(receipt ethReceipt, record depositRecord, now int64) (uin
 		if log.Removed || !strings.EqualFold(log.Address, record.Contract) || len(log.Topics) != 3 || !strings.EqualFold(log.Topics[0], depositEventTopic) {
 			continue
 		}
-		if !isHex(log.Topics[1], 32) || !isHex(log.Topics[2], 32) || !isHex(log.Data, 96) {
+		if !isHex(log.Topics[1], 32) || !isHex(log.Topics[2], 32) || !isHex(log.Data, 64) {
 			continue
 		}
 		eventCommitment, _ := new(big.Int).SetString(log.Topics[2][2:], 16)
@@ -648,68 +666,6 @@ func matchDepositEvent(receipt ethReceipt, record depositRecord, now int64) (uin
 		return matchingNote, matchingExpiry, nil
 	}
 	return 0, 0, errors.New("deposit receipt must contain exactly one event matching this private note")
-}
-
-// depositTimePath is Amendment A1's deposit-time Merkle path: the root this
-// deposit set (NoteDeposited.newRoot) and the zero path the deposit was signed
-// with, which are the note's siblings at that root. The vault accepts every
-// root it ever held, so the companion exits with them without the indexer or
-// a log rebuild. Nothing is returned unless the path proves the note's leaf
-// at that root; the companion checks it again before keeping it.
-func depositTimePath(receipt ethReceipt, record depositRecord, noteID uint32, expiry uint64) (string, []string, bool) {
-	if len(record.ZeroPath) != merkleDepth {
-		return "", nil, false
-	}
-	commitment, ok := parseFieldElement(record.Commitment)
-	if !ok {
-		return "", nil, false
-	}
-	siblings := make([]*big.Int, merkleDepth)
-	for i, sibling := range record.ZeroPath {
-		if siblings[i], ok = parseFieldElement(sibling); !ok {
-			return "", nil, false
-		}
-	}
-	leaf := noteLeaf(noteID, commitment, record.Amount, expiry)
-	computed := merkleRoot(noteID, leaf, siblings)
-	for _, log := range receipt.Logs {
-		if log.Removed || !strings.EqualFold(log.Address, record.Contract) || len(log.Topics) != 3 || !strings.EqualFold(log.Topics[0], depositEventTopic) || !isHex(log.Topics[1], 32) || !isHex(log.Data, 96) {
-			continue
-		}
-		if note, ok := new(big.Int).SetString(log.Topics[1][2:], 16); !ok || !note.IsUint64() || note.Uint64() != uint64(noteID) {
-			continue
-		}
-		root, ok := new(big.Int).SetString(log.Data[130:194], 16)
-		if ok && root.Cmp(computed) == 0 {
-			return fmt.Sprintf("0x%064x", root), record.ZeroPath, true
-		}
-	}
-	return "", nil, false
-}
-
-// Deposit witnesses describe the current shared tree, not private wallet
-// material. Refresh after token approval so other deposits do not leave a
-// restored preparation permanently stuck with an obsolete empty-leaf path.
-func (h *FundingHandler) depositPath(ctx context.Context) (any, error) {
-	if err := h.client.Check(ctx); err != nil {
-		return nil, err
-	}
-	raw, err := h.client.request(ctx, http.MethodGet, "/oa/v1/deposit/path", nil)
-	if err != nil {
-		return nil, err
-	}
-	var result struct {
-		ZeroPath []string `json:"zero_path"`
-	}
-	if json.Unmarshal(raw, &result) != nil || len(result.ZeroPath) != 32 {
-		return nil, errors.New("invalid refreshed deposit path")
-	}
-	for _, sibling := range result.ZeroPath {
-		if !isField(sibling) {
-			return nil, errors.New("invalid refreshed deposit path")
-		}
-	}
-	return result, nil
 }
 
 func syncDirectoryChain(path string) error {

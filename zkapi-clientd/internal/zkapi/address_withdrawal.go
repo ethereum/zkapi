@@ -3,6 +3,7 @@ package zkapi
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -228,18 +229,23 @@ type withdrawalBridgeStatus struct {
 	EscapePayoutCredited bool `json:"escape_payout_credited"`
 }
 
-// withdrawalInputs is the 16-field statement of circuit
-// zkapi-v2-concession-v1 (WithdrawalPublicInputsV2C), in public-input order.
+// withdrawalInputs is the statement of circuit zkapi-v2-concession-v2
+// (WithdrawalPublicInputsV2C), in public-input order. Its 16 public inputs
+// are these fields with NoteID, DepositAmount and ExpiryTs packed into input
+// 8 (noteFields). Input 3 is the note's leaf, which the vault compares with
+// the leaf it stored at deposit: an exit needs no Merkle path or root.
 type withdrawalInputs struct {
 	ProtocolVersion uint64  `json:"protocol_version"`
 	ChainID         uint64  `json:"chain_id"`
 	Contract        string  `json:"contract_address"`
-	ActiveRoot      string  `json:"active_root"`
+	NoteLeaf        string  `json:"note_leaf"`
 	StateKeyX       string  `json:"state_signing_key_x"`
 	StateKeyY       string  `json:"state_signing_key_y"`
 	ClearanceKeyX   string  `json:"clearance_signing_key_x"`
 	ClearanceKeyY   string  `json:"clearance_signing_key_y"`
 	NoteID          uint64  `json:"note_id"`
+	DepositAmount   uint64  `json:"deposit_amount"`
+	ExpiryTs        uint64  `json:"expiry_ts"`
 	FinalBalance    uint64  `json:"final_balance"`
 	Destination     []uint8 `json:"destination"`
 	Nullifier       string  `json:"withdrawal_nullifier"`
@@ -249,8 +255,9 @@ type withdrawalInputs struct {
 	ValidUntil      uint64  `json:"valid_until"`
 }
 
-// withdrawalTuple is the vault's WithdrawalPublicInputs tuple.
-const withdrawalTuple = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)"
+// withdrawalTuple is the vault's WithdrawalPublicInputs tuple (vault revision
+// 4): word 3 is noteLeaf and word 8 the uint256 noteFields.
+const withdrawalTuple = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64)"
 
 // exitProofValidity is how long the vault accepts an escape or close proof;
 // a proof is signed only while its valid_until is within this (plus a small
@@ -265,7 +272,6 @@ const withdrawalCalldataLength = 4 + 26*32
 type withdrawalPlan struct {
 	Mode         string           `json:"mode"`
 	PublicInputs withdrawalInputs `json:"public_inputs"`
-	Siblings     []string         `json:"siblings"`
 	Proof        struct {
 		Backend string `json:"backend"`
 		Proof   string `json:"proof"`
@@ -370,7 +376,7 @@ func (h *FundingHandler) escapePayoutCredits(ctx context.Context, config funding
 	return credits, nil
 }
 
-const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed before finishing local bookkeeping."
+const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state to confirm the note is closed before finishing local bookkeeping."
 
 // requireClearanceOwnershipCapability runs only before a companion reserves a
 // note for a new withdrawal. Where the pinned deployment's server may require
@@ -1189,7 +1195,7 @@ func withdrawalStatusMatches(status withdrawalBridgeStatus, record *addressWithd
 func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addressWithdrawalRecord, previousBalance uint64, now time.Time) (string, string, error) {
 	p := plan.PublicInputs
 	invalid := errors.New("withdrawal proof does not match the authorized note, destination, balance, or deployment")
-	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.proofDestination()) || p.FinalBalance > previousBalance || plan.Proof.Backend != "groth16_bn254" {
+	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.proofDestination()) || p.FinalBalance > previousBalance || p.FinalBalance > p.DepositAmount || plan.Proof.Backend != "groth16_bn254" {
 		return "", "", invalid
 	}
 	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.proofDestination())
@@ -1211,30 +1217,74 @@ func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addres
 }
 
 // withdrawalWords is the 16 tuple words of p, with destination as the
-// payout address, and the 256 proof bytes.
+// payout address, and the 256 proof bytes. Word 3 is the note leaf and word
+// 8 the packed note fields (noteFieldsWord).
 func withdrawalWords(p withdrawalInputs, encodedProof, destination string) ([]string, []byte, error) {
 	proof, err := base64.StdEncoding.DecodeString(encodedProof)
 	if err != nil || len(proof) != 256 {
 		return nil, nil, errors.New("invalid proof")
 	}
-	for _, field := range []string{p.ActiveRoot, p.StateKeyX, p.StateKeyY, p.ClearanceKeyX, p.ClearanceKeyY, p.Nullifier, p.NextNullifier} {
+	for _, field := range []string{p.NoteLeaf, p.StateKeyX, p.StateKeyY, p.ClearanceKeyX, p.ClearanceKeyY, p.Nullifier, p.NextNullifier} {
 		if !isField(field) {
 			return nil, nil, errors.New("invalid field")
 		}
 	}
-	words := []string{fmt.Sprintf("%064x", p.ProtocolVersion), fmt.Sprintf("%064x", p.ChainID), addressABIWord(p.Contract), addressABIWord(p.ActiveRoot), addressABIWord(p.StateKeyX), addressABIWord(p.StateKeyY), addressABIWord(p.ClearanceKeyX), addressABIWord(p.ClearanceKeyY), fmt.Sprintf("%064x", p.NoteID), fmt.Sprintf("%064x", p.FinalBalance), addressABIWord(destination), addressABIWord(p.Nullifier), fmt.Sprintf("%064x", p.Kind), addressABIWord(p.NextNullifier), fmt.Sprintf("%064x", p.Conceded), fmt.Sprintf("%064x", p.ValidUntil)}
+	// A leaf is a nonzero field element: zero is the retired (and empty)
+	// leaf, which no exit can match.
+	if leaf, ok := parseFieldElement(p.NoteLeaf); !ok || leaf.Sign() == 0 {
+		return nil, nil, errors.New("invalid note leaf")
+	}
+	if p.NoteID > 0xffffffff || p.DepositAmount == 0 || p.DepositAmount > maxSafeNoteAmount || p.ExpiryTs == 0 {
+		return nil, nil, errors.New("invalid note fields")
+	}
+	words := []string{fmt.Sprintf("%064x", p.ProtocolVersion), fmt.Sprintf("%064x", p.ChainID), addressABIWord(p.Contract), addressABIWord(p.NoteLeaf), addressABIWord(p.StateKeyX), addressABIWord(p.StateKeyY), addressABIWord(p.ClearanceKeyX), addressABIWord(p.ClearanceKeyY), noteFieldsWord(uint32(p.NoteID), p.DepositAmount, p.ExpiryTs), fmt.Sprintf("%064x", p.FinalBalance), addressABIWord(destination), addressABIWord(p.Nullifier), fmt.Sprintf("%064x", p.Kind), addressABIWord(p.NextNullifier), fmt.Sprintf("%064x", p.Conceded), fmt.Sprintf("%064x", p.ValidUntil)}
 	for i := range words {
 		words[i] = strings.ToLower(words[i])
 	}
 	return words, proof, nil
 }
 
-// withdrawalBinding is the keccak of the 16 tuple words with the root (word
-// 3) and valid_until (word 15) blanked: a re-proof at another root or with a
-// fresh lifetime keeps every other public input of the authorized exit.
+// noteFieldsWord is tuple word 8, noteFields = noteID·2^192 + amount·2^64 +
+// expiry, as 64 lowercase hex digits.
+func noteFieldsWord(noteID uint32, amount, expiry uint64) string {
+	return fmt.Sprintf("%064x", noteFields(noteID, amount, expiry))
+}
+
+// parseNoteFieldsWord unpacks tuple word 8. It refuses what the vault
+// refuses before verifying a proof (InvalidNoteFields: fields of 2^224 or
+// more; InvalidBalance: an amount above 2^53 - 1) and a zero amount or
+// expiry, which no deposit records.
+func parseNoteFieldsWord(word string) (noteID uint32, amount, expiry uint64, ok bool) {
+	raw, err := hex.DecodeString(word)
+	if err != nil || len(raw) != 32 {
+		return 0, 0, 0, false
+	}
+	for _, b := range raw[:4] {
+		if b != 0 {
+			return 0, 0, 0, false
+		}
+	}
+	for _, b := range raw[8:16] {
+		if b != 0 {
+			return 0, 0, 0, false
+		}
+	}
+	noteID = binary.BigEndian.Uint32(raw[4:8])
+	amount = binary.BigEndian.Uint64(raw[16:24])
+	expiry = binary.BigEndian.Uint64(raw[24:32])
+	if amount == 0 || amount > maxSafeNoteAmount || expiry == 0 {
+		return 0, 0, 0, false
+	}
+	return noteID, amount, expiry, true
+}
+
+// withdrawalBinding is the keccak of the 16 tuple words with valid_until
+// (word 15) blanked: a re-proof with a fresh lifetime keeps every other
+// public input of the authorized exit. The note leaf (word 3) and the note
+// fields (word 8) never change while the note is Active, so they are bound.
 func withdrawalBinding(words []string) string {
 	bound := append([]string{}, words[:16]...)
-	bound[3], bound[15] = "", ""
+	bound[15] = ""
 	return crypto.Keccak256Hash([]byte(strings.Join(bound, ""))).Hex()
 }
 
@@ -1352,11 +1402,13 @@ func (h *FundingHandler) checkRelayedEscapePayout(ctx context.Context, config fu
 }
 
 // validateSignedWithdrawal checks signed mutualClose calldata against the
-// saved authorization: 836 bytes; the fixed words 0, 1, 2, 8, 9, 10 and 11;
+// saved authorization: 836 bytes; the fixed words 0, 1, 2, 9, 10 and 11; a
+// nonzero note leaf (word 3); note fields (word 8) of the saved note, below
+// 2^224, with a deposit of at most 2^53 - 1 units that covers the payout;
 // kind 1 with no successor nullifier and no concession; the bytes offset and
-// length; and the binding over the 16 tuple words with words 3 and 15
-// blanked. With a nonzero now (before signing), valid_until (word 15) must
-// also lie in [now, now + 10,800 + 300].
+// length; and the binding over the 16 tuple words with word 15 blanked. With
+// a nonzero now (before signing), valid_until (word 15) must also lie in
+// [now, now + 10,800 + 300].
 func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressWithdrawalRecord, now time.Time) error {
 	invalid := errors.New("signed withdrawal does not match its saved authorization; preserve recovery files")
 	if saved == nil || len(data) != withdrawalCalldataLength || hex.EncodeToString(data[:4]) != withdrawalSelector || saved.Binding == "" || !isHex(saved.Nullifier, 32) {
@@ -1367,11 +1419,14 @@ func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressW
 		words[i] = hex.EncodeToString(data[4+i*32 : 4+(i+1)*32])
 	}
 	zero := strings.Repeat("0", 64)
-	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
+	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
 	for index, value := range expected {
 		if !strings.EqualFold(words[index], value) {
 			return invalid
 		}
+	}
+	if !validNoteWords(words, saved.NoteID, saved.Amount) {
+		return invalid
 	}
 	if !now.IsZero() && !validUntilInWindow(words[15], now) {
 		return invalid
@@ -1380,6 +1435,16 @@ func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressW
 		return invalid
 	}
 	return nil
+}
+
+// validNoteWords checks an exit's note words: a nonzero canonical leaf (word
+// 3) and note fields (word 8) naming noteID, whose deposit covers payout.
+func validNoteWords(words []string, noteID, payout uint64) bool {
+	if leaf, ok := parseFieldElement("0x" + words[3]); !ok || leaf.Sign() == 0 {
+		return false
+	}
+	id, amount, _, ok := parseNoteFieldsWord(words[8])
+	return ok && uint64(id) == noteID && payout <= amount
 }
 
 // validUntilInWindow reports whether the valid_until word lies in

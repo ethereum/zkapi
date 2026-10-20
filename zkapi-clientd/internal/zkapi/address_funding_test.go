@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +30,7 @@ var addressTestBlock = addressTestHeader.Hash().Hex()
 type addressFixture struct {
 	native                                                         bool
 	estimateValue                                                  string
+	nextNoteReads, leafPageReads                                   int
 	overrideReads                                                  int
 	mu                                                             sync.Mutex
 	h                                                              *FundingHandler
@@ -43,10 +43,15 @@ type addressFixture struct {
 	active                                                         bool
 	prepared, activated, paths                                     int
 	rpcCalls                                                       []string
-	// Independent corroboration sources. The RPC answers vault notes() from
-	// vaultNotes; the separate indexer server serves leaves. mine registers
+	// Independent corroboration sources. The RPC answers the vault's
+	// noteRecord() from vaultNotes, and nextNoteId() and noteLeaves() from
+	// leaves; the separate indexer server serves leaves too. mine registers
 	// a deposit in both, and tests make them disagree deliberately.
-	vaultNotes                 map[uint32]fixtureNote
+	vaultNotes map[uint32]fixtureNote
+	// pinnedNoteStatus, by note, is the status the pinned RPC alone
+	// answers for noteRecord (a lying pinned RPC); the exit RPC serves
+	// vaultNotes.
+	pinnedNoteStatus           map[uint32]uint8
 	vaultReadsAt               []string
 	leaves                     []*big.Int
 	indexer                    *httptest.Server
@@ -60,8 +65,6 @@ type addressFixture struct {
 	cachedVersion, leafVersion int
 	mined                      map[string]uint32
 	minedExpiry                map[uint32]uint64
-	// minedRoot is NoteDeposited.newRoot of each mined deposit, by hash.
-	minedRoot map[string]*big.Int
 	// Block headers served by eth_getBlockByHash, by lowercase hash.
 	headers map[string]*types.Header
 	// Companion wallet state for activation and rebind.
@@ -123,11 +126,12 @@ func (f *addressFixture) registerDeposit(id uint32, commitment string, amount, e
 	f.setLeaf(id, noteLeaf(id, fieldValue(commitment), amount, expiry))
 }
 
+// closeNote closes a note in the vault. Its leaf stays in the tree, in the
+// vault and the indexer alike: only retireClosedLeaf would zero it.
 func (f *addressFixture) closeNote(id uint32) {
 	note := f.vaultNotes[id]
 	note.status = noteClosed
 	f.vaultNotes[id] = note
-	f.setLeaf(id, new(big.Int))
 }
 
 // tree returns the root and the empty-slot path at next_note_id, cached
@@ -329,7 +333,22 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				}
 				break
 			}
-			if strings.EqualFold(call.To, addressTestVault) && strings.HasPrefix(call.Data, notesSelector) {
+			if strings.EqualFold(call.To, addressTestVault) && (call.Data == nextNoteIDSelector || strings.HasPrefix(call.Data, noteLeavesSelector)) {
+				if call.Data == nextNoteIDSelector {
+					f.nextNoteReads++
+					result = fmt.Sprintf("0x%064x", len(f.leaves))
+					break
+				}
+				leaves, ok := encodeNoteLeaves(f.leaves, call.Data)
+				if !ok {
+					_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": 3, "message": "execution reverted: InvalidNoteRange"}})
+					return
+				}
+				f.leafPageReads++
+				result = leaves
+				break
+			}
+			if strings.EqualFold(call.To, addressTestVault) && strings.HasPrefix(call.Data, noteRecordSelector) {
 				var block struct {
 					BlockHash        string `json:"blockHash"`
 					RequireCanonical bool   `json:"requireCanonical"`
@@ -343,8 +362,15 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				} else {
 					f.vaultReadsAt = append(f.vaultReadsAt, string(request.Params[1]))
 				}
-				id, _ := new(big.Int).SetString(call.Data[10:], 16)
-				result = encodeVaultNote(f.vaultNotes[uint32(id.Uint64())])
+				id, ok := noteRecordID(call.Data)
+				if !ok {
+					t.Errorf("invalid noteRecord call %s", call.Data)
+				}
+				note := f.vaultNotes[id]
+				if status, lying := f.pinnedNoteStatus[id]; lying && !exit {
+					note.status = status
+				}
+				result = encodeVaultNote(id, note)
 				break
 			}
 			if !strings.EqualFold(call.To, addressTestToken) {
@@ -462,15 +488,12 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				Amount uint64 `json:"amount"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&input)
-			path := make([]string, 32)
-			for i := range path {
-				path[i] = "0x0"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"amount": input.Amount, "secret": "0xabcdef", "commitment": "0x1234", "zero_path": path})
+			_ = json.NewEncoder(w).Encode(map[string]any{"amount": input.Amount, "secret": "0xabcdef", "commitment": "0x1234"})
 		case "/oa/v1/deposit/path":
+			// Vault revision 4: a deposit fetches no path.
 			f.paths++
-			_, path := f.tree()
-			_ = json.NewEncoder(w).Encode(map[string]any{"zero_path": fieldHexes(path)})
+			t.Error("a deposit fetched a Merkle path")
+			w.WriteHeader(http.StatusNotFound)
 		case "/funding/api/deposit/confirm":
 			var body map[string]any
 			if json.NewDecoder(r.Body).Decode(&body) != nil {
@@ -560,12 +583,8 @@ func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 				id = uint32(len(f.leaves))
 				f.mined[hash], f.minedExpiry[id] = id, uint64(time.Now().Unix())+3600
 				f.registerDeposit(id, commitment, amount.Uint64(), f.minedExpiry[id])
-				if f.minedRoot == nil {
-					f.minedRoot = map[string]*big.Int{}
-				}
-				f.minedRoot[hash], _ = f.tree()
 			}
-			receipt["logs"] = depositEventReceiptAt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id], f.minedRoot[hash]).Logs
+			receipt["logs"] = depositEventReceipt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id]).Logs
 			f.allowance = "0x0"
 		}
 	}
@@ -705,24 +724,17 @@ func TestAddressFundingApprovesExactAmountRefreshesPathAndDepositsOnce(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deposit.Phase != "deposit_pending" || f.paths != 1 || f.prepared != 1 {
+	if deposit.Phase != "deposit_pending" || f.paths != 0 || f.prepared != 1 {
 		t.Fatalf("deposit did not use refreshed saved note: %+v", deposit)
 	}
 	tx = f.accepted[deposit.TransactionHash]
 	if tx == nil || tx.Nonce() != 1 || !strings.EqualFold(tx.To().Hex(), addressTestVault) {
 		t.Fatal("invalid deposit transaction")
 	}
-	// The prepared "0x0" path was replaced by the refreshed empty-slot path,
-	// bound to the indexer slot the deposit targets; the calldata carries
-	// only the commitment and the amount (vault revision 3).
-	f.mu.Lock()
-	_, path := f.tree()
-	f.mu.Unlock()
+	// The deposit is bound to the indexer slot it targets and fetches no
+	// path; the calldata carries only the commitment and the amount.
 	if data := hex.EncodeToString(tx.Data()); len(data) != 8+64*2 || !strings.HasPrefix(data, depositSelector) {
 		t.Fatal("deposit calldata is not deposit(bytes32,uint128)")
-	}
-	if refreshed := f.savedDeposit(t).ZeroPath; !slices.Equal(refreshed, fieldHexes(path)) || slices.Equal(refreshed, slices.Repeat([]string{"0x0"}, 32)) {
-		t.Fatal("deposit witness was not refreshed")
 	}
 	if saved, err := f.h.readAddressDeposit(fundingConfig{ChainID: 1, Contract: addressTestVault, Token: addressTestToken}); err != nil || saved.Slot == nil || saved.Slot.NoteID != addressTestFirstNote {
 		t.Fatalf("deposit slot was not recorded before signing: %+v %v", saved, err)
@@ -956,7 +968,7 @@ func TestAddressFundingAmbiguousDepositNeverChoosesNewNonce(t *testing.T) {
 			t.Fatal("ambiguous deposit changed identity")
 		}
 	}
-	if len(f.accepted) != 1 || f.prepared != 1 || f.paths != 1 {
+	if len(f.accepted) != 1 || f.prepared != 1 || f.paths != 0 {
 		t.Fatal("ambiguous deposit regenerated note/path/transaction")
 	}
 	for _, raw := range f.submitted {
@@ -1016,7 +1028,7 @@ func TestAddressFundingRevertedDepositRetainsNoteAndRefreshesWitnessOnExplicitRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Phase != "deposit_pending" || second.TransactionHash == first.TransactionHash || f.prepared != 1 || f.paths != 2 || len(f.accepted) != 2 {
+	if second.Phase != "deposit_pending" || second.TransactionHash == first.TransactionHash || f.prepared != 1 || f.paths != 0 || len(f.accepted) != 2 {
 		t.Fatalf("safe retry did not retain note: %+v", second)
 	}
 	raw, _ := os.ReadFile(f.h.statePath)

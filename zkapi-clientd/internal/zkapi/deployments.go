@@ -21,8 +21,9 @@ import (
 // mutable remote manifest must not silently change the vault, signer or oracle
 // that owns an existing wallet. Updating deployments requires a source release.
 //
-// This release serves only the concession-exit vault (revision 3, circuit
-// zkapi-v2-concession-v1). Until it is deployed on a network, the network's
+// This release serves only the leaf-bound concession-exit vault (revision 4,
+// circuit zkapi-v2-concession-v2), whose exits bind the note's stored leaf
+// and need no Merkle path. Until it is deployed on a network, the network's
 // manifest is a "not_deployed" placeholder that pins only the circuit, the
 // setup and the vault parameters, and nothing starts against it.
 //
@@ -43,7 +44,20 @@ func SetPackagedDeploymentsForTesting(fsys fs.FS) func() {
 }
 
 // RequiredCircuitID is the statement this release proves and verifies.
-const RequiredCircuitID = "zkapi-v2-concession-v1"
+const RequiredCircuitID = "zkapi-v2-concession-v2"
+
+// Vault revision 4's pins: exits bind the note's stored leaf
+// (LEAF_BOUND_EXIT_VERSION() 1), deposits of fewer than min_deposit_units
+// revert (minDeposit()), and a deposit's gas limit adds fresh_slot_gas for
+// the first write of a frontier level (depositGasLimit).
+const (
+	requiredVaultRevision = 4
+	requiredLeafBoundExit = 1
+	// minFreshSlotGas and maxFreshSlotGas bound a profile's fresh_slot_gas:
+	// 22,100 under mainnet rules, about 110,000 under EIP-8037 (Sepolia).
+	minFreshSlotGas = 5_000
+	maxFreshSlotGas = 1_000_000
+)
 
 // ErrDeploymentNotDeployed refuses a network whose packaged manifest is a
 // placeholder: its vault is not deployed yet.
@@ -99,7 +113,14 @@ type deploymentIdentity struct {
 	MaxPauseDuration uint64 `json:"max_pause_duration_seconds"`
 	SettlementWindow uint64 `json:"settlement_window_seconds"`
 	ExitConcession   int    `json:"exit_concession"`
-	DeployBlock      uint64 `json:"deploy_block"`
+	LeafBoundExit    int    `json:"leaf_bound_exit"`
+	// MinDepositUnits is the vault's minDeposit(), in billing units.
+	MinDepositUnits uint64 `json:"min_deposit_units"`
+	// FreshSlotGas is the gas of writing a fresh storage slot on this
+	// network, which the deposit gas policy adds when a deposit in the
+	// window first writes a frontier level.
+	FreshSlotGas uint64 `json:"fresh_slot_gas"`
+	DeployBlock  uint64 `json:"deploy_block"`
 	// The contracts the client checks before trusting the vault.
 	ProofAdapter     string             `json:"proof_adapter_address"`
 	PoseidonLibrary  string             `json:"poseidon_library_address"`
@@ -167,6 +188,16 @@ type proofSetupIdentity struct {
 	WithdrawalVerifyingKeySHA256 string `json:"withdrawal_verifying_key_sha256"`
 }
 
+// MinimumDeposit is the deployed vault's minDeposit() in billing units, as
+// the release pins it (min_deposit_units); a smaller deposit is refused.
+func (c *Client) MinimumDeposit() (uint64, error) {
+	deployment, _, err := deployedDeployment(c.config.Network)
+	if err != nil {
+		return 0, err
+	}
+	return deployment.MinDepositUnits, nil
+}
+
 // MatchesDeployment checks a public management response against this release's
 // immutable network/vault identity without a network read or wallet operation.
 func MatchesDeployment(network, deploymentID, contract string) bool {
@@ -222,9 +253,13 @@ func parseDeploymentIdentity(network string, raw []byte) (deploymentIdentity, er
 	if json.Unmarshal(raw, &identity) != nil || identity.ChainID != chain || identity.ID == "" || identity.Asset != "native_eth" || identity.Unit != "gwei" || identity.Proof.Circuit != RequiredCircuitID || identity.Proof.SetupID == "" || identity.NoteTTL == 0 {
 		return deploymentIdentity{}, invalid
 	}
-	// Only the concession vault: revision 3 with the concession exit, whose
-	// clearances require an ownership proof.
-	if identity.VaultRevision != 3 || identity.ExitConcession != 1 || identity.ClearanceOwnershipProof != "required" || identity.SettlementWindow == 0 || identity.ChallengePeriod == 0 || identity.MaxPauseDuration < 2*identity.ChallengePeriod {
+	// Only the leaf-bound concession vault: revision 4 with the concession
+	// exit and leaf-bound exits, whose clearances require an ownership proof.
+	// A revision-3 profile (circuit zkapi-v2-concession-v1) is refused.
+	if identity.VaultRevision != requiredVaultRevision || identity.ExitConcession != 1 || identity.LeafBoundExit != requiredLeafBoundExit || identity.ClearanceOwnershipProof != "required" || identity.SettlementWindow == 0 || identity.ChallengePeriod == 0 || identity.MaxPauseDuration < 2*identity.ChallengePeriod {
+		return deploymentIdentity{}, invalid
+	}
+	if identity.MinDepositUnits == 0 || identity.MinDepositUnits > maxSafeNoteAmount || identity.FreshSlotGas < minFreshSlotGas || identity.FreshSlotGas > maxFreshSlotGas {
 		return deploymentIdentity{}, invalid
 	}
 	for _, pin := range []string{identity.Proof.RequestVKKeccak256, identity.Proof.WithdrawalVKKeccak256} {

@@ -9,9 +9,14 @@ development build, not a deployed production release. See
 
 ## Protocol and deployment gate
 
-The client now uses vault revision 3 and circuit `zkapi-v2-concession-v1`,
-including upstream concession exits, independent exit-RPC support, and
-payout-funded withdrawals where a deployed manifest enables them. The Rust
+The client now uses vault revision 4 and circuit `zkapi-v2-concession-v2`
+(leaf-bound exits: an exit binds the note's stored leaf and needs no Merkle
+path), including upstream concession exits, independent exit-RPC support, and
+payout-funded withdrawals where a deployed manifest enables them. It refuses a
+revision-3 profile (circuit `zkapi-v2-concession-v1`) and a vault whose
+`LEAF_BOUND_EXIT_VERSION()` is not 1; deposits below the vault's minimum
+(`min_deposit_units`) are refused, and each deposit is signed with the gas
+limit of the deposit gas policy (`fresh_slot_gas` from the profile). The Rust
 companion is `crates/zkapi-companion`, not the removed legacy companion patch.
 
 **Both shipping networks remain `not_deployed`.** There is no configured vault,

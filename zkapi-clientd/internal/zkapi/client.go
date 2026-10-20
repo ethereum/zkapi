@@ -320,7 +320,7 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			for _, code := range []string{nested.Code, flat, failure.Code} {
 				switch code {
 				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state", "ownership_proof_sent",
-					// Circuit zkapi-v2-concession-v1 (design §6.3, §6.4).
+					// The concession exit (design §6.3, §6.4).
 					"escape_required", "conceded_mismatch", "device_not_newest", "exit_locked", "note_near_expiry", "bound_fixed_at_state", "invalid_successor", "late_successor", "exit_lock_conflict":
 					return nil, &Error{response.StatusCode, code}
 				}
@@ -372,8 +372,10 @@ func (c *Client) Check(ctx context.Context) error {
 	return nil
 }
 
-// CompanionBridgeVersion is the bridge the companion must speak: 5 is circuit
-// zkapi-v2-concession-v1 with the escape routes.
+// CompanionBridgeVersion is the bridge the companion must speak: 5 is the
+// concession exit with the escape routes. The circuit (zkapi-v2-concession-v2
+// for vault revision 4) is pinned by the deployment manifest the companion
+// checks, not by the bridge version.
 const CompanionBridgeVersion = 5
 
 // Complete passes the caller's JSON unchanged over the anonymous HTTP client.

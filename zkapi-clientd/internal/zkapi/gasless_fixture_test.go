@@ -596,7 +596,8 @@ func (g *gaslessFixture) mineUserOp(t *testing.T, hash string, success bool, set
 	}
 	switch len(vaultCall) {
 	case withdrawalCalldataLength:
-		noteID = uint32(new(big.Int).SetBytes(vaultCall[4+8*32 : 4+9*32]).Uint64())
+		// Word 8 is the packed note fields; the note ID is its bits 192-223.
+		noteID = uint32(new(big.Int).Rsh(new(big.Int).SetBytes(vaultCall[4+8*32:4+9*32]), 192).Uint64())
 		finalBalance = new(big.Int).SetBytes(vaultCall[4+9*32 : 4+10*32]).Uint64()
 		nullifier.SetBytes(vaultCall[4+11*32 : 4+12*32])
 		kind = gaslessKindClose

@@ -111,7 +111,7 @@ func TestGuidedFundingShowsVerifyingStageAndStopsOnConflict(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "deposit needs attention") || !strings.Contains(err.Error(), "config --menu, then choose repair") {
 		t.Fatalf("verification conflict did not stop guided funding with repair guidance: %v", err)
 	}
-	if !strings.Contains(ui.String(), "waiting for the zkAPI indexer to confirm it before activation") {
+	if !strings.Contains(ui.String(), "waiting for the vault state to confirm it before activation") {
 		t.Fatalf("verifying stage was not shown: %s", ui.String())
 	}
 	if f.resumeCalls != 2 || f.approveCalls != 0 || f.quoteCalls != 0 {

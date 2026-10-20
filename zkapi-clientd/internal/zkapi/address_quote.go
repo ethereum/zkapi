@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -311,31 +310,14 @@ func checkedAddressQuote(record *addressFundingRecord, id, kind string) (*Addres
 	copy := *q
 	return &copy, nil
 }
+
+// refreshAddressDeposit is the deposit's calldata. deposit(bytes32,uint128): the vault appends
+// the leaf itself (vault revisions 3 and 4), so no path is fetched, and the note's exits need none.
 func (h *FundingHandler) refreshAddressDeposit(ctx context.Context, deposit *depositRecord) (string, error) {
-	path, err := h.depositPath(ctx)
-	if err != nil {
+	if err := h.client.Check(ctx); err != nil {
 		return "", err
 	}
-	raw, _ := json.Marshal(path)
-	var refreshed struct {
-		ZeroPath []string `json:"zero_path"`
-	}
-	if json.Unmarshal(raw, &refreshed) != nil || len(refreshed.ZeroPath) != 32 {
-		return "", errors.New("invalid refreshed deposit path")
-	}
-	// deposit(bytes32,uint128): the vault appends the leaf itself (revision 3). The path stays
-	// with the record, for the note's exit proof.
-	data := depositCalldata(deposit.Commitment, deposit.Amount)
-	for _, sibling := range refreshed.ZeroPath {
-		if !isField(sibling) {
-			return "", errors.New("invalid refreshed deposit path")
-		}
-	}
-	deposit.ZeroPath = refreshed.ZeroPath
-	if err = h.save(*deposit); err != nil {
-		return "", err
-	}
-	return data, nil
+	return depositCalldata(deposit.Commitment, deposit.Amount), nil
 }
 func positiveDifference(left, right *big.Int) *big.Int {
 	n := new(big.Int).Sub(left, right)

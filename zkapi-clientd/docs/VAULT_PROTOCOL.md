@@ -45,10 +45,34 @@ in legacy mode requires its valid profile.
 
 ## This selects a stack, not an address
 
-Concession uses circuit `zkapi-v2-concession-v1`, vault revision 3, and its current
+Concession uses circuit `zkapi-v2-concession-v2`, vault revision 4, and its current
 compiled manifests. Legacy uses `zkapi-v2-note-bound-v1` and the historical
 compiled manifests, client, companion and verified proving setup. A new prover
-cannot operate an old vault by replacing a contract address.
+cannot operate an old vault by replacing a contract address; this release also
+refuses a revision-3 concession profile (circuit `zkapi-v2-concession-v1`) and a
+vault without `LEAF_BOUND_EXIT_VERSION() == 1`.
+
+Vault revision 4 binds every exit to the note's leaf. The vault stores one word
+per note, its leaf and status (`noteRecord`); the leaf commits to the
+registration commitment, the note ID, the deposit amount `D` and the expiry `e`.
+A mutual close or an escape publishes that leaf and `noteFields = n·2^192 +
+D·2^64 + e` as public inputs, and the vault compares the leaf with the stored
+one, so an exit needs no Merkle path, root, indexer or log scan: only the note
+itself, which the wallet keeps. Deposits must carry at least the vault's
+`minDeposit()` (the profile's `min_deposit_units`), and the client signs each
+deposit with a gas limit that covers the next 64 note IDs (the deposit's cost
+grows with the trailing ones of its note ID, plus the network's
+`fresh_slot_gas` when a frontier level is first written).
+
+**Risk under a broken verifier or setup.** The vault takes `D` from the proof's
+public inputs. With a working Groth16 verifier and an honest setup, the leaf
+binding makes `D` the note's real deposit. If the verifier or the proving setup
+were compromised, one forged mutual close naming `D` equal to the vault's whole
+balance would drain every note's funds in a single transaction. Revision 3
+capped a forged exit at the stored deposit of one note; under either revision the
+eventual loss after such a break is total, but revision 4 removes the rate
+limit. The client's code-hash, verifying-key and setup pins (checked before
+every deposit) are the mitigation on this side.
 
 Legacy dispatch verifies SHA-256 pins for the local historical executables:
 

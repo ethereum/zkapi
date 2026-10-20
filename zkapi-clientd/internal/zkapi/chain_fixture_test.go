@@ -15,19 +15,56 @@ func fixtureHeader(number uint64, at int64) *types.Header {
 	return &types.Header{Number: new(big.Int).SetUint64(number), Time: uint64(at), Difficulty: new(big.Int), Extra: []byte{}, BaseFee: big.NewInt(1_000_000_000)}
 }
 
-// fixtureNote is one vault notes(uint32) entry served by a test RPC.
+// fixtureNote is the deposit behind one vault noteRecord(uint32) entry served
+// by a test RPC: the vault stores only its leaf and status. retired zeroes
+// the leaf of a Closed note.
 type fixtureNote struct {
 	commitment     string
 	amount, expiry uint64
 	status         uint8
+	retired        bool
 }
 
-func encodeVaultNote(note fixtureNote) string {
-	commitment := note.commitment
-	if commitment == "" {
-		commitment = "0x0"
+// encodeVaultNote is noteRecord(id)'s answer, (uint256 leaf, uint8 status).
+func encodeVaultNote(id uint32, note fixtureNote) string {
+	leaf := new(big.Int)
+	if note.status != noteUninitialized && !note.retired {
+		commitment := note.commitment
+		if commitment == "" {
+			commitment = "0x0"
+		}
+		leaf = noteLeaf(id, fieldValue(commitment), note.amount, note.expiry)
 	}
-	return "0x" + strings.ToLower(addressABIWord(commitment)) + fmt.Sprintf("%064x%064x%064x", note.amount, note.expiry, note.status)
+	return fmt.Sprintf("0x%064x%064x", leaf, note.status)
+}
+
+// noteRecordID reads the note ID of a noteRecord(uint32) eth_call's data.
+func noteRecordID(data string) (uint32, bool) {
+	if len(data) != 2+8+64 || !strings.HasPrefix(data, noteRecordSelector) {
+		return 0, false
+	}
+	id, ok := new(big.Int).SetString(data[10:], 16)
+	if !ok || !id.IsUint64() || id.Uint64() > 0xffffffff {
+		return 0, false
+	}
+	return uint32(id.Uint64()), true
+}
+
+// encodeNoteLeaves is noteLeaves(start, count)'s answer over leaves.
+func encodeNoteLeaves(leaves []*big.Int, data string) (string, bool) {
+	if len(data) != 2+8+128 || !strings.HasPrefix(data, noteLeavesSelector) {
+		return "", false
+	}
+	start, _ := new(big.Int).SetString(data[10:74], 16)
+	count, _ := new(big.Int).SetString(data[74:], 16)
+	if start == nil || count == nil || !start.IsUint64() || !count.IsUint64() || start.Uint64()+count.Uint64() > uint64(len(leaves)) {
+		return "", false
+	}
+	out := fmt.Sprintf("0x%064x%064x", 32, count.Uint64())
+	for _, leaf := range leaves[start.Uint64() : start.Uint64()+count.Uint64()] {
+		out += fmt.Sprintf("%064x", leaf)
+	}
+	return out, true
 }
 
 // testTree computes the root and bottom-up siblings for index over a dense
@@ -76,18 +113,10 @@ func fieldValue(value string) *big.Int {
 	return parsed
 }
 
-// depositEventReceipt is a successful receipt with one NoteDeposited log
-// whose newRoot is zero.
+// depositEventReceipt is a successful receipt with one NoteDeposited log of
+// vault revision 4: (amount, expiryTs) as its two data words.
 func depositEventReceipt(contract string, noteID uint32, commitment string, amount, expiry uint64) ethReceipt {
-	return depositEventReceiptAt(contract, noteID, commitment, amount, expiry, nil)
-}
-
-// depositEventReceiptAt is depositEventReceipt with NoteDeposited.newRoot.
-func depositEventReceiptAt(contract string, noteID uint32, commitment string, amount, expiry uint64, root *big.Int) ethReceipt {
-	if root == nil {
-		root = new(big.Int)
-	}
-	raw := fmt.Sprintf(`{"status":"0x1","to":%q,"logs":[{"address":%q,"topics":[%q,"0x%064x","0x%s"],"data":"0x%064x%064x%064x"}]}`, contract, contract, depositEventTopic, noteID, addressABIWord(commitment), amount, expiry, root)
+	raw := fmt.Sprintf(`{"status":"0x1","to":%q,"logs":[{"address":%q,"topics":[%q,"0x%064x","0x%s"],"data":"0x%064x%064x"}]}`, contract, contract, depositEventTopic, noteID, addressABIWord(commitment), amount, expiry)
 	var receipt ethReceipt
 	_ = json.Unmarshal([]byte(raw), &receipt)
 	return receipt

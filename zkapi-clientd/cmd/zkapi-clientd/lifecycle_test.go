@@ -10,28 +10,34 @@ import (
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
 
-type lifecycleBudget struct{ model string }
+type lifecycleBudget struct {
+	model   string
+	minimum uint64
+}
 
 func (b *lifecycleBudget) ModelRequestBudget(_ context.Context, model string) (uint64, error) {
 	b.model = model
 	return 1_000_000, nil
 }
+func (b *lifecycleBudget) MinimumDeposit() (uint64, error) { return max(b.minimum, 1), nil }
 func (b *lifecycleBudget) NativeUSDQuote(context.Context) (zkapi.NativeUSDQuote, error) {
 	return zkapi.NativeUSDQuote{Asset: "native_eth", UnitsPerETH: 1_000_000_000, Decimals: 8, Answer: "200000000000", ExpiresAt: uint64(time.Now().Unix() + 600)}, nil
 }
 
 func TestServeRecommendationUsesModelAndGasWithoutApproving(t *testing.T) {
 	for _, test := range []struct {
-		model              string
-		fee                string
-		first, recommended uint64
+		model                       string
+		fee                         string
+		minimum, first, recommended uint64
 	}{
-		{"chosen/model", "100000000000000", 500000, 1500000},
-		{"chosen/model", "1000000000000000", 500000, 10000000},
-		{"", "100000000000000", 3000000, 9000000},
+		{"chosen/model", "100000000000000", 1, 500000, 1500000},
+		{"chosen/model", "1000000000000000", 1, 500000, 10000000},
+		{"", "100000000000000", 1, 3000000, 9000000},
+		// Below the vault's minimum deposit, both quotes ask for it.
+		{"chosen/model", "100000000000000", 2000000, 2000000, 2000000},
 	} {
 		f := newWizardFixture()
-		budget := &lifecycleBudget{}
+		budget := &lifecycleBudget{minimum: test.minimum}
 		stopped := errors.New("stop before signing")
 		f.quote = func(call int, amount, usd uint64) (zkapi.AddressPaymentQuote, error) {
 			if usd != 0 {
@@ -63,23 +69,25 @@ func TestServeRecommendationUsesModelAndGasWithoutApproving(t *testing.T) {
 
 func TestRecommendedDeposit(t *testing.T) {
 	for _, test := range []struct {
-		units uint64
-		fee   string
-		want  uint64
+		units, minimum uint64
+		fee            string
+		want           uint64
 	}{
-		{100, "1", 300}, {100, "100000000000", 1000}, {1, "300000001", 4},
+		{100, 1, "1", 300}, {100, 1, "100000000000", 1000}, {1, 1, "300000001", 4},
+		// The vault's minimum deposit is the floor.
+		{100, 1_000_000, "100000000000", 1_000_000}, {1_000_000, 1_000_000, "1", 3_000_000},
 	} {
-		got, err := recommendedDeposit(test.units, test.fee)
+		got, err := recommendedDeposit(test.units, test.fee, test.minimum)
 		if err != nil || got != test.want {
 			t.Fatalf("%+v got %d: %v", test, got, err)
 		}
 	}
 	for _, fee := range []string{"", "-1", "not-a-number", "1000000000000000000000000000000"} {
-		if _, err := recommendedDeposit(1, fee); err == nil {
+		if _, err := recommendedDeposit(1, fee, 1); err == nil {
 			t.Fatal("accepted", fee)
 		}
 	}
-	if _, err := recommendedDeposit(^uint64(0), "1"); err == nil {
+	if _, err := recommendedDeposit(^uint64(0), "1", 1); err == nil {
 		t.Fatal("overflow accepted")
 	}
 }

@@ -190,28 +190,35 @@ reverts never automatically sign a replacement. Wallet state is preserved
 across updates.
 
 Successful native ETH deposits activate after the saved transaction's successful
-mined receipt, canonical block and deposit event are validated, and two further
-sources agree: the vault's `notes(noteId)` at the receipt's block hash, and the
-zkAPI indexer's whole-tree snapshot, which must hold this deposit's leaf at that
-note. The note secret reaches the wallet companion only after they agree. The
-vault read goes to the packaged RPC, which already serves the deposit and sees
-its note ID in the public deposit event. The snapshot is the same response for
-every client, so the indexer does not learn which note is yours. Disagreement
-leaves the deposit in `verification_conflict`; nothing is activated, retired or
-replaced until a later check agrees. Success does not wait for Ethereum
-finality. Failed receipts retain the finality gate before explicit retry; a
-deposit signed by this release is also retired only after the indexer shows
-its note did not land. Because the RPC can withhold a deposit and relay it
-after that check, a retry is signed only when a bounded search of the
-indexer tree it is built from finds none of the note's earlier deposits
-(CLI_ZKAPI.md describes the bound). That search uses the same whole-tree
-snapshot. A quote repeated while the tree is unchanged reads only the tree's
-root, which is also the same response for every client. So the indexer
-still cannot tell which note is yours. Missing or ambiguous receipts preserve
+mined receipt, canonical block and deposit event are validated, and the vault
+agrees: `noteRecord(noteId)` at the receipt's block hash must show the note
+Active with exactly this deposit's leaf. A vault of revision 4 stores only each
+note's leaf, which commits to the note ID, the commitment, the amount and the
+expiry (from the receipt's `NoteDeposited`), so Go recomputes the leaf and
+compares it. When the zkAPI indexer's whole-tree snapshot covers the receipt's
+block, it must show the same leaf at that note; an indexer that is down or
+behind is skipped. The note secret reaches the wallet companion only after
+this. The vault read goes to the packaged RPC, which already serves the
+deposit and sees its note ID in the public deposit event. The snapshot is the
+same response for every client, so the indexer does not learn which note is
+yours. Disagreement leaves the deposit in `verification_conflict`; nothing is
+activated, retired or replaced until a later check agrees. Success does not
+wait for Ethereum finality. Failed receipts retain the finality gate before
+explicit retry; a deposit signed by this release is also retired only after
+the indexer shows its note did not land. Because the RPC can withhold a
+deposit and relay it after that check, a retry is signed only when a bounded
+search of the indexer tree it is built from finds none of the note's earlier
+deposits (CLI_ZKAPI.md describes the bound). That search uses the same
+whole-tree snapshot. A quote repeated while the tree is unchanged reads only
+the tree's root, which is also the same response for every client. So the
+indexer still cannot tell which note is yours. Repair (rebind) reads the
+vault's own leaves (`noteLeaves`) at the finalized block instead, the same
+call for every note range it covers. Missing or ambiguous receipts preserve
 the exact signed transaction without authorizing a replacement. Withdrawals
 and public ETH returns require their own finality checks, and a withdrawal
-completes locally only after the vault and the indexer both show the note
-closed.
+completes locally only after the vault shows the note Closed at the payout
+block, through the packaged RPC and, when you configured one, your exit RPC.
+A close leaves the note's leaf in the tree, so the indexer cannot attest it.
 
 Pre-finality activation exposes the same reorganization risk as the web wallet:
 a block can be replaced after a private note or inference credit becomes usable.
@@ -228,7 +235,10 @@ destination (it is zero) and the vault accepts it neither as an escape nor
 as a close. The companion keeps the proof it sent in `exit_lock.json`
 (owner-only) so a retry resends the same statement instead of a new one, and
 it sends no chat request from that note state afterwards. The close (kind 1)
-publishes the note ID, payout and destination on chain, as before.
+publishes the note ID, payout and destination on chain, as before. Every
+withdrawal statement of vault revision 4 also carries the note's leaf, its
+deposit amount and its expiry; all three are already public through the
+note's `NoteDeposited` event, and no Merkle root or path is involved.
 
 An escape (kind 0) publishes the note ID, the balance, the destination, the
 conceded amount, the proof's validity time (to within 3 hours) and the next

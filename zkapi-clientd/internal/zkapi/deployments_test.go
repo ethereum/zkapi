@@ -51,7 +51,7 @@ func TestPackagedDeploymentsArePlaceholdersMatchingTheBrowserProfiles(t *testing
 			if err := json.Unmarshal(profileRaw, &profile); err != nil {
 				t.Fatal(err)
 			}
-			for field, browser := range map[string]string{"deployment_status": "deployment_status", "chain_id": "chain_id", "contract_address": "contract_address", "billing_asset": "billing_asset", "billing_unit": "billing_unit", "billing_token_address": "billing_token_address", "native_asset_wei_per_unit": "native_asset_wei_per_unit", "native_price_feed_address": "native_price_feed_address", "native_price_feed_decimals": "native_price_feed_decimals", "native_price_max_age_seconds": "native_price_max_age_seconds", "rpc_url": "rpc_url", "request_charge_cap": "request_charge_cap", "challenge_period_seconds": "challenge_period", "note_ttl_seconds": "note_ttl", "max_pause_duration_seconds": "max_pause_duration", "settlement_window_seconds": "settlement_window_seconds", "vault_revision": "vault_revision", "exit_concession": "exit_concession", "clearance_ownership_proof": "clearance_ownership_proof"} {
+			for field, browser := range map[string]string{"deployment_status": "deployment_status", "chain_id": "chain_id", "contract_address": "contract_address", "billing_asset": "billing_asset", "billing_unit": "billing_unit", "billing_token_address": "billing_token_address", "native_asset_wei_per_unit": "native_asset_wei_per_unit", "native_price_feed_address": "native_price_feed_address", "native_price_feed_decimals": "native_price_feed_decimals", "native_price_max_age_seconds": "native_price_max_age_seconds", "rpc_url": "rpc_url", "request_charge_cap": "request_charge_cap", "challenge_period_seconds": "challenge_period", "note_ttl_seconds": "note_ttl", "max_pause_duration_seconds": "max_pause_duration", "settlement_window_seconds": "settlement_window_seconds", "vault_revision": "vault_revision", "exit_concession": "exit_concession", "leaf_bound_exit": "leaf_bound_exit", "min_deposit_units": "min_deposit_units", "fresh_slot_gas": "fresh_slot_gas", "clearance_ownership_proof": "clearance_ownership_proof"} {
 				if !reflect.DeepEqual(manifest[field], profile.Trusted[browser]) {
 					t.Errorf("%s differs from the browser profile's %s", field, browser)
 				}
@@ -62,8 +62,13 @@ func TestPackagedDeploymentsArePlaceholdersMatchingTheBrowserProfiles(t *testing
 					t.Errorf("%s differs from the browser profile's proof pin", field)
 				}
 			}
-			if identity.Proof.Circuit != RequiredCircuitID || identity.VaultRevision != 3 || identity.ExitConcession != 1 {
+			if identity.Proof.Circuit != RequiredCircuitID || RequiredCircuitID != "zkapi-v2-concession-v2" || identity.VaultRevision != 4 || identity.ExitConcession != 1 || identity.LeafBoundExit != 1 || identity.MinDepositUnits != 1_000_000 {
 				t.Fatal("wrong concession deployment identity")
+			}
+			// EIP-8037 prices a fresh slot at about 110,000 gas on Sepolia;
+			// mainnet rules at 22,100.
+			if want := map[string]uint64{"mainnet": 22_100, "sepolia": 110_000}[network]; identity.FreshSlotGas != want {
+				t.Fatalf("fresh_slot_gas %d, want %d", identity.FreshSlotGas, want)
 			}
 		})
 	}
@@ -80,9 +85,11 @@ func TestPackagedDeploymentsArePlaceholdersMatchingTheBrowserProfiles(t *testing
 	}
 }
 
-// Only the concession vault is accepted: circuit zkapi-v2-concession-v1,
-// vault revision 3 with the concession exit, required ownership proofs, the
-// vault parameters and, once deployed, every code and key pin.
+// Only the leaf-bound concession vault is accepted: circuit
+// zkapi-v2-concession-v2, vault revision 4 with the concession exit and
+// leaf-bound exits, a minimum deposit and a fresh-slot gas pin, required
+// ownership proofs, the vault parameters and, once deployed, every code and
+// key pin. A revision-3 profile (circuit zkapi-v2-concession-v1) is refused.
 func TestDeployedProfilesNeedEveryConcessionPin(t *testing.T) {
 	_, raw, err := pinnedDeployment("sepolia")
 	if err != nil {
@@ -92,8 +99,17 @@ func TestDeployedProfilesNeedEveryConcessionPin(t *testing.T) {
 		t.Fatalf("the fixture is invalid: %v", err)
 	}
 	for _, change := range []struct{ name, before, after string }{
-		{"legacy circuit", `"circuit_id": "zkapi-v2-concession-v1"`, `"circuit_id": "zkapi-v2-note-bound-v1"`},
-		{"hardened vault", `"vault_revision": 3`, `"vault_revision": 2`},
+		{"legacy circuit", `"circuit_id": "zkapi-v2-concession-v2"`, `"circuit_id": "zkapi-v2-note-bound-v1"`},
+		{"revision-3 circuit", `"circuit_id": "zkapi-v2-concession-v2"`, `"circuit_id": "zkapi-v2-concession-v1"`},
+		{"revision-3 vault", `"vault_revision": 4`, `"vault_revision": 3`},
+		{"hardened vault", `"vault_revision": 4`, `"vault_revision": 2`},
+		{"no leaf-bound exit", `"leaf_bound_exit": 1,`, ``},
+		{"another leaf-bound exit", `"leaf_bound_exit": 1`, `"leaf_bound_exit": 2`},
+		{"no minimum deposit", `"min_deposit_units": 1,`, ``},
+		{"zero minimum deposit", `"min_deposit_units": 1`, `"min_deposit_units": 0`},
+		{"minimum deposit above 2^53-1", `"min_deposit_units": 1`, `"min_deposit_units": 9007199254740992`},
+		{"no fresh-slot gas", `"fresh_slot_gas": 110000,`, ``},
+		{"tiny fresh-slot gas", `"fresh_slot_gas": 110000`, `"fresh_slot_gas": 100`},
 		{"no concession exit", `"exit_concession": 1`, `"exit_concession": 0`},
 		{"optional ownership proofs", `"clearance_ownership_proof": "required"`, `"clearance_ownership_proof": "optional"`},
 		{"no setup", `"setup_id": "dev"`, `"setup_id": ""`},

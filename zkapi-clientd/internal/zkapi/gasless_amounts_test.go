@@ -85,8 +85,11 @@ func TestGaslessPreVerificationGasParity(t *testing.T) {
 		handleOpsBytes         int
 	}{
 		// A (LIM-070 term), B (reference minimum), PVG, handleOps bytes (C = 21,000 + 16 × bytes + 10,000)
-		{"close with initCode", closeWithInit, 66_316, 52_668, 66_316, 1_764},
-		{"close without initCode", &closeWithout, 65_356, 51_696, 65_356, 1_668},
+		// The revision-4 close carries the note leaf and the packed note
+		// fields (words 3 and 8): its non-zero bytes cost 72 gas more than
+		// the revision-3 close's in both A and B.
+		{"close with initCode", closeWithInit, 66_388, 52_740, 66_388, 1_764},
+		{"close without initCode", &closeWithout, 65_428, 51_768, 65_428, 1_668},
 		{"forward", &forward, 57_904, 44_136, 57_904, 804},
 		{"finalize", &finalize, 57_956, 44_196, 57_956, 868},
 	} {

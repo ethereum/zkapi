@@ -8,7 +8,8 @@ import (
 
 // A Go port of zkAPI v2's own Poseidon (zkapi-core v2.rs, arkworks
 // PoseidonSponge), used only to recompute public note leaves and Merkle nodes
-// from the indexer's privacy-safe tree snapshot. It is not circomlib Poseidon.
+// from vault state and the indexer's privacy-safe tree snapshot. It is not
+// circomlib Poseidon.
 const (
 	poseidonWidth         = 3
 	poseidonRate          = 2
@@ -23,7 +24,9 @@ var bn254ScalarModulus, _ = new(big.Int).SetString("30644e72e131a029b85045b68181
 var poseidonARK, poseidonMDS = loadPoseidonParameters()
 
 var (
-	domainLeaf = poseidonDomain("zkapi.v2.leaf")
+	// domainLeaf is DOMAIN_LEAF' of vault revision 4 (circuit
+	// zkapi-v2-concession-v2), the capacity domain of a note leaf.
+	domainLeaf = poseidonDomain("zkapi.v2c.leaf")
 	domainNode = poseidonDomain("zkapi.v2.node")
 )
 
@@ -109,18 +112,40 @@ func poseidonHash(inputs ...*big.Int) *big.Int {
 	return state[1]
 }
 
-// noteLeaf mirrors v2::note_leaf, the vault's NoteLeafLib.computeLeaf.
-func noteLeaf(noteID uint32, commitment *big.Int, amount, expiry uint64) *big.Int {
-	return poseidonHash(domainLeaf, new(big.Int).SetUint64(uint64(noteID)), commitment, new(big.Int).SetUint64(amount), new(big.Int).SetUint64(expiry))
+// noteFields mirrors v2::note_fields, the vault's NoteLeafLib.pack and the
+// withdrawal statement's public input 8: noteID·2^192 + amount·2^64 + expiry,
+// below 2^224. Deposits are at most 2^53 - 1 units, so a uint64 amount covers
+// every note of the vault.
+func noteFields(noteID uint32, amount, expiry uint64) *big.Int {
+	fields := new(big.Int).Lsh(new(big.Int).SetUint64(uint64(noteID)), 192)
+	fields.Or(fields, new(big.Int).Lsh(new(big.Int).SetUint64(amount), 64))
+	return fields.Or(fields, new(big.Int).SetUint64(expiry))
 }
 
-// merkleNode mirrors v2::merkle_node (the vault's MerkleUpdateLib.poseidonNodeHash): one
-// permutation of the state (domainNode, left, right), rate lane one. The domain sits in the
-// capacity lane, so a node costs one permutation and cannot collide with a poseidonHash
-// output, whose capacity lane starts at zero.
+// noteLeaf mirrors v2::note_leaf, the vault's NoteLeafLib.computeLeaf: one
+// permutation of (domainLeaf, commitment, noteFields(noteID, amount, expiry)),
+// rate lane one.
+func noteLeaf(noteID uint32, commitment *big.Int, amount, expiry uint64) *big.Int {
+	return noteLeafFromFields(commitment, noteFields(noteID, amount, expiry))
+}
+
+// noteLeafFromFields mirrors v2::note_leaf_from_fields over packed fields.
+func noteLeafFromFields(commitment, fields *big.Int) *big.Int {
+	return poseidonCompress(domainLeaf, commitment, fields)
+}
+
+// merkleNode mirrors v2::merkle_node (the vault's MerkleUpdateLib.poseidonNodeHash).
 func merkleNode(left, right *big.Int) *big.Int {
+	return poseidonCompress(domainNode, left, right)
+}
+
+// poseidonCompress is one permutation of the state (domain, left, right),
+// returning rate lane one. The domain sits in the capacity lane, so a node
+// and a leaf each cost one permutation and cannot collide with each other or
+// with a poseidonHash output, whose capacity lane starts at zero.
+func poseidonCompress(domain, left, right *big.Int) *big.Int {
 	state := [poseidonWidth]*big.Int{
-		new(big.Int).Set(domainNode),
+		new(big.Int).Set(domain),
 		new(big.Int).Mod(left, bn254ScalarModulus),
 		new(big.Int).Mod(right, bn254ScalarModulus),
 	}
