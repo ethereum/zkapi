@@ -132,9 +132,7 @@ impl Chain {
         state: &DevState,
         withdrawal: &DevWithdrawal,
     ) -> (WithdrawalPublicInputsV2C, WithdrawalWitnessData) {
-        state
-            .withdrawal(&self.deployment, &self.tree, withdrawal)
-            .unwrap()
+        state.withdrawal(&self.deployment, withdrawal).unwrap()
     }
 
     /// The canonical withdrawal statement for `state` without the builder's
@@ -151,12 +149,14 @@ impl Chain {
             protocol_version: 2,
             chain_id: CHAIN_ID,
             contract_address: self.deployment.contract_address,
-            active_root: self.tree.root(),
+            note_leaf: state.note.leaf(),
             state_signing_key_x: state_key.x,
             state_signing_key_y: state_key.y,
             clearance_signing_key_x: clearance_key.x,
             clearance_signing_key_y: clearance_key.y,
             note_id: state.note.note_id,
+            deposit_amount: state.note.deposit_amount,
+            expiry_ts: state.note.expiry,
             final_balance: state.balance - withdrawal.conceded,
             destination: withdrawal.destination,
             withdrawal_nullifier: state.nullifier(),
@@ -173,7 +173,6 @@ impl Chain {
             secret: state.note.secret,
             deposit_amount: state.note.deposit_amount,
             expiry: state.note.expiry,
-            merkle_siblings: self.tree.get_siblings(state.note.note_id),
             state_balance: state.balance,
             state_blinding: state.blinding,
             current_anchor: state.anchor,
@@ -217,8 +216,8 @@ impl Chain {
 /// statements whose typed fields cannot hold the value, such as
 /// `valid_until >= 2^64`). Instance index 0 is the constant one.
 pub enum CaseCircuit {
-    Request(RequestCircuit),
-    Withdrawal(WithdrawalCircuit),
+    Request(Box<RequestCircuit>),
+    Withdrawal(Box<WithdrawalCircuit>),
 }
 
 pub struct Case {
@@ -235,7 +234,7 @@ impl Case {
     ) -> Self {
         Self {
             name,
-            circuit: CaseCircuit::Request(request_circuit(public, witness).unwrap()),
+            circuit: CaseCircuit::Request(Box::new(request_circuit(public, witness).unwrap())),
             instance_overrides: vec![],
         }
     }
@@ -247,7 +246,9 @@ impl Case {
     ) -> Self {
         Self {
             name,
-            circuit: CaseCircuit::Withdrawal(withdrawal_circuit(public, witness).unwrap()),
+            circuit: CaseCircuit::Withdrawal(Box::new(
+                withdrawal_circuit(public, witness).unwrap(),
+            )),
             instance_overrides: vec![],
         }
     }
@@ -258,8 +259,8 @@ impl Case {
             construct_matrices: true,
         };
         let cs = match self.circuit {
-            CaseCircuit::Request(circuit) => synthesize(circuit, mode),
-            CaseCircuit::Withdrawal(circuit) => synthesize(circuit, mode),
+            CaseCircuit::Request(circuit) => synthesize(*circuit, mode),
+            CaseCircuit::Withdrawal(circuit) => synthesize(*circuit, mode),
         }
         .unwrap();
         for (index, value) in self.instance_overrides {
@@ -535,15 +536,48 @@ pub fn negative_cases() -> Vec<Case> {
     circuit.public.destination += two_pow(160);
     cases.push(Case {
         name: "destination_at_least_2_160",
-        circuit: CaseCircuit::Withdrawal(circuit),
+        circuit: CaseCircuit::Withdrawal(Box::new(circuit)),
         instance_overrides: vec![],
     });
     let mut range = Case::withdrawal("valid_until_at_least_2_64", &pr, &wr);
     range.instance_overrides = vec![(16, Fr::from(VALID_UNTIL) + two_pow(64))];
     cases.push(range);
-    let mut range = Case::withdrawal("note_id_at_least_2_32", &pr, &wr);
-    range.instance_overrides = vec![(9, Fr::from(c.note.note_id) + two_pow(32))];
-    cases.push(range);
+    // W2 / W5: input 8 is exactly n·2^192 + D·2^64 + e of the witness, and input 3 its leaf.
+    let fields = core::felt_to_field(&pr.note_fields());
+    let leaf = core::felt_to_field(&pr.note_leaf);
+    for (name, index, value) in [
+        ("note_fields_at_least_2_224", 9, fields + two_pow(224)),
+        ("note_fields_plus_one", 9, fields + Fr::from(1u64)),
+        ("note_fields_minus_one", 9, fields - Fr::from(1u64)),
+        (
+            "note_fields_deposit_unit_moved_to_expiry",
+            9,
+            fields - two_pow(64) + Fr::from(1u64),
+        ),
+        ("note_leaf_plus_one", 4, leaf + Fr::from(1u64)),
+        ("note_leaf_zero", 4, Fr::from(0u64)),
+        (
+            "note_leaf_of_the_same_secret_other_note",
+            4,
+            core::felt_to_field(&c.same_secret_note.leaf()),
+        ),
+    ] {
+        let mut range = Case::withdrawal(name, &pr, &wr);
+        range.instance_overrides = vec![(index, value)];
+        cases.push(range);
+    }
+    // A statement whose fields name another deposit or expiry than the witness's note (the
+    // leaf recomputed over the forged fields): the witness's D and e no longer pack to input 8.
+    for (name, deposit, expiry) in [
+        ("note_fields_forged_deposit", DEPOSIT + 1, EXPIRY),
+        ("note_fields_forged_expiry", DEPOSIT, EXPIRY + 86_400),
+    ] {
+        let mut forged = pr.clone();
+        forged.deposit_amount = deposit;
+        forged.expiry_ts = expiry;
+        forged.note_leaf = core::note_leaf(forged.note_id, &c.note.registration(), deposit, expiry);
+        cases.push(Case::withdrawal(name, &forged, &wr));
+    }
     let mut range = Case::withdrawal("conceded_at_least_2_128", &pr, &wr);
     range.instance_overrides = vec![(15, two_pow(128))];
     cases.push(range);

@@ -44,7 +44,7 @@
 //! reviewer runs on their own export (README step 5).
 //!
 //! Then it writes the setup directory (keys with
-//! `zkapi-v2-concession-v1/<setup_id>/<kind>` headers, `manifest.json` with
+//! `zkapi-v2-concession-v2/<setup_id>/<kind>` headers, `manifest.json` with
 //! the SHA-256 of the powers of tau, transcript, R1CS exports and zkeys,
 //! `Bn254PoseidonRuntime.sol` with its `poseidon-runtime.json`, and the
 //! regenerated `Groth16ProofAdapter.sol` with the VK hashes). It refuses to
@@ -231,7 +231,6 @@ pub fn check_proving(pk: &ProvingKey<Bn254>, kind: KeyKind) -> Result<()> {
         KeyKind::Withdrawal => {
             let (public, witness) = state.withdrawal(
                 &deployment,
-                &tree,
                 &DevWithdrawal {
                     kind: WithdrawalKind::Escape,
                     destination: [0xff; 20],

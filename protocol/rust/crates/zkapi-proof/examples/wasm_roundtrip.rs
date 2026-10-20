@@ -6,7 +6,7 @@
 //! The fixture asks the bundle for a genesis request and an escape (kind 0,
 //! `conceded = 0`, `valid_until`) to the destination below; both proofs and
 //! the escape's canonical fields are checked here. It needs a bundle built
-//! for circuit `zkapi-v2-concession-v1` with the development setup.
+//! for circuit `zkapi-v2-concession-v2` with the development setup.
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::{

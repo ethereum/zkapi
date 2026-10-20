@@ -1,4 +1,4 @@
-//! zkAPI Groth16 circuits (`zkapi-v2-concession-v1`) and native proof interface.
+//! zkAPI Groth16 circuits (`zkapi-v2-concession-v2`) and native proof interface.
 //!
 //! * [`groth16`]: the request and withdrawal circuits and native mirrors of
 //!   their hashes.

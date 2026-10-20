@@ -5,7 +5,7 @@
 //! 32-byte big-endian coordinates. Integer fields retain the existing v2 serde
 //! representation. Request types are unchanged from circuit
 //! `zkapi-v2-note-bound-v1`; the withdrawal and clearance types are the V2C
-//! (`zkapi-v2-concession-v1`) statements.
+//! (`zkapi-v2-concession-v2`, leaf-bound) statements.
 
 use serde::{Deserialize, Serialize};
 
@@ -165,7 +165,7 @@ pub struct ErrorResponse {
     pub retry_after_seconds: Option<u64>,
 }
 
-/// Clearance request for a mutual close on a `zkapi-v2-concession-v1`
+/// Clearance request for a mutual close on a `zkapi-v2-concession-v2`
 /// deployment. The ownership proof is required.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -195,10 +195,11 @@ mod tests {
         let zero_destination = [0u8; 20];
         let legacy_destination = [17u8; 20];
         let inputs = serde_json::json!({
-            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "active_root":"0x2",
+            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "note_leaf":"0x2",
             "state_signing_key_x":"0x3", "state_signing_key_y":"0x4",
             "clearance_signing_key_x":"0x5", "clearance_signing_key_y":"0x6",
-            "note_id":7, "final_balance":1950000, "destination":zero_destination,
+            "note_id":7, "deposit_amount":2000000, "expiry_ts":4000000000u64,
+            "final_balance":1950000, "destination":zero_destination,
             "withdrawal_nullifier":"0x7", "kind":2, "next_nullifier":"0x0", "conceded":0,
             "valid_until":2000003600u64
         });
@@ -210,7 +211,20 @@ mod tests {
         assert_eq!(ownership.final_balance, 1_950_000);
         assert_eq!(ownership.kind, 2);
         assert_eq!(ownership.valid_until, 2_000_003_600);
+        assert_eq!(ownership.deposit_amount, 2_000_000);
         assert_eq!(serde_json::to_value(&parsed).unwrap(), body);
+
+        // A zkapi-v2-concession-v1 ownership statement (active_root instead of the leaf and
+        // without the note's deposit and expiry) is refused.
+        let mut v1_body = body.clone();
+        let v1 = v1_body["ownership_proof"]["public_inputs"]
+            .as_object_mut()
+            .unwrap();
+        v1.remove("note_leaf");
+        v1.remove("deposit_amount");
+        v1.remove("expiry_ts");
+        v1.insert("active_root".into(), "0x2".into());
+        assert!(serde_json::from_value::<ClearanceRequestV2C>(v1_body).is_err());
 
         // The ownership proof is mandatory.
         assert!(

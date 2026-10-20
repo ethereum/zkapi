@@ -1,4 +1,4 @@
-//! Real-proof vault fixtures for circuit `zkapi-v2-concession-v1`:
+//! Real-proof vault fixtures for circuit `zkapi-v2-concession-v2`:
 //!
 //! ```text
 //! cargo run --release -p zkapi-proof --example vault_challenge_fixture -- \
@@ -11,8 +11,9 @@
 //!
 //! Note A (id 0) has the honest chain `a0 -R0-> a1 -R1-> a2 -R2-> a3`, each
 //! successor signed at `next_anchor(N)`. Note B (id 1) shares A's secret and
-//! stays at genesis. Every proof is at root `ab` (A and B deposited) unless
-//! named otherwise, and is valid until `valid_until`.
+//! stays at genesis. Every request proof is at root `ab` (A and B deposited);
+//! withdrawal proofs carry the note's leaf and fields, no root. Every proof is
+//! valid until `valid_until` unless named otherwise.
 //!
 //! * Withholding: the user at `a2` sent R2 (`request_a2`, `sb = 100,000`) and
 //!   the operator withheld `a3`. `escape_a2_concede` concedes `sb`
@@ -23,10 +24,13 @@
 //! * Re-escapes after that defeat: `escape_a2` again (ChallengedNullifier),
 //!   `escape_a1` (SupersededState: its next nullifier `N2` was flagged),
 //!   `escape_a0` (verified, then defeated by `request_a1`).
-//! * `escape_a2_at_root_a` is at the root before B's deposit; `escape_a2_expired`
-//!   has `valid_until = timestamp - 1`; `ownership_a2` is kind 2 (rejected by
-//!   the vault); `escape_b0_genesis_concede`, `close_b0` and `request_b0` use
-//!   note B (same secret, disjoint nullifiers).
+//! * `escape_b0_forged_deposit` and `escape_b0_forged_expiry` are valid proofs
+//!   of genesis escapes for note B's ID and secret with another deposit
+//!   (2,000,000) or expiry (one bucket later): self-consistent statements whose
+//!   leaf is not the one the vault stored (NoteLeafMismatch).
+//!   `escape_a2_expired` has `valid_until = timestamp - 1`; `ownership_a2` is
+//!   kind 2 (rejected by the vault); `escape_b0_genesis_concede`, `close_b0`
+//!   and `request_b0` use note B (same secret, disjoint nullifiers).
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::Serialize;
@@ -85,7 +89,6 @@ impl Generator {
     fn withdrawal(
         &self,
         state: &DevState,
-        tree: &MerkleTree,
         kind: WithdrawalKind,
         destination: [u8; 20],
         conceded: u128,
@@ -93,7 +96,6 @@ impl Generator {
     ) -> Result<Fixture> {
         let (public, witness) = state.withdrawal(
             &self.deployment,
-            tree,
             &DevWithdrawal {
                 kind,
                 destination,
@@ -173,8 +175,16 @@ fn main() -> Result<()> {
         note_id: 1,
         ..a.clone()
     };
-    let tree_a = tree_with(&[&a]);
     let tree_ab = tree_with(&[&a, &b]);
+    // Note B's ID and secret with another deposit or expiry than the vault stored.
+    let b_forged_deposit = DevNote {
+        deposit_amount: 2 * DEPOSIT,
+        ..b.clone()
+    };
+    let b_forged_expiry = DevNote {
+        expiry: expiry + 86_400,
+        ..b.clone()
+    };
 
     let (r0, r1, r2, r3) = (
         request(100_000, 99, 9),
@@ -189,7 +199,7 @@ fn main() -> Result<()> {
     let b0 = b.genesis(Felt252::from_u64(8));
 
     let w = |state: &DevState, kind, destination, conceded| {
-        generator.withdrawal(state, &tree_ab, kind, destination, conceded, VALID_UNTIL)
+        generator.withdrawal(state, kind, destination, conceded, VALID_UNTIL)
     };
     let mut fixtures = serde_json::Map::new();
     let mut put = |name: &str, fixture: Fixture| -> Result<()> {
@@ -213,26 +223,26 @@ fn main() -> Result<()> {
         w(&a2, WithdrawalKind::Escape, [0x22; 20], 0)?,
     )?;
     put(
-        "escape_a2_at_root_a",
-        generator.withdrawal(
-            &a2,
-            &tree_a,
+        "escape_b0_forged_deposit",
+        w(
+            &b_forged_deposit.genesis(Felt252::from_u64(8)),
             WithdrawalKind::Escape,
             DESTINATION,
             0,
-            VALID_UNTIL,
+        )?,
+    )?;
+    put(
+        "escape_b0_forged_expiry",
+        w(
+            &b_forged_expiry.genesis(Felt252::from_u64(8)),
+            WithdrawalKind::Escape,
+            DESTINATION,
+            0,
         )?,
     )?;
     put(
         "escape_a2_expired",
-        generator.withdrawal(
-            &a2,
-            &tree_ab,
-            WithdrawalKind::Escape,
-            DESTINATION,
-            0,
-            TIMESTAMP - 1,
-        )?,
+        generator.withdrawal(&a2, WithdrawalKind::Escape, DESTINATION, 0, TIMESTAMP - 1)?,
     )?;
     put(
         "escape_b0_genesis_concede",
@@ -268,7 +278,8 @@ fn main() -> Result<()> {
         "note_b_registration": b.registration(),
         "note_a_leaf": a.leaf(),
         "note_b_leaf": b.leaf(),
-        "root_a": tree_a.root(),
+        "note_a_fields": zkapi_core::v2::note_fields(a.note_id, a.deposit_amount, a.expiry),
+        "note_b_fields": zkapi_core::v2::note_fields(b.note_id, b.deposit_amount, b.expiry),
         "root_ab": tree_ab.root(),
         "states": {
             "a0": state_summary(&a0),
