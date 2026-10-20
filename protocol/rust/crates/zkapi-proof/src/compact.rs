@@ -370,6 +370,12 @@ pub fn verifying_key_keccak256(vk_file: &[u8], kind: KeyKind) -> Result<[u8; 32]
     Ok(keccak256(payload))
 }
 
+/// keccak256 of a verifying key's arkworks compressed bytes: the adapter's
+/// `REQUEST_VK_HASH` or `WITHDRAWAL_VK_HASH` for that key.
+pub fn verifying_key_hash(key: &VerifyingKey<Bn254>) -> [u8; 32] {
+    vk_hash(key)
+}
+
 fn vk_hash(key: &VerifyingKey<Bn254>) -> [u8; 32] {
     let mut bytes = Vec::new();
     key.serialize_compressed(&mut bytes)
@@ -617,6 +623,18 @@ impl RequestVerifier {
         verify_raw(&self.key, KeyKind::Request, public_inputs, proof)
     }
 
+    /// The verifying key.
+    pub fn verifying_key(&self) -> &VerifyingKey<Bn254> {
+        &self.key
+    }
+
+    /// The adapter's batch verification of request statements under this key
+    /// ([`crate::batch::BatchVerifier`]).
+    pub fn batch(&self) -> crate::batch::BatchVerifier<'_> {
+        crate::batch::BatchVerifier::new(&self.key, KeyKind::Request)
+            .expect("the key's shape was checked when it was loaded")
+    }
+
     /// Verify a typed statement. A field at or above the scalar modulus, or
     /// a point off the curve, is an error rather than reduced.
     pub fn verify(&self, public: &RequestPublicInputsV2, proof: &Groth16ProofWire) -> Result<bool> {
@@ -710,6 +728,18 @@ impl WithdrawalVerifier {
         proof: &Groth16ProofWire,
     ) -> Result<bool> {
         verify_raw(&self.key, KeyKind::Withdrawal, public_inputs, proof)
+    }
+
+    /// The verifying key.
+    pub fn verifying_key(&self) -> &VerifyingKey<Bn254> {
+        &self.key
+    }
+
+    /// The adapter's batch verification of withdrawal statements under this
+    /// key ([`crate::batch::BatchVerifier`]).
+    pub fn batch(&self) -> crate::batch::BatchVerifier<'_> {
+        crate::batch::BatchVerifier::new(&self.key, KeyKind::Withdrawal)
+            .expect("the key's shape was checked when it was loaded")
     }
 
     /// Verify a proof of any kind. The caller checks `kind`, `valid_until` and
@@ -1623,8 +1653,47 @@ const WITHDRAWAL_SOLIDITY_INPUTS: [SolidityInput; 16] = [
     input("validUntil", 64, None),
 ];
 
+/// The ABI bit width of every public input of a statement kind, in Groth16 order (256 for a
+/// field element): the table the adapter's narrow-field checks are generated from, which the
+/// reference batch verifier ([`crate::batch`]) applies the same way.
+pub(crate) fn statement_input_bits(kind: KeyKind) -> Vec<u16> {
+    let table: &[SolidityInput] = match kind {
+        KeyKind::Request => &REQUEST_SOLIDITY_INPUTS,
+        KeyKind::Withdrawal => &WITHDRAWAL_SOLIDITY_INPUTS,
+    };
+    table.iter().map(|input| input.bits).collect()
+}
+
 /// The bytes of `Types.WithdrawalPublicInputs` in calldata: one word per input.
 const WITHDRAWAL_INPUT_BYTES: usize = 32 * WITHDRAWAL_SOLIDITY_INPUTS.len();
+
+/// The bytes of `Types.RequestPublicInputs` in calldata: one word per input.
+const REQUEST_INPUT_BYTES: usize = 32 * REQUEST_SOLIDITY_INPUTS.len();
+
+/// The domain tag of the batch verifier's Fiat-Shamir transcript: its first word is
+/// `keccak256(BATCH_DOMAIN_TAG)` ([`batch_domain`]).
+pub const BATCH_DOMAIN_TAG: &str = "zkapi.groth16.batch.v1";
+
+/// The tag of the adapter's request records: their slot preimage starts with
+/// `keccak256(REQUEST_RECORD_TAG)` ([`request_record`]).
+pub const REQUEST_RECORD_TAG: &str = "zkapi.groth16.request-record.v1";
+
+/// `keccak256(BATCH_DOMAIN_TAG)`, the adapter's `BATCH_DOMAIN`.
+pub fn batch_domain() -> [u8; 32] {
+    keccak256(BATCH_DOMAIN_TAG.as_bytes())
+}
+
+/// `keccak256(REQUEST_RECORD_TAG)`, the adapter's `REQUEST_RECORD`. A withdrawal record's slot
+/// preimage starts with its destination, an address below 2^160, so the request namespace is
+/// disjoint from it only if this word is at or above 2^160: asserted here, at generation.
+pub fn request_record() -> [u8; 32] {
+    let word = keccak256(REQUEST_RECORD_TAG.as_bytes());
+    assert!(
+        word[..12].iter().any(|byte| *byte != 0),
+        "REQUEST_RECORD must be at or above 2^160"
+    );
+    word
+}
 
 /// The proof the adapter reads: A, B and C, eight words.
 const GROTH16_PROOF_BYTES: usize = 0x100;
@@ -1691,6 +1760,7 @@ pub fn groth16_solidity_source(
     let source = r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {IZkApiBatchProofAdapter} from "../interfaces/IZkApiBatchProofAdapter.sol";
 import {IZkApiProofAdapter} from "../interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../libraries/Types.sol";
 
@@ -1709,10 +1779,16 @@ import {Types} from "../libraries/Types.sol";
 ///         statement and proof it verified for the rest of the transaction (EIP-1153), and
 ///         assertValidWithdrawal of the same bytes, the vault's in the execution phase, then
 ///         returns without verifying them again.
+///         The batch entry points (IZkApiBatchProofAdapter) verify n statements of one kind at
+///         once, all or nothing, with one random linear combination of their equations: n + 3
+///         pairings and one shared multi-scalar multiplication instead of 4n pairings and n. The
+///         Once variants then write, for every item, the record a single verification would have
+///         left (withdrawals: the record of verifyWithdrawalOnce; requests: a record under
+///         REQUEST_RECORD that assertValidRequest consults), for ZkApiExitBatcher's vault calls.
 /// @dev Every word is read from calldata as Solidity's ABI decoder reads it: the narrow fields
 ///      must be clean (an empty revert otherwise), the proof is 256 bytes and every input and
 ///      proof word must be canonical; any other failure reverts InvalidProof().
-contract Groth16ProofAdapter is IZkApiProofAdapter {
+contract Groth16ProofAdapter is IZkApiProofAdapter, IZkApiBatchProofAdapter {
     /// @notice keccak256("__CIRCUIT_ID__"): the statement this adapter verifies.
     bytes32 public constant CIRCUIT_ID_HASH = __CIRCUIT_ID_HASH__;
     /// @notice keccak256 of the request verifying key (arkworks compressed bytes of request.vk
@@ -1727,6 +1803,12 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
         21888242871839275222246405745257275088696311157297823662689037894645226208583;
     /// @dev The protocol version every statement carries.
     uint256 private constant PROTOCOL_VERSION = 2;
+    /// @dev keccak256("__BATCH_DOMAIN_TAG__"): the first word of a batch's Fiat-Shamir transcript.
+    uint256 private constant BATCH_DOMAIN = __BATCH_DOMAIN__;
+    /// @dev keccak256("__REQUEST_RECORD_TAG__"), at or above 2^160: the first word of a request
+    ///      record's slot preimage, where a withdrawal record has its destination (below 2^160), so
+    ///      that no record of one kind can be read as one of the other.
+    uint256 private constant REQUEST_RECORD = __REQUEST_RECORD__;
 
     /// @notice The chain ID the fold binds: block.chainid at construction.
     uint256 public immutable foldedChainId;
@@ -1781,6 +1863,7 @@ __VK_CONSTANTS__
         view
         override
     {
+        if (_requestVerifiedEarlier(inputs, proof)) return;
         _verifyRequest(inputs, proof);
     }
 
@@ -1804,8 +1887,63 @@ __VK_CONSTANTS__
         }
     }
 
+    function verifyWithdrawalBatch(Types.WithdrawalPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        view
+        override
+    {
+        _verifyWithdrawalBatch(inputs, proofs);
+    }
+
+    function verifyRequestBatch(Types.RequestPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        view
+        override
+    {
+        _verifyRequestBatch(inputs, proofs);
+    }
+
+    /// @dev The batch verification, then every item's record exactly as verifyWithdrawalOnce writes
+    ///      it (_verifiedSlot).
+    function verifyWithdrawalBatchOnce(Types.WithdrawalPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        override
+    {
+        _verifyWithdrawalBatch(inputs, proofs);
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            for { let i := 0 } lt(i, inputs.length) { i := add(i, 1) } {
+                let w := add(inputs.offset, mul(i, __RECORD_INPUT_BYTES__))
+                calldatacopy(m, w, __RECORD_INPUT_BYTES__)
+                calldatacopy(add(m, __RECORD_INPUT_BYTES__), add(proofs.offset, mul(i, 0x100)), 0x100)
+                mstore(0x00, __BATCH_RECORD_DESTINATION__)
+                mstore(0x20, keccak256(m, __RECORD_BYTES__))
+                tstore(keccak256(0x00, 0x40), 1)
+            }
+        }
+    }
+
+    /// @dev The batch verification, then every item's request record (_requestVerifiedEarlier).
+    function verifyRequestBatchOnce(Types.RequestPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        override
+    {
+        _verifyRequestBatch(inputs, proofs);
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            for { let i := 0 } lt(i, inputs.length) { i := add(i, 1) } {
+                calldatacopy(m, add(inputs.offset, mul(i, __REQUEST_INPUT_BYTES__)), __REQUEST_INPUT_BYTES__)
+                calldatacopy(add(m, __REQUEST_INPUT_BYTES__), add(proofs.offset, mul(i, 0x100)), 0x100)
+                mstore(0x00, REQUEST_RECORD)
+                mstore(0x20, keccak256(m, __REQUEST_RECORD_BYTES__))
+                tstore(keccak256(0x00, 0x40), 1)
+            }
+        }
+    }
+
     function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
-        return interfaceId == type(IZkApiProofAdapter).interfaceId || interfaceId == 0x01ffc9a7;
+        return interfaceId == type(IZkApiProofAdapter).interfaceId
+            || interfaceId == type(IZkApiBatchProofAdapter).interfaceId || interfaceId == 0x01ffc9a7;
     }
 
     /// @dev Whether verifyWithdrawalOnce verified exactly these inputs and proof earlier in this
@@ -1843,9 +1981,33 @@ __VK_CONSTANTS__
         }
     }
 
+    /// @dev Whether verifyRequestBatchOnce verified exactly these inputs and proof earlier in this
+    ///      transaction: keccak256(REQUEST_RECORD ‖ h), h the keccak256 of the 12 input words and the
+    ///      256 proof bytes as the call carries them. Only a full batch verification writes a record
+    ///      and none is ever erased; a proof that is not 256 bytes never has one.
+    function _requestVerifiedEarlier(Types.RequestPublicInputs calldata inputs, bytes calldata proof)
+        private
+        view
+        returns (bool verified)
+    {
+        if (proof.length != 0x100) return false;
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            calldatacopy(m, inputs, __REQUEST_INPUT_BYTES__)
+            calldatacopy(add(m, __REQUEST_INPUT_BYTES__), proof.offset, 0x100)
+            mstore(0x00, REQUEST_RECORD)
+            mstore(0x20, keccak256(m, __REQUEST_RECORD_BYTES__))
+            verified := iszero(iszero(tload(keccak256(0x00, 0x40))))
+        }
+    }
+
 __VERIFY_REQUEST__
 
 __VERIFY_WITHDRAWAL__
+
+__VERIFY_REQUEST_BATCH__
+
+__VERIFY_WITHDRAWAL_BATCH__
 
 __FOLD__
 }
@@ -1867,6 +2029,14 @@ __FOLD__
             "__VERIFY_WITHDRAWAL__",
             &solidity_verify_function("withdrawal", &WITHDRAWAL_SOLIDITY_INPUTS),
         )
+        .replace(
+            "__VERIFY_REQUEST_BATCH__",
+            &solidity_batch_function("request", &REQUEST_SOLIDITY_INPUTS),
+        )
+        .replace(
+            "__VERIFY_WITHDRAWAL_BATCH__",
+            &solidity_batch_function("withdrawal", &WITHDRAWAL_SOLIDITY_INPUTS),
+        )
         .replace("__FOLD__", &solidity_fold_function())
         .replace(
             "__RECORD_INPUT_BYTES__",
@@ -1877,9 +2047,25 @@ __FOLD__
             &yul_input_word(withdrawal_destination_index()),
         )
         .replace(
+            "__BATCH_RECORD_DESTINATION__",
+            &yul_word_at("w", withdrawal_destination_index()),
+        )
+        .replace(
             "__RECORD_BYTES__",
             &format!("{:#x}", WITHDRAWAL_INPUT_BYTES + GROTH16_PROOF_BYTES),
         )
+        .replace(
+            "__REQUEST_INPUT_BYTES__",
+            &format!("{:#x}", REQUEST_INPUT_BYTES),
+        )
+        .replace(
+            "__REQUEST_RECORD_BYTES__",
+            &format!("{:#x}", REQUEST_INPUT_BYTES + GROTH16_PROOF_BYTES),
+        )
+        .replace("__BATCH_DOMAIN_TAG__", BATCH_DOMAIN_TAG)
+        .replace("__BATCH_DOMAIN__", &hex32(&batch_domain()))
+        .replace("__REQUEST_RECORD_TAG__", REQUEST_RECORD_TAG)
+        .replace("__REQUEST_RECORD__", &hex32(&request_record()))
         .replace("__CIRCUIT_ID_HASH__", &hex32(&CIRCUIT_ID_HASH))
         .replace("__CIRCUIT_ID__", CIRCUIT_ID)
         .replace("__SETUP_ID__", setup_id)
@@ -1889,10 +2075,15 @@ __FOLD__
 
 /// The Yul word of input `index` of the struct at `inputs`.
 fn yul_input_word(index: usize) -> String {
+    yul_word_at("inputs", index)
+}
+
+/// The Yul word `index` of the calldata words at `base`.
+fn yul_word_at(base: &str, index: usize) -> String {
     if index == 0 {
-        "calldataload(inputs)".to_string()
+        format!("calldataload({base})")
     } else {
-        format!("calldataload(add(inputs, {:#x}))", 32 * index)
+        format!("calldataload(add({base}, {:#x}))", 32 * index)
     }
 }
 
@@ -2075,6 +2266,248 @@ fn solidity_pairing(prefix: &str) -> String {
         out.push_str(&format!("            {line}\n"));
     }
     out
+}
+
+/// The Yul function the batch verification adds to [`SOLIDITY_YUL_HELPERS`].
+const SOLIDITY_YUL_BATCH_HELPERS: &str = r#"            // Adds r · x to the scalar at p, modulo the field order. An input at or above it is
+            // refused, as the single verification's addTerm refuses it, so no statement verifies
+            // in a non-canonical form (x + r).
+            function accumulate(p, x, r) {
+                if iszero(lt(x, SCALAR_MODULUS)) { fail() }
+                if x { mstore(p, addmod(mload(p), mulmod(r, x, SCALAR_MODULUS), SCALAR_MODULUS)) }
+            }
+"#;
+
+/// `// <head> <item>, <item>, …, <item>.` wrapped at 100 columns, continuation lines `// `.
+fn wrapped_yul_comment(indent: &str, head: &str, items: &[String]) -> String {
+    let mut out = String::new();
+    let mut line = format!("{indent}// {head}");
+    for (position, item) in items.iter().enumerate() {
+        let separator = if position + 1 == items.len() {
+            "."
+        } else {
+            ","
+        };
+        let piece = format!(" {item}{separator}");
+        if line.len() + piece.len() > 100 {
+            out.push_str(&line);
+            out.push('\n');
+            line = format!("{indent}//");
+        }
+        line.push_str(&piece);
+    }
+    out.push_str(&line);
+    out
+}
+
+/// `_verifyRequestBatch` or `_verifyWithdrawalBatch`: the random-linear-combination (RLC) batch
+/// verification of n ≥ 1 statements of one kind in one assembly block, generated from the same
+/// input table as the single verification ([`solidity_verify_function`]): its per-input
+/// narrow-field masks, its folded constants and its generic fallback. With challenges r_0 = 1 and
+/// r_i = keccak256(seed ‖ i) >> 128 for i ≥ 1, where seed = keccak256(BATCH_DOMAIN ‖ VK hash ‖ n ‖
+/// every input word ‖ every proof word), the batch holds iff
+/// Π e(-r_i A_i, B_i) · e((Σ r_i) alpha, beta) · e(Σ r_i L_i, gamma) · e(Σ r_i C_i, delta) == 1,
+/// n + 3 pairs, where Σ r_i L_i = (Σ_folded r_i) IC0' + (Σ_other r_i) IC0 + Σ_j (Σ_i r_i x_ij) IC_j
+/// is one shared multi-scalar multiplication. [`crate::batch`] is the reference implementation of
+/// exactly this transcript and these checks.
+fn solidity_batch_function(kind: &str, inputs: &[SolidityInput]) -> String {
+    let prefix = kind.to_uppercase();
+    let title = format!("{}{}", kind[..1].to_uppercase(), &kind[1..]);
+    let stride = 32 * inputs.len();
+    // The scalars s: Σ r over the folded items, Σ r over the others, then Σ r x_j per input.
+    let scalar_bytes = 32 * (2 + inputs.len());
+    let narrow_names = wrapped_yul_comment(
+        "                ",
+        "The narrow fields, as Solidity's ABI decoder checks them (an empty revert):",
+        &inputs
+            .iter()
+            .filter(|input| input.bits < 256)
+            .map(|input| format!("{} ({})", input.name, input.bits))
+            .collect::<Vec<_>>(),
+    );
+    let narrow_check = yul_tree(
+        "or",
+        &inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.bits < 256)
+            .map(|(index, input)| format!("shr({}, {})", input.bits, yul_word_at("w", index)))
+            .collect::<Vec<_>>(),
+    );
+    let proof_words = yul_tree(
+        "and",
+        &(0..8)
+            .map(|word| format!("lt({}, BASE_MODULUS)", yul_word_at("o", word)))
+            .collect::<Vec<_>>(),
+    );
+    let folded_match = yul_tree(
+        "and",
+        &inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, input)| {
+                input
+                    .folded
+                    .map(|constant| format!("eq({}, {constant})", yul_word_at("w", index)))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let accumulate = |index: usize, indent: &str| {
+        format!(
+            "{indent}accumulate(add(s, {at:#x}), {word}, r)\n",
+            at = 0x40 + 32 * index,
+            word = yul_word_at("w", index)
+        )
+    };
+    let mut generic = String::new();
+    let mut shared = String::new();
+    for (index, input) in inputs.iter().enumerate() {
+        if input.folded.is_some() {
+            generic.push_str(&accumulate(index, "                    "));
+        } else {
+            shared.push_str(&accumulate(index, "                "));
+        }
+    }
+    let msm = (0..inputs.len())
+        .map(|index| {
+            format!(
+                "            addTerm(l, {prefix}_IC{point}_X, {prefix}_IC{point}_Y, mload(add(s, {at:#x})))\n",
+                point = index + 1,
+                at = 0x40 + 32 * index
+            )
+        })
+        .collect::<String>();
+    let mut locals = format!(
+        "        uint256 foldedX = folded{title}Ic0X;\n        uint256 foldedY = folded{title}Ic0Y;\n"
+    );
+    for (local, immutable) in [
+        ("chainId", "foldedChainId"),
+        ("vault", "uint256(uint160(foldedVault))"),
+        ("stateX", "foldedStateSigningKeyX"),
+        ("stateY", "foldedStateSigningKeyY"),
+        ("clearanceX", "foldedClearanceSigningKeyX"),
+        ("clearanceY", "foldedClearanceSigningKeyY"),
+    ] {
+        if inputs.iter().any(|input| input.folded == Some(local)) {
+            locals.push_str(&format!("        uint256 {local} = {immutable};\n"));
+        }
+    }
+    let struct_name = format!("{title}PublicInputs");
+    format!(
+        r#"    /// @dev The batch Groth16 verification of n ≥ 1 {kind} statements, all or nothing: reverts
+    ///      unless every one holds. Each item gets the single verification's checks in its order
+    ///      (narrow fields: an empty revert; proof words, then inputs, canonical: InvalidProof()),
+    ///      and the equations are combined with r_0 = 1 and 128-bit Fiat-Shamir challenges r_i =
+    ///      keccak256(seed ‖ i) >> 128 (i ≥ 1), seed = keccak256(BATCH_DOMAIN ‖ {prefix}_VK_HASH ‖ n ‖
+    ///      every input word ‖ every proof word), the bytes the loop reads: Π e(-r_i A_i, B_i) ·
+    ///      e(Σ r_i alpha, beta) · e(Σ r_i L_i, gamma) · e(Σ r_i C_i, delta) == 1, n + 3 pairs, where
+    ///      Σ r_i L_i = (Σ_folded r_i) IC0' + (Σ_other r_i) IC0 + Σ_j (Σ_i r_i x_ij) IC_j is one
+    ///      shared multi-scalar multiplication over the folded and generic items alike. An empty
+    ///      batch and a proofs length other than 256 · n revert InvalidProof(). Memory from the free
+    ///      pointer m: first the transcript (n ≥ 2), then the pairing input ((n + 3) · 0xc0 bytes),
+    ///      the scalars s ({scalar_words} words), Σ r L with its four scratch words, and Σ r C with its.
+    function _verify{title}Batch(Types.{struct_name}[] calldata inputs, bytes calldata proofs) private view {{
+{locals}        assembly ("memory-safe") {{
+{helpers}{batch_helpers}            let n := inputs.length
+            if iszero(n) {{ fail() }}
+            if iszero(eq(proofs.length, mul(n, 0x100))) {{ fail() }}
+            let m := mload(0x40)
+            // The Fiat-Shamir seed over every byte the loop reads. One statement needs none: r_0 = 1.
+            let seed := 0
+            if gt(n, 1) {{
+                mstore(m, BATCH_DOMAIN)
+                mstore(add(m, 0x20), {prefix}_VK_HASH)
+                mstore(add(m, 0x40), n)
+                calldatacopy(add(m, 0x60), inputs.offset, mul(n, {stride:#x}))
+                calldatacopy(add(m, add(0x60, mul(n, {stride:#x}))), proofs.offset, mul(n, 0x100))
+                seed := keccak256(m, add(0x60, mul(n, {transcript_item:#x})))
+            }}
+            let s := add(m, mul(add(n, 3), 0xc0))
+            let l := add(s, {scalar_bytes:#x})
+            let c := add(l, 0xc0)
+            for {{ let k := 0 }} lt(k, {scalar_bytes:#x}) {{ k := add(k, 0x20) }} {{ mstore(add(s, k), 0) }}
+            for {{ let i := 0 }} lt(i, n) {{ i := add(i, 1) }} {{
+                let w := add(inputs.offset, mul(i, {stride:#x}))
+                let o := add(proofs.offset, mul(i, 0x100))
+{narrow_names}
+                if {narrow_check} {{ revert(0x00, 0x00) }}
+                // The proof: every word a canonical base-field element.
+                if iszero({proof_words}) {{ fail() }}
+                // The challenge: 1 for the first statement, the top 128 bits of keccak256(seed ‖ i)
+                // after it.
+                let r := 1
+                if i {{
+                    mstore(0x00, seed)
+                    mstore(0x20, i)
+                    r := shr(128, keccak256(0x00, 0x40))
+                }}
+                switch {folded_match}
+                case 0 {{
+                    // Another vault, chain, key or version: IC0 and every input.
+                    mstore(add(s, 0x20), addmod(mload(add(s, 0x20)), r, SCALAR_MODULUS))
+{generic}                }}
+                default {{
+                    // The folded constants: IC0'.
+                    mstore(s, addmod(mload(s), r, SCALAR_MODULUS))
+                }}
+{shared}                // Pair i: (-r A, B), A negated in place, then scaled; and r C into the sum at c.
+                let q := add(m, mul(i, 0xc0))
+                mstore(q, calldataload(o))
+                mstore(add(q, 0x20), mod(sub(BASE_MODULUS, calldataload(add(o, 0x20))), BASE_MODULUS))
+                switch i
+                case 0 {{ calldatacopy(c, add(o, 0xc0), 0x40) }}
+                default {{
+                    mstore(add(q, 0x40), r)
+                    if iszero(staticcall(gas(), 0x07, q, 0x60, q, 0x40)) {{ fail() }}
+                    calldatacopy(add(c, 0x40), add(o, 0xc0), 0x40)
+                    mstore(add(c, 0x80), r)
+                    if iszero(staticcall(gas(), 0x07, add(c, 0x40), 0x60, add(c, 0x40), 0x40)) {{ fail() }}
+                    if iszero(staticcall(gas(), 0x06, c, 0x80, c, 0x40)) {{ fail() }}
+                }}
+                mstore(add(q, 0x40), calldataload(add(o, 0x60)))
+                mstore(add(q, 0x60), calldataload(add(o, 0x40)))
+                mstore(add(q, 0x80), calldataload(add(o, 0xa0)))
+                mstore(add(q, 0xa0), calldataload(add(o, 0x80)))
+            }}
+            // Σ r_i L_i: the shared multi-scalar multiplication, from the identity.
+            mstore(l, 0)
+            mstore(add(l, 0x20), 0)
+            addTerm(l, foldedX, foldedY, mload(s))
+            addTerm(l, {prefix}_IC0_X, {prefix}_IC0_Y, mload(add(s, 0x20)))
+{msm}            // The last three pairs: ((Σ r) alpha, beta), (Σ r L, gamma), (Σ r C, delta).
+            let q := add(m, mul(n, 0xc0))
+            let sum := addmod(mload(s), mload(add(s, 0x20)), SCALAR_MODULUS)
+            mstore(q, {prefix}_ALPHA_X)
+            mstore(add(q, 0x20), {prefix}_ALPHA_Y)
+            if iszero(eq(sum, 1)) {{
+                mstore(add(q, 0x40), sum)
+                if iszero(staticcall(gas(), 0x07, q, 0x60, q, 0x40)) {{ fail() }}
+            }}
+            mstore(add(q, 0x40), {prefix}_BETA_X_C1)
+            mstore(add(q, 0x60), {prefix}_BETA_X_C0)
+            mstore(add(q, 0x80), {prefix}_BETA_Y_C1)
+            mstore(add(q, 0xa0), {prefix}_BETA_Y_C0)
+            mstore(add(q, 0xc0), mload(l))
+            mstore(add(q, 0xe0), mload(add(l, 0x20)))
+            mstore(add(q, 0x100), {prefix}_GAMMA_X_C1)
+            mstore(add(q, 0x120), {prefix}_GAMMA_X_C0)
+            mstore(add(q, 0x140), {prefix}_GAMMA_Y_C1)
+            mstore(add(q, 0x160), {prefix}_GAMMA_Y_C0)
+            mstore(add(q, 0x180), mload(c))
+            mstore(add(q, 0x1a0), mload(add(c, 0x20)))
+            mstore(add(q, 0x1c0), {prefix}_DELTA_X_C1)
+            mstore(add(q, 0x1e0), {prefix}_DELTA_X_C0)
+            mstore(add(q, 0x200), {prefix}_DELTA_Y_C1)
+            mstore(add(q, 0x220), {prefix}_DELTA_Y_C0)
+            let ok := staticcall(gas(), 0x08, m, mul(add(n, 3), 0xc0), 0x00, 0x20)
+            if iszero(and(ok, eq(mload(0x00), 1))) {{ fail() }}
+        }}
+    }}"#,
+        helpers = SOLIDITY_YUL_HELPERS,
+        batch_helpers = SOLIDITY_YUL_BATCH_HELPERS,
+        scalar_words = 2 + inputs.len(),
+        transcript_item = stride + GROTH16_PROOF_BYTES,
+    )
 }
 
 /// `_fold`: the constructor's sum of IC0 and the folded inputs' terms, for both keys, by the
@@ -2429,8 +2862,10 @@ mod tests {
             ("WITHDRAWAL", &WITHDRAWAL_SOLIDITY_INPUTS[..]),
         ] {
             for (index, input) in inputs.iter().enumerate() {
+                // the single verification's term (and the fold's for a folded input), and the
+                // batch verification's shared multi-scalar multiplication
                 let term = format!("addTerm(l, {prefix}_IC{point}_X", point = index + 1);
-                let expected = if input.folded.is_some() { 2 } else { 1 };
+                let expected = if input.folded.is_some() { 3 } else { 2 };
                 assert_eq!(
                     source.matches(&term).count(),
                     expected,
@@ -2440,6 +2875,8 @@ mod tests {
                 if input.bits < 256 {
                     let word = yul_input_word(index);
                     assert!(source.contains(&format!("shr({}, {word})", input.bits)));
+                    let batch_word = yul_word_at("w", index);
+                    assert!(source.contains(&format!("shr({}, {batch_word})", input.bits)));
                 }
             }
             assert!(!source.contains(&format!("{prefix}_IC{}_X", inputs.len() + 1)));
@@ -2482,11 +2919,86 @@ mod tests {
             "calldatacopy(m, inputs, 0x200)",
             "calldatacopy(add(m, 0x200), proof.offset, 0x100)",
             "mstore(0x00, calldataload(add(inputs, 0x140)))",
-            "mstore(0x20, keccak256(m, 0x300))",
+            // verifyWithdrawalBatchOnce writes the same record per item
+            "calldatacopy(m, w, 0x200)",
+            "calldatacopy(add(m, 0x200), add(proofs.offset, mul(i, 0x100)), 0x100)",
+            "mstore(0x00, calldataload(add(w, 0x140)))",
         ] {
             assert_eq!(source.matches(line).count(), 1, "{line}");
         }
+        assert_eq!(
+            source.matches("mstore(0x20, keccak256(m, 0x300))").count(),
+            2
+        );
+        // request records: 12 words and the proof, under REQUEST_RECORD, written by
+        // verifyRequestBatchOnce and read by assertValidRequest
+        assert_eq!(
+            source.matches("mstore(0x20, keccak256(m, 0x280))").count(),
+            2
+        );
+        assert_eq!(source.matches("mstore(0x00, REQUEST_RECORD)").count(), 2);
+        assert!(source.contains("if (_requestVerifiedEarlier(inputs, proof)) return;"));
         assert!(!source.contains("__RECORD_"));
+        assert!(!source.contains("__REQUEST_"));
+        assert!(!source.contains("__BATCH_"));
+    }
+
+    /// REQUEST_RECORD is at or above 2^160, so no withdrawal record (whose slot preimage starts with
+    /// an address) can be read as a request record; the batch domain is another word.
+    #[test]
+    fn request_records_live_outside_every_destination() {
+        let record = request_record();
+        assert!(record[..12].iter().any(|byte| *byte != 0));
+        assert_ne!(record, batch_domain());
+        assert_eq!(
+            hex32(&batch_domain()),
+            hex32(&keccak256(b"zkapi.groth16.batch.v1"))
+        );
+    }
+
+    /// The batch verification is generated from the same input table as the single one: a changed
+    /// width or meaning of an input (design C turns input 3 into the note's leaf and input 8 into
+    /// noteFields, up to 224 bits) changes only the table. Every narrow input is checked at its
+    /// width, every folded input joins IC0' on the folded path and is accumulated on the generic
+    /// one, and every other input is accumulated on both.
+    #[test]
+    fn batch_verification_follows_the_input_table() {
+        let mut table: Vec<SolidityInput> = WITHDRAWAL_SOLIDITY_INPUTS
+            .iter()
+            .map(|input| SolidityInput {
+                name: input.name,
+                bits: input.bits,
+                folded: input.folded,
+            })
+            .collect();
+        table[3] = input("noteLeaf", 256, None);
+        table[8] = input("noteFields", 224, None);
+        let source = solidity_batch_function("withdrawal", &table);
+        assert!(source.contains("shr(224, calldataload(add(w, 0x100)))"));
+        assert!(!source.contains("shr(32, calldataload(add(w, 0x100)))"));
+        assert!(source.contains("noteFields (224)"));
+        for (index, input) in table.iter().enumerate() {
+            let accumulate = format!(
+                "accumulate(add(s, {:#x}), {}, r)",
+                0x40 + 32 * index,
+                yul_word_at("w", index)
+            );
+            assert_eq!(source.matches(&accumulate).count(), 1, "{}", input.name);
+            if let Some(constant) = input.folded {
+                assert!(source.contains(&format!("eq({}, {constant})", yul_word_at("w", index))));
+            }
+        }
+        assert!(source.contains(&format!("lt(k, {:#x})", 32 * (2 + table.len()))));
+        assert!(source.contains(&format!("mul(n, {:#x})", 32 * table.len())));
+        assert!(source.contains(&format!("mul(n, {:#x})", 32 * table.len() + 0x100)));
+        // and the request kind, with its own table
+        let request = solidity_batch_function("request", &REQUEST_SOLIDITY_INPUTS);
+        assert!(request.contains("mstore(add(m, 0x20), REQUEST_VK_HASH)"));
+        assert!(request.contains("mul(n, 0x180)"));
+        assert_eq!(
+            request.matches("accumulate(add(s, ").count(),
+            REQUEST_PUBLIC_INPUTS
+        );
     }
 
     #[test]

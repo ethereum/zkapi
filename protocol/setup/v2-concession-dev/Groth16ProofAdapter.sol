@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {IZkApiBatchProofAdapter} from "../interfaces/IZkApiBatchProofAdapter.sol";
 import {IZkApiProofAdapter} from "../interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../libraries/Types.sol";
 
@@ -19,10 +20,16 @@ import {Types} from "../libraries/Types.sol";
 ///         statement and proof it verified for the rest of the transaction (EIP-1153), and
 ///         assertValidWithdrawal of the same bytes, the vault's in the execution phase, then
 ///         returns without verifying them again.
+///         The batch entry points (IZkApiBatchProofAdapter) verify n statements of one kind at
+///         once, all or nothing, with one random linear combination of their equations: n + 3
+///         pairings and one shared multi-scalar multiplication instead of 4n pairings and n. The
+///         Once variants then write, for every item, the record a single verification would have
+///         left (withdrawals: the record of verifyWithdrawalOnce; requests: a record under
+///         REQUEST_RECORD that assertValidRequest consults), for ZkApiExitBatcher's vault calls.
 /// @dev Every word is read from calldata as Solidity's ABI decoder reads it: the narrow fields
 ///      must be clean (an empty revert otherwise), the proof is 256 bytes and every input and
 ///      proof word must be canonical; any other failure reverts InvalidProof().
-contract Groth16ProofAdapter is IZkApiProofAdapter {
+contract Groth16ProofAdapter is IZkApiProofAdapter, IZkApiBatchProofAdapter {
     /// @notice keccak256("zkapi-v2-concession-v1"): the statement this adapter verifies.
     bytes32 public constant CIRCUIT_ID_HASH = 0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687;
     /// @notice keccak256 of the request verifying key (arkworks compressed bytes of request.vk
@@ -37,6 +44,12 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
         21888242871839275222246405745257275088696311157297823662689037894645226208583;
     /// @dev The protocol version every statement carries.
     uint256 private constant PROTOCOL_VERSION = 2;
+    /// @dev keccak256("zkapi.groth16.batch.v1"): the first word of a batch's Fiat-Shamir transcript.
+    uint256 private constant BATCH_DOMAIN = 0xca80fe9779d18ee0b63d605d88a5b66c8270acd425592d10473e2ebee417e6c8;
+    /// @dev keccak256("zkapi.groth16.request-record.v1"), at or above 2^160: the first word of a request
+    ///      record's slot preimage, where a withdrawal record has its destination (below 2^160), so
+    ///      that no record of one kind can be read as one of the other.
+    uint256 private constant REQUEST_RECORD = 0xe8b8fb47a0b8117907fcaea5c18794512eebbf818b8c203f2a5875f17da985bb;
 
     /// @notice The chain ID the fold binds: block.chainid at construction.
     uint256 public immutable foldedChainId;
@@ -180,6 +193,7 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
         view
         override
     {
+        if (_requestVerifiedEarlier(inputs, proof)) return;
         _verifyRequest(inputs, proof);
     }
 
@@ -203,8 +217,63 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
         }
     }
 
+    function verifyWithdrawalBatch(Types.WithdrawalPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        view
+        override
+    {
+        _verifyWithdrawalBatch(inputs, proofs);
+    }
+
+    function verifyRequestBatch(Types.RequestPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        view
+        override
+    {
+        _verifyRequestBatch(inputs, proofs);
+    }
+
+    /// @dev The batch verification, then every item's record exactly as verifyWithdrawalOnce writes
+    ///      it (_verifiedSlot).
+    function verifyWithdrawalBatchOnce(Types.WithdrawalPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        override
+    {
+        _verifyWithdrawalBatch(inputs, proofs);
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            for { let i := 0 } lt(i, inputs.length) { i := add(i, 1) } {
+                let w := add(inputs.offset, mul(i, 0x200))
+                calldatacopy(m, w, 0x200)
+                calldatacopy(add(m, 0x200), add(proofs.offset, mul(i, 0x100)), 0x100)
+                mstore(0x00, calldataload(add(w, 0x140)))
+                mstore(0x20, keccak256(m, 0x300))
+                tstore(keccak256(0x00, 0x40), 1)
+            }
+        }
+    }
+
+    /// @dev The batch verification, then every item's request record (_requestVerifiedEarlier).
+    function verifyRequestBatchOnce(Types.RequestPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        override
+    {
+        _verifyRequestBatch(inputs, proofs);
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            for { let i := 0 } lt(i, inputs.length) { i := add(i, 1) } {
+                calldatacopy(m, add(inputs.offset, mul(i, 0x180)), 0x180)
+                calldatacopy(add(m, 0x180), add(proofs.offset, mul(i, 0x100)), 0x100)
+                mstore(0x00, REQUEST_RECORD)
+                mstore(0x20, keccak256(m, 0x280))
+                tstore(keccak256(0x00, 0x40), 1)
+            }
+        }
+    }
+
     function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
-        return interfaceId == type(IZkApiProofAdapter).interfaceId || interfaceId == 0x01ffc9a7;
+        return interfaceId == type(IZkApiProofAdapter).interfaceId
+            || interfaceId == type(IZkApiBatchProofAdapter).interfaceId || interfaceId == 0x01ffc9a7;
     }
 
     /// @dev Whether verifyWithdrawalOnce verified exactly these inputs and proof earlier in this
@@ -239,6 +308,26 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
             mstore(0x00, calldataload(add(inputs, 0x140)))
             mstore(0x20, keccak256(m, 0x300))
             slot := keccak256(0x00, 0x40)
+        }
+    }
+
+    /// @dev Whether verifyRequestBatchOnce verified exactly these inputs and proof earlier in this
+    ///      transaction: keccak256(REQUEST_RECORD ‖ h), h the keccak256 of the 12 input words and the
+    ///      256 proof bytes as the call carries them. Only a full batch verification writes a record
+    ///      and none is ever erased; a proof that is not 256 bytes never has one.
+    function _requestVerifiedEarlier(Types.RequestPublicInputs calldata inputs, bytes calldata proof)
+        private
+        view
+        returns (bool verified)
+    {
+        if (proof.length != 0x100) return false;
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            calldatacopy(m, inputs, 0x180)
+            calldatacopy(add(m, 0x180), proof.offset, 0x100)
+            mstore(0x00, REQUEST_RECORD)
+            mstore(0x20, keccak256(m, 0x280))
+            verified := iszero(iszero(tload(keccak256(0x00, 0x40))))
         }
     }
 
@@ -454,6 +543,376 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
             mstore(add(m, 0x2c0), WITHDRAWAL_DELTA_Y_C1)
             mstore(add(m, 0x2e0), WITHDRAWAL_DELTA_Y_C0)
             let ok := staticcall(gas(), 0x08, m, 0x300, 0x00, 0x20)
+            if iszero(and(ok, eq(mload(0x00), 1))) { fail() }
+        }
+    }
+
+    /// @dev The batch Groth16 verification of n ≥ 1 request statements, all or nothing: reverts
+    ///      unless every one holds. Each item gets the single verification's checks in its order
+    ///      (narrow fields: an empty revert; proof words, then inputs, canonical: InvalidProof()),
+    ///      and the equations are combined with r_0 = 1 and 128-bit Fiat-Shamir challenges r_i =
+    ///      keccak256(seed ‖ i) >> 128 (i ≥ 1), seed = keccak256(BATCH_DOMAIN ‖ REQUEST_VK_HASH ‖ n ‖
+    ///      every input word ‖ every proof word), the bytes the loop reads: Π e(-r_i A_i, B_i) ·
+    ///      e(Σ r_i alpha, beta) · e(Σ r_i L_i, gamma) · e(Σ r_i C_i, delta) == 1, n + 3 pairs, where
+    ///      Σ r_i L_i = (Σ_folded r_i) IC0' + (Σ_other r_i) IC0 + Σ_j (Σ_i r_i x_ij) IC_j is one
+    ///      shared multi-scalar multiplication over the folded and generic items alike. An empty
+    ///      batch and a proofs length other than 256 · n revert InvalidProof(). Memory from the free
+    ///      pointer m: first the transcript (n ≥ 2), then the pairing input ((n + 3) · 0xc0 bytes),
+    ///      the scalars s (14 words), Σ r L with its four scratch words, and Σ r C with its.
+    function _verifyRequestBatch(Types.RequestPublicInputs[] calldata inputs, bytes calldata proofs) private view {
+        uint256 foldedX = foldedRequestIc0X;
+        uint256 foldedY = foldedRequestIc0Y;
+        uint256 chainId = foldedChainId;
+        uint256 vault = uint256(uint160(foldedVault));
+        uint256 stateX = foldedStateSigningKeyX;
+        uint256 stateY = foldedStateSigningKeyY;
+        assembly ("memory-safe") {
+            // Reverts InvalidProof().
+            function fail() {
+                mstore(0x00, shl(224, 0x09bde339))
+                revert(0x00, 0x04)
+            }
+            // Adds s · (x, y) to the G1 point at l, with the four words after it as scratch. A
+            // scalar at or above the field order is refused. 0 · P is the identity, the neutral
+            // element of the sum: skipped. 1 · P and 2 · P need no scalar multiplication (6,000
+            // gas) either: the point itself, and one addition. The protocol version (2), a
+            // close's kind (1), an escape's kind (0) and an exit's zero nextNullifier and conceded
+            // take these paths.
+            function addTerm(l, x, y, s) {
+                if iszero(lt(s, SCALAR_MODULUS)) { fail() }
+                if s {
+                    let t := add(l, 0x40)
+                    mstore(t, x)
+                    mstore(add(t, 0x20), y)
+                    switch s
+                    case 1 {}
+                    case 2 {
+                        mstore(add(t, 0x40), x)
+                        mstore(add(t, 0x60), y)
+                        if iszero(staticcall(gas(), 0x06, t, 0x80, t, 0x40)) { fail() }
+                    }
+                    default {
+                        mstore(add(t, 0x40), s)
+                        if iszero(staticcall(gas(), 0x07, t, 0x60, t, 0x40)) { fail() }
+                    }
+                    if iszero(staticcall(gas(), 0x06, l, 0x80, l, 0x40)) { fail() }
+                }
+            }
+            // Adds r · x to the scalar at p, modulo the field order. An input at or above it is
+            // refused, as the single verification's addTerm refuses it, so no statement verifies
+            // in a non-canonical form (x + r).
+            function accumulate(p, x, r) {
+                if iszero(lt(x, SCALAR_MODULUS)) { fail() }
+                if x { mstore(p, addmod(mload(p), mulmod(r, x, SCALAR_MODULUS), SCALAR_MODULUS)) }
+            }
+            let n := inputs.length
+            if iszero(n) { fail() }
+            if iszero(eq(proofs.length, mul(n, 0x100))) { fail() }
+            let m := mload(0x40)
+            // The Fiat-Shamir seed over every byte the loop reads. One statement needs none: r_0 = 1.
+            let seed := 0
+            if gt(n, 1) {
+                mstore(m, BATCH_DOMAIN)
+                mstore(add(m, 0x20), REQUEST_VK_HASH)
+                mstore(add(m, 0x40), n)
+                calldatacopy(add(m, 0x60), inputs.offset, mul(n, 0x180))
+                calldatacopy(add(m, add(0x60, mul(n, 0x180))), proofs.offset, mul(n, 0x100))
+                seed := keccak256(m, add(0x60, mul(n, 0x280)))
+            }
+            let s := add(m, mul(add(n, 3), 0xc0))
+            let l := add(s, 0x1c0)
+            let c := add(l, 0xc0)
+            for { let k := 0 } lt(k, 0x1c0) { k := add(k, 0x20) } { mstore(add(s, k), 0) }
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                let w := add(inputs.offset, mul(i, 0x180))
+                let o := add(proofs.offset, mul(i, 0x100))
+                // The narrow fields, as Solidity's ABI decoder checks them (an empty revert):
+                // protocolVersion (16), chainId (64), contractAddress (160), requestTime (64),
+                // solvencyBound (128).
+                if or(or(or(shr(16, calldataload(w)), shr(64, calldataload(add(w, 0x20)))), shr(160, calldataload(add(w, 0x40)))), or(shr(64, calldataload(add(w, 0xc0))), shr(128, calldataload(add(w, 0xe0))))) { revert(0x00, 0x00) }
+                // The proof: every word a canonical base-field element.
+                if iszero(and(and(and(lt(calldataload(o), BASE_MODULUS), lt(calldataload(add(o, 0x20)), BASE_MODULUS)), and(lt(calldataload(add(o, 0x40)), BASE_MODULUS), lt(calldataload(add(o, 0x60)), BASE_MODULUS))), and(and(lt(calldataload(add(o, 0x80)), BASE_MODULUS), lt(calldataload(add(o, 0xa0)), BASE_MODULUS)), and(lt(calldataload(add(o, 0xc0)), BASE_MODULUS), lt(calldataload(add(o, 0xe0)), BASE_MODULUS))))) { fail() }
+                // The challenge: 1 for the first statement, the top 128 bits of keccak256(seed ‖ i)
+                // after it.
+                let r := 1
+                if i {
+                    mstore(0x00, seed)
+                    mstore(0x20, i)
+                    r := shr(128, keccak256(0x00, 0x40))
+                }
+                switch and(and(and(eq(calldataload(w), PROTOCOL_VERSION), eq(calldataload(add(w, 0x20)), chainId)), eq(calldataload(add(w, 0x40)), vault)), and(eq(calldataload(add(w, 0x80)), stateX), eq(calldataload(add(w, 0xa0)), stateY)))
+                case 0 {
+                    // Another vault, chain, key or version: IC0 and every input.
+                    mstore(add(s, 0x20), addmod(mload(add(s, 0x20)), r, SCALAR_MODULUS))
+                    accumulate(add(s, 0x40), calldataload(w), r)
+                    accumulate(add(s, 0x60), calldataload(add(w, 0x20)), r)
+                    accumulate(add(s, 0x80), calldataload(add(w, 0x40)), r)
+                    accumulate(add(s, 0xc0), calldataload(add(w, 0x80)), r)
+                    accumulate(add(s, 0xe0), calldataload(add(w, 0xa0)), r)
+                }
+                default {
+                    // The folded constants: IC0'.
+                    mstore(s, addmod(mload(s), r, SCALAR_MODULUS))
+                }
+                accumulate(add(s, 0xa0), calldataload(add(w, 0x60)), r)
+                accumulate(add(s, 0x100), calldataload(add(w, 0xc0)), r)
+                accumulate(add(s, 0x120), calldataload(add(w, 0xe0)), r)
+                accumulate(add(s, 0x140), calldataload(add(w, 0x100)), r)
+                accumulate(add(s, 0x160), calldataload(add(w, 0x120)), r)
+                accumulate(add(s, 0x180), calldataload(add(w, 0x140)), r)
+                accumulate(add(s, 0x1a0), calldataload(add(w, 0x160)), r)
+                // Pair i: (-r A, B), A negated in place, then scaled; and r C into the sum at c.
+                let q := add(m, mul(i, 0xc0))
+                mstore(q, calldataload(o))
+                mstore(add(q, 0x20), mod(sub(BASE_MODULUS, calldataload(add(o, 0x20))), BASE_MODULUS))
+                switch i
+                case 0 { calldatacopy(c, add(o, 0xc0), 0x40) }
+                default {
+                    mstore(add(q, 0x40), r)
+                    if iszero(staticcall(gas(), 0x07, q, 0x60, q, 0x40)) { fail() }
+                    calldatacopy(add(c, 0x40), add(o, 0xc0), 0x40)
+                    mstore(add(c, 0x80), r)
+                    if iszero(staticcall(gas(), 0x07, add(c, 0x40), 0x60, add(c, 0x40), 0x40)) { fail() }
+                    if iszero(staticcall(gas(), 0x06, c, 0x80, c, 0x40)) { fail() }
+                }
+                mstore(add(q, 0x40), calldataload(add(o, 0x60)))
+                mstore(add(q, 0x60), calldataload(add(o, 0x40)))
+                mstore(add(q, 0x80), calldataload(add(o, 0xa0)))
+                mstore(add(q, 0xa0), calldataload(add(o, 0x80)))
+            }
+            // Σ r_i L_i: the shared multi-scalar multiplication, from the identity.
+            mstore(l, 0)
+            mstore(add(l, 0x20), 0)
+            addTerm(l, foldedX, foldedY, mload(s))
+            addTerm(l, REQUEST_IC0_X, REQUEST_IC0_Y, mload(add(s, 0x20)))
+            addTerm(l, REQUEST_IC1_X, REQUEST_IC1_Y, mload(add(s, 0x40)))
+            addTerm(l, REQUEST_IC2_X, REQUEST_IC2_Y, mload(add(s, 0x60)))
+            addTerm(l, REQUEST_IC3_X, REQUEST_IC3_Y, mload(add(s, 0x80)))
+            addTerm(l, REQUEST_IC4_X, REQUEST_IC4_Y, mload(add(s, 0xa0)))
+            addTerm(l, REQUEST_IC5_X, REQUEST_IC5_Y, mload(add(s, 0xc0)))
+            addTerm(l, REQUEST_IC6_X, REQUEST_IC6_Y, mload(add(s, 0xe0)))
+            addTerm(l, REQUEST_IC7_X, REQUEST_IC7_Y, mload(add(s, 0x100)))
+            addTerm(l, REQUEST_IC8_X, REQUEST_IC8_Y, mload(add(s, 0x120)))
+            addTerm(l, REQUEST_IC9_X, REQUEST_IC9_Y, mload(add(s, 0x140)))
+            addTerm(l, REQUEST_IC10_X, REQUEST_IC10_Y, mload(add(s, 0x160)))
+            addTerm(l, REQUEST_IC11_X, REQUEST_IC11_Y, mload(add(s, 0x180)))
+            addTerm(l, REQUEST_IC12_X, REQUEST_IC12_Y, mload(add(s, 0x1a0)))
+            // The last three pairs: ((Σ r) alpha, beta), (Σ r L, gamma), (Σ r C, delta).
+            let q := add(m, mul(n, 0xc0))
+            let sum := addmod(mload(s), mload(add(s, 0x20)), SCALAR_MODULUS)
+            mstore(q, REQUEST_ALPHA_X)
+            mstore(add(q, 0x20), REQUEST_ALPHA_Y)
+            if iszero(eq(sum, 1)) {
+                mstore(add(q, 0x40), sum)
+                if iszero(staticcall(gas(), 0x07, q, 0x60, q, 0x40)) { fail() }
+            }
+            mstore(add(q, 0x40), REQUEST_BETA_X_C1)
+            mstore(add(q, 0x60), REQUEST_BETA_X_C0)
+            mstore(add(q, 0x80), REQUEST_BETA_Y_C1)
+            mstore(add(q, 0xa0), REQUEST_BETA_Y_C0)
+            mstore(add(q, 0xc0), mload(l))
+            mstore(add(q, 0xe0), mload(add(l, 0x20)))
+            mstore(add(q, 0x100), REQUEST_GAMMA_X_C1)
+            mstore(add(q, 0x120), REQUEST_GAMMA_X_C0)
+            mstore(add(q, 0x140), REQUEST_GAMMA_Y_C1)
+            mstore(add(q, 0x160), REQUEST_GAMMA_Y_C0)
+            mstore(add(q, 0x180), mload(c))
+            mstore(add(q, 0x1a0), mload(add(c, 0x20)))
+            mstore(add(q, 0x1c0), REQUEST_DELTA_X_C1)
+            mstore(add(q, 0x1e0), REQUEST_DELTA_X_C0)
+            mstore(add(q, 0x200), REQUEST_DELTA_Y_C1)
+            mstore(add(q, 0x220), REQUEST_DELTA_Y_C0)
+            let ok := staticcall(gas(), 0x08, m, mul(add(n, 3), 0xc0), 0x00, 0x20)
+            if iszero(and(ok, eq(mload(0x00), 1))) { fail() }
+        }
+    }
+
+    /// @dev The batch Groth16 verification of n ≥ 1 withdrawal statements, all or nothing: reverts
+    ///      unless every one holds. Each item gets the single verification's checks in its order
+    ///      (narrow fields: an empty revert; proof words, then inputs, canonical: InvalidProof()),
+    ///      and the equations are combined with r_0 = 1 and 128-bit Fiat-Shamir challenges r_i =
+    ///      keccak256(seed ‖ i) >> 128 (i ≥ 1), seed = keccak256(BATCH_DOMAIN ‖ WITHDRAWAL_VK_HASH ‖ n ‖
+    ///      every input word ‖ every proof word), the bytes the loop reads: Π e(-r_i A_i, B_i) ·
+    ///      e(Σ r_i alpha, beta) · e(Σ r_i L_i, gamma) · e(Σ r_i C_i, delta) == 1, n + 3 pairs, where
+    ///      Σ r_i L_i = (Σ_folded r_i) IC0' + (Σ_other r_i) IC0 + Σ_j (Σ_i r_i x_ij) IC_j is one
+    ///      shared multi-scalar multiplication over the folded and generic items alike. An empty
+    ///      batch and a proofs length other than 256 · n revert InvalidProof(). Memory from the free
+    ///      pointer m: first the transcript (n ≥ 2), then the pairing input ((n + 3) · 0xc0 bytes),
+    ///      the scalars s (18 words), Σ r L with its four scratch words, and Σ r C with its.
+    function _verifyWithdrawalBatch(Types.WithdrawalPublicInputs[] calldata inputs, bytes calldata proofs) private view {
+        uint256 foldedX = foldedWithdrawalIc0X;
+        uint256 foldedY = foldedWithdrawalIc0Y;
+        uint256 chainId = foldedChainId;
+        uint256 vault = uint256(uint160(foldedVault));
+        uint256 stateX = foldedStateSigningKeyX;
+        uint256 stateY = foldedStateSigningKeyY;
+        uint256 clearanceX = foldedClearanceSigningKeyX;
+        uint256 clearanceY = foldedClearanceSigningKeyY;
+        assembly ("memory-safe") {
+            // Reverts InvalidProof().
+            function fail() {
+                mstore(0x00, shl(224, 0x09bde339))
+                revert(0x00, 0x04)
+            }
+            // Adds s · (x, y) to the G1 point at l, with the four words after it as scratch. A
+            // scalar at or above the field order is refused. 0 · P is the identity, the neutral
+            // element of the sum: skipped. 1 · P and 2 · P need no scalar multiplication (6,000
+            // gas) either: the point itself, and one addition. The protocol version (2), a
+            // close's kind (1), an escape's kind (0) and an exit's zero nextNullifier and conceded
+            // take these paths.
+            function addTerm(l, x, y, s) {
+                if iszero(lt(s, SCALAR_MODULUS)) { fail() }
+                if s {
+                    let t := add(l, 0x40)
+                    mstore(t, x)
+                    mstore(add(t, 0x20), y)
+                    switch s
+                    case 1 {}
+                    case 2 {
+                        mstore(add(t, 0x40), x)
+                        mstore(add(t, 0x60), y)
+                        if iszero(staticcall(gas(), 0x06, t, 0x80, t, 0x40)) { fail() }
+                    }
+                    default {
+                        mstore(add(t, 0x40), s)
+                        if iszero(staticcall(gas(), 0x07, t, 0x60, t, 0x40)) { fail() }
+                    }
+                    if iszero(staticcall(gas(), 0x06, l, 0x80, l, 0x40)) { fail() }
+                }
+            }
+            // Adds r · x to the scalar at p, modulo the field order. An input at or above it is
+            // refused, as the single verification's addTerm refuses it, so no statement verifies
+            // in a non-canonical form (x + r).
+            function accumulate(p, x, r) {
+                if iszero(lt(x, SCALAR_MODULUS)) { fail() }
+                if x { mstore(p, addmod(mload(p), mulmod(r, x, SCALAR_MODULUS), SCALAR_MODULUS)) }
+            }
+            let n := inputs.length
+            if iszero(n) { fail() }
+            if iszero(eq(proofs.length, mul(n, 0x100))) { fail() }
+            let m := mload(0x40)
+            // The Fiat-Shamir seed over every byte the loop reads. One statement needs none: r_0 = 1.
+            let seed := 0
+            if gt(n, 1) {
+                mstore(m, BATCH_DOMAIN)
+                mstore(add(m, 0x20), WITHDRAWAL_VK_HASH)
+                mstore(add(m, 0x40), n)
+                calldatacopy(add(m, 0x60), inputs.offset, mul(n, 0x200))
+                calldatacopy(add(m, add(0x60, mul(n, 0x200))), proofs.offset, mul(n, 0x100))
+                seed := keccak256(m, add(0x60, mul(n, 0x300)))
+            }
+            let s := add(m, mul(add(n, 3), 0xc0))
+            let l := add(s, 0x240)
+            let c := add(l, 0xc0)
+            for { let k := 0 } lt(k, 0x240) { k := add(k, 0x20) } { mstore(add(s, k), 0) }
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                let w := add(inputs.offset, mul(i, 0x200))
+                let o := add(proofs.offset, mul(i, 0x100))
+                // The narrow fields, as Solidity's ABI decoder checks them (an empty revert):
+                // protocolVersion (16), chainId (64), contractAddress (160), noteId (32),
+                // finalBalance (128), destination (160), kind (8), conceded (128), validUntil (64).
+                if or(or(or(or(shr(16, calldataload(w)), shr(64, calldataload(add(w, 0x20)))), shr(160, calldataload(add(w, 0x40)))), or(shr(32, calldataload(add(w, 0x100))), shr(128, calldataload(add(w, 0x120))))), or(or(shr(160, calldataload(add(w, 0x140))), shr(8, calldataload(add(w, 0x180)))), or(shr(128, calldataload(add(w, 0x1c0))), shr(64, calldataload(add(w, 0x1e0)))))) { revert(0x00, 0x00) }
+                // The proof: every word a canonical base-field element.
+                if iszero(and(and(and(lt(calldataload(o), BASE_MODULUS), lt(calldataload(add(o, 0x20)), BASE_MODULUS)), and(lt(calldataload(add(o, 0x40)), BASE_MODULUS), lt(calldataload(add(o, 0x60)), BASE_MODULUS))), and(and(lt(calldataload(add(o, 0x80)), BASE_MODULUS), lt(calldataload(add(o, 0xa0)), BASE_MODULUS)), and(lt(calldataload(add(o, 0xc0)), BASE_MODULUS), lt(calldataload(add(o, 0xe0)), BASE_MODULUS))))) { fail() }
+                // The challenge: 1 for the first statement, the top 128 bits of keccak256(seed ‖ i)
+                // after it.
+                let r := 1
+                if i {
+                    mstore(0x00, seed)
+                    mstore(0x20, i)
+                    r := shr(128, keccak256(0x00, 0x40))
+                }
+                switch and(and(and(eq(calldataload(w), PROTOCOL_VERSION), eq(calldataload(add(w, 0x20)), chainId)), and(eq(calldataload(add(w, 0x40)), vault), eq(calldataload(add(w, 0x80)), stateX))), and(and(eq(calldataload(add(w, 0xa0)), stateY), eq(calldataload(add(w, 0xc0)), clearanceX)), eq(calldataload(add(w, 0xe0)), clearanceY)))
+                case 0 {
+                    // Another vault, chain, key or version: IC0 and every input.
+                    mstore(add(s, 0x20), addmod(mload(add(s, 0x20)), r, SCALAR_MODULUS))
+                    accumulate(add(s, 0x40), calldataload(w), r)
+                    accumulate(add(s, 0x60), calldataload(add(w, 0x20)), r)
+                    accumulate(add(s, 0x80), calldataload(add(w, 0x40)), r)
+                    accumulate(add(s, 0xc0), calldataload(add(w, 0x80)), r)
+                    accumulate(add(s, 0xe0), calldataload(add(w, 0xa0)), r)
+                    accumulate(add(s, 0x100), calldataload(add(w, 0xc0)), r)
+                    accumulate(add(s, 0x120), calldataload(add(w, 0xe0)), r)
+                }
+                default {
+                    // The folded constants: IC0'.
+                    mstore(s, addmod(mload(s), r, SCALAR_MODULUS))
+                }
+                accumulate(add(s, 0xa0), calldataload(add(w, 0x60)), r)
+                accumulate(add(s, 0x140), calldataload(add(w, 0x100)), r)
+                accumulate(add(s, 0x160), calldataload(add(w, 0x120)), r)
+                accumulate(add(s, 0x180), calldataload(add(w, 0x140)), r)
+                accumulate(add(s, 0x1a0), calldataload(add(w, 0x160)), r)
+                accumulate(add(s, 0x1c0), calldataload(add(w, 0x180)), r)
+                accumulate(add(s, 0x1e0), calldataload(add(w, 0x1a0)), r)
+                accumulate(add(s, 0x200), calldataload(add(w, 0x1c0)), r)
+                accumulate(add(s, 0x220), calldataload(add(w, 0x1e0)), r)
+                // Pair i: (-r A, B), A negated in place, then scaled; and r C into the sum at c.
+                let q := add(m, mul(i, 0xc0))
+                mstore(q, calldataload(o))
+                mstore(add(q, 0x20), mod(sub(BASE_MODULUS, calldataload(add(o, 0x20))), BASE_MODULUS))
+                switch i
+                case 0 { calldatacopy(c, add(o, 0xc0), 0x40) }
+                default {
+                    mstore(add(q, 0x40), r)
+                    if iszero(staticcall(gas(), 0x07, q, 0x60, q, 0x40)) { fail() }
+                    calldatacopy(add(c, 0x40), add(o, 0xc0), 0x40)
+                    mstore(add(c, 0x80), r)
+                    if iszero(staticcall(gas(), 0x07, add(c, 0x40), 0x60, add(c, 0x40), 0x40)) { fail() }
+                    if iszero(staticcall(gas(), 0x06, c, 0x80, c, 0x40)) { fail() }
+                }
+                mstore(add(q, 0x40), calldataload(add(o, 0x60)))
+                mstore(add(q, 0x60), calldataload(add(o, 0x40)))
+                mstore(add(q, 0x80), calldataload(add(o, 0xa0)))
+                mstore(add(q, 0xa0), calldataload(add(o, 0x80)))
+            }
+            // Σ r_i L_i: the shared multi-scalar multiplication, from the identity.
+            mstore(l, 0)
+            mstore(add(l, 0x20), 0)
+            addTerm(l, foldedX, foldedY, mload(s))
+            addTerm(l, WITHDRAWAL_IC0_X, WITHDRAWAL_IC0_Y, mload(add(s, 0x20)))
+            addTerm(l, WITHDRAWAL_IC1_X, WITHDRAWAL_IC1_Y, mload(add(s, 0x40)))
+            addTerm(l, WITHDRAWAL_IC2_X, WITHDRAWAL_IC2_Y, mload(add(s, 0x60)))
+            addTerm(l, WITHDRAWAL_IC3_X, WITHDRAWAL_IC3_Y, mload(add(s, 0x80)))
+            addTerm(l, WITHDRAWAL_IC4_X, WITHDRAWAL_IC4_Y, mload(add(s, 0xa0)))
+            addTerm(l, WITHDRAWAL_IC5_X, WITHDRAWAL_IC5_Y, mload(add(s, 0xc0)))
+            addTerm(l, WITHDRAWAL_IC6_X, WITHDRAWAL_IC6_Y, mload(add(s, 0xe0)))
+            addTerm(l, WITHDRAWAL_IC7_X, WITHDRAWAL_IC7_Y, mload(add(s, 0x100)))
+            addTerm(l, WITHDRAWAL_IC8_X, WITHDRAWAL_IC8_Y, mload(add(s, 0x120)))
+            addTerm(l, WITHDRAWAL_IC9_X, WITHDRAWAL_IC9_Y, mload(add(s, 0x140)))
+            addTerm(l, WITHDRAWAL_IC10_X, WITHDRAWAL_IC10_Y, mload(add(s, 0x160)))
+            addTerm(l, WITHDRAWAL_IC11_X, WITHDRAWAL_IC11_Y, mload(add(s, 0x180)))
+            addTerm(l, WITHDRAWAL_IC12_X, WITHDRAWAL_IC12_Y, mload(add(s, 0x1a0)))
+            addTerm(l, WITHDRAWAL_IC13_X, WITHDRAWAL_IC13_Y, mload(add(s, 0x1c0)))
+            addTerm(l, WITHDRAWAL_IC14_X, WITHDRAWAL_IC14_Y, mload(add(s, 0x1e0)))
+            addTerm(l, WITHDRAWAL_IC15_X, WITHDRAWAL_IC15_Y, mload(add(s, 0x200)))
+            addTerm(l, WITHDRAWAL_IC16_X, WITHDRAWAL_IC16_Y, mload(add(s, 0x220)))
+            // The last three pairs: ((Σ r) alpha, beta), (Σ r L, gamma), (Σ r C, delta).
+            let q := add(m, mul(n, 0xc0))
+            let sum := addmod(mload(s), mload(add(s, 0x20)), SCALAR_MODULUS)
+            mstore(q, WITHDRAWAL_ALPHA_X)
+            mstore(add(q, 0x20), WITHDRAWAL_ALPHA_Y)
+            if iszero(eq(sum, 1)) {
+                mstore(add(q, 0x40), sum)
+                if iszero(staticcall(gas(), 0x07, q, 0x60, q, 0x40)) { fail() }
+            }
+            mstore(add(q, 0x40), WITHDRAWAL_BETA_X_C1)
+            mstore(add(q, 0x60), WITHDRAWAL_BETA_X_C0)
+            mstore(add(q, 0x80), WITHDRAWAL_BETA_Y_C1)
+            mstore(add(q, 0xa0), WITHDRAWAL_BETA_Y_C0)
+            mstore(add(q, 0xc0), mload(l))
+            mstore(add(q, 0xe0), mload(add(l, 0x20)))
+            mstore(add(q, 0x100), WITHDRAWAL_GAMMA_X_C1)
+            mstore(add(q, 0x120), WITHDRAWAL_GAMMA_X_C0)
+            mstore(add(q, 0x140), WITHDRAWAL_GAMMA_Y_C1)
+            mstore(add(q, 0x160), WITHDRAWAL_GAMMA_Y_C0)
+            mstore(add(q, 0x180), mload(c))
+            mstore(add(q, 0x1a0), mload(add(c, 0x20)))
+            mstore(add(q, 0x1c0), WITHDRAWAL_DELTA_X_C1)
+            mstore(add(q, 0x1e0), WITHDRAWAL_DELTA_X_C0)
+            mstore(add(q, 0x200), WITHDRAWAL_DELTA_Y_C1)
+            mstore(add(q, 0x220), WITHDRAWAL_DELTA_Y_C0)
+            let ok := staticcall(gas(), 0x08, m, mul(add(n, 3), 0xc0), 0x00, 0x20)
             if iszero(and(ok, eq(mload(0x00), 1))) { fail() }
         }
     }
