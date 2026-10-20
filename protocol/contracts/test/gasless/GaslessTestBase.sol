@@ -848,6 +848,9 @@ abstract contract GaslessTestBase is VaultTestBase {
     /// after the paymaster's validation (AA32), so the whole validation phase is traced and the
     /// execution phase, which the audit does not cover, is not (the real Groth16 verification run
     /// twice would not fit in the trace).
+    /// @dev How many times the last _audit saw the paymaster set the sender's escape lock.
+    uint256 internal auditEscapeLocks;
+
     function _audit(PackedUserOperation memory op, bool expectCreate2, bool expectBalance, bool expectAdapterRecord)
         internal
     {
@@ -891,6 +894,10 @@ abstract contract GaslessTestBase is VaultTestBase {
         uint256 paymasterSteps;
         uint256 adapterRecords;
         address proofAdapter = address(vault.proofAdapter());
+        // The paymaster's transient escape lock of the sender (one sponsored escape per transit
+        // account per bundle): its own storage, set once by an ESCAPE's validation.
+        bytes32 escapeLockSlot = keccak256(abi.encode(bytes32("transit-escape"), op.sender));
+        auditEscapeLocks = 0;
         // The slots keccak256(sender ‖ x) the adapter's frame hashed so far (ERC-7562 associated
         // storage of the sender).
         bytes32[] memory associated = new bytes32[](steps.length - start);
@@ -938,6 +945,12 @@ abstract contract GaslessTestBase is VaultTestBase {
                     && bytes32(st.memoryInput) == bytes32(uint256(uint160(op.sender)))
             ) {
                 associated[associatedCount++] = keccak256(st.memoryInput);
+            }
+            if (
+                o == OP_TSTORE && frame == address(paymaster) && bytes32(st.stack[0]) == escapeLockSlot
+                    && st.stack[1] == 1
+            ) {
+                ++auditEscapeLocks;
             }
             if (o == OP_TSTORE && frame == proofAdapter) {
                 bool senderSlot;

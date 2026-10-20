@@ -182,6 +182,19 @@ Folded into 0.2.0's notes at release.
   `SponsorshipRetired` unless paused). See
   [Gas schedule](docs/deployment.md#gas-schedule).
 
+### Fixed
+
+- **Two sponsored escapes from one transit account in one bundle** were both
+  sponsored, and the second overwrote the first escape's FORWARD evidence
+  (`escapeNotePlusOne` is written in postOp, after the whole bundle is
+  validated; ERC-7562 lets a bundler include several operations of one
+  sender). The paymaster now takes a transient per-transit-account escape lock
+  in validation and refuses the second with `SponsorshipInFlight`.
+  `docs/deployment.md` no longer claims a compliant bundler never bundles two
+  operations of one sender, and states that verify-once's record on a
+  first-use operation relies on STO-022, which makes the factory's stake
+  load-bearing.
+
 ### Breaking
 - **`deposit(bytes32 commitment, uint128 amount)`** (selector `0x56d2e1ea`)
   replaces `deposit(bytes32,uint128,uint256[32])`: the siblings argument is

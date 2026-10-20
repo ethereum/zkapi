@@ -568,14 +568,25 @@ bundler's second validation, and ERC-7562 GREP-040 lets that bundler ban the
 paymaster at once. Only the operator's whitelisting bundler is reliable, so it
 is the supported default.
 
-The paymaster also holds a per-key in-flight lock (`SponsorshipInFlight` in
-`ZkApiWithdrawalPaymaster.sol`). It refuses, in validation, a second
-sponsorship of the same key in one bundle, because the EntryPoint validates a
-whole bundle before it executes any of it. A compliant bundler never bundles
-two operations of one sender, so the lock fires only against a non-compliant
-or malicious bundler. When it fires, the whole bundle fails on-chain
-validation: the bundler pays, nothing is counted, and GREP-040 lets that
-bundler ban the paymaster. Clients replace a pending operation only at the
+The paymaster also holds transient in-flight locks (`SponsorshipInFlight` in
+`ZkApiWithdrawalPaymaster.sol`), because the EntryPoint validates a whole
+bundle before it executes any of it. In validation they refuse a second
+sponsorship of the same key (the same close replayed at the next nonce), of
+the same note (an escape and a close of one note, or closes at two of its
+nullifiers), and a second sponsored escape from the same transit account.
+The last one protects the forward evidence: `escapeNotePlusOne(S)` is
+written in postOp, so two escapes of different notes from one `S`, validated
+together, would both pass the one-open-escape check and the second record
+would overwrite the first escape's. ERC-4337 and ERC-7562 do not forbid a
+bundler from including several operations of one sender in a bundle: the
+mempool holds several operations of a sender with consecutive nonces, and a
+bundler may include them together. So the locks can fire against a compliant
+bundler too, not only against a non-compliant or malicious one. When one
+fires, the whole bundle fails on-chain validation: the bundler pays, nothing
+is counted, and GREP-040 lets that bundler ban the paymaster. A bundler's
+pre-send simulation returns the `FailedOp` at its index, so it drops that
+operation and resubmits the rest; clients reusing one transit account per
+payee therefore never keep two sponsored escapes from one `S` in flight. Clients replace a pending operation only at the
 same nonce (a fee bump), and never build a new operation for a key while an
 older one may still be in a mempool. Configure the operator's bundler so
 that, while an operation is pending for a (sender, nonce key), it rejects
@@ -623,11 +634,16 @@ policy: recompute them with `gasFields` whenever it changes.
 
 **Stakes.** Never `unlockStake` the paymaster or the factory while the
 paymaster sponsors. The factory's stake lifts the public mempool's
-per-factory limits for operations that create `S`. It is also what ERC-7562
-relies on for a first use: validation writes the adapter's transient record
-at a slot associated with `S` (STO-021) while `S` is created by the same
-operation, which the rules allow in a non-entity contract only with a staked
-factory. Withdraw it only with the paymaster's. The
+per-factory limits for operations that create `S`. It is also load-bearing
+for ERC-7562 compliance: validation verifies through the adapter's
+`verifyWithdrawalOnce`, whose `TSTORE` writes the transient verify-once
+record at a slot associated with `S` (`keccak256(S ‖ h)`) in the adapter, a
+non-entity contract. Once `S` exists, STO-021 admits that write. A first-use
+operation creates `S` through its own `initCode`, and then only STO-022
+admits it, and STO-022 requires the factory to be staked. Without the
+factory's stake every first-use sponsored CLOSE and ESCAPE fails a compliant
+bundler's simulation (reused transit accounts keep working). Withdraw it
+only with the paymaster's. The
 factory's code stays deployed (it is immutable): every `S` address depends
 on it, and its `createAccount` keeps working for sweeps without any stake.
 

@@ -27,13 +27,15 @@ import {ZkApiWithdrawalAccountFactory} from "./ZkApiWithdrawalAccountFactory.sol
 /// @dev One contract holds every rule: validation-time refusals (uncharged: the bundler drops the
 ///      operation in simulation, or pays itself if the state changed before inclusion), per-key
 ///      attempt counting written in validation so it survives any execution outcome, one
-///      sponsorship per key per transaction (a transient lock, since a bundle is validated whole
-///      before any of it executes), and a postOp
+///      sponsorship per key, per note and (for an escape) per transit account per transaction
+///      (transient locks, since a bundle is validated whole before any of it executes), and a postOp
 ///      that never reverts within its gas floor (no loops, no bubbling external call, guarded
 ///      arithmetic). Validation never reads block time, number or gas price, calls only contracts
 ///      with code, reads only its own and the vault's storage and writes only its own and, through
 ///      the adapter's verifyWithdrawalOnce, the transient record of the verified proof at a slot
-///      ERC-7562 associates with the sender (STO-021).
+///      ERC-7562 associates with the sender (STO-021; STO-022 when the operation deploys S through
+///      its initCode, which admits it only because the factory is staked: the factory's stake is
+///      load-bearing for every first-use operation).
 ///      Every gas constant is measured under one gas schedule, EIP-2929's storage pricing (a fresh
 ///      slot costs 22,100 cold): the constructor refuses a chain that prices state creation above
 ///      FRESH_SLOT_GAS_BOUND (EIP-8037, live on Sepolia), and checkGasSchedule lets anyone pause
@@ -300,15 +302,21 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     ///         the EntryPoint validates a whole bundle before it executes any of it, so a second
     ///         operation that the first would make fail is refused in validation rather than
     ///         reverted in execution at the float's expense. Two locks, both transient:
-    ///         - the attempts key (the same close replayed at the next nonce). An ERC-4337 bundler
-    ///           never includes two operations of one sender in a bundle, so this one fires only
-    ///           against a non-compliant or malicious bundler. Clients therefore replace a pending
-    ///           operation only at the same nonce (a fee bump) and never build a new operation for
-    ///           a key while an older one may still be in a mempool.
+    ///         - the attempts key (the same close replayed at the next nonce). ERC-4337 and ERC-7562
+    ///           let a bundler include several operations of one sender in a bundle (consecutive
+    ///           nonces of a sender the mempool holds together), so a compliant bundler can trip
+    ///           this one too. Clients therefore replace a pending operation only at the same nonce
+    ///           (a fee bump) and never build a new operation for a key while an older one may
+    ///           still be in a mempool.
     ///         - the note of a CLOSE, ESCAPE or FINALIZE, key = keccak256(abi.encode(bytes32("note"),
     ///           uint256(noteId))): an escape and a close of one note, or closes at two of its
     ///           nullifiers, have different keys and, from different transit accounts, may be
     ///           bundled by a compliant bundler, yet at most one of them can execute.
+    ///         - the sender of an ESCAPE, key = keccak256(abi.encode(bytes32("transit-escape"),
+    ///           sender)): two sponsored escapes of different notes from one transit account would
+    ///           both pass the one-open-escape check (escapeNotePlusOne is written in postOp, after
+    ///           the whole bundle is validated), and the second record would overwrite the first
+    ///           escape's FORWARD evidence. One sponsored escape per transit account per bundle.
     ///         Either way the whole bundle fails on-chain validation (the bundler pays, nothing is
     ///         counted). A bundler's pre-send simulation returns the FailedOp at its index, so it
     ///         drops that operation and resubmits the rest; ERC-7562 GREP-040 lets it throttle or
@@ -529,28 +537,24 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         // attempts for free. One sponsorship per key per transaction: the lock is transient (an
         // own slot, ERC-7562 OP-070), so the second operation fails the bundle's validation instead
         // (the bundler pays, nothing is counted), and postOp releases it once the outcome is state.
-        // A compliant bundler never bundles two operations of one sender, so the lock only ever
-        // fires against a non-compliant or malicious one (see SponsorshipInFlight); clients replace
-        // a pending operation only at the same nonce and never build a new operation for a key
-        // while an older one may still be in a mempool.
-        uint256 locked;
-        assembly ("memory-safe") {
-            locked := tload(key)
-        }
-        if (locked != 0) revert SponsorshipInFlight(key);
+        // A bundler may include several operations of one sender (ERC-7562 does not forbid it), so
+        // the lock can fire against a compliant bundler too (see SponsorshipInFlight); clients
+        // replace a pending operation only at the same nonce and never build a new operation for a
+        // key while an older one may still be in a mempool.
+        // A lock taken here and a refusal further down revert together: the locks stand only for
+        // an operation whose whole validation passed.
+        _lockOnce(key);
         // The same holds across keys of one note: an ESCAPE and a CLOSE of a note, or CLOSEs at two
         // of its nullifiers, have different keys, and when their senders differ a compliant bundler
         // bundles them. Every one passes the note's state checks, at most one executes, and the
         // rest revert after the full verification at the float's expense, with nothing reaching
         // their senders for a FORWARD to recover. One sponsorship per note per transaction too.
-        bytes32 noteLock;
-        if (kind != KIND_FORWARD) {
-            noteLock = _noteLock(o.noteId);
-            assembly ("memory-safe") {
-                locked := tload(noteLock)
-            }
-            if (locked != 0) revert SponsorshipInFlight(noteLock);
-        }
+        if (kind != KIND_FORWARD) _lockOnce(_slotOf("note", o.noteId));
+        // And one sponsored escape per transit account per transaction: escapeNotePlusOne(S), which
+        // _validateExit checks, is written in postOp, so a second escape of another note from S
+        // validated in the same bundle would pass that check and overwrite the first escape's
+        // FORWARD evidence.
+        if (kind == KIND_ESCAPE) _lockOnce(_slotOf("transit-escape", uint160(f.sender)));
         // Own storage, in the outer frame: the count persists for every included operation
         // whatever its execution and postOp do.
         attempts[key] = used + 1;
@@ -560,8 +564,6 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         // sender an address, so the two slots never coincide.
         address sender = f.sender;
         assembly ("memory-safe") {
-            tstore(key, 1)
-            if noteLock { tstore(noteLock, 1) }
             tstore(sender, add(tload(sender), 1))
         }
         emit Sponsored(key, sender, payee, kind, o.noteId, maxCost);
@@ -622,6 +624,9 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
             // escape and must not be overwritten before that escape settles (see escapeNotePlusOne).
             (bool open, uint32 openNote) = _openEscape(f.sender);
             if (open) revert EscapeEvidencePending(openNote);
+            // The record is written in postOp, after the EntryPoint validated the whole bundle, so
+            // a second escape from S validated in the same bundle would find none and overwrite
+            // the first one's: S's transient escape lock refuses it (validatePaymasterUserOp).
             uint256 nn = inputs.nextNullifier;
             if (nn == 0 || nn == n) revert BadSuccessor();
             if (nn >= MerkleUpdateLib.FIELD_MODULUS) revert InvalidFelt();
@@ -751,7 +756,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         }
         if (inFlight == 0) revert NotRepayable();
         // Transient: the operation's postOp, later in this transaction, consumes both.
-        bytes32 slot = _receivedSlot(s);
+        bytes32 slot = _slotOf("received", uint160(s));
         assembly ("memory-safe") {
             tstore(slot, add(tload(slot), callvalue()))
             tstore(add(slot, 1), executionGasUsed)
@@ -760,7 +765,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
 
     /// @notice Wei S forwarded during the current operation (transient, so 0 outside one).
     function received(address s) external view returns (uint256 amount) {
-        bytes32 slot = _receivedSlot(s);
+        bytes32 slot = _slotOf("received", uint160(s));
         assembly ("memory-safe") {
             amount := tload(slot)
         }
@@ -769,7 +774,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     /// @notice The execution gas S reported during the current operation (transient, so 0
     ///         outside one).
     function receivedGas(address s) external view returns (uint256 gasUsed) {
-        bytes32 slot = _receivedSlot(s);
+        bytes32 slot = _slotOf("received", uint160(s));
         assembly ("memory-safe") {
             gasUsed := tload(add(slot, 1))
         }
@@ -805,18 +810,21 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         Ctx memory c = abi.decode(context, (Ctx));
         address sender = c.sender;
         bytes32 key = c.key;
-        // The outcome is state now: release the key and the note, and count this sponsorship of
-        // the sender out.
-        bytes32 noteLock = c.kind == KIND_FORWARD ? bytes32(0) : _noteLock(c.noteId);
+        // The outcome is state now: release the key, the note and an escape's sender lock (a
+        // successful initiation wrote escapeNotePlusOne below, which _openEscape reads from now
+        // on), and count this sponsorship of the sender out.
+        bytes32 noteLock = c.kind == KIND_FORWARD ? bytes32(0) : _slotOf("note", c.noteId);
+        bytes32 escapeLock = c.kind == KIND_ESCAPE ? _slotOf("transit-escape", uint160(sender)) : bytes32(0);
         assembly ("memory-safe") {
             tstore(key, 0)
             if noteLock { tstore(noteLock, 0) }
+            if escapeLock { tstore(escapeLock, 0) }
             let inFlight := tload(sender)
             if inFlight { tstore(sender, sub(inFlight, 1)) }
         }
         uint256 got;
         uint256 execUsed;
-        bytes32 receivedSlot = _receivedSlot(sender);
+        bytes32 receivedSlot = _slotOf("received", uint160(sender));
         assembly ("memory-safe") {
             got := tload(receivedSlot)
             execUsed := tload(add(receivedSlot, 1))
@@ -1028,23 +1036,30 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         revert InvalidKind();
     }
 
-    /// @dev The transient slot of a note's in-flight lock (see SponsorshipInFlight). A hash, so it
-    ///      coincides neither with an attempts key (other tags) nor with a sender's slot (an address).
-    function _noteLock(uint32 noteId) private pure returns (bytes32 slot) {
+    /// @dev Takes a transient in-flight lock (see SponsorshipInFlight) in the paymaster's own
+    ///      storage (ERC-7562 OP-070), refusing an operation whose lock another operation of this
+    ///      transaction holds. postOp releases it once the outcome is state.
+    function _lockOnce(bytes32 slot) private {
+        uint256 locked;
         assembly ("memory-safe") {
-            mstore(0x00, "note")
-            mstore(0x20, noteId)
-            slot := keccak256(0x00, 0x40)
+            locked := tload(slot)
+        }
+        if (locked != 0) revert SponsorshipInFlight(slot);
+        assembly ("memory-safe") {
+            tstore(slot, 1)
         }
     }
 
-    /// @dev The transient slots of what S forwarded during the current operation (the wei, and at
-    ///      the next slot the execution gas S reported), written by repay and consumed by postOp. A
-    ///      hash, so it coincides neither with the locks nor with a sender's slot.
-    function _receivedSlot(address s) private pure returns (bytes32 slot) {
+    /// @dev keccak256(abi.encode(bytes32(tag), value)): the transient slots of a note's in-flight
+    ///      lock ("note", noteId), of a transit account's in-flight sponsored escape
+    ///      ("transit-escape", S) and of what S forwarded during the current operation ("received",
+    ///      S: the wei, and at the next slot the execution gas S reported, written by repay and
+    ///      consumed by postOp). A hash under its own tag, so none coincides with another, with an
+    ///      attempts key (other tags) or with a sender's slot (an address).
+    function _slotOf(bytes32 tag, uint256 value) private pure returns (bytes32 slot) {
         assembly ("memory-safe") {
-            mstore(0x00, "received")
-            mstore(0x20, s)
+            mstore(0x00, tag)
+            mstore(0x20, value)
             slot := keccak256(0x00, 0x40)
         }
     }

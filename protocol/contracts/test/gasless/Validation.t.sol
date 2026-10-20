@@ -845,6 +845,24 @@ contract ValidationTest is GaslessTestBase {
         (PackedUserOperation memory op,) = _escapeOp(id, 2001, 2002, BIG - 2_000_000, 1_000_000);
         assertGt(op.initCode.length, 0, "first use");
         _audit(op, true, false, true);
+        assertEq(auditEscapeLocks, 1, "the escape locks its sender in the paymaster's own storage");
+    }
+
+    /// An escape from a transit account that already exists (reused for its payee after an earlier
+    /// escape settled): no initCode, so the adapter's record is admitted by STO-021, and the escape
+    /// lock is the paymaster's own transient storage.
+    function test_opcodeAudit_escapeFromAnExistingAccount() public {
+        uint32 idA = _bigNote(42);
+        (PackedUserOperation memory first,) = _escapeOp(idA, 2001, 2002, BIG - 2_000_000, 1_000_000);
+        _handle(first);
+        vm.prank(challenger);
+        vault.challengeEscapeWithdrawal(idA, _evidence(2002, 100_000), PROOF);
+        uint32 idB = _bigNote(43);
+        (PackedUserOperation memory op,) = _escapeOp(idB, 3001, 3002, BIG - 2_000_000, 1_000_000);
+        assertEq(op.initCode.length, 0, "the account exists");
+        assertEq(op.sender, first.sender, "the same transit account");
+        _audit(op, false, false, true);
+        assertEq(auditEscapeLocks, 1, "the escape locks its sender");
     }
 
     function test_opcodeAudit_finalize() public {
@@ -853,6 +871,7 @@ contract ValidationTest is GaslessTestBase {
         _handle(op);
         vm.warp(_deadline(id));
         _audit(_finalizeOp(id), false, false, false);
+        assertEq(auditEscapeLocks, 0, "only an escape takes the lock");
     }
 
     function test_opcodeAudit_forward() public {
