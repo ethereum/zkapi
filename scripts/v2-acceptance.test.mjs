@@ -377,7 +377,7 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
 const GASLESS_KEYS = ['entry_point_address', 'entry_point_runtime_codehash', 'sender_creator_address', 'sender_creator_runtime_codehash',
     'withdrawal_paymaster_address', 'withdrawal_paymaster_runtime_codehash', 'withdrawal_account_factory_address',
     'withdrawal_account_factory_runtime_codehash', 'withdrawal_account_implementation_address',
-    'withdrawal_account_implementation_runtime_codehash', 'account_creation_code', 'account_creation_code_keccak256', 'bundler_url',
+    'withdrawal_account_implementation_runtime_codehash', 'account_creation_code', 'account_creation_code_keccak256', 'gas_schedule', 'bundler_url',
     'gas_policy', 'policy', 'fee_ceilings', 'uneconomic_fraction_percent'];
 const GASLESS_EVIDENCE_KEYS = ['entry_point_runtime_keccak256', 'sender_creator_runtime_keccak256', 'paymaster_runtime_keccak256',
     'factory_runtime_keccak256', 'account_implementation_runtime_keccak256'];
@@ -442,7 +442,7 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
     assert.equal(gasless.withdrawal_account_implementation_address, implementation.toLowerCase());
     assert.equal(gasless.withdrawal_account_implementation_runtime_codehash, finalized.accountImplementationRuntimeCodehash);
     assert.equal(gasless.account_creation_code, creation);
-    assert.match(gasless.account_creation_code, /^0x[0-9a-f]{148}$/);
+    assert.match(gasless.account_creation_code, /^0x[0-9a-f]{154}$/);
     assert.equal(gasless.account_creation_code_keccak256, finalized.accountCreationCodeKeccak256);
     assert.equal(gasless.bundler_url, 'https://bundler.example/rpc');
     const gp = gasless.gas_policy;
@@ -680,8 +680,8 @@ test('mini bundler: v0.7 packing and the user operation hash match the golden ve
         paymasterVerificationGasLimit: undefined, paymasterPostOpGasLimit: undefined };
     assert.equal(packUserOperation(plain).paymasterAndData, '0x');
     assert.equal(packUserOperation(plain).initCode, '0x');
-    assert.equal(bundleGas([op]), 395_000n + 180_000n + 50_000n + 370_000n + 270_000n + 300_000n);
-    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 395_000n + 180_000n + 50_000n);
+    assert.equal(bundleGas([op]), 402_500n + 150_000n + 50_000n + 370_000n + 270_000n + 300_000n);
+    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 402_500n + 150_000n + 50_000n);
 });
 
 test('mini bundler: refuses malformed operations by field', () => {

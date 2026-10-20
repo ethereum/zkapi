@@ -160,8 +160,8 @@ test('a sponsored close creates the transit account, signs the hash once, journa
     assert.equal(op.paymasterData, `0x${BigInt(VECTORS.policy.flat_fee_wei).toString(16).padStart(24, '0')}`, 'feeCapWei = the flat fee shown');
     assert.equal(BigInt(op.maxFeePerGas), 2n * chain.baseFee + chain.priorityFee);
     assert.equal(BigInt(op.maxPriorityFeePerGas), chain.priorityFee);
-    assert.equal(BigInt(op.callGasLimit), 395_000n, 'the profile default, not the bundler estimate');
-    assert.equal(BigInt(op.verificationGasLimit), 180_000n, 'verification_default_init');
+    assert.equal(BigInt(op.callGasLimit), 402_500n, 'the profile default, not the bundler estimate');
+    assert.equal(BigInt(op.verificationGasLimit), 150_000n, 'verification_default_init');
     assert.equal(BigInt(op.paymasterPostOpGasLimit), 270_000n);
     // The transit vectors' default (PM_VERIFICATION_FLOOR 340,000 plus margin).
     assert.equal(BigInt(op.paymasterVerificationGasLimit), 370_000n);
@@ -1002,7 +1002,7 @@ test('a bundler estimate between the signed default and the paymaster’s cap is
     between.bundler.autoMine = between.closeBundle();
     const result = await within(5_000, between.withdraw('mutual'), 'estimate between the default and the cap');
     assert.equal(result.status, 'closed');
-    assert.equal(BigInt(between.bundler.sent[0].op.callGasLimit), 395_000n, 'the pinned default is still what is signed');
+    assert.equal(BigInt(between.bundler.sent[0].op.callGasLimit), 402_500n, 'the pinned default is still what is signed');
     const above = await scenario();
     above.bundler.estimate = { callGasLimit: '0xf4240' };
     await assert.rejects(above.withdraw('mutual'), error => error.code === 'gasless_estimate_above_cap'
