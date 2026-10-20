@@ -1,0 +1,13 @@
+{
+  "name": "@zkapi/ceremony-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "ceremony": "node ceremony.mjs",
+    "test": "node --test test/unit.test.mjs",
+    "rehearse": "node --test test/rehearsal.test.mjs"
+  },
+  "dependencies": { "snarkjs": "0.7.6" }
+}

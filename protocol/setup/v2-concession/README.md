@@ -44,6 +44,11 @@ this binding independently of the coordinator.
 
 ## Steps
 
+For the optional-name/email participant command and sequential Git bundle
+handoff, see [the ceremony tools](../../../tools/ceremony/README.md). They wrap
+the steps below for both circuits. Tooling preparation does not start the
+ceremony; initialization and rehearsals are separate, explicit commands.
+
 All commands run from `protocol/rust` at the frozen circuit revision
 (`circuit-freeze-v2c`).
 

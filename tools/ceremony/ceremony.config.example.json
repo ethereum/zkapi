@@ -1,0 +1,13 @@
+{
+  "id": "zkapi-v2-concession-mpc-1",
+  "setupId": "mpc-1",
+  "sourceCommit": "REPLACE_WITH_REVIEWED_40_CHARACTER_GIT_COMMIT",
+  "ptauSha256": "1c401abb57c9ce531370f3015c3e75c0892e0f32b8b1e94ace0f6682d9695922",
+  "expectedContributions": 10,
+  "contributionsCloseAt": "REPLACE_WITH_UTC_TIME_BEFORE_THE_BEACON",
+  "beacon": {
+    "source": "REPLACE_WITH_PUBLIC_SOURCE_AND_EXACT_FUTURE_BLOCK_OR_ROUND",
+    "notBefore": "REPLACE_WITH_UTC_TIME_AFTER_CONTRIBUTIONS_CLOSE",
+    "iterationsExp": 10
+  }
+}
