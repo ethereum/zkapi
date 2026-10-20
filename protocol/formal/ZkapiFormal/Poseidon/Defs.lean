@@ -93,15 +93,20 @@ def domainOf (label : List UInt8) : F := (label.foldl (fun acc b => acc * 256 + 
 /-- `DOMAIN_NODE = "zkapi.v2.node"` (`MerkleUpdateLib.DOMAIN_NODE`). -/
 def domainNode : F := 0x7a6b6170692e76322e6e6f6465
 
-/-- `DOMAIN_LEAF = "zkapi.v2.leaf"`. -/
-def domainLeaf : F := 0x7a6b6170692e76322e6c656166
+/-- `DOMAIN_LEAF = "zkapi.v2c.leaf"`, the note leaf's capacity domain (circuit
+`zkapi-v2-concession-v2`). -/
+def domainLeaf : F := 0x7a6b6170692e7632632e6c656166
 
 theorem domainNode_eq : domainNode = domainOf "zkapi.v2.node".toUTF8.toList := by decide +kernel
 
-theorem domainLeaf_eq : domainLeaf = domainOf "zkapi.v2.leaf".toUTF8.toList := by decide +kernel
+theorem domainLeaf_eq : domainLeaf = domainOf "zkapi.v2c.leaf".toUTF8.toList := by decide +kernel
 
 /-- The note tree's node hash (`zkapi_core::v2::merkle_node`, `MerkleUpdateLib.poseidonNodeHash`). -/
 def merkleNode (left right : F) : F := compress domainNode left right
+
+/-- The note leaf (`zkapi_core::v2::note_leaf`, `NoteLeafLib.computeLeaf`): one permutation of
+`(DOMAIN_LEAF, registration, fields)`, `fields = noteId * 2^192 + depositAmount * 2^64 + expiryTs`. -/
+def noteLeaf (registration fields : F) : F := compress domainLeaf registration fields
 
 /-- The root of an empty subtree of height `n` (`zkapi_core::v2::zero_hashes`). -/
 def zeroHash : ℕ → F

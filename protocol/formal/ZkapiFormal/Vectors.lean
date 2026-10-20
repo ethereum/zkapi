@@ -6,8 +6,8 @@ import ZkapiFormal.Poseidon.Defs
 
    Sources (SHA-256):
    69f90b60f9f6b9e89fc78993f4d0dd05d07cc8d8bf85c9a63952f87fc48d70ab protocol/contracts/test/Bn254PoseidonRuntime.t.sol
-   8e2e8925da1b5a9f68f60a0f975cf07f48800d29acd8081f578045cdcdf52202 protocol/contracts/src/libraries/MerkleUpdateLib.sol
-   279f105596b468375a9a6f2fa3e9fa28f780d121f4e8664f86b50f4f5c06fa5b zkapi-clientd/internal/zkapi/testdata/poseidon-vectors.json
+   7c1843831dbebfefaaaffaa89bce9c619246d094f4a2948d39e357fad599be0d protocol/contracts/src/libraries/MerkleUpdateLib.sol
+   f7086fc27798b695d05872f228c9035bf30c4e803ba89b45c86a4a3000840336 zkapi-clientd/internal/zkapi/testdata/poseidon-vectors.json
    6748a0684290488ecc82afa916b5c979354c30cb39f9ea0dae78b482c5e030f2 protocol/formal/reference/permutation-vectors.json
 
    Generation is not a proof: every fact the Lean development uses about these
@@ -186,39 +186,39 @@ theorem rust_hash_felts_reduced_1 :
     hashFields [((0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff : ℕ) : F), ((0x0000000000000000000000000000000000000000000000000000000000000007 : ℕ) : F)] = (0x2ebb7de7dc8521fcb0ecd2895dae84ecdaa85797143c02315adb5a70261d44dc : F) := by
   decide +kernel
 
-/-- `note_leaf(0, registration, 100000, 1760000000)`. -/
+/-- `note_leaf(0, registration, 100000, 1760000000)`: one permutation over the packed fields. -/
 theorem rust_note_leaf_0 :
-    hash5 domainLeaf (0 : F) (0x0000000000000000000000000000000000000000000000000000000000001234 : F) (100000 : F) (1760000000 : F) = (0x1c9bbb2c575058a6349a271df1ecd03e9eb94f5057a421c7f79e7865f305e69e : F) := by
+    noteLeaf (0x0000000000000000000000000000000000000000000000000000000000001234 : F) (0x0000000000000000000000000000000000000000000186a00000000068e77800 : F) = (0x1e519af4971c06b3d6b997b55f9af501713b3a0c9c1aea977cea515c9e7d1d79 : F) := by
   decide +kernel
 
-/-- `note_leaf(12, registration, 100000, 1786060800)`. -/
+/-- `note_leaf(12, registration, 100000, 1786060800)`: one permutation over the packed fields. -/
 theorem rust_note_leaf_1 :
-    hash5 domainLeaf (12 : F) (0x0000000000000000000000000000000000000000000000000000000000001234 : F) (100000 : F) (1786060800 : F) = (0x0d9d08da75fc273d4b340ca8dc392fad48b4f40e3ab72ba78daa837e0163bd7a : F) := by
+    noteLeaf (0x0000000000000000000000000000000000000000000000000000000000001234 : F) (0x000000000000000c000000000000000000000000000186a0000000006a752000 : F) = (0x1e98417d82af5d34aea109f8170ffeae42875c0f98734264a33917c50982d105 : F) := by
   decide +kernel
 
-/-- `note_leaf(13, registration, 50000, 1786147200)`. -/
+/-- `note_leaf(13, registration, 50000, 1786147200)`: one permutation over the packed fields. -/
 theorem rust_note_leaf_2 :
-    hash5 domainLeaf (13 : F) (0x0000000000000000000000000000000000000000000000000000000000005678 : F) (50000 : F) (1786147200 : F) = (0x0a12714c76bc802295d96417b1f64a1492da9fe918248a3acedadd0654c6a497 : F) := by
+    noteLeaf (0x0000000000000000000000000000000000000000000000000000000000005678 : F) (0x000000000000000d0000000000000000000000000000c350000000006a767180 : F) = (0x26bbe98287874d133ce12297ada3ea06ab81a30326820fc8adb7859ebf16fafb : F) := by
   decide +kernel
 
-/-- `note_leaf(42148, registration, 424242, 1790000000)`. -/
+/-- `note_leaf(42148, registration, 424242, 1790000000)`: one permutation over the packed fields. -/
 theorem rust_note_leaf_3 :
-    hash5 domainLeaf (42148 : F) (0x20a13a2400624900d45a616ce3e2f5c1a69e9b539673fab59b7818617e1f22bf : F) (424242 : F) (1790000000 : F) = (0x2e15a24336397b34f3b4edfc2740a9a80c2379d2bd796bd9d450f397de8a933e : F) := by
+    noteLeaf (0x20a13a2400624900d45a616ce3e2f5c1a69e9b539673fab59b7818617e1f22bf : F) (0x000000000000a4a400000000000000000000000000067932000000006ab13b80 : F) = (0x072acdca9e27815beb97d4d466cf411e147dbeb702c175bebef2ab1679ba1591 : F) := by
   decide +kernel
 
-/-- `note_leaf(4294967295, registration, 9007199254740991, 18446744073709551615)`. -/
+/-- `note_leaf(4294967295, registration, 9007199254740991, 18446744073709551615)`: one permutation over the packed fields. -/
 theorem rust_note_leaf_4 :
-    hash5 domainLeaf (4294967295 : F) (0x02f2c96db0eadfd3ba14e4488b47e94370dfdc4b1b30bb64cc77598f21acc96c : F) (9007199254740991 : F) (18446744073709551615 : F) = (0x1f9b048957695ba3b7163bd4f5d8e32d943962c81d04b2e80c3da5f90e1ec837 : F) := by
+    noteLeaf (0x02f2c96db0eadfd3ba14e4488b47e94370dfdc4b1b30bb64cc77598f21acc96c : F) (0x00000000ffffffff0000000000000000001fffffffffffffffffffffffffffff : F) = (0x2a3d31afb39d0421df6ee68460b77b5228a5b14518c04fd393105bd57a1a0d41 : F) := by
   decide +kernel
 
-/-- `note_leaf(7, registration, 340282366920938463463374607431768211455, 0)`. -/
+/-- `note_leaf(7, registration, 340282366920938463463374607431768211455, 0)`: one permutation over the packed fields. -/
 theorem rust_note_leaf_5 :
-    hash5 domainLeaf (7 : F) (0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000 : F) (340282366920938463463374607431768211455 : F) (0 : F) = (0x0eaa353295e42b3c6728aea76dae0d85db42fea0160c0dc06e0e50a2796be1ee : F) := by
+    noteLeaf (0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000 : F) (0x0000000000000007ffffffffffffffffffffffffffffffff0000000000000000 : F) = (0x1cebaaca5167296da9b18590c6f76ed7d1b817c3e49240dc882b0a85265e3d9f : F) := by
   decide +kernel
 
-/-- `note_leaf(1, registration, 0, 0)`. -/
+/-- `note_leaf(1, registration, 0, 0)`: one permutation over the packed fields. -/
 theorem rust_note_leaf_6 :
-    hash5 domainLeaf (1 : F) (0x0000000000000000000000000000000000000000000000000000000000000000 : F) (0 : F) (0 : F) = (0x2fe40819444e2ffcf8635ee416e9de53bc4ecfa0fd9834f8065d4b0687fcb843 : F) := by
+    noteLeaf (0x0000000000000000000000000000000000000000000000000000000000000000 : F) (0x0000000000000001000000000000000000000000000000000000000000000000 : F) = (0x02b8e5aaab8f7ffdeefff76d2b22eb81810dc1635218902e79f7b2bc6c2cdd02 : F) := by
   decide +kernel
 
 theorem rust_registration_commitment_0 :

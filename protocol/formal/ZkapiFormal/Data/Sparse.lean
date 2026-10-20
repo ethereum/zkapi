@@ -3,7 +3,7 @@
    Sparse optimized schedule (zkapi-proof compact.rs optimized_poseidon_constants, equal to the former library's CONSTANTS blob, now the test oracle Bn254PoseidonReference) and its change-of-basis certificates.
 
    Sources (SHA-256):
-   98253402cf735451f9a7d01415bf251fd7e26264588f6ca0d97d2c4c78669fe1 protocol/setup/v2-concession-dev/manifest.json
+   64e865c5cd991a5c32109e2f5e207f9a2d672f9b29520ec0f8c10d21a67fb579 protocol/setup/v2-concession-dev/manifest.json
    a2942e5d5c9621942d1670a8b12b09ce291938c7372096bf4597e458b218d467 protocol/contracts/test/reference/Bn254PoseidonReference.sol
 
    Generation is not a proof: every fact the Lean development uses about these

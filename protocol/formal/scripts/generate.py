@@ -77,7 +77,9 @@ SETUP_RUNTIME_SOL = PROTOCOL / "setup" / "v2-concession-dev" / "Bn254PoseidonRun
 PERM_VECTORS = FORMAL / "reference" / "permutation-vectors.json"
 
 DOMAIN_NODE = int.from_bytes(b"zkapi.v2.node", "big")
-DOMAIN_LEAF = int.from_bytes(b"zkapi.v2.leaf", "big")
+# The note leaf of circuit zkapi-v2-concession-v2: one permutation with this capacity domain over
+# (registration, noteId * 2^192 + depositAmount * 2^64 + expiryTs) (zkapi_core::v2::note_leaf).
+DOMAIN_LEAF = int.from_bytes(b"zkapi.v2c.leaf", "big")
 DOMAIN_REG = int.from_bytes(b"zkapi.v2.reg", "big")
 assert DOMAIN_NODE == 0x7A6B6170692E76322E6E6F6465
 
@@ -814,13 +816,15 @@ def clientd_vectors():
     nodes = [(int(e["left"], 16), int(e["right"], 16), int(e["node"], 16)) for e in d["merkle_node"]]
     zs = [int(x, 16) for x in d["zero_hashes"]]
     leaves = [(e["note_id"], int(e["commitment"], 16), int(e["amount"]), int(e["expiry_ts"]),
-               int(e["leaf"], 16)) for e in d["note_leaf"]]
+               int(e["fields"], 16), int(e["leaf"], 16)) for e in d["note_leaf"]]
+    require(all(f == (nid << 192) + (amount << 64) + expiry for nid, _, amount, expiry, f, _ in leaves),
+            "note_leaf fields are not noteId * 2^192 + depositAmount * 2^64 + expiryTs")
     regs = [(int(e["secret"], 16), int(e["commitment"], 16)) for e in d["registration_commitment"]]
     roots = [(int(e["note_id"]), int(e["leaf"], 16), [int(x, 16) for x in e["siblings"]], int(e["root"], 16))
              for e in d["merkle_root"]]
     require(all(len(sb) == 32 for _, _, sb, _ in roots), "merkle_root siblings")
     require(int(d["domains"]["zkapi.v2.reg"], 16) == DOMAIN_REG, "vector file DOMAIN_REG")
-    require(int(d["domains"]["zkapi.v2.leaf"], 16) == DOMAIN_LEAF, "vector file DOMAIN_LEAF")
+    require(int(d["domains"]["zkapi.v2c.leaf"], 16) == DOMAIN_LEAF, "vector file DOMAIN_LEAF")
     require(int(d["domains"]["zkapi.v2.node"], 16) == DOMAIN_NODE, "vector file DOMAIN_NODE")
     return dict(hash_fields=hf, reduced=red, nodes=nodes, zeros=zs, leaves=leaves, registrations=regs,
                 roots=roots)
@@ -1021,12 +1025,12 @@ def vectors_module(comp, h5, zs, cv, perms, ark, mds):
                   "theorem rust_hash_felts_reduced_%d :" % n,
                   "    hashFields %s = (%s : F) := by" % (lst, hexw(out)),
                   "  decide +kernel", ""]
-    for n, (nid, reg, amount, expiry, out) in enumerate(cv["leaves"]):
-        require(hash_fields(ark, mds, [DOMAIN_LEAF, nid, reg, amount, expiry]) == out, "note_leaf vector")
-        lines += ["/-- `note_leaf(%d, registration, %d, %d)`. -/" % (nid, amount, expiry),
+    for n, (nid, reg, amount, expiry, fields, out) in enumerate(cv["leaves"]):
+        require(compress(ark, mds, DOMAIN_LEAF, reg, fields) == out, "note_leaf vector")
+        lines += ["/-- `note_leaf(%d, registration, %d, %d)`: one permutation over the packed fields. -/" % (
+                      nid, amount, expiry),
                   "theorem rust_note_leaf_%d :" % n,
-                  "    hash5 domainLeaf (%d : F) (%s : F) (%d : F) (%d : F) = (%s : F) := by" % (
-                      nid, hexw(reg), amount, expiry, hexw(out)),
+                  "    noteLeaf (%s : F) (%s : F) = (%s : F) := by" % (hexw(reg), hexw(fields), hexw(out)),
                   "  decide +kernel", ""]
     for n, (secret, out) in enumerate(cv["registrations"]):
         require(hash_fields(ark, mds, [DOMAIN_REG, secret, 0]) == out, "registration vector")

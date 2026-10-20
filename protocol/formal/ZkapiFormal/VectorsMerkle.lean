@@ -5,7 +5,7 @@ import ZkapiFormal.Lazy.Paths
    Known-answer vectors for `merkle_root` (zkapi-clientd poseidon-vectors.json, computed by zkapi-core): the reference `merkleRoot` and the word-level loop `insertPath32Word` (the unrolled program), each by kernel evaluation.
 
    Sources (SHA-256):
-   279f105596b468375a9a6f2fa3e9fa28f780d121f4e8664f86b50f4f5c06fa5b zkapi-clientd/internal/zkapi/testdata/poseidon-vectors.json
+   f7086fc27798b695d05872f228c9035bf30c4e803ba89b45c86a4a3000840336 zkapi-clientd/internal/zkapi/testdata/poseidon-vectors.json
 
    Generation is not a proof: every fact the Lean development uses about these
    values is re-checked by the Lean kernel. -/
