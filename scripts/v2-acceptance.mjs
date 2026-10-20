@@ -27,6 +27,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { decodeFailedOp, encodeHandleOps, packUserOperation, startMiniBundler, userOperationHash, vaultCallOf } from './acceptance/mini-bundler.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH, accountCreationCode, hexToBytes,
     keccak256 } from './expected-codehashes.mjs';
+import { deriveTransitOwnerKey } from '../sdk/services/zkapiGasless.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SETUP_DIR = path.join(ROOT, 'protocol/setup/v2-concession-dev');
@@ -513,6 +514,40 @@ export function mockOaOrg(provider, options) {
     return { org, verifier, issued };
 }
 
+// The harness as zkapi-clientd derives a transit account's owner key as
+// clientd does (deriveTransitOwnerKey, HKDF-SHA256 over the wallet's seed,
+// scoped to the chain, the profile's gasless contracts and the payout
+// address; clientd's seed is its payment key): one owner, and so one transit
+// account, per payout address. `gasless` is a profile's gasless object.
+export async function clientdTransitOwner(seed, { chainId, vault, gasless, payee }) {
+    return deriveTransitOwnerKey(seed, {
+        chainId, vault, payee, entryPoint: gasless.entry_point_address, factory: gasless.withdrawal_account_factory_address,
+        paymaster: gasless.withdrawal_paymaster_address, accountCreationCodeKeccak256: gasless.account_creation_code_keccak256
+    });
+}
+
+// What two sponsored closes to one payout address must show when the second
+// reuses the first one's transit account: the same sender; the first
+// operation creating it (initCode, AccountDeployed, the verification default
+// with initCode), the second carrying no initCode and deploying nothing
+// (the verification default without initCode); both succeeding and settled
+// to that payee. Each close is { sender, initCode, deployed, success,
+// settledPayee, verificationGasLimit }; returns the failed checks.
+export function transitReuseProblems(first, second, { payee, gasPolicy }) {
+    const problems = [];
+    const same = (a, b) => String(a ?? '').toLowerCase() === String(b ?? '').toLowerCase();
+    if (!first?.sender || !same(first.sender, second?.sender)) problems.push('the second close is not sent from the first one\'s transit account');
+    if (!first?.initCode || !first?.deployed) problems.push('the first close does not create the transit account through initCode');
+    if (second?.initCode || second?.deployed) problems.push('the second close carries initCode or deploys again');
+    if (Number(first?.verificationGasLimit) !== Number(gasPolicy.verification_default_init)) problems.push('the first close is not at the verification default with initCode');
+    if (Number(second?.verificationGasLimit) !== Number(gasPolicy.verification_default)) problems.push('the second close is not at the verification default without initCode');
+    for (const [name, close] of [['first', first], ['second', second]]) {
+        if (!close?.success) problems.push(`the ${name} close did not succeed`);
+        if (!same(close?.settledPayee, payee)) problems.push(`the ${name} close was not settled to the payout address`);
+    }
+    return problems;
+}
+
 // Collects every receipt's gas by operation (gas.json).
 export function gasLedger() {
     const entries = [];
@@ -573,7 +608,7 @@ async function main() {
             + 'Runs only disposable loopback services, with mock provider, OA org and price feed. See docs/v2-acceptance.md.\n'
             + '--stop-after ends a development run early, after one of: deploy, stack, honest, stale, clients, mismatch, sdk-honest,\n'
             + 'sdk-close, raise, companion, companion-close, gasless-close, gasless-bundler, gasless-griefing, gasless-replay,\n'
-            + 'gasless-fallback, gasless-escape, gasless-sdk-escape, pause, gasless-pause, pause-max, gasless-reopen, anchors,\n'
+            + 'gasless-fallback, gasless-escape, gasless-reuse, gasless-sdk-escape, pause, gasless-pause, pause-max, gasless-reopen, anchors,\n'
             + 'lie-expired, withhold, rebuild, hang, missed, late-successor.');
         return;
     }
@@ -2001,7 +2036,7 @@ async function main() {
         // vault's checks in validation) and pushes the payout less its
         // measured charge to the payee, which needs no ETH. The operator's
         // bundler is the mini bundler; the SDK and the harness as zkapi-clientd
-        // (an ephemeral owner key per withdrawal) are the clients.
+        // (an owner key derived per payout address) are the clients.
         const gaslessPins = trusted.gasless;
         const entryPointAddress = gaslessPins.entry_point_address;
         const paymasterAddress = gaslessPins.withdrawal_paymaster_address;
@@ -2069,6 +2104,7 @@ async function main() {
         const freshAddress = () => `0x${randomBytes(20).toString('hex')}`;
         const GASLESS_CLOSE_ETH = '0.02';
         const GASLESS_ESCAPE_UNITS = 50_000_000; // gwei: an escape's payout must also cover the finalization reserve and the minimum net
+        const GASLESS_CLOSE_UNITS = 20_000_000; // gwei: GASLESS_CLOSE_ETH, a companion's sponsored close
         // An SDK whose connected account is a fresh role (it owns the transit
         // accounts), with the submission loop's waits shortened as the SDK's
         // own tests shorten them.
@@ -2498,8 +2534,9 @@ async function main() {
         stopAfter('gasless-fallback');
 
         // ---------------------------------------------------------------- gasless escapes
-        // The harness as zkapi-clientd (design §3.3): an ephemeral owner key
-        // per withdrawal, the operation's gas fields from the profile's
+        // The harness as zkapi-clientd (design §3.3): the owner key derived
+        // per payout address from the wallet's seed (clientdTransitOwner; one
+        // transit account per payout address), the operation's gas fields from the profile's
         // pinned policy, the fees within the paymaster's ceilings, an
         // EIP-191 signature over the operation hash, the bundler's JSON-RPC.
         async function clientdOperation({ owner, payee, kind, vaultCall, nonceKey }) {
@@ -2524,6 +2561,11 @@ async function main() {
             op.signature = (await owner.signMessage(getBytes(hash))).toLowerCase();
             return { op, hash, S, withInitCode, maxCost: maxCostOf(op) };
         }
+        // The harness-as-clientd wallet's seed (clientd's payment key) and the
+        // owner of its transit account for a payout address.
+        const clientdSeed = `0x${randomBytes(32).toString('hex')}`;
+        const clientdOwner = async payee => new Wallet((await clientdTransitOwner(clientdSeed,
+            { chainId: CHAIN_ID, vault: vaultAddress, gasless: gaslessPins, payee })).privateKey);
         async function clientdSend({ op, hash }) {
             const answered = await rpcAt(bundler.url, 'eth_sendUserOperation', [op, entryPointAddress]);
             assert.equal(answered, hash, 'the bundler returns the locally computed hash');
@@ -2533,13 +2575,13 @@ async function main() {
         }
         const gaslessEscapes = [];
 
-        await scenario('gasless escape as zkapi-clientd (ephemeral owner key): the companion proves an early escape to S, the sponsored initiation records S\'s debt, the challenger raises the concession', async () => {
+        await scenario('gasless escape as zkapi-clientd (owner key derived per payout address): the companion proves an early escape to S, the sponsored initiation records S\'s debt, the challenger raises the concession', async () => {
             await startServer(null, { keySource: 'oa_org' });
             const companion = await startCompanion('gasless');
             const noteId = await companionDeposit(companion, GASLESS_ESCAPE_UNITS);
             await companionRequest(companion);
-            const owner = Wallet.createRandom();
             const payee = freshAddress();
+            const owner = await clientdOwner(payee);
             const S = await transitOf(owner.address, payee);
             gate.mode = 'down';
             let prepared;
@@ -2588,6 +2630,85 @@ async function main() {
                 raise: raised.event.transactionHash, raised_to: INFERENCE_CHARGE };
         });
         stopAfter('gasless-escape');
+
+        // The vault call of a companion's mutual close: mutualClose(inputs, proof).
+        function companionMutualClose(prepared) {
+            const pi = prepared.public_inputs;
+            const asHex = value => Array.isArray(value) ? `0x${Buffer.from(value).toString('hex')}` : String(value);
+            const asAddress = value => `0x${BigInt(asHex(value)).toString(16).padStart(40, '0')}`;
+            const tuple = [pi.protocol_version, pi.chain_id, asAddress(pi.contract_address), asHex(pi.active_root),
+                asHex(pi.state_signing_key_x), asHex(pi.state_signing_key_y), asHex(pi.clearance_signing_key_x), asHex(pi.clearance_signing_key_y),
+                pi.note_id, BigInt(pi.final_balance), asAddress(pi.destination), asHex(pi.withdrawal_nullifier), pi.kind,
+                asHex(pi.next_nullifier), BigInt(pi.conceded), pi.valid_until];
+            return vault.encodeFunctionData('mutualClose', [tuple, `0x${Buffer.from(prepared.proof.proof, 'base64').toString('hex')}`]);
+        }
+
+        await scenario('two closes to one payout address as zkapi-clientd: the owner key derived per payout address gives both one transit account; the first close creates it through initCode, the second reuses it without initCode, and both settle to the payee', async () => {
+            await startServer(null, { keySource: 'oa_org' });
+            const companion = await startCompanion('gasless-reuse');
+            const payee = freshAddress();
+            const owner = await clientdOwner(payee);
+            assert.equal(owner.address, (await clientdOwner(payee)).address, 'the derivation is deterministic');
+            assert.notEqual(owner.address, (await clientdOwner(freshAddress())).address, 'another payout address gets another owner');
+            const S = await transitOf(owner.address, payee);
+            assert.equal(await rpc('eth_getCode', [S, 'latest']), '0x', 'a fresh payout address has no transit account yet');
+            const closes = [];
+            for (const round of [1, 2]) {
+                const noteId = await companionDeposit(companion, GASLESS_CLOSE_UNITS);
+                const attempts = [];
+                const prepared = await waitFor(`the companion prepares close ${round} to the transit account`, async () => {
+                    const answer = await companion.call('POST', '/oa/v1/withdraw/prepare', { destination: S });
+                    attempts.push({ status: answer.status, code: companionError(answer) });
+                    return answer.status === 200 && answer.value;
+                }, 300_000, 5_000).catch(async error => {
+                    await save(`gasless-reuse-prepare-${round}.json`, attempts); throw error; });
+                assert.equal(Number(prepared.public_inputs.kind), 1, json(prepared.public_inputs));
+                const vaultCall = companionMutualClose(prepared);
+                const closeCall = vault.parseTransaction({ data: vaultCall });
+                assert.equal(closeCall.args.inputs.destination.toLowerCase(), S, 'the proof names the transit account');
+                const nullifier = BigInt(closeCall.args.inputs.withdrawalNullifier);
+                const before = await balances(payee);
+                const built = await clientdOperation({ owner, payee, kind: 1, vaultCall, nonceKey: nullifier & ((1n << 192n) - 1n) });
+                assert.equal(built.S, S);
+                const receipt = await clientdSend(built);
+                const outcome = sponsoredOutcome(receipt, S);
+                assert.ok(outcome.op?.args.success, `close ${round}: ${json(outcome.paymasterEvents)}`);
+                assert.equal(outcome.postOpFailure, null, 'postOp never reverts');
+                const event = eventOf(receipt, 'MutualClose');
+                assert.equal(Number(event.args.noteId), noteId);
+                assert.equal(event.args.destination.toLowerCase(), S);
+                const settled = outcome.settled.args;
+                assert.equal(settled.received, event.args.finalBalance * GWEI, 'S forwarded the whole payout');
+                assert.equal(settled.paidOut, settled.received - settled.charged, 'the payee gets P − charged');
+                assert.equal((await balances(payee))[payee] - before[payee], settled.paidOut);
+                assert.equal(await balance(S), 0n, 'nothing stays in the transit account');
+                const margin = chargeWithinMargin(outcome);
+                gas.record(round === 1 ? 'gasless_close_clientd_first' : 'gasless_close_clientd_reused', receipt,
+                    { client: 'clientd', note_id: noteId, user_op_hash: built.hash, init_code: built.withInitCode, ...margin });
+                const confirmed = await waitFor(`the companion confirms close ${round}`, async () => {
+                    const answer = await companion.call('POST', '/oa/v1/withdraw/confirm', { transaction_hash: receipt.transactionHash });
+                    return answer.status === 200 && answer.value;
+                }, 60_000, 1_000);
+                const wallet = await companion.call('GET', '/status');
+                assert.equal(wallet.value.has_note, false, `the companion still holds note ${noteId}: ${json(wallet.value)}`);
+                closes.push({ noteId, built, receipt, outcome, settled, confirmed });
+            }
+            const [first, second] = closes.map(close => ({
+                sender: close.built.op.sender, initCode: close.built.withInitCode && Boolean(close.built.op.factory),
+                deployed: Boolean(close.outcome.deployed), success: Boolean(close.outcome.op?.args.success),
+                settledPayee: close.settled.payee, verificationGasLimit: BigInt(close.built.op.verificationGasLimit)
+            }));
+            assert.deepEqual(transitReuseProblems(first, second, { payee, gasPolicy }), []);
+            const gasUsed = closes.map(close => BigInt(close.receipt.gasUsed));
+            await stop(companion.child);
+            await startServer();
+            return { payee, owner: owner.address.toLowerCase(), transit_account: S,
+                closes: closes.map(close => ({ note_id: close.noteId, user_op_hash: close.built.hash, bundle: close.receipt.transactionHash,
+                    init_code: close.built.withInitCode, gas_used: Number(BigInt(close.receipt.gasUsed)), charged_wei: close.settled.charged.toString(),
+                    paid_out_wei: close.settled.paidOut.toString() })),
+                gas_saved_by_reuse: Number(gasUsed[0] - gasUsed[1]) };
+        });
+        stopAfter('gasless-reuse');
 
         let gaslessPauseNote = null;
         await scenario('gasless escape through the SDK: a sponsored initiation (escapes enabled for the drill) records the debt; a second balance is deposited beside it', async () => {
@@ -3497,7 +3618,7 @@ async function main() {
                 clients: { wallet_core: 'examples/v2_acceptance_wallet (zkapi-browser natively; the harness applies the exit rules for it)',
                     sdk: 'sdk/ (zkapiClient + browserWalletRuntime) with sdk/wasm in Node: its own exit decisions, escapes, mutual closes, finalizations and credit claim',
                     companion: 'zkapi-walletd routes the Go clientd calls, escape and mutual close (the harness signs and sends its transactions), every connection through its authenticated proxy' },
-                gasless: 'the canonical EntryPoint v0.7.0 and SenderCreator runtimes etched at their addresses (codehash-pinned), the paymaster and its factory from the same Deploy.s.sol broadcast; sponsored closes, escapes, finalizations, forwards and sweeps through the SDK (fees: payout) and the harness as zkapi-clientd (ephemeral owner key)',
+                gasless: 'the canonical EntryPoint v0.7.0 and SenderCreator runtimes etched at their addresses (codehash-pinned), the paymaster and its factory from the same Deploy.s.sol broadcast; sponsored closes, escapes, finalizations, forwards and sweeps through the SDK (fees: payout) and the harness as zkapi-clientd (owner key derived per payout address, one transit account reused by two closes)',
                 bundler: 'in-process mini bundler (handleOps from an Anvil account); no real bundler tracer',
                 erc7562_audit: 'not run here: the Forge suite traces validation (protocol/contracts/test/gasless/Validation.t.sol test_opcodeAudit_*, RealAdapter.t.sol with the real adapter); a real bundler tracer run is a release gate (docs/migration-concession-vault.md)',
                 provider: 'loopback mock management and inference HTTP service',

@@ -17,7 +17,7 @@ import {
     bumpFees, checkEstimate, decodeAddressWord, decodeBool, decodeGasPolicy, decodePolicy, decodeQuote, decodeWord, dryRunError,
     encodeAttempts, encodeBalanceOf, encodeCallCap, encodeCredits, encodeEscapeNotePlusOne, encodeGetAddress,
     encodeGetNonce, encodeGetUserOpHash, encodeHandleOps, encodeOwed, encodeQuote, encodeStranded, gasFields, gaslessAmounts,
-    gaslessError, gaslessPins as gaslessPinsOf, handleOpsCalldataBytes, journalValue, maxCostWei, nonceKeyFor, packNonce, weiString,
+    gaslessError, gaslessPins as gaslessPinsOf, handleOpsCalldataBytes, journalValue, maxCostWei, nonceKeyFor, openSponsoredEscapeRecord, packNonce, weiString,
     parseCollected, parseCreditClaimed, parsePayoutCredited, sameGasPolicy, selectFees, settlementOf, toBigInt, emittedUserOpHash,
     transitAccountAddress, transitInitCode, unpackNonce, userOpHash, userOperationFromJson, userOperationJson,
     userOperationReceiptTransactionHash
@@ -2771,7 +2771,11 @@ class ZkapiClient extends EventTarget {
     // With `fees: 'payout'` a withdrawal proof names a transit account S =
     // CREATE2(factory, 0, creationCode ‖ (entryPoint, vault, paymaster, owner,
     // payee)) as its destination, where owner is the connected account and
-    // payee the payout address Y. The vault call runs inside an ERC-4337 user
+    // payee the payout address Y: one S per (connected account, payout
+    // address), which every later withdrawal of that account to Y reuses
+    // (initCode only while S has no code), so the client refuses a second
+    // sponsored escape from S while S's first one is open
+    // (assertNoOpenTransitEscape). The vault call runs inside an ERC-4337 user
     // operation sent from S and sponsored by the withdrawal paymaster P, which
     // keeps a measured charge out of the payout and pushes the rest to Y. The
     // connected account signs the operation's hash with personal_sign and never
@@ -2934,6 +2938,58 @@ class ZkapiClient extends EventTarget {
             payee: String(payout).toLowerCase(),
             creationCodeKeccak: pins.accountCreationCodeKeccak256
         };
+    }
+
+    /**
+     * The paymaster's open sponsored escape of S, read as its _openEscape
+     * reads it: escapeNotePlusOne(S) names a note that is pending, or closed
+     * while S still holds a balance (the payout waits for a forward). Null
+     * when S has none open (none recorded, the note active again after a
+     * defeat, or closed with S emptied).
+     */
+    async openTransitEscape(context) {
+        const S = context.transit.account;
+        const notePlusOne = decodeWord(await this.gaslessCall(context.reader, context.pins.paymaster, encodeEscapeNotePlusOne(S)), 'escapeNotePlusOne');
+        if (notePlusOne === 0n || notePlusOne > 1n << 32n) return null;
+        const noteId = Number(notePlusOne - 1n);
+        const status = await this.readBrowserWithdrawalStatus(noteId, null, { request: context.reader });
+        if (status.status === 'pending_withdrawal') return { noteId, status: 'pending' };
+        if (status.status === 'closed') {
+            const balance = toBigInt(await context.reader({ method: 'eth_getBalance', params: [S, 'latest'] }), 'balance');
+            if (balance !== 0n) return { noteId, status: 'payout_waiting', transitBalanceWei: balance.toString() };
+        }
+        return null;
+    }
+
+    /**
+     * One open sponsored escape per transit account (§3.2): the paymaster
+     * keeps one escape record per S, the evidence a FORWARD of that escape's
+     * payout needs, and refuses a second sponsored escape from S while the
+     * first is open (EscapeEvidencePending; within one bundle a transient
+     * per-S lock). S is one account per (connected account, payout address),
+     * so a second balance escaping to the same payout address meets it. It is
+     * refused here, before any proof binds S (`transit_escape_pending`): from
+     * this browser's records (an escape whose inclusion the read RPC may not
+     * show yet, or whose operation is in flight) and from the paymaster.
+     * Escapes of `noteId` itself (a resumed or re-proved escape of this
+     * balance) and closes are never refused this way: closes from one S use
+     * distinct nonce keys (the withdrawal nullifier) and the paymaster
+     * sponsors any number of them.
+     */
+    async assertNoOpenTransitEscape(context, { noteId }) {
+        const S = context.transit.account;
+        const records = await browserWalletRuntime.currentWithdrawals().catch(() => browserWalletRuntime.withdrawals || []);
+        const local = openSponsoredEscapeRecord(records, { account: S, noteId });
+        if (local) {
+            throw gaslessError('transit_escape_pending', { transitAccount: S, noteId: Number(local.noteId), recordId: local.recordId || null,
+                source: 'record', alternatives: ["withdraw('escape', onStatus, { fees: 'wallet' })", 'finalizeEscape', 'collectTransitBalance'] });
+        }
+        const open = await this.openTransitEscape(context);
+        if (open && open.noteId !== Number(noteId)) {
+            throw gaslessError('transit_escape_pending', { transitAccount: S, noteId: open.noteId, source: 'paymaster', status: open.status,
+                ...(open.transitBalanceWei ? { transitBalanceWei: open.transitBalanceWei } : {}),
+                alternatives: ["withdraw('escape', onStatus, { fees: 'wallet' })", 'finalizeEscape', 'collectTransitBalance'] });
+        }
     }
 
     /**
@@ -3176,6 +3232,7 @@ class ZkapiClient extends EventTarget {
         }
         if (!quote.attemptsLeft) throw gaslessError('gasless_attempts_exhausted');
         if (kind === KIND.escape && !quote.escapeOpen) {
+            if (state.policy.escapesEnabled) await this.assertNoOpenTransitEscape(context, { noteId });
             throw gaslessError(state.policy.escapesEnabled ? 'escape_already_sponsored' : 'escapes_disabled', { noteId },
                 state.policy.escapesEnabled ? 'An escape of this balance was already sponsored once, or this transit account still has an open sponsored escape.' : null);
         }
@@ -3934,6 +3991,7 @@ class ZkapiClient extends EventTarget {
         });
         if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
         context.state = preflight.state;
+        if (kind === KIND.escape) await this.assertNoOpenTransitEscape(context, { noteId });
 
         const withdrawal = { phase: 'prepared', mode, noteId, destination: S, payout, feePayer: 'payout', transit: context.transit };
         let plan;
@@ -3992,6 +4050,7 @@ class ZkapiClient extends EventTarget {
                     preflight = await this.gaslessPreflight(context, { kind, key: attemptsKey(KIND.escape, { noteId }) });
                     if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
                     context.state = preflight.state;
+                    await this.assertNoOpenTransitEscape(context, { noteId });
                 }
                 const knownHash = plan.transactionHash || null;
                 this.rememberWithdrawal({ ...withdrawal, phase: knownHash ? 'submitted' : 'prepared', transactionHash: knownHash,

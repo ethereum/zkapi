@@ -2565,3 +2565,47 @@ test('with escapes disabled, a direct escape started from the wallet is finalize
     // Its finalization cannot be sponsored: the record has no transit account.
     await assert.rejects(client.finalizeEscape(started.recordId, () => {}, { fees: 'payout' }), { code: 'gasless_plan_mismatch' });
 });
+
+test('one open sponsored escape per transit account: a second escape to the same payout address is refused before any proof; closes from it are not', async () => {
+    // The paymaster records an escape of note 99 from S that is still pending.
+    const pending = await scenario();
+    pending.chain.noteStatus(99, 2);
+    pending.chain.setPending(99, { nullifier: 0x99n, finalBalance: 1_000n, destination: pending.S, challengeDeadline: BigInt(Math.floor(Date.now() / 1_000) + 3_600),
+        stateBalance: 1_000n, conceded: 0n, nextNullifier: 0x9an });
+    pending.chain.paymasterState.escapeNotePlusOne.set(pending.S, 100n);
+    await assert.rejects(pending.withdraw('escape'), error => error.code === 'transit_escape_pending' && error.data.source === 'paymaster'
+        && error.data.noteId === 99 && error.data.status === 'pending' && low(error.data.transitAccount) === low(pending.S));
+    assert.equal(proofs(pending.h, 'escape').length, 0, 'refused before the proof binds S');
+    assert.equal(pending.wallet.signatures.length, 0);
+    // Finalized by a third party, its payout still in S: still open.
+    pending.chain.noteStatus(99, 3);
+    pending.chain.vaultState.pending.delete(99);
+    pending.chain.setBalance(pending.S, wei(1_000));
+    await assert.rejects(pending.withdraw('escape'), error => error.code === 'transit_escape_pending' && error.data.status === 'payout_waiting'
+        && error.data.transitBalanceWei === wei(1_000).toString());
+    assert.equal(proofs(pending.h, 'escape').length, 0);
+    // A close from the same S is sponsored all the same (no initCode once S exists).
+    pending.bundler.autoMine = pending.closeBundle();
+    const closed = await within(5_000, pending.withdraw('mutual'), 'a close beside an open escape');
+    assert.equal(closed.status, 'closed');
+    assert.equal(low(pending.bundler.sent.at(-1).op.sender), low(pending.S));
+
+    // Settled (S emptied): the next escape passes this check and is proved.
+    const settled = await scenario();
+    settled.chain.noteStatus(99, 3);
+    settled.chain.paymasterState.escapeNotePlusOne.set(settled.S, 100n);
+    settled.bundler.autoMine = () => ({ success: false, revert: '0x' });
+    await settled.withdraw('escape').catch(() => null);
+    assert.equal(proofs(settled.h, 'escape').length, 1, 'a settled escape of S does not refuse the next one');
+
+    // This browser's own record of an escape of note 6 from S, pending on
+    // chain although the read RPC shows no paymaster record yet.
+    const local = await scenario();
+    await store.putBrowserWithdrawal({ recordId: 'escape-6', deploymentId: DEPLOYMENT, chainId: CHAIN_ID, contractAddress: VAULT, noteId: 6, mode: 'escape',
+        phase: 'pending', destination: local.S, feePayer: 'payout', payout: PAYEE, transit: { account: local.S, owner: low(OWNER), payee: PAYEE },
+        userOpHash: `0x${'ab'.repeat(32)}`, finalBalance: 1_000, challengeDeadline: Math.floor(Date.now() / 1_000) + 3_600, createdAt: Date.now() });
+    await runtime.reload();
+    await assert.rejects(local.withdraw('escape'), error => error.code === 'transit_escape_pending' && error.data.source === 'record'
+        && error.data.noteId === 6 && error.data.recordId === 'escape-6');
+    assert.equal(proofs(local.h, 'escape').length, 0);
+});

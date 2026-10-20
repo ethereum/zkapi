@@ -782,14 +782,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		proofDestination := ""
 		payeeHasCode := false
 		if options.Fees == "payout" {
-			if payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindClose, wallet.Note.Balance, destination); err != nil {
-				return status, err
-			}
-			profile, _, err := h.gaslessProfile()
-			if err != nil {
-				return status, err
-			}
-			if transit, err = h.newTransit(ctx, config, profile, destination); err != nil {
+			if transit, payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindClose, wallet.Note.Balance, destination, record); err != nil {
 				return status, err
 			}
 			proofDestination = transit.Account

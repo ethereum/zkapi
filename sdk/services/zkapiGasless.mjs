@@ -118,6 +118,7 @@ export const GASLESS_MESSAGES = Object.freeze({
     gasless_op_pending: 'The sponsored operation is not included yet. It stays journaled and is checked in the background.',
     max_cost_above_policy: 'The sponsored operation would cost more than the paymaster’s policy allows at the current fees. Try again at a lower fee, or pay the fee from a wallet.',
     escape_already_sponsored: 'An escape of this balance was already sponsored once, or this transit account still has an open sponsored escape.',
+    transit_escape_pending: 'This payout address’s transit account already carries a sponsored escape that is not settled, and the paymaster sponsors one open escape per transit account. Finalize that escape (and collect its payout) first, or start this escape with the fee paid from a wallet.',
     payout_credited: 'The payout address did not accept the payment. The paymaster holds it; anyone can deliver it with claimGaslessCredit once the address accepts ETH.'
 });
 
@@ -344,6 +345,110 @@ export function transitInitCode({ factory, owner, payee }) {
         if (!ADDRESS.test(value || '')) throw new TypeError(`The transit account's ${label} is not an address.`);
     }
     return `0x${strip(factory).toLowerCase()}${GASLESS_ABI.createAccount}${word(owner)}${word(payee)}`;
+}
+
+// ---------------------------------------------------------------- the transit owner key
+//
+// The browser flow needs no owner derivation: the connected account owns S
+// (owner = from) and signs its operations with personal_sign, so S is
+// already one account per (connected account, payout address) and every
+// later withdrawal of that account to that payout address reuses it, with
+// initCode only while S has no code. zkapi-clientd, which signs with a key
+// of its own, derives that key per payout address from its payment key with
+// the derivation below. It is exported for a host that signs locally the
+// same way (a headless agent answering personal_sign from a seed), and is
+// byte-for-byte clientd's deriveTransitOwnerKey:
+// zkapi-clientd/internal/zkapi/testdata/transit-owner-vectors.json is the
+// table both assert.
+//
+//   PRK     = HKDF-Extract(SHA-256, salt = "zkapi/transit-owner/v1", IKM = seed)
+//   info(c) = uint256(chainId) ‖ entryPoint ‖ vault ‖ factory ‖ paymaster ‖
+//             keccak256(accountCreationCode) ‖ payee ‖ uint32(c)   (168 bytes, big-endian)
+//   key     = HKDF-Expand(SHA-256, PRK, info(c), 32) for the first c = 0, 1, …
+//             whose value is in [1, n − 1] (n the secp256k1 order)
+
+/** The name a record journals for this derivation (zkapi-clientd's transit.owner_derivation). */
+export const TRANSIT_OWNER_DERIVATION = 'hkdf-sha256/zkapi-transit-owner-v1';
+/** The HKDF salt of the owner derivation: its domain tag. */
+export const TRANSIT_OWNER_SALT = 'zkapi/transit-owner/v1';
+const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const TRANSIT_OWNER_MAX_COUNTER = 256;
+
+/**
+ * The HKDF info of counter `counter`: everything S's address commits to
+ * besides its owner (chain, EntryPoint, vault, factory, paymaster, the
+ * creation code's keccak256, payee), then the counter. 168 bytes.
+ */
+export function transitOwnerInfo({ chainId, entryPoint, vault, factory, paymaster, accountCreationCodeKeccak256, payee }, counter = 0) {
+    for (const [label, value] of [['entryPoint', entryPoint], ['vault', vault], ['factory', factory], ['paymaster', paymaster], ['payee', payee]]) {
+        if (!ADDRESS.test(value || '')) throw new TypeError(`The transit owner derivation's ${label} is not an address.`);
+    }
+    if (!WORD.test(accountCreationCodeKeccak256 || '')) throw new TypeError('The transit owner derivation needs the creation code\'s keccak256.');
+    if (!Number.isInteger(counter) || counter < 0 || counter > 0xffffffff) throw new RangeError('The derivation counter is not a uint32.');
+    const chain = toBigInt(chainId, 'chainId');
+    if (chain >= 1n << 256n) throw new RangeError('The chain ID is above 2^256.');
+    const hex = `${word(chain)}${[entryPoint, vault, factory, paymaster].map(value => strip(value)).join('')}`
+        + `${strip(accountCreationCodeKeccak256)}${strip(payee)}${counter.toString(16).padStart(8, '0')}`;
+    return hexBytes(`0x${hex.toLowerCase()}`);
+}
+
+/** HKDF-SHA256 with one 32-byte output, through Web Crypto (browsers and Node). */
+async function hkdfSha256(seed, info) {
+    const subtle = globalThis.crypto?.subtle;
+    if (!subtle) throw new Error('This environment has no Web Crypto for the transit owner derivation.');
+    const key = await subtle.importKey('raw', seed, 'HKDF', false, ['deriveBits']);
+    const bits = await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new TextEncoder().encode(TRANSIT_OWNER_SALT), info }, key, 256);
+    return new Uint8Array(bits);
+}
+
+/**
+ * The owner key zkapi-clientd derives for a transit account: `seed` (bytes,
+ * or 0x hex; at least 32 bytes) and the scope of transitOwnerInfo. Returns
+ * `{ privateKey, counter }`, the key as 0x hex. `derive(seed, info)` replaces
+ * the HKDF (tests use it to reach the resampling).
+ */
+export async function deriveTransitOwnerKey(seed, scope, { derive = hkdfSha256 } = {}) {
+    const bytes = typeof seed === 'string' ? (HEX.test(seed) ? hexBytes(seed) : null) : seed instanceof Uint8Array ? seed : null;
+    if (!bytes || bytes.length < 32) throw new TypeError('The transit owner derivation needs a seed of at least 32 bytes.');
+    for (let counter = 0; counter < TRANSIT_OWNER_MAX_COUNTER; counter += 1) {
+        const okm = await derive(bytes, transitOwnerInfo(scope, counter));
+        if (!(okm instanceof Uint8Array) || okm.length !== 32) throw new Error('The transit owner derivation returned no 32-byte key.');
+        const hex = Array.from(okm, byte => byte.toString(16).padStart(2, '0')).join('');
+        const scalar = BigInt(`0x${hex}`);
+        if (scalar >= 1n && scalar < SECP256K1_N) return { privateKey: `0x${hex}`, counter };
+    }
+    throw new Error('The transit owner derivation found no valid key.');
+}
+
+// ---------------------------------------------------------------- one open escape per transit account
+
+/**
+ * A withdrawal record of this browser that holds an open sponsored escape of
+ * another note from transit account `account`, or null. The paymaster keeps
+ * one open sponsored escape per S (escapeNotePlusOne(S), the evidence a
+ * FORWARD of that escape's payout needs) and refuses a second sponsored
+ * ESCAPE from S (EscapeEvidencePending; within one bundle its transient
+ * per-S lock) while the recorded note is pending or closed with S holding
+ * its payout. Every withdrawal of one connected account to one payout
+ * address shares S, so before a sponsored escape is proved the client looks
+ * here (an escape this browser recorded but the read RPC may not show yet)
+ * and at the paymaster (openTransitEscape in the client). Open: the escape
+ * was sponsored (an initiation operation hash) and is pending on chain, or
+ * its payout waits in S, or one of its sponsored operations is in flight.
+ */
+export function openSponsoredEscapeRecord(records, { account, noteId = null } = {}) {
+    if (!ADDRESS.test(account || '')) return null;
+    const inFlight = phase => phase === 'op_built' || phase === 'op_submitted';
+    for (const record of records || []) {
+        if (record?.feePayer !== 'payout' || record.mode !== 'escape' || !record.userOpHash) continue;
+        if (String(record.transit?.account || '').toLowerCase() !== account.toLowerCase()) continue;
+        if (noteId != null && Number(record.noteId) === Number(noteId)) continue;
+        if (record.phase === 'pending' || record.fundsWaitingInTransit === true
+            || inFlight(record.finalizeUserOpPhase) || inFlight(record.forwardUserOpPhase)) {
+            return record;
+        }
+    }
+    return null;
 }
 
 /** The paymaster's attempt key of a sponsorship: keccak256(abi.encode("close", n)) etc. */

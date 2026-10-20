@@ -686,7 +686,8 @@ a refusal (`gasless_unavailable`, `bundler_unavailable`, `sponsorship_paused`,
 `exits_paused`, `payout_below_gas`, `gasless_uneconomic` — the fee would take
 more than the deployment's uneconomic fraction, 25%, of the payout, unless
 `--allow-expensive-gas` — `gas_above_paymaster_ceiling`, `paymaster_underfunded`,
-`gasless_attempts_exhausted`) disables only `--fees payout`; deposits and
+`gasless_attempts_exhausted`, and for an escape `transit_escape_pending`,
+below) disables only `--fees payout`; deposits and
 wallet-paid exits are unaffected. A payout address the transit account's
 factory never accepts as a payee (the vault, the EntryPoint, the withdrawal
 paymaster or the withdrawal account factory of the deployment) is refused with
@@ -694,11 +695,31 @@ paymaster or the withdrawal account factory of the deployment) is refused with
 could never be created, so neither a sponsored operation nor `--sweep` could
 deliver the payout.
 
-A fresh owner key is generated for every withdrawal and saved, hex-encoded, in
-the mode-0600 payment journal (`transit.owner_key`); the funding key never owns
-a transit account. The transit account `S` is `CREATE2(factory, 0,
-creationCode ‖ abi.encode(entryPoint, vault, paymaster, owner, destination))`,
-cross-checked with the factory's `getAddress`; the companion prepares the
+The transit account's owner key is derived per destination from the local
+payment key (the funding key itself never owns a transit account), so every
+gasless withdrawal of this wallet to one destination uses one transit
+account: the first one's operation creates `S` through its `initCode`, every
+later one finds `S`'s code and carries no `initCode` (it saves `S`'s creation,
+about 89,000 gas on mainnet, and is checked under the paymaster's lower
+verification floor without `initCode`). The derivation is HKDF-SHA256 with the
+32 bytes of the payment key as input key material, the salt
+`zkapi/transit-owner/v1` and as info the chain ID (32 bytes, big-endian), the
+EntryPoint, vault, factory and paymaster addresses (20 bytes each), the
+keccak-256 of the account creation code, the destination (20 bytes) and a
+4-byte big-endian counter; the 32-byte output is the key, unless it is 0 or
+not below the secp256k1 order, in which case the counter is raised (this
+happens with probability about 2^-128). Another deployment, paymaster or
+destination therefore gets an unrelated key, and the owner addresses on chain
+cannot be linked to each other or to the payment key. The key is still saved,
+hex-encoded, in the mode-0600 payment journal (`transit.owner_key`, with
+`transit.owner_derivation` naming the derivation), and is checked against
+the derivation on every load; records of earlier builds, whose owner key was
+drawn at random for one withdrawal and has no `owner_derivation`, keep
+working from their journaled key. The transit account `S` is
+`CREATE2(factory, 0, creationCode ‖ abi.encode(entryPoint, vault, paymaster,
+owner, destination))`, cross-checked with the factory's `getAddress`; the
+pre-proof fee check prices the operation with `initCode` only while `S` has
+no code and deducts what `S` still owes; the companion prepares the
 proof with `S` as its destination (`proof_destination` in the journal, while
 `destination` stays the payout address), so nothing after proving can change
 where the money goes. The quote shows the payout, the most the fee can take
@@ -861,7 +882,18 @@ finalization from the transit account (the sponsored path takes over a
 wallet-paid escape bound to the transit account whenever none of its
 transactions is pending). When a sponsored finalization would be refused too,
 nothing is reserved and the refusal names only `--fees wallet`: that escape
-is bound to the payout address and its finalization is wallet-paid as well. Phases: `op_built`/`op_submitted` →
+is bound to the payout address and its finalization is wallet-paid as well.
+The paymaster keeps one open sponsored escape per transit account (its
+record is the evidence a sponsored forward of that escape's payout needs),
+and since every escape of this wallet to one destination uses one transit
+account, a sponsored escape is refused before anything is reserved or proved
+(`transit_escape_pending`) while the paymaster records an earlier sponsored
+escape from it that is still pending, or finalized with its payout still in
+the transit account: rerun once that escape is finalized and its payout
+delivered (a sponsored close to the same destination delivers it too, as
+does the permissionless sweep of the transit account), or escape with
+`--fees wallet`, bound to the payout address. Sponsored closes from one
+transit account are never refused this way. Phases: `op_built`/`op_submitted` →
 `escape_pending` → `escape_initiated` → `finalize_op_built` /
 `finalize_op_submitted` → `finalize_pending` → `complete`. When someone else
 finalized the escape (the vault paid the transit account), the same

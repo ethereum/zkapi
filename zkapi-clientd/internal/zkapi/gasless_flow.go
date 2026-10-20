@@ -19,10 +19,11 @@ import (
 
 // The gasless withdrawal flow of design section 3.3: a withdrawal whose
 // network fee is paid from the payout. The proof binds a transit account S
-// (a fresh owner key per withdrawal and the payout address Y); the exit is
-// carried by a user operation the paymaster sponsors; the record journals
-// the owner key and every operation before it is sent, and a resume follows
-// the operation on the bundler and, authoritatively, on chain.
+// (an owner key derived per payout address from the local payment key, and
+// the payout address Y, so every exit of this wallet to Y reuses one S); the
+// exit is carried by a user operation the paymaster sponsors; the record
+// journals the owner key and every operation before it is sent, and a resume
+// follows the operation on the bundler and, authoritatively, on chain.
 
 // addressWithdrawalOptions are the per-request choices of a withdrawal
 // command (the CLI's --fees, --fee-cap-gwei, --bundler-url,
@@ -61,8 +62,13 @@ func WithWithdrawalOptions(ctx context.Context, options addressWithdrawalOptions
 }
 
 // addressTransit is the transit account S of a gasless withdrawal: the
-// pinned contracts it was derived from, its owner key (fresh per
-// withdrawal, never the funding key) and the payout address it binds.
+// pinned contracts it was derived from, its owner key (never the funding key
+// itself) and the payout address it binds. OwnerDerivation names how the
+// owner key was made: transitOwnerDerivationV1 (derived per payout address
+// from the funding key, deriveTransitOwnerKey) for records of this build,
+// empty for records of earlier builds, whose owner key was drawn at random
+// for that one withdrawal and exists only as journaled here. Both are read
+// and recovered the same way (transitOwnerKey).
 type addressTransit struct {
 	Factory            string `json:"factory"`
 	Paymaster          string `json:"paymaster"`
@@ -70,6 +76,7 @@ type addressTransit struct {
 	Account            string `json:"account"`
 	Owner              string `json:"owner"`
 	OwnerKey           string `json:"owner_key"`
+	OwnerDerivation    string `json:"owner_derivation,omitempty"`
 	CreationCodeKeccak string `json:"creation_code_keccak256"`
 }
 
@@ -284,16 +291,43 @@ func checkGaslessPayee(profile gaslessProfile, vault, payee string) error {
 	return nil
 }
 
-// newTransit derives a transit account for the payout address: a fresh
-// owner key, S by CREATE2 from the profile's creation code, cross-checked
-// with the factory's getAddress through the read RPC.
-func (h *FundingHandler) newTransit(ctx context.Context, config fundingConfig, profile gaslessProfile, payee string) (*addressTransit, error) {
+// transitOwnerScopeOf is the derivation scope of a transit account for payee
+// under the given contracts on the funding chain.
+func transitOwnerScopeOf(chainID uint64, vault, entryPoint, factory, paymaster, creationCodeKeccak, payee string) transitOwnerScope {
+	return transitOwnerScope{
+		ChainID: chainID, EntryPoint: common.HexToAddress(entryPoint), Vault: common.HexToAddress(vault), Factory: common.HexToAddress(factory),
+		Paymaster: common.HexToAddress(paymaster), CreationCodeHash: common.HexToHash(creationCodeKeccak), Payee: common.HexToAddress(payee),
+	}
+}
+
+// fundingSeed is the derivation seed of the transit owner keys: the 32 bytes
+// of the local payment key.
+func fundingSeed(record *addressFundingRecord) ([]byte, error) {
+	seed, err := hex.DecodeString(strings.TrimPrefix(record.PrivateKey, "0x"))
+	if err != nil || len(seed) != 32 {
+		return nil, errors.New("invalid saved payment key; preserve its recovery file")
+	}
+	return seed, nil
+}
+
+// newTransit derives the transit account of the payout address under the
+// profile's contracts: the owner key derived from the local payment key for
+// this payee (deriveTransitOwnerKey, the same key and so the same S for
+// every withdrawal of this wallet to payee), S by CREATE2 from the profile's
+// creation code, cross-checked with the factory's getAddress through the
+// read RPC. S may exist already (an earlier withdrawal to payee created it):
+// the operation then carries no initCode (buildGaslessOp reads its code).
+func (h *FundingHandler) newTransit(ctx context.Context, config fundingConfig, profile gaslessProfile, payee string, record *addressFundingRecord) (*addressTransit, error) {
 	if err := checkGaslessPayee(profile, config.Contract, payee); err != nil {
 		return nil, err
 	}
-	key, err := crypto.GenerateKey()
+	seed, err := fundingSeed(record)
 	if err != nil {
-		return nil, errors.New("cannot generate the transit account's owner key")
+		return nil, err
+	}
+	key, _, err := deriveTransitOwnerKey(seed, transitOwnerScopeOf(config.ChainID, config.Contract, profile.EntryPoint, profile.Factory, profile.Paymaster, profile.AccountCreationCodeHash, payee))
+	if err != nil {
+		return nil, err
 	}
 	owner := crypto.PubkeyToAddress(key.PublicKey)
 	creation, _ := hex.DecodeString(strings.TrimPrefix(profile.AccountCreationCode, "0x"))
@@ -305,7 +339,7 @@ func (h *FundingHandler) newTransit(ctx context.Context, config fundingConfig, p
 	if !isHex(derived, 32) || !strings.EqualFold(derived[2:], addressABIWord(strings.ToLower(account.Hex()))) {
 		return nil, fmt.Errorf("%w: the factory derives another transit account than this client (gasless_deployment_mismatch)", errGaslessUnavailable)
 	}
-	return &addressTransit{Factory: common.HexToAddress(profile.Factory).Hex(), Paymaster: common.HexToAddress(profile.Paymaster).Hex(), EntryPoint: common.HexToAddress(profile.EntryPoint).Hex(), Account: account.Hex(), Owner: owner.Hex(), OwnerKey: hex.EncodeToString(crypto.FromECDSA(key)), CreationCodeKeccak: profile.AccountCreationCodeHash}, nil
+	return &addressTransit{Factory: common.HexToAddress(profile.Factory).Hex(), Paymaster: common.HexToAddress(profile.Paymaster).Hex(), EntryPoint: common.HexToAddress(profile.EntryPoint).Hex(), Account: account.Hex(), Owner: owner.Hex(), OwnerKey: hex.EncodeToString(crypto.FromECDSA(key)), OwnerDerivation: transitOwnerDerivationV1, CreationCodeKeccak: profile.AccountCreationCodeHash}, nil
 }
 
 // GaslessRecordNotPinned is the refusal of a sponsored operation (a
@@ -411,13 +445,46 @@ func releasedOperationReason(w *addressWithdrawalRecord) string {
 }
 
 // transitOwnerKey is the record's transit owner key, checked against its
-// journaled owner and the proof's destination.
-func transitOwnerKey(w *addressWithdrawalRecord) (*ecdsa.PrivateKey, error) {
-	key, err := crypto.HexToECDSA(w.Transit.OwnerKey)
-	if err != nil || !strings.EqualFold(crypto.PubkeyToAddress(key.PublicKey).Hex(), w.Transit.Owner) {
+// journaled owner and the proof's destination. A record of an earlier build
+// (no owner_derivation) holds a random key that exists only as journaled. A
+// derived key (owner_derivation transitOwnerDerivationV1) is derived again
+// from the local payment key and the journaled contracts and payout address
+// (never the current profile's, so recovery survives the profile's
+// retirement of its gasless pins): a journaled copy must equal it, and a
+// record whose copy is missing recovers from the payment key alone.
+func transitOwnerKey(record *addressFundingRecord) (*ecdsa.PrivateKey, error) {
+	w := record.Withdrawal
+	t := w.Transit
+	var key *ecdsa.PrivateKey
+	switch t.OwnerDerivation {
+	case "":
+		parsed, err := crypto.HexToECDSA(t.OwnerKey)
+		if err != nil {
+			return nil, errors.New("the saved transit owner key is invalid; preserve the recovery file")
+		}
+		key = parsed
+	case transitOwnerDerivationV1:
+		seed, err := fundingSeed(record)
+		if err != nil {
+			return nil, err
+		}
+		derived, _, err := deriveTransitOwnerKey(seed, transitOwnerScopeOf(record.ChainID, record.Contract, t.EntryPoint, t.Factory, t.Paymaster, t.CreationCodeKeccak, w.Destination))
+		if err != nil {
+			return nil, err
+		}
+		if t.OwnerKey != "" {
+			if parsed, err := crypto.HexToECDSA(t.OwnerKey); err != nil || parsed.D.Cmp(derived.D) != 0 {
+				return nil, errors.New("the saved transit owner key is not the one derived from the payment key for its payout address; preserve the recovery file")
+			}
+		}
+		key = derived
+	default:
+		return nil, errors.New("the saved transit owner key was made by an unknown derivation; preserve the recovery file and update zkapi-clientd")
+	}
+	if !strings.EqualFold(crypto.PubkeyToAddress(key.PublicKey).Hex(), t.Owner) {
 		return nil, errors.New("the saved transit owner key is invalid; preserve the recovery file")
 	}
-	if !strings.EqualFold(w.ProofDestination, w.Transit.Account) {
+	if !strings.EqualFold(w.ProofDestination, t.Account) {
 		return nil, errors.New("the saved transit account is not the one derived from its owner and payout address; preserve the recovery file")
 	}
 	return key, nil
@@ -444,7 +511,7 @@ func (h *FundingHandler) journaledEnvironment(ctx context.Context, config fundin
 			return nil, errors.New("the saved transit account names an invalid contract or account address; preserve the recovery file")
 		}
 	}
-	key, err := transitOwnerKey(w)
+	key, err := transitOwnerKey(record)
 	if err != nil {
 		return nil, err
 	}
@@ -521,7 +588,7 @@ func (h *FundingHandler) gaslessEnvironment(ctx context.Context, config fundingC
 	if err != nil {
 		return nil, err
 	}
-	key, err := transitOwnerKey(w)
+	key, err := transitOwnerKey(record)
 	if err != nil {
 		return nil, err
 	}
@@ -1018,6 +1085,9 @@ func (h *FundingHandler) crossCheckQuote(ctx context.Context, env *gaslessEnviro
 		return refuse("gasless_attempts_exhausted", "this state used its sponsored attempts; use --fees wallet")
 	}
 	if kind == gaslessKindEscape && words[5].Sign() == 0 {
+		if err := h.checkTransitEscape(ctx, env); err != nil {
+			return err
+		}
 		return refuse("escapes_disabled", "the paymaster will not sponsor this escape (escapes disabled, the note already sponsored, or an open sponsored escape of this transit account); use --fees wallet")
 	}
 	return nil
@@ -1087,7 +1157,9 @@ func refusalOfFailure(f aaFailure) error {
 		return refuse("exits_paused", "the vault is paused; rerun once exits reopen")
 	case "FeeAboveCeiling":
 		return refuse("gas_above_paymaster_ceiling", "the operation's fees are above the paymaster's ceilings; request a fresh quote")
-	case "EscapesDisabled", "EscapeAlreadySponsored", "EscapeEvidencePending":
+	case "EscapeEvidencePending":
+		return refuse(GaslessTransitEscapePending, "the paymaster will not sponsor this escape while an earlier sponsored escape from the same transit account is open (%s); rerun once it is settled, or escape with --fees wallet", f.Inner)
+	case "EscapesDisabled", "EscapeAlreadySponsored":
 		return refuse("escapes_disabled", "the paymaster will not sponsor this escape (%s); initiate it with --fees wallet", f.Inner)
 	case "NoteNotActive", "NullifierUsed", "NotPendingEscape":
 		return refuse("note_closed", "the vault no longer accepts this exit (%s): the note may have been closed by another transaction, with the payout in the transit account; run withdraw --collect", f.Inner)
@@ -2385,41 +2457,114 @@ func (h *FundingHandler) gaslessPreflight(ctx context.Context, config fundingCon
 	return live, env, nil
 }
 
-// gaslessPrepareCheck is the pre-proof amount check: the current private
-// balance must cover the sponsored fee at the current fees, so nothing is
-// reserved for a payout the fee would eat. It reports whether the payout
-// address has code (design 3.1's advisory: the push may fail and the
-// payout be credited), read before the transit account is derived.
-func (h *FundingHandler) gaslessPrepareCheck(ctx context.Context, config fundingConfig, options addressWithdrawalOptions, kind uint8, balanceUnits uint64, payee string) (payeeHasCode bool, err error) {
+// gaslessPrepareCheck is the pre-proof check: it derives the payout
+// address's transit account S (newTransit) and checks that the current
+// private balance covers the sponsored fee at the current fees, of the
+// operation the proof will be carried by as the client will build it (with
+// initCode only while S has no code: a later withdrawal to the same payout
+// address reuses S) and with what S owes already, so nothing is reserved for
+// a payout the fee would eat. For an escape it also refuses a second
+// sponsored escape from S while S's first one is open (checkTransitEscape).
+// It returns S and whether the payout address has code (design 3.1's
+// advisory: the push may fail and the payout be credited).
+func (h *FundingHandler) gaslessPrepareCheck(ctx context.Context, config fundingConfig, options addressWithdrawalOptions, kind uint8, balanceUnits uint64, payee string, record *addressFundingRecord) (transit *addressTransit, payeeHasCode bool, err error) {
 	profile, _, err := h.gaslessProfile()
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if err := checkGaslessPayee(profile, config.Contract, payee); err != nil {
-		return false, err
+		return nil, false, err
 	}
 	live, env, err := h.gaslessPreflight(ctx, config, options, kind)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
-	env.payee = common.HexToAddress(payee)
+	if transit, err = h.newTransit(ctx, config, profile, payee, record); err != nil {
+		return nil, false, err
+	}
+	env.payee, env.account, env.owner = common.HexToAddress(payee), common.HexToAddress(transit.Account), common.HexToAddress(transit.Owner)
+	if kind == gaslessKindEscape {
+		if err := h.checkTransitEscape(ctx, env); err != nil {
+			return nil, false, err
+		}
+	}
+	var code string
+	if err := h.addressRPC(ctx, env.config, "eth_getCode", []any{env.account.Hex(), "latest"}, &code); err != nil {
+		return nil, false, err
+	}
+	if live.Owed, err = h.gaslessWord(ctx, env, env.paymaster, "0x"+selectorOwed+addressABIWord(strings.ToLower(env.account.Hex()))); err != nil {
+		return nil, false, err
+	}
 	maxFee, priority, err := h.gaslessFees(ctx, env, live)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	g := env.profile.GasPolicy
-	// The operation the proof will be carried by, as the client builds it
-	// (a new transit account, so initCode), its preVerificationGas the
-	// shared rule's on its worst-case calldata.
-	op := gaslessShapeOp(g, kind, true, env.paymaster, live.FlatFee, live.CallCap)
+	// The operation the proof will be carried by, as the client builds it,
+	// its preVerificationGas the shared rule's on its worst-case calldata.
+	op := gaslessShapeOp(g, kind, code == "0x" || code == "", env.paymaster, live.FlatFee, live.CallCap)
 	op.MaxFeePerGas, op.MaxPriorityFeePerGas = maxFee, priority
 	payout := new(big.Int).Mul(new(big.Int).SetUint64(balanceUnits), big.NewInt(1_000_000_000))
 	hasCode, isEmpty, err := h.payeeState(ctx, env)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
-	live.Owed = new(big.Int)
-	return hasCode, checkGaslessAmounts(gaslessAmountsFor(kind, payout, op, live, g, hasCode, isEmpty), kind, live, uint64(env.profile.UneconomicFractionPercent), options)
+	if err := checkGaslessAmounts(gaslessAmountsFor(kind, payout, op, live, g, hasCode, isEmpty), kind, live, uint64(env.profile.UneconomicFractionPercent), options); err != nil {
+		return nil, hasCode, err
+	}
+	return transit, hasCode, nil
+}
+
+// GaslessTransitEscapePending is the refusal of a sponsored escape from a
+// transit account whose earlier sponsored escape is still open. The
+// paymaster keeps one open sponsored-escape record per transit account
+// (escapeNotePlusOne(S): the evidence its FORWARD of that escape's payout
+// needs) and refuses a second sponsored ESCAPE from S (EscapeEvidencePending)
+// while the recorded note is pending, or closed with S still holding a
+// balance; within one bundle its transient per-S escape lock refuses the
+// second one too. Since every withdrawal of a wallet to one payout address
+// reuses one S, a second note escaping to the same payout address meets
+// this: it is refused before anything is reserved or proved, with the
+// wallet-paid escape (bound to the payout address, no transit account) and
+// waiting for the earlier escape to settle as the ways forward. Closes are
+// unaffected: the paymaster sponsors any number of them from one S.
+const GaslessTransitEscapePending = "transit_escape_pending"
+
+// checkTransitEscape refuses a sponsored escape from env.account while the
+// paymaster records an open sponsored escape of S, read as the paymaster's
+// _openEscape reads it: escapeNotePlusOne(S) names a note that is pending,
+// or closed with S's balance nonzero (its payout waits for a forward). The
+// wallet's own records need no separate check: it holds one withdrawal
+// record at a time, so an earlier escape of this wallet from S is either
+// complete or retired by a later deposit, and only the paymaster's record of
+// it can still be open (with its payout waiting in S, which a sponsored
+// close from S also delivers to the payout address).
+func (h *FundingHandler) checkTransitEscape(ctx context.Context, env *gaslessEnvironment) error {
+	recorded, err := h.gaslessWord(ctx, env, env.paymaster, "0x"+selectorEscapeNotePlusOne+addressABIWord(strings.ToLower(env.account.Hex())))
+	if err != nil {
+		return err
+	}
+	if recorded.Sign() == 0 || !recorded.IsUint64() || recorded.Uint64() > 1<<32 {
+		return nil
+	}
+	noteID := uint32(recorded.Uint64() - 1)
+	note, err := h.vaultNote(ctx, env.config, noteID, "latest")
+	if err != nil {
+		return err
+	}
+	switch note.Status {
+	case notePendingWithdrawal:
+		return refuse(GaslessTransitEscapePending, "the transit account %s of this payout address already carries a sponsored escape (note %d) that is pending, and the paymaster sponsors one open escape per transit account; rerun once that escape is finalized, or escape with --fees wallet (paid from the local signing address, straight to the payout address)", env.account.Hex(), noteID)
+	case noteClosed:
+		balance, err := h.addressQuantity(ctx, env.config, "eth_getBalance", []any{env.account.Hex(), "latest"})
+		if err != nil {
+			return err
+		}
+		if balance.Sign() != 0 {
+			return refuse(GaslessTransitEscapePending, "the transit account %s of this payout address still holds the payout of an earlier sponsored escape (note %d), and the paymaster sponsors no new escape from it until that payout is delivered; deliver it (a sponsored close to this payout address does, as does the permissionless sweep of the transit account), or escape with --fees wallet (paid from the local signing address, straight to the payout address)", env.account.Hex(), noteID)
+		}
+	}
+	return nil
 }
 
 // ------------------------------------------------------- resumes and actions

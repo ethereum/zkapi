@@ -143,7 +143,9 @@ To withdraw, run `zkapi-clientd config --menu` and choose `withdraw`. It asks fo
 Where the deployment publishes a gasless withdrawal paymaster, the menu also
 offers to pay the network fee from the payout itself ("no ETH needed"): the
 withdrawal is then carried by an ERC-4337 user operation from a transit
-account bound to your destination, signed with a fresh key per withdrawal and
+account bound to your destination (one per destination: its key is derived
+from this wallet's payment key, so later withdrawals to the same destination
+reuse it and skip its creation) and
 sponsored by the paymaster, which keeps a measured gas charge and pushes the
 rest to the destination. On the command line this is `zkapi-clientd withdraw
 --to ADDRESS --fees payout` (defaults: `config --withdrawal-fees payout

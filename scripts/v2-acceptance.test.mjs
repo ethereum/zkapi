@@ -4,8 +4,8 @@ import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
-    CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, drillTiming, gasLedger, gaslessProfile, localJSON, mockOaOrg,
-    isProfileBundlerUrl, mockProvider, proxyAuthorized, proxyJsonRpc, trustedDeployment,
+    CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, clientdTransitOwner, drillTiming, gasLedger, gaslessProfile, localJSON,
+    mockOaOrg, isProfileBundlerUrl, mockProvider, proxyAuthorized, proxyJsonRpc, transitReuseProblems, trustedDeployment,
 } from './v2-acceptance.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
     accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
@@ -753,4 +753,38 @@ test('mini bundler: estimates answer the profile\'s pinned defaults by kind', as
     assert.equal(vaultCallOf(finalize), `0xff8f5585${word(9)}`);
     assert.equal(sponsoredKind(withdraw(`0xa38d62aa${'00'.repeat(832)}`)), 2);
     assert.equal(vaultCallOf('0x12345678'), null);
+});
+
+// ---------------------------------------------------------------- two closes to one payout address (the harness as zkapi-clientd)
+
+test('the harness derives a clientd transit owner as clientd does (the shared owner-key vectors)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const vectors = JSON.parse(readFileSync(new URL('../zkapi-clientd/internal/zkapi/testdata/transit-owner-vectors.json', import.meta.url), 'utf8'));
+    for (const c of vectors.cases.filter(entry => !entry.reject_counters)) {
+        const gasless = { entry_point_address: c.entry_point, withdrawal_account_factory_address: c.factory,
+            withdrawal_paymaster_address: c.paymaster, account_creation_code_keccak256: c.account_creation_code_keccak256 };
+        const derived = await clientdTransitOwner(c.seed, { chainId: c.chain_id, vault: c.vault, gasless, payee: c.payee });
+        assert.deepEqual(derived, { privateKey: c.owner_private_key, counter: c.counter }, c.name);
+    }
+});
+
+test('transitReuseProblems: the second close to one payout address reuses the first one\'s transit account without initCode', () => {
+    const gasPolicy = { verification_default: 70_000, verification_default_init: 180_000 };
+    const payee = `0x${'9a'.repeat(20)}`;
+    const S = `0x${'5a'.repeat(20)}`;
+    const first = { sender: S, initCode: true, deployed: true, success: true, settledPayee: payee.toUpperCase().replace('0X', '0x'), verificationGasLimit: 180_000n };
+    const second = { sender: S.toUpperCase().replace('0X', '0x'), initCode: false, deployed: false, success: true, settledPayee: payee, verificationGasLimit: 70_000n };
+    assert.deepEqual(transitReuseProblems(first, second, { payee, gasPolicy }), []);
+    const problems = (changes, which = 'second') => transitReuseProblems(which === 'first' ? { ...first, ...changes } : first,
+        which === 'second' ? { ...second, ...changes } : second, { payee, gasPolicy });
+    assert.match(problems({ sender: `0x${'5b'.repeat(20)}` }).join(), /not sent from the first one's transit account/);
+    assert.match(problems({ initCode: true }).join(), /carries initCode/);
+    assert.match(problems({ deployed: true }).join(), /deploys again/);
+    assert.match(problems({ verificationGasLimit: 180_000n }).join(), /second close is not at the verification default without initCode/);
+    assert.match(problems({ success: false }).join(), /second close did not succeed/);
+    assert.match(problems({ settledPayee: `0x${'01'.repeat(20)}` }).join(), /second close was not settled/);
+    assert.match(problems({ initCode: false }, 'first').join(), /first close does not create/);
+    assert.match(problems({ deployed: false }, 'first').join(), /first close does not create/);
+    assert.match(problems({ verificationGasLimit: 70_000n }, 'first').join(), /first close is not at the verification default with initCode/);
+    assert.ok(transitReuseProblems(null, second, { payee, gasPolicy }).length > 0);
 });

@@ -173,9 +173,16 @@ Deposit/withdrawal QR codes are generated locally and contain only public
 payment address, chain and amount. No external QR service receives them.
 A withdrawal fee QR funds the local signing address, never the private payout.
 With `--fees payout` no local signing address pays for the withdrawal and no
-withdrawal fee QR is needed; a fresh owner key per withdrawal signs the
-operation and the payout address appears on chain only as the transit
-account's payee. The bundler (the deployment's, or your own `--bundler-url`)
+withdrawal fee QR is needed; an owner key derived per payout address from
+the payment key signs the operation and the payout address appears on chain
+only as the transit account's payee. Every gasless withdrawal of this wallet
+to one payout address uses the same transit account, so they are visibly
+withdrawals of one wallet: withdrawals to a payout address that others use
+too (an exchange deposit address, for example) can be told apart from other
+users' by their transit account, which a fresh account per withdrawal did
+not reveal. Use `--fees wallet`, or another payout address, where that
+matters. The owner addresses cannot be linked to each other or to the
+payment key. The bundler (the deployment's, or your own `--bundler-url`)
 sees the operation and your client IP before inclusion, as an RPC does.
 
 Waiting for ETH and refreshing quotes do not authorize transactions. For a
