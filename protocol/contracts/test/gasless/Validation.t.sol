@@ -154,7 +154,8 @@ contract ValidationTest is GaslessTestBase {
             address(this),
             _defaultPolicy(),
             MAX_FEE_CEILING,
-            PRIORITY_CEILING
+            PRIORITY_CEILING,
+            ZkApiWithdrawalPaymaster.GasSchedule.Original
         );
     }
 

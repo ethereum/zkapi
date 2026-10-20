@@ -33,6 +33,7 @@ import {
     g1Add,
     g1Mul,
     gasPolicyWords,
+    gasScheduleImmutables,
     gaslessImmutables,
     hexToBytes,
     keccak256,
@@ -437,6 +438,16 @@ function gaslessChain(deployment, latest = 7) {
     };
     return fake;
 }
+
+test('gas schedules are explicit and encoded in the runtime pins', () => {
+    const original = gasScheduleImmutables(0);
+    const sepolia = gasScheduleImmutables(1);
+    assert.equal(BigInt(`0x${original.FRESH_SLOT_GAS_BOUND}`), 25000n);
+    assert.equal(BigInt(`0x${sepolia.FRESH_SLOT_GAS_BOUND}`), 120000n);
+    assert.equal(BigInt(`0x${sepolia.VERIFICATION_FLOOR_INIT}`), 490000n);
+    assert.equal(BigInt(`0x${sepolia.PM_VERIFICATION_FLOOR}`), 496000n);
+    assert.throws(() => gasScheduleImmutables(2), /gasSchedule/);
+});
 
 test('the paymaster, factory and account logic runtime code fills exactly their immutables', { skip: NO_ARTIFACTS }, () => {
     const deployment = gaslessManifest();

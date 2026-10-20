@@ -27,9 +27,8 @@ import {IBn254Poseidon} from "./interfaces/IBn254Poseidon.sol";
 ///      need no Merkle path, no root, no indexer and no logs.
 ///      The request tree (request proofs only) has the notes' leaves in deposit order; the vault
 ///      keeps its frontier and computes currentRoot() on demand, and keeps no root history. The
-///      server admits request proofs at any root it read from the vault within its grace window
-///      (request_root_grace_seconds), so retireClosedLeaf takes effect for new requests at most
-///      that long after it lands.
+///      server grants historical roots a grace window only across additions. On observing a new
+///      retirementEpoch in its next successful pinned-block poll, it discards every older root.
 ///      Ownership transfers are two-step and stay open while paused, for incident key rotation:
 ///      transferOwnership only nominates pendingOwner, and the current owner keeps every power
 ///      (including unpause and replacing the nomination) until the nominee calls acceptOwnership.
@@ -160,6 +159,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     mapping(uint256 => uint256) private _recordedRoots;
     /// @dev The request tree's frontier: see MerkleUpdateLib. Index 0 is unused.
     uint256[32] private _filledSubtrees;
+    /// @notice Changes on every successful leaf removal. Readers discard historical request roots
+    ///         whenever this value changes, reading it at the same block as currentRoot().
+    uint256 public retirementEpoch;
 
     modifier whenNotPaused() {
         if (paused) revert Errors.Paused();
@@ -476,6 +478,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         if (leaf == 0) revert Errors.StaleRoot();
         MerkleUpdateLib.retire(poseidon, _filledSubtrees, nextNoteId, noteId, leaf, siblings);
         _notes[noteId] = _word(0, Types.NoteStatus.Closed);
+        ++retirementEpoch;
         emit ClosedLeafRetired(noteId);
     }
 

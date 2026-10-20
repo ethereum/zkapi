@@ -792,6 +792,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
     }
 
     function test_retireClosedLeafRemovesTheLeafOnce() public {
+        assertEq(vault.retirementEpoch(), 0);
         uint32 a = _deposit(42);
         uint32 b = _deposit(43);
         vault.mutualClose(_close(a, N(2), B2), PROOF);
@@ -809,6 +810,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         vm.prank(address(0xD00D)); // permissionless
         vault.retireClosedLeaf(a, path);
         retired[a] = true;
+        assertEq(vault.retirementEpoch(), 1);
         assertEq(vault.currentRoot(), expected);
         assertNotEq(vault.currentRoot(), oldRoot);
         (uint256 leaf, Types.NoteStatus status) = vault.noteRecord(a);
@@ -820,6 +822,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         path = _path(a);
         vm.expectRevert(Errors.StaleRoot.selector);
         vault.retireClosedLeaf(a, path);
+        assertEq(vault.retirementEpoch(), 1, "reverted retirements do not change the epoch");
         // A deposit and an exit of the other note still work on the new tree.
         _deposit(44);
         vault.mutualClose(_close(b, 9000, DEPOSIT), PROOF);

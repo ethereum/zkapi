@@ -404,10 +404,10 @@ export const ENTRY_POINT_V070_CODEHASH = '0x8db5ff695839d655407cc8490bb7a5d82337
 export const SENDER_CREATOR = '0xefc2c1444ebcc4db75e7613d20c6a62ff67a167c';
 export const SENDER_CREATOR_V070_CODEHASH = '0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689';
 // ZkApiWithdrawalAccountFactory's constants: every transit account's creation code is
-// CREATION_STUB ‖ PROXY_HEAD ‖ <account logic address> ‖ PROXY_TAIL (74 bytes).
-const CREATION_STUB = '600d80380380916000396000f3';
-const PROXY_HEAD = '36600060003760a0603d36396000600060a03601600073';
-const PROXY_TAIL = '5af43d600060003e3d600082603b57fd5bf3';
+// CREATION_STUB ‖ PROXY_HEAD ‖ <account logic address> ‖ PROXY_TAIL (77 bytes).
+const CREATION_STUB = '603560185f39601460b9603539601460d9604939605d5ff3';
+const PROXY_HEAD = '365f5f376028603536395f5f602836015f73';
+const PROXY_TAIL = '5af43d5f5f3e3d5f82603357fd5bf3';
 /// ZkApiWithdrawalPaymaster.GasPolicy after its two uint256[4] arrays (callFloor, callHardCap),
 /// in ABI order; the manifest's paymasterGasPolicy names them the same, with callHardCap as callCap.
 export const GAS_POLICY_SCALARS = Object.freeze([
@@ -434,7 +434,7 @@ export function createAddress(deployer, nonce) {
     return `0x${keccak256(hexToBytes(rlp)).slice(26)}`;
 }
 
-/// The 74-byte creation code of every transit account of a factory whose account logic is at
+/// The 77-byte creation code of every transit account of a factory whose account logic is at
 /// `implementation` (ZkApiWithdrawalAccountFactory.accountCreationCode()).
 export function accountCreationCode(implementation) {
     return `0x${CREATION_STUB}${PROXY_HEAD}${address(implementation, 'implementation').slice(2)}${PROXY_TAIL}`;
@@ -456,6 +456,45 @@ export function gasPolicyWords(policy) {
 /// words, from a manifest's gasless fields; checks the fields against each other first (the logic
 /// is the factory's nonce-1 creation, the creation code is the factory's constants around it, and
 /// its keccak256 is both contracts' accountCreationCodeHash).
+// Constructor-fixed gas budgets, never selected from chainId. Keep in lockstep with the
+// reviewed schedules in ZkApiWithdrawalPaymaster; manifest gas figures are checked separately.
+export function gasScheduleImmutables(schedule = 0) {
+    const choice = uint(schedule, 8, 'gasSchedule');
+    if (choice > 1n) fail('gasSchedule must be Original (0) or Glamsterdam (1)');
+    const budgets = {
+        FRESH_SLOT_GAS_BOUND: [25000, 120000],
+        CALL_FLOOR_CLOSE: [220000, 550000],
+        CALL_FLOOR_ESCAPE: [160000, 800000],
+        CALL_FLOOR_FINALIZE: [200000, 500000],
+        CALL_HARD_CAP_CLOSE: [950000, 1400000],
+        CALL_HARD_CAP_ESCAPE: [1100000, 1800000],
+        CALL_HARD_CAP_FINALIZE: [400000, 750000],
+        POSTOP_FLOOR: [250000, 560000],
+        POSTOP_CAP: [350000, 700000],
+        VERIFICATION_FLOOR: [50000, 140000],
+        VERIFICATION_FLOOR_INIT: [110000, 490000],
+        VERIFICATION_CAP: [400000, 496000],
+        PM_VERIFICATION_FLOOR: [340000, 496000],
+        POSTOP_BASE_GAS: [17000, 23000],
+        POSTOP_ESCAPE_GAS: [71200, 339000],
+        POSTOP_FINALIZE_EXTRA_GAS: [5000, 20000],
+        POSTOP_ESCAPE_FORWARD_GAS: [30000, 145000],
+        POSTOP_ESCAPE_DEPOSIT_GAS: [15000, 9000],
+        EOA_PUSH_GAS: [9100, 11400],
+        NEW_ACCOUNT_GAS: [25000, 183600],
+        CREDIT_GAS: [46000, 223000],
+        ACCOUNT_CALL_OVERHEAD_GAS: [11500, 16000],
+        ACCOUNT_CALL_OVERHEAD_ESCAPE_GAS: [4800, 8000],
+        FAILURE_POSTOP_GAS: [70000, 250000],
+        FAILURE_DEBT_DEPOSIT_GAS: [20000, 30000],
+    };
+    const selected = Object.fromEntries(Object.entries(budgets).map(([name, choices]) => [name, choices[Number(choice)]]));
+    selected.FINALIZE_RESERVE_GAS = 40_000 + selected.VERIFICATION_FLOOR + selected.CALL_FLOOR_FINALIZE
+        + selected.PM_VERIFICATION_FLOOR + selected.POSTOP_FLOOR;
+    return { gasSchedule: word(choice, 'gasSchedule'),
+        ...Object.fromEntries(Object.entries(selected).map(([name, value]) => [name, word(value, name)])) };
+}
+
 export function gaslessImmutables(inputs) {
     const entryPoint = address(inputs.entryPoint, 'entryPoint');
     const vault = address(inputs.vault, 'vault');
@@ -478,6 +517,7 @@ export function gaslessImmutables(inputs) {
     const hashWord = creationHash.slice(2);
     return {
         paymaster: {
+            ...gasScheduleImmutables(inputs.gasSchedule ?? 0),
             entryPoint: word(entryPoint, 'entryPoint'),
             vault: word(vault, 'vault'),
             adapter: word(address(inputs.proofAdapter, 'proofAdapter'), 'proofAdapter'),
@@ -497,7 +537,9 @@ export function gaslessImmutables(inputs) {
             implementation: word(implementation, 'withdrawalAccountImplementation'),
             accountCreationCodeHash: hashWord,
         },
-        implementation: { self: word(implementation, 'withdrawalAccountImplementation') },
+        implementation: { self: word(implementation, 'withdrawalAccountImplementation'),
+            fixedEntryPoint: word(entryPoint, 'entryPoint'), fixedVault: word(vault, 'vault'),
+            fixedPaymaster: word(paymaster, 'withdrawalPaymaster') },
         accountCreationCode: creation,
     };
 }
@@ -654,6 +696,7 @@ export function deploymentInputs(deployment, overrides = {}) {
             nativeAssetWeiPerUnit: deployment.nativeAssetWeiPerUnit,
             accountCreationCode: deployment.accountCreationCode,
             accountCreationCodeKeccak256: deployment.accountCreationCodeKeccak256,
+            gasSchedule: deployment.paymasterGasSchedule ?? 0,
             ...overrides,
         });
     }

@@ -150,7 +150,8 @@ name the runtime contract.
 | `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains, Mainnet included ([Single-party setup](#single-party-setup)). Recorded as `allowDevSetup`; default 0 |
 | `POSEIDON_ADDRESS` | An already deployed `Bn254PoseidonRuntime` to reuse (it holds no state and no address of its own, so one deployment serves every vault on a chain); its runtime code hash must equal `runtime_codehash` in the `poseidon-runtime.json` next to `SETUP_MANIFEST`. Unset deploys a fresh one |
 | `CHAIN_ID` | Optional expected chain ID; a mismatch aborts |
-| `GASLESS` | `1` (default) deploys the gasless-withdrawal paymaster after the vault; `0` skips the block and writes `withdrawalPaymaster: null`. `1` is refused, before anything is broadcast, on a chain that prices a fresh storage slot above 25,000 gas, such as Sepolia today ([gas schedule](#gas-schedule)): deploy there with `GASLESS=0`. A `forge script` dry run without an RPC has no EntryPoint code, so it needs `GASLESS=0`. An Anvil started with a public chain ID (for example Sepolia's 11155111, as the acceptance harness does) is a public chain to the script: it needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI`, or `GASLESS=0` |
+| `PAYMASTER_GAS_SCHEDULE` | `0` (Original, default) or `1` (Glamsterdam/current Sepolia); selected explicitly and probed against the RPC before broadcasting |
+| `GASLESS` | `1` (default) deploys the gasless-withdrawal paymaster after the vault; `0` skips the block and writes `withdrawalPaymaster: null`. `1` requires `PAYMASTER_GAS_SCHEDULE` to match the RPC pricing ([gas schedule](#gas-schedule)); use `1` for current Sepolia and `0` for Original pricing. A `forge script` dry run without an RPC has no EntryPoint code, so it needs `GASLESS=0`. An Anvil started with a public chain ID (for example Sepolia's 11155111, as the acceptance harness does) is a public chain to the script: it needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI`, or `GASLESS=0` |
 | `ENTRY_POINT` | The ERC-4337 EntryPoint v0.7.0; default the canonical `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Its runtime must hash to `0x8db5ff69…fc58`, and the SenderCreator at `0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C` to `0x283c9d14…a7689`; on Anvil etch both first (`cast rpc anvil_setCode` from `protocol/contracts/test/fixtures/*.runtime.hex`, as CI does) |
 | `PAYMASTER_OWNER` | Owner of the paymaster (policy, fee ceilings, call caps, key release, stake and deposit withdrawals); default `OWNER`. When it is not the deployer, the script deploys the paymaster with the deployer as owner (only the owner may set the first stake), stakes and funds it, and nominates `PAYMASTER_OWNER`, which must call `acceptOwnership()` on the paymaster; the manifest records this as `paymasterOwnershipTransferPending` |
 | `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` | EntryPoint stakes of the paymaster and the factory (positive, at most 2^112 - 1). Local chains default to 0.1 ether each; required off local chains. Plan 1 ether each on Mainnet and 0.1 ether on a testnet |
@@ -421,7 +422,7 @@ records the verified exit for the transaction (EIP-1153, at a slot associated
 with the sender), so the vault's verification of the same exit in the
 execution phase is a lookup and a sponsored exit pays for one verification.
 `IZkApiProofAdapter` makes that record part of the interface, and the
-paymaster's CLOSE and ESCAPE call floors (210,000 and 160,000) count on it;
+paymaster's CLOSE and ESCAPE Original call floors (220,000 and 160,000) count on it;
 the constructor can only check the interface, so they hold for the generated
 `Groth16ProofAdapter` the deployment pins by codehash, and pairing the
 paymaster with any other adapter means re-deriving them
@@ -429,46 +430,50 @@ paymaster with any other adapter means re-deriving them
 
 #### Gas schedule
 
-Every gas constant of the paymaster (call, verification and postOp floors and
-caps, the postOp estimates, `NEW_ACCOUNT_GAS`) was measured under EIP-2929
-storage pricing, where a fresh storage slot costs 22,100 gas cold and a new
-account 25,000. EIP-8037 prices state creation instead: about 110,000 per
-fresh slot and 183,600 per new account. No floor, cap or estimate covers that.
-Under that pricing:
+The paymaster has two explicit, immutable policies: `Original` (0), with
+EIP-2929 storage pricing, and `Glamsterdam` (1), measured with real withdrawal
+proofs and canonical EntryPoint v0.7 `eth_call` simulations on Sepolia. Select
+the latter with `PAYMASTER_GAS_SCHEDULE=1`; it is recorded as
+`paymasterGasSchedule` in the deployment manifest. The `gasPolicy()` ABI is
+unchanged, and clients read its limits from the pinned deployment.
 
-- sponsored escapes revert at their floors, at the float's expense;
-- postOps that credit a payout revert at `POSTOP_CAP`;
-- a first use cannot fit `VERIFICATION_CAP`;
-- successful operations are charged less than they cost.
+Glamsterdam prices fresh storage at about 110,000 gas and a new account at
+183,600. Its policy accounts for those charges, including failed payout
+credits, escape debt, reused debt slots, and never-used recipients. Every
+additional fee is capped by the signed maximum. A repeated escape with a
+tiny or partial balance already in its transit account uses a conservative
+debt-slot estimate (about 101,000 gas above measured cost in the live probe),
+within the configured margin plus credit allowance; ordinary close and
+empty-balance escape probes stay within the 15,000-gas margin. Operation-local receipts and
+proof-verification records remain transient. The account proxy stores only
+packed owner/payee addresses (93 bytes); the shared implementation pins the
+EntryPoint, vault and paymaster. Its CREATE2 preimage still uses the published
+creation code followed by the same five ABI-encoded addresses.
 
-Sepolia runs that pricing. In October 2026 a fresh-slot probe measured
-110,027 gas there and 22,107 on mainnet and Hoodi, and the paymaster's
-constructor reverted `UnsupportedGasSchedule(110057)` on Sepolia.
+The paymaster uses 200 optimizer runs to fit EIP-170. Foundry applies that
+profile to its importers and dependencies, so the demo deployment compilation
+unit also produces the vault, adapter, factory and account with 200 runs.
+Always finalize and audit this deployment with `--artifacts demo/contracts/out`;
+the standalone protocol artifacts can contain different compiler profiles.
+Poseidon's separately verified compiler profile is unchanged. Live measurements
+use the actual demo artifacts, with conditions recorded in
+`protocol/contracts/snapshots/sepolia-gasless-gas.json`.
 
-The constructor therefore measures one fresh `SSTORE` and reverts
-`UnsupportedGasSchedule(freshSlotGas)` above `FRESH_SLOT_GAS_BOUND` (25,000).
-Forge simulates a broadcast on its own EVM, whose schedule passes, so
-`Deploy.s.sol` first runs the same measurement on the RPC (an `eth_call` of
-a probe creation) and refuses `GASLESS=1` there before anything is sent.
+The constructor rejects a fresh storage write above the selected bound
+(25,000 for Original, 120,000 for Glamsterdam). Before broadcasting,
+`Deploy.s.sol` probes the actual RPC and also rejects the wrong schedule
+selection. This matters because Forge's local simulation can use different
+pricing. The probe explicitly uses less than 2^24 gas, so EIP-8037's separate
+state-gas reservoir cannot hide the allocation from `GAS`.
 
-- **Sepolia.** Deploy with `GASLESS=0` until a paymaster with a policy
-  derived under EIP-8037 exists. Drill gasless withdrawals on Anvil (the
-  acceptance harness, CI) or on a testnet without state-gas pricing, such as
-  Hoodi.
-- **A fork that reprices state creation under a live paymaster** (mainnet's
-  Glamsterdam). The constants are immutable. Before activation, pause
-  sponsorship (`setPolicy` with `sponsorshipPaused`) and deploy a re-derived
-  paymaster. Once the fork is live, anyone may call `checkGasSchedule()`: it
-  re-measures, and above the bound pauses sponsorship for good
-  (`scheduleRepriced()`, event `ScheduleRepriced`). `setPolicy` then reverts
-  `SponsorshipRetired` for any policy that is not paused. Send that call with
-  at most 2^24 gas: above EIP-7825's cap, EIP-8037 pays state gas from a
-  reservoir that `GAS` does not show, so the measurement reads low and
-  nothing changes.
+For a later fork that exceeds the selected bound, anyone may call
+`checkGasSchedule()` to pause sponsorship permanently. `setPolicy` cannot
+resume it; deploy a paymaster whose policy has been measured under the new
+schedule. Send this check with at most 2^24 gas for the same reason as above.
 
 Post-checks, before the manifest is written: the paymaster's
 `ENTRY_POINT_V070_CODEHASH` is the pin above, `FRESH_SLOT_GAS_BOUND()` the
-script's 25,000 and `scheduleRepriced()` false; `entryPoint()`, `vault()` and
+selected bound and `scheduleRepriced()` false; `entryPoint()`, `vault()` and
 `adapter()` are the deployed ones; `factory().paymaster()` is the paymaster
 and the factory's `entryPoint()` and `vault()` are the same; the factory's
 `implementation()` is its nonce-1 creation; `WEI_PER_UNIT()` equals the

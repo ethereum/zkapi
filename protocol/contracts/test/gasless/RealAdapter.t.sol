@@ -21,7 +21,7 @@ import {PoseidonRuntime, ReferenceHashes} from "../helpers/PoseidonRuntime.sol";
 contract ProvenanceOverrideFactory {
     bytes32 private immutable c0;
     bytes32 private immutable c1;
-    bytes10 private immutable c2;
+    bytes13 private immutable c2;
     address private immutable entryPoint;
     address private immutable vault;
     address private immutable paymaster;
@@ -38,7 +38,7 @@ contract ProvenanceOverrideFactory {
         address payeeX_,
         address target_
     ) {
-        require(creationCode.length == 74, "creation code");
+        require(creationCode.length == 77, "creation code");
         bytes32 a;
         bytes32 b;
         bytes32 c;
@@ -49,7 +49,7 @@ contract ProvenanceOverrideFactory {
         }
         c0 = a;
         c1 = b;
-        c2 = bytes10(c);
+        c2 = bytes13(c);
         entryPoint = entryPoint_;
         vault = vault_;
         paymaster = paymaster_;
@@ -140,7 +140,13 @@ abstract contract RealAdapterBase is GaslessTestBase {
         (uint256 leafB,) = vault.noteRecord(1);
         assertEq(leafB, closeInputs.noteLeaf, "golden leaf");
         paymaster = new ZkApiWithdrawalPaymaster(
-            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
+            entryPoint,
+            vault,
+            address(this),
+            _defaultPolicy(),
+            MAX_FEE_CEILING,
+            PRIORITY_CEILING,
+            ZkApiWithdrawalPaymaster.GasSchedule.Original
         );
         factory = paymaster.factory();
         gp = paymaster.gasPolicy();

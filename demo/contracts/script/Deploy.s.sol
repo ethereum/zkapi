@@ -97,11 +97,10 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
 ///         Gasless withdrawals (ERC-4337):
 ///           GASLESS     – 1 (default) deploys ZkApiWithdrawalPaymaster after the vault; 0 skips
-///                         the block and writes withdrawalPaymaster: null. The paymaster's gas
-///                         policy holds only where a fresh storage slot costs at most
-///                         FRESH_SLOT_GAS_BOUND (25,000): before anything is broadcast, GASLESS=1
-///                         measures one on the RPC and refuses a chain that prices state creation
-///                         as EIP-8037 does (Sepolia since 2026: about 110,000).
+///                         the block and writes withdrawalPaymaster: null.
+///           PAYMASTER_GAS_SCHEDULE – 0 (Original, default) or 1 (Glamsterdam / current Sepolia).
+///                         GASLESS=1 probes the RPC before broadcast and rejects a mismatched
+///                         selection or prices above the supported bound.
 ///           ENTRY_POINT – the EntryPoint v0.7.0; defaults to the canonical
 ///                         0x0000000071727De22E5E9d8BAf0edAc6f37da032 and must carry its runtime.
 ///           PAYMASTER_OWNER – owner of the paymaster (policy, fee ceilings, call caps, key
@@ -169,7 +168,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     /// creation whose constructor returns what GAS reads around one fresh SSTORE (slot 0, cleared
     /// again): gas, push1 1, push0, sstore, gas, swap1, sub, push0, push0, sstore, then
     /// mstore(0, used) and return(0, 32). It measures 22,107 under EIP-2929 storage pricing.
-    uint256 internal constant FRESH_SLOT_GAS_BOUND = 25_000;
+    uint256 internal constant ORIGINAL_FRESH_SLOT_GAS_BOUND = 25_000;
+    uint256 internal constant GLAMSTERDAM_FRESH_SLOT_GAS_BOUND = 120_000;
     bytes internal constant FRESH_SLOT_PROBE = hex"5a60015f555a90035f5f555f5260205ff3";
     /// Placeholder the manifest serializer writes for withdrawalPaymaster with GASLESS=0; it is
     /// replaced by a JSON null before the file is written (vm.serialize* has no null).
@@ -205,6 +205,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     /// The gasless block's inputs (GASLESS and the PAYMASTER_* variables).
     struct Gasless {
         bool enabled;
+        ZkApiWithdrawalPaymaster.GasSchedule gasSchedule;
         IEntryPoint entryPoint;
         address owner;
         address feeKeeper;
@@ -241,7 +242,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         Params memory p = _params(vm.addr(deployerKey), local);
         Setup memory setup = _setup(local);
         Gasless memory g = _gasless(p, local);
-        if (g.enabled) _requireSponsorableGasSchedule();
+        if (g.enabled) _requireSponsorableGasSchedule(g.gasSchedule);
 
         address poseidonIn = vm.envOr("POSEIDON_ADDRESS", address(0));
         require(
@@ -418,6 +419,9 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         require(flag <= 1, "GASLESS must be 0 or 1");
         g.enabled = flag == 1;
         if (!g.enabled) return g;
+        uint256 schedule = vm.envOr("PAYMASTER_GAS_SCHEDULE", uint256(0));
+        require(schedule <= 1, "PAYMASTER_GAS_SCHEDULE must be 0 (Original) or 1 (Glamsterdam)");
+        g.gasSchedule = ZkApiWithdrawalPaymaster.GasSchedule(schedule);
         g.entryPoint = IEntryPoint(vm.envOr("ENTRY_POINT", CANONICAL_ENTRY_POINT));
         g.owner = vm.envOr("PAYMASTER_OWNER", p.owner);
         require(g.owner != address(0), "PAYMASTER_OWNER must be nonzero");
@@ -489,15 +493,14 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         );
     }
 
-    /// The paymaster's constructor refuses a chain that prices a fresh storage slot above
-    /// FRESH_SLOT_GAS_BOUND, where none of its gas constants holds (EIP-8037). forge simulates the
-    /// broadcast on its own EVM, whose schedule passes, so on such a chain the library, the adapter
-    /// and the vault would be sent before the paymaster's creation reverted. The same measurement
-    /// runs on the RPC first, as an eth_call of FRESH_SLOT_PROBE's creation, and stops GASLESS=1
-    /// there. The gasless block needs the EntryPoint's runtime (_gasless), so an RPC is there.
-    function _requireSponsorableGasSchedule() internal {
+    /// Probe the actual RPC before broadcasting: Forge's local EVM may use another schedule.
+    /// The selected policy must match the RPC, and an unknown higher price fails closed. Keep
+    /// this call below 2^24 gas so EIP-8037 state allocations remain visible to GAS.
+    function _requireSponsorableGasSchedule(ZkApiWithdrawalPaymaster.GasSchedule schedule) internal {
         bytes memory answer;
-        try vm.rpc("eth_call", string.concat('[{"data":"', vm.toString(FRESH_SLOT_PROBE), '"},"latest"]')) returns (
+        try vm.rpc(
+            "eth_call", string.concat('[{"data":"', vm.toString(FRESH_SLOT_PROBE), '","gas":"0xffffff"},"latest"]')
+        ) returns (
             bytes memory result
         ) {
             answer = result;
@@ -506,14 +509,12 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         }
         require(answer.length == 32, "fresh-slot probe: unexpected eth_call result");
         uint256 freshSlotGas = abi.decode(answer, (uint256));
+        bool repriced = freshSlotGas > ORIGINAL_FRESH_SLOT_GAS_BOUND;
         require(
-            freshSlotGas <= FRESH_SLOT_GAS_BOUND,
-            string.concat(
-                "the chain prices a fresh storage slot at ",
-                vm.toString(freshSlotGas),
-                " gas, above the paymaster's FRESH_SLOT_GAS_BOUND (25000): its gas policy does not hold here (EIP-8037); pass GASLESS=0"
-            )
+            repriced == (schedule == ZkApiWithdrawalPaymaster.GasSchedule.Glamsterdam),
+            "PAYMASTER_GAS_SCHEDULE does not match the RPC gas schedule"
         );
+        require(freshSlotGas <= GLAMSTERDAM_FRESH_SLOT_GAS_BOUND, "fresh-slot pricing above supported schedules");
         console2.log("gas schedule fresh slot", freshSlotGas);
     }
 
@@ -525,7 +526,13 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     function _deployGasless(Deployed memory d, Params memory p, Gasless memory g) internal {
         bool handover = g.owner != p.deployer;
         d.paymaster = new ZkApiWithdrawalPaymaster(
-            g.entryPoint, d.vault, handover ? p.deployer : g.owner, g.policy, g.maxFeeCeiling, g.priorityFeeCeiling
+            g.entryPoint,
+            d.vault,
+            handover ? p.deployer : g.owner,
+            g.policy,
+            g.maxFeeCeiling,
+            g.priorityFeeCeiling,
+            g.gasSchedule
         );
         d.factory = d.paymaster.factory();
         d.implementation = address(d.factory.implementation());
@@ -646,7 +653,14 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         ZkApiWithdrawalPaymaster pm = d.paymaster;
         ZkApiWithdrawalAccountFactory factory = d.factory;
         require(pm.ENTRY_POINT_V070_CODEHASH() == ENTRY_POINT_V070_CODEHASH, "EntryPoint codehash pin");
-        require(pm.FRESH_SLOT_GAS_BOUND() == FRESH_SLOT_GAS_BOUND, "paymaster FRESH_SLOT_GAS_BOUND");
+        require(pm.gasSchedule() == g.gasSchedule, "paymaster gasSchedule");
+        require(
+            pm.FRESH_SLOT_GAS_BOUND()
+                == (g.gasSchedule == ZkApiWithdrawalPaymaster.GasSchedule.Glamsterdam
+                        ? GLAMSTERDAM_FRESH_SLOT_GAS_BOUND
+                        : ORIGINAL_FRESH_SLOT_GAS_BOUND),
+            "paymaster FRESH_SLOT_GAS_BOUND"
+        );
         require(!pm.scheduleRepriced(), "paymaster gas schedule");
         require(address(pm.entryPoint()) == address(g.entryPoint), "paymaster entryPoint");
         require(address(pm.vault()) == address(d.vault), "paymaster vault");
@@ -788,6 +802,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeBytes32(m, "accountImplementationRuntimeCodehash", d.implementation.codehash);
         vm.serializeBytes(m, "accountCreationCode", d.factory.accountCreationCode());
         vm.serializeBytes32(m, "accountCreationCodeKeccak256", d.factory.accountCreationCodeHash());
+        vm.serializeUint(m, "paymasterGasSchedule", uint256(g.gasSchedule));
         vm.serializeAddress(m, "paymasterOwner", g.owner);
         vm.serializeBool(m, "paymasterOwnershipTransferPending", d.paymasterOwnershipPending);
         vm.serializeAddress(m, "paymasterDeployer", p.deployer);

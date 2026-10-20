@@ -21,7 +21,11 @@ contract ForkablePaymaster is ZkApiWithdrawalPaymaster {
         Policy memory policy_,
         uint256 maxFeeCeiling_,
         uint256 priorityFeeCeiling_
-    ) ZkApiWithdrawalPaymaster(entryPoint_, vault_, owner_, policy_, maxFeeCeiling_, priorityFeeCeiling_) {}
+    )
+        ZkApiWithdrawalPaymaster(
+            entryPoint_, vault_, owner_, policy_, maxFeeCeiling_, priorityFeeCeiling_, GasSchedule.Original
+        )
+    {}
 
     function fork() external {
         forked = true;
@@ -45,8 +49,9 @@ contract RepricedChainPaymaster is ZkApiWithdrawalPaymaster {
         address owner_,
         Policy memory policy_,
         uint256 maxFeeCeiling_,
-        uint256 priorityFeeCeiling_
-    ) ZkApiWithdrawalPaymaster(entryPoint_, vault_, owner_, policy_, maxFeeCeiling_, priorityFeeCeiling_) {}
+        uint256 priorityFeeCeiling_,
+        GasSchedule schedule
+    ) ZkApiWithdrawalPaymaster(entryPoint_, vault_, owner_, policy_, maxFeeCeiling_, priorityFeeCeiling_, schedule) {}
 
     /// @dev Not a constant, so the compiler cannot see the constructor revert on every path (it
     ///      refuses to compile a contract whose immutables are never assigned).
@@ -84,8 +89,35 @@ contract GasScheduleTest is GaslessTestBase {
     function test_constructorRefusesAChainThatRepricesStateCreation() public {
         vm.expectRevert(abi.encodeWithSelector(ZkApiWithdrawalPaymaster.UnsupportedGasSchedule.selector, 110_027));
         new RepricedChainPaymaster(
-            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
+            entryPoint,
+            vault,
+            address(this),
+            _defaultPolicy(),
+            MAX_FEE_CEILING,
+            PRIORITY_CEILING,
+            ZkApiWithdrawalPaymaster.GasSchedule.Original
         );
+    }
+
+    function test_explicitGlamsterdamPolicyAcceptsRepricedStateCreation() public {
+        RepricedChainPaymaster repriced = new RepricedChainPaymaster(
+            entryPoint,
+            vault,
+            address(this),
+            _defaultPolicy(),
+            MAX_FEE_CEILING,
+            PRIORITY_CEILING,
+            ZkApiWithdrawalPaymaster.GasSchedule.Glamsterdam
+        );
+        assertEq(repriced.FRESH_SLOT_GAS_BOUND(), 120_000);
+        assertFalse(repriced.checkGasSchedule());
+        assertFalse(repriced.scheduleRepriced());
+        assertEq(uint256(repriced.gasSchedule()), 1);
+        ZkApiWithdrawalPaymaster.GasPolicy memory g = repriced.gasPolicy();
+        assertEq(g.verificationFloorInit, 490_000);
+        assertEq(g.pmVerificationFloor, 496_000);
+        assertEq(g.newAccountGas, 183_600);
+        assertGe(g.postOpFloor, 500_000);
     }
 
     /// Under the measured schedule the check changes nothing, whoever calls it.

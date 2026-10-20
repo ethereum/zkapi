@@ -332,6 +332,10 @@ abstract contract GaslessTestBase is VaultTestBase {
     /// factory is the paymaster's nonce 1 and the account logic the factory's nonce 1), funds and
     /// stakes the paymaster and the factory.
     function _setUpGasless() internal {
+        _setUpGasless(ZkApiWithdrawalPaymaster.GasSchedule.Original);
+    }
+
+    function _setUpGasless(ZkApiWithdrawalPaymaster.GasSchedule schedule) internal {
         vm.warp(1_700_000_000);
         vm.fee(BASEFEE);
         _etchEntryPoint();
@@ -345,7 +349,7 @@ abstract contract GaslessTestBase is VaultTestBase {
         adapter = new MockProofAdapter();
         vault = _newVault(CHALLENGE_PERIOD, MAX_PAUSE);
         paymaster = new ZkApiWithdrawalPaymaster(
-            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
+            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING, schedule
         );
         vm.stopPrank();
         factory = paymaster.factory();
@@ -432,8 +436,10 @@ abstract contract GaslessTestBase is VaultTestBase {
     function _gas(uint8 kind, bool withInit) internal view returns (OpGas memory g) {
         g.pvg = gp.pvgFloor + 10_000;
         g.verification = withInit ? gp.verificationFloorInit + 40_000 : gp.verificationFloor + 20_000;
+        if (g.verification > gp.verificationCap) g.verification = gp.verificationCap;
         g.call = gp.callFloor[kind - 1] + (gp.callHardCap[kind - 1] - gp.callFloor[kind - 1]) / 4;
         g.pmVerification = gp.pmVerificationFloor + 30_000;
+        if (g.pmVerification > gp.pmVerificationCap) g.pmVerification = gp.pmVerificationCap;
         g.postOp = gp.postOpFloor + 20_000;
         g.maxFee = MAX_FEE;
         g.priority = PRIORITY;
