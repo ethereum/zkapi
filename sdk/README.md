@@ -544,6 +544,8 @@ await client.withdraw(mode, onStatus, {
   destination,            // the payout address Y; default: the connected account
   fees: 'payout',         // 'wallet' (the default) is today's path, unchanged
   feeCapWei: null,        // refuse a paymaster flat fee above this (wei)
+  maxCostWei: null,       // optional approved maximum gas reservation
+  maxTotalFeeWei: null,   // optional gas + flat fee + contract-credit ceiling
   bundlerUrl: null,       // this call's bundler; default: setBundlerUrl, then the profile's
   allowExpensiveGas: false,
   selfBundle: false       // a funded wallet sends handleOps itself (see fallbacks)
@@ -992,7 +994,7 @@ Each of these errors carries a `shortMessage` for display.
 | Exit kit | `exit_kit_invalid`, `exit_kit_passphrase`, `exit_kit_passphrase_weak` |
 | Request path rebuild | `tree_root_mismatch`, `tree_state_unavailable`, `tree_state_invalid`, `tree_logs_unavailable`, `tree_note_missing`, `tree_event_invalid`, `tree_rebuild_timeout`, `wrong_network` (each with `error.data.request_path_unavailable`) |
 | Exit RPC | `exit_rpc_invalid`, `exit_rpc_unsaved` |
-| Sponsored withdrawals (refused before any prompt) | `gasless_unavailable` (`error.data.reason`: `not_pinned`, `gasless_profile_invalid`, `gasless_deployment_mismatch`), `gasless_policy_mismatch`, `bundler_unavailable` (`error.data.fallbacks`), `bundler_wrong_chain`, `bundler_unsupported_entry_point`, `bundler_url_invalid`, `bundler_url_unsaved`, `sponsorship_paused`, `escapes_disabled`, `escape_already_sponsored`, `paymaster_underfunded`, `exits_paused` (`error.data.reopenAt`), `gas_above_paymaster_ceiling` (`error.data`, wei as bigints: `baseFeePerGas`, `maxPriorityFeePerGas`, `neededMaxFeePerGas` = base + tip, the amount compared with the ceiling, `wantedMaxFeePerGas` = 2 × base + tip, `maxFeeCeiling`), `max_cost_above_policy`, `payout_below_gas`, `gasless_uneconomic`, `gasless_attempts_exhausted`, `gasless_fee_above_cap`, `gasless_estimate_above_cap`, `gas_limit_out_of_range` (a gas field outside the paymaster's policy; `error.data`: `name`, `value`, `floor`, `cap`), `gasless_plan_mismatch`, `gasless_record_not_pinned` (`error.data.reason`: `not_pinned`, `pins_mismatch`; recover with `withdraw(mode, …, { fees: 'wallet' })` while the note has not left the vault, then with `sweepTransit`, `claimGaslessCredit` or `finalizeEscape(…, { fees: 'wallet' })`, as `error.data.alternatives` lists them), `wrong_owner_account` (`error.data.expected`), `entry_point_hash_mismatch` |
+| Sponsored withdrawals (refused before any prompt) | `gasless_unavailable` (`error.data.reason`: `not_pinned`, `gasless_profile_invalid`, `gasless_deployment_mismatch`), `gasless_policy_mismatch`, `bundler_unavailable` (`error.data.fallbacks`), `bundler_wrong_chain`, `bundler_unsupported_entry_point`, `bundler_url_invalid`, `bundler_url_unsaved`, `sponsorship_paused`, `escapes_disabled`, `escape_already_sponsored`, `paymaster_underfunded`, `exits_paused` (`error.data.reopenAt`), `gas_above_paymaster_ceiling` (`error.data`, wei as bigints: `baseFeePerGas`, `maxPriorityFeePerGas`, `neededMaxFeePerGas` = base + tip, the amount compared with the ceiling, `wantedMaxFeePerGas` = 2 × base + tip, `maxFeeCeiling`), `max_cost_above_policy`, `payout_below_gas`, `gasless_uneconomic`, `gasless_attempts_exhausted`, `gasless_fee_above_cap`, `gasless_cost_above_cap` (an explicitly supplied gas or total fee cap was exceeded), `gasless_estimate_above_cap`, `gas_limit_out_of_range` (a gas field outside the paymaster's policy; `error.data`: `name`, `value`, `floor`, `cap`), `gasless_plan_mismatch`, `gasless_record_not_pinned` (`error.data.reason`: `not_pinned`, `pins_mismatch`; recover with `withdraw(mode, …, { fees: 'wallet' })` while the note has not left the vault, then with `sweepTransit`, `claimGaslessCredit` or `finalizeEscape(…, { fees: 'wallet' })`, as `error.data.alternatives` lists them), `wrong_owner_account` (`error.data.expected`), `entry_point_hash_mismatch` |
 | Sponsored withdrawals (after a submission) | `signature_rejected` (also a bundler's ERC-7769 `-32507`), `paymaster_underfunded` (also a bundler's `-32508`: the float cannot cover every pending operation; neither code is re-signed), `escape_not_due` (a sponsored finalization the latest block has not reached the deadline for within three minutes; `error.data.validAfter`, `blockTimestamp`), `bundler_hash_mismatch` (a status, the chain decides), `bundler_rejected` (the bundler refused the send with AA25 or AA10 although the chain disagrees; `error.data`: `method`, `aa`, `rpcCode`, `rpcMessage`), `gasless_op_expired` (proved again), `gasless_op_pending` (journaled, checked in the background), `user_op_pending` (`finalizeEscape(…, { fees: 'wallet' })` while a sponsored finalization sent before the profile stopped pinning its paymaster may still land; `error.data.userOpHash`, `retryAfterMs`), `gasless_fee_bump_exhausted`, `gasless_op_reverted` (`error.data.reason`, the vault error; the record may hold `fundsWaitingInTransit`), `transit_funds_waiting` (a forward is sponsored), `transit_sweep_needed` (a status after a wallet-paid exit to `S`, which leaves the paymaster no evidence: only `sweepTransit` collects it), `transit_not_stranded`, `transit_balance_empty`; the EntryPoint's `AA..` reasons map to `sender_already_constructed` and `nonce_rejected` (handled silently), `signature_rejected`, `paymaster_underfunded`, `paymaster_time_window`, `paymaster_rejected` and the paymaster's own errors above |
 
 ## Credited escape payouts
@@ -1318,3 +1320,17 @@ and no withdrawal needs one either; only requests read `/v1/tree/snapshot`,
 and they rebuild their path from the vault when it is gone. Set this flag in every browser profile
 of the drained deployment, legacy-exit builds included. Builds older than this
 release ignore it and keep offering deposits.
+
+### Withdrawal identity and optional fee limits
+
+`getWithdrawalFeeBudget(mode)` reads a conservative wallet-funded fee reserve
+without preparing or reserving a withdrawal. Hosts may bind the user's selected
+operation with `expectedWithdrawalOperationId`; preparation and submission
+recheck the note, destination and operation while holding the wallet lock.
+Sponsored resumes also check the exact statement and saved operation hash.
+
+`maxCostWei` and `maxTotalFeeWei` are optional host limits. When supplied, they
+are journaled and checked before new signing and fee replacement; omitting them
+for a new withdrawal uses the deployment's normal paymaster limits. Existing
+signed operations are checked for inclusion before retrying. Contract-payee
+quotes include possible credit-bookkeeping cost in the disclosed minimum.

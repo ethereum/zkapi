@@ -1307,6 +1307,7 @@ class BrowserWalletRuntime extends EventTarget {
                     && depositReplacementIdentities.size === 1
             } : null,
             prepared_withdrawal: prepared ? {
+                operation_id: prepared.operationId || null,
                 mode: prepared.mode,
                 phase: prepared.phase || (prepared.transactionHash ? 'submitted' : 'prepared'),
                 note_id: prepared.public_inputs?.note_id ?? prepared.noteId ?? prepared.note_id,
@@ -1324,6 +1325,9 @@ class BrowserWalletRuntime extends EventTarget {
                 // transit identity and the operation's hash and phase.
                 fee_payer: prepared.feePayer === 'payout' ? 'payout' : 'wallet',
                 payout: prepared.feePayer === 'payout' ? prepared.payout || null : null,
+                max_cost_wei: prepared.feePayer === 'payout' ? prepared.gaslessMaxCostWei ?? null : null,
+                max_total_fee_wei: prepared.feePayer === 'payout' ? prepared.gaslessMaxTotalFeeWei ?? null : null,
+                flat_fee_cap_wei: prepared.feePayer === 'payout' ? prepared.gaslessFlatFeeCapWei ?? null : null,
                 transit: prepared.feePayer === 'payout' && prepared.transit ? structuredClone(prepared.transit) : null,
                 user_op_hash: prepared.feePayer === 'payout' ? prepared.userOpHash || null : null,
                 user_op_phase: prepared.feePayer === 'payout' ? prepared.userOpPhase || null : null
@@ -4163,10 +4167,11 @@ class BrowserWalletRuntime extends EventTarget {
      * instead of waiting for a wallet window that no longer exists. Without
      * one the ordinary claim applies.
      */
-    async claimPreparedWithdrawalUserOp({ liveWindowMs = GASLESS_TIMING.resendAfterMs } = {}) {
+    async claimPreparedWithdrawalUserOp({ liveWindowMs = GASLESS_TIMING.resendAfterMs, expected = null } = {}) {
         const takeover = await withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const prepared = this.runtime.preparedWithdrawal;
+            this.assertPreparedWithdrawalIdentity(prepared, expected);
             if (!prepared || !isGaslessWithdrawal(prepared) || !prepared.userOp || preparedWithdrawalHashes(prepared).length) return null;
             // A claim another client is still following is refused like the
             // wallet path's (409 withdrawal_wallet_pending); only a claim no
@@ -4215,7 +4220,7 @@ class BrowserWalletRuntime extends EventTarget {
                 bundlerUrl: next.bundlerUrl || null
             };
         });
-        const claim = takeover || await this.claimPreparedWithdrawalSubmission();
+        const claim = takeover || await this.claimPreparedWithdrawalSubmission(expected);
         if (claim?.submissionId && !claim.transactionHash) this.liveGaslessClaims.add(claim.submissionId);
         return claim;
     }
@@ -4244,6 +4249,8 @@ class BrowserWalletRuntime extends EventTarget {
                 userOpHash: hash,
                 userOpHashes: [...new Set([...(prepared.userOpHashes || []), hash])],
                 userOpNonce: String(details.userOpNonce ?? details.userOp.nonce ?? ''),
+                ...(details.gaslessMaxCostWei != null ? { gaslessMaxCostWei: String(details.gaslessMaxCostWei) } : {}),
+                ...(details.gaslessMaxTotalFeeWei != null ? { gaslessMaxTotalFeeWei: String(details.gaslessMaxTotalFeeWei) } : {}),
                 userOpInitCode: Boolean(details.userOpInitCode),
                 bundlerUrl: details.bundlerUrl || null,
                 userOpBuiltAt: Number(details.userOpBuiltAt || Date.now()),
@@ -4712,6 +4719,10 @@ class BrowserWalletRuntime extends EventTarget {
         walletRequest = null,
         signal = null,
         gasless = null,
+        // The note and the prepared operation the person was shown. Compared
+        // inside the wallet lock, before any reservation or proof.
+        expectedNoteId = null,
+        expectedWithdrawalOperationId = null,
         onProgress = () => {}
     } = {}) {
         await this.init();
@@ -4742,7 +4753,8 @@ class BrowserWalletRuntime extends EventTarget {
                 // there (E1, E3.2, E4.3, E6).
                 for (let pass = 0; pass < 4; pass += 1) {
                     const plan = await this.prepareExitLocked(mode, destination, {
-                        reprove, earlyConcession, walletRequest, signal, gasless, onProgress
+                        reprove, earlyConcession, walletRequest, signal, gasless, onProgress,
+                        expectedNoteId, expectedWithdrawalOperationId
                     });
                     if (plan !== WITHDRAWAL_RESTART) return plan;
                 }
@@ -4774,10 +4786,29 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     async prepareExitLocked(requested, destination, { reprove, earlyConcession, walletRequest = null, signal, gasless = null,
+        expectedNoteId = null, expectedWithdrawalOperationId = null,
         onProgress }) {
         await this.reload();
         const state = this.runtime.state;
         if (!state) throw new Error('There is no active private note to withdraw.');
+        // The person confirmed one note and one prepared operation; another
+        // tab may have replaced either since. Refuse before any network
+        // read, reservation or proof (the lock is held by the caller).
+        if (expectedNoteId != null && Number(state.note_id) !== Number(expectedNoteId)) {
+            throw new BrowserWalletHttpError(
+                'The private balance changed after this withdrawal was shown. Review the current balance before continuing.',
+                409,
+                'withdrawal_note_changed'
+            );
+        }
+        if (expectedWithdrawalOperationId != null
+            && this.runtime.preparedWithdrawal?.operationId !== expectedWithdrawalOperationId) {
+            throw new BrowserWalletHttpError(
+                'This withdrawal was replaced in another tab after it was shown. Review it again before continuing.',
+                409,
+                'withdrawal_note_changed'
+            );
+        }
         if (unresolvedLateWithdrawalForNote(this.runtime, state.note_id)) {
             throw new BrowserWalletHttpError(
                 'A withdrawal from another tab may already be on-chain. Check its status before starting another withdrawal.',
@@ -5179,11 +5210,16 @@ class BrowserWalletRuntime extends EventTarget {
         const conceded = BigInt(decision.conceded ?? 0);
         // A sponsored plan (§3.2) carries its fee payer, payout address and
         // transit identity through every re-proof; a wallet-paid one none.
-        const sponsored = gasless || (isGaslessWithdrawal(existing) ? { payout: existing.payout, transit: existing.transit } : null);
+        const sponsored = gasless || (isGaslessWithdrawal(existing) ? { payout: existing.payout, transit: existing.transit,
+            maxCostWei: existing.gaslessMaxCostWei, maxTotalFeeWei: existing.gaslessMaxTotalFeeWei,
+            flatFeeCapWei: existing.gaslessFlatFeeCapWei } : null);
         const staleUserOpHashes = [...new Set([...(existing?.staleUserOpHashes || []), ...(existing?.userOpHashes || [])])];
         const staleBlocks = [existing?.staleSubmittedAtBlock, existing?.submittedAtBlock].filter(value => value != null).map(Number);
         const decorated = {
             ...(sponsored ? { feePayer: 'payout', payout: sponsored.payout.toLowerCase(), transit: structuredClone(sponsored.transit) } : {}),
+            ...(sponsored?.maxCostWei != null ? { gaslessMaxCostWei: String(sponsored.maxCostWei) } : {}),
+            ...(sponsored?.maxTotalFeeWei != null ? { gaslessMaxTotalFeeWei: String(sponsored.maxTotalFeeWei) } : {}),
+            ...(sponsored?.flatFeeCapWei != null ? { gaslessFlatFeeCapWei: String(sponsored.flatFeeCapWei) } : {}),
             // The hashes of this plan's earlier sponsored operations stay
             // recognizable after a re-proof (a late inclusion lands on them),
             // with the earliest block their inclusion is searched from.
@@ -5378,11 +5414,26 @@ class BrowserWalletRuntime extends EventTarget {
         return this.deploymentVerification;
     }
 
-    async claimPreparedWithdrawalSubmission() {
+    assertPreparedWithdrawalIdentity(prepared, expected) {
+        if (expected == null) return;
+        const mismatch = !prepared || (expected.operationId != null && prepared.operationId !== expected.operationId)
+            || (expected.noteId != null && Number(prepared.noteId ?? prepared.public_inputs?.note_id) !== Number(expected.noteId))
+            || (expected.mode != null && prepared.mode !== expected.mode)
+            || (expected.destination != null && String(prepared.destination || '').toLowerCase() !== String(expected.destination).toLowerCase())
+            || (expected.statement != null && JSON.stringify(prepared.public_inputs) !== expected.statement)
+            || (Object.hasOwn(expected, 'userOpHash') && (prepared.userOpHash ?? null) !== expected.userOpHash);
+        if (mismatch) throw new BrowserWalletHttpError(
+            'This withdrawal was replaced in another tab. Review it again before continuing.', 409, 'withdrawal_note_changed');
+    }
+
+    async claimPreparedWithdrawalSubmission(expected = null) {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             let prepared = this.runtime.preparedWithdrawal;
             if (!prepared) throw new Error('The durable prepared withdrawal is missing.');
+            // The caller names the plan it just prepared (after any
+            // mutual-to-escape conversion). Another tab may have replaced it.
+            this.assertPreparedWithdrawalIdentity(prepared, expected);
             if (!prepared.operationId) {
                 prepared = { ...prepared, operationId: uuid() };
                 await this.commit({ ...this.runtime, preparedWithdrawal: prepared });

@@ -61,6 +61,7 @@ case "${1:-}" in
             --proof-setup-dir "$ZKAPI_PROOF_SETUP_DIR" \
             serverd --listen 0.0.0.0:3000 \
             --indexer-url http://indexer:3001 \
+            --root-poll-interval-ms "${ROOT_POLL_INTERVAL_MS:-1000}" \
             --native-billing-rpc-url "$ZKAPI_NATIVE_BILLING_RPC_URL" \
             --native-price-feed-address "$ZKAPI_NATIVE_PRICE_FEED_ADDRESS" \
             --native-price-feed-decimals "${ZKAPI_NATIVE_PRICE_FEED_DECIMALS:-8}" \
