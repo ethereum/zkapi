@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Entirely local end-to-end acceptance of circuit zkapi-v2-concession-v1
-// (vault revision 3), the §10.7 Phase B drill scenarios that run on a local
+// Entirely local end-to-end acceptance of circuit zkapi-v2-concession-v2
+// (vault revision 4, leaf-bound exits), the §10.7 Phase B drill scenarios that run on a local
 // chain, and a gas measurement (docs/v2-acceptance.md).
 //
 // Real: the contracts (deployed by demo/contracts/script/Deploy.s.sol and
@@ -34,8 +34,20 @@ const SETUP_DIR = path.join(ROOT, 'protocol/setup/v2-concession-dev');
 // but mainnet's. Deploy.s.sol treats it as off a local chain, so the drill
 // vault's dev setup needs ALLOW_DEV_SETUP=1 there, as on Sepolia.
 export const CHAIN_ID = 11155111;
+// The statement every component of the run must serve.
+export const CIRCUIT_ID = 'zkapi-v2-concession-v2';
 const GWEI = 1_000_000_000n;
 const DEPOSIT = 1_000_000; // gwei: 0.001 ETH per note
+// A withdrawal statement's word 8 (vault revision 4): the note's ID (32
+// bits), deposit (128) and expiry (64), packed as n·2^192 + D·2^64 + e < 2^224.
+export function noteFields(noteId, amount, expiry) {
+    const [n, d, e] = [BigInt(noteId), BigInt(amount), BigInt(expiry)];
+    assert.ok(n >= 0n && n < 1n << 32n && d >= 0n && d < 1n << 128n && e >= 0n && e < 1n << 64n, 'note fields out of range');
+    return (n << 192n) + (d << 64n) + e;
+}
+// The drill vault's minDeposit (Deploy.s.sol MIN_DEPOSIT, gwei): every note
+// deposits exactly the minimum, and one gwei less reverts DepositTooSmall.
+export const MIN_DEPOSIT = DEPOSIT;
 const CAP = 50_000; // request_charge_cap: every request's solvency bound
 const MOCK_USAGE_MICRO_USD = 1_000;
 const MOCK_PRICE = 250_000_000_000n; // $2,500 / ETH, eight decimal places.
@@ -319,6 +331,17 @@ export function gaslessProfile(finalized, bundlerUrl = null) {
     };
 }
 
+// The gas a fresh storage slot costs on a network, which clients add to a
+// deposit's gas limit when the next deposits complete a frontier level for the
+// first time (docs/deployment.md, deposit gas limit): 22,100 under EIP-2929
+// pricing (mainnet, local chains), about 110,000 where state creation is
+// repriced (EIP-8037, Sepolia). Other chains must name it.
+export function defaultFreshSlotGas(chainId) {
+    if (chainId === 1 || chainId === 31337 || chainId === 1337) return 22_100;
+    if (chainId === 11155111) return 110_000;
+    return undefined;
+}
+
 // The deployment profile (§10.3 `trusted_deployment`) of a finalized
 // Deploy.s.sol manifest, as serverd, zkapi-challenged, the SDK and the
 // companion read it. Only a finalized manifest is a deployment. The `gasless`
@@ -328,8 +351,13 @@ export function gaslessProfile(finalized, bundlerUrl = null) {
 export function trustedDeployment(finalized, services) {
     assert.equal(finalized.deploymentStatus, 'deployed', 'profiles come only from a finalized manifest');
     assert.ok(Number.isSafeInteger(finalized.deployBlock) && finalized.deployBlock > 0, 'finalized manifests carry deployBlock');
-    assert.equal(finalized.vaultRevision, 3);
+    assert.equal(finalized.vaultRevision, 4);
     assert.equal(finalized.concessionEscapeVersion, 1);
+    assert.equal(finalized.leafBoundExitVersion, 1);
+    assert.ok(Number.isSafeInteger(finalized.minDeposit) && finalized.minDeposit > 0, 'finalized manifests carry minDeposit');
+    const freshSlotGas = services.freshSlotGas ?? defaultFreshSlotGas(finalized.chainId);
+    assert.ok(Number.isSafeInteger(freshSlotGas) && freshSlotGas > 0,
+        `chain ${finalized.chainId} has no default fresh-slot gas: name it (--fresh-slot-gas)`);
     const key = (x, y) => ({ x: felt(x), y: felt(y) });
     return {
         deployment_status: 'deployed',
@@ -341,6 +369,8 @@ export function trustedDeployment(finalized, services) {
         protocol_server_url: services.protocolServerUrl,
         indexer_url: services.indexerUrl,
         request_charge_cap: finalized.requestChargeCap,
+        min_deposit_units: finalized.minDeposit,
+        fresh_slot_gas: freshSlotGas,
         state_signing_key: key(finalized.stateSigningKeyX, finalized.stateSigningKeyY),
         clearance_signing_key: key(finalized.clearanceSigningKeyX, finalized.clearanceSigningKeyY),
         rpc_url: services.rpcUrl,
@@ -366,8 +396,9 @@ export function trustedDeployment(finalized, services) {
         note_ttl: finalized.noteTtl,
         max_pause_duration: finalized.maxPauseDuration,
         settlement_window_seconds: services.settlementWindowSeconds,
-        vault_revision: 3,
+        vault_revision: 4,
         exit_concession: 1,
+        leaf_bound_exit: 1,
         clearance_ownership_proof: 'required',
         allow_dev_setup: finalized.allowDevSetup,
         canary: null,
@@ -813,6 +844,7 @@ async function main() {
             CLEARANCE_SIGNING_KEY_X: signingKeys.clearance_signing_key.x, CLEARANCE_SIGNING_KEY_Y: signingKeys.clearance_signing_key.y,
             CHALLENGE_PERIOD_SECONDS: String(TIMING.challengePeriod), NOTE_TTL_SECONDS: String(TIMING.noteTtl),
             MAX_PAUSE_DURATION_SECONDS: String(TIMING.maxPauseDuration), REQUEST_CHARGE_CAP: String(CAP),
+            MIN_DEPOSIT: String(MIN_DEPOSIT),
             // Off a local chain (this Anvil has Sepolia's ID) the single-party
             // dev setup deploys only as a drill vault.
             ALLOW_DEV_SETUP: '1',
@@ -870,18 +902,29 @@ async function main() {
             if (operation) gas.record(operation, receipt);
             return receipt;
         }
+        // Revision 4 stores one word per note: its leaf (which binds the
+        // registration, note ID, deposit and expiry) and its status. The
+        // deposit and expiry are read from the note's NoteDeposited event.
         async function noteView(noteId) {
-            const [commitment, amount, expiry, status] = await vaultRead('notes', [noteId]);
-            return { commitment, amount, expiry: Number(expiry), status: Number(status) };
+            const [leaf, status] = await vaultRead('noteRecord', [noteId]);
+            return { leaf: BigInt(leaf), status: Number(status) };
         }
-        const NOTE = Object.freeze({ Active: 1, PendingWithdrawal: 2, Closed: 3 });
+        const NOTE = Object.freeze({ Uninitialized: 0, Active: 1, PendingWithdrawal: 2, Closed: 3 });
         assert.equal(await vaultRead('CONCESSION_ESCAPE_VERSION'), 1n);
+        assert.equal(await vaultRead('LEAF_BOUND_EXIT_VERSION'), 1n);
+        assert.equal(await vaultRead('minDeposit'), BigInt(MIN_DEPOSIT));
+        assert.equal(finalized.minDeposit, MIN_DEPOSIT, 'the manifest pins the vault\'s minDeposit');
+        assert.equal(finalized.vaultRevision, 4);
+        assert.equal(finalized.leafBoundExitVersion, 1);
+        assert.equal(finalized.circuitId, CIRCUIT_ID);
+        assert.ok(!('rootHistoryWindow' in finalized), 'revision 4 keeps no root history');
         assert.equal(await vaultRead('challengePeriod'), BigInt(TIMING.challengePeriod));
         assert.equal(await vaultRead('maxPauseDuration'), BigInt(TIMING.maxPauseDuration));
         assert.equal((await vaultRead('owner')).toLowerCase(), owner.toLowerCase());
         evidence.deployment = { script: 'demo/contracts/script/Deploy.s.sol', finalized_by: 'scripts/expected-codehashes.mjs --finalize',
             vault: vaultAddress, deploy_block: deployBlock, deploy_block_lower_bound: pending.deployBlockLowerBound,
             setup_id: finalized.setupId, allow_dev_setup: finalized.allowDevSetup, circuit_id: finalized.circuitId,
+            vault_revision: finalized.vaultRevision, leaf_bound_exit_version: finalized.leafBoundExitVersion, min_deposit: finalized.minDeposit,
             codehashes: { vault: finalized.vaultRuntimeCodehash, adapter: finalized.adapterRuntimeCodehash,
                 poseidon: finalized.poseidonRuntimeCodehash, entry_point: finalized.entryPointRuntimeCodehash,
                 sender_creator: finalized.senderCreatorRuntimeCodehash, paymaster: finalized.paymasterRuntimeCodehash,
@@ -1019,7 +1062,7 @@ async function main() {
             ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: String(CHALLENGE_MAX_FEE_PER_GAS),
             ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI: String(CHALLENGE_MAX_PRIORITY_FEE_PER_GAS),
             ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI: String(CHALLENGE_PRIORITY_FEE_PER_GAS),
-            ZKAPI_CHALLENGE_RETIRE_ON_MISS: 'true', ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '2' } });
+            ZKAPI_CHALLENGE_RETIRE_ON_MISS: 'true', ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '4' } });
         const signerHealth = await waitFor('signer health', async () => {
             const health = await request(`${signerUrl}/health`);
             return health.status === 200 && health.value;
@@ -1108,6 +1151,13 @@ async function main() {
             unpinned_seeds: await refusedStart('unpinned-seeds', { ZKAPI_STATE_SEED: randomSeed(), ZKAPI_CLEAR_SEED: randomSeed() },
                 /do not derive the keys the deployment manifest pins/),
             missing_seeds: await refusedStart('missing-seeds', {}, /ZKAPI_STATE_SEED \(or --state-seed\) is required/),
+            // Revision 4 removed the clearance root window (clearance reads
+            // the note's leaf): the old setting fails startup, flag or env.
+            removed_clearance_root_window_env: await refusedStart('clearance-root-window-env',
+                { ...seedEnv, ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS: '600' }, /removed in vault revision 4: clearance checks the note leaf/),
+            removed_clearance_root_window_flag: await refusedStart('clearance-root-window-flag', seedEnv,
+                /removed in vault revision 4: clearance checks the note leaf/,
+                (port, db) => [...serverArgs(port, db), '--clearance-root-window-seconds', '600']),
         };
         // The codehash-mismatch profile: bound by db init, refused by serverd.
         const tamperedDb = path.join(runDir, 'refused-codehash.db');
@@ -1128,8 +1178,11 @@ async function main() {
                 return BigInt(health.current_root) === await vaultRead('currentRoot') && health;
             }, 90_000);
             const health = await get(`${serverUrl}/health`);
-            assert.equal(health.circuit_id, 'zkapi-v2-concession-v1');
+            assert.equal(health.circuit_id, CIRCUIT_ID);
             assert.equal(health.exit_concession, 1);
+            assert.equal(health.leaf_bound_exit, 1);
+            assert.equal(health.vault_revision, 4);
+            assert.equal(health.request_root_grace_seconds, 60, 'O5\': the default request-root grace');
             return health;
         }
         const serverHealth = await startServer();
@@ -1178,35 +1231,63 @@ async function main() {
                     child.stdin.write(JSON.stringify({ id, command, ...data }) + '\n');
                 });
             };
-            assert.equal((await call('circuit')).circuit_id, 'zkapi-v2-concession-v1');
+            assert.equal((await call('circuit')).circuit_id, CIRCUIT_ID);
             await call('init', { config });
             return call;
         }
-        const WITHDRAWAL_TUPLE = 'tuple(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)';
+        // The 16-word withdrawal statement: word 3 is the note's leaf, word 8
+        // its packed fields (noteFields = n·2^192 + D·2^64 + e).
+        const WITHDRAWAL_TUPLE = 'tuple(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64)';
+        const SELECTOR = Object.freeze({ escape: vault.getFunction('initiateEscapeWithdrawal').selector,
+            close: vault.getFunction('mutualClose').selector });
+        assert.deepEqual(SELECTOR, { escape: '0x8cd67c60', close: '0xbce12a6c' }, 'the revision-4 exit selectors');
         const wallNow = () => Math.floor(Date.now() / 1000);
+        // A request's membership path (requests still prove at a request root
+        // the server read from the vault; exits take no path).
         async function treePath(client, noteId) {
             const snapshot = await synchronizedTree();
             return client('tree_path', { args: { snapshot, note_id: noteId, require_existing: true } });
         }
+        // A note's deposit preimage, from its NoteDeposited event (the vault
+        // stores only the leaf).
+        async function depositOf(noteId) {
+            const [event] = await vaultEventsSince('NoteDeposited', noteId, deployBlock);
+            assert.ok(event, `no NoteDeposited for note ${noteId}`);
+            return { noteId, commitment: event.args.commitment, amount: Number(event.args.amount), expiry: Number(event.args.expiryTs) };
+        }
+        // An exit's calldata is bound to the note's stored leaf and its
+        // (n, D, e): word 3 is noteRecord(n).leaf, word 8 packs the deposit.
+        async function assertLeafBound(calldata, noteId, label = 'exit') {
+            const call = vault.parseTransaction({ data: calldata });
+            const deposit = await depositOf(noteId);
+            const record = await noteView(noteId);
+            assert.ok(record.leaf !== 0n, `${label}: note ${noteId} has a stored leaf`);
+            assert.equal(BigInt(call.args.inputs.noteLeaf), record.leaf, `${label}: noteLeaf is noteRecord(${noteId}).leaf`);
+            assert.equal(BigInt(call.args.inputs.noteFields), noteFields(noteId, deposit.amount, deposit.expiry),
+                `${label}: noteFields packs (n, D, e) of the deposit`);
+            return { note_leaf: felt(record.leaf), note_fields: felt(call.args.inputs.noteFields), deposit_amount: deposit.amount,
+                expiry_ts: deposit.expiry };
+        }
         async function driverDeposit(client, amount = DEPOSIT, from = account.driver) {
-            const snapshot = await synchronizedTree();
             const params = await client('deposit_params');
-            const merkle = await client('tree_path', { args: { snapshot, note_id: snapshot.next_note_id, require_existing: false } });
             const receipt = await vaultSend(from, 'deposit', [felt(params.registration_commitment), amount],
-                { value: BigInt(amount) * GWEI, operation: 'deposit' });
+                { value: BigInt(amount) * GWEI });
             assert.equal(receipt.status, '0x1');
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
+            gas.record('deposit', receipt, { note_id: noteId, client: 'driver' });
+            assert.equal(deposited.args.amount, BigInt(amount));
+            assert.equal(BigInt(deposited.args.commitment), BigInt(params.registration_commitment));
+            const expiry = Number(deposited.args.expiryTs);
             const note = await noteView(noteId);
-            assert.equal(note.amount, BigInt(amount));
             assert.equal(note.status, NOTE.Active);
-            const status = await client('confirm_deposit', { args: { note_id: noteId, amount, expiry_ts: note.expiry } });
+            const status = await client('confirm_deposit', { args: { note_id: noteId, amount, expiry_ts: expiry } });
             assert.equal(status.state.note.is_genesis, true);
-            // Amendment A1: the deposit's own root and siblings prove the note
-            // for good; exits need no indexer.
-            const depositPath = { active_root: felt(deposited.args.newRoot), siblings: merkle.siblings };
-            assert.equal((await client('note_path_matches', { args: { active_root: depositPath.active_root, siblings: depositPath.siblings } })).matches, true);
-            return { noteId, receipt, depositPath, expiry: note.expiry };
+            // The note's exits are bound to the leaf the vault stored at
+            // deposit: the wallet's own leaf of (s, n, D, e) is that leaf.
+            const leaf = await client('note_leaf');
+            assert.equal(BigInt(leaf.leaf), note.leaf, 'the wallet\'s note leaf is noteRecord(n).leaf');
+            return { noteId, receipt, expiry, leaf: note.leaf };
         }
         const quotePayload = async () => JSON.stringify({ mode: 'openrouter_ephemeral_lease', version: 1,
             billing_quote: await get(`${gateUrl}/v2/billing/quote`) });
@@ -1250,12 +1331,14 @@ async function main() {
             assert.equal(status.pending_request, false);
             return { ...sent, response, status };
         }
-        async function driverEscape(client, noteId, { snapshot, conceded = 0, destination = account.destination, validUntil, path: merkle,
+        // Exits take no root and no path: the proof binds the note's leaf.
+        async function driverEscape(client, noteId, { snapshot, conceded = 0, destination = account.destination, validUntil,
             from = account.driver, send = true, operation = 'escape' } = {}) {
             const plan = await client('prepare_withdrawal', { ...(snapshot ? { snapshot } : {}), args: { mode: 'escape', destination,
-                conceded, valid_until: validUntil ?? (await chainNow()) + 10_800, active_root: merkle.active_root, merkle_siblings: merkle.siblings } });
+                conceded, valid_until: validUntil ?? (await chainNow()) + 10_800 } });
             assert.equal(plan.public_inputs.kind, 0);
-            assert.ok(plan.calldata.startsWith('0xa38d62aa') && plan.calldata.length === 2 + 836 * 2, 'escape calldata layout');
+            assert.ok(plan.calldata.startsWith(SELECTOR.escape) && plan.calldata.length === 2 + 836 * 2, 'escape calldata layout');
+            assert.equal(BigInt(plan.public_inputs.note_leaf), (await noteView(noteId)).leaf, 'the escape proves the stored leaf');
             if (!send) return { plan };
             const receipt = await sendTx({ from, to: vaultAddress, data: plan.calldata });
             assert.equal(receipt.status, '0x1', 'the escape reverted');
@@ -1266,19 +1349,19 @@ async function main() {
             assert.equal(recorded.args.conceded, BigInt(conceded));
             return { plan, receipt, initiated, recorded, deadline: Number(initiated.args.challengeDeadline) };
         }
-        async function clearance(client, merkle) {
-            const ownership = await client('prepare_withdrawal', { args: { mode: 'ownership', valid_until: wallNow() + 3_000,
-                active_root: merkle.active_root, merkle_siblings: merkle.siblings } });
+        async function clearance(client) {
+            const ownership = await client('prepare_withdrawal', { args: { mode: 'ownership', valid_until: wallNow() + 3_000 } });
             assert.equal(ownership.public_inputs.kind, 2);
             const granted = await request(`${gateUrl}/v2/withdraw/clearance`, { method: 'POST', value: ownership.clearance_request });
             return { ownership, granted };
         }
-        async function driverMutualClose(client, noteId, merkle, destination = account.destination) {
-            const { ownership, granted } = await clearance(client, merkle);
+        async function driverMutualClose(client, noteId, destination = account.destination) {
+            const { ownership, granted } = await clearance(client);
             assert.equal(granted.status, 200, `clearance refused: ${JSON.stringify(granted.value)}`);
             const close = await client('prepare_withdrawal', { args: { mode: 'mutual', destination, valid_until: (await chainNow()) + 10_800,
-                active_root: merkle.active_root, merkle_siblings: merkle.siblings, clearance: granted.value } });
-            assert.ok(close.calldata.startsWith('0x72cd2e44') && close.calldata.length === 2 + 836 * 2, 'close calldata layout');
+                clearance: granted.value } });
+            assert.ok(close.calldata.startsWith(SELECTOR.close) && close.calldata.length === 2 + 836 * 2, 'close calldata layout');
+            await assertLeafBound(close.calldata, noteId, 'close');
             const receipt = await sendTx({ from: account.driver, to: vaultAddress, data: close.calldata });
             assert.equal(receipt.status, '0x1', 'the mutual close reverted');
             gas.record('mutual_close', receipt, { note_id: noteId });
@@ -1320,7 +1403,7 @@ async function main() {
             assert.equal(state.bound_at_state, 0, 'an installed successor resets the bound');
             assert.equal((await get(`${gateUrl}/v2/requests/${first.id}`)).nullifier_status, 'finalized');
             // An ownership proof (kind 2) never lands on chain.
-            const { ownership, granted } = await clearance(client, note.depositPath);
+            const { ownership, granted } = await clearance(client);
             assert.equal(granted.status, 200, `clearance refused: ${JSON.stringify(granted.value)}`);
             const tuple = coder.decode([WITHDRAWAL_TUPLE], ownership.inputs_abi)[0];
             const asEscape = vault.encodeFunctionData('initiateEscapeWithdrawal', [tuple, ownership.proof_hex]);
@@ -1332,10 +1415,36 @@ async function main() {
             gas.record('ownership_proof_on_chain_reverts', rejected);
             const nullifier = ownership.public_inputs.withdrawal_nullifier;
             assert.equal((await get(`${gateUrl}/v2/nullifiers/${nullifier}`)).nullifier_status, 'clearance_reserved');
-            // The close proves at the deposit's root (Amendment A1).
+            // The close is bound to the note's stored leaf, whatever the root.
             const close = await client('prepare_withdrawal', { args: { mode: 'mutual', destination: account.destination,
-                valid_until: (await chainNow()) + 10_800, active_root: note.depositPath.active_root, merkle_siblings: note.depositPath.siblings,
-                clearance: granted.value } });
+                valid_until: (await chainNow()) + 10_800, clearance: granted.value } });
+            const binding = await assertLeafBound(close.calldata, note.noteId, 'close');
+            // The binding checks before the proof: a noteLeaf other than the
+            // stored one (NoteLeafMismatch), noteFields of 2^224 or more
+            // (InvalidNoteFields), noteFields naming a note that is not
+            // Active (NoteNotActive). A deposit or expiry the proof did not
+            // bind passes them and fails the proof.
+            const closeCall = vault.parseTransaction({ data: close.calldata });
+            const forged = (index, delta) => {
+                const inputs = [...closeCall.args.inputs];
+                inputs[index] = BigInt(inputs[index]) + delta;
+                return vault.encodeFunctionData('mutualClose', [inputs, closeCall.args.proof]);
+            };
+            const unusedNote = BigInt(await vaultRead('nextNoteId')) - BigInt(note.noteId);
+            const forgedRefusals = { note_leaf_plus_one: await revertName(forged(3, 1n)),
+                note_fields_at_2_224: await revertName(forged(8, 1n << 224n)),
+                note_fields_of_an_unused_note: await revertName(forged(8, unusedNote << 192n)),
+                note_fields_deposit_plus_one: await revertName(forged(8, 1n << 64n)) };
+            assert.equal(forgedRefusals.note_leaf_plus_one, 'NoteLeafMismatch');
+            assert.equal(forgedRefusals.note_fields_at_2_224, 'InvalidNoteFields');
+            assert.equal(forgedRefusals.note_fields_of_an_unused_note, 'NoteNotActive');
+            // The adapter's InvalidProof() (raised in assembly, so in no ABI).
+            assert.equal(forgedRefusals.note_fields_deposit_plus_one, new Interface(['error InvalidProof()']).getError('InvalidProof').selector,
+                'a deposit the proof did not bind fails the proof');
+            forgedRefusals.note_fields_deposit_plus_one = 'InvalidProof (the adapter)';
+            const forgedSent = await sendTx({ from: account.thirdParty, to: vaultAddress, data: forged(3, 1n), gasLimit: 1_000_000 });
+            assert.equal(forgedSent.status, '0x0');
+            gas.record('close_note_leaf_mismatch_reverts', forgedSent);
             const receipt = await sendTx({ from: account.driver, to: vaultAddress, data: close.calldata });
             assert.equal(receipt.status, '0x1');
             gas.record('mutual_close', receipt, { note_id: note.noteId });
@@ -1350,8 +1459,15 @@ async function main() {
             assert.equal(await vaultRead('usedNullifiers', [nullifier]), true);
             const final = await client('status');
             assert.equal(final.state.note.current_balance, payout, 'the wallet\'s balance is what the close paid');
+            // The vault holds the note Closed under its leaf; a clearance after
+            // the close reads that fresh (no cache): note_not_active.
+            assert.equal((await noteView(note.noteId)).leaf, BigInt(binding.note_leaf), 'a closed note keeps its leaf until retired');
+            const afterClose = await clearance(client);
+            assert.equal(afterClose.granted.status, 409, json(afterClose.granted.value));
+            assert.equal(afterClose.granted.value?.error_code, 'note_not_active');
             return { note_id: note.noteId, charges: [first.response.charge_applied, second.response.charge_applied],
-                payout_gwei: payout, treasury_gwei: 2 * INFERENCE_CHARGE, close_transaction: receipt.transactionHash,
+                payout_gwei: payout, treasury_gwei: 2 * INFERENCE_CHARGE, close_transaction: receipt.transactionHash, leaf_binding: binding,
+                forged_statement_refusals: forgedRefusals, clearance_after_close: 'note_not_active (409)',
                 ownership_proof_on_chain: 'WrongWithdrawalKind (escape and close)', client_final_balance: final.state.note.current_balance };
         });
         stopAfter('honest');
@@ -1376,8 +1492,7 @@ async function main() {
             assert.equal((await client('verify_request', { args: { public_inputs: served.public_inputs, proof: served.proof.proof } })).valid, true,
                 'the evidence at the successor verifies');
             // 1. Escape from S2 after spending S3: defeated by the request at N3.
-            const merkle = await treePath(client, note.noteId);
-            const fromS2 = await driverEscape(client, note.noteId, { snapshot: 'S2', path: merkle });
+            const fromS2 = await driverEscape(client, note.noteId, { snapshot: 'S2' });
             const defeat = await waitEvent('EscapeWithdrawalChallenged', note.noteId, fromS2.receipt.blockNumber);
             gas.record('defeat', defeat.receipt, { note_id: note.noteId });
             assert.equal(BigInt(defeat.event.args.nullifier), BigInt(snapshots[2].withdrawal_nullifier));
@@ -1403,25 +1518,25 @@ async function main() {
             const indexerPublished = await get(`${indexerUrl}/v1/nullifiers/${snapshots[2].successor_nullifier}/published`);
             assert.equal(indexerPublished.published, true);
             // 2. From S1: its successor N2 is challenged, so SupersededState.
-            const fromS1 = await driverEscape(client, note.noteId, { snapshot: 'S1', path: merkle, send: false });
+            const fromS1 = await driverEscape(client, note.noteId, { snapshot: 'S1', send: false });
             assert.equal(await revertName(fromS1.plan.calldata), 'SupersededState');
             const superseded = await sendTx({ from: account.driver, to: vaultAddress, data: fromS1.plan.calldata, gasLimit: 1_000_000 });
             assert.equal(superseded.status, '0x0');
             gas.record('escape_superseded_state_reverts', superseded);
             // 3. From S0 (two states older): recorded, then defeated by the request at N1.
-            const fromS0 = await driverEscape(client, note.noteId, { snapshot: 'S0', path: note.depositPath });
+            const fromS0 = await driverEscape(client, note.noteId, { snapshot: 'S0' });
             const second = await waitEvent('EscapeWithdrawalChallenged', note.noteId, fromS0.receipt.blockNumber);
             gas.record('defeat', second.receipt, { note_id: note.noteId });
             assert.equal(BigInt(second.event.args.nullifier), BigInt(snapshots[0].withdrawal_nullifier));
             assert.equal(await vaultRead('challengedNullifiers', [snapshots[0].withdrawal_nullifier]), true);
             // 4. S2 again: ChallengedNullifier.
-            const again = await driverEscape(client, note.noteId, { snapshot: 'S2', path: merkle, send: false });
+            const again = await driverEscape(client, note.noteId, { snapshot: 'S2', send: false });
             assert.equal(await revertName(again.plan.calldata), 'ChallengedNullifier');
             // Defeats move no funds; the newest state then closes mutually.
             const mid = await balances(vaultAddress, treasury, account.destination);
             assert.equal(mid[vaultAddress], before[vaultAddress]);
             assert.equal(mid[account.destination], before[account.destination]);
-            const close = await driverMutualClose(client, note.noteId, await treePath(client, note.noteId));
+            const close = await driverMutualClose(client, note.noteId);
             const payout = DEPOSIT - 4 * INFERENCE_CHARGE;
             assert.equal(eventOf(close.receipt, 'MutualClose').args.finalBalance, BigInt(payout));
             const after = await balances(vaultAddress, treasury, account.destination);
@@ -1437,6 +1552,28 @@ async function main() {
                 client_final_balance: final.state.note.current_balance };
         });
         stopAfter('stale');
+
+        await scenario('minimum deposit: one gwei below minDeposit reverts DepositTooSmall; exactly minDeposit is a note', async () => {
+            const commitment = felt(BigInt(`0x${randomBytes(31).toString('hex')}`));
+            const below = vault.encodeFunctionData('deposit', [commitment, MIN_DEPOSIT - 1]);
+            const value = hex(BigInt(MIN_DEPOSIT - 1) * GWEI);
+            let refusal;
+            try {
+                await rpc('eth_call', [{ from: account.thirdParty, to: vaultAddress, data: below, value }, 'latest']);
+                refusal = null;
+            } catch (error) {
+                refusal = vault.parseError(error.data)?.name ?? error.message;
+            }
+            assert.equal(refusal, 'DepositTooSmall');
+            const nextBefore = await vaultRead('nextNoteId');
+            const reverted = await sendTx({ from: account.thirdParty, to: vaultAddress, data: below, value: BigInt(MIN_DEPOSIT - 1) * GWEI,
+                gasLimit: 300_000 });
+            assert.equal(reverted.status, '0x0');
+            gas.record('deposit_too_small_reverts', reverted);
+            assert.equal(await vaultRead('nextNoteId'), nextBefore, 'no note was created');
+            return { min_deposit_gwei: MIN_DEPOSIT, below_minimum: refusal, reverted_transaction: reverted.transactionHash,
+                at_minimum: 'every drill note deposits exactly minDeposit' };
+        });
 
         // ---------------------------------------------------------------- the browser SDK
         // The host: browser-config.json (the build-pinned profile), the proof
@@ -1507,6 +1644,22 @@ async function main() {
             await call('start', { hostUrl, configUrl: `${hostUrl}/zkapi/${build}/browser-config.json`, walletRpcUrl: rpcUrl, account: walletAccount });
             return call;
         }
+        // An SDK deposit, its gas recorded by note index with the gas limit
+        // the SDK chose (sized by the frontier levels the next deposits may
+        // write); the limit covers the gas used.
+        async function sdkDeposit(sdk, amount) {
+            const deposited = await sdk('deposit', { amount });
+            const tx = deposited.sent.findLast(item => item.data === vault.getFunction('deposit').selector);
+            if (deposited.note && tx) {
+                const receipt = await waitReceipt(tx.hash);
+                const gasLimit = tx.gas == null ? null : Number(BigInt(tx.gas));
+                if (gasLimit != null) {
+                    assert.ok(gasLimit >= Number(BigInt(receipt.gasUsed)) && gasLimit <= 1_500_000, `SDK deposit gas limit ${gasLimit}`);
+                }
+                gas.record('deposit', receipt, { client: 'sdk', note_id: Number(deposited.note.note_id), gas_limit: gasLimit });
+            }
+            return deposited;
+        }
         // The SDK's refusal, as an object (its code and data).
         const sdkRefusal = promise => promise.then(value => assert.fail(`expected a refusal, got ${json(value)}`), error => {
             assert.ok(error.sdk, error.message);
@@ -1569,8 +1722,8 @@ async function main() {
         const companionManifest = { deployment_id: trusted.deployment_id, protocol_version: 2, chain_id: CHAIN_ID,
             rpc_url: trusted.rpc_url, contract_address: vaultAddress, billing_token_address: null, billing_asset: 'native_eth',
             billing_unit: 'gwei', native_asset_wei_per_unit: trusted.native_asset_wei_per_unit, native_price_feed_address: feed,
-            native_price_feed_decimals: 8, native_price_max_age_seconds: 4_500, vault_revision: 3, deployment_status: 'deployed',
-            exit_concession: 1, settlement_window_seconds: W, deploy_block: deployBlock, protocol_server_url: gateUrl,
+            native_price_feed_decimals: 8, native_price_max_age_seconds: 4_500, vault_revision: 4, deployment_status: 'deployed',
+            exit_concession: 1, leaf_bound_exit: 1, min_deposit_units: trusted.min_deposit_units, settlement_window_seconds: W, deploy_block: deployBlock, protocol_server_url: gateUrl,
             indexer_url: indexerUrl, request_charge_cap: CAP, proof_backend: 'groth16_bn254',
             proof_setup: { circuit_id: trusted.circuit_id, setup_id: trusted.setup_id },
             state_signing_key: trusted.state_signing_key, clearance_signing_key: trusted.clearance_signing_key,
@@ -1660,10 +1813,15 @@ async function main() {
         });
         stopAfter('mismatch');
 
-        await scenario('SDK: deposit with deployment checks, request, settle; indexer down, escape with the deposit-time path', async () => {
+        await scenario('SDK: deposit with deployment checks, request, settle; indexer down, escape bound to the note\'s leaf', async () => {
             const sdk = await sdkAgent('honest', { walletAccount: account.sdk });
             await sdk('init');
-            const deposited = await sdk('deposit', { amount: '0.001' });
+            // Below the profile's min_deposit_units: refused before any transaction.
+            const tooSmall = await sdkRefusal(sdk('deposit', { amount: '0.000999999' }));
+            assert.equal(tooSmall.code, 'deposit_too_small', json(tooSmall));
+            assert.equal(Number(tooSmall.data?.min_deposit_units), MIN_DEPOSIT, json(tooSmall.data));
+            assert.equal((await sdk('snapshot')).sent.length, 0, 'the wallet signed nothing for the refused deposit');
+            const deposited = await sdkDeposit(sdk, '0.001');
             const note = deposited.note;
             assert.ok(note, `no note after the deposit: ${json(deposited)}`);
             assert.equal(Number(note.current_balance), DEPOSIT);
@@ -1671,52 +1829,64 @@ async function main() {
             assert.equal((await noteView(noteId)).status, NOTE.Active);
             const depositTx = deposited.sent.find(item => item.data === vault.getFunction('deposit').selector);
             assert.ok(depositTx, 'the wallet sent the deposit');
-            gas.record('deposit', await rpc('eth_getTransactionReceipt', [depositTx.hash]), { client: 'sdk' });
+            const gasLimit = depositTx.gas == null ? null : Number(BigInt(depositTx.gas));
             const chat = await sdk('chat', { sessionId: 'acceptance-sdk', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
             const settled = await sdk('settle');
             assert.equal(Number(settled.note.current_balance), DEPOSIT - INFERENCE_CHARGE, json(settled.note));
-            // Another deposit moves the root past this note's deposit root.
-            // It is the note claimExpired sweeps at the end of the run.
+            // Another deposit moves the request root past this note's
+            // deposit; exits never read a root. It is the note claimExpired
+            // sweeps at the end of the run.
             expiryNote = { client: await wallet('expiry') };
             Object.assign(expiryNote, await driverDeposit(expiryNote.client));
-            const depositRoot = (await vaultEventsSince('NoteDeposited', noteId, deployBlock))[0].args.newRoot;
-            assert.notEqual(await vaultRead('currentRoot'), depositRoot);
-            // The operator's indexer goes down; the escape needs no indexer
-            // (Amendment A1: the deposit's root is a known root for good).
+            // The operator's indexer goes down. serverd keeps admitting
+            // requests (vault-read roots) and reports the indexer in /health
+            // and /metrics only.
             await stop(indexer);
+            const degraded = await waitFor('serverd reports the indexer unavailable', async () => {
+                const health = await get(`${serverUrl}/health`);
+                return health.indexer_root === 'unavailable' && health;
+            }, 30_000);
+            assert.equal(degraded.status, 'degraded');
+            const metrics = await request(`${serverUrl}/metrics`);
+            assert.equal(metrics.status, 200);
+            assert.match(metrics.text ?? '', /^zkapi_indexer_root_unavailable 1$/m);
+            assert.match(metrics.text ?? '', /^zkapi_vault_root_stale 0$/m, 'vault reads continue');
+            // The SDK sees the indexer down too, and the escape never asks it:
+            // no path, no root, no log scan.
+            const refusedBefore = (await sdk('indexer_down', { on: true })).indexer_refused;
             const before = await balances(vaultAddress, account.sdkDestination);
             const escaped = await sdk('withdraw', { mode: 'escape', destination: account.sdkDestination });
             const record = escaped.withdrawals.find(item => Number(item.noteId) === noteId) ?? escaped.withdrawal;
             assert.ok(record, json(escaped));
-            const escapeTx = escaped.sent.find(item => item.data === vault.getFunction('initiateEscapeWithdrawal').selector);
+            const escapeTx = escaped.sent.find(item => item.data === SELECTOR.escape);
             assert.ok(escapeTx, 'the wallet sent the escape');
             const receipt = await waitReceipt(escapeTx.hash);
             assert.equal(receipt.status, '0x1');
-            gas.record('escape', receipt, { client: 'sdk', conceded: 0 });
+            gas.record('escape', receipt, { client: 'sdk', conceded: 0, note_id: noteId });
             const recorded = eventOf(receipt, 'EscapeConcessionRecorded');
             assert.equal(recorded.args.conceded, 0n, 'a fresh state escapes conceding nothing');
             assert.equal(recorded.args.stateBalance, BigInt(DEPOSIT - INFERENCE_CHARGE));
             assert.equal((await vaultRead('pendingWithdrawals', [noteId]))[0], true);
-            // The vault does not store the proof's root (pendingWithdrawals word 1 is zero): the
-            // escape's calldata carries it.
-            const escapeCall = vault.parseTransaction({ data: (await rpc('eth_getTransactionByHash', [escapeTx.hash])).input });
-            const root = BigInt(escapeCall.args.inputs.activeRoot);
-            assert.equal(root, depositRoot, 'the escape proves at the note\'s deposit root, not the current one');
-            assert.equal(await vaultRead('isKnownRoot', [root]), true);
+            assert.equal((await noteView(noteId)).status, NOTE.PendingWithdrawal);
+            // Bound to the note: noteLeaf is noteRecord(n).leaf, noteFields
+            // packs (n, D, e) of the NoteDeposited event.
+            const binding = await assertLeafBound((await rpc('eth_getTransactionByHash', [escapeTx.hash])).input, noteId, 'SDK escape');
+            const afterEscape = await sdk('indexer_down', { on: false });
+            assert.equal(afterEscape.indexer_refused, refusedBefore, 'the escape made no indexer call');
             await save('sdk-honest-escape.json', escaped);
-            const pathSource = escaped.result?.pathSource;
-            assert.equal(pathSource, 'deposit', 'the SDK took the deposit-time path');
+            assert.equal(escaped.result?.pathSource, undefined, 'an escape has no path source');
             assert.deepEqual(escaped.result?.decision, { rule: 'E2.escape', conceded: '0' });
             // Restart the indexer from its checkpoint.
             indexer = launch(path.join(opts.binDir, 'zkapi-indexerd'), indexerArgs, 'indexer-2.log');
             await synchronizedTree();
             pendingEscapes.push({ name: 'sdk-honest', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
                 payout: DEPOSIT - INFERENCE_CHARGE, stateBalance: DEPOSIT - INFERENCE_CHARGE, before });
-            return { note_id: noteId, deposit: depositTx.hash, escape: escapeTx.hash, path_source: pathSource,
-                decision: escaped.result?.decision ?? null, sdk_statuses: escaped.statuses,
-                proof_root: felt(root), proof_root_is_the_deposit_root: true, deposit_root_is_not_current: true, conceded: 0,
-                indexer_down_during_escape: true, sdk_settled_balance: Number(settled.note.current_balance) };
+            return { note_id: noteId, deposit: depositTx.hash, deposit_gas_limit: gasLimit, deposit_too_small: tooSmall.code,
+                escape: escapeTx.hash, leaf_binding: binding, decision: escaped.result?.decision ?? null, sdk_statuses: escaped.statuses,
+                indexer_down_during_escape: true, indexer_calls_during_escape: 0,
+                server_health_with_indexer_down: { status: degraded.status, indexer_root: degraded.indexer_root },
+                conceded: 0, sdk_settled_balance: Number(settled.note.current_balance) };
         });
         stopAfter('sdk-honest');
 
@@ -1757,7 +1927,7 @@ async function main() {
         await scenario('SDK honest close (Phase C smoke): deposit, request, settle, mutual close through the SDK', async () => {
             const sdk = await sdkAgent('close', { walletAccount: account.sdk });
             await sdk('init');
-            const deposited = await sdk('deposit', { amount: '0.001' });
+            const deposited = await sdkDeposit(sdk, '0.001');
             const noteId = Number(deposited.note.note_id);
             const chat = await sdk('chat', { sessionId: 'acceptance-sdk-close', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
@@ -1785,7 +1955,7 @@ async function main() {
             // The owner concedes less than the request will cost.
             const conceded = 100;
             assert.ok(conceded < INFERENCE_CHARGE);
-            const escape = await driverEscape(client, note.noteId, { conceded, destination: slowReceiver, path: note.depositPath });
+            const escape = await driverEscape(client, note.noteId, { conceded, destination: slowReceiver });
             assert.equal(escape.recorded.args.stateBalance, BigInt(DEPOSIT));
             // The lease retires; the server settles its charge, but the
             // nullifier is consumed on chain, so it signs no successor (O7).
@@ -1825,16 +1995,30 @@ async function main() {
             const bridge = await companion.call('GET', '/oa/v1/status');
             assert.equal(bridge.status, 200);
             assert.equal(bridge.value.exit_concession, 1);
+            assert.equal(bridge.value.leaf_bound_exit, 1);
+            assert.equal(bridge.value.vault_revision, 4);
+            assert.equal(bridge.value.circuit_id, CIRCUIT_ID);
+            // Below the pinned min_deposit_units: refused before any plan.
+            const tooSmall = await companion.call('POST', '/deposit/prepare', { amount: MIN_DEPOSIT - 1 });
+            assert.equal(tooSmall.status, 400, json(tooSmall.value));
+            assert.match(JSON.stringify(tooSmall.value), /deposit_too_small/);
             const plan = await companion.call('POST', '/deposit/prepare', { amount: DEPOSIT });
             assert.equal(plan.status, 200, json(plan.value));
+            assert.ok(!('zero_path' in plan.value) && !('active_root' in plan.value), 'a deposit plan carries no path');
             const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), DEPOSIT],
-                { value: BigInt(DEPOSIT) * GWEI, operation: 'deposit' });
+                { value: BigInt(DEPOSIT) * GWEI });
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
+            gas.record('deposit', receipt, { note_id: noteId, client: 'companion' });
             assert.equal(noteId, plan.value.next_note_id);
-            const note = await noteView(noteId);
+            // A confirm whose expiry does not reproduce the stored leaf is
+            // refused (every exit of it would revert NoteLeafMismatch).
+            const wrongExpiry = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount: DEPOSIT,
+                expiry_ts: Number(deposited.args.expiryTs) + 86_400 });
+            assert.notEqual(wrongExpiry.status, 200, json(wrongExpiry.value));
+            assert.match(JSON.stringify(wrongExpiry.value), /note_leaf_mismatch/);
             const confirmed = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount: DEPOSIT,
-                expiry_ts: note.expiry, deposit_root: felt(deposited.args.newRoot), deposit_siblings: plan.value.zero_path });
+                expiry_ts: Number(deposited.args.expiryTs) });
             assert.equal(confirmed.status, 200, json(confirmed.value));
             await synchronizedTree();
             // One request, as clientd makes it: an OA bridge lease (the
@@ -1855,10 +2039,13 @@ async function main() {
                     { destination: account.companionDestination, conceded: String(decision.value.conceded ?? '0'), early_exit: 'concede_nothing' })).value;
                 assert.equal(prepared.status, 'prepared', json(prepared));
                 assert.equal(String(prepared.conceded), '0');
-                assert.equal(prepared.path_source, 'deposit', 'the escape proves from the deposit-time path');
+                assert.ok(!('path_source' in prepared), 'an escape takes no path');
             } finally {
                 gate.mode = 'pass';
             }
+            // Proved while the operator was down, bound to the note's stored leaf.
+            const binding = await assertLeafBound(prepared.calldata, noteId, 'companion escape');
+            assert.equal(BigInt(prepared.public_inputs.note_leaf), BigInt(binding.note_leaf));
             const escapeReceipt = await sendTx({ from: account.companion, to: vaultAddress, data: prepared.calldata });
             assert.equal(escapeReceipt.status, '0x1');
             gas.record('escape', escapeReceipt, { client: 'companion', conceded: 0 });
@@ -1878,7 +2065,8 @@ async function main() {
             pendingEscapes.push({ name: 'companion-forced', client: 'companion', companion, noteId, destination: account.companionDestination,
                 payout: DEPOSIT - INFERENCE_CHARGE, before: await balances(account.companionDestination) });
             return { note_id: noteId, decision: { rule: prepared.reason ?? null, conceded: prepared.conceded, bound: prepared.bound_at_state },
-                path_source: prepared.path_source, escape: escapeReceipt.transactionHash, raise: raised.event.transactionHash,
+                leaf_binding: binding, deposit_too_small: 'refused before a plan (400 deposit_too_small)',
+                confirm_with_wrong_expiry: 'refused (note_leaf_mismatch)', escape: escapeReceipt.transactionHash, raise: raised.event.transactionHash,
                 traffic: companionTraffic(companion, ['operator', 'indexer', 'exit_rpc', 'verifier']),
                 escape_status_phase: status.value.phase ?? status.value.record?.phase ?? null };
         });
@@ -1893,12 +2081,12 @@ async function main() {
             const plan = await companion.call('POST', '/deposit/prepare', { amount });
             assert.equal(plan.status, 200, json(plan.value));
             const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), amount],
-                { value: BigInt(amount) * GWEI, operation: 'deposit' });
+                { value: BigInt(amount) * GWEI });
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
-            const note = await noteView(noteId);
+            gas.record('deposit', receipt, { note_id: noteId, client: 'companion' });
             const confirmed = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount,
-                expiry_ts: note.expiry, deposit_root: felt(deposited.args.newRoot), deposit_siblings: plan.value.zero_path });
+                expiry_ts: Number(deposited.args.expiryTs) });
             assert.equal(confirmed.status, 200, json(confirmed.value));
             await synchronizedTree();
             return noteId;
@@ -1957,15 +2145,18 @@ async function main() {
             assert.equal(Number(pi.conceded), 0);
             const asHex = value => Array.isArray(value) ? `0x${Buffer.from(value).toString('hex')}` : String(value);
             const asAddress = value => `0x${BigInt(asHex(value)).toString(16).padStart(40, '0')}`;
-            const tuple = [pi.protocol_version, pi.chain_id, asAddress(pi.contract_address), asHex(pi.active_root),
+            // The 18-field statement JSON packs into the 16-word tuple: word 8
+            // is noteFields of (note_id, deposit_amount, expiry_ts).
+            const tuple = [pi.protocol_version, pi.chain_id, asAddress(pi.contract_address), asHex(pi.note_leaf),
                 asHex(pi.state_signing_key_x), asHex(pi.state_signing_key_y), asHex(pi.clearance_signing_key_x), asHex(pi.clearance_signing_key_y),
-                pi.note_id, BigInt(pi.final_balance), asAddress(pi.destination), asHex(pi.withdrawal_nullifier), pi.kind,
+                noteFields(pi.note_id, BigInt(pi.deposit_amount), BigInt(pi.expiry_ts)), BigInt(pi.final_balance), asAddress(pi.destination), asHex(pi.withdrawal_nullifier), pi.kind,
                 asHex(pi.next_nullifier), BigInt(pi.conceded), pi.valid_until];
             const proofHex = `0x${Buffer.from(prepared.proof.proof, 'base64').toString('hex')}`;
             // zkapi-clientd signs this call; the harness sends it.
             const before = await balances(vaultAddress, treasury, destination);
-            const closeReceipt = await sendTx({ from: account.companion, to: vaultAddress,
-                data: vault.encodeFunctionData('mutualClose', [tuple, proofHex]) });
+            const closeData = vault.encodeFunctionData('mutualClose', [tuple, proofHex]);
+            const closeBinding = await assertLeafBound(closeData, noteId, 'companion close');
+            const closeReceipt = await sendTx({ from: account.companion, to: vaultAddress, data: closeData });
             assert.equal(closeReceipt.status, '0x1', 'the companion mutual close reverted');
             gas.record('mutual_close', closeReceipt, { client: 'companion' });
             const event = eventOf(closeReceipt, 'MutualClose');
@@ -1989,7 +2180,7 @@ async function main() {
             await startServer();
             return { note_id: noteId, first_successor_balance: Number(installed.note.current_balance),
                 stale_device: { refusal: companionError(refused), exit_lock: null, traffic: staleTraffic },
-                prepare_attempts: attempts.length, close: closeReceipt.transactionHash, payout_gwei: payout,
+                prepare_attempts: attempts.length, close: closeReceipt.transactionHash, leaf_binding: closeBinding, payout_gwei: payout,
                 confirm: confirmed.status ?? confirmed, client_final_state: { has_note: wallet.value.has_note }, traffic };
         });
         stopAfter('companion-close');
@@ -2079,7 +2270,7 @@ async function main() {
             return sdk;
         }
         async function gaslessDeposit(sdk, amount = GASLESS_CLOSE_ETH) {
-            const deposited = await sdk('deposit', { amount });
+            const deposited = await sdkDeposit(sdk, amount);
             assert.ok(deposited.note, json(deposited.statuses));
             return { noteId: Number(deposited.note.note_id), units: Number(deposited.note.current_balance),
                 deposit: Number(deposited.note.current_balance), sent: deposited.sent.length,
@@ -2619,7 +2810,7 @@ async function main() {
         // Prepared now, abandoned, replayed after its valid_until.
         const replay = { client: await wallet('replay') };
         Object.assign(replay, await driverDeposit(replay.client));
-        replay.abandoned = await driverEscape(replay.client, replay.noteId, { validUntil: (await chainNow()) + 600, path: replay.depositPath, send: false });
+        replay.abandoned = await driverEscape(replay.client, replay.noteId, { validUntil: (await chainNow()) + 600, send: false });
         assert.equal(await revertName(replay.abandoned.plan.calldata), null, 'the abandoned proof would still land now');
         // The missed-defeat note: two settled requests, so a request at the
         // genesis state's successor exists.
@@ -2694,7 +2885,7 @@ async function main() {
             assert.equal(paused.status, '0x1');
             assert.equal(await vaultRead('paused'), true);
             // New exits are blocked while paused (until maxPauseDuration).
-            const blocked = await driverEscape(replay.client, replay.noteId, { path: replay.depositPath, send: false });
+            const blocked = await driverEscape(replay.client, replay.noteId, { send: false });
             assert.equal(await revertName(blocked.plan.calldata), 'Paused');
             const deadlines = await Promise.all(pendingEscapes.map(async entry => Number((await vaultRead('pendingWithdrawals', [entry.noteId]))[5])));
             await skipChain(Math.max(...deadlines) - await chainNow() + 5, 'challenge period, while paused');
@@ -2863,8 +3054,17 @@ async function main() {
             const replayed = await sendTx({ from: account.thirdParty, to: vaultAddress, data: replay.abandoned.plan.calldata, gasLimit: 1_000_000 });
             assert.equal(replayed.status, '0x0');
             gas.record('escape_expired_proof_reverts', replayed);
+            // Clearance reads the note fresh at every call (no cache): it
+            // grants one for the Active note, then, once the note escaped,
+            // refuses the same state with note_not_active.
+            const before = await clearance(replay.client);
+            assert.equal(before.granted.status, 200, `clearance of the Active note: ${json(before.granted.value)}`);
             // A fresh escape lands although the vault is still paused.
-            const escape = await driverEscape(replay.client, replay.noteId, { path: replay.depositPath });
+            const escape = await driverEscape(replay.client, replay.noteId);
+            assert.equal((await noteView(replay.noteId)).status, NOTE.PendingWithdrawal);
+            const warm = await clearance(replay.client);
+            assert.equal(warm.granted.status, 409, json(warm.granted.value));
+            assert.equal(warm.granted.value?.error_code, 'note_not_active', 'the clearance re-read the note after its escape');
             pendingEscapes.push({ name: 'driver-escape-after-pause', client: 'driver', wallet: replay.client, noteId: replay.noteId,
                 destination: account.destination, payout: DEPOSIT, exitedNullifier: escape.plan.public_inputs.withdrawal_nullifier,
                 stateBalance: DEPOSIT });
@@ -2874,7 +3074,7 @@ async function main() {
             return { paused_at: pausedAt, gasless_while_paused: { reason: pausedAvailability.result.reason, reopen_at: staleReopenAt,
                 wallet_path: 'the escape below lands from the wallet' },
                 escape_while_paused: escape.receipt.transactionHash, abandoned_proof: 'ProofExpired',
-                repause: 'PauseCooldown' };
+                clearance: { before_escape: 200, after_escape: warm.granted.value.error_code }, repause: 'PauseCooldown' };
         });
         stopAfter('pause-max');
 
@@ -2941,7 +3141,7 @@ async function main() {
             const rule = check === 'S4' ? 'E3.forced' : 'E3.lost_epsilon';
             const conceded = check === 'S4' ? 0 : Math.min(charge, bound);
             const balanceBefore = Number(after.state.note.current_balance);
-            const escape = await driverEscape(client, note.noteId, { conceded, path: note.depositPath });
+            const escape = await driverEscape(client, note.noteId, { conceded });
             // The concession that is paid: the challenger raises an S4 exit to
             // the settled charge; the lost-ε concession already covers what
             // the bound lets it take.
@@ -2983,7 +3183,7 @@ async function main() {
             await startServer('random-anchor');
             const sdk = await sdkAgent('random-anchor', { walletAccount: account.sdk });
             await sdk('init');
-            const deposited = await sdk('deposit', { amount: '0.001' });
+            const deposited = await sdkDeposit(sdk, '0.001');
             const noteId = Number(deposited.note.note_id);
             const chat = await sdk('chat', { sessionId: 'acceptance-random-anchor', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
@@ -3018,7 +3218,7 @@ async function main() {
             await startServer('lie-expired');
             const sdk = await sdkAgent('lie-expired', { walletAccount: account.sdk });
             await sdk('init');
-            const deposited = await sdk('deposit', { amount: '0.001' });
+            const deposited = await sdkDeposit(sdk, '0.001');
             const noteId = Number(deposited.note.note_id);
             // The lease reaches serverd, which reserves it and issues a key;
             // the operator keeps the key, spends it, and tells the SDK that its
@@ -3075,7 +3275,7 @@ async function main() {
             await startServer('withhold');
             const sdk = await sdkAgent('withhold', { walletAccount: account.sdk });
             await sdk('init');
-            const deposited = await sdk('deposit', { amount: '0.001' });
+            const deposited = await sdkDeposit(sdk, '0.001');
             const noteId = Number(deposited.note.note_id);
             const chat = await sdk('chat', { sessionId: 'acceptance-withhold', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200);
@@ -3128,56 +3328,59 @@ async function main() {
 
         // ---------------------------------------------------------------- operator and indexer outages
         await startServer();
-        await scenario('indexer down, then rebuild from logs: an SDK note without its deposit-time path escapes at the rebuilt root', async () => {
+        await scenario('indexer down: an SDK request proves at a path rebuilt from the vault\'s state (noteLeaves at one block hash), serverd admits it, and the escape needs no path', async () => {
             const sdk = await sdkAgent('rebuild', { walletAccount: account.sdk });
             await sdk('init');
-            const deposited = await sdk('deposit', { amount: '0.001' });
+            const deposited = await sdkDeposit(sdk, '0.001');
             const noteId = Number(deposited.note.note_id);
-            const depositRoot = (await vaultEventsSince('NoteDeposited', noteId, deployBlock))[0].args.newRoot;
-            // A later deposit moves the root; that note escapes too.
+            // A later deposit moves the request root; that note escapes too.
             const filler = { client: await wallet('rebuild-filler') };
             Object.assign(filler, await driverDeposit(filler.client));
-            const currentRoot = await vaultRead('currentRoot');
-            assert.notEqual(currentRoot, depositRoot);
-            // The rebuild reads the vault's logs up to the finalized block.
-            const fillerBlock = Number(BigInt(filler.receipt.blockNumber));
-            await waitFor('the filler deposit is final', async () =>
-                Number(BigInt((await rpc('eth_getBlockByNumber', ['finalized', false])).number)) >= fillerBlock, 30_000);
-            const dropped = await sdk('drop_deposit_path');
-            assert.equal(dropped.dropped, true, 'the SDK had saved a deposit-time path');
-            assert.equal(dropped.deposit_path_saved, false);
+            const nextNoteId = Number(await vaultRead('nextNoteId'));
+            assert.ok(nextNoteId > filler.noteId);
+            // The operator's indexer goes down, and the SDK cannot reach it.
             await stop(indexer);
+            await sdk('indexer_down', { on: true });
+            // A request: its membership path comes from the vault's state
+            // (nextNoteId, noteLeaves pages and currentRoot at one block
+            // hash), and serverd admits the root it read from the vault.
+            const chat = await sdk('chat', { sessionId: 'acceptance-rebuild', model: MODEL, prompt: PROMPT });
+            assert.equal(chat.status, 200, json(chat));
+            const settled = await sdk('settle');
+            assert.equal(Number(settled.note.current_balance), DEPOSIT - INFERENCE_CHARGE, json(settled.note));
+            assert.equal(settled.request_path_source, 'state', 'with no indexer the request path is rebuilt from the vault\'s state');
+            assert.ok(settled.indexer_refused > 0, 'the SDK tried the indexer first');
+            const refusedBefore = settled.indexer_refused;
+            // The escape: no path, no root, no indexer call.
             const escaped = await sdk('withdraw', { mode: 'escape', destination: account.sdkDestination });
-            const escapeTx = escaped.sent.find(item => item.data === vault.getFunction('initiateEscapeWithdrawal').selector);
+            const escapeTx = escaped.sent.find(item => item.data === SELECTOR.escape);
             assert.ok(escapeTx, json(escaped.statuses));
             const receipt = await waitReceipt(escapeTx.hash);
             assert.equal(receipt.status, '0x1');
-            gas.record('escape', receipt, { client: 'sdk', conceded: 0, path: 'rebuild' });
-            assert.equal(escaped.result?.pathSource, 'rebuild', 'with no saved path and no indexer the path is rebuilt from the logs');
+            gas.record('escape', receipt, { client: 'sdk', conceded: 0, note_id: noteId });
             assert.deepEqual(escaped.result?.decision, { rule: 'E2.escape', conceded: '0' });
             assert.equal((await vaultRead('pendingWithdrawals', [noteId]))[0], true);
-            // The vault does not store the proof's root (pendingWithdrawals word 1 is zero): the
-            // escape's calldata carries it.
-            const escapeCall = vault.parseTransaction({ data: (await rpc('eth_getTransactionByHash', [escapeTx.hash])).input });
-            const proofRoot = BigInt(escapeCall.args.inputs.activeRoot);
-            assert.equal(proofRoot, currentRoot, 'the escape proves at the root rebuilt from the logs, not the deposit root');
+            const binding = await assertLeafBound((await rpc('eth_getTransactionByHash', [escapeTx.hash])).input, noteId, 'SDK escape');
+            const after = await sdk('indexer_down', { on: false });
+            assert.equal(after.indexer_refused, refusedBefore, 'the escape made no indexer call');
             indexer = launch(path.join(opts.binDir, 'zkapi-indexerd'), indexerArgs, 'indexer-3.log');
             await synchronizedTree();
-            const fillerEscape = await driverEscape(filler.client, filler.noteId, { path: filler.depositPath });
+            const fillerEscape = await driverEscape(filler.client, filler.noteId);
             pendingEscapes.push({ name: 'sdk-rebuild', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
-                payout: DEPOSIT, stateBalance: DEPOSIT });
+                payout: DEPOSIT - INFERENCE_CHARGE, stateBalance: DEPOSIT - INFERENCE_CHARGE });
             pendingEscapes.push({ name: 'rebuild-filler', client: 'driver', wallet: filler.client, noteId: filler.noteId,
                 destination: account.destination, payout: DEPOSIT, stateBalance: DEPOSIT,
                 exitedNullifier: fillerEscape.plan.public_inputs.withdrawal_nullifier });
-            return { note_id: noteId, path_source: escaped.result.pathSource, proof_root: felt(proofRoot), deposit_root: felt(depositRoot),
-                indexer_down_during_escape: true, escape: escapeTx.hash, decision: escaped.result.decision };
+            return { note_id: noteId, request_path_source: settled.request_path_source, indexer_refused_during_request: refusedBefore,
+                indexer_calls_during_escape: 0, next_note_id_at_request: nextNoteId, leaf_binding: binding, indexer_down_during_request_and_escape: true,
+                escape: escapeTx.hash, decision: escaped.result.decision };
         });
         stopAfter('rebuild');
 
         await scenario('hang: serverd --adversary hang holds every call; the SDK escapes within its exit budget, before must_initiate_by', async () => {
             const sdk = await sdkAgent('hang', { walletAccount: account.sdk });
             await sdk('init');
-            const deposited = await sdk('deposit', { amount: '0.001' });
+            const deposited = await sdkDeposit(sdk, '0.001');
             const noteId = Number(deposited.note.note_id);
             const chat = await sdk('chat', { sessionId: 'acceptance-hang', model: MODEL, prompt: PROMPT });
             assert.equal(chat.status, 200, json(chat));
@@ -3211,7 +3414,7 @@ async function main() {
             // the lease retirement stay below 7 minutes.
             assert.deepEqual(escaped.result?.decision, { rule: 'E3.forced', conceded: '0' }, json(escaped.result));
             assert.ok(seconds < 420, `the escape took ${seconds} s against a hanging operator`);
-            const note = await noteView(noteId);
+            const note = await depositOf(noteId);
             const initiatedAt = Number(BigInt((await rpc('eth_getBlockByNumber', [receipt.blockNumber, false])).timestamp));
             const mustInitiateBy = note.expiry - 43_200;
             assert.ok(initiatedAt < mustInitiateBy, 'the escape landed before must_initiate_by');
@@ -3236,7 +3439,7 @@ async function main() {
             await stop(challenger);
             // A stale escape from the genesis state, whose successor's request
             // is in the server's evidence: a defeat is due, and nobody sends it.
-            const escape = await driverEscape(missed.client, missed.noteId, { snapshot: 'S0', path: missed.depositPath });
+            const escape = await driverEscape(missed.client, missed.noteId, { snapshot: 'S0' });
             assert.equal(BigInt(escape.recorded.args.nextNullifier), BigInt(missed.requests[1].nullifier), 'evidence at N⁺ exists');
             pendingEscapes.push({ name: 'missed-defeat', client: 'driver', wallet: missed.client, noteId: missed.noteId,
                 destination: account.destination, payout: DEPOSIT, missed: true, escapeBlock: Number(BigInt(escape.receipt.blockNumber)),
@@ -3294,6 +3497,9 @@ async function main() {
 
         await scenario('retire-on-miss: the restarted challenger reports the missed defeat and retires the closed leaf', async () => {
             const rootBefore = await vaultRead('currentRoot');
+            const recordBefore = await noteView(missed.noteId);
+            assert.equal(recordBefore.status, NOTE.Closed);
+            assert.ok(recordBefore.leaf !== 0n, 'the finalized note is Closed with its leaf still in the tree');
             const restartBlock = Number(await rpc('eth_blockNumber'));
             await startChallenger();
             const retired = await waitEvent('ClosedLeafRetired', missed.noteId, restartBlock, 120_000);
@@ -3301,10 +3507,20 @@ async function main() {
             assert.equal((await rpc('eth_getTransactionByHash', [retired.event.transactionHash])).from.toLowerCase(), challengerAccount.toLowerCase());
             assert.ok(challengeSends.some(send => send.call === 'retireClosedLeaf' && send.hash === retired.event.transactionHash),
                 'the retirement went through the signer');
+            // Retired: the record is (0, Closed) and the request root, a view
+            // the vault computes from its frontier, changed with it. Only
+            // siblings below ℓ = msb(n XOR nextNoteId) are read; the
+            // challenger zero-fills the rest.
             const rootAfter = await vaultRead('currentRoot');
-            assert.notEqual(rootAfter, rootBefore);
-            assert.equal(BigInt(retired.event.args.newRoot), rootAfter);
-            assert.equal(await vaultRead('isKnownRoot', [rootAfter]), true);
+            assert.notEqual(rootAfter, rootBefore, 'the retirement changed the request root');
+            const recordAfter = await noteView(missed.noteId);
+            assert.deepEqual(recordAfter, { leaf: 0n, status: NOTE.Closed }, 'a retired note is (0, Closed)');
+            const retireCall = vault.parseTransaction({ data: (await rpc('eth_getTransactionByHash', [retired.event.transactionHash])).input });
+            const retireBlock = Number(BigInt(retired.receipt.blockNumber));
+            const nextAtRetire = Number(await vaultRead('nextNoteId', [], hex(retireBlock - 1)));
+            const level = 31 - Math.clz32(missed.noteId ^ nextAtRetire);
+            const siblings = retireCall.args.siblings.map(BigInt);
+            assert.ok(siblings.slice(level).every(value => value === 0n), `the siblings at and above ℓ = ${level} are zero-filled`);
             const status = await waitFor('the challenger counts the missed defeat', async () => {
                 const current = await challengerStatus();
                 return current.escapes_finalized_with_successor_evidence_total >= 1 && current;
@@ -3317,16 +3533,22 @@ async function main() {
             const missLine = new RegExp(`MISSED escape deadline note_id=${missed.noteId} .*missed="defeat"`);
             assert.ok(logs.some(text => text.replace(/\u001b\[[0-9;]*m/g, '').split('\n').some(line => missLine.test(line))),
                 'the challenger logs the miss of this note');
-            // The retired leaf is gone from the tree: the newest state of the
-            // note can no longer prove membership at the current root.
+            // The retired leaf is gone from the tree: the indexer's snapshot,
+            // which matches the vault's root, holds 0 at the note, and the
+            // vault's own noteLeaves reads the same.
             const snapshot = await synchronizedTree();
             assert.equal(BigInt(snapshot.leaves[missed.noteId]), 0n);
-            const atCurrentRoot = await missed.client('tree_path', { args: { snapshot, note_id: missed.noteId, require_existing: true } });
-            assert.equal((await missed.client('note_path_matches', { args: { active_root: atCurrentRoot.active_root,
-                siblings: atCurrentRoot.siblings } })).matches, false, 'the note\'s leaf is not under the current root');
+            assert.equal((await vaultRead('noteLeaves', [missed.noteId, 1]))[0], 0n);
+            // Any exit of the note now fails before its proof: the stored
+            // leaf (0) is not the statement's.
+            const stale = await missed.client('prepare_withdrawal', { snapshot: 'S0', args: { mode: 'escape', destination: account.destination,
+                conceded: 0, valid_until: (await chainNow()) + 10_800 } });
+            const staleRefusal = await revertName(stale.calldata);
+            assert.equal(staleRefusal, 'NoteNotActive', 'a retired note cannot exit');
             const signer = await get(`${signerUrl}/health`);
             assert.equal(signer.retirements_last_24h, 1);
-            return { note_id: missed.noteId, retirement: retired.event.transactionHash, new_root: felt(rootAfter),
+            return { note_id: missed.noteId, retirement: retired.event.transactionHash, root_before: felt(rootBefore), new_root: felt(rootAfter),
+                retire_level: level, zero_filled_siblings: 32 - level, record_after: { leaf: '0', status: 'Closed' }, exit_after_retirement: staleRefusal,
                 missed_defeats_counted: status.escapes_finalized_with_successor_evidence_total, signer_retirements_last_24h: signer.retirements_last_24h,
                 last_missed: status.last_missed ?? null };
         });
@@ -3347,7 +3569,7 @@ async function main() {
         await scenario('late successor, then switch: the successor arrives after an escape proof is released; E6 installs it once the proof is dead, and the owner closes from the newer state', async () => {
             const sdk = await sdkAgent('late', { walletAccount: account.sdk });
             await sdk('init');
-            const deposited = await sdk('deposit', { amount: '0.001' });
+            const deposited = await sdkDeposit(sdk, '0.001');
             const noteId = Number(deposited.note.note_id);
             await sdk('hold_successors', { on: true });
             const chat = await sdk('chat', { sessionId: 'acceptance-late', model: MODEL, prompt: PROMPT });
@@ -3407,26 +3629,51 @@ async function main() {
         });
         stopAfter('late-successor');
 
-        await scenario('expiry sweep and pause cooldown end: claimExpired after effectiveExpiry; a pause after PAUSE_COOLDOWN', async () => {
+        await scenario('expiry sweep and pause cooldown end: claimExpired after effectiveExpiry with the note\'s deposit preimage (a wrong one: NoteLeafMismatch); a pause after PAUSE_COOLDOWN; recordRoot changes nothing', async () => {
             // Stop the daemons first: block time now runs ahead of the wall clock.
             await stop(challenger);
             await stop(server);
             gate.target = null;
-            const expiry = Number(await vaultRead('effectiveExpiry', [expiryNote.noteId]));
+            // The vault stores only the leaf: claimExpired and effectiveExpiry
+            // take the note's preimage (commitment, deposit, expiry) from its
+            // NoteDeposited event and check it reproduces the stored leaf.
+            const deposit = await depositOf(expiryNote.noteId);
+            const preimage = [expiryNote.noteId, deposit.commitment, deposit.amount, deposit.expiry];
+            const wrongPreimage = [expiryNote.noteId, deposit.commitment, deposit.amount, deposit.expiry + 86_400];
+            const expiry = Number(await vaultRead('effectiveExpiry', preimage));
+            assert.ok(expiry >= deposit.expiry, 'the effective expiry is at least expiryTs (pauses only extend it)');
+            assert.equal(await vaultRead('effectiveExpiry', wrongPreimage), 0n, 'a preimage that is not the note\'s has no expiry');
             const now = await chainNow();
             await rpc('evm_increaseTime', [expiry - now + 1]);
             await rpc('evm_mine', []);
+            const wrongClaim = await revertName(vault.encodeFunctionData('claimExpired', wrongPreimage));
+            assert.equal(wrongClaim, 'NoteLeafMismatch');
             const before = await balances(treasury, vaultAddress);
-            const claimed = await vaultSend(account.thirdParty, 'claimExpired', [expiryNote.noteId], { operation: 'claim_expired' });
+            const claimed = await vaultSend(account.thirdParty, 'claimExpired', preimage, { operation: 'claim_expired' });
             assert.equal(claimed.status, '0x1');
             assert.ok(eventOf(claimed, 'ExpiredClaimed'));
-            assert.equal((await noteView(expiryNote.noteId)).status, NOTE.Closed);
+            assert.deepEqual(await noteView(expiryNote.noteId), { leaf: expiryNote.leaf, status: NOTE.Closed },
+                'a swept note keeps its leaf, Closed');
             const after = await balances(treasury, vaultAddress);
             assert.equal(after[treasury] - before[treasury], BigInt(DEPOSIT) * GWEI);
             const paused = await vaultSend(owner, 'pause', [], { operation: 'pause' });
             assert.equal(paused.status, '0x1', 'PAUSE_COOLDOWN has passed');
             await vaultSend(owner, 'unpause', [], { operation: 'unpause' });
-            return { note_id: expiryNote.noteId, claim: claimed.transactionHash, treasury_gwei: DEPOSIT, repause_after_cooldown: paused.transactionHash };
+            // recordRoot() is an optional audit trail: it emits RootRecorded
+            // and changes no root, note or count (nothing depends on it).
+            const rootBefore = await vaultRead('currentRoot');
+            const nextBefore = await vaultRead('nextNoteId');
+            const recordedTx = await vaultSend(account.thirdParty, 'recordRoot', [], { operation: 'record_root' });
+            assert.equal(recordedTx.status, '0x1');
+            const recordedEvent = eventOf(recordedTx, 'RootRecorded');
+            assert.equal(recordedEvent.args.root, rootBefore);
+            assert.equal(Number(recordedEvent.args.noteCount), Number(nextBefore));
+            assert.equal(await vaultRead('currentRoot'), rootBefore);
+            assert.equal(await vaultRead('nextNoteId'), nextBefore);
+            assert.deepEqual(vaultEvents(recordedTx).map(event => event.name), ['RootRecorded']);
+            return { note_id: expiryNote.noteId, claim: claimed.transactionHash, treasury_gwei: DEPOSIT, repause_after_cooldown: paused.transactionHash,
+                wrong_preimage: { claim_expired: wrongClaim, effective_expiry: '0' }, record_root: { transaction: recordedTx.transactionHash,
+                    root: felt(rootBefore), note_count: Number(nextBefore), state_changed: false } };
         });
 
         // Every note of the run is closed; the vault holds only what the
@@ -3475,10 +3722,15 @@ async function main() {
             assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.error?.message ?? result.stderr}`);
             return result.stdout;
         };
-        const gasReport = { schema: 'zkapi-acceptance-gas/v1', circuit_id: 'zkapi-v2-concession-v1', setup_id: finalized.setupId,
+        const gasReport = { schema: 'zkapi-acceptance-gas/v1', circuit_id: CIRCUIT_ID, setup_id: finalized.setupId,
             chain: 'anvil', chain_id: CHAIN_ID, note: 'transaction gasUsed of real calls on a fresh Anvil vault (receipt gas, refunds applied)',
             snapshot: await readJSON(path.join(ROOT, 'protocol/contracts/snapshots/concession-exit-gas.json')).catch(() => null),
-            summary: gas.summary(), transactions: gas.entries };
+            summary: gas.summary(),
+            // A deposit's gas depends on its note index (the frontier levels
+            // it completes): every deposit of the run by note ID.
+            deposits_by_note_index: Object.fromEntries(gas.entries.filter(entry => entry.operation === 'deposit' && entry.note_id != null)
+                .sort((a, b) => a.note_id - b.note_id).map(entry => [entry.note_id, entry.gas_used])),
+            transactions: gas.entries };
         await save('gas.json', gasReport);
         const result = { passed: true, timestamp: new Date().toISOString(), elapsed_wall_seconds: (Date.now() - started) / 1000,
             source_commit: gitOutput(['rev-parse', 'HEAD']).trim(),

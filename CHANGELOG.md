@@ -312,7 +312,17 @@ Folded into 0.2.0's notes at release.
   answers 409 `note_leaf_mismatch` or `note_not_active` from a fresh
   `noteRecord` read.
 - **Indexer.** Checkpoints are format v4 (v3 is refused: rebuild);
-  `/v1/tree/roots/{root}` and `/v1/tree/notes/{id}/zero-path` are gone.
+  `/v1/tree/roots/{root}` and `/v1/tree/notes/{id}/zero-path` are gone;
+  `/v1/tree/root` adds `block_hash`, health reports `state_note_count`
+  instead of `known_root_count`, and `--bootstrap-from-state` rebuilds the
+  tree from `noteLeaves` pages pinned to one block hash. serverd serves
+  `GET /metrics` and reports a `degraded` `/health` (still HTTP 200) when the
+  indexer's root disagrees with the vault's.
+- **SDK.** The package export `./withdrawal-root` is replaced by
+  `./tree-rebuild`; `prepareWithdrawal` no longer takes `expectedActiveRoot`
+  or `refusedRoot`, and deposits below `min_deposit_units` are refused with
+  `deposit_too_small`. The companion drops `GET /oa/v1/deposit/path` and the
+  deposit-prepare reply's `active_root` and `zero_path`.
 - **Gasless paymaster.** `PM_VERIFICATION_FLOOR` is 340,000 (was 350,000);
   `NoteLeafMismatch` and `InvalidNoteFields` replace `UnknownRoot`.
 - **Challenge signer.** `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` defaults to
