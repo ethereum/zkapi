@@ -1,0 +1,151 @@
+import ZkapiFormal.Audit.Command
+import ZkapiFormal.Poseidon.Sponge
+import ZkapiFormal.Poseidon.Deployed
+import ZkapiFormal.Vectors
+import ZkapiFormal.VectorsMerkle
+import ZkapiFormal.Lazy.Permutation
+import ZkapiFormal.Lazy.Paths
+import ZkapiFormal.Lazy.WordVectors
+import ZkapiFormal.Yul.Entry
+import ZkapiFormal.Yul.Vectors
+
+/-! Fail the build if a checked theorem depends on an admission or an axiom beyond Lean's
+standard `propext`, `Classical.choice` and `Quot.sound`. This audits the named results; it does
+not discharge their hypotheses (they are stated in the theorems: word-sized or arbitrary inputs,
+and for the Yul theorems the calldata size). -/
+
+-- Specification sanity
+assert_standard_axioms Zkapi.Poseidon.hash5_eq_hashFields
+assert_standard_axioms Zkapi.Poseidon.domainNode_eq
+assert_standard_axioms Zkapi.Poseidon.domainLeaf_eq
+
+-- Sparse (deployed) schedule = reference, on every state
+assert_standard_axioms Zkapi.Poseidon.Sparse.permute_eq_reference
+assert_standard_axioms Zkapi.Poseidon.Sparse.deployed_constants
+
+-- Scaled sparse schedule (new implementation) = reference, on every state
+assert_standard_axioms Zkapi.Poseidon.Scaled.permute_eq_sparse
+assert_standard_axioms Zkapi.Poseidon.Scaled.permute_eq_reference
+assert_standard_axioms Zkapi.Poseidon.Scaled.permute_eq_reference'
+assert_standard_axioms Zkapi.Poseidon.Scaled.compress_eq_reference
+assert_standard_axioms Zkapi.Poseidon.Scaled.hash5_eq_reference
+assert_standard_axioms Zkapi.Poseidon.Scaled.absorb_eq_reference
+assert_standard_axioms Zkapi.Poseidon.Scaled.hashFields_eq_reference
+
+-- Known-answer vectors (kernel evaluation)
+assert_standard_axioms Zkapi.Vectors.arkworks_permute_0
+assert_standard_axioms Zkapi.Vectors.arkworks_permute_1
+assert_standard_axioms Zkapi.Vectors.arkworks_permute_2
+assert_standard_axioms Zkapi.Vectors.arkworks_permute_3
+assert_standard_axioms Zkapi.Vectors.arkworks_permute_4
+assert_standard_axioms Zkapi.Vectors.solidity_compress_0
+assert_standard_axioms Zkapi.Vectors.solidity_compress_1
+assert_standard_axioms Zkapi.Vectors.solidity_hash5_0
+assert_standard_axioms Zkapi.Vectors.zero_hashes_eq
+assert_standard_axioms Zkapi.Vectors.empty_root
+assert_standard_axioms Zkapi.Vectors.rust_merkle_node_0
+assert_standard_axioms Zkapi.Vectors.rust_merkle_node_1
+assert_standard_axioms Zkapi.Vectors.rust_merkle_node_2
+assert_standard_axioms Zkapi.Vectors.rust_merkle_node_3
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_0
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_1
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_2
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_3
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_4
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_5
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_6
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_7
+assert_standard_axioms Zkapi.Vectors.rust_hash_fields_8
+assert_standard_axioms Zkapi.Vectors.rust_hash_felts_reduced_0
+assert_standard_axioms Zkapi.Vectors.rust_hash_felts_reduced_1
+assert_standard_axioms Zkapi.Vectors.rust_note_leaf_0
+assert_standard_axioms Zkapi.Vectors.rust_note_leaf_1
+assert_standard_axioms Zkapi.Vectors.rust_note_leaf_2
+assert_standard_axioms Zkapi.Vectors.rust_note_leaf_3
+assert_standard_axioms Zkapi.Vectors.rust_note_leaf_4
+assert_standard_axioms Zkapi.Vectors.rust_note_leaf_5
+assert_standard_axioms Zkapi.Vectors.rust_note_leaf_6
+assert_standard_axioms Zkapi.Vectors.rust_registration_commitment_0
+assert_standard_axioms Zkapi.Vectors.rust_registration_commitment_1
+assert_standard_axioms Zkapi.Vectors.rust_registration_commitment_2
+assert_standard_axioms Zkapi.Vectors.rust_merkle_root_0
+assert_standard_axioms Zkapi.Vectors.rust_merkle_root_1
+assert_standard_axioms Zkapi.Vectors.rust_merkle_root_2
+assert_standard_axioms Zkapi.Vectors.insertPath32_root_0
+assert_standard_axioms Zkapi.Vectors.insertPath32_root_1
+assert_standard_axioms Zkapi.Vectors.insertPath32_root_2
+
+-- Lazy reduction (integer level)
+assert_standard_axioms Zkapi.Lazy.lzW_spec
+assert_standard_axioms Zkapi.Lazy.full_first_spec
+assert_standard_axioms Zkapi.Lazy.full_spec
+assert_standard_axioms Zkapi.Lazy.partial_spec
+assert_standard_axioms Zkapi.Lazy.last_spec
+assert_standard_axioms Zkapi.Lazy.program_spec
+assert_standard_axioms Zkapi.Lazy.wordPermute_eq
+assert_standard_axioms Zkapi.Lazy.wordPermute_safe
+assert_standard_axioms Zkapi.Lazy.program_lits
+assert_standard_axioms Zkapi.Lazy.program_words
+assert_standard_axioms Zkapi.Lazy.program_words_prefix
+assert_standard_axioms Zkapi.Lazy.compressWord_eq
+assert_standard_axioms Zkapi.Lazy.hash5Word_eq
+assert_standard_axioms Zkapi.Lazy.fullStmts_from_3p
+assert_standard_axioms Zkapi.Lazy.partialStmts_from_3p_4p
+assert_standard_axioms Zkapi.Lazy.partialStmts_from_3p_5p
+assert_standard_axioms Zkapi.Lazy.phase2_bounds
+assert_standard_axioms Zkapi.Lazy.phase4_bounds
+assert_standard_axioms Zkapi.Lazy.wordPermute_arkworks_0
+assert_standard_axioms Zkapi.Lazy.wordPermute_arkworks_1_reduces
+assert_standard_axioms Zkapi.Lazy.compressWord_solidity_0
+assert_standard_axioms Zkapi.Lazy.compressWord_solidity_1
+assert_standard_axioms Zkapi.Lazy.hash5Word_solidity_0
+assert_standard_axioms Zkapi.Lazy.compressWord_reduces
+assert_standard_axioms Zkapi.Lazy.compressWord_full_width
+assert_standard_axioms Zkapi.Lazy.compress_full_width
+assert_standard_axioms Zkapi.Lazy.hash5Word_full_width
+assert_standard_axioms Zkapi.Lazy.hash5_full_width
+
+-- The Merkle-path loops on words
+assert_standard_axioms Zkapi.Lazy.pathNodeW_eq
+assert_standard_axioms Zkapi.Lazy.insertPath32Word_eq
+assert_standard_axioms Zkapi.Lazy.insertPath32Word_root
+assert_standard_axioms Zkapi.Lazy.compressPairPath32Word_eq
+
+-- The Yul source: parsed by the kernel, Yul semantics, generic simulation
+assert_standard_axioms Zkapi.Yul.Frag.execS_flat
+assert_standard_axioms Zkapi.Yul.Frag.execL_flat
+assert_standard_axioms Zkapi.Yul.execS_unemb
+assert_standard_axioms Zkapi.Yul.execL_unemb
+assert_standard_axioms Zkapi.Yul.beqS_eq
+assert_standard_axioms Zkapi.Yul.loop_count
+assert_standard_axioms Zkapi.Yul.exec_for
+assert_standard_axioms Zkapi.Yul.blockOK_source
+assert_standard_axioms Zkapi.Yul.blockAst_spec
+assert_standard_axioms Zkapi.Yul.permute_body
+assert_standard_axioms Zkapi.Yul.yul_permute
+
+-- The runtime's entry points, for all calldata
+assert_standard_axioms Zkapi.Yul.exec_compressArm
+assert_standard_axioms Zkapi.Yul.exec_hash5Arm
+assert_standard_axioms Zkapi.Yul.exec_insertArm
+assert_standard_axioms Zkapi.Yul.exec_pairArm
+assert_standard_axioms Zkapi.Yul.runtime_block
+assert_standard_axioms Zkapi.Yul.runtime_fallback
+assert_standard_axioms Zkapi.Yul.runtime_compress
+assert_standard_axioms Zkapi.Yul.runtime_hash5
+assert_standard_axioms Zkapi.Yul.runtime_insertPath32
+assert_standard_axioms Zkapi.Yul.runtime_insertPath32_root
+assert_standard_axioms Zkapi.Yul.runtime_compressPairPath32
+
+-- Known answers: the kernel runs the parsed runtime
+assert_standard_axioms Zkapi.Yul.yul_compress_node
+assert_standard_axioms Zkapi.Yul.yul_compress_node_reduces
+assert_standard_axioms Zkapi.Yul.yul_hash5
+assert_standard_axioms Zkapi.Yul.yul_compress_short
+assert_standard_axioms Zkapi.Yul.yul_unknown_selector
+assert_standard_axioms Zkapi.Yul.yul_insertPath32_dirty_index
+assert_standard_axioms Zkapi.Yul.yul_callvalue
+assert_standard_axioms Zkapi.Yul.yul_permute_branch_taken
+
+-- Every declaration of the project, including definitions and generated auxiliaries.
+assert_standard_axioms_in Zkapi

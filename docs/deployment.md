@@ -101,9 +101,11 @@ its vault's, treat it as compromised and follow
 
 ## Contracts
 
-`demo/contracts/script/Deploy.s.sol` links (or deploys) the `Bn254Poseidon`
-library, deploys the circuit's Groth16 adapter and the native-only vault with
-its 11 constructor arguments, and checks the adapter's circuit and
+`demo/contracts/script/Deploy.s.sol` deploys (or reuses) the vault's Poseidon,
+`Bn254PoseidonRuntime`, after requiring its runtime code hash to be the
+`runtime_codehash` of the setup's `poseidon-runtime.json`, deploys the circuit's
+Groth16 adapter and the native-only vault with its 12 constructor arguments
+(the Poseidon runtime's address last), and checks the adapter's circuit and
 verifying-key hashes against the setup manifest and the vault's getters
 against the inputs. The adapter is folded for its vault: its constructor takes
 the vault's address (the deployer's next creation, predicted with its nonce)
@@ -120,8 +122,16 @@ gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint
 v0.7.0, stakes it and its transit-account factory, funds its deposit and
 checks its getters ([below](#gasless-withdrawals)). Its header lists the
 environment it reads, and `demo/contracts/foundry.toml` notes how to run it
-with `forge script`. The script links the library itself; no
-`FOUNDRY_REMAPPINGS` override is needed.
+with `forge script`. The vault links no library, so no `FOUNDRY_REMAPPINGS`
+override is needed: it keeps the runtime's address as an immutable and calls
+it with `STATICCALL`, so the hasher can never touch the vault's state. The
+runtime is compiled with solc's legacy pipeline (both `foundry.toml` files
+restrict `src/poseidon/Bn254PoseidonRuntime.sol` to it), its `permute` body is
+the program `protocol/formal` proves equal to zkAPI's Poseidon, and it is
+deployed from its artifact. The manifest keeps the field names
+`poseidonLibrary`, `poseidonLibraryReused` and `poseidonRuntimeCodehash` (and
+the profiles `poseidon_library_address` and `poseidon_runtime_codehash`): they
+name the runtime contract.
 
 | Variable | Meaning |
 | --- | --- |
@@ -136,7 +146,7 @@ with `forge script`. The script links the library itself; no
 | `REQUEST_CHARGE_CAP` | Per-request gwei limit; the script default is 1,000,000, the published deployments use 50,000, so pass it explicitly |
 | `SETUP_MANIFEST` | The setup's `manifest.json`; the adapter's hashes must match it. Required except on local chains (default `protocol/setup/v2-concession-dev`) |
 | `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains, Mainnet included ([Single-party setup](#single-party-setup)). Recorded as `allowDevSetup`; default 0 |
-| `POSEIDON_ADDRESS` | An already deployed `Bn254Poseidon` to link; its runtime code hash must equal the compiled library's. Unset deploys a fresh library |
+| `POSEIDON_ADDRESS` | An already deployed `Bn254PoseidonRuntime` to reuse (it holds no state and no address of its own, so one deployment serves every vault on a chain); its runtime code hash must equal `runtime_codehash` in the `poseidon-runtime.json` next to `SETUP_MANIFEST`. Unset deploys a fresh one |
 | `CHAIN_ID` | Optional expected chain ID; a mismatch aborts |
 | `GASLESS` | `1` (default) deploys the gasless-withdrawal paymaster after the vault; `0` skips the block and writes `withdrawalPaymaster: null`. `1` is refused, before anything is broadcast, on a chain that prices a fresh storage slot above 25,000 gas, such as Sepolia today ([gas schedule](#gas-schedule)): deploy there with `GASLESS=0`. A `forge script` dry run without an RPC has no EntryPoint code, so it needs `GASLESS=0`. An Anvil started with a public chain ID (for example Sepolia's 11155111, as the acceptance harness does) is a public chain to the script: it needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI`, or `GASLESS=0` |
 | `ENTRY_POINT` | The ERC-4337 EntryPoint v0.7.0; default the canonical `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Its runtime must hash to `0x8db5ff69…fc58`, and the SenderCreator at `0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C` to `0x283c9d14…a7689`; on Anvil etch both first (`cast rpc anvil_setCode` from `protocol/contracts/test/fixtures/*.runtime.hex`, as CI does) |
@@ -649,8 +659,12 @@ initiation (about 643,000 gas, `handleOpsRealEscape` in
 `protocol/contracts/snapshots/gasless-gas.json`) on top of the existing
 challenge (about 284,000 gas, `challengeEscapeWithdrawal` in
 `snapshots/concession-exit-gas.json`) when the escape is defeated, against
-the attacker's deposit gas (about 1.0M, recovered later): roughly 1:1, about
-0.93M of the operator's gas per 1.0M of the attacker's. Enable it on the
+the attacker's deposit gas (about 0.58M per transaction, 573,516 to 609,678
+in `GasBaseline.t.sol`, recovered later): about 0.93M of the operator's gas per
+0.58M of the attacker's, roughly 1.6:1 against the operator. The Poseidon
+runtime made deposits about 40% cheaper and moved this ratio from about 1:1;
+review it, and if needed raise `minEscapeNetWei` or the deposit floor, before
+enabling sponsored escapes anywhere but a drill. Enable it on the
 Sepolia drill, and decide for mainnet from the `EscapeInitiationOwed` and
 `owedPaid` data. Keep `minEscapeNetWei` at least 10 × a typical initiation
 plus finalization cost. While it is disabled, escapes are sponsored only at

@@ -472,11 +472,14 @@ ignore its Phases 1 to 4, which this runbook replaces.
    rebuild the WebAssembly with `bash scripts/build-browser-client.sh --setup mpc-1`,
    which also copies the keys into `sdk/assets/proofs/` and rewrites
    `sdk/assets/manifest.json`. Commit
-   `protocol/setup/v2-concession/manifest.json`: `Deploy.s.sol` checks an
-   `mpc-1` deployment against it. Then `npm run verify:wasm` must reproduce
-   the WebAssembly byte for byte.
+   `protocol/setup/v2-concession/manifest.json` together with the
+   `Bn254PoseidonRuntime.sol` and `poseidon-runtime.json` that `import_zkey`
+   writes next to it: `Deploy.s.sol` checks an `mpc-1` deployment against the
+   manifest, and refuses to run without a `poseidon-runtime.json` next to
+   `SETUP_MANIFEST` (its `runtime_codehash` pins the Poseidon runtime). Then
+   `npm run verify:wasm` must reproduce the WebAssembly byte for byte.
 5. **Expected codehashes.** Publish the expected runtime code hashes of the
-   vault, adapter and library for each deployment's constructor arguments,
+   vault, adapter and Poseidon runtime for each deployment's constructor arguments,
    computed from source by `node scripts/expected-codehashes.mjs` (it takes
    the arguments as flags, or reads a deployment manifest with
    `--deployment`). Anyone can rebuild the Forge artifacts with the pinned
@@ -674,10 +677,13 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    multisig, ideally behind a timelock), `TREASURY`, the four key
    coordinates, the Sepolia production parameters,
    `SETUP_MANIFEST=../../protocol/setup/v2-concession/manifest.json`,
-   optionally `POSEIDON_ADDRESS` (an existing library with the compiled
-   codehash) and `CHAIN_ID=11155111`; see [the contract notes](deployment.md#contracts).
-   The script checks the keys, links the library, deploys the adapter and
-   the vault with 11 constructor arguments, checks the adapter's
+   optionally `POSEIDON_ADDRESS` (an already deployed `Bn254PoseidonRuntime`
+   whose runtime code hash is the `runtime_codehash` of the
+   `poseidon-runtime.json` next to `SETUP_MANIFEST`) and `CHAIN_ID=11155111`;
+   see [the contract notes](deployment.md#contracts). The script checks the
+   keys, deploys (or reuses) the Poseidon runtime after checking its code hash
+   against that pin, deploys the adapter and the vault with 12 constructor
+   arguments (the Poseidon runtime's address last), checks the adapter's
    `CIRCUIT_ID_HASH()` and verifying-key hashes against the setup manifest,
    and writes only the provisional manifest `$OUTPUT_PATH.pending`.
 
@@ -830,7 +836,7 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    binding before they migrate anything, and refuse a database bound to
    another deployment, including the legacy vault's, and one whose binding
    cannot be read. Each daemon refuses a placeholder or provisional
-   manifest, and checks the vault, the adapter and the library against it.
+   manifest, and checks the vault, the adapter and the Poseidon runtime against it.
    **The challenger must be healthy, with its alerting armed, before the
    first deposit.**
 8. **Acceptance.** Run the Docker guide's acceptance checks: `/health` and
@@ -1382,7 +1388,9 @@ initiation (about 643,000 gas, `handleOpsRealEscape` in
 `protocol/contracts/snapshots/gasless-gas.json`) on top of the operator's
 challenge (about 284,000 gas, `challengeEscapeWithdrawal` in
 `snapshots/concession-exit-gas.json`), against the attacker's deposit gas
-(about 1.0M, recovered later): roughly 1:1. Enable them only on the drill
+(about 0.58M per transaction, recovered later): roughly 1.6:1 against the
+operator, since the Poseidon runtime made deposits about 40% cheaper
+([deployment notes](deployment.md#operating-gasless-withdrawals)). Enable them only on the drill
 vault, and decide for mainnet from the `EscapeInitiationOwed` and
 `owedPaid` data.
 Without them, escapes are sponsored at finalization only.

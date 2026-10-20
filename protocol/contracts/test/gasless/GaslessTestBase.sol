@@ -5,7 +5,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {console} from "forge-std/console.sol";
 import {ZkApiVault} from "../../src/ZkApiVault.sol";
 import {Types} from "../../src/libraries/Types.sol";
-import {Bn254Poseidon} from "../../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "../reference/Bn254PoseidonReference.sol";
 import {IAccount, IEntryPoint, IPaymaster, PackedUserOperation} from "../../src/gasless/IERC4337.sol";
 import {IZkApiProofAdapter} from "../../src/interfaces/IZkApiProofAdapter.sol";
 import {ZkApiWithdrawalAccount} from "../../src/gasless/ZkApiWithdrawalAccount.sol";
@@ -338,7 +338,7 @@ abstract contract GaslessTestBase is VaultTestBase {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
         vm.setNonce(DEPLOYER, 0);
         vm.startPrank(DEPLOYER);

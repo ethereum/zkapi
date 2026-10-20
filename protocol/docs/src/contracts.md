@@ -7,13 +7,26 @@ signing keys, the proof adapter, the challenge period, the note lifetime and
 the maximum pause. Amounts are bounded by `2^53 - 1` gwei.
 
 [NoteLeafLib](../../contracts/src/libraries/NoteLeafLib.sol) and
-[MerkleUpdateLib](../../contracts/src/libraries/MerkleUpdateLib.sol) use the
-[BN254 Poseidon implementation](../../contracts/src/libraries/Bn254Poseidon.sol)
-shared with the circuit parameters (a leaf is the sponge over its five fields;
-a node is one permutation with the domain in the capacity lane, `compress`).
-The library is generated with the setup (`zkapi-proof`'s `refresh_setup_sources`
-example rewrites it) in the optimized form of the Poseidon reference
-implementation. Only `deposit` and `retireClosedLeaf` update the tree:
+[MerkleUpdateLib](../../contracts/src/libraries/MerkleUpdateLib.sol) hash
+with the vault's
+[BN254 Poseidon runtime](../../contracts/src/poseidon/Bn254PoseidonRuntime.sol)
+(the circuit's parameters; a leaf is the sponge over its five fields, a node
+one permutation with the domain in the capacity lane, `compress`). It is a
+separate contract whose address the vault takes in its constructor and calls
+with `STATICCALL` ([IBn254Poseidon](../../contracts/src/interfaces/IBn254Poseidon.sol)),
+so it can never change the vault's state. It is generated with the setup
+(`zkapi-proof`'s `refresh_setup_sources` example rewrites it and its
+`poseidon-runtime.json`, which pins its source hash and runtime codehash) and
+compiled with solc's legacy pipeline: one inline-assembly block, the
+permutation fully unrolled in the scaled sparse form with lazy modular
+reduction (about 12,700 gas per permutation, against 23,400 for the looped
+library it replaced, which the tests keep as their reference implementation;
+solc's stack shuffling costs about 1,260 gas per permutation more than the
+hand-scheduled bytecode prototype's 11,468, about 46k per deposit and 89k per
+retirement, the price of a source that the proof checks).
+[protocol/formal](../../formal/README.md) proves in Lean that the body of its
+`permute` computes zkAPI's Poseidon for all inputs. Only `deposit` and
+`retireClosedLeaf` update the tree:
 `MerkleUpdateLib` keeps the tree's frontier, so a deposit appends its leaf
 without a Merkle proof (32 compressions) and deposits never invalidate each
 other, while a retirement proves the leaf's siblings at the live root and

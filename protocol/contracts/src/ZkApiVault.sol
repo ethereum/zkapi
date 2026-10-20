@@ -11,6 +11,7 @@ import {MerkleUpdateLib} from "./libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "./libraries/NoteLeafLib.sol";
 import {ReentrancyGuardTransient} from "./libraries/ReentrancyGuardTransient.sol";
 import {IZkApiProofAdapter} from "./interfaces/IZkApiProofAdapter.sol";
+import {IBn254Poseidon} from "./interfaces/IBn254Poseidon.sol";
 
 /// @title ZkApiVault
 /// @notice Native ETH settlement in whole gwei with in-protocol BN254 Groth16 verification, for
@@ -26,6 +27,9 @@ import {IZkApiProofAdapter} from "./interfaces/IZkApiProofAdapter.sol";
 ///      transferOwnership only nominates pendingOwner, and the current owner keeps every power
 ///      (including unpause and replacing the nomination) until the nominee calls acceptOwnership.
 ///      A mistyped or unusable nominee therefore cannot leave a paused vault without an owner.
+///      The note tree's hashing (deposit's leaf and insertion, retireClosedLeaf's two paths) is done
+///      by `poseidon`, a Bn254PoseidonRuntime deployed separately and called with STATICCALL, so it
+///      can never change the vault's state.
 contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     uint16 public constant PROTOCOL_VERSION = 2;
     /// @notice Capability marker of the concession exit (vault revision 3).
@@ -83,6 +87,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     /// @notice Longest time a pause blocks initiateEscapeWithdrawal and mutualClose; at least
     ///         2 * challengePeriod.
     uint64 public immutable maxPauseDuration;
+    /// @notice The Poseidon contract (src/poseidon/Bn254PoseidonRuntime.sol) that hashes the note
+    ///         tree: leaves (hash5) and Merkle paths (insertPath32, compressPairPath32).
+    IBn254Poseidon public immutable poseidon;
 
     address public treasury;
     bool public paused;
@@ -144,7 +151,8 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         uint256 clearanceSigningKeyX_,
         uint256 clearanceSigningKeyY_,
         address owner_,
-        uint64 maxPauseDuration_
+        uint64 maxPauseDuration_,
+        address poseidon_
     ) Ownable(owner_) {
         if (
             treasury_ == address(0) || proofAdapter_ == address(0) || challengePeriod_ == 0
@@ -159,6 +167,13 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         if (
             (stateSigningKeyX_ == 0 && stateSigningKeyY_ == 0)
                 || (clearanceSigningKeyX_ == 0 && clearanceSigningKeyY_ == 0)
+        ) revert Errors.InvalidDeploymentBinding();
+        // The hasher must be a contract that answers compress(DOMAIN_NODE, 0, 0) with the tree's
+        // first zero hash: a guard against a wrong address (an account without code, or another
+        // contract of the deployment). Its identity is pinned by its runtime codehash off chain.
+        if (
+            poseidon_.code.length == 0
+                || MerkleUpdateLib.poseidonNodeHash(IBn254Poseidon(poseidon_), 0, 0) != MerkleUpdateLib.zeroHash(1)
         ) revert Errors.InvalidDeploymentBinding();
 
         if (requestChargeCap_ == 0 || requestChargeCap_ > MAX_NATIVE_UNITS) {
@@ -177,6 +192,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         clearanceSigningKeyX = clearanceSigningKeyX_;
         clearanceSigningKeyY = clearanceSigningKeyY_;
         maxPauseDuration = maxPauseDuration_;
+        poseidon = IBn254Poseidon(poseidon_);
         currentRoot = MerkleUpdateLib.EMPTY_ROOT;
         knownRoots[MerkleUpdateLib.EMPTY_ROOT] = true;
     }
@@ -196,8 +212,8 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         uint256 bucketedExpiry = ((rawExpiry + EXPIRY_BUCKET - 1) / EXPIRY_BUCKET) * EXPIRY_BUCKET;
         if (bucketedExpiry > type(uint64).max) revert Errors.InvalidFelt();
         uint64 expiryTs = uint64(bucketedExpiry);
-        uint256 newLeaf = NoteLeafLib.computeLeaf(noteId, commitment, amount, expiryTs);
-        uint256 newRoot = MerkleUpdateLib.insert(_filledSubtrees, noteId, newLeaf);
+        uint256 newLeaf = NoteLeafLib.computeLeaf(poseidon, noteId, commitment, amount, expiryTs);
+        uint256 newRoot = MerkleUpdateLib.insert(poseidon, _filledSubtrees, noteId, newLeaf);
 
         _setCurrentRoot(newRoot);
         notes[noteId] = Types.Note(commitment, amount, expiryTs, Types.NoteStatus.Active);
@@ -397,8 +413,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     function retireClosedLeaf(uint32 noteId, uint256[32] calldata siblings) external nonReentrant {
         Types.Note storage note = notes[noteId];
         if (note.status != Types.NoteStatus.Closed) revert Errors.NoteNotClosed();
-        uint256 newRoot =
-            MerkleUpdateLib.retire(_filledSubtrees, nextNoteId, currentRoot, noteId, _leaf(noteId, note), siblings);
+        uint256 newRoot = MerkleUpdateLib.retire(
+            poseidon, _filledSubtrees, nextNoteId, currentRoot, noteId, _leaf(noteId, note), siblings
+        );
         _setCurrentRoot(newRoot);
         emit ClosedLeafRetired(noteId, newRoot);
     }
@@ -687,7 +704,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     }
 
     function _leaf(uint32 noteId, Types.Note storage note) private view returns (uint256) {
-        return NoteLeafLib.computeLeaf(noteId, note.commitment, note.depositAmount, note.expiryTs);
+        return NoteLeafLib.computeLeaf(poseidon, noteId, note.commitment, note.depositAmount, note.expiryTs);
     }
 
     function _requireField(uint256 value) private pure {

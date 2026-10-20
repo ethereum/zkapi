@@ -7,12 +7,13 @@ import {ZkApiVault} from "../../src/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "../../src/adapters/Groth16ProofAdapter.sol";
 import {Types} from "../../src/libraries/Types.sol";
 import {Errors} from "../../src/libraries/Errors.sol";
-import {Bn254Poseidon} from "../../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "../reference/Bn254PoseidonReference.sol";
 import {NoteLeafLib} from "../../src/libraries/NoteLeafLib.sol";
 import {PackedUserOperation} from "../../src/gasless/IERC4337.sol";
 import {ZkApiWithdrawalAccountFactory} from "../../src/gasless/ZkApiWithdrawalAccountFactory.sol";
 import {ZkApiWithdrawalPaymaster} from "../../src/gasless/ZkApiWithdrawalPaymaster.sol";
 import {GaslessTestBase, EntryPointDriver} from "./GaslessTestBase.sol";
+import {PoseidonRuntime, ReferenceHashes} from "../helpers/PoseidonRuntime.sol";
 
 /// @dev Etched over the real factory: the real CREATE2 computation (same creation code, same gas),
 ///      except that one (owner, payee) pair maps to the golden close's destination, so a transit
@@ -100,7 +101,7 @@ abstract contract RealAdapterBase is GaslessTestBase {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             goldenEmptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
         (escapeInputs, escapeProof) = _golden("escape_a2_concede");
         Types.WithdrawalPublicInputs memory escape = escapeInputs;
@@ -126,7 +127,8 @@ abstract contract RealAdapterBase is GaslessTestBase {
             escape.clearanceSigningKeyX,
             escape.clearanceSigningKeyY,
             GOLDEN_OWNER,
-            7 days
+            7 days,
+            PoseidonRuntime.etch()
         );
         assertEq(address(vault), escape.contractAddress, "golden vault");
         vm.deal(GOLDEN_USER, 10 ether);
@@ -234,7 +236,7 @@ abstract contract RealAdapterBase is GaslessTestBase {
     function _goldenLeaf(uint32 noteId) internal view returns (uint256) {
         if (noteId >= vault.nextNoteId()) return 0;
         (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiry);
+        return ReferenceHashes.leaf(noteId, commitment, amount, expiry);
     }
 
     function _goldenPath(uint32 index) internal view returns (uint256[32] memory siblings) {

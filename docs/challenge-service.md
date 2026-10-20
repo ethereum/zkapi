@@ -450,8 +450,10 @@ which refuses every retirement when it is `false`.
 
 ### The signer's retirement budget
 
-A leaf retirement costs about 6M gas, far more than a defeat or a raise, so
-the bundled signer bounds what a compromised daemon host could spend on it:
+A leaf retirement costs about 0.94M gas (`GasBaselineRetire` in
+`protocol/contracts/test/GasBaseline.t.sol`), about three times a defeat or a
+raise, so the bundled signer bounds what a compromised daemon host could spend
+on it:
 
 - it signs `retireClosedLeaf` only while `ZKAPI_CHALLENGE_RETIRE_ON_MISS` is
   on (`retirement_disabled` otherwise), and only for a note whose escape

@@ -14,15 +14,16 @@ import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 import {SetupPolicy} from "./SetupPolicy.sol";
 
 /// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v1, vault revision 3).
-/// @notice Links (or deploys) the Bn254Poseidon library, deploys the circuit-specific Groth16
-///         verifier folded for the vault (the address the vault gets next, the chain and the
-///         signing keys) and the native ETH ZkApiVault with its 11 constructor arguments, checks the
+/// @notice Deploys (or reuses) the vault's Poseidon, Bn254PoseidonRuntime, after checking its
+///         runtime codehash against the setup's poseidon-runtime.json, deploys the circuit-specific
+///         Groth16 verifier folded for the vault (the address the vault gets next, the chain and the
+///         signing keys) and the native ETH ZkApiVault with its 12 constructor arguments, checks the
 ///         adapter's circuit and verifying-key hashes against the setup manifest, its folded
 ///         constants against the vault's and its folded points against the manifest's verifying
 ///         keys, and the vault's getters against the inputs, then (unless GASLESS=0) deploys the
 ///         gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same
 ///         broadcast, stakes it and its transit-account factory, funds its deposit and checks its
-///         getters, and writes the provisional deployment manifest, including the linked addresses
+///         getters, and writes the provisional deployment manifest, including the Poseidon address
 ///         and every runtime codehash, to $OUTPUT_PATH.pending.
 /// @dev    forge runs run() locally before it sends any transaction, so every check here and the
 ///         provisional manifest describe the simulated deployment: its addresses assume the
@@ -38,8 +39,10 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///         that created the vault) and deploymentStatus "deployed". Profiles take their pins and
 ///         deploy_block from $OUTPUT_PATH only. A dry run (no --broadcast) writes deploymentStatus
 ///         "simulated", which finalize refuses.
-///         The script links the vault itself (creation code from out/ZkApiVault.sol/ZkApiVault.json
-///         with the library placeholder replaced), so forge never links it.
+///         The vault links no library: it takes the Poseidon runtime's address as its last
+///         constructor argument (an immutable, called with STATICCALL). The runtime is compiled
+///         with the legacy pipeline (foundry.toml compilation_restrictions; script/PoseidonRuntime
+///         Artifact.sol pulls it into out/) and deployed from its artifact.
 ///         The gasless block needs the canonical EntryPoint v0.7.0 runtime at ENTRY_POINT and the
 ///         SenderCreator runtime at 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C, both pinned by
 ///         keccak256 (the paymaster's constructor pins the EntryPoint the same way): on a public
@@ -83,9 +86,10 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///                         included (the Sepolia drill vault, or a vault that trusts its
 ///                         setup's generator not to forge proofs); recorded in the manifest
 ///                         as allowDevSetup. Default 0.
-///           POSEIDON_ADDRESS – an already deployed Bn254Poseidon to link; its runtime codehash
-///                         must equal the compiled library's at that address. Unset deploys a
-///                         fresh library.
+///           POSEIDON_ADDRESS – an already deployed Bn254PoseidonRuntime to reuse; its runtime
+///                         codehash must equal runtime_codehash of poseidon-runtime.json in the
+///                         directory of SETUP_MANIFEST (as must the compiled runtime's). Unset
+///                         deploys a fresh one.
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
 ///         Gasless withdrawals (ERC-4337):
 ///           GASLESS     – 1 (default) deploys ZkApiWithdrawalPaymaster after the vault; 0 skips
@@ -131,6 +135,11 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     uint64 internal constant LOCAL_MAX_PAUSE_DURATION = 7 days;
     uint256 internal constant VAULT_REVISION = 3;
     string internal constant DEFAULT_SETUP_MANIFEST = "../../protocol/setup/v2-concession-dev/manifest.json";
+    /// The vault's Poseidon, legacy-compiled, by its artifact path (a name lookup does not find
+    /// artifacts of the additional compiler profile).
+    string internal constant POSEIDON_ARTIFACT = "out/Bn254PoseidonRuntime.sol/Bn254PoseidonRuntime.json";
+    /// The setup file that pins the runtime (zkapi-proof poseidon_runtime.rs), next to SETUP_MANIFEST.
+    string internal constant POSEIDON_RUNTIME_MANIFEST = "poseidon-runtime.json";
     /// Largest integer a JSON number carries exactly in JavaScript (Number.MAX_SAFE_INTEGER).
     uint256 internal constant MAX_SAFE_INTEGER = 9_007_199_254_740_991;
 
@@ -180,6 +189,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         bool allowDevSetup;
         /// The manifest itself, whose verifying keys' IC points the adapter's fold is checked against.
         string manifest;
+        /// runtime_codehash of the setup's poseidon-runtime.json: the only Poseidon code deployed.
+        bytes32 poseidonCodehash;
     }
 
     /// The gasless block's inputs (GASLESS and the PAYMASTER_* variables).
@@ -224,46 +235,44 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         if (g.enabled) _requireSponsorableGasSchedule();
 
         address poseidonIn = vm.envOr("POSEIDON_ADDRESS", address(0));
-        bytes memory poseidonRuntime = vm.getDeployedCode("Bn254Poseidon.sol:Bn254Poseidon");
+        require(
+            keccak256(vm.getDeployedCode(POSEIDON_ARTIFACT)) == setup.poseidonCodehash,
+            "the compiled Bn254PoseidonRuntime is not the runtime poseidon-runtime.json pins"
+        );
         if (poseidonIn != address(0)) {
             require(
-                poseidonIn.codehash == _libraryCodehash(poseidonRuntime, poseidonIn),
-                "POSEIDON_ADDRESS runtime code is not the compiled Bn254Poseidon"
+                poseidonIn.codehash == setup.poseidonCodehash,
+                "POSEIDON_ADDRESS runtime code is not the pinned Bn254PoseidonRuntime"
             );
         }
 
         vm.startBroadcast(deployerKey);
         Deployed memory d;
         d.poseidonReused = poseidonIn != address(0);
-        d.poseidon = d.poseidonReused ? poseidonIn : _create(vm.getCode("Bn254Poseidon.sol:Bn254Poseidon"));
+        d.poseidon = d.poseidonReused ? poseidonIn : _create(vm.getCode(POSEIDON_ARTIFACT));
         // The adapter folds the vault's address into its verifying keys: the vault is the deployer's
         // next creation after the adapter. Checked against the deployed vault below (_checkAdapter).
         address predictedVault = vm.computeCreateAddress(p.deployer, vm.getNonce(p.deployer) + 1);
         d.adapter = new Groth16ProofAdapter(predictedVault, p.stateKeyX, p.stateKeyY, p.clearanceKeyX, p.clearanceKeyY);
-        d.vault = ZkApiVault(
-            _create(
-                abi.encodePacked(
-                    _linkedVaultCreationCode(d.poseidon),
-                    abi.encode(
-                        p.treasury,
-                        p.noteTtl,
-                        p.challengePeriod,
-                        p.requestChargeCap,
-                        address(d.adapter),
-                        p.stateKeyX,
-                        p.stateKeyY,
-                        p.clearanceKeyX,
-                        p.clearanceKeyY,
-                        p.owner,
-                        p.maxPauseDuration
-                    )
-                )
-            )
+        d.vault = new ZkApiVault(
+            p.treasury,
+            p.noteTtl,
+            p.challengePeriod,
+            p.requestChargeCap,
+            address(d.adapter),
+            p.stateKeyX,
+            p.stateKeyY,
+            p.clearanceKeyX,
+            p.clearanceKeyY,
+            p.owner,
+            p.maxPauseDuration,
+            d.poseidon
         );
         if (g.enabled) _deployGasless(d, p, g);
         vm.stopBroadcast();
 
-        require(d.poseidon.codehash == _libraryCodehash(poseidonRuntime, d.poseidon), "linked library codehash");
+        // Before anything is written: the vault's Poseidon is the pinned runtime.
+        require(d.poseidon.codehash == setup.poseidonCodehash, "Bn254PoseidonRuntime codehash");
         _checkAdapter(d, setup);
         _checkVault(d, p);
         if (g.enabled) _checkGasless(d, p, g);
@@ -372,6 +381,17 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             facts.ceremonyWithdrawalVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.withdrawal");
         }
         _checkSetupPolicy(facts, local, setup.allowDevSetup);
+
+        // The Poseidon runtime the setup pins (generated with its sources), read once the setup
+        // may deploy at all.
+        string memory runtimeManifest = string.concat(_directory(path), POSEIDON_RUNTIME_MANIFEST);
+        require(vm.exists(runtimeManifest), string.concat("no ", runtimeManifest, " next to SETUP_MANIFEST"));
+        string memory runtime = vm.readFile(runtimeManifest);
+        require(
+            _eq(vm.parseJsonString(runtime, ".contract"), "Bn254PoseidonRuntime"),
+            "poseidon-runtime.json does not describe Bn254PoseidonRuntime"
+        );
+        setup.poseidonCodehash = vm.parseJsonBytes32(runtime, ".runtime_codehash");
     }
 
     /// The gasless block's inputs. The variables are read and bounded before the EntryPoint is
@@ -584,6 +604,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         require(vault.CONCESSION_ESCAPE_VERSION() == 1, "CONCESSION_ESCAPE_VERSION");
         require(vault.ROOT_HISTORY_WINDOW() == 1 days, "ROOT_HISTORY_WINDOW");
         require(address(vault.proofAdapter()) == address(d.adapter), "proofAdapter");
+        require(address(vault.poseidon()) == d.poseidon, "poseidon");
         require(vault.owner() == p.owner && vault.treasury() == p.treasury, "owner or treasury");
         require(
             vault.noteTtl() == p.noteTtl && vault.challengePeriod() == p.challengePeriod
@@ -826,40 +847,18 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         console2.logBytes32(address(d.factory).codehash);
     }
 
-    /// ZkApiVault's creation code with every Bn254Poseidon placeholder replaced by `poseidon`.
-    function _linkedVaultCreationCode(address poseidon) internal view returns (bytes memory) {
-        string memory artifact = vm.readFile(string.concat(vm.projectRoot(), "/out/ZkApiVault.sol/ZkApiVault.json"));
-        string memory code = vm.parseJsonString(artifact, ".bytecode.object");
-        uint256 at = vm.indexOf(code, "__$");
-        require(at != type(uint256).max, "ZkApiVault creation code has no library placeholder");
-        bytes memory raw = bytes(code);
-        bytes memory placeholder = new bytes(40);
-        for (uint256 i = 0; i < 40; ++i) {
-            placeholder[i] = raw[at + i];
+    /// The directory part of `path`, with its final "/" ("" for a bare file name).
+    function _directory(string memory path) internal pure returns (string memory) {
+        bytes memory raw = bytes(path);
+        uint256 end = raw.length;
+        while (end > 0 && raw[end - 1] != "/") {
+            --end;
         }
-        require(placeholder[37] == "$" && placeholder[38] == "_" && placeholder[39] == "_", "placeholder shape");
-        string memory linked = vm.replace(code, string(placeholder), _hex40(poseidon));
-        require(vm.indexOf(linked, "__$") == type(uint256).max, "ZkApiVault links a library other than Bn254Poseidon");
-        return vm.parseBytes(linked);
-    }
-
-    /// The runtime codehash of the compiled library deployed at `at`. A library with call
-    /// protection starts with PUSH20 <its own address>, written at deployment; Bn254Poseidon's
-    /// via-IR code has none (all its functions are pure), so its code does not depend on `at`.
-    function _libraryCodehash(bytes memory runtime, address at) internal pure returns (bytes32) {
-        if (runtime.length > 21 && uint8(runtime[0]) == 0x73 && bytes20(_slice20(runtime, 1)) == bytes20(0)) {
-            bytes20 word = bytes20(at);
-            for (uint256 i = 0; i < 20; ++i) {
-                runtime[1 + i] = word[i];
-            }
+        bytes memory out = new bytes(end);
+        for (uint256 i = 0; i < end; ++i) {
+            out[i] = raw[i];
         }
-        return keccak256(runtime);
-    }
-
-    function _slice20(bytes memory data, uint256 start) internal pure returns (bytes20 out) {
-        assembly ("memory-safe") {
-            out := mload(add(add(data, 0x20), start))
-        }
+        return string(out);
     }
 
     function _create(bytes memory initcode) internal returns (address deployed) {
@@ -867,17 +866,6 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             deployed := create(0, add(initcode, 0x20), mload(initcode))
         }
         require(deployed != address(0), "contract creation failed");
-    }
-
-    function _hex40(address value) internal pure returns (string memory) {
-        bytes memory digits = "0123456789abcdef";
-        bytes memory out = new bytes(40);
-        uint160 v = uint160(value);
-        for (uint256 i = 40; i > 0; --i) {
-            out[i - 1] = digits[v & 0xf];
-            v >>= 4;
-        }
-        return string(out);
     }
 
     /// A positive uint64 that JSON carries exactly to JavaScript (at most 2^53 - 1 seconds).

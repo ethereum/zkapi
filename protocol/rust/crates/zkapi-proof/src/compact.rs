@@ -16,7 +16,8 @@
 //!   `mpc-1` keys ([`check_setup_accepted`]).
 //! * Setup directories: [`write_setup_directory`] writes the four keys,
 //!   `manifest.json` ([`SetupManifest`]) and the generated Solidity
-//!   (`Bn254Poseidon.sol`, `Groth16ProofAdapter.sol`); [`setup`] generates the
+//!   (`Bn254PoseidonRuntime.sol` with its `poseidon-runtime.json`,
+//!   `Groth16ProofAdapter.sol`); [`setup`] generates the
 //!   development setup. Generating keys needs no feature: only accepting
 //!   development keys does.
 
@@ -116,7 +117,10 @@ pub const REQUEST_VERIFYING_KEY_FILE: &str = "request.vk";
 pub const WITHDRAWAL_PROVING_KEY_FILE: &str = "withdrawal.pk";
 pub const WITHDRAWAL_VERIFYING_KEY_FILE: &str = "withdrawal.vk";
 pub const SETUP_MANIFEST_FILE: &str = "manifest.json";
-pub const SOLIDITY_POSEIDON_FILE: &str = "Bn254Poseidon.sol";
+/// The vault's Poseidon contract ([`poseidon_runtime_solidity_source`]).
+pub const SOLIDITY_POSEIDON_FILE: &str = "Bn254PoseidonRuntime.sol";
+/// Its sidecar ([`poseidon_runtime_manifest`]).
+pub const POSEIDON_RUNTIME_MANIFEST_FILE: &str = "poseidon-runtime.json";
 pub const SOLIDITY_VERIFIER_FILE: &str = "Groth16ProofAdapter.sol";
 
 /// Seeds of the published development signing keys. Every fixture, example and
@@ -996,7 +1000,7 @@ pub struct PoseidonManifest {
     pub test_hash3: String,
     pub test_hash5: String,
     /// `merkle_node(1, 2)`: one permutation of `(DOMAIN_NODE, 1, 2)`, word 1 (the note tree's
-    /// node hash, `Bn254Poseidon.compress`).
+    /// node hash, `Bn254PoseidonRuntime`'s `compress`).
     #[serde(default)]
     pub test_node: String,
 }
@@ -1023,8 +1027,9 @@ pub fn setup(directory: impl AsRef<Path>) -> Result<()> {
 
 /// Write a setup directory: the four key files with
 /// `zkapi-v2-concession-v1/<setup_id>/<kind>` headers, `manifest.json`,
-/// `Bn254Poseidon.sol` and `Groth16ProofAdapter.sol` (with
-/// `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`). Used by
+/// `Bn254PoseidonRuntime.sol` with `poseidon-runtime.json`, and
+/// `Groth16ProofAdapter.sol` (with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and
+/// `WITHDRAWAL_VK_HASH`). Used by
 /// [`setup`] and by `examples/import_zkey.rs` for the ceremony keys.
 pub fn write_setup_directory(
     directory: impl AsRef<Path>,
@@ -1095,11 +1100,7 @@ pub fn write_setup_directory(
     manifest_json.push(b'\n');
     fs::write(directory.join(SETUP_MANIFEST_FILE), manifest_json)
         .context("write setup manifest")?;
-    fs::write(
-        directory.join(SOLIDITY_POSEIDON_FILE),
-        poseidon_solidity_source(),
-    )
-    .context("write Solidity Poseidon library")?;
+    write_poseidon_runtime(directory)?;
     fs::write(
         directory.join(SOLIDITY_VERIFIER_FILE),
         groth16_solidity_source(setup_id, &request_pk.vk, &withdrawal_pk.vk),
@@ -2177,8 +2178,9 @@ fn poseidon_manifest() -> PoseidonManifest {
     }
 }
 
-/// The optimized Poseidon constants of the Solidity library (the form of the Poseidon reference
-/// implementation): 372 words, in the layout `Bn254Poseidon.CONSTANTS` documents. Partial rounds
+/// The optimized (sparse) Poseidon constants (the form of the Poseidon reference
+/// implementation): 372 words, in the layout of the former library's `CONSTANTS`
+/// (`protocol/contracts/test/reference/Bn254PoseidonReference.sol`). Partial rounds
 /// add one constant (the constants of the two words that skip the S-box move through the linear
 /// layer into the next round's) and multiply by a sparse matrix: the round's matrix `L` is
 /// factored as `L = M' M''` with `M'' = [[l00, l01, l02], [w1, 1, 0], [w2, 0, 1]]` and
@@ -2186,7 +2188,8 @@ fn poseidon_manifest() -> PoseidonManifest {
 /// round's constant and S-box (they touch word 0 only), folds into the next round's matrix
 /// `M · M'`. The last partial round keeps its dense matrix: the full round after it mixes every
 /// word. [`optimized_poseidon_permutation`] is the permutation these constants describe; the
-/// tests check it against the plain one.
+/// tests check it against the plain one. [`crate::poseidon_runtime::scaled_schedule`] derives the
+/// runtime's scaled constants from them.
 pub(crate) fn optimized_poseidon_constants() -> Vec<Fr> {
     const RF_HALF: usize = 4;
     const RP: usize = 57;
@@ -2251,7 +2254,7 @@ pub(crate) fn optimized_poseidon_constants() -> Vec<Fr> {
     words
 }
 
-/// The permutation [`optimized_poseidon_constants`] describes, as the Solidity library runs it.
+/// The permutation [`optimized_poseidon_constants`] describes, as the former library runs it.
 #[cfg(test)]
 pub(crate) fn optimized_poseidon_permutation(words: &[Fr], mut s: [Fr; 3]) -> [Fr; 3] {
     let config = crate::groth16::poseidon_config();
@@ -2307,7 +2310,8 @@ pub(crate) fn optimized_poseidon_permutation(words: &[Fr], mut s: [Fr; 3]) -> [F
 }
 
 /// Rewrites the generated sources of an existing setup directory from its keys: the Solidity
-/// adapter and Poseidon library, and the manifest's `poseidon` section. For a change to the
+/// adapter, the Poseidon contract and its `poseidon-runtime.json`, and the manifest's `poseidon`
+/// section. For a change to the
 /// generators that leaves the keys alone (the import and the round-trip test regenerate them the
 /// same way).
 pub fn refresh_setup_sources(directory: impl AsRef<Path>) -> Result<()> {
@@ -2331,11 +2335,7 @@ pub fn refresh_setup_sources(directory: impl AsRef<Path>) -> Result<()> {
     let mut manifest_json = serde_json::to_vec_pretty(&manifest).context("encode manifest")?;
     manifest_json.push(b'\n');
     fs::write(&manifest_path, manifest_json).context("write setup manifest")?;
-    fs::write(
-        directory.join(SOLIDITY_POSEIDON_FILE),
-        poseidon_solidity_source(),
-    )
-    .context("write Solidity Poseidon library")?;
+    write_poseidon_runtime(directory)?;
     fs::write(
         directory.join(SOLIDITY_VERIFIER_FILE),
         groth16_solidity_source(&setup_id, &request_vk, &withdrawal_vk),
@@ -2344,365 +2344,47 @@ pub fn refresh_setup_sources(directory: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-fn poseidon_solidity_source() -> String {
-    let config = crate::groth16::poseidon_config();
-    let constants = optimized_poseidon_constants()
-        .iter()
-        .map(|value| hex::encode(prime_field_bytes(value)))
-        .collect::<String>();
-    let mds = config
-        .mds
-        .iter()
-        .flatten()
-        .map(field_hex)
-        .collect::<Vec<_>>();
-    let mut source = r#"// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
-
-/// @title Bn254Poseidon
-/// @notice Poseidon over the BN254 scalar field, generated from zkAPI v2's arkworks parameters:
-///         width 3, rate 2, x^5 S-box, 8 full rounds and 57 partial rounds. compress is the note
-///         tree's node hash (one permutation, the domain in the capacity lane); hash5 is the sponge
-///         (zkapi_core::v2::hash_fields) over five inputs, the note leaf.
-/// @dev The permutation is in the optimized form of the Poseidon reference implementation: every
-///      partial round adds one constant (the constants of the two words that skip the S-box are
-///      moved through the linear layer into the next round) and multiplies by a sparse matrix (the
-///      MDS matrix factored per round, the dense factor folded into the next round's matrix); the
-///      hash function is unchanged. The rounds are Yul with the state in three locals and the round
-///      constants read from memory, where each entry point copies them once.
-library Bn254Poseidon {
-    uint256 internal constant FIELD_MODULUS =
-        21888242871839275222246405745257275088548364400416034343698204186575808495617;
-
-    /// @dev 372 words: the first 4 full rounds (3 constants each), 56 partial rounds (the
-    ///      constant, the sparse matrix's first row and its first column below the diagonal), the
-    ///      last partial round (3 constants and its dense matrix), the last 4 full rounds.
-    bytes internal constant CONSTANTS =
-        hex"__CONSTANTS__";
-
-    /// @notice One permutation of the state (capacity, left, right), its first rate lane: the
-    ///         two-to-one compression of the note tree, zkapi_core::v2::compress_fields.
-    function compress(uint256 capacity, uint256 left, uint256 right) public pure returns (uint256 result) {
-        uint256 freeMemoryPointer;
-        assembly ("memory-safe") {
-            freeMemoryPointer := mload(0x40)
-        }
-        (, result,) = _permute(capacity, left, right, _constants());
-        assembly ("memory-safe") {
-            mstore(0x40, freeMemoryPointer)
-        }
-    }
-
-    /// @notice The sponge over five inputs: zkapi_core::v2::hash_fields, the note leaf's hash.
-    function hash5(uint256 a, uint256 b, uint256 c, uint256 d, uint256 e) public pure returns (uint256 result) {
-        uint256 freeMemoryPointer;
-        assembly ("memory-safe") {
-            freeMemoryPointer := mload(0x40)
-        }
-        uint256 constants = _constants();
-        (uint256 s0, uint256 s1, uint256 s2) = _permute(0, a, b, constants);
-        (s0, s1, s2) = _permute(s0, addmod(s1, c, FIELD_MODULUS), addmod(s2, d, FIELD_MODULUS), constants);
-        (, result,) = _permute(s0, addmod(s1, e, FIELD_MODULUS), s2, constants);
-        assembly ("memory-safe") {
-            mstore(0x40, freeMemoryPointer)
-        }
-    }
-
-    /// @notice The roots of the depth-32 tree with oldLeaf and with newLeaf at index, from the
-    ///         leaf's siblings (bottom up), and the new path's node at nodeLevel (the leaf at 0,
-    ///         the root at 32): 64 compressions with capacity as the node domain.
-    function compressPairPath32(
-        uint256 capacity,
-        uint32 index,
-        uint256 oldLeaf,
-        uint256 newLeaf,
-        uint256[32] calldata siblings,
-        uint256 nodeLevel
-    ) public pure returns (uint256 oldRoot, uint256 newRoot, uint256 newNode) {
-        uint256 freeMemoryPointer;
-        assembly ("memory-safe") {
-            freeMemoryPointer := mload(0x40)
-        }
-        uint256 constants = _constants();
-        oldRoot = oldLeaf;
-        newRoot = newLeaf;
-        newNode = newLeaf;
-        for (uint256 level = 0; level < 32;) {
-            if (level == nodeLevel) newNode = newRoot;
-            uint256 sibling = siblings[level];
-            if (((index >> level) & 1) == 0) {
-                (, oldRoot,) = _permute(capacity, oldRoot, sibling, constants);
-                (, newRoot,) = _permute(capacity, newRoot, sibling, constants);
-            } else {
-                (, oldRoot,) = _permute(capacity, sibling, oldRoot, constants);
-                (, newRoot,) = _permute(capacity, sibling, newRoot, constants);
-            }
-            unchecked {
-                ++level;
-            }
-        }
-        if (nodeLevel >= 32) newNode = newRoot;
-        assembly ("memory-safe") {
-            mstore(0x40, freeMemoryPointer)
-        }
-    }
-
-    /// @notice The root of the depth-32 tree with leaf at index, from the leaf's siblings (bottom
-    ///         up), and the node the insertion completes: the path's node at the level of the
-    ///         lowest zero bit of index (the leaf itself when index is even; the root when every
-    ///         bit is set). An append-only tree stores that node as the left sibling of the
-    ///         insertions that follow.
-    function insertPath32(uint256 capacity, uint32 index, uint256 leaf, uint256[32] memory siblings)
-        public
-        pure
-        returns (uint256 root, uint256 completed)
-    {
-        uint256 freeMemoryPointer;
-        assembly ("memory-safe") {
-            freeMemoryPointer := mload(0x40)
-        }
-        uint256 constants = _constants();
-        root = leaf;
-        completed = leaf;
-        bool completing = true;
-        for (uint256 level = 0; level < 32;) {
-            uint256 sibling = siblings[level];
-            if (((index >> level) & 1) == 0) {
-                if (completing) {
-                    completed = root;
-                    completing = false;
-                }
-                (, root,) = _permute(capacity, root, sibling, constants);
-            } else {
-                (, root,) = _permute(capacity, sibling, root, constants);
-            }
-            unchecked {
-                ++level;
-            }
-        }
-        if (completing) completed = root;
-        assembly ("memory-safe") {
-            mstore(0x40, freeMemoryPointer)
-        }
-    }
-
-    /// @dev The round constants copied to memory; returns the offset of their first word.
-    function _constants() private pure returns (uint256 offset) {
-        bytes memory constants = CONSTANTS;
-        assembly ("memory-safe") {
-            offset := add(constants, 0x20)
-        }
-    }
-
-    /// @dev One Poseidon permutation: 4 full rounds, 57 partial rounds, 4 full rounds. The round
-    ///      groups are separate functions so that the stack pressure of a full round (three S-box
-    ///      outputs and a dense matrix) does not make the compiler keep the partial rounds' values
-    ///      in memory.
-    function _permute(uint256 s0, uint256 s1, uint256 s2, uint256 constants)
-        private
-        pure
-        returns (uint256, uint256, uint256)
-    {
-        (s0, s1, s2) = _fullRounds(s0, s1, s2, constants);
-        (s0, s1, s2) = _partialRounds(s0, s1, s2, constants + 384);
-        (s0, s1, s2) = _lastPartialRound(s0, s1, s2, constants + 11136);
-        (s0, s1, s2) = _fullRounds(s0, s1, s2, constants + 11520);
-        return (s0, s1, s2);
-    }
-
-    /// @dev Four full rounds whose constants start at off.
-    function _fullRounds(uint256 s0, uint256 s1, uint256 s2, uint256 off)
-        private
-        pure
-        returns (uint256, uint256, uint256)
-    {
-        assembly ("memory-safe") {
-            for { let end := add(off, 384) } lt(off, end) { off := add(off, 96) } {
-                let x := addmod(s0, mload(off), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                let y :=
-                    addmod(s1, mload(add(off, 32)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                let z :=
-                    addmod(s2, mload(add(off, 64)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                {
-                    let q := mulmod(x, x, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                    x := mulmod(
-                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                        x,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    )
-                }
-                {
-                    let q := mulmod(y, y, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                    y := mulmod(
-                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                        y,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    )
-                }
-                {
-                    let q := mulmod(z, z, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                    z := mulmod(
-                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                        z,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    )
-                }
-                s0 := addmod(
-                    addmod(
-                        mulmod(
-                            x,
-                            __M0__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        mulmod(
-                            y,
-                            __M1__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    mulmod(
-                        z,
-                        __M2__,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                )
-                s1 := addmod(
-                    addmod(
-                        mulmod(
-                            x,
-                            __M3__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        mulmod(
-                            y,
-                            __M4__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    mulmod(
-                        z,
-                        __M5__,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                )
-                s2 := addmod(
-                    addmod(
-                        mulmod(
-                            x,
-                            __M6__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        mulmod(
-                            y,
-                            __M7__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    mulmod(
-                        z,
-                        __M8__,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                )
-            }
-        }
-        return (s0, s1, s2);
-    }
-
-    /// @dev The 56 partial rounds with a sparse matrix, constants at off (6 words each): the new
-    ///      first word is a full row, the other two gain a multiple of the S-box output.
-    function _partialRounds(uint256 s0, uint256 s1, uint256 s2, uint256 off)
-        private
-        pure
-        returns (uint256, uint256, uint256)
-    {
-        assembly ("memory-safe") {
-            let P := 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-            // Never taken (calldata is far smaller). The modulus must reach the rounds as one stack
-            // value: left a single literal, the optimizer inlines it into every use and the code
-            // transform then places each through codecopy and scratch memory, at a multiple of the
-            // gas. A second, runtime-opaque definition prevents that.
-            if gt(calldatasize(), 0xffffffffffff) { P := 1 }
-            for { let end := add(off, 10752) } lt(off, end) { off := add(off, 192) } {
-                let x := addmod(s0, mload(off), P)
-                {
-                    let q := mulmod(x, x, P)
-                    x := mulmod(mulmod(q, q, P), x, P)
-                }
-                s0 := addmod(
-                    addmod(mulmod(x, mload(add(off, 32)), P), mulmod(s1, mload(add(off, 64)), P), P),
-                    mulmod(s2, mload(add(off, 96)), P),
-                    P
-                )
-                s1 := addmod(s1, mulmod(x, mload(add(off, 128)), P), P)
-                s2 := addmod(s2, mulmod(x, mload(add(off, 160)), P), P)
-            }
-        }
-        return (s0, s1, s2);
-    }
-
-    /// @dev The last partial round, with its dense matrix: constants at off (3 words), the matrix
-    ///      after them (9 words, row-major).
-    function _lastPartialRound(uint256 s0, uint256 s1, uint256 s2, uint256 off)
-        private
-        pure
-        returns (uint256, uint256, uint256)
-    {
-        assembly ("memory-safe") {
-            let x := addmod(s0, mload(off), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-            let y := addmod(s1, mload(add(off, 32)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-            let z := addmod(s2, mload(add(off, 64)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-            {
-                let q := mulmod(x, x, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                x := mulmod(
-                    mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    x,
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                )
-            }
-            s0 := addmod(
-                addmod(
-                    mulmod(x, mload(add(off, 96)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    mulmod(y, mload(add(off, 128)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                ),
-                mulmod(z, mload(add(off, 160)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-            )
-            s1 := addmod(
-                addmod(
-                    mulmod(x, mload(add(off, 192)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    mulmod(y, mload(add(off, 224)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                ),
-                mulmod(z, mload(add(off, 256)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-            )
-            s2 := addmod(
-                addmod(
-                    mulmod(x, mload(add(off, 288)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    mulmod(y, mload(add(off, 320)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                ),
-                mulmod(z, mload(add(off, 352)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-            )
-        }
-        return (s0, s1, s2);
-    }
+/// The vault's Poseidon contract, `Bn254PoseidonRuntime.sol` ([`crate::poseidon_runtime`]): the
+/// permutation of [`optimized_poseidon_constants`] in the scaled sparse form, fully unrolled with
+/// lazy reduction, behind the four entry points of the `Bn254Poseidon` library it replaces.
+pub fn poseidon_runtime_solidity_source() -> String {
+    crate::poseidon_runtime::runtime_source(&scaled_poseidon_schedule())
 }
-"#
-    .replace("__CONSTANTS__", &constants);
-    for (index, value) in mds.iter().enumerate() {
-        source = source.replace(&format!("__M{index}__"), value);
-    }
-    source
+
+/// `poseidon-runtime.json`, the sidecar of [`poseidon_runtime_solidity_source`]: the compiler
+/// settings, the source's SHA-256, the pinned runtime codehash, the entry points, the scaled
+/// constants and the lane bounds after every round.
+pub fn poseidon_runtime_manifest() -> crate::poseidon_runtime::RuntimeManifest {
+    crate::poseidon_runtime::runtime_manifest(&scaled_poseidon_schedule(), SOLIDITY_POSEIDON_FILE)
+}
+
+/// `poseidon-runtime.json` as written: pretty JSON with a final newline.
+pub fn poseidon_runtime_manifest_json() -> Result<Vec<u8>> {
+    let mut json = serde_json::to_vec_pretty(&poseidon_runtime_manifest())
+        .context("encode poseidon-runtime.json")?;
+    json.push(b'\n');
+    Ok(json)
+}
+
+pub(crate) fn scaled_poseidon_schedule() -> crate::poseidon_runtime::ScaledSchedule {
+    let config = crate::groth16::poseidon_config();
+    let mds: [[Fr; 3]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| config.mds[i][j]));
+    crate::poseidon_runtime::scaled_schedule(&optimized_poseidon_constants(), mds)
+}
+
+/// Writes the generated Poseidon contract and its sidecar into a setup directory.
+fn write_poseidon_runtime(directory: &Path) -> Result<()> {
+    fs::write(
+        directory.join(SOLIDITY_POSEIDON_FILE),
+        poseidon_runtime_solidity_source(),
+    )
+    .context("write Solidity Poseidon runtime")?;
+    fs::write(
+        directory.join(POSEIDON_RUNTIME_MANIFEST_FILE),
+        poseidon_runtime_manifest_json()?,
+    )
+    .context("write poseidon-runtime.json")?;
+    Ok(())
 }
 
 fn g1_manifest(point: &G1Affine) -> [String; 2] {
@@ -3017,6 +2699,113 @@ mod tests {
             let s = permute([s[0], s[1] + c, s[2] + d]);
             let s = permute([s[0], s[1] + e, s[2]]);
             assert_eq!(s[1], core::hash_fields(&[a, b, c, d, e]));
+        }
+    }
+
+    /// The runtime's scaled schedule (lane 0 divided by λ_j in partial round j) is the same
+    /// permutation: every lane against the sparse form (checked above against zkapi-core), the
+    /// node compression with its domain in the capacity lane and the five-input sponge against
+    /// zkapi-core's arkworks sponge, including inputs that are not reduced field elements.
+    #[test]
+    fn scaled_poseidon_schedule_describes_the_same_permutation() {
+        let schedule = scaled_poseidon_schedule();
+        let words = optimized_poseidon_constants();
+        let scaled = |s: [Fr; 3]| crate::poseidon_runtime::scaled_permutation(&schedule, s);
+        assert_eq!(schedule.lambdas.len(), 57);
+        assert_eq!(schedule.lambdas[0], Fr::one());
+        let domain = Fr::from_be_bytes_mod_order(b"zkapi.v2.node");
+        let mut rng = ark_std::test_rng();
+        for seed in 0u64..8 {
+            let state = [Fr::rand(&mut rng), Fr::rand(&mut rng), Fr::rand(&mut rng)];
+            assert_eq!(scaled(state), optimized_poseidon_permutation(&words, state));
+            let (a, b, c, d, e) = (
+                Fr::from(seed * 7 + 1),
+                Fr::rand(&mut rng),
+                Fr::from(seed * 13 + 3),
+                -Fr::from(seed + 1),
+                Fr::rand(&mut rng),
+            );
+            assert_eq!(
+                scaled([domain, a, b])[1],
+                core::compress_fields(domain, a, b)
+            );
+            assert_eq!(
+                scaled([state[0], a, b])[1],
+                core::compress_fields(state[0], a, b)
+            );
+            let s = scaled([Fr::zero(), a, b]);
+            let s = scaled([s[0], s[1] + c, s[2] + d]);
+            let s = scaled([s[0], s[1] + e, s[2]]);
+            assert_eq!(s[1], core::hash_fields(&[a, b, c, d, e]));
+        }
+        assert_eq!(
+            scaled([domain, Fr::from(1u64), Fr::from(2u64)])[1],
+            crate::groth16::merkle_node(Fr::from(1u64), Fr::from(2u64))
+        );
+    }
+
+    /// The generated runtime: the library's four selectors, one unrolled `permute` of 65 round
+    /// blocks after the modulus binding and the never-taken branch, a plain ADD only where the
+    /// operands' bounds total at most 5 (5p < 2^256), canonical outputs, and a sidecar that
+    /// describes this source.
+    #[test]
+    fn poseidon_runtime_source_has_the_verified_shape() {
+        use crate::poseidon_runtime::{permute_body, word_hex};
+        let schedule = scaled_poseidon_schedule();
+        let (body, bounds) = permute_body(&schedule);
+        assert_eq!(bounds.len(), 65);
+        assert!(bounds.iter().flatten().all(|&m| (1..=5).contains(&m)));
+        assert_eq!(bounds[64], [1, 1, 1], "the last round reduces every lane");
+        let rounds = body
+            .lines()
+            .filter(|line| line == &"                {")
+            .count();
+        assert_eq!(rounds, 65);
+        assert!(body.starts_with(
+            "                let P := 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001\n"
+        ));
+        assert!(body.ends_with("                }\n"));
+        for line in body.lines() {
+            assert!(!line.ends_with(' ') && !line.contains('\t'), "{line:?}");
+        }
+        let source = poseidon_runtime_solidity_source();
+        assert_eq!(
+            source
+                .matches("function permute(s0, s1, s2) -> r0, r1, r2 {")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches(&body).count(), 1);
+        for selector in ["0x2d0c7694", "0xc98aeff5", "0x21d2c645", "0xf6073d4e"] {
+            assert_eq!(source.matches(&format!("case {selector} {{")).count(), 1);
+        }
+        assert!(!source.contains('\r') && source.ends_with("}\n"));
+        let manifest = poseidon_runtime_manifest();
+        assert_eq!(
+            manifest.source_sha256,
+            hex::encode(sha256(source.as_bytes()))
+        );
+        assert_eq!(manifest.lane_bounds, bounds);
+        assert_eq!(manifest.scaled_constants.lambdas[0], word_hex(&Fr::one()));
+        assert_eq!(manifest.scaled_constants.partial_rounds.len(), 56);
+        assert_eq!(
+            manifest
+                .entry_points
+                .iter()
+                .map(|e| e.selector.as_str())
+                .collect::<Vec<_>>(),
+            ["0x2d0c7694", "0xc98aeff5", "0x21d2c645", "0xf6073d4e"]
+        );
+        // Every literal of the body is a canonical constant (or the modulus itself, in the
+        // binding), written as 0x and 64 hex digits.
+        for token in body
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.starts_with("0x"))
+        {
+            if token == "0xffffffffffff" {
+                continue;
+            }
+            assert_eq!(token.len(), 66, "{token}");
         }
     }
 

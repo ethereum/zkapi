@@ -19,7 +19,8 @@ use ark_std::rand::{rngs::StdRng, SeedableRng};
 use common::*;
 use zkapi_core::v2 as core;
 use zkapi_proof::compact::{
-    circuit_shape, decode_compressed, decode_compressed_for, keccak256, proof_from_wire,
+    circuit_shape, decode_compressed, decode_compressed_for, keccak256,
+    poseidon_runtime_manifest_json, poseidon_runtime_solidity_source, proof_from_wire,
     proof_to_wire, request_circuit, sha256, verifying_key_keccak256, withdrawal_circuit, KeyKind,
     RequestProver, RequestVerifier, SetupManifest, VkPins, WithdrawalProver, WithdrawalVerifier,
     CEREMONY_SETUP_ID, CEREMONY_VK_KECCAK256, DEV_SETUP_ID, REHEARSAL_SETUP_ID,
@@ -159,6 +160,21 @@ fn setup_matches_its_manifest_and_adapter() {
     assert_eq!(
         manifest.circuits.withdrawal,
         circuit_shape(KeyKind::Withdrawal).unwrap()
+    );
+}
+
+/// The setup's Poseidon runtime and its sidecar are this build's generator output, byte for byte
+/// (the Forge suite compiles the contracts' copy, which CI diffs with the setup's, and checks the
+/// sidecar's source hash and runtime codehash; protocol/formal checks the same source).
+#[test]
+fn setup_poseidon_runtime_is_the_generator_output() {
+    assert_eq!(
+        String::from_utf8(read("Bn254PoseidonRuntime.sol")).unwrap(),
+        poseidon_runtime_solidity_source()
+    );
+    assert_eq!(
+        String::from_utf8(read("poseidon-runtime.json")).unwrap(),
+        String::from_utf8(poseidon_runtime_manifest_json().unwrap()).unwrap()
     );
 }
 

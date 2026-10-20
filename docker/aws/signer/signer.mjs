@@ -25,9 +25,9 @@ export const ABSOLUTE_FEE_CEILING = 1_000_000n * GWEI;
 // geth's and reth's default --rpc.txfeecap: 1 ether of gas limit x maxFeePerGas.
 export const DEFAULT_TX_FEE_CAP = 10n ** 18n;
 export const UPSTREAM_TIMEOUT_MS = 8_000;
-// Leaf retirements (about 6M gas each) follow only a missed defeat, which is
+// Leaf retirements (about 0.94M gas each) follow only a missed defeat, which is
 // rare and alarmed on, but any closed note simulates successfully, and a
-// copy that mines after the leaf is gone still pays about 5.9M gas before it
+// copy that mines after the leaf is gone still pays about 0.9M gas before it
 // reverts StaleRoot. Retirement transactions signed per rolling day, one per
 // nonce, are capped so that a compromised caller cannot spend the float
 // meant for defeats and raises on them.
@@ -223,7 +223,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   // The leaf retirements broadcast (or possibly broadcast) in the last
   // RETIREMENT_WINDOW_MS, one entry per (note, nonce), by first signing time.
   // Each entry is one unit of the budget: a nonce mines at most one
-  // transaction, and every retirement that mines costs about 6M gas, even
+  // transaction, and every retirement that mines costs about 0.94M gas, even
   // one that reverts StaleRoot because the leaf is already gone. A fee
   // replacement or re-send on a counted nonce therefore needs no new budget.
   // The same note on another nonce takes a new unit, and only once every

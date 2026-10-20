@@ -111,7 +111,7 @@ below rather than far beyond it.
 A defeat or raise needs a pending escape and a request proof the vault
 accepts, so a caller can spend gas on them only as fast as real escapes need
 them. A leaf retirement needs only a `Closed` note and the current siblings:
-every closed note simulates successfully, each retirement costs about 6M gas,
+every closed note simulates successfully, each retirement costs about 0.94M gas,
 and each changes the vault root, so every request proof in flight must be made
 again at the new root. A compromised challenger host could otherwise spend the
 float meant for defeats and raises on the ever-growing set of closed notes.
@@ -136,7 +136,7 @@ The signer applies the same policy before it counts a retirement:
   replacements on a counted nonce are not checked again.
 
 The budget counts nonces, not notes. A nonce mines at most one transaction,
-and every retirement that mines pays about 6M gas, including a copy that
+and every retirement that mines pays about 0.94M gas, including a copy that
 mines after the leaf is gone: `verifyAndUpdate` hashes both paths before it
 reverts `StaleRoot`. The signer therefore signs retirements on at most
 `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` nonces (default 2) per rolling 24

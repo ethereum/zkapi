@@ -5,8 +5,9 @@ import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {VaultTestBase} from "./helpers/VaultTestBase.sol";
+import {ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
 /// @dev Deposits, the basic exit lifecycle and the post-defeat grace, against the mock adapter.
 contract ZkApiVaultTest is VaultTestBase {
@@ -22,7 +23,7 @@ contract ZkApiVaultTest is VaultTestBase {
         // Rounded up to the day (a literal expression would divide exactly).
         uint64 expiry = uint64(((depositedAt + 30 days + 1 days - 1) / 1 days) * 1 days);
         assertEq(expiry % 1 days, 0);
-        uint256 leaf = NoteLeafLib.computeLeaf(0, bytes32(uint256(42)), DEPOSIT, expiry);
+        uint256 leaf = ReferenceHashes.leaf(0, bytes32(uint256(42)), DEPOSIT, expiry);
         uint256 root = leaf;
         for (uint256 level = 0; level < 32; ++level) {
             root = _hashNode(root, emptySiblings[level]);
@@ -182,6 +183,6 @@ contract ZkApiVaultTest is VaultTestBase {
     }
 
     function _hashNode(uint256 left, uint256 right) private pure returns (uint256) {
-        return Bn254Poseidon.compress(DOMAIN_NODE, left, right);
+        return Bn254PoseidonReference.compress(DOMAIN_NODE, left, right);
     }
 }

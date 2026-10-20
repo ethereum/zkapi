@@ -5,10 +5,11 @@ import {Test} from "forge-std/Test.sol";
 import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 import {MockProofAdapter} from "./mocks/MockProofAdapters.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
+import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
 /// @dev Drives a vault (mock adapter) through random deposits, escapes with concessions, raises,
 ///      defeats, finalizations, closes, expiry claims, payout claims, retirements, pauses, time and
@@ -52,7 +53,7 @@ contract VaultHandler is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
         vm.deal(address(this), 1_000 ether);
         roots.push(vault_.currentRoot());
@@ -313,19 +314,19 @@ contract VaultHandler is Test {
     function _treeLeaf(uint32 index) private view returns (uint256) {
         if (index >= vault.nextNoteId() || retired[index]) return 0;
         (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(index);
-        return NoteLeafLib.computeLeaf(index, commitment, amount, expiry);
+        return ReferenceHashes.leaf(index, commitment, amount, expiry);
     }
 
     function _path(uint32 index) private view returns (uint256[32] memory siblings) {
         siblings = emptySiblings;
         siblings[0] = _treeLeaf(index ^ 1);
         uint32 pair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
+        siblings[1] = Bn254PoseidonReference.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
         uint32 quad = (index >> 2) ^ 1;
-        siblings[2] = Bn254Poseidon.compress(
+        siblings[2] = Bn254PoseidonReference.compress(
             DOMAIN_NODE,
-            Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(quad * 4), _treeLeaf(quad * 4 + 1)),
-            Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(quad * 4 + 2), _treeLeaf(quad * 4 + 3))
+            Bn254PoseidonReference.compress(DOMAIN_NODE, _treeLeaf(quad * 4), _treeLeaf(quad * 4 + 1)),
+            Bn254PoseidonReference.compress(DOMAIN_NODE, _treeLeaf(quad * 4 + 2), _treeLeaf(quad * 4 + 3))
         );
     }
 
@@ -356,7 +357,18 @@ contract ZkApiVaultInvariantTest is Test {
         treasury.setAccepting(true);
         ToggleableDestination wallet = new ToggleableDestination();
         vault = new ZkApiVault(
-            address(treasury), 30 days, 24 hours, 100_000, address(adapter), 11, 12, 13, 14, address(this), 7 days
+            address(treasury),
+            30 days,
+            24 hours,
+            100_000,
+            address(adapter),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            7 days,
+            PoseidonRuntime.etch()
         );
         handler = new VaultHandler(vault, adapter, treasury, wallet);
         // The handler is the owner, so it can pause and unpause.

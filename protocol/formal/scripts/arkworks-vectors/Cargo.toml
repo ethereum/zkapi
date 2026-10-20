@@ -1,0 +1,23 @@
+# Known-answer vectors for protocol/formal, computed by arkworks with zkapi-core's Poseidon
+# configuration. Standalone (not a member of protocol/rust's workspace):
+#
+#   cargo run --release --manifest-path protocol/formal/scripts/arkworks-vectors/Cargo.toml -- \
+#       permutation > protocol/formal/reference/permutation-vectors.json
+#   cargo run --release --manifest-path protocol/formal/scripts/arkworks-vectors/Cargo.toml -- \
+#       check zkapi-clientd/internal/zkapi/testdata/poseidon-vectors.json
+[package]
+name = "zkapi-formal-arkworks-vectors"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+zkapi-core = { path = "../../../rust/crates/zkapi-core" }
+zkapi-types = { path = "../../../rust/crates/zkapi-types" }
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+ark-crypto-primitives = { version = "0.5", features = ["sponge"] }
+serde_json = "1"
+
+[workspace]

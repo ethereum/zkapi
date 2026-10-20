@@ -8,10 +8,11 @@ import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
 import {AcceptAllProofs} from "./mocks/MockProofAdapters.sol";
+import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
 contract RejectingTreasury {
     receive() external payable {
@@ -55,7 +56,7 @@ contract ZkApiVaultPauseTest is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
         vault = new ZkApiVault(
             treasury,
@@ -68,7 +69,8 @@ contract ZkApiVaultPauseTest is Test {
             13,
             14,
             address(this),
-            MAX_PAUSE
+            MAX_PAUSE,
+            PoseidonRuntime.etch()
         );
         vm.deal(user, 100 ether);
     }
@@ -659,12 +661,34 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(vault.treasuryChangeDelay(), vault.MIN_TREASURY_CHANGE_DELAY());
         assertEq(vault.unpauseClaimGrace(), 1 days);
         ZkApiVault slow = new ZkApiVault(
-            treasury, 30 days, 5 days, 100_000, address(new AcceptAllProofs()), 11, 12, 13, 14, address(this), 10 days
+            treasury,
+            30 days,
+            5 days,
+            100_000,
+            address(new AcceptAllProofs()),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            10 days,
+            PoseidonRuntime.etch()
         );
         assertEq(slow.treasuryChangeDelay(), 5 days);
         assertEq(slow.unpauseClaimGrace(), 5 days);
         ZkApiVault fast = new ZkApiVault(
-            treasury, 30 days, 1 hours, 100_000, address(new AcceptAllProofs()), 11, 12, 13, 14, address(this), 2 hours
+            treasury,
+            30 days,
+            1 hours,
+            100_000,
+            address(new AcceptAllProofs()),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            2 hours,
+            PoseidonRuntime.etch()
         );
         assertEq(fast.treasuryChangeDelay(), 2 days);
         assertEq(fast.unpauseClaimGrace(), 1 days);
@@ -1081,7 +1105,7 @@ contract ZkApiVaultPauseTest is Test {
     function _leafAt(uint32 index) private view returns (uint256) {
         if (index >= vault.nextNoteId()) return 0;
         (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(index);
-        return NoteLeafLib.computeLeaf(index, commitment, amount, expiry);
+        return ReferenceHashes.leaf(index, commitment, amount, expiry);
     }
 
     /// Path for slots 0..3 of a tree whose other leaves are empty.
@@ -1090,7 +1114,7 @@ contract ZkApiVaultPauseTest is Test {
         siblings = emptySiblings;
         siblings[0] = _leafAt(index ^ 1);
         uint32 otherPair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _leafAt(otherPair * 2), _leafAt(otherPair * 2 + 1));
+        siblings[1] = Bn254PoseidonReference.compress(DOMAIN_NODE, _leafAt(otherPair * 2), _leafAt(otherPair * 2 + 1));
     }
 
     /// A close (kind 1) or an escape (kind 0, successor nullifier + SUCCESSOR) with a 700,000

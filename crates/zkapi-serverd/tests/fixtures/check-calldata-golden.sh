@@ -17,8 +17,17 @@ trap 'rm -rf "$work"' EXIT
 
 mkdir -p "$work/src" "$work/test"
 cp "$here/VaultCalldataGolden.t.sol" "$work/test/"
-# The protocol profile's settings (via_ir and the optimizer), so the vault
-# compiles as it does in protocol/contracts.
+# The vault's constructor takes its Poseidon runtime, which compiles with the
+# legacy pipeline (as in protocol/contracts); this file brings it into out/.
+cat >"$work/src/PoseidonRuntimeArtifact.sol" <<'SOL'
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import "zkapi/poseidon/Bn254PoseidonRuntime.sol";
+SOL
+# The protocol profile's settings (via_ir and the optimizer, the legacy
+# pipeline for the Poseidon runtime), so the contracts compile as they do in
+# protocol/contracts.
 cat >"$work/foundry.toml" <<EOF
 [profile.default]
 src = "src"
@@ -31,9 +40,19 @@ solc = "0.8.28"
 optimizer = true
 optimizer_runs = 10000
 via_ir = true
+bytecode_hash = "none"
+cbor_metadata = false
+fs_permissions = [{ access = "read", path = "./out" }]
+additional_compiler_profiles = [{ name = "legacy", via_ir = false }]
+compilation_restrictions = [
+    { paths = "$repo/protocol/contracts/src/poseidon/Bn254PoseidonRuntime.sol", via_ir = false },
+    { paths = "src/PoseidonRuntimeArtifact.sol", via_ir = false },
+]
 EOF
 
-if ! (cd "$work" && forge test --match-contract GoldenTest -vv) >"$work/forge.log" 2>&1; then
+# forge build first: a filtered forge test compiles only what the test imports,
+# and the test takes the runtime from its artifact.
+if ! (cd "$work" && forge build && forge test --match-contract GoldenTest -vv) >"$work/forge.log" 2>&1; then
   cat "$work/forge.log" >&2
   exit 1
 fi

@@ -5,7 +5,7 @@ import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {VaultTestBase} from "./helpers/VaultTestBase.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
 
@@ -785,9 +785,9 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         uint256[32] memory path = _path(a);
         // The root of the tree that holds only note b's leaf.
         uint256 expected = _leafOf(b);
-        expected = Bn254Poseidon.compress(DOMAIN_NODE, 0, expected);
+        expected = Bn254PoseidonReference.compress(DOMAIN_NODE, 0, expected);
         for (uint256 level = 1; level < 32; ++level) {
-            expected = Bn254Poseidon.compress(DOMAIN_NODE, expected, emptySiblings[level]);
+            expected = Bn254PoseidonReference.compress(DOMAIN_NODE, expected, emptySiblings[level]);
         }
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         vm.expectEmit(address(vault));
@@ -822,7 +822,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         // The tree is empty again.
         uint256 empty;
         for (uint256 level = 0; level < 32; ++level) {
-            empty = Bn254Poseidon.compress(DOMAIN_NODE, empty, empty);
+            empty = Bn254PoseidonReference.compress(DOMAIN_NODE, empty, empty);
         }
         assertEq(vault.currentRoot(), empty);
     }

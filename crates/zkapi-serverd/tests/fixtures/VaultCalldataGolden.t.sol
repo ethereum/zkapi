@@ -114,9 +114,11 @@ contract GoldenTest is Test {
 
         // Every vault and adapter function the server, challenger, indexer,
         // signer and clients call or decode. Public getters have selectors
-        // only on an instance, so a vault is deployed.
+        // only on an instance, so a vault is deployed (with the real Poseidon
+        // runtime, which its constructor checks).
+        address poseidon = deployCode("out/Bn254PoseidonRuntime.sol/Bn254PoseidonRuntime.json");
         ZkApiVault vault = new ZkApiVault(
-            address(0xbeef), 30 days, 1 days, 100_000, address(0xada), 11, 12, 13, 14, address(this), 2 days
+            address(0xbeef), 30 days, 1 days, 100_000, address(0xada), 11, 12, 13, 14, address(this), 2 days, poseidon
         );
         IZkApiProofAdapter adapter = IZkApiProofAdapter(address(0xada));
         selector("challengeEscapeWithdrawal", vault.challengeEscapeWithdrawal.selector);

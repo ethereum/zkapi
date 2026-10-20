@@ -6,15 +6,17 @@ import {Vm} from "forge-std/Vm.sol";
 import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "../src/adapters/Groth16ProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {MerkleUpdateLib} from "../src/libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
+import {IBn254Poseidon} from "../src/interfaces/IBn254Poseidon.sol";
+import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
-/// @dev Gas baseline of the vault, its Poseidon library and its Groth16 adapter. Logs only (no
+/// @dev Gas baseline of the vault, its Poseidon runtime and its Groth16 adapter. Logs only (no
 ///      snapshot files). Run: forge test --match-path test/GasBaseline.t.sol -vv
 ///
 ///      Methodology. Every measured call goes from the test contract to the vault with the vault,
-///      the adapter, the Poseidon library, the treasury and USER marked cold (vm.cool), as at the
+///      the adapter, the Poseidon runtime, the treasury and USER marked cold (vm.cool), as at the
 ///      start of a real transaction; the pranked sender is warm, as tx.origin is. Each line logs:
 ///        frame   vm.lastCallGas().gasTotalUsed, the callee's execution gas before refunds: what a
 ///                real transaction spends after its intrinsic cost.
@@ -90,12 +92,13 @@ abstract contract GasBaselineBase is Test {
             parameters.clearanceSigningKeyX,
             parameters.clearanceSigningKeyY,
             address(this),
-            7 days
+            7 days,
+            PoseidonRuntime.etch()
         );
         assertEq(address(vault), parameters.contractAddress);
         vm.deal(USER, 100_000 ether);
         if (treasuryExists) vm.deal(TREASURY, 1 wei);
-        poseidon = address(Bn254Poseidon);
+        poseidon = address(vault.poseidon());
     }
 
     function _coolAll() internal {
@@ -146,7 +149,7 @@ abstract contract GasBaselineBase is Test {
         emit log_named_uint(string.concat(label, " | gasleft delta"), m.delta);
     }
 
-    /// Execution gas of a direct (non-delegate) static call, e.g. into a pure library function.
+    /// Execution gas of a static call, as the vault calls its Poseidon runtime.
     function _staticFrame(address target, bytes memory data, bool cold) internal returns (uint256, bytes memory) {
         if (cold) vm.cool(target);
         (bool ok, bytes memory ret) = target.staticcall(data);
@@ -182,7 +185,7 @@ abstract contract GasBaselineBase is Test {
 
     function _leafOf(uint32 noteId) internal view returns (uint256) {
         (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiry);
+        return ReferenceHashes.leaf(noteId, commitment, amount, expiry);
     }
 
     function _request(string memory name) internal view returns (Types.RequestPublicInputs memory, bytes memory) {
@@ -329,7 +332,7 @@ abstract contract DepositAtBase is GasBaselineBase {
                     frontier[level] = node;
                     break;
                 }
-                node = Bn254Poseidon.compress(DOMAIN_NODE, frontier[level], node);
+                node = Bn254PoseidonReference.compress(DOMAIN_NODE, frontier[level], node);
             }
         }
         for (uint256 level = 0; level < 32; ++level) {
@@ -358,24 +361,26 @@ abstract contract DepositAtBase is GasBaselineBase {
         uint256 node = _leafOf(n);
         for (uint256 level = 0; level < 32; ++level) {
             node = ((n >> level) & 1) == 1
-                ? Bn254Poseidon.compress(DOMAIN_NODE, frontier[level], node)
-                : Bn254Poseidon.compress(DOMAIN_NODE, node, MerkleUpdateLib.zeroHash(level));
+                ? Bn254PoseidonReference.compress(DOMAIN_NODE, frontier[level], node)
+                : Bn254PoseidonReference.compress(DOMAIN_NODE, node, MerkleUpdateLib.zeroHash(level));
         }
         assertEq(vault.currentRoot(), node, "root");
         assertEq(vault.nextNoteId(), n + 1);
 
-        // Vault-own execution: frame minus the two library frames and their DELEGATECALL access
-        // (2,600 cold, then 100 warm). The library frames are data independent.
+        // Vault-own execution: frame minus the two runtime frames and their STATICCALL access
+        // (2,600 cold, then 100 warm). The runtime frames are data independent.
         (uint256 hash5Frame,) = _staticFrame(
             poseidon,
             abi.encodeWithSelector(
-                Bn254Poseidon.hash5.selector, DOMAIN_LEAF, uint256(n), commitment, uint256(DEPOSIT), uint256(1)
+                IBn254Poseidon.hash5.selector, DOMAIN_LEAF, uint256(n), commitment, uint256(DEPOSIT), uint256(1)
             ),
             false
         );
         uint256[32] memory siblings;
         (uint256 insertFrame,) = _staticFrame(
-            poseidon, abi.encodeWithSelector(Bn254Poseidon.insertPath32.selector, DOMAIN_NODE, n, node, siblings), false
+            poseidon,
+            abi.encodeWithSelector(IBn254Poseidon.insertPath32.selector, DOMAIN_NODE, n, node, siblings),
+            false
         );
         uint256 own = m.frame - hash5Frame - insertFrame - 2_700;
         emit log_named_uint(string.concat("deposit #", vm.toString(uint256(n)), " | vault-own (frame - hashing)"), own);
@@ -447,72 +452,91 @@ contract GasBaselineComponents is GasBaselineBase {
         _deploy(true);
     }
 
-    /// One compress, hash5, insertPath32 and compressPairPath32: the library frame alone (direct
-    /// STATICCALL, cold and warm), and as the vault reaches it (a Solidity library call, i.e. a
-    /// DELEGATECALL, measured as a gasleft() delta that includes access, ABI encoding and decoding).
+    /// One compress, hash5, insertPath32 and compressPairPath32: the runtime frame alone (direct
+    /// STATICCALL, cold and warm), and as the vault reaches it (an interface call, measured as a
+    /// gasleft() delta that includes access, ABI encoding and decoding). The reference (the
+    /// former Bn254Poseidon library, which the vault DELEGATECALLed) is measured the same way for
+    /// comparison.
     function test_poseidonComponents() public {
         (uint256 compressCold, bytes memory r1) = _staticFrame(
-            poseidon, abi.encodeWithSelector(Bn254Poseidon.compress.selector, DOMAIN_NODE, uint256(1), uint256(2)), true
+            poseidon,
+            abi.encodeWithSelector(IBn254Poseidon.compress.selector, DOMAIN_NODE, uint256(1), uint256(2)),
+            true
         );
         assertEq(abi.decode(r1, (uint256)), 0x178f4ab3e9e68f4c3459db1c927c9abd074ba5079d8d972e6594b07a5ab1c3b1);
         (uint256 compressWarm,) = _staticFrame(
             poseidon,
-            abi.encodeWithSelector(Bn254Poseidon.compress.selector, DOMAIN_NODE, uint256(1), uint256(2)),
+            abi.encodeWithSelector(IBn254Poseidon.compress.selector, DOMAIN_NODE, uint256(1), uint256(2)),
             false
         );
-        emit log_named_uint("compress | library frame", compressCold);
-        emit log_named_uint("compress | library frame (warm library)", compressWarm);
+        emit log_named_uint("compress | runtime frame", compressCold);
+        emit log_named_uint("compress | runtime frame (warm runtime)", compressWarm);
 
         vm.cool(poseidon);
         uint256 before = gasleft();
-        uint256 h = Bn254Poseidon.compress(DOMAIN_NODE, 1, 2);
-        emit log_named_uint("compress | library call from Solidity, cold (gasleft delta)", before - gasleft());
+        uint256 h = IBn254Poseidon(poseidon).compress(DOMAIN_NODE, 1, 2);
+        emit log_named_uint("compress | interface call from Solidity, cold (gasleft delta)", before - gasleft());
         before = gasleft();
-        h = Bn254Poseidon.compress(DOMAIN_NODE, h, 2);
-        emit log_named_uint("compress | library call from Solidity, warm (gasleft delta)", before - gasleft());
+        h = IBn254Poseidon(poseidon).compress(DOMAIN_NODE, h, 2);
+        emit log_named_uint("compress | interface call from Solidity, warm (gasleft delta)", before - gasleft());
 
         (uint256 hash5Frame, bytes memory r2) = _staticFrame(
             poseidon,
             abi.encodeWithSelector(
-                Bn254Poseidon.hash5.selector, uint256(1), uint256(2), uint256(3), uint256(4), uint256(5)
+                IBn254Poseidon.hash5.selector, uint256(1), uint256(2), uint256(3), uint256(4), uint256(5)
             ),
             true
         );
         assertEq(abi.decode(r2, (uint256)), 0x26081ccbe44f775603e118e5d9152fbbff51c9d7af1a96c9d25ddc7cbed55457);
-        emit log_named_uint("hash5 | library frame (3 permutations)", hash5Frame);
+        emit log_named_uint("hash5 | runtime frame (3 permutations)", hash5Frame);
 
         vm.cool(poseidon);
         before = gasleft();
-        h = NoteLeafLib.computeLeaf(7, bytes32(_commitment(7)), DEPOSIT, 1_800_000_000);
-        emit log_named_uint("NoteLeafLib.computeLeaf | cold library (gasleft delta)", before - gasleft());
+        h = NoteLeafLib.computeLeaf(IBn254Poseidon(poseidon), 7, bytes32(_commitment(7)), DEPOSIT, 1_800_000_000);
+        emit log_named_uint("NoteLeafLib.computeLeaf | cold runtime (gasleft delta)", before - gasleft());
+        assertEq(h, ReferenceHashes.leaf(7, bytes32(_commitment(7)), DEPOSIT, 1_800_000_000));
 
         uint256[32] memory siblings;
         for (uint256 level = 0; level < 32; ++level) {
             siblings[level] = MerkleUpdateLib.zeroHash(level);
         }
-        (uint256 insertFrame,) = _staticFrame(
-            poseidon,
-            abi.encodeWithSelector(Bn254Poseidon.insertPath32.selector, DOMAIN_NODE, uint32(5), h, siblings),
-            true
-        );
-        emit log_named_uint("insertPath32 | library frame (32 compressions)", insertFrame);
+        bytes memory insertData =
+            abi.encodeWithSelector(IBn254Poseidon.insertPath32.selector, DOMAIN_NODE, uint32(5), h, siblings);
+        (uint256 insertFrame,) = _staticFrame(poseidon, insertData, true);
+        emit log_named_uint("insertPath32 | runtime frame (32 compressions)", insertFrame);
         emit log_named_uint("insertPath32 | per compression", insertFrame / 32);
 
-        (uint256 pairFrame,) = _staticFrame(
-            poseidon,
-            abi.encodeWithSelector(
-                Bn254Poseidon.compressPairPath32.selector, DOMAIN_NODE, uint32(5), h, uint256(0), siblings, uint256(3)
-            ),
-            true
+        bytes memory pairData = abi.encodeWithSelector(
+            IBn254Poseidon.compressPairPath32.selector, DOMAIN_NODE, uint32(5), h, uint256(0), siblings, uint256(3)
         );
-        emit log_named_uint("compressPairPath32 | library frame (64 compressions)", pairFrame);
+        (uint256 pairFrame,) = _staticFrame(poseidon, pairData, true);
+        emit log_named_uint("compressPairPath32 | runtime frame (64 compressions)", pairFrame);
 
         // The permutation alone: the difference between hash5 (3 permutations) and compress (1),
-        // both paying one entry (constants copy, ABI) each.
+        // both paying one entry (dispatch, ABI checks, return) each.
         emit log_named_uint("permutation | marginal ((hash5 - compress) / 2)", (hash5Frame - compressWarm) / 2);
         emit log_named_uint(
-            "library entry overhead | compress - permutation", compressWarm - (hash5Frame - compressWarm) / 2
+            "runtime entry overhead | compress - permutation", compressWarm - (hash5Frame - compressWarm) / 2
         );
+
+        address oracle = address(Bn254PoseidonReference);
+        (uint256 refCompress,) = _staticFrame(
+            oracle, abi.encodeWithSelector(IBn254Poseidon.compress.selector, DOMAIN_NODE, uint256(1), uint256(2)), false
+        );
+        (uint256 refHash5,) = _staticFrame(
+            oracle,
+            abi.encodeWithSelector(
+                IBn254Poseidon.hash5.selector, uint256(1), uint256(2), uint256(3), uint256(4), uint256(5)
+            ),
+            false
+        );
+        (uint256 refInsert,) = _staticFrame(oracle, insertData, true);
+        (uint256 refPair,) = _staticFrame(oracle, pairData, true);
+        emit log_named_uint("reference | compress frame (warm)", refCompress);
+        emit log_named_uint("reference | hash5 frame (warm)", refHash5);
+        emit log_named_uint("reference | insertPath32 frame", refInsert);
+        emit log_named_uint("reference | compressPairPath32 frame", refPair);
+        emit log_named_uint("reference | permutation marginal", (refHash5 - refCompress) / 2);
     }
 
     /// The Groth16 adapter alone, cold, with the real vault-challenge proofs, and its precompile
@@ -591,20 +615,19 @@ contract GasBaselineComponents is GasBaselineBase {
     }
 }
 
-/// Returns constants for the two library entry points deposit uses, at the library's selectors,
-/// so a deposit through it costs the vault's own work only (plus two trivial frames). Payable:
-/// the vault DELEGATECALLs it inside a payable deposit, and a library has no callvalue check.
+/// Returns constants for the two runtime entry points deposit uses, at the runtime's selectors,
+/// so a deposit through it costs the vault's own work only (plus two trivial frames).
 contract PoseidonStub {
-    function hash5(uint256, uint256, uint256, uint256, uint256) external payable returns (uint256) {
+    function hash5(uint256, uint256, uint256, uint256, uint256) external pure returns (uint256) {
         return 0x1111;
     }
 
-    function insertPath32(uint256, uint32, uint256, uint256[32] memory) external payable returns (uint256, uint256) {
+    function insertPath32(uint256, uint32, uint256, uint256[32] memory) external pure returns (uint256, uint256) {
         return (0x2222, 0x3333);
     }
 }
 
-/// Deposit #2 with the Poseidon library replaced by PoseidonStub (vm.etch): the vault's own
+/// Deposit #2 with the Poseidon runtime replaced by PoseidonStub (vm.etch): the vault's own
 /// execution (storage, event, calldata and memory work) measured directly, not by subtraction.
 contract GasBaselineDepositStubbedHashing is GasBaselineBase {
     function setUp() public {
@@ -614,17 +637,18 @@ contract GasBaselineDepositStubbedHashing is GasBaselineBase {
     }
 
     function test_depositWithoutHashing() public {
-        assertEq(PoseidonStub.hash5.selector, Bn254Poseidon.hash5.selector);
-        assertEq(PoseidonStub.insertPath32.selector, Bn254Poseidon.insertPath32.selector);
+        assertEq(PoseidonStub.hash5.selector, IBn254Poseidon.hash5.selector);
+        assertEq(PoseidonStub.insertPath32.selector, IBn254Poseidon.insertPath32.selector);
         vm.etch(poseidon, address(new PoseidonStub()).code);
         Measured memory m =
             _measure(USER, uint256(DEPOSIT) * 1 gwei, _depositData(_commitment(2)), "deposit #2, stubbed Poseidon");
         assertEq(vault.currentRoot(), 0x2222);
         uint256[32] memory siblings;
-        (bool ok,) = poseidon.call(abi.encodeWithSelector(PoseidonStub.hash5.selector, 1, 2, 3, 4, uint256(5)));
+        (bool ok,) = poseidon.staticcall(abi.encodeWithSelector(PoseidonStub.hash5.selector, 1, 2, 3, 4, uint256(5)));
         require(ok, "stub hash5");
         uint256 stubHash5 = vm.lastCallGas().gasTotalUsed;
-        (ok,) = poseidon.call(abi.encodeWithSelector(PoseidonStub.insertPath32.selector, 1, uint32(2), 3, siblings));
+        (ok,) =
+            poseidon.staticcall(abi.encodeWithSelector(PoseidonStub.insertPath32.selector, 1, uint32(2), 3, siblings));
         require(ok, "stub insertPath32");
         uint256 stubInsert = vm.lastCallGas().gasTotalUsed;
         emit log_named_uint("deposit #2, stubbed Poseidon | stub frames", stubHash5 + stubInsert);
@@ -749,9 +773,9 @@ contract GasBaselineRetire is GasBaselineBase {
             siblings[level] = MerkleUpdateLib.zeroHash(level);
         }
         _measure(OPERATOR, 0, abi.encodeCall(ZkApiVault.retireClosedLeaf, (0, siblings)), "retireClosedLeaf");
-        uint256 node = Bn254Poseidon.compress(DOMAIN_NODE, 0, siblings[0]);
+        uint256 node = Bn254PoseidonReference.compress(DOMAIN_NODE, 0, siblings[0]);
         for (uint256 level = 1; level < 32; ++level) {
-            node = Bn254Poseidon.compress(DOMAIN_NODE, node, siblings[level]);
+            node = Bn254PoseidonReference.compress(DOMAIN_NODE, node, siblings[level]);
         }
         assertEq(vault.currentRoot(), node, "retired root");
     }

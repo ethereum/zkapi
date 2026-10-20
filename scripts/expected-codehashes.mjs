@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 // Expected runtime codehashes of a zkAPI deployment (vault revision 3), computed from the
-// pinned-compiler Forge artifacts alone: the vault's deployedBytecode with the Bn254Poseidon
-// link applied and its immutableReferences filled from the constructor arguments, the adapter's
-// deployedBytecode with its immutables filled from the vault, the chain and the signing keys it is
-// folded for (the folded IC points recomputed here on BN254 from the verifying-key constants in
-// the artifact's AST), and the library's deployedBytecode (with its own address in a
-// call-protection prefix, if the compiler emitted one). A deployment with the gasless-withdrawal paymaster adds
+// pinned-compiler Forge artifacts alone: the vault's deployedBytecode with its immutableReferences
+// filled from the constructor arguments (the Poseidon runtime's address among them; the vault links
+// no library), the adapter's deployedBytecode with its immutables filled from the vault, the chain
+// and the signing keys it is folded for (the folded IC points recomputed here on BN254 from the
+// verifying-key constants in the artifact's AST), and the Poseidon runtime's deployedBytecode
+// (Bn254PoseidonRuntime, legacy-compiled, no immutables; the setup's poseidon-runtime.json pins
+// its codehash, which Deploy.s.sol checks). A deployment with the gasless-withdrawal paymaster adds
 // the paymaster's, the transit-account factory's and the account logic's deployedBytecode with
 // their immutables filled the same way, and the two canonical ERC-4337 v0.7.0 runtimes (the
 // EntryPoint and its SenderCreator), which are pinned constants. Anyone can rebuild the artifacts
-// from source (protocol/contracts/foundry.toml pins solc, via_ir, 10,000 runs, bytecode_hash
-// "none" and cbor_metadata false) and audit a deployment.
+// from source (protocol/contracts/foundry.toml pins solc, via_ir (off for the Poseidon runtime),
+// 10,000 runs, bytecode_hash "none" and cbor_metadata false) and audit a deployment. The manifest
+// keeps the field names poseidonLibrary, poseidonLibraryReused and poseidonRuntimeCodehash: they
+// name the Poseidon runtime contract now.
 //
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json [--check] [--rpc URL]
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json.pending --rpc URL \
@@ -378,6 +381,7 @@ export function vaultImmutables(inputs) {
         clearanceSigningKeyX: word(inputs.clearanceSigningKeyX, 'clearanceSigningKeyX'),
         clearanceSigningKeyY: word(inputs.clearanceSigningKeyY, 'clearanceSigningKeyY'),
         maxPauseDuration: word(maxPauseDuration, 'maxPauseDuration'),
+        poseidon: word(address(inputs.poseidonLibrary, 'poseidonLibrary'), 'poseidonLibrary'),
     };
 }
 
@@ -494,22 +498,11 @@ export function hasGasless(inputs) {
 }
 
 export function expectedRuntimeCode(artifactsDir, inputs) {
-    const poseidon = address(inputs.poseidonLibrary, 'poseidonLibrary').slice(2);
-
     const vaultArtifact = artifact(artifactsDir, 'ZkApiVault');
     let vault = vaultArtifact.deployedBytecode.object.replace(/^0x/, '');
-    const links = vaultArtifact.deployedBytecode.linkReferences ?? {};
-    let linked = 0;
-    for (const [file, libraries] of Object.entries(links)) {
-        for (const [name, refs] of Object.entries(libraries)) {
-            if (name !== 'Bn254Poseidon') fail(`ZkApiVault links an unexpected library ${file}:${name}`);
-            for (const ref of refs) {
-                vault = patch(vault, ref.start, ref.length, poseidon);
-                ++linked;
-            }
-        }
+    if (Object.keys(vaultArtifact.deployedBytecode.linkReferences ?? {}).length) {
+        fail('ZkApiVault links a library: the artifacts predate the Poseidon runtime (rebuild)');
     }
-    if (linked === 0) fail('ZkApiVault has no Bn254Poseidon link reference');
     const names = immutableNames(vaultArtifact.ast);
     const values = vaultImmutables(inputs);
     const filled = new Set();
@@ -525,14 +518,13 @@ export function expectedRuntimeCode(artifactsDir, inputs) {
     const adapterArtifact = artifact(artifactsDir, 'Groth16ProofAdapter');
     const adapter = filledRuntimeCode('Groth16ProofAdapter', adapterArtifact, adapterImmutables(adapterArtifact, inputs));
 
-    const libraryArtifact = artifact(artifactsDir, 'Bn254Poseidon');
-    let library = libraryArtifact.deployedBytecode.object.replace(/^0x/, '');
-    // A library with call protection starts with PUSH20 <its own address>, written at deployment.
-    // Bn254Poseidon's via-IR code has none (all its functions are pure), so its code does not
-    // depend on its address.
-    if (library.startsWith('73' + '0'.repeat(40))) library = patch(library, 1, 20, poseidon);
+    // The Poseidon runtime: legacy-compiled, no immutables, no links, so its runtime code is the
+    // artifact's as it stands.
+    const runtimeArtifact = artifact(artifactsDir, 'Bn254PoseidonRuntime');
+    const runtime = filledRuntimeCode('Bn254PoseidonRuntime', runtimeArtifact, {});
+    if (runtimeArtifact.metadata?.settings?.viaIR) fail('Bn254PoseidonRuntime was compiled with via_ir; its pinned codehash is the legacy pipeline\'s');
 
-    const code = { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${library}` };
+    const code = { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${runtime}` };
     if (!hasGasless(inputs)) return code;
     const immutables = gaslessImmutables(inputs);
     code.paymaster = `0x${filledRuntimeCode('ZkApiWithdrawalPaymaster', artifact(artifactsDir, 'ZkApiWithdrawalPaymaster'), immutables.paymaster)}`;
