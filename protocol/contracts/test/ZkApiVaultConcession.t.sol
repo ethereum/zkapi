@@ -61,7 +61,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         (bool exists, uint256 activeRoot, uint256 nullifier, uint128 finalBalance, address destination, uint64 dl) =
             vault.pendingWithdrawals(id);
         assertTrue(exists);
-        assertEq(activeRoot, inputs.activeRoot);
+        assertEq(activeRoot, 0, "the proof's root is not stored");
         assertEq(nullifier, N(2));
         assertEq(finalBalance, B2 - SB2);
         assertEq(destination, user);
@@ -75,11 +75,12 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
 
-    /// An unrelated deposit mined first changes nothing about the escape. The pending record keeps
-    /// the proof's root, but the events report the live root: the indexer and the clients' log
-    /// rebuild require every root-bearing event other than NoteDeposited and ClosedLeafRetired to
-    /// carry the current computed root. A defeat after a further deposit reports the root live at
-    /// the defeat, neither the proof's root nor the one live at initiation.
+    /// An unrelated deposit mined first changes nothing about the escape. The pending record does
+    /// not keep the proof's root (its pendingWithdrawals word is zero), and the events report the
+    /// live root: the indexer and the clients' log rebuild require every root-bearing event other
+    /// than NoteDeposited and ClosedLeafRetired to carry the current computed root. A defeat after
+    /// a further deposit reports the root live at the defeat, neither the proof's root nor the one
+    /// live at initiation.
     function test_depositLandingFirstDoesNotInvalidateTheEscape() public {
         uint32 id = _deposit(42);
         Types.WithdrawalPublicInputs memory inputs = _escapeFrom(id, 2, B2, 0);
@@ -92,8 +93,9 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         vm.expectEmit(address(vault));
         emit Events.EscapeWithdrawalInitiated(id, N(2), B2, user, deadline, liveRoot);
         _initiate(inputs);
-        (, uint256 activeRoot,,,,) = vault.pendingWithdrawals(id);
-        assertEq(activeRoot, proofRoot);
+        (bool exists, uint256 activeRoot,,,,) = vault.pendingWithdrawals(id);
+        assertTrue(exists);
+        assertEq(activeRoot, 0, "the proof's root is not stored");
         assertEq(vault.currentRoot(), liveRoot);
 
         _deposit(45);
@@ -557,6 +559,143 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         vault.finalizeEscapeWithdrawal(id);
         assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Closed));
         assertEq(treasury.balance, uint256(DEPOSIT - 450_000) * 1 gwei);
+    }
+
+    // ============================================================= nullifier words
+
+    /// An escape keeps its successor nullifier and destination in its nullifiers' words and its
+    /// amounts in 96 bits: the extreme values round-trip through every getter, a raise and the
+    /// finalization. N = 0 is a field element like any other; N_{k+1} = r - 1 is the largest.
+    function test_escapeRecordRoundTripsAtTheFieldAndAmountBounds() public {
+        uint128 max = vault.MAX_NATIVE_UNITS();
+        vm.deal(user, uint256(max + DEPOSIT) * 1 gwei);
+        uint32 id = vault.nextNoteId();
+        vm.prank(user);
+        vault.deposit{value: uint256(max) * 1 gwei}(bytes32(uint256(42)), max);
+        address destination = address(type(uint160).max);
+        uint256 next = SCALAR_MODULUS - 1;
+        Types.WithdrawalPublicInputs memory inputs = _escape(id, 0, next, max - 1, 1);
+        inputs.destination = destination;
+        _initiate(inputs);
+
+        (bool exists, uint256 activeRoot, uint256 nullifier, uint128 finalBalance, address pendingTo, uint64 dl) =
+            vault.pendingWithdrawals(id);
+        assertTrue(exists);
+        assertEq(activeRoot, 0);
+        assertEq(nullifier, 0);
+        assertEq(finalBalance, max - 1);
+        assertEq(pendingTo, destination);
+        assertEq(dl, uint64(vm.getBlockTimestamp()) + CHALLENGE_PERIOD);
+        (uint256 pendingNext, uint128 stateBalance, uint128 conceded) = _concession(id);
+        assertEq(pendingNext, next);
+        assertEq(stateBalance, max);
+        assertEq(conceded, 1);
+        assertTrue(vault.usedNullifiers(0) && vault.usedNullifiers(next));
+        assertFalse(vault.challengedNullifiers(0) || vault.challengedNullifiers(next));
+
+        vault.raiseEscapeConcession(id, _evidence(0, max), PROOF, max - 5);
+        _assertConcession(id, max - 5);
+        assertEq(_pendingFinalBalance(id), 5);
+        (pendingNext,,) = _concession(id);
+        assertEq(pendingNext, next);
+        (,,,, pendingTo, dl) = vault.pendingWithdrawals(id);
+        assertEq(pendingTo, destination);
+        assertEq(dl, _deadline(id));
+
+        vm.warp(_deadline(id));
+        vault.finalizeEscapeWithdrawal(id);
+        assertEq(destination.balance, 5 gwei);
+        assertEq(treasury.balance, uint256(max - 5) * 1 gwei);
+        // What the words still hold is invisible: the getters read zero and only USED remains.
+        (exists, activeRoot, nullifier, finalBalance, pendingTo, dl) = vault.pendingWithdrawals(id);
+        assertFalse(exists);
+        assertEq(activeRoot + nullifier + finalBalance + uint160(pendingTo) + dl, 0);
+        (pendingNext, stateBalance, conceded) = _concession(id);
+        assertEq(pendingNext + stateBalance + conceded, 0);
+        assertTrue(vault.usedNullifiers(0) && vault.usedNullifiers(next));
+        assertFalse(vault.challengedNullifiers(0) || vault.challengedNullifiers(next));
+        uint32 other = _deposit(43);
+        _escapeReverts(_escape(other, next, N(1), 1, 0), Errors.ReplayedNullifier.selector);
+        _escapeReverts(_escape(other, 0, N(1), 1, 0), Errors.ReplayedNullifier.selector);
+        _closeReverts(_close(other, next, 1), Errors.ReplayedNullifier.selector);
+    }
+
+    /// A defeat leaves N_k's word CHALLENGED and N_{k+1}'s empty, whatever the escape wrote there:
+    /// the successor escapes afresh, and an escape naming N_k as its successor is superseded.
+    function test_defeatClearsTheEscapeFromItsNullifierWords() public {
+        uint32 id = _deposit(42);
+        uint256 top = SCALAR_MODULUS - 1;
+        Types.WithdrawalPublicInputs memory inputs = _escape(id, top, 1, B2, 0);
+        inputs.destination = address(type(uint160).max);
+        _initiate(inputs);
+        _defeat(id, 1);
+        assertFalse(vault.usedNullifiers(top) || vault.usedNullifiers(1));
+        assertTrue(vault.challengedNullifiers(top));
+        assertFalse(vault.challengedNullifiers(1));
+        (bool exists,,,,,) = vault.pendingWithdrawals(id);
+        assertFalse(exists);
+
+        _initiate(_escape(id, 1, 2, 750_000, 0));
+        _assertPending(id, 1, 2);
+        (,,,, address destination,) = vault.pendingWithdrawals(id);
+        assertEq(destination, user);
+        _defeat(id, 2);
+        _escapeReverts(_escape(id, top, 3, B2, 0), Errors.ChallengedNullifier.selector);
+        _escapeReverts(_escape(id, 3, top, B2, 0), Errors.SupersededState.selector);
+    }
+
+    /// What the escape lifecycle costs in fresh storage, the dearest write (about 110,000 gas a
+    /// slot where state gas is priced, as on Sepolia): an initiation fills four zero slots (N_k's
+    /// and N_{k+1}'s words and the 2-slot record by note), and a raise, a defeat or a finalization
+    /// none (a defeat close to the note's expiry also records its grace).
+    function test_escapeLifecycleFreshSlots() public {
+        uint32 id = _deposit(42);
+        Types.WithdrawalPublicInputs memory escape = _escapeFrom(id, 2, B2, 0);
+        assertEq(_freshSlots(abi.encodeCall(ZkApiVault.initiateEscapeWithdrawal, (escape, PROOF))), 4, "initiation");
+        Types.RequestPublicInputs memory raise = _evidence(N(2), SB2);
+        assertEq(_freshSlots(abi.encodeCall(ZkApiVault.raiseEscapeConcession, (id, raise, PROOF, SB2))), 0, "raise");
+        uint256 pending = vm.snapshotState();
+        Types.RequestPublicInputs memory defeat = _evidence(N(3), SB2);
+        assertEq(_freshSlots(abi.encodeCall(ZkApiVault.challengeEscapeWithdrawal, (id, defeat, PROOF))), 0, "defeat");
+        vm.revertToState(pending);
+        vm.warp(_deadline(id));
+        assertEq(_freshSlots(abi.encodeCall(ZkApiVault.finalizeEscapeWithdrawal, (id))), 0, "finalization");
+    }
+
+    /// Calls the vault with `data` and counts the vault slots it changed from zero to nonzero.
+    function _freshSlots(bytes memory data) internal returns (uint256 fresh) {
+        uint256 before = vm.snapshotState();
+        vm.record();
+        (bool ok,) = address(vault).call(data);
+        assertTrue(ok);
+        (, bytes32[] memory writes) = vm.accesses(address(vault));
+        bytes32[] memory values = new bytes32[](writes.length);
+        for (uint256 i = 0; i < writes.length; ++i) {
+            values[i] = vm.load(address(vault), writes[i]);
+        }
+        uint256 afterCall = vm.snapshotState();
+        vm.revertToState(before);
+        for (uint256 i = 0; i < writes.length; ++i) {
+            bool counted;
+            for (uint256 j = 0; j < i; ++j) {
+                if (writes[j] == writes[i]) counted = true;
+            }
+            if (!counted && values[i] != 0 && vm.load(address(vault), writes[i]) == 0) ++fresh;
+        }
+        vm.revertToState(afterCall);
+    }
+
+    /// The nullifier checks keep their order: the field check of N, its replay check, then N_{k+1}'s.
+    function test_escapeChecksItsNullifiersInOrder() public {
+        uint256 r = SCALAR_MODULUS;
+        uint32 id = _deposit(42);
+        uint32 closed = _deposit(43);
+        vault.mutualClose(_close(closed, N(7), 1), PROOF);
+        _escapeReverts(_escape(id, N(7), N(8) + r, 1, 0), Errors.ReplayedNullifier.selector);
+        _escapeReverts(_escape(id, N(8) + r, N(7), 1, 0), Errors.InvalidFelt.selector);
+        _escapeReverts(_escape(id, N(8), N(7), 1, 0), Errors.ReplayedNullifier.selector);
+        _escapeReverts(_escape(id, N(8), N(9) + r, 1, 0), Errors.InvalidFelt.selector);
+        _assertUntouched(id);
     }
 
     // ======================================================================= close

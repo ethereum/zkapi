@@ -249,15 +249,23 @@ func (h *FundingHandler) ensureGaslessChecked(ctx context.Context) error {
 // never accepts as a payee.
 var errGaslessPayee = errors.New("invalid_payee")
 
+// maxPrecompilePayee is the highest address the factory reserves for
+// precompiles (0x01-0x11 and P256VERIFY at 0x100 today, zero included).
+var maxPrecompilePayee = big.NewInt(0xffff)
+
 // checkGaslessPayee applies the factory's InvalidPayee rule
 // (ZkApiWithdrawalAccountFactory.createAccount reverts for the zero
-// address, the vault, the paymaster, the EntryPoint and the factory
-// itself): getAddress is pure and derives a transit account for such a
-// payee too, but that account can never be created, so a proof bound to it
-// would strand the payout (no sponsored operation, no sweep). The payout
-// address is refused before anything is reserved.
+// address and every other address up to 0xffff, the precompiles' range,
+// the vault, the paymaster, the EntryPoint and the factory itself):
+// getAddress is pure and derives a transit account for such a payee too,
+// but that account can never be created, so a proof bound to it would
+// strand the payout (no sponsored operation, no sweep). The payout address
+// is refused before anything is reserved.
 func checkGaslessPayee(profile gaslessProfile, vault, payee string) error {
 	address := common.HexToAddress(payee)
+	if new(big.Int).SetBytes(address.Bytes()).Cmp(maxPrecompilePayee) <= 0 && address != (common.Address{}) {
+		return fmt.Errorf("%w: the payout address %s is in the precompiles' range (up to 0xffff), which the transit account's factory never accepts as a payee; withdraw to another address", errGaslessPayee, address.Hex())
+	}
 	names := []struct {
 		address common.Address
 		name    string

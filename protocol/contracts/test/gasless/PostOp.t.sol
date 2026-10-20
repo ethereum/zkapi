@@ -126,7 +126,7 @@ contract PostOpTest is GaslessTestBase {
         Vm.Log[] memory logs = _handle(op);
         _assertSettledCleanly(logs);
         // and with initCode at its own floor
-        address other = address(0x0A11);
+        address other = address(0x10A11);
         uint32 id2 = _bigNote(43);
         (op,) = _closeOpFor(other, id2, 1002, BIG - 1_000_000);
         g.verification = gp.verificationFloorInit;

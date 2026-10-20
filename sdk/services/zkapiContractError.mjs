@@ -157,7 +157,7 @@ const CONTRACT_ERRORS = Object.freeze({
     // UnknownCall()
     '0x35c169a5': { code: 'unknown_call', message: 'The transit account does not accept this call.' },
     // InvalidPayee()
-    '0xb387a238': { code: 'invalid_payee', message: 'The payout address cannot be the vault, the paymaster, the EntryPoint, the factory or zero.' },
+    '0xb387a238': { code: 'invalid_payee', message: 'The payout address cannot be the vault, the paymaster, the EntryPoint, the factory, zero or a precompile address (up to 0xffff).' },
     // CreateFailed()
     '0x7e16b8cd': { code: 'create_failed', message: 'The transit account could not be created.' },
     // NotPaymasterOwner()

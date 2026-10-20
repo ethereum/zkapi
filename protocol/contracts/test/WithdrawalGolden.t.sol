@@ -49,8 +49,15 @@ contract WithdrawalGoldenTest is Test {
             emptySiblings[level] = zero;
             zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
         }
-        adapter = new Groth16ProofAdapter();
         (Types.WithdrawalPublicInputs memory escape,) = _withdrawal(ESCAPE);
+        // Folded for the vault DEPLOYER creates at nonce 0, the address the proofs bind.
+        adapter = new Groth16ProofAdapter(
+            vm.computeCreateAddress(DEPLOYER, 0),
+            escape.stateSigningKeyX,
+            escape.stateSigningKeyY,
+            escape.clearanceSigningKeyX,
+            escape.clearanceSigningKeyY
+        );
         vm.setNonce(DEPLOYER, 0);
         vm.prank(DEPLOYER);
         vault = new ZkApiVault(

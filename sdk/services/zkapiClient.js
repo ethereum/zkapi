@@ -8573,10 +8573,11 @@ class ZkapiClient extends EventTarget {
         } catch {
             concession = null;
         }
+        // Word 1 (activeRoot) is always zero: the vault keeps no escape's root, which only
+        // the escape's own calldata carries. It is not reported.
         return {
             status: 'pending_withdrawal',
             note_id: Number(noteId),
-            active_root: `0x${pendingWords[1]}`,
             withdrawal_nullifier: `0x${pendingWords[2]}`,
             final_balance: Number(BigInt(`0x${pendingWords[3]}`)),
             destination: `0x${pendingWords[4].slice(-40)}`,

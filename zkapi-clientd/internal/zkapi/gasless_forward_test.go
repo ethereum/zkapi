@@ -135,8 +135,9 @@ func TestGaslessRefusedForwardIncludedAfterAllIsFollowed(t *testing.T) {
 }
 
 // The factory's InvalidPayee rule: a payout address the factory never
-// accepts (the EntryPoint, the paymaster, the factory) is refused before
-// anything is reserved, for a close and an escape alike.
+// accepts (the EntryPoint, the paymaster, the factory, an address in the
+// precompiles' range) is refused before anything is reserved, for a close
+// and an escape alike.
 func TestGaslessRefusesAPayeeTheFactoryRejects(t *testing.T) {
 	for _, target := range []string{"entry point", "paymaster", "factory"} {
 		t.Run(target, func(t *testing.T) {
@@ -160,12 +161,16 @@ func TestGaslessRefusesAPayeeTheFactoryRejects(t *testing.T) {
 		})
 	}
 	profile := gaslessProfile{EntryPoint: "0x0000000071727De22E5E9d8BAf0edAc6f37da032", Paymaster: "0x00000000000000000000000000000000000000aa", Factory: "0x00000000000000000000000000000000000000bb"}
-	for _, payee := range []string{"0x0000000000000000000000000000000000000000", addressTestVault, "0x0000000071727de22e5e9d8baf0edac6f37da032"} {
-		if err := checkGaslessPayee(profile, addressTestVault, payee); err == nil {
-			t.Fatalf("%s accepted", payee)
+	for _, payee := range []string{"0x0000000000000000000000000000000000000000", addressTestVault, "0x0000000071727de22e5e9d8baf0edac6f37da032",
+		"0x0000000000000000000000000000000000000001", "0x0000000000000000000000000000000000000009", "0x0000000000000000000000000000000000000100",
+		"0x000000000000000000000000000000000000ffff"} {
+		if err := checkGaslessPayee(profile, addressTestVault, payee); err == nil || !strings.Contains(err.Error(), "invalid_payee") {
+			t.Fatalf("%s accepted: %v", payee, err)
 		}
 	}
-	if err := checkGaslessPayee(profile, addressTestVault, withdrawalTestDestination); err != nil {
-		t.Fatal(err)
+	for _, payee := range []string{withdrawalTestDestination, "0x0000000000000000000000000000000000010000"} {
+		if err := checkGaslessPayee(profile, addressTestVault, payee); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

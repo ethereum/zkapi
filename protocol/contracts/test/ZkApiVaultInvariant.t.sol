@@ -388,18 +388,35 @@ contract ZkApiVaultInvariantTest is Test {
         uint32 count = vault.nextNoteId();
         for (uint32 id = 0; id < count; ++id) {
             (, uint128 amount,, Types.NoteStatus status) = vault.notes(id);
-            (bool exists,, uint256 nullifier, uint128 finalBalance,,) = vault.pendingWithdrawals(id);
+            (
+                bool exists,
+                uint256 activeRoot,
+                uint256 nullifier,
+                uint128 finalBalance,
+                address destination,
+                uint64 deadline
+            ) = vault.pendingWithdrawals(id);
             (uint256 next, uint128 stateBalance, uint128 conceded) = vault.pendingConcessions(id);
+            // The proof's root is never stored.
+            assertEq(activeRoot, 0);
             if (status == Types.NoteStatus.PendingWithdrawal) {
                 assertTrue(exists);
                 assertEq(uint256(finalBalance) + conceded, stateBalance);
                 assertLe(stateBalance, amount);
                 assertNotEq(next, 0);
                 assertNotEq(next, nullifier);
+                assertNotEq(destination, address(0));
+                assertNotEq(deadline, 0);
                 assertTrue(vault.usedNullifiers(nullifier));
                 assertTrue(vault.usedNullifiers(next));
+                assertFalse(vault.challengedNullifiers(nullifier));
+                assertFalse(vault.challengedNullifiers(next));
             } else {
                 assertFalse(exists);
+                assertEq(nullifier, 0);
+                assertEq(finalBalance, 0);
+                assertEq(destination, address(0));
+                assertEq(deadline, 0);
                 assertEq(next, 0);
                 assertEq(stateBalance, 0);
                 assertEq(conceded, 0);

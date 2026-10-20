@@ -18,6 +18,9 @@ import {Errors} from "../src/libraries/Errors.sol";
 ///      challengedNullifiers and pendingConcessions on the raw words, so an adapter that reduced
 ///      N + r or N_{k+1} + r to a valid proof would let an escape slip past ChallengedNullifier,
 ///      SupersededState and ReplayedNullifier, or name a successor no defeat can match.
+///      Every proof is checked on two adapters: one folded for its own fixture's vault (each
+///      mutation of a folded word leaves the folded path) and one folded for the other fixture's,
+///      which verifies it over every input.
 contract ZkApiVaultMutationTest is Test {
     uint256 constant SCALAR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint256 constant BASE_MODULUS = 21888242871839275222246405745257275088696311157297823662689037894645226208583;
@@ -25,6 +28,9 @@ contract ZkApiVaultMutationTest is Test {
     /// all the gas the adapter forwards to it; the cap keeps the loop from running dry.
     uint256 constant VERIFY_GAS = 1_000_000;
 
+    /// Folded for vault-challenge.json's vault, and for solidity-fixture.json's (contract 0x1234).
+    Groth16ProofAdapter vaultAdapter;
+    Groth16ProofAdapter solidityAdapter;
     Groth16ProofAdapter adapter;
 
     /// Bit widths of the request inputs in order (256: a field element).
@@ -33,36 +39,64 @@ contract ZkApiVaultMutationTest is Test {
     uint16[16] WITHDRAWAL_BITS = [16, 64, 160, 256, 256, 256, 256, 256, 32, 128, 160, 256, 8, 256, 128, 64];
 
     function setUp() public {
-        adapter = new Groth16ProofAdapter();
+        vm.chainId(31_337);
+        vaultAdapter = _folded("test/fixtures/vault-challenge.json", "close_a2");
+        solidityAdapter = _folded("test/fixtures/solidity-fixture.json", "close");
+        assertNotEq(vaultAdapter.foldedVault(), solidityAdapter.foldedVault());
+    }
+
+    /// An adapter folded for the vault, chain and keys of fixture `name` in `file`.
+    function _folded(string memory file, string memory name) private returns (Groth16ProofAdapter) {
+        (bytes memory words,) = _fixture(file, name);
+        Types.WithdrawalPublicInputs memory binding = abi.decode(words, (Types.WithdrawalPublicInputs));
+        assertEq(binding.chainId, block.chainid);
+        return new Groth16ProofAdapter(
+            binding.contractAddress,
+            binding.stateSigningKeyX,
+            binding.stateSigningKeyY,
+            binding.clearanceSigningKeyX,
+            binding.clearanceSigningKeyY
+        );
+    }
+
+    function _adapters() private view returns (Groth16ProofAdapter[2] memory) {
+        return [vaultAdapter, solidityAdapter];
     }
 
     function test_everyRequestInputIsBound() public {
-        string[2] memory solidity = ["request", "request_signed"];
-        for (uint256 i = 0; i < solidity.length; ++i) {
-            _mutateRequest("test/fixtures/solidity-fixture.json", solidity[i]);
-        }
-        string[5] memory vault = ["request_a0", "request_a1", "request_a2", "request_a3", "request_b0"];
-        for (uint256 i = 0; i < vault.length; ++i) {
-            _mutateRequest("test/fixtures/vault-challenge.json", vault[i]);
+        for (uint256 a = 0; a < 2; ++a) {
+            adapter = _adapters()[a];
+            string[2] memory solidity = ["request", "request_signed"];
+            for (uint256 i = 0; i < solidity.length; ++i) {
+                _mutateRequest("test/fixtures/solidity-fixture.json", solidity[i]);
+            }
+            string[5] memory vault = ["request_a0", "request_a1", "request_a2", "request_a3", "request_b0"];
+            for (uint256 i = 0; i < vault.length; ++i) {
+                _mutateRequest("test/fixtures/vault-challenge.json", vault[i]);
+            }
         }
     }
 
     function test_everyWithdrawalInputIsBound() public {
-        string[6] memory solidity =
-            ["withdrawal", "escape_c0", "escape_genesis_concession", "close", "ownership", "escape_full_destination"];
-        for (uint256 i = 0; i < solidity.length; ++i) {
-            _mutateWithdrawal("test/fixtures/solidity-fixture.json", solidity[i]);
-        }
-        string[6] memory vault = [
-            "escape_a2",
-            "escape_a2_concede",
-            "escape_a2_expired",
-            "escape_b0_genesis_concede",
-            "close_a2",
-            "ownership_a2"
-        ];
-        for (uint256 i = 0; i < vault.length; ++i) {
-            _mutateWithdrawal("test/fixtures/vault-challenge.json", vault[i]);
+        for (uint256 a = 0; a < 2; ++a) {
+            adapter = _adapters()[a];
+            string[6] memory solidity = [
+                "withdrawal", "escape_c0", "escape_genesis_concession", "close", "ownership", "escape_full_destination"
+            ];
+            for (uint256 i = 0; i < solidity.length; ++i) {
+                _mutateWithdrawal("test/fixtures/solidity-fixture.json", solidity[i]);
+            }
+            string[6] memory vault = [
+                "escape_a2",
+                "escape_a2_concede",
+                "escape_a2_expired",
+                "escape_b0_genesis_concede",
+                "close_a2",
+                "ownership_a2"
+            ];
+            for (uint256 i = 0; i < vault.length; ++i) {
+                _mutateWithdrawal("test/fixtures/vault-challenge.json", vault[i]);
+            }
         }
     }
 

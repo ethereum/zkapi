@@ -55,6 +55,21 @@ contract TransitAccountTest is GaslessTestBase {
         factory.createAccount(address(0), payee);
     }
 
+    /// A precompile has no code, so the paymaster would price a push to it as an EOA's while a
+    /// failing one burns the whole push gas, and a credit to it could never be claimed: the
+    /// factory reserves the whole range up to 0xffff (0x01-0x11 and P256VERIFY at 0x100 today).
+    function test_createAccountRefusesAPrecompilePayee() public {
+        uint160[7] memory precompiles = [uint160(0x01), 0x08, 0x09, 0x0a, 0x11, 0x100, 0xffff];
+        for (uint256 i = 0; i < precompiles.length; ++i) {
+            vm.expectRevert(ZkApiWithdrawalAccountFactory.InvalidPayee.selector);
+            factory.createAccount(ownerAddr, address(precompiles[i]));
+        }
+        address first = address(uint160(0x10000));
+        assertEq(
+            factory.createAccount(ownerAddr, first), factory.getAddress(ownerAddr, first), "the first address above"
+        );
+    }
+
     function test_createAccountIsDeterministicAndIdempotent() public {
         address predicted = factory.getAddress(ownerAddr, payee);
         bytes memory creationCode = factory.accountCreationCode();

@@ -646,8 +646,8 @@ test('mini bundler: v0.7 packing and the user operation hash match the golden ve
         paymasterVerificationGasLimit: undefined, paymasterPostOpGasLimit: undefined };
     assert.equal(packUserOperation(plain).paymasterAndData, '0x');
     assert.equal(packUserOperation(plain).initCode, '0x');
-    assert.equal(bundleGas([op]), 642_500n + 180_000n + 50_000n + 430_000n + 270_000n + 300_000n);
-    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 642_500n + 180_000n + 50_000n);
+    assert.equal(bundleGas([op]), 395_000n + 180_000n + 50_000n + 380_000n + 270_000n + 300_000n);
+    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 395_000n + 180_000n + 50_000n);
 });
 
 test('mini bundler: refuses malformed operations by field', () => {

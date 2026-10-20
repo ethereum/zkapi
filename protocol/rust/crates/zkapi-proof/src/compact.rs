@@ -1573,24 +1573,144 @@ fn verifying_key_manifest(key: &VerifyingKey<Bn254>) -> VerifyingKeyManifest {
     }
 }
 
+/// A public input of a statement, in Groth16 order: its field in `Types`, its ABI bit width (256
+/// for a field element) and, for one that every proof of a vault shares, the Yul name of the
+/// constant the adapter's constructor folds into the first IC point.
+struct SolidityInput {
+    name: &'static str,
+    bits: u16,
+    folded: Option<&'static str>,
+}
+
+const fn input(name: &'static str, bits: u16, folded: Option<&'static str>) -> SolidityInput {
+    SolidityInput { name, bits, folded }
+}
+
+/// `Types.RequestPublicInputs`, in order.
+const REQUEST_SOLIDITY_INPUTS: [SolidityInput; 12] = [
+    input("protocolVersion", 16, Some("PROTOCOL_VERSION")),
+    input("chainId", 64, Some("chainId")),
+    input("contractAddress", 160, Some("vault")),
+    input("activeRoot", 256, None),
+    input("stateSigningKeyX", 256, Some("stateX")),
+    input("stateSigningKeyY", 256, Some("stateY")),
+    input("requestTime", 64, None),
+    input("solvencyBound", 128, None),
+    input("requestNullifier", 256, None),
+    input("authorizationTag", 256, None),
+    input("anonymousCommitmentX", 256, None),
+    input("anonymousCommitmentY", 256, None),
+];
+
+/// `Types.WithdrawalPublicInputs`, in order.
+const WITHDRAWAL_SOLIDITY_INPUTS: [SolidityInput; 16] = [
+    input("protocolVersion", 16, Some("PROTOCOL_VERSION")),
+    input("chainId", 64, Some("chainId")),
+    input("contractAddress", 160, Some("vault")),
+    input("activeRoot", 256, None),
+    input("stateSigningKeyX", 256, Some("stateX")),
+    input("stateSigningKeyY", 256, Some("stateY")),
+    input("clearanceSigningKeyX", 256, Some("clearanceX")),
+    input("clearanceSigningKeyY", 256, Some("clearanceY")),
+    input("noteId", 32, None),
+    input("finalBalance", 128, None),
+    input("destination", 160, None),
+    input("withdrawalNullifier", 256, None),
+    input("kind", 8, None),
+    input("nextNullifier", 256, None),
+    input("conceded", 128, None),
+    input("validUntil", 64, None),
+];
+
+/// The bytes of `Types.WithdrawalPublicInputs` in calldata: one word per input.
+const WITHDRAWAL_INPUT_BYTES: usize = 32 * WITHDRAWAL_SOLIDITY_INPUTS.len();
+
+/// The proof the adapter reads: A, B and C, eight words.
+const GROTH16_PROOF_BYTES: usize = 0x100;
+
+/// The position of `destination` among the withdrawal inputs: the verify-once record is kept at
+/// keccak256(destination ‖ h), storage ERC-7562 associates with the operation's sender.
+fn withdrawal_destination_index() -> usize {
+    WITHDRAWAL_SOLIDITY_INPUTS
+        .iter()
+        .position(|input| input.name == "destination" && input.bits == 160)
+        .expect("Types.WithdrawalPublicInputs has an address destination")
+}
+
+/// The Yul functions every assembly block of the adapter uses.
+const SOLIDITY_YUL_HELPERS: &str = r#"            // Reverts InvalidProof().
+            function fail() {
+                mstore(0x00, shl(224, 0x09bde339))
+                revert(0x00, 0x04)
+            }
+            // Adds s · (x, y) to the G1 point at l, with the four words after it as scratch. A
+            // scalar at or above the field order is refused. 0 · P is the identity, the neutral
+            // element of the sum: skipped. 1 · P and 2 · P need no scalar multiplication (6,000
+            // gas) either: the point itself, and one addition. The protocol version (2), a
+            // close's kind (1), an escape's kind (0) and an exit's zero nextNullifier and conceded
+            // take these paths.
+            function addTerm(l, x, y, s) {
+                if iszero(lt(s, SCALAR_MODULUS)) { fail() }
+                if s {
+                    let t := add(l, 0x40)
+                    mstore(t, x)
+                    mstore(add(t, 0x20), y)
+                    switch s
+                    case 1 {}
+                    case 2 {
+                        mstore(add(t, 0x40), x)
+                        mstore(add(t, 0x60), y)
+                        if iszero(staticcall(gas(), 0x06, t, 0x80, t, 0x40)) { fail() }
+                    }
+                    default {
+                        mstore(add(t, 0x40), s)
+                        if iszero(staticcall(gas(), 0x07, t, 0x60, t, 0x40)) { fail() }
+                    }
+                    if iszero(staticcall(gas(), 0x06, l, 0x80, l, 0x40)) { fail() }
+                }
+            }
+"#;
+
 /// The generated `Groth16ProofAdapter.sol` for a pair of verifying keys.
 pub fn groth16_solidity_source(
     setup_id: &str,
     request_key: &VerifyingKey<Bn254>,
     withdrawal_key: &VerifyingKey<Bn254>,
 ) -> String {
-    let mut source = r#"// SPDX-License-Identifier: MIT
+    assert_eq!(
+        request_key.gamma_abc_g1.len(),
+        REQUEST_SOLIDITY_INPUTS.len() + 1,
+        "request key shape"
+    );
+    assert_eq!(
+        withdrawal_key.gamma_abc_g1.len(),
+        WITHDRAWAL_SOLIDITY_INPUTS.len() + 1,
+        "withdrawal key shape"
+    );
+    let source = r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
 import {IZkApiProofAdapter} from "../interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../libraries/Types.sol";
-import {Errors} from "../libraries/Errors.sol";
 
 /// @title Groth16ProofAdapter
 /// @notice zkAPI verifier for circuit __CIRCUIT_ID__, setup __SETUP_ID__, generated from its
 ///         verifying keys. Verification is standard Groth16 over the 12 request and 16 withdrawal
 ///         public inputs, in the order of Types.RequestPublicInputs and Types.WithdrawalPublicInputs;
 ///         inputs of 0, 1 and 2 skip the scalar multiplication.
+///         A deployment serves one vault: the constructor folds the inputs every proof of that
+///         vault shares (protocol version 2, the chain ID, the vault's address and its signing
+///         keys) into the first IC point, and a statement whose words equal them all skips their
+///         scalar multiplications. Any other statement is verified over every input, so the
+///         adapter accepts exactly the proofs of these keys, whatever it was folded for; a wrong
+///         fold only costs gas.
+///         verifyWithdrawalOnce, the gasless paymaster's verification in validation, records the
+///         statement and proof it verified for the rest of the transaction (EIP-1153), and
+///         assertValidWithdrawal of the same bytes, the vault's in the execution phase, then
+///         returns without verifying them again.
+/// @dev Every word is read from calldata as Solidity's ABI decoder reads it: the narrow fields
+///      must be clean (an empty revert otherwise), the proof is 256 bytes and every input and
+///      proof word must be canonical; any other failure reverts InvalidProof().
 contract Groth16ProofAdapter is IZkApiProofAdapter {
     /// @notice keccak256("__CIRCUIT_ID__"): the statement this adapter verifies.
     bytes32 public constant CIRCUIT_ID_HASH = __CIRCUIT_ID_HASH__;
@@ -1604,208 +1724,430 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint256 private constant BASE_MODULUS =
         21888242871839275222246405745257275088696311157297823662689037894645226208583;
+    /// @dev The protocol version every statement carries.
+    uint256 private constant PROTOCOL_VERSION = 2;
 
-    struct G1Point { uint256 x; uint256 y; }
-    // Coordinates use arkworks order: c0 (real), then c1 (imaginary).
-    struct G2Point { uint256[2] x; uint256[2] y; }
-    struct Proof { G1Point a; G2Point b; G1Point c; }
+    /// @notice The chain ID the fold binds: block.chainid at construction.
+    uint256 public immutable foldedChainId;
+    /// @notice The vault address the fold binds (the statements' contractAddress).
+    address public immutable foldedVault;
+    /// @notice The state signing key the fold binds.
+    uint256 public immutable foldedStateSigningKeyX;
+    uint256 public immutable foldedStateSigningKeyY;
+    /// @notice The clearance signing key the withdrawal fold binds.
+    uint256 public immutable foldedClearanceSigningKeyX;
+    uint256 public immutable foldedClearanceSigningKeyY;
+    /// @notice IC0 + 2 · IC1 + chainId · IC2 + vault · IC3 + stateX · IC5 + stateY · IC6 of the
+    ///         request key, with the constants above.
+    uint256 public immutable foldedRequestIc0X;
+    uint256 public immutable foldedRequestIc0Y;
+    /// @notice The same for the withdrawal key, plus clearanceX · IC7 + clearanceY · IC8.
+    uint256 public immutable foldedWithdrawalIc0X;
+    uint256 public immutable foldedWithdrawalIc0Y;
+
+    // The verifying keys. G2 coordinates are named by their arkworks coefficients: c0 (real)
+    // and c1 (imaginary), which EIP-197 takes first.
+__VK_CONSTANTS__
+    /// @param vault The vault whose proofs take the folded path: its address, predicted before it
+    ///        exists (the deployer's CREATE nonce, or CREATE2).
+    /// @param stateSigningKeyX The vault's state and clearance signing keys. A coordinate at or
+    ///        above the scalar field order reverts InvalidProof(): no proof can carry it.
+    constructor(
+        address vault,
+        uint256 stateSigningKeyX,
+        uint256 stateSigningKeyY,
+        uint256 clearanceSigningKeyX,
+        uint256 clearanceSigningKeyY
+    ) {
+        foldedChainId = block.chainid;
+        foldedVault = vault;
+        foldedStateSigningKeyX = stateSigningKeyX;
+        foldedStateSigningKeyY = stateSigningKeyY;
+        foldedClearanceSigningKeyX = clearanceSigningKeyX;
+        foldedClearanceSigningKeyY = clearanceSigningKeyY;
+        (foldedRequestIc0X, foldedRequestIc0Y, foldedWithdrawalIc0X, foldedWithdrawalIc0Y) = _fold(
+            block.chainid,
+            uint256(uint160(vault)),
+            stateSigningKeyX,
+            stateSigningKeyY,
+            clearanceSigningKeyX,
+            clearanceSigningKeyY
+        );
+    }
 
     function assertValidRequest(Types.RequestPublicInputs calldata inputs, bytes calldata proof)
-        external view override
+        external
+        view
+        override
     {
-        uint256[12] memory values = [
-            uint256(inputs.protocolVersion),
-            uint256(inputs.chainId),
-            uint256(uint160(inputs.contractAddress)),
-            inputs.activeRoot,
-            inputs.stateSigningKeyX,
-            inputs.stateSigningKeyY,
-            uint256(inputs.requestTime),
-            uint256(inputs.solvencyBound),
-            inputs.requestNullifier,
-            inputs.authorizationTag,
-            inputs.anonymousCommitmentX,
-            inputs.anonymousCommitmentY
-        ];
-        (Proof memory parsed, bool validEncoding) = _decodeProof(proof);
-        if (!validEncoding || !_verifyRequest(values, parsed)) revert Errors.InvalidProof();
+        _verifyRequest(inputs, proof);
     }
 
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
-        external view override
+        external
+        view
+        override
     {
-        uint256[16] memory values = [
-            uint256(inputs.protocolVersion),
-            uint256(inputs.chainId),
-            uint256(uint160(inputs.contractAddress)),
-            inputs.activeRoot,
-            inputs.stateSigningKeyX,
-            inputs.stateSigningKeyY,
-            inputs.clearanceSigningKeyX,
-            inputs.clearanceSigningKeyY,
-            uint256(inputs.noteId),
-            uint256(inputs.finalBalance),
-            uint256(uint160(inputs.destination)),
-            inputs.withdrawalNullifier,
-            uint256(inputs.kind),
-            inputs.nextNullifier,
-            uint256(inputs.conceded),
-            uint256(inputs.validUntil)
-        ];
-        (Proof memory parsed, bool validEncoding) = _decodeProof(proof);
-        if (!validEncoding || !_verifyWithdrawal(values, parsed)) revert Errors.InvalidProof();
+        if (_verifiedEarlier(inputs, proof)) return;
+        _verifyWithdrawal(inputs, proof);
     }
 
-    function _verifyRequest(uint256[12] memory values, Proof memory proof) private view returns (bool) {
-        G1Point memory accumulator = _requestIc(0);
-        for (uint256 i = 0; i < 12; ++i) {
-            uint256 value = values[i];
-            if (value >= SCALAR_MODULUS) return false;
-            // 0 · IC is the point at infinity, the neutral element of the sum: skipped. 1 · IC and
-            // 2 · IC need no scalar multiplication (6,000 gas) either: the point itself, and one
-            // addition. The protocol version (2), a close's kind (1), an escape's kind (0) and an
-            // exit's zero nextNullifier and conceded take these paths.
-            if (value == 0) continue;
-            G1Point memory point = _requestIc(i + 1);
-            G1Point memory term = point;
-            bool ok;
-            if (value == 2) {
-                (term, ok) = _add(point, point);
-                if (!ok) return false;
-            } else if (value != 1) {
-                (term, ok) = _scalarMul(point, value);
-                if (!ok) return false;
-            }
-            (accumulator, ok) = _add(accumulator, term);
-            if (!ok) return false;
-        }
-        return _pairing(
-            _negate(proof.a), proof.b,
-            _requestAlpha(), _requestBeta(),
-            accumulator, _requestGamma(),
-            proof.c, _requestDelta()
-        );
-    }
-
-    function _verifyWithdrawal(uint256[16] memory values, Proof memory proof) private view returns (bool) {
-        G1Point memory accumulator = _withdrawalIc(0);
-        for (uint256 i = 0; i < 16; ++i) {
-            uint256 value = values[i];
-            if (value >= SCALAR_MODULUS) return false;
-            // 0 · IC is the point at infinity, the neutral element of the sum: skipped. 1 · IC and
-            // 2 · IC need no scalar multiplication (6,000 gas) either: the point itself, and one
-            // addition. The protocol version (2), a close's kind (1), an escape's kind (0) and an
-            // exit's zero nextNullifier and conceded take these paths.
-            if (value == 0) continue;
-            G1Point memory point = _withdrawalIc(i + 1);
-            G1Point memory term = point;
-            bool ok;
-            if (value == 2) {
-                (term, ok) = _add(point, point);
-                if (!ok) return false;
-            } else if (value != 1) {
-                (term, ok) = _scalarMul(point, value);
-                if (!ok) return false;
-            }
-            (accumulator, ok) = _add(accumulator, term);
-            if (!ok) return false;
-        }
-        return _pairing(
-            _negate(proof.a), proof.b,
-            _withdrawalAlpha(), _withdrawalBeta(),
-            accumulator, _withdrawalGamma(),
-            proof.c, _withdrawalDelta()
-        );
-    }
-
-    function _decodeProof(bytes calldata encoded) private pure returns (Proof memory proof, bool valid) {
-        if (encoded.length != 256) return (proof, false);
-        uint256[8] memory words;
+    function verifyWithdrawalOnce(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
+        external
+        override
+    {
+        _verifyWithdrawal(inputs, proof);
+        bytes32 slot = _verifiedSlot(inputs, proof);
         assembly ("memory-safe") {
-            let start := encoded.offset
-            mstore(words, calldataload(start))
-            mstore(add(words, 0x20), calldataload(add(start, 0x20)))
-            mstore(add(words, 0x40), calldataload(add(start, 0x40)))
-            mstore(add(words, 0x60), calldataload(add(start, 0x60)))
-            mstore(add(words, 0x80), calldataload(add(start, 0x80)))
-            mstore(add(words, 0xa0), calldataload(add(start, 0xa0)))
-            mstore(add(words, 0xc0), calldataload(add(start, 0xc0)))
-            mstore(add(words, 0xe0), calldataload(add(start, 0xe0)))
+            tstore(slot, 1)
         }
-        for (uint256 i = 0; i < 8; ++i) if (words[i] >= BASE_MODULUS) return (proof, false);
-        proof.a = G1Point(words[0], words[1]);
-        proof.b = G2Point([words[2], words[3]], [words[4], words[5]]);
-        proof.c = G1Point(words[6], words[7]);
-        return (proof, true);
     }
 
-    function _negate(G1Point memory point) private pure returns (G1Point memory) {
-        if (point.x == 0 && point.y == 0) return G1Point(0, 0);
-        return G1Point(point.x, BASE_MODULUS - (point.y % BASE_MODULUS));
+    function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
+        return interfaceId == type(IZkApiProofAdapter).interfaceId || interfaceId == 0x01ffc9a7;
     }
 
-    function _add(G1Point memory a, G1Point memory b) private view returns (G1Point memory result, bool ok) {
-        uint256[4] memory input = [a.x, a.y, b.x, b.y];
-        assembly ("memory-safe") { ok := staticcall(gas(), 6, input, 0x80, result, 0x40) }
-    }
-
-    function _scalarMul(G1Point memory point, uint256 scalar)
-        private view returns (G1Point memory result, bool ok)
+    /// @dev Whether verifyWithdrawalOnce verified exactly these inputs and proof earlier in this
+    ///      transaction. Only a full verification writes a record and none is ever erased, so a
+    ///      record means these bytes verified; a proof that is not 256 bytes never does.
+    function _verifiedEarlier(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
+        private
+        view
+        returns (bool verified)
     {
-        uint256[3] memory input = [point.x, point.y, scalar];
-        assembly ("memory-safe") { ok := staticcall(gas(), 7, input, 0x60, result, 0x40) }
+        if (proof.length != 0x100) return false;
+        bytes32 slot = _verifiedSlot(inputs, proof);
+        assembly ("memory-safe") {
+            verified := iszero(iszero(tload(slot)))
+        }
     }
 
-    function _pairing(
-        G1Point memory a1, G2Point memory a2,
-        G1Point memory b1, G2Point memory b2,
-        G1Point memory c1, G2Point memory c2,
-        G1Point memory d1, G2Point memory d2
-    ) private view returns (bool) {
-        uint256[24] memory input;
-        _writePair(input, 0, a1, a2);
-        _writePair(input, 6, b1, b2);
-        _writePair(input, 12, c1, c2);
-        _writePair(input, 18, d1, d2);
-        uint256[1] memory output;
-        bool ok;
-        assembly ("memory-safe") { ok := staticcall(gas(), 8, input, 0x300, output, 0x20) }
-        return ok && output[0] == 1;
-    }
-
-    function _writePair(uint256[24] memory input, uint256 offset, G1Point memory g1, G2Point memory g2)
-        private pure
+    /// @dev The transient slot of a verified withdrawal: keccak256(destination ‖ h), h the
+    ///      keccak256 of the 16 input words and the 256 proof bytes as the call carries them. Only
+    ///      these exact bytes name it, and it is associated with the destination in the ERC-7562
+    ///      sense (STO-021): the paymaster records it in validation for an operation whose sender
+    ///      is the destination.
+    function _verifiedSlot(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
+        private
+        pure
+        returns (bytes32 slot)
     {
-        input[offset] = g1.x;
-        input[offset + 1] = g1.y;
-        // EIP-197 expects the imaginary coefficient before the real coefficient.
-        input[offset + 2] = g2.x[1];
-        input[offset + 3] = g2.x[0];
-        input[offset + 4] = g2.y[1];
-        input[offset + 5] = g2.y[0];
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            calldatacopy(m, inputs, __RECORD_INPUT_BYTES__)
+            calldatacopy(add(m, __RECORD_INPUT_BYTES__), proof.offset, 0x100)
+            mstore(0x00, __RECORD_DESTINATION__)
+            mstore(0x20, keccak256(m, __RECORD_BYTES__))
+            slot := keccak256(0x00, 0x40)
+        }
     }
 
-__REQUEST_VK__
+__VERIFY_REQUEST__
 
-__WITHDRAWAL_VK__
+__VERIFY_WITHDRAWAL__
+
+__FOLD__
 }
-"#
-    .to_string();
-    source = source
+"#;
+    source
+        .replace(
+            "__VK_CONSTANTS__",
+            &format!(
+                "{}\n{}",
+                solidity_vk_constants("REQUEST", request_key),
+                solidity_vk_constants("WITHDRAWAL", withdrawal_key)
+            ),
+        )
+        .replace(
+            "__VERIFY_REQUEST__",
+            &solidity_verify_function("request", &REQUEST_SOLIDITY_INPUTS),
+        )
+        .replace(
+            "__VERIFY_WITHDRAWAL__",
+            &solidity_verify_function("withdrawal", &WITHDRAWAL_SOLIDITY_INPUTS),
+        )
+        .replace("__FOLD__", &solidity_fold_function())
+        .replace(
+            "__RECORD_INPUT_BYTES__",
+            &format!("{:#x}", WITHDRAWAL_INPUT_BYTES),
+        )
+        .replace(
+            "__RECORD_DESTINATION__",
+            &yul_input_word(withdrawal_destination_index()),
+        )
+        .replace(
+            "__RECORD_BYTES__",
+            &format!("{:#x}", WITHDRAWAL_INPUT_BYTES + GROTH16_PROOF_BYTES),
+        )
         .replace("__CIRCUIT_ID_HASH__", &hex32(&CIRCUIT_ID_HASH))
         .replace("__CIRCUIT_ID__", CIRCUIT_ID)
         .replace("__SETUP_ID__", setup_id)
         .replace("__REQUEST_VK_HASH__", &hex32(&vk_hash(request_key)))
-        .replace("__WITHDRAWAL_VK_HASH__", &hex32(&vk_hash(withdrawal_key)));
-    source = source.replace(
-        "__REQUEST_VK__",
-        &solidity_vk_functions("request", request_key),
+        .replace("__WITHDRAWAL_VK_HASH__", &hex32(&vk_hash(withdrawal_key)))
+}
+
+/// The Yul word of input `index` of the struct at `inputs`.
+fn yul_input_word(index: usize) -> String {
+    if index == 0 {
+        "calldataload(inputs)".to_string()
+    } else {
+        format!("calldataload(add(inputs, {:#x}))", 32 * index)
+    }
+}
+
+/// `terms` combined pairwise by the Yul builtin `op`, as a balanced tree.
+fn yul_tree(op: &str, terms: &[String]) -> String {
+    match terms {
+        [] => unreachable!("no terms"),
+        [one] => one.clone(),
+        _ => {
+            let (left, right) = terms.split_at(terms.len().div_ceil(2));
+            format!("{op}({}, {})", yul_tree(op, left), yul_tree(op, right))
+        }
+    }
+}
+
+/// `_verifyRequest` or `_verifyWithdrawal`: the whole Groth16 check of one statement in one
+/// assembly block. The pairing input (24 words) is built in place at the free memory pointer m:
+/// the multi-scalar multiplication accumulates at its third G1 point (m + 0x180) and uses the
+/// four words after it, which the gamma point overwrites afterwards, as scratch.
+fn solidity_verify_function(kind: &str, inputs: &[SolidityInput]) -> String {
+    let prefix = kind.to_uppercase();
+    let title = format!("{}{}", kind[..1].to_uppercase(), &kind[1..]);
+    let narrow: Vec<&SolidityInput> = inputs.iter().filter(|input| input.bits < 256).collect();
+    // The comment naming them, wrapped at 100 columns.
+    let mut narrow_names = String::new();
+    let mut line = "            // The narrow fields, as Solidity's ABI decoder checks them (an empty revert):"
+        .to_string();
+    for (position, input) in narrow.iter().enumerate() {
+        let separator = if position + 1 == narrow.len() {
+            "."
+        } else {
+            ","
+        };
+        let item = format!(" {} ({}){separator}", input.name, input.bits);
+        if line.len() + item.len() > 100 {
+            narrow_names.push_str(&line);
+            narrow_names.push('\n');
+            line = "            //".to_string();
+        }
+        line.push_str(&item);
+    }
+    narrow_names.push_str(&line);
+    let narrow_check = yul_tree(
+        "or",
+        &inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.bits < 256)
+            .map(|(index, input)| format!("shr({}, {})", input.bits, yul_input_word(index)))
+            .collect::<Vec<_>>(),
     );
-    source = source.replace(
-        "__WITHDRAWAL_VK__",
-        &solidity_vk_functions("withdrawal", withdrawal_key),
+    let proof_words = yul_tree(
+        "and",
+        &(0..8)
+            .map(|word| {
+                let load = if word == 0 {
+                    "calldataload(o)".to_string()
+                } else {
+                    format!("calldataload(add(o, {:#x}))", 32 * word)
+                };
+                format!("lt({load}, BASE_MODULUS)")
+            })
+            .collect::<Vec<_>>(),
     );
-    source
+    let folded_match = yul_tree(
+        "and",
+        &inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, input)| {
+                input
+                    .folded
+                    .map(|constant| format!("eq({}, {constant})", yul_input_word(index)))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let term = |index: usize| {
+        format!(
+            "addTerm(l, {prefix}_IC{point}_X, {prefix}_IC{point}_Y, {word})",
+            point = index + 1,
+            word = yul_input_word(index)
+        )
+    };
+    let mut generic = String::new();
+    let mut shared = String::new();
+    for (index, input) in inputs.iter().enumerate() {
+        if input.folded.is_some() {
+            generic.push_str(&format!("                {}\n", term(index)));
+        } else {
+            shared.push_str(&format!("            {}\n", term(index)));
+        }
+    }
+    let mut locals = format!(
+        "        uint256 foldedX = folded{title}Ic0X;\n        uint256 foldedY = folded{title}Ic0Y;\n"
+    );
+    for (local, immutable) in [
+        ("chainId", "foldedChainId"),
+        ("vault", "uint256(uint160(foldedVault))"),
+        ("stateX", "foldedStateSigningKeyX"),
+        ("stateY", "foldedStateSigningKeyY"),
+        ("clearanceX", "foldedClearanceSigningKeyX"),
+        ("clearanceY", "foldedClearanceSigningKeyY"),
+    ] {
+        if inputs.iter().any(|input| input.folded == Some(local)) {
+            locals.push_str(&format!("        uint256 {local} = {immutable};\n"));
+        }
+    }
+    let struct_name = format!("{title}PublicInputs");
+    format!(
+        r#"    /// @dev The Groth16 verification of a {kind} statement; reverts unless it holds. The
+    ///      checks run in the order of the ABI decoder and the plain verifier: the narrow fields,
+    ///      the proof's length and words, then each input as it enters the multi-scalar
+    ///      multiplication. The pairing input (24 words) is built in place at the free memory
+    ///      pointer m: the multiplication accumulates at its third G1 point (m + 0x180), with the
+    ///      four words gamma takes afterwards as scratch.
+    function _verify{title}(Types.{struct_name} calldata inputs, bytes calldata proof) private view {{
+{locals}        assembly ("memory-safe") {{
+{helpers}{narrow_names}
+            if {narrow_check} {{ revert(0x00, 0x00) }}
+            // The proof: 256 bytes, every word a canonical base-field element.
+            if iszero(eq(proof.length, 0x100)) {{ fail() }}
+            let o := proof.offset
+            if iszero({proof_words}) {{ fail() }}
+            let m := mload(0x40)
+            let l := add(m, 0x180)
+            switch {folded_match}
+            case 0 {{
+                // Another vault, chain, key or version: IC0 and every input.
+                mstore(l, {prefix}_IC0_X)
+                mstore(add(l, 0x20), {prefix}_IC0_Y)
+{generic}            }}
+            default {{
+                // The folded constants: their sum is the constructor's.
+                mstore(l, foldedX)
+                mstore(add(l, 0x20), foldedY)
+            }}
+{shared}{pairing}        }}
+    }}"#,
+        helpers = SOLIDITY_YUL_HELPERS,
+        pairing = solidity_pairing(&prefix),
+    )
+}
+
+/// The pairing e(-A, B) · e(alpha, beta) · e(L, gamma) · e(C, delta) == 1 over the input at m,
+/// whose L the multi-scalar multiplication left at m + 0x180. The proof's words are A.x, A.y,
+/// B.x.c0, B.x.c1, B.y.c0, B.y.c1, C.x, C.y; EIP-197 takes each G2 coefficient c1 first.
+fn solidity_pairing(prefix: &str) -> String {
+    let mut lines = vec![
+        "mstore(m, calldataload(o))".to_string(),
+        "mstore(add(m, 0x20), mod(sub(BASE_MODULUS, calldataload(add(o, 0x20))), BASE_MODULUS))"
+            .to_string(),
+        "mstore(add(m, 0x40), calldataload(add(o, 0x60)))".to_string(),
+        "mstore(add(m, 0x60), calldataload(add(o, 0x40)))".to_string(),
+        "mstore(add(m, 0x80), calldataload(add(o, 0xa0)))".to_string(),
+        "mstore(add(m, 0xa0), calldataload(add(o, 0x80)))".to_string(),
+    ];
+    let g2 = |point: &str| {
+        ["X_C1", "X_C0", "Y_C1", "Y_C0"].map(|coordinate| format!("{prefix}_{point}_{coordinate}"))
+    };
+    let mut constants = vec![
+        (0xc0, format!("{prefix}_ALPHA_X")),
+        (0xe0, format!("{prefix}_ALPHA_Y")),
+    ];
+    for (point, at) in [("BETA", 0x100), ("GAMMA", 0x1c0), ("DELTA", 0x280)] {
+        for (word, name) in g2(point).into_iter().enumerate() {
+            constants.push((at + 0x20 * word, name));
+        }
+    }
+    for (at, name) in constants {
+        if at == 0x280 {
+            lines.push("calldatacopy(add(m, 0x240), add(o, 0xc0), 0x40)".to_string());
+        }
+        lines.push(format!("mstore(add(m, {at:#x}), {name})"));
+    }
+    lines.push("let ok := staticcall(gas(), 0x08, m, 0x300, 0x00, 0x20)".to_string());
+    lines.push("if iszero(and(ok, eq(mload(0x00), 1))) { fail() }".to_string());
+    let mut out =
+        "            // The pairing: (-A, B), (alpha, beta), (L, gamma), (C, delta).\n".to_string();
+    for line in lines {
+        out.push_str(&format!("            {line}\n"));
+    }
+    out
+}
+
+/// `_fold`: the constructor's sum of IC0 and the folded inputs' terms, for both keys, by the
+/// routine the verification uses.
+fn solidity_fold_function() -> String {
+    let fold = |prefix: &str, inputs: &[SolidityInput], x: &str, y: &str| {
+        let mut out = format!(
+            "            mstore(l, {prefix}_IC0_X)\n            mstore(add(l, 0x20), {prefix}_IC0_Y)\n"
+        );
+        for (index, input) in inputs.iter().enumerate() {
+            if let Some(constant) = input.folded {
+                out.push_str(&format!(
+                    "            addTerm(l, {prefix}_IC{point}_X, {prefix}_IC{point}_Y, {constant})\n",
+                    point = index + 1
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "            {x} := mload(l)\n            {y} := mload(add(l, 0x20))\n"
+        ));
+        out
+    };
+    format!(
+        r#"    /// @dev IC0 + Σ c · IC over the constants every proof of the vault carries, for both keys,
+    ///      by the routine the verification uses: a constant at or above the scalar field order
+    ///      reverts InvalidProof().
+    function _fold(
+        uint256 chainId,
+        uint256 vault,
+        uint256 stateX,
+        uint256 stateY,
+        uint256 clearanceX,
+        uint256 clearanceY
+    ) private view returns (uint256 requestX, uint256 requestY, uint256 withdrawalX, uint256 withdrawalY) {{
+        assembly ("memory-safe") {{
+{helpers}            let l := mload(0x40)
+{request}{withdrawal}        }}
+    }}"#,
+        helpers = SOLIDITY_YUL_HELPERS,
+        request = fold("REQUEST", &REQUEST_SOLIDITY_INPUTS, "requestX", "requestY"),
+        withdrawal = fold(
+            "WITHDRAWAL",
+            &WITHDRAWAL_SOLIDITY_INPUTS,
+            "withdrawalX",
+            "withdrawalY"
+        ),
+    )
+}
+
+/// A verifying key as Solidity constants: `<PREFIX>_ALPHA_X/Y`, `_BETA_`, `_GAMMA_` and
+/// `_DELTA_X_C0/X_C1/Y_C0/Y_C1`, and `_IC<i>_X/Y`. scripts/expected-codehashes.mjs reads the IC
+/// points by these names from the artifact's AST to recompute the fold.
+fn solidity_vk_constants(prefix: &str, key: &VerifyingKey<Bn254>) -> String {
+    let mut out = String::new();
+    let mut constant = |name: String, value: String| {
+        out.push_str(&format!("    uint256 private constant {name} = {value};\n"));
+    };
+    constant(format!("{prefix}_ALPHA_X"), field_hex(&key.alpha_g1.x));
+    constant(format!("{prefix}_ALPHA_Y"), field_hex(&key.alpha_g1.y));
+    for (name, point) in [
+        ("BETA", &key.beta_g2),
+        ("GAMMA", &key.gamma_g2),
+        ("DELTA", &key.delta_g2),
+    ] {
+        constant(format!("{prefix}_{name}_X_C0"), field_hex(&point.x.c0));
+        constant(format!("{prefix}_{name}_X_C1"), field_hex(&point.x.c1));
+        constant(format!("{prefix}_{name}_Y_C0"), field_hex(&point.y.c0));
+        constant(format!("{prefix}_{name}_Y_C1"), field_hex(&point.y.c1));
+    }
+    for (index, point) in key.gamma_abc_g1.iter().enumerate() {
+        constant(format!("{prefix}_IC{index}_X"), field_hex(&point.x));
+        constant(format!("{prefix}_IC{index}_Y"), field_hex(&point.y));
+    }
+    out
 }
 
 fn poseidon_manifest() -> PoseidonManifest {
@@ -2363,52 +2705,6 @@ library Bn254Poseidon {
     source
 }
 
-fn solidity_vk_functions(prefix: &str, key: &VerifyingKey<Bn254>) -> String {
-    let g1 =
-        |point: &G1Affine| format!("G1Point({}, {})", field_hex(&point.x), field_hex(&point.y));
-    let g2 = |point: &G2Affine| {
-        format!(
-            "G2Point([{}, {}], [{}, {}])",
-            field_hex(&point.x.c0),
-            field_hex(&point.x.c1),
-            field_hex(&point.y.c0),
-            field_hex(&point.y.c1)
-        )
-    };
-    let mut ic_cases = String::new();
-    for (index, point) in key.gamma_abc_g1.iter().enumerate() {
-        ic_cases.push_str(&format!(
-            "        if (index == {index}) return {};\n",
-            g1(point)
-        ));
-    }
-    format!(
-        r#"    function _{prefix}Alpha() private pure returns (G1Point memory) {{
-        return {alpha};
-    }}
-
-    function _{prefix}Beta() private pure returns (G2Point memory) {{
-        return {beta};
-    }}
-
-    function _{prefix}Gamma() private pure returns (G2Point memory) {{
-        return {gamma};
-    }}
-
-    function _{prefix}Delta() private pure returns (G2Point memory) {{
-        return {delta};
-    }}
-
-    function _{prefix}Ic(uint256 index) private pure returns (G1Point memory) {{
-{ic_cases}        revert Errors.InvalidProof();
-    }}"#,
-        alpha = g1(&key.alpha_g1),
-        beta = g2(&key.beta_g2),
-        gamma = g2(&key.gamma_g2),
-        delta = g2(&key.delta_g2),
-    )
-}
-
 fn g1_manifest(point: &G1Affine) -> [String; 2] {
     [field_hex(&point.x), field_hex(&point.y)]
 }
@@ -2436,6 +2732,79 @@ mod tests {
             delta_g2: G2Affine::generator(),
             gamma_abc_g1: vec![G1Affine::generator(); REQUEST_PUBLIC_INPUTS + 1],
         }
+    }
+
+    /// The generated adapter multiplies every public input once on its generic path, and its
+    /// constructor folds exactly the inputs every proof of a vault shares; each narrow input is
+    /// checked at its width.
+    #[test]
+    fn solidity_adapter_folds_only_the_deployment_constants() {
+        let mut withdrawal_vk = test_vk();
+        withdrawal_vk.gamma_abc_g1 = vec![G1Affine::generator(); WITHDRAWAL_PUBLIC_INPUTS + 1];
+        let source = groth16_solidity_source(DEV_SETUP_ID, &test_vk(), &withdrawal_vk);
+        for (prefix, inputs) in [
+            ("REQUEST", &REQUEST_SOLIDITY_INPUTS[..]),
+            ("WITHDRAWAL", &WITHDRAWAL_SOLIDITY_INPUTS[..]),
+        ] {
+            for (index, input) in inputs.iter().enumerate() {
+                let term = format!("addTerm(l, {prefix}_IC{point}_X", point = index + 1);
+                let expected = if input.folded.is_some() { 2 } else { 1 };
+                assert_eq!(
+                    source.matches(&term).count(),
+                    expected,
+                    "{prefix} {}",
+                    input.name
+                );
+                if input.bits < 256 {
+                    let word = yul_input_word(index);
+                    assert!(source.contains(&format!("shr({}, {word})", input.bits)));
+                }
+            }
+            assert!(!source.contains(&format!("{prefix}_IC{}_X", inputs.len() + 1)));
+        }
+        let folded: Vec<&str> = WITHDRAWAL_SOLIDITY_INPUTS
+            .iter()
+            .filter(|input| input.folded.is_some())
+            .map(|input| input.name)
+            .collect();
+        assert_eq!(
+            folded,
+            [
+                "protocolVersion",
+                "chainId",
+                "contractAddress",
+                "stateSigningKeyX",
+                "stateSigningKeyY",
+                "clearanceSigningKeyX",
+                "clearanceSigningKeyY"
+            ]
+        );
+        assert!(REQUEST_SOLIDITY_INPUTS
+            .iter()
+            .filter(|input| input.folded.is_some())
+            .map(|input| input.name)
+            .eq(folded[..5].iter().copied()));
+    }
+
+    /// The verify-once record covers the 16 input words and the 256 proof bytes, and its slot is
+    /// keyed by the destination word, so that it stays storage ERC-7562 associates with the
+    /// paymaster's sender (destination = sender) if the input order ever changes.
+    #[test]
+    fn solidity_adapter_records_under_the_destination() {
+        let mut withdrawal_vk = test_vk();
+        withdrawal_vk.gamma_abc_g1 = vec![G1Affine::generator(); WITHDRAWAL_PUBLIC_INPUTS + 1];
+        let source = groth16_solidity_source(DEV_SETUP_ID, &test_vk(), &withdrawal_vk);
+        assert_eq!(withdrawal_destination_index(), 10);
+        assert_eq!(WITHDRAWAL_INPUT_BYTES, 32 * WITHDRAWAL_PUBLIC_INPUTS);
+        for line in [
+            "calldatacopy(m, inputs, 0x200)",
+            "calldatacopy(add(m, 0x200), proof.offset, 0x100)",
+            "mstore(0x00, calldataload(add(inputs, 0x140)))",
+            "mstore(0x20, keccak256(m, 0x300))",
+        ] {
+            assert_eq!(source.matches(line).count(), 1, "{line}");
+        }
+        assert!(!source.contains("__RECORD_"));
     }
 
     #[test]

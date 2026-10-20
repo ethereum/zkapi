@@ -105,7 +105,17 @@ its vault's, treat it as compromised and follow
 library, deploys the circuit's Groth16 adapter and the native-only vault with
 its 11 constructor arguments, and checks the adapter's circuit and
 verifying-key hashes against the setup manifest and the vault's getters
-against the inputs. Unless `GASLESS=0`, the same broadcast then deploys the
+against the inputs. The adapter is folded for its vault: its constructor takes
+the vault's address (the deployer's next creation, predicted with its nonce)
+and the four signing-key coordinates, records `block.chainid`, and sums the
+seven inputs every proof of that vault shares into its first IC point, so a
+proof of the vault skips six of the withdrawal's scalar multiplications (four
+of a request's; the protocol version, 2, never needed one); any other
+statement is still verified over every input. The script requires
+`foldedVault()`, `foldedChainId()` and the four `folded*SigningKey*()` getters
+to be the deployed vault's, and the folded points to be the sums of the setup
+manifest's IC points it computes itself, before it writes the manifest.
+Unless `GASLESS=0`, the same broadcast then deploys the
 gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint
 v0.7.0, stakes it and its transit-account factory, funds its deposit and
 checks its getters ([below](#gasless-withdrawals)). Its header lists the
@@ -128,17 +138,17 @@ with `forge script`. The script links the library itself; no
 | `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains, Mainnet included ([Single-party setup](#single-party-setup)). Recorded as `allowDevSetup`; default 0 |
 | `POSEIDON_ADDRESS` | An already deployed `Bn254Poseidon` to link; its runtime code hash must equal the compiled library's. Unset deploys a fresh library |
 | `CHAIN_ID` | Optional expected chain ID; a mismatch aborts |
-| `GASLESS` | `1` (default) deploys the gasless-withdrawal paymaster after the vault; `0` skips the block and writes `withdrawalPaymaster: null`. A `forge script` dry run without an RPC has no EntryPoint code, so it needs `GASLESS=0`. An Anvil started with a public chain ID (for example Sepolia's 11155111, as the acceptance harness does) is a public chain to the script: it needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI`, or `GASLESS=0` |
+| `GASLESS` | `1` (default) deploys the gasless-withdrawal paymaster after the vault; `0` skips the block and writes `withdrawalPaymaster: null`. `1` is refused, before anything is broadcast, on a chain that prices a fresh storage slot above 25,000 gas, such as Sepolia today ([gas schedule](#gas-schedule)): deploy there with `GASLESS=0`. A `forge script` dry run without an RPC has no EntryPoint code, so it needs `GASLESS=0`. An Anvil started with a public chain ID (for example Sepolia's 11155111, as the acceptance harness does) is a public chain to the script: it needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI`, or `GASLESS=0` |
 | `ENTRY_POINT` | The ERC-4337 EntryPoint v0.7.0; default the canonical `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Its runtime must hash to `0x8db5ff69…fc58`, and the SenderCreator at `0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C` to `0x283c9d14…a7689`; on Anvil etch both first (`cast rpc anvil_setCode` from `protocol/contracts/test/fixtures/*.runtime.hex`, as CI does) |
 | `PAYMASTER_OWNER` | Owner of the paymaster (policy, fee ceilings, call caps, key release, stake and deposit withdrawals); default `OWNER`. When it is not the deployer, the script deploys the paymaster with the deployer as owner (only the owner may set the first stake), stakes and funds it, and nominates `PAYMASTER_OWNER`, which must call `acceptOwnership()` on the paymaster; the manifest records this as `paymasterOwnershipTransferPending` |
-| `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` | EntryPoint stakes of the paymaster and the factory (positive, at most 2^112 - 1). Local chains default to 0.1 ether each; required off local chains. Plan 1 ether each on Mainnet and 0.1 ether on Sepolia |
+| `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` | EntryPoint stakes of the paymaster and the factory (positive, at most 2^112 - 1). Local chains default to 0.1 ether each; required off local chains. Plan 1 ether each on Mainnet and 0.1 ether on a testnet |
 | `PAYMASTER_UNSTAKE_DELAY_SECONDS` | Unstake delay of both stakes; default 86,400 |
-| `PAYMASTER_DEPOSIT_WEI` | Initial EntryPoint deposit of the paymaster, the float that pays sponsored gas (positive). Local default 1 ether; required off local chains. Plan 1 ETH on Sepolia and 2 ETH on Mainnet |
+| `PAYMASTER_DEPOSIT_WEI` | Initial EntryPoint deposit of the paymaster, the float that pays sponsored gas (positive). Local default 1 ether; required off local chains. Plan 1 ETH on a testnet and 2 ETH on Mainnet |
 | `PAYMASTER_MAX_SPONSORED_COST_WEI` | Most one sponsored operation may cost the float; default 0.05 ether, at most 0.25 ether |
 | `PAYMASTER_FLAT_FEE_WEI` | Flat fee kept per sponsored operation; default 0, at most 0.001 ether |
 | `PAYMASTER_MIN_ESCAPE_NET_WEI` | Least net payout a sponsored escape must leave; default 0.01 ether, at most 2^64 - 1 |
 | `PAYMASTER_ESCAPES` | `1` sponsors escape initiations; default `0` (finalizations are always sponsored) |
-| `PAYMASTER_MAX_FEE_CEILING_WEI`, `PAYMASTER_PRIORITY_FEE_CEILING_WEI` | Fee ceilings per gas the paymaster accepts; defaults 100 gwei and 3 gwei (Sepolia: 200 gwei), at most 500 gwei and 20 gwei, and the priority ceiling must not exceed the max ceiling |
+| `PAYMASTER_MAX_FEE_CEILING_WEI`, `PAYMASTER_PRIORITY_FEE_CEILING_WEI` | Fee ceilings per gas the paymaster accepts; defaults 100 gwei and 3 gwei (a testnet: 200 gwei), at most 500 gwei and 20 gwei, and the priority ceiling must not exceed the max ceiling |
 | `PAYMASTER_FEE_KEEPER` | Optional key that may re-set the fee ceilings (`setFeeCeilings`) |
 
 The setup policy is enforced by the script: off local chains (Mainnet
@@ -314,8 +324,61 @@ then calls `addStake` on the paymaster and on the factory
 `PAYMASTER_UNSTAKE_DELAY_SECONDS`), `deposit` (`PAYMASTER_DEPOSIT_WEI`) and,
 if set, `setFeeKeeper`.
 
+The paymaster's constructor refuses a vault whose adapter does not report
+`IZkApiProofAdapter` through ERC-165 (`supportsInterface`): validation
+verifies the proof through the adapter's `verifyWithdrawalOnce`, which
+records the verified exit for the transaction (EIP-1153, at a slot associated
+with the sender), so the vault's verification of the same exit in the
+execution phase is a lookup and a sponsored exit pays for one verification.
+`IZkApiProofAdapter` makes that record part of the interface, and the
+paymaster's CLOSE and ESCAPE call floors (210,000 and 160,000) count on it;
+the constructor can only check the interface, so they hold for the generated
+`Groth16ProofAdapter` the deployment pins by codehash, and pairing the
+paymaster with any other adapter means re-deriving them
+(`protocol/contracts/test/gasless/Gas.t.sol`).
+
+#### Gas schedule
+
+Every gas constant of the paymaster (call, verification and postOp floors and
+caps, the postOp estimates, `NEW_ACCOUNT_GAS`) was measured under EIP-2929
+storage pricing, where a fresh storage slot costs 22,100 gas cold and a new
+account 25,000. EIP-8037 prices state creation instead: about 110,000 per
+fresh slot and 183,600 per new account. No floor, cap or estimate covers that.
+Under that pricing:
+
+- sponsored escapes revert at their floors, at the float's expense;
+- postOps that credit a payout revert at `POSTOP_CAP`;
+- a first use cannot fit `VERIFICATION_CAP`;
+- successful operations are charged less than they cost.
+
+Sepolia runs that pricing. In October 2026 a fresh-slot probe measured
+110,027 gas there and 22,107 on mainnet and Hoodi, and the paymaster's
+constructor reverted `UnsupportedGasSchedule(110057)` on Sepolia.
+
+The constructor therefore measures one fresh `SSTORE` and reverts
+`UnsupportedGasSchedule(freshSlotGas)` above `FRESH_SLOT_GAS_BOUND` (25,000).
+Forge simulates a broadcast on its own EVM, whose schedule passes, so
+`Deploy.s.sol` first runs the same measurement on the RPC (an `eth_call` of
+a probe creation) and refuses `GASLESS=1` there before anything is sent.
+
+- **Sepolia.** Deploy with `GASLESS=0` until a paymaster with a policy
+  derived under EIP-8037 exists. Drill gasless withdrawals on Anvil (the
+  acceptance harness, CI) or on a testnet without state-gas pricing, such as
+  Hoodi.
+- **A fork that reprices state creation under a live paymaster** (mainnet's
+  Glamsterdam). The constants are immutable. Before activation, pause
+  sponsorship (`setPolicy` with `sponsorshipPaused`) and deploy a re-derived
+  paymaster. Once the fork is live, anyone may call `checkGasSchedule()`: it
+  re-measures, and above the bound pauses sponsorship for good
+  (`scheduleRepriced()`, event `ScheduleRepriced`). `setPolicy` then reverts
+  `SponsorshipRetired` for any policy that is not paused. Send that call with
+  at most 2^24 gas: above EIP-7825's cap, EIP-8037 pays state gas from a
+  reservoir that `GAS` does not show, so the measurement reads low and
+  nothing changes.
+
 Post-checks, before the manifest is written: the paymaster's
-`ENTRY_POINT_V070_CODEHASH` is the pin above; `entryPoint()`, `vault()` and
+`ENTRY_POINT_V070_CODEHASH` is the pin above, `FRESH_SLOT_GAS_BOUND()` the
+script's 25,000 and `scheduleRepriced()` false; `entryPoint()`, `vault()` and
 `adapter()` are the deployed ones; `factory().paymaster()` is the paymaster
 and the factory's `entryPoint()` and `vault()` are the same; the factory's
 `implementation()` is its nonce-1 creation; `WEI_PER_UNIT()` equals the
@@ -354,11 +417,14 @@ anywhere between the kind's floor and this hard cap), `postOpFloor`, `postOpCap`
 `finalizeReserveGas`, `maxAttempts`). With `GASLESS=0` the manifest carries
 `withdrawalPaymaster: null` and none of the others.
 
-`expected-codehashes.mjs` derives the paymaster's, the factory's and the
-account logic's runtime code from the artifacts with their immutables filled
-from the manifest (the EntryPoint, vault, adapter, factory, unit size, keys,
-pause bound and creation-code hash; the factory's paymaster and logic; the
-logic's own address), and pins the EntryPoint's and SenderCreator's runtimes
+`expected-codehashes.mjs` derives the adapter's runtime code with its
+immutables filled from the manifest's vault, chain and keys and its folded
+points summed on BN254 from the verifying-key constants of the artifact, and
+the paymaster's, the factory's and the account logic's runtime code from the
+artifacts with their immutables filled from the manifest (the EntryPoint,
+vault, adapter, factory, unit size, keys, pause bound and creation-code hash;
+the factory's paymaster and logic; the logic's own address), and pins the
+EntryPoint's and SenderCreator's runtimes
 as constants, so `--check` and `--rpc` cover eight code hashes. `--finalize`
 additionally requires the paymaster's creation receipt (the factory and the
 logic are constructor creations, checked by their code), the deposit of at
@@ -510,7 +576,7 @@ SDK's 12.5% bump of both fee fields).
 **Float.** Bundlers reserve each pending operation's `maxCost` against the
 paymaster's deposit (ERC-7562 EREP-010), so keep `entryPoint.balanceOf(P)` at
 `N × maxSponsoredCost` plus a loss buffer for `N` concurrent operations.
-With the default `maxSponsoredCost` of 0.05 ETH, start Sepolia at 1 ETH
+With the default `maxSponsoredCost` of 0.05 ETH, start a testnet at 1 ETH
 (about 20 concurrent operations) and mainnet at 2 ETH (about 40). Alert
 below `10 × maxSponsoredCost` (`deposit_covers_operations` under 10 in
 `paymaster-status.mjs`). Start well above that threshold: the release
@@ -525,25 +591,33 @@ its measured charge, which covers the EntryPoint's cost within
 (`owed`).
 
 `maxSponsoredCost` also bounds the fees the paymaster sponsors. A close or
-escape that creates `S` signs about 1.7 million gas of limits, and its
+escape that creates `S` signs about 1.41 million gas of limits with the
+default fields (`gasFields` in `sdk/services/zkapiGasless.mjs`: call 395,000,
+verification 300,000, paymaster verification 380,000, postOp 275,000 and a
+preVerificationGas of about 59,000; up to 1.5 million at `pvgCap`), and its
 `maxCost` is those limits times `maxFeePerGas`. Both clients choose it by
 one rule: `min(2 × base fee + tip, maxFeeCeiling)`, with the tip capped at
 `priorityFeeCeiling`, refused (`gas_above_paymaster_ceiling`, before any
 proof) only when `base fee + tip` exceeds `maxFeeCeiling`.
 At the default 0.05 ETH, operations
-are refused above a `maxFeePerGas` of about 28 gwei (`max_cost_above_policy`,
-before any proof). Raise the policy toward `1.8M × maxFeeCeiling` to sponsor
-up to the ceiling, and fund the float to match, within the immutable hard
-cap of 0.25 ETH per operation (`setPolicy` reverts `PolicyOutOfBounds`
-above it, and `Deploy.s.sol` refuses a larger
+are refused above a `maxFeePerGas` of about 35 gwei (`max_cost_above_policy`,
+before any proof; 0.05 ETH / 1.41M gas). Raise the policy toward
+`1.5M × maxFeeCeiling` to sponsor up to the ceiling, and fund the float to
+match, within the immutable hard cap of 0.25 ETH per operation (`setPolicy`
+reverts `PolicyOutOfBounds` above it, and `Deploy.s.sol` refuses a larger
 `PAYMASTER_MAX_SPONSORED_COST_WEI`). That cap stops sponsorship above a
-`maxFeePerGas` of about 139 gwei (0.25 ETH / 1.8M gas) whatever the
-ceiling: a ceiling above that, such as Sepolia's 200 gwei, matters only for
-operations with smaller limits.
+`maxFeePerGas` of about 177 gwei (0.25 ETH / 1.41M gas; 167 gwei at
+`pvgCap`) whatever the ceiling: a ceiling above that, such as a testnet's 200 gwei, matters only
+for operations with smaller limits. These figures follow the pinned gas
+policy: recompute them with `gasFields` whenever it changes.
 
-**Stakes.** Never `unlockStake` the paymaster while it sponsors. The
-factory's stake only lifts the public mempool's per-factory limits for
-operations that create `S`; withdraw it only with the paymaster's. The
+**Stakes.** Never `unlockStake` the paymaster or the factory while the
+paymaster sponsors. The factory's stake lifts the public mempool's
+per-factory limits for operations that create `S`. It is also what ERC-7562
+relies on for a first use: validation writes the adapter's transient record
+at a slot associated with `S` (STO-021) while `S` is created by the same
+operation, which the rules allow in a non-entity contract only with a staked
+factory. Withdraw it only with the paymaster's. The
 factory's code stays deployed (it is immutable): every `S` address depends
 on it, and its `createAccount` keeps working for sweeps without any stake.
 
@@ -571,9 +645,12 @@ are too high raise that griefing exposure linearly.
 
 **Escapes.** `escapesEnabled` is false in every published profile
 (`PAYMASTER_ESCAPES=0`). Enabling it means the float pays each sponsored
-initiation (about 1.25M gas) on top of the existing challenge (about 435k
-gas) when the escape is defeated, against the attacker's deposit gas (about
-0.3M, recovered later): about 5:1 against the operator. Enable it on the
+initiation (about 643,000 gas, `handleOpsRealEscape` in
+`protocol/contracts/snapshots/gasless-gas.json`) on top of the existing
+challenge (about 284,000 gas, `challengeEscapeWithdrawal` in
+`snapshots/concession-exit-gas.json`) when the escape is defeated, against
+the attacker's deposit gas (about 1.0M, recovered later): roughly 1:1, about
+0.93M of the operator's gas per 1.0M of the attacker's. Enable it on the
 Sepolia drill, and decide for mainnet from the `EscapeInitiationOwed` and
 `owedPaid` data. Keep `minEscapeNetWei` at least 10 × a typical initiation
 plus finalization cost. While it is disabled, escapes are sponsored only at

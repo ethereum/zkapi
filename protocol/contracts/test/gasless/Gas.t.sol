@@ -16,7 +16,9 @@ import {GaslessTestBase, GasBurner, Rejecter, Acceptor, EntryPointDriver} from "
 ///      against the measurements: every floor exceeds its need by the stated slack.
 ///
 ///      Every number is a transaction with every account and slot cold, from a deployment in its
-///      steady state (a funded treasury and payee), with the mock adapter unless stated. Forge
+///      steady state (a funded treasury and payee), with the mock adapter unless stated, under
+///      Forge's EIP-2929 storage pricing: the schedule the paymaster's FRESH_SLOT_GAS_BOUND admits
+///      (GasSchedule.t.sol). Forge
 ///      keeps the EIP-2929 warm set for the whole test function (every account and slot a test
 ///      touches, through a call or a cheatcode, stays warm; vm.cool cools an account's slots but
 ///      not its address), so the cold discipline is: setUp prepares every scenario (notes, transit
@@ -48,7 +50,7 @@ contract GasTest is GaslessTestBase {
     uint8 constant SC_FINALIZE_NO_DEBT = 10; // the finalization of a direct escape paid to S
     uint8 constant SC_FORWARD = 11; // a forward of a balance the owner allowed
     uint8 constant SC_REVERTED = 12; // the postOp context of a validated close (nothing arrived)
-    uint8 constant SC_REVERTED_WITH_DEBT = 13; // ... of a finalization whose payout arrived, with a debt
+    uint8 constant SC_REVERTED_WITH_DEBT = 13; // a finalization whose payout arrives, then the reverted path, with a debt
     uint8 constant SC_REVERTED_NO_DEBT = 14; // ... the same with the debt written off
     uint8 constant SC_CLOSE_FIRST = 15; // a first-use close (initCode) to a funded EOA
     uint8 constant SC_CLOSE_REPEAT = 16; // a second close from an S a sponsored close created
@@ -60,10 +62,10 @@ contract GasTest is GaslessTestBase {
     uint8 constant SC_MIN_VERIFICATION = 22; // ... without
     uint8 constant SC_COLLECT = 23; // a sweep of an S with a balance
 
-    address constant EMPTY_PAYEE = address(0xE3A7);
-    address constant EMPTY_PAYEE_FIRST = address(0xE3A6);
-    address constant DRAINED_PAYEE = address(0xD4A1);
-    address constant DRAINED_PAYEE_FIRST = address(0xD4A2);
+    address constant EMPTY_PAYEE = address(0x1E3A7);
+    address constant EMPTY_PAYEE_FIRST = address(0x1E3A6);
+    address constant DRAINED_PAYEE = address(0x1D4A1);
+    address constant DRAINED_PAYEE_FIRST = address(0x1D4A2);
 
     struct Prepared {
         address sender;
@@ -89,7 +91,16 @@ contract GasTest is GaslessTestBase {
 
     function setUp() public {
         _setUpGasless();
-        realAdapter = new Groth16ProofAdapter();
+        // The real adapter, folded for the vault the golden close binds (chain 31337), as a
+        // deployment folds it for its own vault.
+        (Types.WithdrawalPublicInputs memory golden,) = _goldenClose();
+        realAdapter = new Groth16ProofAdapter(
+            golden.contractAddress,
+            golden.stateSigningKeyX,
+            golden.stateSigningKeyY,
+            golden.clearanceSigningKeyX,
+            golden.clearanceSigningKeyY
+        );
         // a funded treasury: the vault's push to it is never a new-account transfer
         vm.prank(user);
         vault.mutualClose(_close(_bigNote(nextCommitment++), nextNullifier++, BIG - 1_000_000), PROOF);
@@ -226,12 +237,13 @@ contract GasTest is GaslessTestBase {
         _store(id, _finalizeOpFor(p.payee, p.noteId), _finalizeCall(p.noteId));
     }
 
-    /// The finalization executed from the driver without its postOp: the payout reached S and P,
-    /// and the context is what a reverted execution's postOp would then receive.
+    /// A finalization the test runs through the driver with a reverted-mode postOp
+    /// (driver.runReverted): its payout reaches S and P, and postOp then finds it as when an
+    /// unsponsored finalization of S ran earlier in the bundle. What S forwards is transient, so
+    /// the withdraw and the postOp run in the test's one call tree.
     function _prepRevertedFinalize(uint8 id, bool writeOff) internal {
         _prepFinalize(id);
         if (writeOff) paymaster.writeOffDebt(prepared[id].sender);
-        prepared[id].context = _runPrepared(id, 0, 0).context;
     }
 
     function _prepForward(uint8 id) internal {
@@ -264,6 +276,13 @@ contract GasTest is GaslessTestBase {
         p.callData = _callData(_closeCall(_closeTo(note, nullifier, BIG - 1_000_000, s)));
     }
 
+    /// test/fixtures/vault-challenge.json's close_b0, a real close and its proof.
+    function _goldenClose() internal view returns (Types.WithdrawalPublicInputs memory inputs, bytes memory proof) {
+        string memory fixtures = vm.readFile("test/fixtures/vault-challenge.json");
+        inputs = abi.decode(vm.parseJsonBytes(fixtures, ".close_b0.inputs_abi"), (Types.WithdrawalPublicInputs));
+        proof = vm.parseJsonBytes(fixtures, ".close_b0.proof_hex");
+    }
+
     // ------------------------------------------------------------------------------ measuring
 
     function _snap(string memory name, uint256 value) internal {
@@ -287,6 +306,13 @@ contract GasTest is GaslessTestBase {
 
     function _closeRun(uint8 id) internal returns (EntryPointDriver.Run memory) {
         return _runPrepared(id, PRE_GAS * FEE, FEE);
+    }
+
+    /// Validation, withdraw and a reverted-mode postOp of a prepared operation from the driver.
+    function _runRevertedPrepared(uint8 id) internal returns (EntryPointDriver.Run memory) {
+        PackedUserOperation memory op = _op(id);
+        Prepared storage p = prepared[id];
+        return driver.runReverted(paymaster, op, p.hash, _maxCostOf(op), p.vaultCall, PRE_GAS * FEE, FEE);
     }
 
     // ------------------------------------------------------------------------ direct measurements
@@ -445,15 +471,16 @@ contract GasTest is GaslessTestBase {
     function test_measure_postOpRevertedWithDebt() public {
         uint256 cold = vm.snapshotState();
         Prepared storage p = prepared[SC_REVERTED_WITH_DEBT];
-        assertEq(paymaster.received(p.sender), uint256(BIG - 2_000_000) * 1 gwei, "the finalization reached S and P");
         assertGt(paymaster.owed(p.sender), 0);
-        uint256 withDebt = driver.postOpReverted(paymaster, p.context, PRE_GAS * FEE, FEE);
+        EntryPointDriver.Run memory r = _runRevertedPrepared(SC_REVERTED_WITH_DEBT);
+        assertEq(r.received, uint256(BIG - 2_000_000) * 1 gwei, "the finalization reached S and P");
+        uint256 withDebt = r.postOpGas;
         _snap("postOpRevertedWithDebt", withDebt);
         assertEq(paymaster.owed(p.sender), 0, "the debt is settled on the reverted path too");
         vm.revertToState(cold);
         p = prepared[SC_REVERTED_NO_DEBT];
         assertEq(paymaster.owed(p.sender), 0, "written off");
-        uint256 noDebt = driver.postOpReverted(paymaster, p.context, PRE_GAS * FEE, FEE);
+        uint256 noDebt = _runRevertedPrepared(SC_REVERTED_NO_DEBT).postOpGas;
         _snap("postOpRevertedNoDebt", noDebt);
         // FAILURE_POSTOP_GAS (70,000) + FAILURE_DEBT_DEPOSIT_GAS (20,000) + CREDIT_GAS bound the path.
         assertLe(withDebt - noDebt, 20_000, "the debt settlement within FAILURE_DEBT_DEPOSIT_GAS");
@@ -518,27 +545,42 @@ contract GasTest is GaslessTestBase {
 
     /// The call floors cover the measured execution through S with the real adapter, a treasury
     /// that uses its whole 100,000-gas push, a never-used account (25,000), the 63/64 rule and a
-    /// margin; the vault's own exits with real proofs sit well under them.
+    /// margin, each rounded up to 10,000. In a sponsored exit the vault's verification finds the
+    /// record the paymaster's validation left in the same transaction (adapterVerifyRecorded): a
+    /// record is written only after a full verification and never erased, so the CLOSE and ESCAPE
+    /// floors cover the recorded verification. Their hard caps still cover a full verification
+    /// (adapterVerifyCold), so an owner's callCap can always admit one.
     function test_callFloorsCoverTheRealExecution() public {
-        string memory fixtures = vm.readFile("test/fixtures/vault-challenge.json");
-        Types.WithdrawalPublicInputs memory inputs =
-            abi.decode(vm.parseJsonBytes(fixtures, ".close_b0.inputs_abi"), (Types.WithdrawalPublicInputs));
-        bytes memory proof = vm.parseJsonBytes(fixtures, ".close_b0.proof_hex");
+        (Types.WithdrawalPublicInputs memory inputs, bytes memory proof) = _goldenClose();
         uint256 cold = vm.snapshotState();
         uint256 adapterGas = driver.verify(realAdapter, inputs, proof);
         vm.revertToState(cold);
+        uint256 recordedGas = driver.verifyRecorded(realAdapter, inputs, proof);
+        _snap("adapterVerifyRecorded", recordedGas);
+        assertLt(recordedGas, 5_000, "a lookup, not a verification");
+        vm.revertToState(cold);
         uint256 closeCall = _runPrepared(SC_CLOSE_EOA, 0, 0).withdrawGas;
         uint256 vaultExtras = 100_000 + 25_000;
-        assertGe(gp.callFloor[0], (closeCall + adapterGas + vaultExtras) * 64 / 63 + 20_000, "close floor");
+        uint256 closeNeed = (closeCall + recordedGas + vaultExtras) * 64 / 63 + 20_000;
+        assertGe(gp.callFloor[0], closeNeed, "close floor");
+        assertLt(gp.callFloor[0], closeNeed + 10_000, "close floor rounded up to 10k");
+        assertGe(gp.callHardCap[0], (closeCall + adapterGas + vaultExtras) * 64 / 63 + 20_000, "close cap");
         vm.revertToState(cold);
         uint256 escapeCall = _runPrepared(SC_ESCAPE, 0, 0).withdrawGas;
-        assertGe(gp.callFloor[1], (escapeCall + adapterGas + 25_000) * 64 / 63 + 20_000, "escape floor");
+        uint256 escapeNeed = (escapeCall + recordedGas + 25_000) * 64 / 63 + 20_000;
+        assertGe(gp.callFloor[1], escapeNeed, "escape floor");
+        assertLt(gp.callFloor[1], escapeNeed + 10_000, "escape floor rounded up to 10k");
+        assertGe(gp.callHardCap[1], (escapeCall + adapterGas + 25_000) * 64 / 63 + 20_000, "escape cap");
         vm.revertToState(cold);
         uint256 finalizeCall = _runPrepared(SC_FINALIZE, 0, 0).withdrawGas;
-        assertGe(gp.callFloor[2], (finalizeCall + vaultExtras) * 64 / 63 + 20_000, "finalize floor");
+        uint256 finalizeNeed = (finalizeCall + vaultExtras) * 64 / 63 + 20_000;
+        assertGe(gp.callFloor[2], finalizeNeed, "finalize floor");
+        assertLt(gp.callFloor[2], finalizeNeed + 10_000, "finalize floor rounded up to 10k");
         vm.revertToState(cold);
         uint256 forwardCall = _runPrepared(SC_FORWARD, 0, 0).withdrawGas;
-        assertGe(gp.callFloor[3], forwardCall * 64 / 63 + 20_000, "forward floor");
+        uint256 forwardNeed = forwardCall * 64 / 63 + 20_000;
+        assertGe(gp.callFloor[3], forwardNeed, "forward floor");
+        assertLt(gp.callFloor[3], forwardNeed + 10_000, "forward floor rounded up to 10k");
         assertLt(gp.callFloor[0], gp.callHardCap[0]);
         assertLt(gp.callFloor[1], gp.callHardCap[1]);
         assertLt(gp.callFloor[2], gp.callHardCap[2]);

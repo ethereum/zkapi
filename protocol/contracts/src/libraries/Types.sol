@@ -17,23 +17,24 @@ library Types {
         NoteStatus status;
     }
 
-    /// @dev A pending escape, 5 slots. The getters pendingWithdrawals (6 words: exists, activeRoot,
-    ///      withdrawalNullifier, finalBalance, destination, challengeDeadline) and pendingConcessions
-    ///      (3 words: nextNullifier, stateBalance, conceded) are what clients and the challenger
-    ///      decode; `exists` is destination != 0 and stateBalance = finalBalance + conceded.
+    /// @dev A pending escape's own record, 2 slots. The rest of the escape lives in the words of
+    ///      the two nullifiers it consumes, which are written anyway (ZkApiVault._nullifierWords):
+    ///      N_k's word holds N_{k+1} and N_{k+1}'s word the destination. The getters
+    ///      pendingWithdrawals (6 words: exists, a zero word where revision 2 had the proof's
+    ///      activeRoot, withdrawalNullifier, finalBalance, destination, challengeDeadline) and
+    ///      pendingConcessions (3 words: nextNullifier, stateBalance, conceded) are what clients and
+    ///      the challenger decode; `exists` is challengeDeadline != 0 and stateBalance =
+    ///      finalBalance + conceded.
     struct Escape {
         /// @dev N_k of the state the escape leaves.
         uint256 withdrawalNullifier;
-        /// @dev N_{k+1}: only a request proof at this nullifier defeats the escape.
-        uint256 nextNullifier;
-        /// @dev The escape proof's activeRoot; informational, the vault never reads it.
-        uint256 activeRoot;
-        address destination;
+        /// @dev Nonzero exactly while the escape is pending.
         uint64 challengeDeadline;
-        /// @dev The current payout: the state balance B_k minus `conceded`.
-        uint128 finalBalance;
+        /// @dev The current payout: the state balance B_k minus `conceded`. Both amounts are at most
+        ///      the note's depositAmount, which deposit bounds by MAX_NATIVE_UNITS (< 2^53).
+        uint96 finalBalance;
         /// @dev c; a raise only ever increases it.
-        uint128 conceded;
+        uint96 conceded;
     }
 
     /// @dev Field order is the exact Groth16 public-input order.

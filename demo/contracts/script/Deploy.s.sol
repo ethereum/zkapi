@@ -15,13 +15,15 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 
 /// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v1, vault revision 3).
 /// @notice Links (or deploys) the Bn254Poseidon library, deploys the circuit-specific Groth16
-///         verifier and the native ETH ZkApiVault with its 11 constructor arguments, checks the
-///         adapter's circuit and verifying-key hashes against the setup manifest and the vault's
-///         getters against the inputs, then (unless GASLESS=0) deploys the gasless-withdrawal
-///         paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same broadcast, stakes
-///         it and its transit-account factory, funds its deposit and checks its getters, and writes
-///         the provisional deployment manifest, including the linked addresses and every runtime
-///         codehash, to $OUTPUT_PATH.pending.
+///         verifier folded for the vault (the address the vault gets next, the chain and the
+///         signing keys) and the native ETH ZkApiVault with its 11 constructor arguments, checks the
+///         adapter's circuit and verifying-key hashes against the setup manifest, its folded
+///         constants against the vault's and its folded points against the manifest's verifying
+///         keys, and the vault's getters against the inputs, then (unless GASLESS=0) deploys the
+///         gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same
+///         broadcast, stakes it and its transit-account factory, funds its deposit and checks its
+///         getters, and writes the provisional deployment manifest, including the linked addresses
+///         and every runtime codehash, to $OUTPUT_PATH.pending.
 /// @dev    forge runs run() locally before it sends any transaction, so every check here and the
 ///         provisional manifest describe the simulated deployment: its addresses assume the
 ///         deployer's nonces at simulation time, and deployBlockLowerBound is the chain head the
@@ -87,7 +89,11 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
 ///         Gasless withdrawals (ERC-4337):
 ///           GASLESS     – 1 (default) deploys ZkApiWithdrawalPaymaster after the vault; 0 skips
-///                         the block and writes withdrawalPaymaster: null.
+///                         the block and writes withdrawalPaymaster: null. The paymaster's gas
+///                         policy holds only where a fresh storage slot costs at most
+///                         FRESH_SLOT_GAS_BOUND (25,000): before anything is broadcast, GASLESS=1
+///                         measures one on the RPC and refuses a chain that prices state creation
+///                         as EIP-8037 does (Sepolia since 2026: about 110,000).
 ///           ENTRY_POINT – the EntryPoint v0.7.0; defaults to the canonical
 ///                         0x0000000071727De22E5E9d8BAf0edAc6f37da032 and must carry its runtime.
 ///           PAYMASTER_OWNER – owner of the paymaster (policy, fee ceilings, call caps, key
@@ -142,6 +148,12 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     uint256 internal constant FLAT_FEE_HARD_CAP = 0.001 ether;
     uint256 internal constant MAX_FEE_HARD_CAP = 500 gwei;
     uint256 internal constant PRIORITY_FEE_HARD_CAP = 20 gwei;
+    /// The paymaster's FRESH_SLOT_GAS_BOUND (_checkGasless compares the deployed getter), and a
+    /// creation whose constructor returns what GAS reads around one fresh SSTORE (slot 0, cleared
+    /// again): gas, push1 1, push0, sstore, gas, swap1, sub, push0, push0, sstore, then
+    /// mstore(0, used) and return(0, 32). It measures 22,107 under EIP-2929 storage pricing.
+    uint256 internal constant FRESH_SLOT_GAS_BOUND = 25_000;
+    bytes internal constant FRESH_SLOT_PROBE = hex"5a60015f555a90035f5f555f5260205ff3";
     /// Placeholder the manifest serializer writes for withdrawalPaymaster with GASLESS=0; it is
     /// replaced by a JSON null before the file is written (vm.serialize* has no null).
     string internal constant NULL_PLACEHOLDER = "__null__";
@@ -166,6 +178,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         bytes32 requestVkHash;
         bytes32 withdrawalVkHash;
         bool allowDevSetup;
+        /// The manifest itself, whose verifying keys' IC points the adapter's fold is checked against.
+        string manifest;
     }
 
     /// The gasless block's inputs (GASLESS and the PAYMASTER_* variables).
@@ -207,6 +221,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         Params memory p = _params(vm.addr(deployerKey), local);
         Setup memory setup = _setup(local);
         Gasless memory g = _gasless(p, local);
+        if (g.enabled) _requireSponsorableGasSchedule();
 
         address poseidonIn = vm.envOr("POSEIDON_ADDRESS", address(0));
         bytes memory poseidonRuntime = vm.getDeployedCode("Bn254Poseidon.sol:Bn254Poseidon");
@@ -221,7 +236,10 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         Deployed memory d;
         d.poseidonReused = poseidonIn != address(0);
         d.poseidon = d.poseidonReused ? poseidonIn : _create(vm.getCode("Bn254Poseidon.sol:Bn254Poseidon"));
-        d.adapter = new Groth16ProofAdapter();
+        // The adapter folds the vault's address into its verifying keys: the vault is the deployer's
+        // next creation after the adapter. Checked against the deployed vault below (_checkAdapter).
+        address predictedVault = vm.computeCreateAddress(p.deployer, vm.getNonce(p.deployer) + 1);
+        d.adapter = new Groth16ProofAdapter(predictedVault, p.stateKeyX, p.stateKeyY, p.clearanceKeyX, p.clearanceKeyY);
         d.vault = ZkApiVault(
             _create(
                 abi.encodePacked(
@@ -246,7 +264,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.stopBroadcast();
 
         require(d.poseidon.codehash == _libraryCodehash(poseidonRuntime, d.poseidon), "linked library codehash");
-        _checkAdapter(d.adapter, setup);
+        _checkAdapter(d, setup);
         _checkVault(d, p);
         if (g.enabled) _checkGasless(d, p, g);
         bool broadcast =
@@ -328,6 +346,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     function _setup(bool local) internal view returns (Setup memory setup) {
         string memory path = local ? vm.envOr("SETUP_MANIFEST", DEFAULT_SETUP_MANIFEST) : vm.envString("SETUP_MANIFEST");
         string memory manifest = vm.readFile(path);
+        setup.manifest = manifest;
         setup.circuitId = vm.parseJsonString(manifest, ".circuit_id");
         setup.setupId = vm.parseJsonString(manifest, ".setup_id");
         setup.requestVkHash = vm.parseJsonBytes32(manifest, ".vk_keccak256.request");
@@ -435,6 +454,34 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         );
     }
 
+    /// The paymaster's constructor refuses a chain that prices a fresh storage slot above
+    /// FRESH_SLOT_GAS_BOUND, where none of its gas constants holds (EIP-8037). forge simulates the
+    /// broadcast on its own EVM, whose schedule passes, so on such a chain the library, the adapter
+    /// and the vault would be sent before the paymaster's creation reverted. The same measurement
+    /// runs on the RPC first, as an eth_call of FRESH_SLOT_PROBE's creation, and stops GASLESS=1
+    /// there. The gasless block needs the EntryPoint's runtime (_gasless), so an RPC is there.
+    function _requireSponsorableGasSchedule() internal {
+        bytes memory answer;
+        try vm.rpc("eth_call", string.concat('[{"data":"', vm.toString(FRESH_SLOT_PROBE), '"},"latest"]')) returns (
+            bytes memory result
+        ) {
+            answer = result;
+        } catch {
+            revert("GASLESS=1 measures a fresh storage slot through the RPC (eth_call), which failed");
+        }
+        require(answer.length == 32, "fresh-slot probe: unexpected eth_call result");
+        uint256 freshSlotGas = abi.decode(answer, (uint256));
+        require(
+            freshSlotGas <= FRESH_SLOT_GAS_BOUND,
+            string.concat(
+                "the chain prices a fresh storage slot at ",
+                vm.toString(freshSlotGas),
+                " gas, above the paymaster's FRESH_SLOT_GAS_BOUND (25000): its gas policy does not hold here (EIP-8037); pass GASLESS=0"
+            )
+        );
+        console2.log("gas schedule fresh slot", freshSlotGas);
+    }
+
     /// Deploys the paymaster (which deploys the factory, which deploys the account logic), stakes
     /// both with the EntryPoint and funds the float, inside the broadcast. The first stake may only
     /// be set by the paymaster's owner, so when PAYMASTER_OWNER is not the deployer the paymaster
@@ -455,11 +502,79 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         d.paymasterOwnershipPending = handover;
     }
 
-    /// The adapter compiled into this script verifies the setup in SETUP_MANIFEST.
-    function _checkAdapter(Groth16ProofAdapter adapter, Setup memory setup) internal view {
+    /// The adapter compiled into this script verifies the setup in SETUP_MANIFEST, and is folded for
+    /// the vault deployed after it: its folded vault, chain and keys are the vault's, and its folded
+    /// points are IC0 + Σ c · IC with the manifest's IC points, summed here through the precompiles.
+    /// A wrong fold would only cost gas (its proofs take the adapter's generic path), but the
+    /// manifest records the deployment as it is meant to be, so any mismatch stops the script
+    /// before the manifest is written.
+    function _checkAdapter(Deployed memory d, Setup memory setup) internal view {
+        Groth16ProofAdapter adapter = d.adapter;
+        ZkApiVault vault = d.vault;
         require(adapter.CIRCUIT_ID_HASH() == keccak256(bytes(setup.circuitId)), "adapter CIRCUIT_ID_HASH != manifest");
         require(adapter.REQUEST_VK_HASH() == setup.requestVkHash, "adapter REQUEST_VK_HASH != manifest");
         require(adapter.WITHDRAWAL_VK_HASH() == setup.withdrawalVkHash, "adapter WITHDRAWAL_VK_HASH != manifest");
+        require(adapter.foldedVault() == address(vault), "adapter folded for another vault address");
+        require(adapter.foldedChainId() == block.chainid, "adapter folded for another chain");
+        require(
+            adapter.foldedStateSigningKeyX() == vault.stateSigningKeyX()
+                && adapter.foldedStateSigningKeyY() == vault.stateSigningKeyY()
+                && adapter.foldedClearanceSigningKeyX() == vault.clearanceSigningKeyX()
+                && adapter.foldedClearanceSigningKeyY() == vault.clearanceSigningKeyY(),
+            "adapter folded for other signing keys than the vault's"
+        );
+        uint256[] memory constants = new uint256[](7);
+        constants[0] = vault.PROTOCOL_VERSION();
+        constants[1] = block.chainid;
+        constants[2] = uint160(address(vault));
+        constants[3] = vault.stateSigningKeyX();
+        constants[4] = vault.stateSigningKeyY();
+        constants[5] = vault.clearanceSigningKeyX();
+        constants[6] = vault.clearanceSigningKeyY();
+        // Groth16 IC indices of the folded inputs (input i is IC i + 1): protocolVersion, chainId,
+        // contractAddress, stateSigningKeyX/Y and, for withdrawals, clearanceSigningKeyX/Y.
+        uint256[7] memory points = [uint256(1), 2, 3, 5, 6, 7, 8];
+        (uint256 x, uint256 y) = _foldedPoint(setup.manifest, ".request.ic", constants, points, 5);
+        require(
+            adapter.foldedRequestIc0X() == x && adapter.foldedRequestIc0Y() == y,
+            "adapter request fold != manifest verifying key"
+        );
+        (x, y) = _foldedPoint(setup.manifest, ".withdrawal.ic", constants, points, 7);
+        require(
+            adapter.foldedWithdrawalIc0X() == x && adapter.foldedWithdrawalIc0Y() == y,
+            "adapter withdrawal fold != manifest verifying key"
+        );
+    }
+
+    /// IC[0] + Σ constants[k] · IC[points[k]] over the first `count` folded inputs of the IC list at
+    /// `key` in the setup manifest, through ecMul and ecAdd.
+    function _foldedPoint(
+        string memory manifest,
+        string memory key,
+        uint256[] memory constants,
+        uint256[7] memory points,
+        uint256 count
+    ) internal view returns (uint256 x, uint256 y) {
+        (x, y) = _manifestPoint(manifest, key, 0);
+        for (uint256 k = 0; k < count; ++k) {
+            (uint256 px, uint256 py) = _manifestPoint(manifest, key, points[k]);
+            (bool ok, bytes memory out) = address(7).staticcall(abi.encode(px, py, constants[k]));
+            require(ok && out.length == 64, "ecMul of a manifest IC point");
+            (px, py) = abi.decode(out, (uint256, uint256));
+            (ok, out) = address(6).staticcall(abi.encode(x, y, px, py));
+            require(ok && out.length == 64, "ecAdd of a manifest IC point");
+            (x, y) = abi.decode(out, (uint256, uint256));
+        }
+    }
+
+    function _manifestPoint(string memory manifest, string memory key, uint256 index)
+        internal
+        pure
+        returns (uint256, uint256)
+    {
+        string memory at = string.concat(key, "[", vm.toString(index), "]");
+        return
+            (vm.parseJsonUint(manifest, string.concat(at, "[0]")), vm.parseJsonUint(manifest, string.concat(at, "[1]")));
     }
 
     /// Post-deploy checks: the vault's getters equal the inputs and the expected constants.
@@ -491,6 +606,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         ZkApiWithdrawalPaymaster pm = d.paymaster;
         ZkApiWithdrawalAccountFactory factory = d.factory;
         require(pm.ENTRY_POINT_V070_CODEHASH() == ENTRY_POINT_V070_CODEHASH, "EntryPoint codehash pin");
+        require(pm.FRESH_SLOT_GAS_BOUND() == FRESH_SLOT_GAS_BOUND, "paymaster FRESH_SLOT_GAS_BOUND");
+        require(!pm.scheduleRepriced(), "paymaster gas schedule");
         require(address(pm.entryPoint()) == address(g.entryPoint), "paymaster entryPoint");
         require(address(pm.vault()) == address(d.vault), "paymaster vault");
         require(address(pm.adapter()) == address(d.adapter), "paymaster adapter");

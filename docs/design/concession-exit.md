@@ -320,7 +320,7 @@ mapping(uint32 => Types.PendingConcession) public pendingConcessions;           
 ```
 
 - **Constructor:** 11 arguments, the existing 10 plus `maxPauseDuration_`. It requires `maxPauseDuration_ ≥ 2 · challengePeriod_`. Everything else is unchanged, including `PROTOCOL_VERSION = 2`, `ROOT_HISTORY_WINDOW = 1 days` and the unread `requestChargeCap`.
-- `pendingWithdrawals[n].finalBalance` always holds the **current** payout. Its `activeRoot` word now stores the proof's `activeRoot` and remains informational.
+- `pendingWithdrawals[n].finalBalance` always holds the **current** payout. Its `activeRoot` word now stores the proof's `activeRoot` and remains informational (superseded: the word is zero, see [Implementation status](#implementation-status), "Escape storage").
 - **Invariant for every pending escape:**
 
   ```
@@ -1040,13 +1040,13 @@ New linkage stays confined to exits, the exiting note and its last request. Clie
 ### 10.4 Vault and adapter deployment (Sepolia, then mainnet)
 1. **`Deploy.s.sol`.**
    - Require a `POSEIDON_ADDRESS` whose runtime codehash equals the compiled library and link it; otherwise deploy a fresh library and record that address.
-   - Deploy the adapter, then the vault with 11 constructor arguments.
+   - Deploy the adapter, then the vault with 11 constructor arguments (superseded: the adapter takes the vault's predicted address and its four key coordinates; see [Implementation status](#implementation-status), "Adapter folding and verify-once").
    - Assert `adapter.CIRCUIT_ID_HASH()` and both VK hashes against the manifest.
    - Write the actual linked addresses and the three runtime codehashes.
 2. **Expected codehashes.** `scripts/expected-codehashes.mjs` computes the expected runtime code:
    - from the pinned-compiler `deployedBytecode`;
    - with the library link applied;
-   - with `immutableReferences` filled from the constructor arguments (keys, periods, adapter address, `maxPauseDuration`, `requestChargeCap`, and the derived `treasuryChangeDelay` and `unpauseClaimGrace`).
+   - with `immutableReferences` filled from the constructor arguments (keys, periods, adapter address, `maxPauseDuration`, `requestChargeCap`, and the derived `treasuryChangeDelay` and `unpauseClaimGrace`), and the adapter's from its vault, chain and keys (see [Implementation status](#implementation-status), "Adapter folding and verify-once").
 
    CI publishes the result so third parties can audit any profile against the ceremony transcript.
 3. **Parameters.**
@@ -1392,16 +1392,16 @@ The implementation differs from the text above as follows. Each item names the s
 | Request circuit | ≈31,679 constraints | 31,670 constraints, 12 public inputs, 31,378 witnesses, domain 2^15 |
 | Withdrawal circuit | ≈36,458 constraints | 36,452 constraints, 16 public inputs, 36,001 witnesses, domain 2^16 |
 | Native prove (Apple Silicon, release, median of 3) | n/a | request 356 ms, escape 395 ms; verify 1.5 ms |
-| `initiateEscapeWithdrawal` (transaction gas) | 0.55–0.62M | 574,544 |
-| Defeat | 0.33–0.40M | 374,881 |
-| Raise | ≈0.33M | 335,128 |
-| `mutualClose` | 0.40–0.45M | 427,837 |
-| `finalizeEscapeWithdrawal` | 30–206k | 91,898 |
-| `claimExpired` | 0.06–0.15M | 77,509 |
+| `initiateEscapeWithdrawal` (transaction gas) | 0.55–0.62M | 364,202 |
+| Defeat | 0.33–0.40M | 284,281 |
+| Raise | ≈0.33M | 271,591 |
+| `mutualClose` | 0.40–0.45M | 327,247 |
+| `finalizeEscapeWithdrawal` | 30–206k | 80,291 |
+| `claimExpired` | 0.06–0.15M | 72,703 |
 | `retireClosedLeaf` | ≈6.0M | ≈5.95M; a duplicate that reverts `StaleRoot` costs ≈5.9M |
-| Vault runtime size | 16.3–17.3 KB | 17,431 B (7,145 B under EIP-170); adapter 7,343 B, Poseidon 9,723 B |
+| Vault runtime size | 16.3–17.3 KB | 18,651 B (5,925 B under EIP-170); adapter 13,154 B, Poseidon 9,723 B |
 
-The gas figures are pinned in `protocol/contracts/snapshots/concession-exit-gas.json`, with a ceiling of 250k added for `finalizeEscapeWithdrawal`. All are dev-setup figures; G-SETUP replaces the keys, adapter, fixtures and snapshot.
+The gas figures are pinned in `protocol/contracts/snapshots/concession-exit-gas.json`, with a ceiling of 250k added for `finalizeEscapeWithdrawal`. They include the folded adapter and the escape storage below; WP-B first measured 574,544 for the initiation, 374,881 for the defeat, 335,128 for the raise, 427,837 for the close, 91,898 for the finalization and 77,509 for the claim. All are dev-setup figures under EIP-2929 storage pricing; G-SETUP replaces the keys, adapter, fixtures and snapshot.
 
 ### Circuits, setup and key policy (§3, §10.1, §10.2)
 
@@ -1416,6 +1416,9 @@ The gas figures are pinned in `protocol/contracts/snapshots/concession-exit-gas.
 ### Contracts and deployment (§4, §10.4)
 
 - **Amendment A1.** `isKnownRoot` returns `knownRoots[root]`, every root the vault ever set; `rootRetiredAt` is informational. `ROOT_HISTORY_WINDOW()` stays 86400 and is now only a probe value and the default bound of off-chain root windows.
+- **Escape storage (§4.1, §4.2 step 10, §4.3 step 6, §4.6).** The getters keep their selectors, shapes and values, except that `pendingWithdrawals` word 1 (`activeRoot`) is always zero: the vault never read it, and the escape's calldata carries the proof's root. `usedNullifiers` and `challengedNullifiers` are views over one word per nullifier (bit 0 used, bit 1 challenged), and a pending escape keeps the rest of its record in the two words it consumes anyway: `N`'s word holds `N⁺` and `N⁺`'s word the destination, above the flags. The record by note holds only `N`, the deadline and the two amounts (96 bits each; both are at most `depositAmount ≤ MAX_NATIVE_UNITS < 2^53`, checked before the store). An escape therefore writes four fresh slots instead of seven, and a defeat none instead of one (`challengedNullifiers[N]` is a bit of `N`'s word). A defeat rewrites `N`'s word to the challenged flag alone and clears `N⁺`'s; a finalization leaves both words (only the record by note says whether an escape is pending). The §4.6 table and every check order and revert are unchanged. Measured with the committed-state method (every account and slot cold, a funded treasury): `initiateEscapeWithdrawal` 438,009 → 367,002 transaction gas, the defeat 304,490 → 286,381 (net of refunds), the raise 278,855 → 276,891 and the finalization 61,504 → 56,591.
+- **Adapter folding and verify-once (§4, §10.4 items 1 and 2).** The generated `Groth16ProofAdapter` serves one vault. Its constructor `(vault, stateSigningKeyX, stateSigningKeyY, clearanceSigningKeyX, clearanceSigningKeyY)` records `block.chainid`, keeps the vault and the four coordinates as public immutables (`foldedChainId`, `foldedVault`, `folded*SigningKey*`), and folds the seven inputs every proof of that vault shares (protocol version 2, the chain, the vault, the keys) into the first IC point (`foldedRequestIc0X/Y`, `foldedWithdrawalIc0X/Y`), range-checking each constant. A statement whose words all equal them takes the fast path: four of a request's and six of a withdrawal's scalar multiplications fewer. Any other statement takes the generic path over every input, so the adapter accepts exactly the proofs of its keys, whatever it was folded for. A wrong fold only costs gas, and `Deploy.s.sol` refuses one before it writes the manifest. The verifier is one straight-line assembly body that keeps the ABI decoder's narrow-field checks and reverts `InvalidProof()`. `verifyWithdrawalOnce` (the gasless paymaster's call in validation) always verifies in full, then records the exit in transient storage at `keccak256(destination ‖ keccak256(inputs ‖ proof))`, a slot ERC-7562 associates with the sender (STO-021). `assertValidWithdrawal` of byte-identical inputs and proof later in the same transaction (the vault's call in execution) returns after that lookup. `IZkApiProofAdapter` makes the record part of the interface, and the adapter reports it through ERC-165 (`supportsInterface`), which the paymaster's constructor requires. The adapter's runtime code depends on its vault, chain and keys, so `scripts/expected-codehashes.mjs` fills those immutables and sums the folded points on BN254 itself. Measured with the committed-state method: the adapter's frame of a close 276,950 → 217,014 gas and of a request 274,774 → 228,514, and a sponsored close 905,292 → 530,598 and escape 1,080,542 → 643,294 (`handleOpsReal*`).
+- **Gas schedule (§1.5, §4.9, §10.7 B).** Every figure here, and every gas constant of the gasless paymaster, is measured under EIP-2929 storage pricing. EIP-8037 prices a fresh slot at about 110,000 gas instead of 22,100, and Sepolia runs it: an escape, which writes four fresh slots, costs roughly twice as much there. The paymaster's constructor refuses such a chain (`FRESH_SLOT_GAS_BOUND`, 25,000), so the Sepolia vaults deploy without it until its policy is derived under EIP-8037 (`docs/deployment.md`, "Gas schedule").
 - **Two-stage deployment manifest (§10.4 items 1 and 4).** `Deploy.s.sol` writes only a provisional manifest, `$OUTPUT_PATH.pending`, with `deploymentStatus` `"pending"` (or `"simulated"` without `--broadcast`) and `deployBlockLowerBound`. `node scripts/expected-codehashes.mjs --deployment $OUTPUT_PATH.pending --rpc $RPC_URL --finalize $OUTPUT_PATH` then reads the creation receipts from forge's broadcast log, checks each creation, the three runtime codehashes, the owner and the treasury on chain, and only then writes the final manifest with `deploymentStatus: "deployed"`, `deployBlock` (the vault's creation block) and `deployTransactions`. `deploy_block` (§10.3, §10.7 B step 2.1) is that `deployBlock`. serverd, `zkapi db init`, the companion, the SDK build and clientd refuse a `pending` or `simulated` manifest. Finalize needs forge's broadcast log (or `--broadcast-log`), defaults to `--confirmations 1`, and checks owner and treasury only when it runs; `--check --rpc` later audits codehashes only.
 - **Setup policy (§10.2 "no single-party setup").** Enforced by `SetupPolicy` in `Deploy.s.sol`: off local chains a `dev` or `rehearsal` setup needs `ALLOW_DEV_SETUP=1` (recorded as `allowDevSetup`), mainnet included since v0.2 (a single-party vault trusts its setup's generator; see `docs/deployment.md`, "Single-party setup"), and an `mpc-1` setup must have the verifying keys of the committed `protocol/setup/v2-concession/manifest.json`. Local chains (31337, 1337) accept any setup id.
 - **Deployment script.** It links `Bn254Poseidon` itself; requires `OWNER`, `TREASURY`, `SETUP_MANIFEST` and `MAX_PAUSE_DURATION_SECONDS` off local chains; checks the signing keys (prime-order subgroup, distinct, not the published development keys off local chains); and writes key coordinates as decimal strings. The demo Foundry profile uses the protocol profile's compiler settings, so both build the same runtime code.

@@ -22,7 +22,15 @@ recorded in `knownRoots`, and a withdrawal proof may use any of them.
 
 [Groth16ProofAdapter](../../contracts/src/adapters/Groth16ProofAdapter.sol)
 verifies the request and withdrawal statements directly and exposes
-`CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`. Public
+`CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`. One is deployed
+per vault: its constructor takes the vault's address and signing keys, records
+the chain ID (`folded*` immutables) and folds the inputs every proof of that
+vault shares into the first IC point, so those proofs skip their scalar
+multiplications while any other statement is still verified over every input.
+`verifyWithdrawalOnce`, the gasless paymaster's call in validation, records a
+verified withdrawal in transient storage, and the vault's
+`assertValidWithdrawal` of the same bytes later in the transaction is then a
+lookup. Public
 deployment fields and pinned signing keys are checked by the vault before
 settlement.
 

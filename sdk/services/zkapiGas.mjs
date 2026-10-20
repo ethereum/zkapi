@@ -22,5 +22,7 @@ export function bufferedGasLimit(estimate) {
 
 // The gas limit an exit is submitted with when the wallet provider's
 // simulation refuses it (design §6.4 E4.5: that simulation is advisory). An
-// escape costs about 0.55–0.62M gas and a mutual close about 0.40–0.45M.
+// escape initiation costs about 0.37M gas and a mutual close about 0.31M
+// under EIP-2929 storage pricing, and about 0.72M and 0.40M where EIP-8037
+// prices each fresh storage slot at about 110,000 (Sepolia).
 export const EXIT_FALLBACK_GAS_LIMIT = 1_000_000n;

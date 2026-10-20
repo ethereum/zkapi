@@ -160,10 +160,10 @@ test('a sponsored close creates the transit account, signs the hash once, journa
     assert.equal(op.paymasterData, `0x${BigInt(VECTORS.policy.flat_fee_wei).toString(16).padStart(24, '0')}`, 'feeCapWei = the flat fee shown');
     assert.equal(BigInt(op.maxFeePerGas), 2n * chain.baseFee + chain.priorityFee);
     assert.equal(BigInt(op.maxPriorityFeePerGas), chain.priorityFee);
-    assert.equal(BigInt(op.callGasLimit), 642_500n, 'the profile default, not the bundler estimate');
+    assert.equal(BigInt(op.callGasLimit), 395_000n, 'the profile default, not the bundler estimate');
     assert.equal(BigInt(op.verificationGasLimit), 180_000n, 'verification_default_init');
     assert.equal(BigInt(op.paymasterPostOpGasLimit), 270_000n);
-    assert.equal(BigInt(op.paymasterVerificationGasLimit), 430_000n);
+    assert.equal(BigInt(op.paymasterVerificationGasLimit), 380_000n);
     // Journaled before eth_sendUserOperation, with the signature; two dry runs (unsigned, then signed) and the EntryPoint hash cross-check.
     assert.equal(journalAtSend.userOpPhase, 'op_built');
     assert.deepEqual(journalAtSend.userOp, op);
@@ -402,7 +402,7 @@ test('a reverted execution (NoteNotActive after a replay) leaves the payout in S
     assert.equal(unpackNonce(forward.nonce).key, FORWARD_NONCE_KEY);
     assert.equal(forward.callData, encodeTransitWithdraw('0x'));
     assert.equal('factory' in forward, false);
-    assert.equal(BigInt(forward.callGasLimit), 97_500n);
+    assert.equal(BigInt(forward.callGasLimit), 60_000n);
     assert.equal(wallet.signatures.length, 2);
     saved = await record();
     assert.equal(saved.fundsWaitingInTransit, false);
@@ -515,7 +515,7 @@ test('a sponsored escape records its initiation debt; its finalization after the
     assert.equal(escapeAmounts[0].minimumReceived, null);
     assert.ok(BigInt(escapeAmounts[0].estimatedReceived) > 0n);
     assert.equal(unpackNonce(bundler.sent[0].op.nonce).key, BigInt(nullifier) & ((1n << 192n) - 1n));
-    assert.equal(BigInt(bundler.sent[0].op.callGasLimit), 680_000n, 'the escape default');
+    assert.equal(BigInt(bundler.sent[0].op.callGasLimit), 395_000n, 'the escape default');
     let saved = await record();
     assert.equal(saved.mode, 'escape');
     assert.equal(saved.phase, 'pending');
@@ -548,7 +548,7 @@ test('a sponsored escape records its initiation debt; its finalization after the
     const finalizeOp = bundler.sent.at(-1).op;
     assert.equal(finalizeOp.callData, encodeTransitWithdraw(encodeFinalizeEscape(NOTE_ID)));
     assert.equal(unpackNonce(finalizeOp.nonce).key, BigInt(nullifier) & ((1n << 192n) - 1n), 'uint192(pending.withdrawalNullifier)');
-    assert.equal(BigInt(finalizeOp.callGasLimit), 287_500n);
+    assert.equal(BigInt(finalizeOp.callGasLimit), 250_000n);
     assert.ok(statuses.some(message => /receives at least/.test(message)));
     assert.ok(statuses.some(message => /0\.004 ETH of debt paid/.test(message)), statuses.join('\n'));
     saved = await record();
@@ -1001,7 +1001,7 @@ test('a bundler estimate between the signed default and the paymaster’s cap is
     between.bundler.autoMine = between.closeBundle();
     const result = await within(5_000, between.withdraw('mutual'), 'estimate between the default and the cap');
     assert.equal(result.status, 'closed');
-    assert.equal(BigInt(between.bundler.sent[0].op.callGasLimit), 642_500n, 'the pinned default is still what is signed');
+    assert.equal(BigInt(between.bundler.sent[0].op.callGasLimit), 395_000n, 'the pinned default is still what is signed');
     const above = await scenario();
     above.bundler.estimate = { callGasLimit: '0xf4240' };
     await assert.rejects(above.withdraw('mutual'), error => error.code === 'gasless_estimate_above_cap'

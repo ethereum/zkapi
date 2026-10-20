@@ -46,8 +46,15 @@ contract ZkApiVaultGroth16Test is Test {
             emptySiblings[level] = zero;
             zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
         }
-        adapter = new Groth16ProofAdapter();
         (Types.WithdrawalPublicInputs memory parameters,) = _withdrawal("escape_a2");
+        // Folded for the vault DEPLOYER creates at nonce 0, the address the proofs bind.
+        adapter = new Groth16ProofAdapter(
+            vm.computeCreateAddress(DEPLOYER, 0),
+            parameters.stateSigningKeyX,
+            parameters.stateSigningKeyY,
+            parameters.clearanceSigningKeyX,
+            parameters.clearanceSigningKeyY
+        );
         vm.setNonce(DEPLOYER, 0);
         vm.prank(DEPLOYER);
         vault = new ZkApiVault(
@@ -503,8 +510,9 @@ contract ZkApiVaultGroth16Test is Test {
         assertNotEq(rootAtInitiation, rootA);
         _expectInitiated(escape, rootAtInitiation);
         _initiate("escape_a2_at_root_a");
-        (, uint256 pendingRoot,,,,) = vault.pendingWithdrawals(0);
-        assertEq(pendingRoot, rootA);
+        (bool pending, uint256 pendingRoot,,,,) = vault.pendingWithdrawals(0);
+        assertTrue(pending);
+        assertEq(pendingRoot, 0, "the proof's root is not stored");
 
         _depositOther(2, 0x1234);
         uint256 rootAtDefeat = vault.currentRoot();

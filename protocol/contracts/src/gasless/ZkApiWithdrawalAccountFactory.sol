@@ -31,6 +31,8 @@ contract ZkApiWithdrawalAccountFactory {
     bytes private constant CREATION_STUB = hex"600d80380380916000396000f3";
     bytes private constant PROXY_HEAD = hex"36600060003760a0603d36396000600060a03601600073";
     bytes private constant PROXY_TAIL = hex"5af43d600060003e3d600082603b57fd5bf3";
+    /// @dev The highest address createAccount reserves for precompiles (zero included).
+    uint160 private constant MAX_PRECOMPILE = 0xffff;
 
     address public immutable entryPoint;
     address public immutable vault;
@@ -65,13 +67,16 @@ contract ZkApiWithdrawalAccountFactory {
     }
 
     /// @notice Creates the transit account of (owner, payee) or returns it if it exists. Permissionless.
-    /// @dev `payee` may not be an address that cannot or must not hold a payout: zero, the vault, the
-    ///      paymaster, the EntryPoint or this factory. The owner may not be zero because ecrecover
-    ///      returns zero for an invalid signature.
+    /// @dev `payee` may not be an address that cannot or must not hold a payout: zero or any other
+    ///      address up to 0xffff, the range of the precompiles (0x01-0x11 and P256VERIFY at 0x100
+    ///      today; a precompile has no code, so the paymaster would charge its push as an EOA's while
+    ///      a failing one burns the whole push gas, and a credit to it could never be claimed), the
+    ///      vault, the paymaster, the EntryPoint or this factory. The owner may not be zero because
+    ///      ecrecover returns zero for an invalid signature.
     function createAccount(address owner, address payee) external returns (address account) {
         if (
-            payee == address(0) || payee == vault || payee == paymaster || payee == entryPoint || payee == address(this)
-                || owner == address(0)
+            uint160(payee) <= MAX_PRECOMPILE || payee == vault || payee == paymaster || payee == entryPoint
+                || payee == address(this) || owner == address(0)
         ) revert InvalidPayee();
         account = getAddress(owner, payee);
         if (account.code.length != 0) return account;

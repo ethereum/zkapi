@@ -20,7 +20,10 @@ import {ZkApiWithdrawalAccountFactory} from "./ZkApiWithdrawalAccountFactory.sol
 ///         and bounds every gas field, fee and cost; in postOp it keeps a measured charge out of what
 ///         S forwarded, re-deposits it, and pushes the rest to S's payee. The operator's float (its
 ///         EntryPoint deposit) is the only asset at risk: user funds enter P only from S and leave
-///         only to S's payee, the deposit, or a credit the payee can claim.
+///         only to S's payee, the deposit, or a credit the payee can claim. The verification runs
+///         once: validation verifies through the adapter's verifyWithdrawalOnce, which records the
+///         verified proof for the transaction, and the vault's own verification of the same exit in
+///         the execution phase then finds the record.
 /// @dev One contract holds every rule: validation-time refusals (uncharged: the bundler drops the
 ///      operation in simulation, or pays itself if the state changed before inclusion), per-key
 ///      attempt counting written in validation so it survives any execution outcome, one
@@ -28,7 +31,13 @@ import {ZkApiWithdrawalAccountFactory} from "./ZkApiWithdrawalAccountFactory.sol
 ///      before any of it executes), and a postOp
 ///      that never reverts within its gas floor (no loops, no bubbling external call, guarded
 ///      arithmetic). Validation never reads block time, number or gas price, calls only contracts
-///      with code, reads only its own and the vault's storage and writes only its own.
+///      with code, reads only its own and the vault's storage and writes only its own and, through
+///      the adapter's verifyWithdrawalOnce, the transient record of the verified proof at a slot
+///      ERC-7562 associates with the sender (STO-021).
+///      Every gas constant is measured under one gas schedule, EIP-2929's storage pricing (a fresh
+///      slot costs 22,100 cold): the constructor refuses a chain that prices state creation above
+///      FRESH_SLOT_GAS_BOUND (EIP-8037, live on Sepolia), and checkGasSchedule lets anyone pause
+///      sponsorship for good once a fork reprices it under a deployed paymaster.
 contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPaymaster {
     using UserOpGas for PackedUserOperation;
 
@@ -47,6 +56,8 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     /// @notice keccak256 of the canonical EntryPoint v0.7.0 runtime (identical on every chain).
     bytes32 public constant ENTRY_POINT_V070_CODEHASH =
         0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58;
+    /// @dev The storage slot _freshSlotGas writes and clears; nothing else uses it.
+    bytes32 private constant PROBE_SLOT = keccak256("zkapi.gasless.freshSlotProbe");
     /// @dev P (20) ‖ paymasterVerificationGasLimit (16) ‖ paymasterPostOpGasLimit (16) ‖ feeCapWei (12).
     uint256 private constant PAYMASTER_DATA_LENGTH = 64;
     /// @dev withdraw(bytes) with a 0-, 36- or 836-byte argument: selector + offset word + length word.
@@ -62,17 +73,35 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     // whose entry names the comments below quote; every floor exceeds the measured need by at least
     // ERC-7562's VALIDATION_GAS_SLACK (4,000), and every cap stays below MAX_VERIFICATION_GAS where
     // the rules apply. The tests assert each rule, so a figure that drifts fails CI instead of
-    // going stale here.
+    // going stale here. Every figure holds only under the schedule it was measured in (EIP-2929
+    // storage pricing, Prague and Osaka): under EIP-8037 a fresh slot costs about 110,000 instead of
+    // 22,100 and a new account 183,600 instead of 25,000, which no floor, cap or postOp constant
+    // here covers, so FRESH_SLOT_GAS_BOUND gates the deployment and checkGasSchedule.
+
+    /// @notice The most gas one write of a nonzero word to a cold, zero storage slot may cost on a
+    ///         chain this paymaster sponsors on, as _freshSlotGas measures it: 22,100 and the
+    ///         probe's own opcodes under the measured schedule, with room for nothing else.
+    uint256 public constant FRESH_SLOT_GAS_BOUND = 25_000;
 
     /// @notice callGasLimit floors per kind: the measured execution through S (accountCall*) with
-    ///         the real Groth16 adapter (adapterVerifyCold), a treasury that uses its whole
-    ///         100,000-gas push and a never-used treasury or destination (25,000, EIP-161), under
-    ///         the 63/64 rule, plus 20,000.
-    uint256 internal constant CALL_FLOOR_CLOSE = 540_000;
-    uint256 internal constant CALL_FLOOR_ESCAPE = 540_000;
-    uint256 internal constant CALL_FLOOR_FINALIZE = 250_000;
-    uint256 internal constant CALL_FLOOR_FORWARD = 80_000;
+    ///         the real Groth16 adapter, a treasury that uses its whole 100,000-gas push and a
+    ///         never-used treasury or destination (25,000, EIP-161), under the 63/64 rule, plus
+    ///         20,000, rounded up to 10,000. The vault's verification of a CLOSE or ESCAPE finds the
+    ///         record this paymaster's validation left in the same transaction
+    ///         (adapterVerifyRecorded): a record is written only after a full verification and never
+    ///         erased, so it is there for the execution of every operation validated here. That
+    ///         lookup is what IZkApiProofAdapter requires of assertValidWithdrawal after
+    ///         verifyWithdrawalOnce, and the generated Groth16ProofAdapter (the adapter the
+    ///         deployment pins by codehash) does it; the constructor can only check that the adapter
+    ///         reports the interface, so pairing this paymaster with any other adapter means
+    ///         re-deriving these two floors with it.
+    uint256 internal constant CALL_FLOOR_CLOSE = 210_000;
+    uint256 internal constant CALL_FLOOR_ESCAPE = 160_000;
+    uint256 internal constant CALL_FLOOR_FINALIZE = 200_000;
+    uint256 internal constant CALL_FLOOR_FORWARD = 30_000;
     /// @notice Upper bounds of callGasLimit per kind; the owner's callCap may only sit at or below.
+    ///         The CLOSE and ESCAPE caps also cover the execution with a full verification
+    ///         (adapterVerifyCold) in place of the recorded one.
     uint256 internal constant CALL_HARD_CAP_CLOSE = 950_000;
     uint256 internal constant CALL_HARD_CAP_ESCAPE = 1_100_000;
     uint256 internal constant CALL_HARD_CAP_FINALIZE = 400_000;
@@ -93,12 +122,15 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     /// @notice preVerificationGas bounds.
     uint256 internal constant PVG_FLOOR = 40_000;
     uint256 internal constant PVG_CAP = 150_000;
-    /// @notice paymasterVerificationGasLimit bounds: the floor is the larger cold measurement with the
-    ///         real Groth16 adapter (paymasterValidationEscapeCold, the shape that reads the most
-    ///         vault state, or paymasterValidationCold) plus VALIDATION_GAS_SLACK, rounded up to
-    ///         10,000; both measurements fit under the cap with 20,000 to spare; the cap is
-    ///         MAX_VERIFICATION_GAS minus VALIDATION_GAS_SLACK.
-    uint256 internal constant PM_VERIFICATION_FLOOR = 400_000;
+    /// @notice paymasterVerificationGasLimit bounds: the floor is the dearest cold validation with the
+    ///         real Groth16 adapter (paymasterValidationEscapeWorstCold: the ESCAPE shape, which
+    ///         reads the most vault state, from an S that carries a settled sponsored-escape record,
+    ///         plus the scalar multiplication a noteId of 3 or more adds to the golden proof's
+    ///         noteId 0; every other input that can skip one skips it in every exit or does not in
+    ///         the golden escape) plus VALIDATION_GAS_SLACK, rounded up to 10,000; the golden
+    ///         measurements (paymasterValidationCold, paymasterValidationEscapeCold) fit under the
+    ///         cap with 20,000 to spare; the cap is MAX_VERIFICATION_GAS minus VALIDATION_GAS_SLACK.
+    uint256 internal constant PM_VERIFICATION_FLOOR = 350_000;
     uint256 internal constant PM_VERIFICATION_CAP = 496_000;
     /// @notice postOp's own gas on a CLOSE or FORWARD settling path with a plain transfer to a
     ///         funded EOA (postOpEoa): POSTOP_BASE_GAS + EOA_PUSH_GAS is pinned at or under the
@@ -132,8 +164,8 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     /// @notice The EntryPoint's call into S, the proxy, S's dispatch and its repay call: execution gas
     ///         outside the window S measures (accountCall* − accountMeasured*, with and without a
     ///         value to forward), pinned at or above the measurement and within 4,000 of it.
-    uint256 internal constant ACCOUNT_CALL_OVERHEAD_GAS = 55_500;
-    uint256 internal constant ACCOUNT_CALL_OVERHEAD_ESCAPE_GAS = 28_900;
+    uint256 internal constant ACCOUNT_CALL_OVERHEAD_GAS = 11_500;
+    uint256 internal constant ACCOUNT_CALL_OVERHEAD_ESCAPE_GAS = 4_800;
     /// @notice Covers cold/warm variance; the measured charge exceeds the real cost by at most this
     ///         on every settling path with an EOA payee (the handleOps* entries), and by at most
     ///         this plus CREDIT_GAS when a payout is credited.
@@ -209,10 +241,9 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     mapping(address => uint256) public escapeNotePlusOne;
     /// @notice S whose sponsored CLOSE or FINALIZE reverted: the payout may sit in S.
     mapping(address => bool) public stranded;
-    /// @notice Wei S forwarded during the current operation.
-    mapping(address => uint256) public received;
-    /// @notice The execution gas S reported during the current operation.
-    mapping(address => uint256) public receivedGas;
+    /// @dev The slots of the received and receivedGas mappings, kept so that later slots keep
+    ///      their numbers: what S forwards during an operation is transient now (see received).
+    uint256[2] private _retiredReceivedSlots;
     /// @notice Payouts whose push failed, claimable by anyone for the payee.
     mapping(address => uint256) public credits;
     uint256 public totalCredits;
@@ -221,6 +252,9 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     uint256 public lostWei;
     /// @notice Charges a payout could not cover (metric).
     uint256 public shortfallWei;
+    /// @notice checkGasSchedule found the chain repricing a fresh storage slot above
+    ///         FRESH_SLOT_GAS_BOUND: sponsorship is paused for good.
+    bool public scheduleRepriced;
 
     // -------------------------------------------------------------------------------------- events
 
@@ -255,6 +289,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     event Released(bytes32 indexed key);
     event DebtWrittenOff(address indexed sender, uint256 amount);
     event Rescued(address indexed to, uint256 amount);
+    event ScheduleRepriced(uint256 freshSlotGas);
 
     // -------------------------------------------------------------------------------------- errors
     // Each is a distinct selector so clients can map the inner bytes of an AA33 FailedOpWithRevert.
@@ -325,6 +360,11 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     /// @notice Only the owner may set the stake's terms: a first stake, a longer unstake delay or
     ///         a re-lock after unlockStake.
     error StakeTermsLocked();
+    /// @notice The chain prices a fresh storage slot at `freshSlotGas`, above FRESH_SLOT_GAS_BOUND:
+    ///         the gas policy does not hold there (constructor).
+    error UnsupportedGasSchedule(uint256 freshSlotGas);
+    /// @notice checkGasSchedule found the schedule repriced: setPolicy may not resume sponsorship.
+    error SponsorshipRetired();
 
     // --------------------------------------------------------------------------------- structures
 
@@ -389,9 +429,11 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
 
     // -------------------------------------------------------------------------------- constructor
 
-    /// @dev Pins the EntryPoint by runtime codehash, checks the vault's protocol and concession
-    ///      versions, reads the adapter, both key pairs, the pause bound and the unit size from the
-    ///      vault, and deploys the factory. Every call cap starts at its hard cap.
+    /// @dev Refuses a chain whose gas schedule prices a fresh storage slot above
+    ///      FRESH_SLOT_GAS_BOUND, pins the EntryPoint by runtime codehash, checks the vault's protocol
+    ///      and concession versions, reads the adapter (which must report IZkApiProofAdapter through
+    ///      ERC-165, so that verifyWithdrawalOnce is there), both key pairs, the pause bound and the
+    ///      unit size from the vault, and deploys the factory. Every call cap starts at its hard cap.
     constructor(
         IEntryPoint entryPoint_,
         ZkApiVault vault_,
@@ -400,10 +442,12 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         uint256 maxFeeCeiling_,
         uint256 priorityFeeCeiling_
     ) Ownable(owner_) {
+        uint256 freshSlotGas = _freshSlotGas();
+        if (freshSlotGas > FRESH_SLOT_GAS_BOUND) revert UnsupportedGasSchedule(freshSlotGas);
         if (address(entryPoint_).codehash != ENTRY_POINT_V070_CODEHASH) revert BadEntryPoint();
         if (vault_.PROTOCOL_VERSION() != 2 || vault_.CONCESSION_ESCAPE_VERSION() != 1) revert BadVault();
         IZkApiProofAdapter adapter_ = vault_.proofAdapter();
-        if (address(adapter_).code.length == 0) revert BadVault();
+        if (!_isVerifyOnceAdapter(address(adapter_))) revert BadVault();
         entryPoint = entryPoint_;
         vault = vault_;
         adapter = adapter_;
@@ -541,7 +585,6 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
     ///      then the kind's own rules, the payout against the required cost, and the proof last.
     function _validateExit(uint8 kind, Figures memory f, bytes calldata vaultCall, Policy memory pol)
         private
-        view
         returns (Outcome memory o)
     {
         Types.WithdrawalPublicInputs memory inputs = abi.decode(vaultCall[4:516], (Types.WithdrawalPublicInputs));
@@ -593,8 +636,10 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
             if (!f.estimating && payout < needed) revert PayoutBelowCost(needed, payout);
             o.key = keyFor(KIND_ESCAPE, 0, inputs.noteId, address(0));
         }
-        // Last, after every cheap refusal: the Groth16 verification dominates the gas.
-        adapter.assertValidWithdrawal(inputs, vaultCall[580:836]);
+        // Last, after every cheap refusal: the Groth16 verification dominates the gas. The adapter
+        // records the verified exit for the transaction, at a transient slot associated with S
+        // (the destination), so the vault's verification of these bytes in execution is a lookup.
+        adapter.verifyWithdrawalOnce(inputs, vaultCall[580:836]);
     }
 
     /// @dev Whether S's recorded sponsored escape is still open: the note is pending, or closed with
@@ -705,8 +750,29 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
             inFlight := tload(s)
         }
         if (inFlight == 0) revert NotRepayable();
-        received[s] += msg.value;
-        receivedGas[s] = executionGasUsed;
+        // Transient: the operation's postOp, later in this transaction, consumes both.
+        bytes32 slot = _receivedSlot(s);
+        assembly ("memory-safe") {
+            tstore(slot, add(tload(slot), callvalue()))
+            tstore(add(slot, 1), executionGasUsed)
+        }
+    }
+
+    /// @notice Wei S forwarded during the current operation (transient, so 0 outside one).
+    function received(address s) external view returns (uint256 amount) {
+        bytes32 slot = _receivedSlot(s);
+        assembly ("memory-safe") {
+            amount := tload(slot)
+        }
+    }
+
+    /// @notice The execution gas S reported during the current operation (transient, so 0
+    ///         outside one).
+    function receivedGas(address s) external view returns (uint256 gasUsed) {
+        bytes32 slot = _receivedSlot(s);
+        assembly ("memory-safe") {
+            gasUsed := tload(add(slot, 1))
+        }
     }
 
     /// @notice Called by S.sweep() outside an operation: deducts what S owes first, pushes the rest to
@@ -748,10 +814,15 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
             let inFlight := tload(sender)
             if inFlight { tstore(sender, sub(inFlight, 1)) }
         }
-        uint256 got = received[sender];
-        uint256 execUsed = receivedGas[sender];
-        if (got != 0) delete received[sender];
-        if (execUsed != 0) delete receivedGas[sender];
+        uint256 got;
+        uint256 execUsed;
+        bytes32 receivedSlot = _receivedSlot(sender);
+        assembly ("memory-safe") {
+            got := tload(receivedSlot)
+            execUsed := tload(add(receivedSlot, 1))
+            if got { tstore(receivedSlot, 0) }
+            if execUsed { tstore(add(receivedSlot, 1), 0) }
+        }
         uint256 debt = owed[sender];
         if (mode != PostOpMode.opSucceeded) {
             // The vault call reverted and its state rolled back, so this operation forwarded
@@ -967,6 +1038,47 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         }
     }
 
+    /// @dev The transient slots of what S forwarded during the current operation (the wei, and at
+    ///      the next slot the execution gas S reported), written by repay and consumed by postOp. A
+    ///      hash, so it coincides neither with the locks nor with a sender's slot.
+    function _receivedSlot(address s) private pure returns (bytes32 slot) {
+        assembly ("memory-safe") {
+            mstore(0x00, "received")
+            mstore(0x20, s)
+            slot := keccak256(0x00, 0x40)
+        }
+    }
+
+    /// @dev The gas of one write of a nonzero word to a cold, zero slot (PROBE_SLOT, cleared again at
+    ///      once), as GAS reads it around the SSTORE: 22,100 and the probe's own few opcodes under
+    ///      the measured schedule (freshSlotProbe in snapshots/gasless-gas.json), about 110,000 under
+    ///      EIP-8037 (in October 2026 this constructor reverted UnsupportedGasSchedule(110057) on
+    ///      Sepolia and passed on mainnet). EIP-8037 takes state gas from GAS's gas_left whenever
+    ///      the transaction's gas is at most EIP-7825's 2^24 (above it, from a reservoir GAS does not
+    ///      show). The clear depends on the measurement, which is never 0, so that the optimizer
+    ///      cannot prove the measured write overwritten and drop it. Virtual for the tests only: no
+    ///      EVM they run on prices state creation the other way.
+    function _freshSlotGas() internal virtual returns (uint256 used) {
+        bytes32 slot = PROBE_SLOT;
+        assembly ("memory-safe") {
+            let before := gas()
+            sstore(slot, 1)
+            used := sub(before, gas())
+            if used { sstore(slot, 0) }
+        }
+    }
+
+    /// @dev An adapter with code that reports IZkApiProofAdapter through ERC-165: validation
+    ///      verifies through its verifyWithdrawalOnce. A missing or reverting supportsInterface, or
+    ///      any answer but true, refuses it.
+    function _isVerifyOnceAdapter(address adapter_) private view returns (bool) {
+        if (adapter_.code.length == 0) return false;
+        (bool ok, bytes memory answer) = adapter_.staticcall(
+            abi.encodeCall(IZkApiProofAdapter.supportsInterface, (type(IZkApiProofAdapter).interfaceId))
+        );
+        return ok && answer.length == 32 && uint256(bytes32(answer)) == 1;
+    }
+
     /// @notice The pinned gas policy, for the profile and the clients' cross-check.
     function gasPolicy() external pure returns (GasPolicy memory g) {
         g.callFloor = [CALL_FLOOR_CLOSE, CALL_FLOOR_ESCAPE, CALL_FLOOR_FINALIZE, CALL_FLOOR_FORWARD];
@@ -1028,8 +1140,30 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPa
         if (policy_.maxSponsoredCost > MAX_SPONSORED_COST_HARD_CAP || policy_.flatFeeWei > FLAT_FEE_HARD_CAP) {
             revert PolicyOutOfBounds();
         }
+        if (scheduleRepriced && !policy_.sponsorshipPaused) revert SponsorshipRetired();
         policy = policy_;
         emit PolicySet(policy_);
+    }
+
+    /// @notice Anyone may call it: re-measures a fresh storage write (_freshSlotGas) and, when the
+    ///         chain now prices it above FRESH_SLOT_GAS_BOUND (a fork that reprices state creation,
+    ///         such as EIP-8037), pauses sponsorship for good. Every floor, cap and postOp constant
+    ///         here was measured under the old schedule and is immutable, so a paymaster with a
+    ///         re-derived policy must replace this one; setPolicy can no longer resume it. Returns
+    ///         whether the schedule is repriced. Send it with at most 2^24 gas: above EIP-7825's
+    ///         cap, EIP-8037 pays state gas from a reservoir GAS does not show, the measurement
+    ///         reads low and nothing changes.
+    function checkGasSchedule() external returns (bool) {
+        if (scheduleRepriced) return true;
+        uint256 freshSlotGas = _freshSlotGas();
+        if (freshSlotGas <= FRESH_SLOT_GAS_BOUND) return false;
+        scheduleRepriced = true;
+        Policy memory pol = policy;
+        pol.sponsorshipPaused = true;
+        policy = pol;
+        emit PolicySet(pol);
+        emit ScheduleRepriced(freshSlotGas);
+        return true;
     }
 
     /// @notice Lowers (or restores up to the hard cap) the callGasLimit a kind accepts.

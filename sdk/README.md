@@ -600,14 +600,15 @@ receipt. Every number is cross-checked against the paymaster's `quote`
 `uneconomic_fraction_percent`) is refused with `gasless_uneconomic` unless
 the host passes `allowExpensiveGas: true`. The rule is
 `(maxCost + flatFee) × 100 / payout > uneconomic_fraction_percent`. With the
-committed policy's default limits (about 1.5–1.8 million gas in all, more
-with the account's creation), `maxCost` is those limits times `maxFeePerGas`,
-and the default `maxSponsoredCost` of 0.05 ETH refuses every operation above
-a `maxFeePerGas` of about 28 gwei (a base fee of about 13 gwei) with
+committed policy's default limits (`gasFields`: about 1.19 million gas in
+all, 1.41 million with the account's creation, up to 1.5 million at
+`pvgCap`), `maxCost` is those limits times `maxFeePerGas`, and the default
+`maxSponsoredCost` of 0.05 ETH refuses an operation that creates `S` above a
+`maxFeePerGas` of about 35 gwei (a base fee of about 16 gwei) with
 `max_cost_above_policy`, whatever the payout (docs/deployment.md, fee
 bounds). Within that bound, at a 10 gwei base fee and a 1 gwei tip
 (`maxFeePerGas` 21 gwei), a close that creates `S` has a `maxCost` of about
-0.035 ETH, so payouts under about 0.14 ETH (more with a flat fee) keep the
+0.030 ETH, so payouts under about 0.12 ETH (more with a flat fee) keep the
 wallet path by default; the exact threshold for the current fees comes from
 the quote below. `client.gaslessWithdrawalQuote(mode, { destination, feeCapWei,
 allowExpensiveGas })` returns these numbers (`available`, `reason`,
@@ -882,10 +883,12 @@ cannot be read.
   - `exit_kit` (`state_seq`, `exported_seq`, `out_of_date`);
   - `exit_cost_warning`: `{ floor, cost, gas_price_wei }` (gwei ledger units)
     when the payout floor `current_balance − bound_at_state` is below three
-    times an escape's estimated fee (620,000 gas at the last gas price the
-    wallet provider reported), else `null`. The SDK reads the gas price after
-    each deposit and at the start of each withdrawal, and both flows report
-    the warning in a status message. It never blocks anything: the read ends
+    times an escape's estimated fee (620,000 gas, between the about 0.44M an
+    escape and its finalization cost on mainnet and the about 0.8M on
+    Sepolia, at the last gas price the wallet provider reported), else
+    `null`. The SDK reads the gas price after each deposit and at the start
+    of each withdrawal, and both flows report the warning in a status
+    message. It never blocks anything: the read ends
     within the 20-second call limit, a deposit waits for it at most that
     long, and a withdrawal does not wait for it at all (the warning appears
     when the read completes);

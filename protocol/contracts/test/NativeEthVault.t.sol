@@ -16,6 +16,7 @@ import {MockAdapterIdentity} from "./mocks/MockProofAdapters.sol";
 contract NativeProofFixture is MockAdapterIdentity {
     function assertValidRequest(Types.RequestPublicInputs calldata, bytes calldata) external pure {}
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {}
+    function verifyWithdrawalOnce(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {}
 }
 
 contract RejectNativePayout {

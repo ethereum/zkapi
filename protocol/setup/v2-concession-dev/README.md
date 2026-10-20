@@ -21,7 +21,7 @@ the multi-party ceremony in [`../v2-concession`](../v2-concession/README.md)
 | `request.pk`, `request.vk` | Request circuit keys (12 public inputs, 13 IC points) |
 | `withdrawal.pk`, `withdrawal.vk` | Withdrawal circuit keys (16 public inputs, 17 IC points) |
 | `manifest.json` | `setup_id`, `reduction: "circom"`, SHA-256 of the four key files, `vk_keccak256` per kind, `r1cs_sha256` (this build's `.r1cs` exports), circuit shapes, the verifying keys and the Poseidon parameters. `ptau_sha256`, `transcript_sha256` and `zkey_sha256` are `null`: there was no ceremony. |
-| `Groth16ProofAdapter.sol` | The generated Solidity verifier, with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH` |
+| `Groth16ProofAdapter.sol` | The generated Solidity verifier, with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`; deployed once per vault, folded for that vault's address, chain and signing keys |
 | `Bn254Poseidon.sol` | The generated Poseidon library (unchanged from `setup/v2`) |
 
 The VK hashes are keccak256 of each `.vk` file without its header. They are

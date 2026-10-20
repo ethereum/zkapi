@@ -34,6 +34,27 @@ contract RejectingWithdrawals is MockAdapterIdentity {
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {
         revert Errors.InvalidProof();
     }
+
+    function verifyWithdrawalOnce(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {
+        revert Errors.InvalidProof();
+    }
+}
+
+/// @dev An adapter of the shape before verifyWithdrawalOnce: no ERC-165, so the paymaster refuses it.
+contract AdapterWithoutVerifyOnce {
+    function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {}
+}
+
+/// @dev Answers every call with nothing: a supportsInterface that returns no word is refused too.
+contract SilentFallback {
+    fallback() external {}
+}
+
+/// @dev Reports ERC-165 itself but not IZkApiProofAdapter.
+contract OtherInterfaceAdapter {
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == 0x01ffc9a7;
+    }
 }
 
 /// @dev A vault whose versions and adapter the paymaster's constructor checks: only the getters
@@ -138,7 +159,8 @@ contract ValidationTest is GaslessTestBase {
     }
 
     /// The vault must speak protocol version 2 with concession escapes version 1 and name an
-    /// adapter with code, since validation re-runs the vault's checks and the adapter's proof.
+    /// adapter with code that reports IZkApiProofAdapter through ERC-165, since validation re-runs
+    /// the vault's checks and verifies the proof through the adapter's verifyWithdrawalOnce.
     function test_constructorRefusesABadVault() public {
         VersionedVault wrongProtocol = new VersionedVault(3, 1, address(adapter));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
@@ -149,6 +171,14 @@ contract ValidationTest is GaslessTestBase {
         VersionedVault codelessAdapter = new VersionedVault(2, 1, address(0x1234));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
         _deploy(ENTRY_POINT, address(codelessAdapter));
+        address[3] memory unsupported = [
+            address(new AdapterWithoutVerifyOnce()), address(new SilentFallback()), address(new OtherInterfaceAdapter())
+        ];
+        for (uint256 i = 0; i < unsupported.length; ++i) {
+            VersionedVault legacy = new VersionedVault(2, 1, unsupported[i]);
+            vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
+            _deploy(ENTRY_POINT, address(legacy));
+        }
         // the same mock with the right versions and an adapter with code is accepted
         VersionedVault right = new VersionedVault(2, 1, address(adapter));
         ZkApiWithdrawalPaymaster p = _deploy(ENTRY_POINT, address(right));
@@ -801,16 +831,20 @@ contract ValidationTest is GaslessTestBase {
     // ------------------------------------------------------------------ ERC-7562 opcode audit
     // The audit itself (GaslessTestBase._audit) traces handleOps and checks every validation frame
     // but the EntryPoint's and the SenderCreator's; RealAdapter.t.sol runs it with the real adapter.
+    // The mock adapter records a verified exit as the real one does, so the first-use CLOSE and
+    // ESCAPE below audit the record at the sender's associated slot with initCode (STO-022).
 
     function test_opcodeAudit_firstUseClose() public {
         (PackedUserOperation memory op,,) = _closeReady();
-        _audit(op, true, false);
+        assertGt(op.initCode.length, 0, "first use");
+        _audit(op, true, false, true);
     }
 
     function test_opcodeAudit_escape() public {
         uint32 id = _bigNote(42);
         (PackedUserOperation memory op,) = _escapeOp(id, 2001, 2002, BIG - 2_000_000, 1_000_000);
-        _audit(op, true, false);
+        assertGt(op.initCode.length, 0, "first use");
+        _audit(op, true, false, true);
     }
 
     function test_opcodeAudit_finalize() public {
@@ -818,13 +852,13 @@ contract ValidationTest is GaslessTestBase {
         (PackedUserOperation memory op,) = _escapeOp(id, 2001, 2002, BIG - 2_000_000, 1_000_000);
         _handle(op);
         vm.warp(_deadline(id));
-        _audit(_finalizeOp(id), false, false);
+        _audit(_finalizeOp(id), false, false, false);
     }
 
     function test_opcodeAudit_forward() public {
         address s = factory.createAccount(ownerAddr, payee);
         vm.deal(s, 0.05 ether);
         paymaster.allowForward(s);
-        _audit(_forwardOp(), false, true);
+        _audit(_forwardOp(), false, true, false);
     }
 }

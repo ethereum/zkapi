@@ -370,7 +370,9 @@ only the fee cap changes nothing. Fund the sender for every transaction that may
 once plus reverted attempts: each needs gas limit x fee cap (600,000 gas for a
 defeat, 450,000 for a raise, about 7.2M for a leaf retirement), but never more
 than the ceiling. Size it for `⌈m/2⌉` defeats per note (a user holding `m`
-archived states can force that many, each about 375,000 gas), at most 64
+archived states can force that many, each about 284,000 gas, the
+`challengeEscapeWithdrawal` figure in
+`protocol/contracts/snapshots/concession-exit-gas.json`), at most 64
 concurrent escapes, and a 20% margin. Status warns when the balance cannot
 cover the outstanding obligations at the proposed fee cap, or is below
 `--min-sender-balance-wei`. There is no spending budget beyond the

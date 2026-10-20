@@ -239,9 +239,12 @@ Clients pin those hashes and the runtime code hashes of the vault, adapter and
 Poseidon library, and check them on chain before every deposit; the server
 and the challenger check them at startup. Because the vault's runtime code
 depends only on its source, the pinned compiler settings, its constructor
-arguments and the linked library, `scripts/expected-codehashes.mjs` recomputes
-the expected code hashes of any deployment from source, so anyone can audit a
-client profile against the ceremony's keys.
+arguments and the linked library, and the adapter's only on the setup's
+verifying keys and the vault, chain and signing keys it is folded for (its
+immutables), `scripts/expected-codehashes.mjs` recomputes the expected code
+hashes of any deployment from source, filling the adapter's immutables and
+summing its folded points itself, so anyone can audit a client profile
+against the ceremony's keys.
 
 The vault's proof adapter and signing keys are immutable. Configure the server,
 client, verifier and proof assets to match the deployed vault, and verify the

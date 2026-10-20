@@ -2,7 +2,8 @@
 // values up to 2^64 - 1 as bare JSON numbers, which JSON.parse would round above 2^53 - 1. It also
 // finalizes Deploy.s.sol's provisional manifest against the chain (here a fake JSON-RPC), with or
 // without the gasless-withdrawal paymaster, whose runtime code (and the factory's and the account
-// logic's) it derives from the artifacts the same way as the vault's.
+// logic's) it derives from the artifacts the same way as the vault's, and the adapter's, whose
+// folded points it sums on BN254 as the EVM's precompiles do.
 // Run with: node --test demo/contracts/test/*.test.mjs (after forge build in protocol/contracts
 // for the codehash cases).
 import assert from 'node:assert/strict';
@@ -14,18 +15,23 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+    BN254_BASE_MODULUS,
+    BN254_SCALAR_MODULUS,
     CANONICAL_ENTRY_POINT,
     ENTRY_POINT_V070_CODEHASH,
     GAS_POLICY_SCALARS,
     SENDER_CREATOR,
     SENDER_CREATOR_V070_CODEHASH,
     accountCreationCode,
+    adapterImmutables,
     auditDeployment,
     createAddress,
     deploymentInputs,
     expectedCodehashes,
     expectedRuntimeCode,
     finalizeDeployment,
+    g1Add,
+    g1Mul,
     gasPolicyWords,
     gaslessImmutables,
     hexToBytes,
@@ -53,7 +59,9 @@ function manifest(keyY) {
   "stateSigningKeyX": "${BigInt(WIDE_Y_X)}",
   "stateSigningKeyY": ${keyY},
   "clearanceSigningKeyX": "13",
-  "clearanceSigningKeyY": "14"
+  "clearanceSigningKeyY": "14",
+  "vault": "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0",
+  "chainId": 31337
 }`;
 }
 
@@ -223,11 +231,18 @@ test('finalize waits for confirmations', { skip: NO_ARTIFACTS }, async () => {
 
 test('finalize reports code and storage on chain that are not the manifest\'s, and writes nothing', { skip: NO_ARTIFACTS }, async () => {
     const deployment = pendingManifest();
-    // The vault on chain was deployed with other keys than the manifest records.
+    // The vault on chain was deployed with other keys than the manifest records, and the adapter
+    // folded for them.
     const other = chain({ ...deployment, stateSigningKeyY: String(BigInt(WIDE_Y_Y) + 2n) });
     const { manifest: none, mismatches } = await finalize(deployment, other);
     assert.equal(none, undefined);
-    assert.deepEqual(mismatches.map(m => `${m.source}:${m.field}`), ['rpc:vault_runtime_codehash']);
+    assert.deepEqual(mismatches.map(m => `${m.source}:${m.field}`), ['rpc:vault_runtime_codehash', 'rpc:adapter_runtime_codehash']);
+    // An adapter folded for another vault address than the vault's.
+    const misfolded = chain(deployment);
+    misfolded.state.code[ADAPTER] = expectedRuntimeCode(ARTIFACTS, deploymentInputs({ ...deployment, vault: POSEIDON })).adapter;
+    const folded = await finalize(deployment, misfolded);
+    assert.equal(folded.manifest, undefined);
+    assert.deepEqual(folded.mismatches.map(m => `${m.source}:${m.field}`), ['rpc:adapter_runtime_codehash']);
     // The manifest's own codehashes are not the expected ones.
     const recorded = { ...deployment, adapterRuntimeCodehash: `0x${'00'.repeat(32)}` };
     const result = await finalize(recorded, chain(recorded));
@@ -239,6 +254,68 @@ test('finalize reports code and storage on chain that are not the manifest\'s, a
     const swapped = await finalize(deployment, fake);
     assert.equal(swapped.manifest, undefined);
     assert.deepEqual(swapped.mismatches.map(m => m.field), ['owner', 'treasury']);
+});
+
+// ------------------------------------------------------------------- the adapter's fold
+
+const G1 = [1n, 2n];
+const DEV_MANIFEST = JSON.parse(readFileSync(join(ROOT, 'protocol/setup/v2-concession-dev/manifest.json'), 'utf8'));
+const devIc = (kind, index) => DEV_MANIFEST[kind].ic[index].map(BigInt);
+// test/fixtures/vault-challenge.json's deployment (chain 31337), whose dev keys the setup's fixtures use.
+const FIXTURE_FOLD = {
+    vault: '0xFb1b848e938aE6474F890bfb28f6a793a515BAcb',
+    chainId: 31337,
+    stateSigningKeyX: '0x2b8cfd91b905cae31d41e7dedf4a927ee3bc429aad7e344d59d2810d82876c32',
+    stateSigningKeyY: '0x2aaa6c24a758209e90aced1f10277b762a7c1115dbc0e16ac276fc2c671a861f',
+    clearanceSigningKeyX: '0x1812b84c2101217b0939a2f542535075eeaa81d07dab701a899a55db26e85be4',
+    clearanceSigningKeyY: '0x0be80d0f61a801533a94a03b12683474f86ca012941db1c568c53dc877b16fd6',
+};
+const hex = point => point.map(value => `0x${value.toString(16).padStart(64, '0')}`);
+
+test('g1Add and g1Mul are the ecAdd and ecMul precompiles', () => {
+    // 2 · G and the identity cases.
+    const two = ['0x030644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd3', '0x15ed738c0e0a7c92e7845f96b2ae9c0a68a6a449e3538fc7ff3ebf7a5a18a2c4'];
+    assert.deepEqual(hex(g1Mul(G1, 2n)), two);
+    assert.deepEqual(hex(g1Add(G1, G1)), two);
+    assert.deepEqual(g1Mul(G1, BN254_SCALAR_MODULUS), [0n, 0n]);
+    assert.deepEqual(g1Mul(G1, BN254_SCALAR_MODULUS + 2n), g1Mul(G1, 2n));
+    assert.deepEqual(g1Mul(G1, 0n), [0n, 0n]);
+    assert.deepEqual(g1Add(G1, [1n, BN254_BASE_MODULUS - 2n]), [0n, 0n]);
+    assert.deepEqual(g1Add([0n, 0n], G1), G1);
+    assert.deepEqual(g1Add(g1Mul(G1, 5n), g1Mul(G1, 7n)), g1Mul(G1, 12n));
+    assert.throws(() => g1Add([1n, 3n], G1), /not on BN254/);
+    assert.throws(() => g1Mul([BN254_BASE_MODULUS, 2n], 1n), /not a pair of base-field elements/);
+    // The dev setup's withdrawal fold as Groth16ProofAdapter's constructor computed it on the EVM
+    // for the fixture deployment: IC0 + 2 · IC1 + 31337 · IC2 + vault · IC3 + the keys · IC5..IC8.
+    const scalars = [2n, 31337n, BigInt(FIXTURE_FOLD.vault), BigInt(FIXTURE_FOLD.stateSigningKeyX), BigInt(FIXTURE_FOLD.stateSigningKeyY),
+        BigInt(FIXTURE_FOLD.clearanceSigningKeyX), BigInt(FIXTURE_FOLD.clearanceSigningKeyY)];
+    const fold = (kind, points) => points.reduce((sum, point, k) => g1Add(sum, g1Mul(devIc(kind, point), scalars[k])), devIc(kind, 0));
+    assert.deepEqual(hex(fold('request', [1, 2, 3, 5, 6])), ['0x108152802ebd421ca665b59d609905dbc1ef170be4aa8f21ddc99c4223cf171c', '0x03038d95d6f9a546e1648a82db840fb8a1920ec65054c42b2a412c57705d3b40']);
+    assert.deepEqual(hex(fold('withdrawal', [1, 2, 3, 5, 6, 7, 8])), ['0x0e88be9d38d7b75825e3e8aa73808b1a28e5272439c71597bdc1795b0ed4adf3', '0x1765c84ead23e7992ad624c7e273098305bb8165551a6c5c806e81c308baad64']);
+    // Chain 1, the zero address and zero keys: IC0 + 2 · IC1 + IC2 (the precompiles' 1 and 2 paths).
+    assert.deepEqual(hex(g1Add(g1Add(devIc('withdrawal', 0), g1Mul(devIc('withdrawal', 1), 2n)), devIc('withdrawal', 2))),
+        ['0x2d03832b99646021efdd649f928a779987e12ce082efe209d728089541ab0c1e', '0x0f52d30609b8930db2a759a780075c6aaf901c6bab9e01ac208a2592198cd990']);
+});
+
+test('the adapter\'s immutables are its fold for the vault, chain and keys, from the artifact\'s verifying keys', { skip: NO_ARTIFACTS }, () => {
+    const art = JSON.parse(readFileSync(join(ARTIFACTS, 'Groth16ProofAdapter.sol', 'Groth16ProofAdapter.json'), 'utf8'));
+    const values = adapterImmutables(art, FIXTURE_FOLD);
+    assert.equal(values.foldedChainId, (31337).toString(16).padStart(64, '0'));
+    assert.equal(values.foldedVault, FIXTURE_FOLD.vault.slice(2).toLowerCase().padStart(64, '0'));
+    assert.equal(values.foldedClearanceSigningKeyY, FIXTURE_FOLD.clearanceSigningKeyY.slice(2));
+    assert.equal(`0x${values.foldedWithdrawalIc0X}`, '0x0e88be9d38d7b75825e3e8aa73808b1a28e5272439c71597bdc1795b0ed4adf3');
+    assert.equal(`0x${values.foldedRequestIc0Y}`, '0x03038d95d6f9a546e1648a82db840fb8a1920ec65054c42b2a412c57705d3b40');
+    // The runtime code fills exactly these words (filledRuntimeCode refuses a missing or extra one),
+    // so another vault, chain or key is another codehash.
+    const base = parseDeployment(manifest(`"${WIDE_Y_Y}"`));
+    const hashes = expectedCodehashes(ARTIFACTS, base);
+    for (const change of [{ vault: POSEIDON }, { chainId: 1 }, { clearanceSigningKeyX: '15' }]) {
+        assert.notEqual(expectedCodehashes(ARTIFACTS, { ...base, ...change }).adapter_runtime_codehash, hashes.adapter_runtime_codehash, JSON.stringify(change));
+    }
+    // A coordinate no proof can carry, or a missing vault, is refused, as the constructor refuses it.
+    assert.throws(() => adapterImmutables(art, { ...FIXTURE_FOLD, stateSigningKeyX: BN254_SCALAR_MODULUS.toString() }), /not below the BN254 scalar field order/);
+    assert.throws(() => adapterImmutables(art, { ...FIXTURE_FOLD, vault: undefined }), /missing vault/);
+    assert.throws(() => adapterImmutables(art, { ...FIXTURE_FOLD, chainId: undefined }), /missing chainId/);
 });
 
 // ------------------------------------------------------- the gasless-withdrawal paymaster
