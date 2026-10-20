@@ -138,7 +138,7 @@ contract ZkApiExitBatcher {
             (bool ok, bytes memory reason) =
                 _call(cap, abi.encodeCall(ZkApiVault.mutualClose, (inputs[i], proofs[i * 0x100:(i + 1) * 0x100])));
             if (ok) applied |= 1 << i;
-            else emit ItemSkipped(i, KIND_CLOSE, inputs[i].noteId, reason);
+            else emit ItemSkipped(i, KIND_CLOSE, _noteId(inputs[i]), reason);
         }
     }
 
@@ -158,7 +158,7 @@ contract ZkApiExitBatcher {
                 cap, abi.encodeCall(ZkApiVault.initiateEscapeWithdrawal, (inputs[i], proofs[i * 0x100:(i + 1) * 0x100]))
             );
             if (ok) applied |= 1 << i;
-            else emit ItemSkipped(i, KIND_ESCAPE, inputs[i].noteId, reason);
+            else emit ItemSkipped(i, KIND_ESCAPE, _noteId(inputs[i]), reason);
         }
     }
 
@@ -241,6 +241,12 @@ contract ZkApiExitBatcher {
     }
 
     // ------------------------------------------------------------------------------------ internals
+
+    /// @dev The note a withdrawal statement exits, for ItemSkipped: the one place this contract
+    ///      reads a statement field (the adapter checked the statement's encoding already).
+    function _noteId(Types.WithdrawalPublicInputs calldata inputs) private pure returns (uint32) {
+        return inputs.noteId;
+    }
 
     function _size(uint256 n) private pure returns (uint256) {
         if (n == 0) revert EmptyBatch();

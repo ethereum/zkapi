@@ -20,8 +20,8 @@ use rand::{Rng, SeedableRng};
 use serde_json::Value;
 use zkapi_proof::batch::{BatchRejection, BatchVerifier};
 use zkapi_proof::compact::{
-    batch_domain, keccak256, proof_from_wire, proof_to_wire, request_record, RequestVerifier,
-    WithdrawalVerifier,
+    batch_domain, keccak256, proof_from_wire, proof_to_wire, request_record, statement_input_bits,
+    KeyKind, RequestVerifier, WithdrawalVerifier,
 };
 use zkapi_types::wire::{Groth16ProofWire, ProofBackendWire};
 use zkapi_types::Felt252;
@@ -348,17 +348,8 @@ fn encodings_are_refused_as_the_adapter_refuses_them() {
         carry == 0
     };
     for (items, widths) in [
-        (
-            &withdrawals,
-            [
-                16u16, 64, 160, 256, 256, 256, 256, 256, 32, 128, 160, 256, 8, 256, 128, 64,
-            ]
-            .to_vec(),
-        ),
-        (
-            &requests,
-            [16u16, 64, 160, 256, 256, 256, 64, 128, 256, 256, 256, 256].to_vec(),
-        ),
+        (&withdrawals, statement_input_bits(KeyKind::Withdrawal)),
+        (&requests, statement_input_bits(KeyKind::Request)),
     ] {
         let verifier = setup.batch(items[0].request);
         for position in [0usize, 2] {

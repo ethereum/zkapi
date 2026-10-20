@@ -1656,7 +1656,7 @@ const WITHDRAWAL_SOLIDITY_INPUTS: [SolidityInput; 16] = [
 /// The ABI bit width of every public input of a statement kind, in Groth16 order (256 for a
 /// field element): the table the adapter's narrow-field checks are generated from, which the
 /// reference batch verifier ([`crate::batch`]) applies the same way.
-pub(crate) fn statement_input_bits(kind: KeyKind) -> Vec<u16> {
+pub fn statement_input_bits(kind: KeyKind) -> Vec<u16> {
     let table: &[SolidityInput] = match kind {
         KeyKind::Request => &REQUEST_SOLIDITY_INPUTS,
         KeyKind::Withdrawal => &WITHDRAWAL_SOLIDITY_INPUTS,
