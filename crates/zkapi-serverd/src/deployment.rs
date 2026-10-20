@@ -9,7 +9,10 @@
 //! RPC that
 //!
 //! * the vault reports `CONCESSION_ESCAPE_VERSION() == 1` and
-//!   `ROOT_HISTORY_WINDOW() == 86400`, and its `proofAdapter()` is the
+//!   `LEAF_BOUND_EXIT_VERSION() == 1` (vault revision 4: exits bind the
+//!   stored note leaf, so a revision-3 vault, which lacks the getter, is
+//!   refused), its `minDeposit()` is in range and equals the manifest's
+//!   `min_deposit_units` when it pins one, and its `proofAdapter()` is the
 //!   manifest's adapter;
 //! * the adapter's `CIRCUIT_ID_HASH()`, `REQUEST_VK_HASH()` and
 //!   `WITHDRAWAL_VK_HASH()` equal this build's circuit and the verifying keys
@@ -29,15 +32,21 @@ use zkapi_types::wire::CurvePointWire;
 use crate::native_billing::NativeBillingOracle;
 use crate::nullifier_store::{DeploymentBinding, StatementIdentity, BINDING_SOURCE_MANIFEST};
 
-/// `CONCESSION_ESCAPE_VERSION()` of a revision-3 vault.
+/// `CONCESSION_ESCAPE_VERSION()` of a revision-3 or later vault.
 pub const CONCESSION_ESCAPE_VERSION: u64 = 1;
-/// `ROOT_HISTORY_WINDOW()` of a revision-3 vault.
-pub const ROOT_HISTORY_WINDOW_SECONDS: u64 = 86_400;
+/// `LEAF_BOUND_EXIT_VERSION()` of a revision-4 vault.
+pub const LEAF_BOUND_EXIT_VERSION: u64 = 1;
+/// The vault revision this build serves.
+pub const VAULT_REVISION: u64 = 4;
+/// The largest `minDeposit()` a vault accepts (MAX_NATIVE_UNITS, 2^53 - 1
+/// gwei units).
+pub const MAX_MIN_DEPOSIT_UNITS: u64 = 9_007_199_254_740_991;
 /// The `deployment_status` of a profile whose vault does not exist yet.
 pub const NOT_DEPLOYED: &str = "not_deployed";
 
 pub const CONCESSION_ESCAPE_VERSION_SELECTOR: &str = "0x5e00b426"; // CONCESSION_ESCAPE_VERSION()
-pub const ROOT_HISTORY_WINDOW_SELECTOR: &str = "0x1fe72de0"; // ROOT_HISTORY_WINDOW()
+pub const LEAF_BOUND_EXIT_VERSION_SELECTOR: &str = "0xc0baafb1"; // LEAF_BOUND_EXIT_VERSION()
+pub const MIN_DEPOSIT_SELECTOR: &str = "0x41b3d185"; // minDeposit()
 pub const PROOF_ADAPTER_SELECTOR: &str = "0xefc91e58"; // proofAdapter()
 pub const CIRCUIT_ID_HASH_SELECTOR: &str = "0xda0e8385"; // CIRCUIT_ID_HASH()
 pub const REQUEST_VK_HASH_SELECTOR: &str = "0xfe351488"; // REQUEST_VK_HASH()
@@ -76,6 +85,13 @@ pub struct DeploymentManifest {
     pub exit_concession: Option<u64>,
     #[serde(default)]
     pub vault_revision: Option<u64>,
+    /// Vault capability: leaf-bound exits (revision 4).
+    #[serde(default)]
+    pub leaf_bound_exit: Option<u64>,
+    /// The vault's `minDeposit()` in gwei units; the startup probe requires
+    /// the vault to report it.
+    #[serde(default)]
+    pub min_deposit_units: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +168,26 @@ impl DeploymentManifest {
             ensure!(
                 capability == 1,
                 "the deployment manifest has exit_concession {capability}; this build requires 1"
+            );
+        }
+        if let Some(capability) = manifest.leaf_bound_exit {
+            ensure!(
+                capability == 1,
+                "the deployment manifest has leaf_bound_exit {capability}; this build requires 1"
+            );
+        }
+        if let Some(revision) = manifest.vault_revision {
+            ensure!(
+                revision == VAULT_REVISION,
+                "the deployment manifest has vault_revision {revision}; this build serves \
+                 vault revision {VAULT_REVISION}"
+            );
+        }
+        if let Some(units) = manifest.min_deposit_units {
+            ensure!(
+                (1..=MAX_MIN_DEPOSIT_UNITS).contains(&units),
+                "the deployment manifest has min_deposit_units {units}, outside 1 to \
+                 {MAX_MIN_DEPOSIT_UNITS}"
             );
         }
         ensure!(
@@ -374,6 +410,8 @@ pub fn init_database(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeReport {
     pub proof_adapter_address: String,
+    /// The vault's `minDeposit()`, in gwei units.
+    pub min_deposit_units: u64,
     pub vault_runtime_codehash: String,
     pub adapter_runtime_codehash: String,
     pub poseidon_runtime_codehash: String,
@@ -460,17 +498,35 @@ pub async fn probe_deployment<R: ContractReader + Sync>(
             hex32(&version)
         ));
     }
-    let window = word(
-        ROOT_HISTORY_WINDOW_SELECTOR,
+    let leaf_bound = word(
+        LEAF_BOUND_EXIT_VERSION_SELECTOR,
         vault.clone(),
-        "vault ROOT_HISTORY_WINDOW()",
+        "vault LEAF_BOUND_EXIT_VERSION() (a revision-4 vault has it; revision 3 does not)",
     )
     .await?;
-    if small(window) != Some(ROOT_HISTORY_WINDOW_SECONDS) {
+    if small(leaf_bound) != Some(LEAF_BOUND_EXIT_VERSION) {
         return mismatch(format!(
-            "vault ROOT_HISTORY_WINDOW() is {}, not {ROOT_HISTORY_WINDOW_SECONDS}",
-            hex32(&window)
+            "vault LEAF_BOUND_EXIT_VERSION() is {}, not {LEAF_BOUND_EXIT_VERSION}",
+            hex32(&leaf_bound)
         ));
+    }
+    let min_deposit = word(MIN_DEPOSIT_SELECTOR, vault.clone(), "vault minDeposit()").await?;
+    let min_deposit_units = match small(min_deposit) {
+        Some(units) if (1..=MAX_MIN_DEPOSIT_UNITS).contains(&units) => units,
+        _ => {
+            return mismatch(format!(
+                "vault minDeposit() is {}, outside 1 to {MAX_MIN_DEPOSIT_UNITS}",
+                hex32(&min_deposit)
+            ))
+        }
+    };
+    if let Some(pinned) = manifest.min_deposit_units {
+        if pinned != min_deposit_units {
+            return mismatch(format!(
+                "vault minDeposit() is {min_deposit_units}, but the deployment manifest pins \
+                 min_deposit_units {pinned}"
+            ));
+        }
     }
     let adapter_word = word(
         PROOF_ADAPTER_SELECTOR,
@@ -517,6 +573,7 @@ pub async fn probe_deployment<R: ContractReader + Sync>(
     }
     let mut report = ProbeReport {
         proof_adapter_address: adapter.clone(),
+        min_deposit_units,
         vault_runtime_codehash: String::new(),
         adapter_runtime_codehash: String::new(),
         poseidon_runtime_codehash: String::new(),
@@ -584,7 +641,9 @@ pub(crate) mod tests {
             "poseidon_runtime_codehash": hex32(&zkapi_proof::compact::keccak256(b"poseidon code")),
             "settlement_window_seconds": 21_905,
             "exit_concession": 1,
-            "vault_revision": 3,
+            "vault_revision": 4,
+            "leaf_bound_exit": 1,
+            "min_deposit_units": 1_000_000,
         })
     }
 
@@ -612,7 +671,8 @@ pub(crate) mod tests {
                 "CONCESSION_ESCAPE_VERSION",
                 CONCESSION_ESCAPE_VERSION_SELECTOR,
             ),
-            ("ROOT_HISTORY_WINDOW", ROOT_HISTORY_WINDOW_SELECTOR),
+            ("LEAF_BOUND_EXIT_VERSION", LEAF_BOUND_EXIT_VERSION_SELECTOR),
+            ("minDeposit", MIN_DEPOSIT_SELECTOR),
             ("proofAdapter", PROOF_ADAPTER_SELECTOR),
             ("CIRCUIT_ID_HASH", CIRCUIT_ID_HASH_SELECTOR),
             ("REQUEST_VK_HASH", REQUEST_VK_HASH_SELECTOR),
@@ -681,6 +741,25 @@ pub(crate) mod tests {
         let mut capability = bare.clone();
         capability["exit_concession"] = 0.into();
         assert!(DeploymentManifest::parse(&capability.to_string()).is_err());
+        // A revision-3 profile, a leaf_bound_exit other than 1 and a
+        // minDeposit outside the vault's range are refused.
+        for (field, value) in [
+            ("vault_revision", serde_json::json!(3)),
+            ("leaf_bound_exit", serde_json::json!(0)),
+            ("min_deposit_units", serde_json::json!(0)),
+            (
+                "min_deposit_units",
+                serde_json::json!(MAX_MIN_DEPOSIT_UNITS + 1),
+            ),
+        ] {
+            let mut refused = bare.clone();
+            refused[field] = value.clone();
+            let error = DeploymentManifest::parse(&refused.to_string()).unwrap_err();
+            assert!(
+                error.to_string().contains(field),
+                "{field} {value}: {error}"
+            );
+        }
         let mut zero = bare;
         zero["proof_adapter_address"] = "0x0000000000000000000000000000000000000000".into();
         assert!(DeploymentManifest::parse(&zero.to_string()).is_err());

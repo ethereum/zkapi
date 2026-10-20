@@ -1,18 +1,25 @@
 //! Local mirror of the vault's note tree and note lifecycle, maintained from
 //! contract events.
 //!
-//! Vault revision 3 keeps an append-only note tree (§4, §5.5): a deposit
-//! inserts its note's leaf, and only `retireClosedLeaf` removes one, of a
-//! Closed note. Escapes, defeats, raises, mutual closes, finalizations and
-//! expiry claims change a note's status but never the tree, and every root
-//! such an event carries must equal the mirrored root. The mirror also keeps
+//! Vault revision 4 keeps an append-only note tree: a deposit inserts its
+//! note's leaf `P(D', R, F)` (one word per note), and only `retireClosedLeaf`
+//! removes one, of a Closed note. Escapes, defeats, raises, mutual closes,
+//! finalizations and expiry claims change a note's status but never the
+//! tree. No event carries a root: the caller checks the mirror against the
+//! vault's computed `currentRoot()` and `nextNoteId()` at a block hash. The
+//! mirror also keeps
 //!
-//! * every root the vault ever set (`knownRoots`, Amendment A1): the empty
-//!   root and the root after each deposit and retirement, any of which a
-//!   proof may use;
+//! * each note's `NoteDeposited` preimage (commitment, amount, expiry), which
+//!   operator sweeps (`claimExpired`) need and the vault no longer stores;
 //! * the published-nullifier table (§5.2): every `withdrawalNullifier` and
 //!   `nextNullifier` a vault event made public;
 //! * the open escapes with their concession (`PendingEscape`).
+//!
+//! A mirror built from the vault's state (`TreeMirror::from_state`, the
+//! `noteLeaves` pages of a bootstrap) has the leaves of the notes deposited
+//! before the bootstrap block but none of their history: their preimages,
+//! statuses (`NoteStatus::Unknown` until an event names them), escapes and
+//! published nullifiers are absent.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
@@ -30,6 +37,28 @@ pub enum NoteStatus {
     Active,
     PendingWithdrawal,
     Closed,
+    /// Deposited before the state bootstrap the mirror started from, and
+    /// named by no event since: Active, PendingWithdrawal, or Closed with its
+    /// leaf still in the tree.
+    Unknown,
+}
+
+/// The leaf preimage a `NoteDeposited` event carries: with the note id, it
+/// reproduces the leaf the vault stored, and `claimExpired` and
+/// `effectiveExpiry` take it as arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotePreimage {
+    /// The registration commitment `R = H_reg(s, 0)`.
+    pub commitment: Felt252,
+    pub amount: u128,
+    pub expiry_ts: u64,
+}
+
+impl NotePreimage {
+    /// The leaf of note `note_id` with this preimage.
+    pub fn leaf(&self, note_id: u32) -> Felt252 {
+        compute_note_leaf(note_id, &self.commitment, self.amount, self.expiry_ts)
+    }
 }
 
 /// An escape withdrawal the vault holds open until it is defeated or
@@ -121,17 +150,22 @@ impl std::fmt::Display for MissedReEscape {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TreeMirrorSnapshot {
     pub next_note_id: u32,
-    /// The leaf each note was deposited with, by note id.
-    pub deposited_leaves: Vec<Felt252>,
+    /// Notes `0..state_notes` were read from the vault's state at a
+    /// bootstrap; their history before it is unknown.
+    pub state_notes: u32,
+    /// The leaf each note was deposited with, by note id; zero only for a
+    /// state note whose leaf was retired before the bootstrap.
+    pub leaves: Vec<Felt252>,
+    /// Each note's `NoteDeposited` preimage, by note id; `None` exactly for
+    /// the state notes.
+    pub preimages: Vec<Option<NotePreimage>>,
     /// Each note's status, by note id.
     pub statuses: Vec<NoteStatus>,
-    /// Closed notes whose leaf `ClosedLeafRetired` zeroed, ascending.
+    /// Closed notes whose leaf is zero (retired), ascending.
     pub retired: Vec<u32>,
     pub pending_escapes: Vec<PendingEscape>,
     /// The published-nullifier table, ascending.
     pub published_nullifiers: Vec<Felt252>,
-    /// Every root the vault set, ascending.
-    pub known_roots: Vec<Felt252>,
 }
 
 /// A vault event that cannot follow the mirror's current state. The caller
@@ -154,8 +188,6 @@ pub enum MirrorError {
     ConcessionOutOfOrder { note_id: u32 },
     #[error("inconsistent concession for note {note_id}: {detail}")]
     InconsistentConcession { note_id: u32, detail: String },
-    #[error("event root {event} does not match mirror root {mirror}")]
-    RootMismatch { event: Felt252, mirror: Felt252 },
     #[error("note id space is exhausted")]
     NoteIdOverflow,
 }
@@ -164,13 +196,17 @@ pub enum MirrorError {
 #[derive(Clone)]
 pub struct TreeMirror {
     tree: MerkleTree,
-    /// The leaf each note was deposited with, by note id.
+    /// The leaf each note was deposited with, by note id (zero for a state
+    /// note retired before the bootstrap).
     deposited: Vec<Felt252>,
+    /// Each note's `NoteDeposited` preimage; `None` for the state notes.
+    preimages: Vec<Option<NotePreimage>>,
     statuses: Vec<NoteStatus>,
     retired: BTreeSet<u32>,
+    /// Notes read from the vault's state at a bootstrap, without history.
+    state_notes: u32,
     pending_escapes: BTreeMap<u32, PendingEscape>,
     published: HashSet<Felt252>,
-    known_roots: HashSet<Felt252>,
 }
 
 impl TreeMirror {
@@ -178,16 +214,51 @@ impl TreeMirror {
         Self {
             tree: MerkleTree::new(),
             deposited: Vec::new(),
+            preimages: Vec::new(),
             statuses: Vec::new(),
             retired: BTreeSet::new(),
+            state_notes: 0,
             pending_escapes: BTreeMap::new(),
             published: HashSet::new(),
-            known_roots: HashSet::from([Self::empty_root()]),
         }
     }
 
-    /// Root of the empty tree, which the vault sets (and records as known)
-    /// in its constructor.
+    /// The mirror of a vault whose leaves are `leaves` (`noteLeaves(0, n)`,
+    /// zero for a retired leaf), with no history: every note is a state note,
+    /// a zero leaf is Closed and retired, any other's status is Unknown.
+    ///
+    /// The caller checks its root against `currentRoot()` read at the same
+    /// block hash as the leaves.
+    pub fn from_state(leaves: Vec<Felt252>) -> Result<Self, String> {
+        let notes =
+            u32::try_from(leaves.len()).map_err(|_| "more leaves than note ids".to_string())?;
+        let retired: BTreeSet<u32> = (0..notes)
+            .filter(|note_id| leaves[*note_id as usize].is_zero())
+            .collect();
+        let statuses = leaves
+            .iter()
+            .map(|leaf| {
+                if leaf.is_zero() {
+                    NoteStatus::Closed
+                } else {
+                    NoteStatus::Unknown
+                }
+            })
+            .collect();
+        Ok(Self {
+            tree: MerkleTree::from_leaves(&leaves),
+            preimages: vec![None; leaves.len()],
+            deposited: leaves,
+            statuses,
+            retired,
+            state_notes: notes,
+            pending_escapes: BTreeMap::new(),
+            published: HashSet::new(),
+        })
+    }
+
+    /// Root of the empty tree, which the vault computes before its first
+    /// deposit.
     pub fn empty_root() -> Felt252 {
         static EMPTY_ROOT: OnceLock<Felt252> = OnceLock::new();
         *EMPTY_ROOT.get_or_init(|| MerkleTree::new().root())
@@ -196,6 +267,19 @@ impl TreeMirror {
     /// True before the first deposit.
     pub fn is_empty(&self) -> bool {
         self.deposited.is_empty()
+    }
+
+    /// Notes read from the vault's state at a bootstrap (`0..state_notes`),
+    /// whose preimages, statuses, escapes and published nullifiers before
+    /// it are unknown. Zero for a mirror built from complete logs.
+    pub fn state_notes(&self) -> u32 {
+        self.state_notes
+    }
+
+    /// Whether the mirror holds every vault event since deployment: built
+    /// from logs alone, or bootstrapped before the first deposit.
+    pub fn has_complete_history(&self) -> bool {
+        self.state_notes == 0
     }
 
     /// The current root.
@@ -230,7 +314,9 @@ impl TreeMirror {
         self.pending_escapes.values().copied().collect()
     }
 
-    /// Whether a vault event made `nullifier` public.
+    /// Whether a vault event made `nullifier` public. Only conclusive for a
+    /// nullifier the table lacks when the history is complete
+    /// (`has_complete_history`).
     pub fn is_published(&self, nullifier: &Felt252) -> bool {
         self.published.contains(nullifier)
     }
@@ -239,47 +325,78 @@ impl TreeMirror {
         self.published.len()
     }
 
-    /// Whether the vault ever set `root` (A1: the vault accepts any of them).
-    pub fn is_known_root(&self, root: &Felt252) -> bool {
-        self.known_roots.contains(root)
+    /// The `NoteDeposited` preimage of `note_id`; `None` for a state note
+    /// or a note never deposited.
+    pub fn preimage(&self, note_id: u32) -> Option<NotePreimage> {
+        self.preimages.get(note_id as usize).copied().flatten()
     }
 
-    pub fn known_root_count(&self) -> usize {
-        self.known_roots.len()
+    /// The leaf `note_id` was deposited with (zero if unknown: a state note
+    /// retired before the bootstrap, or a note never deposited).
+    pub fn deposited_leaf(&self, note_id: u32) -> Felt252 {
+        self.deposited
+            .get(note_id as usize)
+            .copied()
+            .unwrap_or(Felt252::ZERO)
     }
 
     /// Capture the mirror for a checkpoint.
     pub fn snapshot(&self) -> TreeMirrorSnapshot {
         let mut published: Vec<_> = self.published.iter().copied().collect();
         published.sort_unstable_by_key(|felt| felt.0);
-        let mut known_roots: Vec<_> = self.known_roots.iter().copied().collect();
-        known_roots.sort_unstable_by_key(|felt| felt.0);
         TreeMirrorSnapshot {
             next_note_id: self.next_note_id(),
-            deposited_leaves: self.deposited.clone(),
+            state_notes: self.state_notes,
+            leaves: self.deposited.clone(),
+            preimages: self.preimages.clone(),
             statuses: self.statuses.clone(),
             retired: self.retired.iter().copied().collect(),
             pending_escapes: self.pending_escapes(),
             published_nullifiers: published,
-            known_roots,
         }
     }
 
-    /// Restore a mirror from a checkpoint, checking that it is consistent.
+    /// Restore a mirror from a checkpoint, checking that it is consistent:
+    /// every logged note's leaf is its preimage's.
     pub fn from_snapshot(snapshot: TreeMirrorSnapshot) -> Result<Self, String> {
         let notes = snapshot.next_note_id as usize;
-        if snapshot.deposited_leaves.len() != notes || snapshot.statuses.len() != notes {
+        if snapshot.leaves.len() != notes
+            || snapshot.preimages.len() != notes
+            || snapshot.statuses.len() != notes
+        {
             return Err(format!(
-                "snapshot has {} deposited leaves and {} statuses but next_note_id is {}",
-                snapshot.deposited_leaves.len(),
+                "snapshot has {} leaves, {} preimages and {} statuses but next_note_id is {}",
+                snapshot.leaves.len(),
+                snapshot.preimages.len(),
                 snapshot.statuses.len(),
                 snapshot.next_note_id
             ));
         }
-        if let Some(note_id) = snapshot.deposited_leaves.iter().position(Felt252::is_zero) {
-            return Err(format!(
-                "snapshot has an empty deposited leaf for note {note_id}"
-            ));
+        if snapshot.state_notes > snapshot.next_note_id {
+            return Err("snapshot has more state notes than notes".to_string());
+        }
+        for note_id in 0..snapshot.next_note_id {
+            let index = note_id as usize;
+            let leaf = snapshot.leaves[index];
+            if note_id < snapshot.state_notes {
+                if snapshot.preimages[index].is_some() {
+                    return Err(format!("snapshot has a preimage for state note {note_id}"));
+                }
+                continue;
+            }
+            let Some(preimage) = snapshot.preimages[index] else {
+                return Err(format!("snapshot lacks the preimage of note {note_id}"));
+            };
+            if leaf.is_zero() || preimage.leaf(note_id) != leaf {
+                return Err(format!(
+                    "snapshot's leaf of note {note_id} is not its preimage's"
+                ));
+            }
+            if snapshot.statuses[index] == NoteStatus::Unknown {
+                return Err(format!(
+                    "snapshot has an unknown status for logged note {note_id}"
+                ));
+            }
         }
         let mut retired = BTreeSet::new();
         for note_id in snapshot.retired {
@@ -325,6 +442,13 @@ impl TreeMirror {
         if pending_notes != pending_escapes.len() {
             return Err("snapshot has a pending note without its escape".to_string());
         }
+        if let Some(note_id) = (0..snapshot.next_note_id).find(|note_id| {
+            snapshot.leaves[*note_id as usize].is_zero() && !retired.contains(note_id)
+        }) {
+            return Err(format!(
+                "snapshot has an empty leaf for note {note_id}, which is not retired"
+            ));
+        }
         let mut published = HashSet::with_capacity(snapshot.published_nullifiers.len());
         for nullifier in snapshot.published_nullifiers {
             if nullifier.is_zero() || !published.insert(nullifier) {
@@ -332,38 +456,32 @@ impl TreeMirror {
             }
         }
 
-        let mut tree = MerkleTree::new();
-        for (note_id, leaf) in snapshot.deposited_leaves.iter().enumerate() {
-            if !retired.contains(&(note_id as u32)) {
-                tree.set_leaf(note_id as u32, *leaf);
-            }
-        }
-        let known_roots: HashSet<Felt252> = snapshot.known_roots.iter().copied().collect();
-        if known_roots.len() != snapshot.known_roots.len() {
-            return Err("snapshot repeats a known root".to_string());
-        }
-        if !known_roots.contains(&Self::empty_root()) || !known_roots.contains(&tree.root()) {
-            return Err("snapshot's known roots lack the empty or the current root".to_string());
-        }
+        let current: Vec<Felt252> = snapshot
+            .leaves
+            .iter()
+            .enumerate()
+            .map(|(note_id, leaf)| {
+                if retired.contains(&(note_id as u32)) {
+                    Felt252::ZERO
+                } else {
+                    *leaf
+                }
+            })
+            .collect();
         Ok(Self {
-            tree,
-            deposited: snapshot.deposited_leaves,
+            tree: MerkleTree::from_leaves(&current),
+            deposited: snapshot.leaves,
+            preimages: snapshot.preimages,
             statuses: snapshot.statuses,
             retired,
+            state_notes: snapshot.state_notes,
             pending_escapes,
             published,
-            known_roots,
         })
     }
 
     /// The sibling path of a note's slot in the current tree.
     pub fn get_path(&self, note_id: u32) -> [Felt252; MERKLE_DEPTH] {
-        self.tree.get_siblings(note_id)
-    }
-
-    /// Deprecated alias of `get_path`: the siblings of a slot do not depend
-    /// on its leaf. Exits no longer need a zero-slot path.
-    pub fn get_zero_path(&self, note_id: u32) -> [Felt252; MERKLE_DEPTH] {
         self.tree.get_siblings(note_id)
     }
 
@@ -373,41 +491,23 @@ impl TreeMirror {
     }
 
     /// Apply a contract event after checking that it can follow the mirrored
-    /// vault state, including the root the vault emitted with it.
+    /// vault state.
     ///
     /// Returns the missed re-escape that an event naming an unlisted
-    /// nullifier implies; the caller's batch-end check of the root and next
-    /// note id remains the safety check of the tree.
+    /// nullifier implies. Events carry no root: the caller's batch-end check
+    /// of `currentRoot()` and `nextNoteId()` is the safety check of the tree.
     ///
-    /// On error the mirror may be partially updated and must be discarded.
+    /// On error the mirror is unchanged.
     pub fn apply_event(
         &mut self,
         event: &VaultEvent,
     ) -> Result<Option<MissedReEscape>, MirrorError> {
         let missed = self.check(event)?;
         self.transition(event);
-        match event {
-            VaultEvent::NoteDeposited { new_root: root, .. }
-            | VaultEvent::ClosedLeafRetired { new_root: root, .. }
-            | VaultEvent::EscapeWithdrawalInitiated {
-                current_root: root, ..
-            }
-            | VaultEvent::EscapeWithdrawalChallenged {
-                current_root: root, ..
-            }
-            | VaultEvent::ExpiredClaimed {
-                current_root: root, ..
-            } => self.require_root(root)?,
-            VaultEvent::MutualClose { .. }
-            | VaultEvent::EscapeConcessionRecorded { .. }
-            | VaultEvent::EscapeConcessionRaised { .. }
-            | VaultEvent::EscapeWithdrawalFinalized { .. } => {}
-        }
         Ok(missed)
     }
 
-    /// Unchecked event application, for tests and reference chains whose
-    /// events carry placeholder roots.
+    /// Unchecked event application, for tests and reference chains.
     #[cfg(test)]
     pub(crate) fn process_event(&mut self, event: &VaultEvent) {
         self.transition(event);
@@ -432,7 +532,11 @@ impl TreeMirror {
             VaultEvent::MutualClose { note_id, .. }
             | VaultEvent::EscapeWithdrawalInitiated { note_id, .. }
             | VaultEvent::ExpiredClaimed { note_id, .. } => {
-                if self.status(*note_id)? != NoteStatus::Active {
+                // A state note's status is unknown: the vault checked it.
+                if !matches!(
+                    self.status(*note_id)?,
+                    NoteStatus::Active | NoteStatus::Unknown
+                ) {
                     return Err(MirrorError::NoteNotActive { note_id: *note_id });
                 }
                 Ok(None)
@@ -461,6 +565,15 @@ impl TreeMirror {
                         "final balance plus conceded is not the state balance",
                     ));
                 }
+                Ok(None)
+            }
+            // An escape of a state note initiated before the bootstrap: the
+            // mirror never listed it and cannot check the event.
+            VaultEvent::EscapeConcessionRaised { note_id, .. }
+            | VaultEvent::EscapeWithdrawalChallenged { note_id, .. }
+            | VaultEvent::EscapeWithdrawalFinalized { note_id, .. }
+                if self.status(*note_id)? == NoteStatus::Unknown =>
+            {
                 Ok(None)
             }
             VaultEvent::EscapeConcessionRaised {
@@ -496,8 +609,11 @@ impl TreeMirror {
             VaultEvent::EscapeWithdrawalFinalized {
                 note_id, nullifier, ..
             } => self.missed_re_escape(*note_id, nullifier, EscapeClose::Finalized),
-            VaultEvent::ClosedLeafRetired { note_id, .. } => {
-                if self.status(*note_id)? != NoteStatus::Closed {
+            VaultEvent::ClosedLeafRetired { note_id } => {
+                if !matches!(
+                    self.status(*note_id)?,
+                    NoteStatus::Closed | NoteStatus::Unknown
+                ) {
                     return Err(MirrorError::NoteNotClosed { note_id: *note_id });
                 }
                 if self.retired.contains(note_id) {
@@ -524,13 +640,17 @@ impl TreeMirror {
                 commitment,
                 amount,
                 expiry_ts,
-                ..
             } => {
-                let leaf = compute_note_leaf(*note_id, commitment, *amount, *expiry_ts);
+                let preimage = NotePreimage {
+                    commitment: *commitment,
+                    amount: *amount,
+                    expiry_ts: *expiry_ts,
+                };
+                let leaf = preimage.leaf(*note_id);
                 self.tree.set_leaf(*note_id, leaf);
                 self.deposited.push(leaf);
+                self.preimages.push(Some(preimage));
                 self.statuses.push(NoteStatus::Active);
-                self.known_roots.insert(self.tree.root());
             }
             VaultEvent::MutualClose { note_id, .. }
             | VaultEvent::ExpiredClaimed { note_id, .. } => {
@@ -595,11 +715,11 @@ impl TreeMirror {
                 set_status(&mut self.statuses, *note_id, NoteStatus::Closed);
                 self.pending_escapes.remove(note_id);
             }
-            VaultEvent::ClosedLeafRetired { note_id, .. } => {
+            VaultEvent::ClosedLeafRetired { note_id } => {
                 if (*note_id as usize) < self.deposited.len() {
                     self.tree.set_leaf(*note_id, Felt252::ZERO);
                     self.retired.insert(*note_id);
-                    self.known_roots.insert(self.tree.root());
+                    set_status(&mut self.statuses, *note_id, NoteStatus::Closed);
                 }
             }
         }
@@ -640,17 +760,6 @@ impl TreeMirror {
             closed_by,
         }))
     }
-
-    fn require_root(&self, event_root: &Felt252) -> Result<(), MirrorError> {
-        let mirror = self.root();
-        if mirror != *event_root {
-            return Err(MirrorError::RootMismatch {
-                event: *event_root,
-                mirror,
-            });
-        }
-        Ok(())
-    }
 }
 
 impl Default for TreeMirror {
@@ -662,9 +771,10 @@ impl Default for TreeMirror {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use zkapi_core::merkle::Frontier;
 
-    /// Builds events whose roots are what the vault would emit, by replaying
-    /// them on a reference mirror.
+    /// Builds the events a vault would emit, replaying them on a reference
+    /// mirror (the vault's note statuses and pending escapes).
     pub(crate) struct Reference(pub(crate) TreeMirror);
 
     impl Reference {
@@ -673,18 +783,23 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn deposit(&mut self, commitment: u64) -> VaultEvent {
-            let mut event = VaultEvent::NoteDeposited {
+            let event = VaultEvent::NoteDeposited {
                 note_id: self.0.next_note_id(),
                 commitment: Felt252::from_u64(commitment),
                 amount: 1_000,
                 expiry_ts: 1_700_000_000,
-                new_root: Felt252::ZERO,
             };
             self.0.process_event(&event);
-            if let VaultEvent::NoteDeposited { new_root, .. } = &mut event {
-                *new_root = self.0.root();
-            }
             event
+        }
+
+        /// The event `close` would emit, without applying it.
+        pub(crate) fn clone_close(&self, note_id: u32) -> VaultEvent {
+            VaultEvent::MutualClose {
+                note_id,
+                nullifier: Felt252::from_u64(7_000 + note_id as u64),
+                final_balance: 10,
+            }
         }
 
         pub(crate) fn close(&mut self, note_id: u32) -> VaultEvent {
@@ -706,7 +821,6 @@ pub(crate) mod tests {
                     nullifier: Felt252::from_u64(nullifier),
                     final_balance: 10,
                     challenge_deadline: 1_700_086_400,
-                    current_root: self.0.root(),
                 },
                 VaultEvent::EscapeConcessionRecorded {
                     note_id,
@@ -736,7 +850,6 @@ pub(crate) mod tests {
             let event = VaultEvent::EscapeWithdrawalChallenged {
                 note_id,
                 nullifier: Felt252::from_u64(nullifier),
-                current_root: self.0.root(),
             };
             self.0.process_event(&event);
             event
@@ -756,21 +869,15 @@ pub(crate) mod tests {
             let event = VaultEvent::ExpiredClaimed {
                 note_id,
                 deposit_amount: 1_000,
-                current_root: self.0.root(),
             };
             self.0.process_event(&event);
             event
         }
 
         pub(crate) fn retire(&mut self, note_id: u32) -> VaultEvent {
-            self.0.process_event(&VaultEvent::ClosedLeafRetired {
-                note_id,
-                new_root: Felt252::ZERO,
-            });
-            VaultEvent::ClosedLeafRetired {
-                note_id,
-                new_root: self.0.root(),
-            }
+            let event = VaultEvent::ClosedLeafRetired { note_id };
+            self.0.process_event(&event);
+            event
         }
     }
 
@@ -826,30 +933,100 @@ pub(crate) mod tests {
         );
     }
 
+    /// The vault's own model of the tree (`Frontier`: computed root, ℓ-level
+    /// retirement) agrees with the mirror after every deposit, exit and
+    /// retirement: the mirror's root is what `currentRoot()` returns.
     #[test]
-    fn every_root_the_vault_set_stays_known() {
+    fn mirror_root_equals_the_vault_view() {
         let mut reference = Reference::new();
         let mut mirror = TreeMirror::new();
-        assert!(mirror.is_known_root(&TreeMirror::empty_root()));
-        let mut roots = vec![TreeMirror::empty_root()];
-        for commitment in 100..103 {
-            mirror.apply_event(&reference.deposit(commitment)).unwrap();
-            roots.push(mirror.root());
+        let mut vault = Frontier::new();
+        assert_eq!(mirror.root(), vault.root());
+        assert_eq!(TreeMirror::empty_root(), vault.root());
+        let mut closed = Vec::new();
+        for step in 0u32..40 {
+            match step % 5 {
+                0 | 1 | 3 => {
+                    let event = reference.deposit(0x100 + u64::from(step));
+                    mirror.apply_event(&event).unwrap();
+                    let VaultEvent::NoteDeposited {
+                        note_id,
+                        commitment,
+                        amount,
+                        expiry_ts,
+                    } = event
+                    else {
+                        unreachable!()
+                    };
+                    let leaf = compute_note_leaf(note_id, &commitment, amount, expiry_ts);
+                    assert_eq!(vault.append(leaf), Ok(note_id));
+                    assert_eq!(mirror.preimage(note_id).unwrap().leaf(note_id), leaf);
+                }
+                2 => {
+                    // Close the oldest active note; exits do no Merkle work.
+                    let note_id = (0..mirror.next_note_id())
+                        .find(|id| mirror.note_status(*id) == Some(NoteStatus::Active))
+                        .unwrap();
+                    mirror.apply_event(&reference.close(note_id)).unwrap();
+                    closed.push(note_id);
+                }
+                _ => {
+                    // Retire a closed leaf, alternating old and recent ones.
+                    let note_id = if step % 2 == 0 {
+                        closed.remove(0)
+                    } else {
+                        closed.pop().unwrap()
+                    };
+                    let siblings = mirror.get_path(note_id);
+                    vault.retire(note_id, &siblings).unwrap();
+                    mirror.apply_event(&reference.retire(note_id)).unwrap();
+                }
+            }
+            assert_eq!(mirror.root(), vault.root(), "step {step}");
+            assert_eq!(mirror.next_note_id(), vault.next_index());
+            assert_eq!(
+                mirror.current_leaves(),
+                (0..vault.next_index())
+                    .map(|id| vault.leaf(id))
+                    .collect::<Vec<_>>()
+            );
         }
-        apply_all(&mut mirror, &[reference.close(0)]);
-        mirror.apply_event(&reference.retire(0)).unwrap();
-        roots.push(mirror.root());
-        // A1: the deposit-time roots stay valid after later deposits and a
-        // retirement; nothing else is a known root.
-        for root in &roots {
-            assert!(mirror.is_known_root(root), "{root}");
-        }
-        assert_eq!(mirror.known_root_count(), roots.len());
-        assert!(!mirror.is_known_root(&Felt252::from_u64(5)));
         let restored = TreeMirror::from_snapshot(mirror.snapshot()).unwrap();
-        for root in &roots {
-            assert!(restored.is_known_root(root));
+        assert_eq!(restored.root(), vault.root());
+    }
+
+    /// The leaf is `P(D', R, F)` of the deposit's preimage, the vector the
+    /// circuit, the vault and the clients pin.
+    #[test]
+    fn deposited_leaf_is_the_leaf_bound_formula() {
+        let commitment =
+            Felt252::from_hex("0x26538304fc53474b13823162f0b9667c1538c7360828d3a1a2e8ffa019a2f8cc")
+                .unwrap();
+        let mut mirror = TreeMirror::new();
+        for note_id in 0..8 {
+            mirror
+                .apply_event(&VaultEvent::NoteDeposited {
+                    note_id,
+                    commitment,
+                    amount: 5_000_000,
+                    expiry_ts: 4_000_000_000,
+                })
+                .unwrap();
         }
+        assert_eq!(
+            mirror.get_leaf(7),
+            Felt252::from_hex("0x1698e82280376fc3506cb7ebf7278db1764d0183aea5fd4d3b475c644b61395f")
+                .unwrap()
+        );
+        assert_eq!(
+            mirror.preimage(7),
+            Some(NotePreimage {
+                commitment,
+                amount: 5_000_000,
+                expiry_ts: 4_000_000_000,
+            })
+        );
+        assert_eq!(mirror.preimage(8), None);
     }
 
     #[test]
@@ -977,67 +1154,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn every_event_root_must_be_the_mirrored_root() {
-        let mut mirror = TreeMirror::new();
-        let error = mirror
-            .apply_event(&VaultEvent::NoteDeposited {
-                note_id: 0,
-                commitment: Felt252::from_u64(100),
-                amount: 1_000,
-                expiry_ts: 1_700_000_000,
-                new_root: Felt252::from_u64(1),
-            })
-            .unwrap_err();
-        assert!(matches!(error, MirrorError::RootMismatch { .. }));
-
-        let mut reference = Reference::new();
-        let deposit = reference.deposit(100);
-        let [mut escape, _] = reference.escape(0, 900);
-        if let VaultEvent::EscapeWithdrawalInitiated { current_root, .. } = &mut escape {
-            *current_root = Felt252::from_u64(5);
-        }
-        let mut mirror = TreeMirror::new();
-        mirror.apply_event(&deposit).unwrap();
-        assert!(matches!(
-            mirror.clone().apply_event(&escape),
-            Err(MirrorError::RootMismatch { .. })
-        ));
-        // An escape's root is the unchanged current root, not a root with the
-        // leaf removed.
-        let mut removed = TreeMirror::new();
-        removed.process_event(&deposit);
-        let mut zeroed = removed.clone();
-        zeroed.tree.set_leaf(0, Felt252::ZERO);
-        if let VaultEvent::EscapeWithdrawalInitiated { current_root, .. } = &mut escape {
-            *current_root = zeroed.root();
-        }
-        assert!(matches!(
-            mirror.clone().apply_event(&escape),
-            Err(MirrorError::RootMismatch { .. })
-        ));
-        for event in [
-            VaultEvent::ExpiredClaimed {
-                note_id: 0,
-                deposit_amount: 1_000,
-                current_root: Felt252::from_u64(5),
-            },
-            VaultEvent::ClosedLeafRetired {
-                note_id: 0,
-                new_root: Felt252::from_u64(5),
-            },
-        ] {
-            let mut closed = mirror.clone();
-            if matches!(event, VaultEvent::ClosedLeafRetired { .. }) {
-                closed.apply_event(&reference.close(0)).unwrap();
-            }
-            assert!(matches!(
-                closed.apply_event(&event),
-                Err(MirrorError::RootMismatch { .. })
-            ));
-        }
-    }
-
-    #[test]
     fn apply_event_rejects_exits_of_a_note_that_is_not_active() {
         let mut reference = Reference::new();
         let deposit = reference.deposit(100);
@@ -1060,7 +1176,6 @@ pub(crate) mod tests {
             nullifier: Felt252::from_u64(1),
             final_balance: 1,
             challenge_deadline: 1,
-            current_root: mirror.root(),
         };
         assert_eq!(
             mirror.clone().apply_event(&escape),
@@ -1069,7 +1184,6 @@ pub(crate) mod tests {
         let claim = VaultEvent::ExpiredClaimed {
             note_id: 0,
             deposit_amount: 1_000,
-            current_root: mirror.root(),
         };
         assert_eq!(
             mirror.apply_event(&claim),
@@ -1099,10 +1213,7 @@ pub(crate) mod tests {
         let deposit = reference.deposit(100);
         let mut mirror = TreeMirror::new();
         mirror.apply_event(&deposit).unwrap();
-        let retire = VaultEvent::ClosedLeafRetired {
-            note_id: 0,
-            new_root: TreeMirror::empty_root(),
-        };
+        let retire = VaultEvent::ClosedLeafRetired { note_id: 0 };
         assert_eq!(
             mirror.clone().apply_event(&retire),
             Err(MirrorError::NoteNotClosed { note_id: 0 })
@@ -1132,7 +1243,6 @@ pub(crate) mod tests {
             VaultEvent::EscapeWithdrawalChallenged {
                 note_id: 0,
                 nullifier: Felt252::from_u64(900),
-                current_root: mirror.root(),
             },
             VaultEvent::EscapeWithdrawalFinalized {
                 note_id: 0,
@@ -1228,16 +1338,6 @@ pub(crate) mod tests {
         assert_eq!(listed.withdrawal_nullifier, Felt252::from_u64(905));
         assert_eq!(listed.next_nullifier, None);
         assert_eq!(listed.state_balance, Some(15));
-
-        // The event's root is still checked.
-        assert!(matches!(
-            mirror.apply_event(&VaultEvent::EscapeWithdrawalChallenged {
-                note_id: 0,
-                nullifier: Felt252::from_u64(905),
-                current_root: Felt252::from_u64(5),
-            }),
-            Err(MirrorError::RootMismatch { .. })
-        ));
     }
 
     #[test]
@@ -1265,10 +1365,104 @@ pub(crate) mod tests {
             assert_eq!(restored.note_status(note_id), mirror.note_status(note_id));
         }
         assert!(restored.is_published(&Felt252::from_u64(901)));
+        // Every preimage survives, the retired note's included: an operator
+        // sweep needs (commitment, amount, expiry) per note.
+        for note_id in 0..3 {
+            let preimage = restored.preimage(note_id).unwrap();
+            assert_eq!(preimage, mirror.preimage(note_id).unwrap());
+            assert_eq!(
+                preimage.commitment,
+                Felt252::from_u64(100 + u64::from(note_id))
+            );
+            assert_eq!(preimage.leaf(note_id), restored.deposited_leaf(note_id));
+        }
+        assert!(restored.get_leaf(2).is_zero());
 
         let mut restored = restored;
         restored.apply_event(&reference.challenge(1, 900)).unwrap();
         assert_eq!(restored.note_status(1), Some(NoteStatus::Active));
+    }
+
+    /// A mirror bootstrapped from `noteLeaves` has the vault's tree, and
+    /// follows later events of notes whose history it lacks.
+    #[test]
+    fn a_state_mirror_follows_events_of_notes_without_history() {
+        let mut reference = Reference::new();
+        let mut events = (0..6)
+            .map(|i| reference.deposit(100 + i))
+            .collect::<Vec<_>>();
+        events.push(reference.close(0));
+        events.push(reference.retire(0));
+        events.push(reference.close(1));
+        events.extend(reference.escape(2, 900));
+        events.extend(reference.escape(3, 910));
+        let mut logged = TreeMirror::new();
+        apply_all(&mut logged, &events);
+
+        let mut state = TreeMirror::from_state(logged.current_leaves()).unwrap();
+        assert_eq!(state.root(), logged.root());
+        assert_eq!(state.next_note_id(), 6);
+        assert_eq!(state.state_notes(), 6);
+        assert!(!state.has_complete_history());
+        assert!(logged.has_complete_history());
+        assert_eq!(state.note_status(0), Some(NoteStatus::Closed));
+        for note_id in 1..6 {
+            assert_eq!(state.note_status(note_id), Some(NoteStatus::Unknown));
+            assert_eq!(state.preimage(note_id), None);
+        }
+        assert!(state.pending_escapes().is_empty());
+        assert_eq!(state.published_count(), 0);
+        // The vault refuses a retired note's exit; so does the mirror.
+        assert_eq!(
+            state.clone().apply_event(&reference.clone_close(0)),
+            Err(MirrorError::NoteNotActive { note_id: 0 })
+        );
+
+        // After the bootstrap block: a deposit (with its preimage), the
+        // retirement of note 1 (closed before), a raise and a defeat of the
+        // escapes of notes 2 and 3 (initiated before), and a new escape of
+        // note 4.
+        let mut after = vec![reference.deposit(106), reference.retire(1)];
+        after.push(reference.raise(2, 900, 8));
+        after.push(reference.challenge(3, 910));
+        after.extend(reference.escape(4, 920));
+        apply_all(&mut state, &after);
+        apply_all(&mut logged, &after);
+        assert_eq!(state.root(), logged.root());
+        assert_eq!(state.current_leaves(), logged.current_leaves());
+        assert_eq!(state.preimage(6), logged.preimage(6));
+        assert_eq!(state.note_status(1), Some(NoteStatus::Closed));
+        assert_eq!(state.note_status(2), Some(NoteStatus::Unknown));
+        assert_eq!(state.note_status(3), Some(NoteStatus::Active));
+        assert_eq!(state.note_status(4), Some(NoteStatus::PendingWithdrawal));
+        assert_eq!(state.note_status(5), Some(NoteStatus::Unknown));
+        // Only escapes initiated after the bootstrap are listed.
+        assert_eq!(
+            state
+                .pending_escapes()
+                .iter()
+                .map(|escape| escape.note_id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(state.is_published(&Felt252::from_u64(921)));
+        assert!(!state.is_published(&Felt252::from_u64(911)));
+
+        // The checkpoint keeps the state notes apart.
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.state_notes, 6);
+        assert_eq!(snapshot.preimages.iter().filter(|p| p.is_some()).count(), 1);
+        let restored = TreeMirror::from_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(restored.root(), state.root());
+        assert_eq!(restored.snapshot(), snapshot);
+        // A state note's leaf may be unknown (retired before the bootstrap),
+        // never a logged note's; a state note has no preimage.
+        let mut forged = snapshot.clone();
+        forged.preimages[2] = logged.preimage(2);
+        assert!(TreeMirror::from_snapshot(forged).is_err());
+        let mut unretired = snapshot;
+        unretired.retired.retain(|note_id| *note_id != 0);
+        assert!(TreeMirror::from_snapshot(unretired).is_err());
     }
 
     #[test]
@@ -1284,12 +1478,32 @@ pub(crate) mod tests {
         let rejection = |snapshot: TreeMirrorSnapshot| TreeMirror::from_snapshot(snapshot).err();
 
         let mut missing = snapshot.clone();
-        missing.deposited_leaves.pop();
+        missing.leaves.pop();
         assert!(rejection(missing).unwrap().contains("next_note_id"));
 
         let mut empty_leaf = snapshot.clone();
-        empty_leaf.deposited_leaves[0] = Felt252::ZERO;
+        empty_leaf.leaves[0] = Felt252::ZERO;
         assert!(rejection(empty_leaf).is_some());
+
+        // A leaf that is not its preimage's, a missing preimage, and a
+        // preimage that does not reproduce the leaf.
+        let mut wrong_leaf = snapshot.clone();
+        wrong_leaf.leaves[0] = Felt252::from_u64(5);
+        assert!(rejection(wrong_leaf).unwrap().contains("preimage"));
+        let mut no_preimage = snapshot.clone();
+        no_preimage.preimages[1] = None;
+        assert!(rejection(no_preimage).unwrap().contains("preimage"));
+        let mut wrong_preimage = snapshot.clone();
+        wrong_preimage.preimages[1].as_mut().unwrap().expiry_ts += 1;
+        assert!(rejection(wrong_preimage).unwrap().contains("preimage"));
+
+        // Only a state note has no history.
+        let mut unknown = snapshot.clone();
+        unknown.statuses[0] = NoteStatus::Unknown;
+        assert!(rejection(unknown).unwrap().contains("unknown status"));
+        let mut too_many = snapshot.clone();
+        too_many.state_notes = 3;
+        assert!(rejection(too_many).is_some());
 
         let mut active_escape = snapshot.clone();
         active_escape.pending_escapes[0].note_id = 0;
@@ -1306,12 +1520,6 @@ pub(crate) mod tests {
         let mut retired_active = snapshot.clone();
         retired_active.retired.push(0);
         assert!(rejection(retired_active).unwrap().contains("not closed"));
-
-        let mut unknown_root = snapshot.clone();
-        unknown_root
-            .known_roots
-            .retain(|root| *root != mirror.root());
-        assert!(rejection(unknown_root).unwrap().contains("current root"));
 
         let mut repeated = snapshot;
         let first = repeated.published_nullifiers[0];

@@ -13,7 +13,7 @@ const REPORTED_ENV = [
     'ZKAPI_STATE_SEED',
     'ZKAPI_CLEAR_SEED',
     'ZKAPI_ALLOW_LEGACY_CLEARANCE',
-    'ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS',
+    'ZKAPI_REQUEST_ROOT_GRACE_SECONDS',
     'ZKAPI_ROOT_MAX_STALENESS_SECONDS',
     'ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS',
     'ZKAPI_CHALLENGE_RPC_URL',
@@ -31,7 +31,7 @@ const BASE_ENV = {
     CHAIN_ID: '11155111',
     VAULT_ADDRESS: '0x0000000000000000000000000000000000000001',
     DEPLOY_BLOCK: '1',
-    CIRCUIT_ID: 'zkapi-v2-concession-v1',
+    CIRCUIT_ID: 'zkapi-v2-concession-v2',
     REQUEST_CHARGE_CAP: '50000',
     ZKAPI_NATIVE_BILLING_RPC_URL: 'https://rpc.example',
     ZKAPI_NATIVE_PRICE_FEED_ADDRESS: '0x0000000000000000000000000000000000000003',
@@ -169,8 +169,8 @@ test('server requires both signing seeds and starts nothing without them', async
 });
 
 test('server passes clearance, root and lease-ceiling settings only through the environment', async () => {
-    const flags = ['--allow-legacy-clearance', '--clearance-root-window-seconds',
-        '--root-max-staleness-seconds', '--request-limit-max-usd-micros'];
+    const flags = ['--allow-legacy-clearance', '--request-root-grace-seconds',
+        '--root-max-staleness-seconds', '--request-limit-max-usd-micros', '--clearance-root-window-seconds'];
     const defaults = await launch('server');
     assert.equal(defaults.status, 0, defaults.stderr);
     for (const name of flags) assert.ok(!defaults.args.includes(name), name);
@@ -180,7 +180,7 @@ test('server passes clearance, root and lease-ceiling settings only through the 
         // serverd refuses this one on the concession circuit; the launcher
         // still leaves the decision to it.
         ZKAPI_ALLOW_LEGACY_CLEARANCE: 'true',
-        ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS: '600',
+        ZKAPI_REQUEST_ROOT_GRACE_SECONDS: '600',
         ZKAPI_ROOT_MAX_STALENESS_SECONDS: '30',
         ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS: '6000000',
     };
@@ -188,14 +188,38 @@ test('server passes clearance, root and lease-ceiling settings only through the 
     assert.equal(configured.status, 0, configured.stderr);
     for (const name of flags) assert.ok(!configured.args.includes(name), name);
     for (const [name, value] of Object.entries(settings)) assert.equal(configured.received[name], value);
+    // serverd validates the grace (0 to 600, default 60); 0 is passed on as set.
+    const exact = await launch('server', { set: { ZKAPI_REQUEST_ROOT_GRACE_SECONDS: '0' } });
+    assert.equal(exact.status, 0, exact.stderr);
+    assert.equal(exact.received.ZKAPI_REQUEST_ROOT_GRACE_SECONDS, '0');
 });
 
-test('the deployment env example sets the canary lease ceiling and no legacy clearance', async () => {
+test('server refuses the removed clearance root window before starting anything', async () => {
+    // Vault revision 4: clearance checks the note leaf. Set empty counts too.
+    for (const value of ['3600', '60', '']) {
+        const result = await launch('server', { set: { ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS: value } });
+        assert.equal(result.status, 1, value);
+        assert.equal(result.stderr.trim(), 'ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS was removed in vault revision 4: '
+            + 'clearance checks the note leaf; delete this setting');
+        assert.deepEqual(result.args, []);
+    }
+    // The other roles do not read it.
+    for (const role of ['db-init', 'indexer', 'challenger']) {
+        const result = await launch(role, { set: { ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS: '3600' } });
+        assert.equal(result.status, 0, `${role}: ${result.stderr}`);
+    }
+});
+
+test('the deployment env example sets the canary lease ceiling, no legacy clearance and no clearance root window', async () => {
     const example = await readFile(resolve('docker/aws/deployment.env.example'), 'utf8');
-    assert.match(example, /^CIRCUIT_ID=zkapi-v2-concession-v1$/m);
+    assert.match(example, /^CIRCUIT_ID=zkapi-v2-concession-v2$/m);
     assert.match(example, /^ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS=6000000$/m);
     assert.doesNotMatch(example, /^ZKAPI_ALLOW_LEGACY_CLEARANCE=/m);
     assert.doesNotMatch(example, /LEGACY_CLEARANCE_MAX_PER_MINUTE/);
+    // Not even as a commented-out default; the request root grace is documented at its default.
+    assert.doesNotMatch(example, /^#? *ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS=/m);
+    assert.match(example, /^# ZKAPI_REQUEST_ROOT_GRACE_SECONDS=60$/m);
+    assert.doesNotMatch(example, /^ZKAPI_REQUEST_ROOT_GRACE_SECONDS=/m);
 });
 
 for (const role of ['server', 'challenger']) {
@@ -295,11 +319,14 @@ test('db-init binds the server database to the manifest and the proof setup', as
 });
 
 test('every role refuses another circuit before starting anything', async () => {
-    for (const role of ['server', 'db-init', 'indexer', 'challenger']) {
-        const result = await launch(role, { set: { CIRCUIT_ID: 'zkapi-v2-note-bound-v1' } });
-        assert.equal(result.status, 1, role);
-        assert.equal(result.stderr.trim(), 'This image requires the zkapi-v2-concession-v1 circuit and a fresh vault');
-        assert.deepEqual(result.args, []);
+    // Including the revision-3 vault's circuit, which this image cannot serve.
+    for (const circuit of ['zkapi-v2-note-bound-v1', 'zkapi-v2-concession-v1']) {
+        for (const role of ['server', 'db-init', 'indexer', 'challenger']) {
+            const result = await launch(role, { set: { CIRCUIT_ID: circuit } });
+            assert.equal(result.status, 1, `${role} ${circuit}`);
+            assert.equal(result.stderr.trim(), 'This image requires the zkapi-v2-concession-v2 circuit and a fresh vault');
+            assert.deepEqual(result.args, []);
+        }
     }
 });
 

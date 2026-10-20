@@ -96,7 +96,7 @@ enum Commands {
             hide_env_values = true
         )]
         openrouter_settlement_deadline_seconds: u64,
-        /// Legacy deployments only. Circuit zkapi-v2-concession-v1 signs a
+        /// Legacy deployments only. Circuit zkapi-v2-concession-v2 signs a
         /// clearance only against a kind-2 ownership proof: the server
         /// refuses to start with this set.
         #[arg(
@@ -112,8 +112,10 @@ enum Commands {
         /// startup probes the vault, adapter and Poseidon library against it.
         #[arg(long, env = "ZKAPI_DEPLOYMENT_MANIFEST", hide_env_values = true)]
         deployment: Option<PathBuf>,
-        /// Admission refuses (root_unavailable) unless the indexer root and
-        /// the vault's currentRoot() agreed at most this many seconds ago.
+        /// Admission refuses (root_unavailable) unless the server read the
+        /// vault's currentRoot() at most this many seconds ago. The indexer
+        /// never refuses a request: its agreement is reported on /health and
+        /// /metrics only.
         #[arg(
             long,
             env = "ZKAPI_ROOT_MAX_STALENESS_SECONDS",
@@ -130,16 +132,25 @@ enum Commands {
             hide_env_values = true
         )]
         request_limit_max_usd_micros: Option<u128>,
-        /// How long a Merkle root the server observed stays acceptable for a
-        /// clearance ownership proof without a vault read (60..=86400); any
-        /// other root the vault ever held is accepted after one.
+        /// A request may use a root the server read from the vault for this
+        /// many seconds after the vault replaced it (0..=600; 0 accepts only
+        /// the latest vault root).
+        #[arg(
+            long,
+            env = "ZKAPI_REQUEST_ROOT_GRACE_SECONDS",
+            default_value_t = zkapi_serverd::config::DEFAULT_REQUEST_ROOT_GRACE_SECONDS,
+            hide_env_values = true
+        )]
+        request_root_grace_seconds: u64,
+        /// Removed in vault revision 4 (clearance checks the note leaf):
+        /// startup fails while it is set.
         #[arg(
             long,
             env = "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",
-            default_value_t = zkapi_serverd::config::DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS,
+            hide = true,
             hide_env_values = true
         )]
-        clearance_root_window_seconds: u64,
+        clearance_root_window_seconds: Option<String>,
         /// Start although the database holds leases of another lease key
         /// source (the other source type, or another OA org URL or OpenRouter
         /// API base), which this server can neither measure nor delete: each
@@ -198,13 +209,15 @@ enum Commands {
         /// No default.
         #[arg(long)]
         clear_seed: Option<String>,
-        /// Merkle root accepted until the indexer serves one. With
-        /// --indexer-url, an indexer that cannot serve a verified root at
-        /// startup falls back to the vault's currentRoot(), then to this.
+        /// Merkle root reported (on /health) until the first vault read; never
+        /// admitted: requests need a root read from the vault.
         #[arg(long, default_value = "0x0")]
         initial_root: String,
+        /// The indexer, whose root the root poller compares with the vault's
+        /// for /health and /metrics only.
         #[arg(long)]
         indexer_url: Option<String>,
+        /// How often the vault's currentRoot() is read at the latest block.
         #[arg(long, default_value_t = 1_000)]
         root_poll_interval_ms: u64,
     },
@@ -239,6 +252,14 @@ enum Commands {
         /// Seconds the RPC head may age before the indexer reports stale; 0 disables.
         #[arg(long, default_value_t = 180)]
         max_head_age_secs: u64,
+        /// Without a checkpoint (first start, --resync) and on every rebuild,
+        /// read the tree from the vault's state (noteLeaves pages, nextNoteId()
+        /// and currentRoot() at one block hash --confirmations below the head)
+        /// instead of replaying logs from --from-block, then follow logs.
+        /// Recommended for a new deployment; deposit preimages, escapes and
+        /// published nullifiers from before that block are then absent.
+        #[arg(long)]
+        bootstrap_from_state: bool,
     },
     /// Offline settlement remediation on a stopped API server's database.
     #[command(subcommand)]
@@ -332,6 +353,19 @@ enum SettlementCommand {
     },
 }
 
+/// The startup error of `--clearance-root-window-seconds` /
+/// `ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS`, removed in vault revision 4.
+const REMOVED_CLEARANCE_ROOT_WINDOW: &str =
+    "removed in vault revision 4: clearance checks the note leaf; delete this setting";
+
+/// Refuse serverd settings that no longer exist, whatever their value.
+fn refuse_removed_settings(clearance_root_window_seconds: Option<&str>) -> anyhow::Result<()> {
+    if clearance_root_window_seconds.is_some() {
+        anyhow::bail!(REMOVED_CLEARANCE_ROOT_WINDOW);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -386,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
             deployment,
             root_max_staleness_seconds,
             request_limit_max_usd_micros,
+            request_root_grace_seconds,
             clearance_root_window_seconds,
             allow_key_source_switch,
             native_billing_rpc_url,
@@ -399,6 +434,8 @@ async fn main() -> anyhow::Result<()> {
             indexer_url,
             root_poll_interval_ms,
         } => {
+            // Before anything else: a removed setting is an operator error.
+            refuse_removed_settings(clearance_root_window_seconds.as_deref())?;
             // Fail fast, before any provider or oracle configuration; run_server
             // re-validates the seeds and checks their keys against the vault.
             let (state_seed, clear_seed) =
@@ -473,7 +510,7 @@ async fn main() -> anyhow::Result<()> {
                 native_billing,
                 proof_setup_dir: cli.proof_setup_dir.clone(),
                 allow_legacy_clearance,
-                clearance_root_window_seconds,
+                request_root_grace_seconds,
                 root_max_staleness_seconds,
                 request_limit_max_usd_micros,
                 // From the vault, once run_server has verified the binding.
@@ -499,6 +536,7 @@ async fn main() -> anyhow::Result<()> {
             stale_after_secs,
             max_block_range,
             max_head_age_secs,
+            bootstrap_from_state,
         } => {
             let config = zkapi_indexerd::IndexerConfig {
                 listen_addr: listen,
@@ -513,6 +551,7 @@ async fn main() -> anyhow::Result<()> {
                 stale_after_secs,
                 max_block_range,
                 max_head_age_secs,
+                bootstrap_from_state,
             };
             zkapi_indexerd::run_indexer(config).await?;
         }
@@ -1072,7 +1111,7 @@ mod tests {
                     allow_legacy_clearance,
                     root_max_staleness_seconds,
                     request_limit_max_usd_micros,
-                    clearance_root_window_seconds,
+                    request_root_grace_seconds,
                     allow_key_source_switch,
                     deployment,
                     ..
@@ -1081,7 +1120,7 @@ mod tests {
                     allow_legacy_clearance,
                     root_max_staleness_seconds,
                     request_limit_max_usd_micros,
-                    clearance_root_window_seconds,
+                    request_root_grace_seconds,
                     allow_key_source_switch,
                     deployment,
                 ),
@@ -1096,7 +1135,7 @@ mod tests {
             "30",
             "--request-limit-max-usd-micros",
             "6000000",
-            "--clearance-root-window-seconds",
+            "--request-root-grace-seconds",
             "600",
             "--allow-key-source-switch",
             "--deployment",
@@ -1123,7 +1162,7 @@ mod tests {
             "ZKAPI_ALLOW_LEGACY_CLEARANCE",
             "ZKAPI_ROOT_MAX_STALENESS_SECONDS",
             "ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS",
-            "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",
+            "ZKAPI_REQUEST_ROOT_GRACE_SECONDS",
             "ZKAPI_ALLOW_KEY_SOURCE_SWITCH",
             "ZKAPI_DEPLOYMENT_MANIFEST",
         ]
@@ -1133,7 +1172,50 @@ mod tests {
             eprintln!("skipping default checks: a settlement or clearance variable is set");
             return;
         }
-        assert_eq!(parse(&[]), (21_600, false, 60, None, 3_600, false, None));
+        assert_eq!(parse(&[]), (21_600, false, 60, None, 60, false, None));
+    }
+
+    /// The removed clearance root window is a hidden argument whose any
+    /// value fails startup with the migration message; the grace period is
+    /// read from ZKAPI_REQUEST_ROOT_GRACE_SECONDS too (run-daemon.sh passes
+    /// it only so). The binary's behaviour, flag and environment, is
+    /// checked in tests/removed_settings.rs.
+    #[test]
+    fn the_removed_clearance_root_window_fails_startup() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let serverd = command.find_subcommand("serverd").unwrap();
+        let arg = |id: &str| {
+            serverd
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap()
+                .clone()
+        };
+        let removed = arg("clearance_root_window_seconds");
+        assert!(removed.is_hide_set());
+        assert_eq!(
+            removed.get_env(),
+            Some(std::ffi::OsStr::new("ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS"))
+        );
+        assert!(!serverd
+            .clone()
+            .render_long_help()
+            .to_string()
+            .contains("clearance-root-window"));
+        assert_eq!(
+            arg("request_root_grace_seconds").get_env(),
+            Some(std::ffi::OsStr::new("ZKAPI_REQUEST_ROOT_GRACE_SECONDS"))
+        );
+        refuse_removed_settings(None).unwrap();
+        for value in ["3600", "0", "", "not a number"] {
+            assert_eq!(
+                refuse_removed_settings(Some(value))
+                    .unwrap_err()
+                    .to_string(),
+                "removed in vault revision 4: clearance checks the note leaf; delete this setting"
+            );
+        }
     }
 
     #[test]
@@ -1592,6 +1674,7 @@ mod tests {
             stale_after_secs,
             max_block_range,
             max_head_age_secs,
+            bootstrap_from_state,
             ..
         } = cli.command
         else {
@@ -1603,6 +1686,7 @@ mod tests {
         assert_eq!(stale_after_secs, 120);
         assert_eq!(max_block_range, 1_000);
         assert_eq!(max_head_age_secs, 180);
+        assert!(!bootstrap_from_state);
 
         let cli = Cli::try_parse_from([
             "zkapi",
@@ -1622,6 +1706,7 @@ mod tests {
             "500",
             "--max-head-age-secs",
             "0",
+            "--bootstrap-from-state",
         ])
         .unwrap();
         assert_eq!(cli.chain_id, 1);
@@ -1632,6 +1717,7 @@ mod tests {
             stale_after_secs,
             max_block_range,
             max_head_age_secs,
+            bootstrap_from_state,
             ..
         } = cli.command
         else {
@@ -1643,5 +1729,6 @@ mod tests {
         assert_eq!(stale_after_secs, 60);
         assert_eq!(max_block_range, 500);
         assert_eq!(max_head_age_secs, 0);
+        assert!(bootstrap_from_state);
     }
 }

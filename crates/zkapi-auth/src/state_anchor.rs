@@ -1,6 +1,6 @@
 //! State-anchor authentication method (the reference implementation).
 //!
-//! This is the zkAPI state chain of circuit `zkapi-v2-concession-v1`
+//! This is the zkAPI state chain of circuit `zkapi-v2-concession-v2`
 //! expressed behind [`CredentialScheme`]: a note-bound Pedersen balance
 //! commitment `C = B·G + r·H + L·J` on Baby-JubJub, a note-bound nullifier
 //! `N = H(d_null', s, note_id, τ)`, successor anchors derived as
@@ -322,6 +322,31 @@ impl CredentialScheme for StateAnchorScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commitment's note binding is the vault revision 4 leaf (one
+    /// compression of R and the packed (n, D, e) under "zkapi.v2c.leaf"):
+    /// the shared vector of circuit zkapi-v2-concession-v2.
+    #[test]
+    fn the_note_binding_is_the_leaf_bound_leaf() {
+        let leaf = core::note_leaf(
+            7,
+            &core::registration_commitment(&Felt252::from_u64(42)),
+            5_000_000,
+            4_000_000_000,
+        );
+        assert_eq!(
+            leaf.to_hex(),
+            "0x1698e82280376fc3506cb7ebf7278db1764d0183aea5fd4d3b475c644b61395f"
+        );
+        let secret = Felt252::from_u64(42);
+        assert_eq!(
+            StateAnchorScheme::leaf(&secret, 7, 5_000_000),
+            core::note_leaf_from_fields(
+                &core::registration_commitment(&secret),
+                &core::note_fields(7, 5_000_000, REFERENCE_EXPIRY),
+            )
+        );
+    }
 
     /// Each successor sits at `next_anchor` of its predecessor's nullifier,
     /// so a withdrawal from a state spends the nullifier the previous

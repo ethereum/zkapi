@@ -21,14 +21,17 @@ pub const STATE_SIGNING_KEY_Y_SELECTOR: &str = "0x230e2a24"; // stateSigningKeyY
 pub const CLEARANCE_SIGNING_KEY_X_SELECTOR: &str = "0xdc41d636"; // clearanceSigningKeyX()
 pub const CLEARANCE_SIGNING_KEY_Y_SELECTOR: &str = "0x112cd6bc"; // clearanceSigningKeyY()
 pub const CHALLENGE_PERIOD_SELECTOR: &str = "0xf3f480d9"; // challengePeriod()
-/// Read by the root poller (O5) and after a clearance ownership proof verified.
+/// Read by the root poller (O5') at a block hash it fetched (a computed
+/// view: about 0.5M gas per eth_call).
 pub const CURRENT_ROOT_SELECTOR: &str = "0xfdab463d"; // currentRoot()
+/// Read by the root poller with currentRoot(), at the same block hash.
+pub const NEXT_NOTE_ID_SELECTOR: &str = "0x7a2043a3"; // nextNoteId()
 /// Nullifier flags, read before signing (O7) and before serving request data.
 pub const USED_NULLIFIERS_SELECTOR: &str = "0xaad24061"; // usedNullifiers(uint256)
 pub const CHALLENGED_NULLIFIERS_SELECTOR: &str = "0x6cda756a"; // challengedNullifiers(uint256)
-/// Every root the vault ever set (Amendment A1); read for a clearance
-/// ownership proof at a root the server has not seen recently.
-pub const KNOWN_ROOTS_SELECTOR: &str = "0x12ad7381"; // knownRoots(uint256)
+/// A note's stored leaf and status, `(uint256 leaf, uint8 status)`; read
+/// fresh after every verified clearance ownership proof (vault revision 4).
+pub const NOTE_RECORD_SELECTOR: &str = "0xd154f5bf"; // noteRecord(uint32)
 /// keccak256 of `EscapeConcessionRecorded(uint32,uint256,uint128,uint128)`,
 /// the event that names an escape's `nextNullifier` (§4.2 step 11). Its
 /// nullifier is not indexed: a scan reads every such log and compares.
@@ -61,6 +64,64 @@ impl std::fmt::Debug for NativeBillingConfig {
             .field("max_age_seconds", &self.max_age_seconds)
             .finish()
     }
+}
+
+/// A note's status in the vault (`noteRecord(n)` word 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteStatus {
+    /// No deposit at this note ID (its leaf is 0).
+    Uninitialized,
+    Active,
+    PendingWithdrawal,
+    /// Closed (mutual close, finalized escape or expired claim); a retired
+    /// note is Closed with leaf 0.
+    Closed,
+}
+
+impl NoteStatus {
+    pub fn from_word(value: u128) -> Option<Self> {
+        match value {
+            0 => Some(Self::Uninitialized),
+            1 => Some(Self::Active),
+            2 => Some(Self::PendingWithdrawal),
+            3 => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// `noteRecord(n)`: the note's stored leaf (0 when uninitialized or retired)
+/// and status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultNoteRecord {
+    pub leaf: Felt252,
+    pub status: NoteStatus,
+}
+
+/// Decode a `noteRecord(n)` response: exactly two ABI words, a field-element
+/// leaf and a known status.
+pub fn decode_note_record(raw: &str) -> Result<VaultNoteRecord, ServerError> {
+    let body = raw
+        .strip_prefix("0x")
+        .ok_or_else(|| invalid("malformed vault noteRecord response"))?;
+    if body.len() != 128 {
+        return Err(invalid("invalid vault noteRecord response length"));
+    }
+    let leaf = decode_field_word(&format!("0x{}", &body[..64]))?;
+    let status = NoteStatus::from_word(decode_word(raw, 1)?)
+        .ok_or_else(|| invalid("invalid vault note status"))?;
+    Ok(VaultNoteRecord { leaf, status })
+}
+
+/// One read of the vault's root (O5'): the latest block, and currentRoot()
+/// and nextNoteId() at that block's hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultRootRead {
+    pub block_number: u64,
+    /// `0x` and 64 lowercase hex digits.
+    pub block_hash: String,
+    pub root: Felt252,
+    pub next_note_id: u32,
 }
 
 /// The vault's immutable signing keys.
@@ -345,31 +406,105 @@ impl NativeBillingOracle {
             .ok_or_else(|| invalid("vault challenge period is zero or out of range"))
     }
 
-    /// The vault's live currentRoot() at "latest", after an eth_chainId check.
-    pub async fn vault_current_root(&self) -> Result<Felt252, ServerError> {
+    /// The vault's currentRoot() at the block `block_hash` (EIP-1898), after
+    /// an eth_chainId check.
+    pub async fn vault_current_root_at(&self, block_hash: &str) -> Result<Felt252, ServerError> {
         async {
             self.assert_chain().await?;
-            self.vault_word(CURRENT_ROOT_SELECTOR).await
+            self.current_root_at(block_hash).await
         }
         .await
         .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
     }
 
-    /// Whether the vault ever set `root` (`knownRoots(root)`, Amendment A1)
-    /// at "latest", after an eth_chainId check.
-    pub async fn vault_known_root(&self, root: &Felt252) -> Result<bool, ServerError> {
+    /// The vault's nextNoteId() at the block `block_hash` (EIP-1898), after an
+    /// eth_chainId check.
+    pub async fn vault_next_note_id_at(&self, block_hash: &str) -> Result<u32, ServerError> {
         async {
             self.assert_chain().await?;
-            let data = format!("{KNOWN_ROOTS_SELECTOR}{}", hex::encode(root.as_bytes()));
-            let raw = self.call(&self.contract_address, &data).await?;
-            if raw.len() != 66 {
-                return Err(invalid("invalid vault knownRoots response length"));
+            self.next_note_id_at(block_hash).await
+        }
+        .await
+        .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
+    }
+
+    async fn current_root_at(&self, block_hash: &str) -> Result<Felt252, ServerError> {
+        decode_field_word(
+            &self
+                .call_pinned(
+                    &self.contract_address,
+                    CURRENT_ROOT_SELECTOR,
+                    block_hash_param(block_hash)?,
+                )
+                .await?,
+        )
+    }
+
+    async fn next_note_id_at(&self, block_hash: &str) -> Result<u32, ServerError> {
+        let raw = self
+            .call_pinned(
+                &self.contract_address,
+                NEXT_NOTE_ID_SELECTOR,
+                block_hash_param(block_hash)?,
+            )
+            .await?;
+        if raw.len() != 66 {
+            return Err(invalid("invalid vault nextNoteId response length"));
+        }
+        u32::try_from(decode_word(&raw, 0)?).map_err(|_| invalid("vault nextNoteId out of range"))
+    }
+
+    /// The root poller's read (O5'): the latest block, then currentRoot()
+    /// and nextNoteId() at its hash, after one eth_chainId check.
+    pub async fn vault_root_read(&self) -> Result<VaultRootRead, ServerError> {
+        async {
+            self.assert_chain().await?;
+            let (block_number, block_hash) = self.block_id(json!("latest")).await?;
+            let root = self.current_root_at(&block_hash).await?;
+            let next_note_id = self.next_note_id_at(&block_hash).await?;
+            Ok::<_, ServerError>(VaultRootRead {
+                block_number,
+                block_hash,
+                root,
+                next_note_id,
+            })
+        }
+        .await
+        .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
+    }
+
+    /// The hash of the canonical block at height `number`, after an
+    /// eth_chainId check; None when the RPC has no such block.
+    pub async fn canonical_block_hash(&self, number: u64) -> Result<Option<String>, ServerError> {
+        async {
+            self.assert_chain().await?;
+            let block = self
+                .rpc_limited(
+                    "eth_getBlockByNumber",
+                    json!([format!("0x{number:x}"), false]),
+                    MAX_BLOCK_OR_LOGS_RESPONSE_BYTES,
+                )
+                .await?;
+            if block.is_null() {
+                return Ok(None);
             }
-            match decode_word(&raw, 0)? {
-                0 => Ok(false),
-                1 => Ok(true),
-                _ => Err(invalid("invalid vault knownRoots boolean")),
+            let (found, hash) = block_id_of(&block)?;
+            if found != number {
+                return Err(invalid("the RPC returned another block"));
             }
+            Ok(Some(hash))
+        }
+        .await
+        .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
+    }
+
+    /// `noteRecord(note_id)` at "latest", after an eth_chainId check. Never
+    /// cached: clearance reads it fresh every time.
+    pub async fn vault_note_record(&self, note_id: u32) -> Result<VaultNoteRecord, ServerError> {
+        async {
+            self.assert_chain().await?;
+            let data = format!("{NOTE_RECORD_SELECTOR}{note_id:064x}");
+            decode_note_record(&self.call(&self.contract_address, &data).await?)
         }
         .await
         .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
@@ -433,6 +568,18 @@ impl NativeBillingOracle {
             1 => Ok(true),
             _ => Err(invalid("invalid vault nullifier boolean")),
         }
+    }
+
+    /// The number and hash of block `tag` ("latest" or a quantity).
+    async fn block_id(&self, tag: Value) -> Result<(u64, String), ServerError> {
+        let block = self
+            .rpc_limited(
+                "eth_getBlockByNumber",
+                json!([tag, false]),
+                MAX_BLOCK_OR_LOGS_RESPONSE_BYTES,
+            )
+            .await?;
+        block_id_of(&block)
     }
 
     /// The number and timestamp of block `tag` ("latest" or a quantity).
@@ -581,6 +728,16 @@ impl NativeBillingOracle {
     }
 
     async fn call_at(&self, address: &str, data: &str, block: &str) -> Result<String, ServerError> {
+        self.call_pinned(address, data, json!(block)).await
+    }
+
+    /// eth_call at `block`: a tag, or an EIP-1898 `{"blockHash": ...}` object.
+    async fn call_pinned(
+        &self,
+        address: &str,
+        data: &str,
+        block: Value,
+    ) -> Result<String, ServerError> {
         self.rpc("eth_call", json!([{ "to":address, "data":data }, block]))
             .await?
             .as_str()
@@ -769,6 +926,35 @@ fn next_nullifier_of(log: &Value, vault: &str) -> Result<String, ServerError> {
         return Err(malformed());
     }
     Ok(format!("0x{}", data[..64].to_ascii_lowercase()))
+}
+
+/// The EIP-1898 block parameter of a 32-byte block hash.
+fn block_hash_param(block_hash: &str) -> Result<Value, ServerError> {
+    if !is_block_hash(block_hash) {
+        return Err(invalid("invalid block hash"));
+    }
+    Ok(json!({ "blockHash": block_hash.to_ascii_lowercase() }))
+}
+
+fn is_block_hash(value: &str) -> bool {
+    value
+        .strip_prefix("0x")
+        .is_some_and(|body| body.len() == 64 && body.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The number and hash (lowercase) of an eth_getBlockByNumber result.
+fn block_id_of(block: &Value) -> Result<(u64, String), ServerError> {
+    let number = block
+        .get("number")
+        .and_then(Value::as_str)
+        .and_then(quantity)
+        .ok_or_else(|| invalid("invalid block response"))?;
+    let hash = block
+        .get("hash")
+        .and_then(Value::as_str)
+        .filter(|hash| is_block_hash(hash))
+        .ok_or_else(|| invalid("invalid block response"))?;
+    Ok((number, hash.to_ascii_lowercase()))
 }
 
 fn valid_address(value: &str) -> bool {
@@ -981,7 +1167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vault_word_reads_selectors_at_latest_after_chain_check() {
+    async fn vault_reads_pin_the_latest_block_hash_after_chain_check() {
         use axum::{routing::post, Json, Router};
         use std::sync::{Arc, Mutex};
         let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -989,18 +1175,31 @@ mod tests {
         let root =
             Felt252::from_hex("0x2a1b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80")
                 .unwrap();
+        let hash = format!("0x{}", "ab".repeat(32));
+        let leaf = Felt252::from_u64(0x1eaf);
+        let served_hash = hash.clone();
         let app = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
                 let calls = recorded.clone();
+                let hash = served_hash.clone();
                 async move {
                     calls.lock().unwrap().push(request.clone());
+                    let data = request["params"][0]["data"].as_str().unwrap_or_default();
                     let result = match request["method"].as_str() {
-                        Some("eth_chainId") => "0xaa36a7".to_string(),
-                        _ if request["params"][0]["data"] == CURRENT_ROOT_SELECTOR => {
-                            format!("0x{}", hex::encode(root.as_bytes()))
+                        Some("eth_chainId") => json!("0xaa36a7"),
+                        Some("eth_getBlockByNumber") => match request["params"][0].as_str() {
+                            Some("latest") | Some("0x2a") => json!({"number":"0x2a","hash":hash}),
+                            _ => Value::Null,
+                        },
+                        _ if data == CURRENT_ROOT_SELECTOR => {
+                            json!(format!("0x{}", hex::encode(root.as_bytes())))
                         }
-                        _ => format!("0x{:064x}", 86_400),
+                        _ if data == NEXT_NOTE_ID_SELECTOR => json!(format!("0x{:064x}", 9)),
+                        _ if data.starts_with(NOTE_RECORD_SELECTOR) => {
+                            json!(format!("0x{}{:064x}", hex::encode(leaf.as_bytes()), 2))
+                        }
+                        _ => json!(format!("0x{:064x}", 86_400)),
                     };
                     Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
                 }
@@ -1021,22 +1220,56 @@ mod tests {
             vault.into(),
         )
         .unwrap();
-        assert_eq!(oracle.vault_current_root().await.unwrap(), root);
+        assert_eq!(
+            oracle.vault_root_read().await.unwrap(),
+            VaultRootRead {
+                block_number: 42,
+                block_hash: hash.clone(),
+                root,
+                next_note_id: 9,
+            }
+        );
         assert_eq!(oracle.vault_challenge_period().await.unwrap(), 86_400);
         {
             let calls = calls.lock().unwrap();
-            assert_eq!(calls.len(), 3);
+            assert_eq!(calls.len(), 5);
             assert_eq!(calls[0]["method"], "eth_chainId");
-            assert_eq!(
-                calls[1]["params"],
-                json!([{"to":vault, "data":"0xfdab463d"}, "latest"])
-            );
+            assert_eq!(calls[1]["params"], json!(["latest", false]));
+            // EIP-1898: both reads at the hash of the block just read.
             assert_eq!(
                 calls[2]["params"],
+                json!([{"to":vault, "data":"0xfdab463d"}, {"blockHash": hash}])
+            );
+            assert_eq!(
+                calls[3]["params"],
+                json!([{"to":vault, "data":"0x7a2043a3"}, {"blockHash": hash}])
+            );
+            assert_eq!(
+                calls[4]["params"],
                 json!([{"to":vault, "data":"0xf3f480d9"}, "latest"])
             );
         }
-        // The runtime root read refuses an RPC on another chain.
+        assert_eq!(oracle.vault_current_root_at(&hash).await.unwrap(), root);
+        assert_eq!(oracle.vault_next_note_id_at(&hash).await.unwrap(), 9);
+        assert!(oracle.vault_current_root_at("0x1234").await.is_err());
+        assert_eq!(
+            oracle.canonical_block_hash(42).await.unwrap(),
+            Some(hash.clone())
+        );
+        assert_eq!(oracle.canonical_block_hash(43).await.unwrap(), None);
+        // noteRecord(n) at latest, with n as one ABI word.
+        assert_eq!(
+            oracle.vault_note_record(7).await.unwrap(),
+            VaultNoteRecord {
+                leaf,
+                status: NoteStatus::PendingWithdrawal
+            }
+        );
+        assert_eq!(
+            calls.lock().unwrap().last().unwrap()["params"],
+            json!([{"to":vault, "data":format!("0xd154f5bf{:064x}", 7)}, "latest"])
+        );
+        // Every runtime vault read refuses an RPC on another chain.
         let other_chain = NativeBillingOracle::new(
             NativeBillingConfig {
                 rpc_url: oracle.config.rpc_url.clone(),
@@ -1047,13 +1280,59 @@ mod tests {
         )
         .unwrap();
         let before = calls.lock().unwrap().len();
-        assert!(matches!(
-            other_chain.vault_current_root().await,
-            Err(ServerError::Internal(message)) if message.starts_with("vault read failed")
+        let refused = |error: ServerError| matches!(error, ServerError::Internal(message) if message.starts_with("vault read failed"));
+        assert!(refused(other_chain.vault_root_read().await.unwrap_err()));
+        assert!(refused(other_chain.vault_note_record(7).await.unwrap_err()));
+        assert!(refused(
+            other_chain.vault_current_root_at(&hash).await.unwrap_err()
         ));
-        assert_eq!(calls.lock().unwrap().len(), before + 1);
+        assert!(refused(
+            other_chain.vault_next_note_id_at(&hash).await.unwrap_err()
+        ));
+        assert!(refused(
+            other_chain.canonical_block_hash(42).await.unwrap_err()
+        ));
+        assert_eq!(calls.lock().unwrap().len(), before + 5);
         server.abort();
     }
+
+    /// noteRecord answers exactly two words: a field-element leaf and a
+    /// status 0 to 3.
+    #[test]
+    fn note_records_decode_strictly() {
+        let word = |value: u64| format!("{value:064x}");
+        assert_eq!(
+            decode_note_record(&format!("0x{}{}", word(5), word(1))).unwrap(),
+            VaultNoteRecord {
+                leaf: Felt252::from_u64(5),
+                status: NoteStatus::Active
+            }
+        );
+        for (status, expected) in [
+            (0, NoteStatus::Uninitialized),
+            (2, NoteStatus::PendingWithdrawal),
+            (3, NoteStatus::Closed),
+        ] {
+            assert_eq!(
+                decode_note_record(&format!("0x{}{}", word(0), word(status)))
+                    .unwrap()
+                    .status,
+                expected
+            );
+        }
+        let not_a_field_element = format!("0x{}{}", "ff".repeat(32), word(1));
+        for raw in [
+            "0x".to_string(),
+            format!("0x{}", word(1)),
+            format!("0x{}{}{}", word(5), word(1), word(0)),
+            format!("0x{}{}", word(5), word(4)),
+            format!("{}{}", word(5), word(1)),
+            not_a_field_element,
+        ] {
+            assert!(decode_note_record(&raw).is_err(), "{raw}");
+        }
+    }
+
     #[test]
     fn vault_signing_key_selectors_match_abi() {
         for (signature, selector) in [
@@ -1063,13 +1342,14 @@ mod tests {
             ("clearanceSigningKeyY()", CLEARANCE_SIGNING_KEY_Y_SELECTOR),
             ("challengePeriod()", CHALLENGE_PERIOD_SELECTOR),
             ("currentRoot()", CURRENT_ROOT_SELECTOR),
-            ("knownRoots(uint256)", KNOWN_ROOTS_SELECTOR),
+            ("nextNoteId()", NEXT_NOTE_ID_SELECTOR),
+            ("noteRecord(uint32)", NOTE_RECORD_SELECTOR),
         ] {
             let digest = Keccak256::digest(signature.as_bytes());
             assert_eq!(selector, format!("0x{}", hex::encode(&digest[..4])));
         }
         assert_eq!(CURRENT_ROOT_SELECTOR, "0xfdab463d");
-        assert_eq!(KNOWN_ROOTS_SELECTOR, "0x12ad7381");
+        assert_eq!(NOTE_RECORD_SELECTOR, "0xd154f5bf");
         assert_eq!(
             ESCAPE_CONCESSION_RECORDED_TOPIC,
             format!(
@@ -1113,12 +1393,13 @@ mod tests {
             ("currentRoot", CURRENT_ROOT_SELECTOR),
             ("usedNullifiers", USED_NULLIFIERS_SELECTOR),
             ("challengedNullifiers", CHALLENGED_NULLIFIERS_SELECTOR),
-            ("knownRoots", KNOWN_ROOTS_SELECTOR),
+            ("nextNoteId", NEXT_NOTE_ID_SELECTOR),
+            ("noteRecord", NOTE_RECORD_SELECTOR),
         ] {
             assert_eq!(real_selector(name), selector, "{name}");
         }
-        // knownRoots(root) answers one boolean word.
-        assert_eq!(real_getter_words("knownRoots"), 1);
+        // noteRecord(n) answers (leaf, status): two words.
+        assert_eq!(real_getter_words("noteRecord"), 2);
         let (topics, data) = real_event("EscapeConcessionRecorded");
         assert_eq!(topics[0], ESCAPE_CONCESSION_RECORDED_TOPIC);
         let vault = "0x00000000000000000000000000000000000000aa";

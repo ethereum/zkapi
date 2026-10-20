@@ -1,4 +1,4 @@
-//! Operator-run challenge daemon of the concession-exit vault (revision 3):
+//! Operator-run challenge daemon of the concession-exit vault (revision 4):
 //! defeats escapes with successor evidence, raises under-conceded ones and
 //! retires the leaf of a missed defeat. See docs/challenge-service.md.
 use anyhow::Context;
