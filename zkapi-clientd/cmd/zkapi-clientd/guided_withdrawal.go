@@ -106,7 +106,7 @@ func guidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui s
 	case "no_note":
 		ui.Printf("There is no open private balance to withdraw.\n")
 		return nil
-	case "complete", "withdrawal_pending", "confirming", "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
+	case "complete", "withdrawal_pending", "confirming", "relay_submitted", "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
 		return finishGuidedWithdrawal(ctx, service, initial, ui, wait)
 	case "ready", "quoted", "waiting_funds", "waiting_settlement", "reverted", "gasless_refused":
 	case "op_reverted":
@@ -529,6 +529,11 @@ func finishGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService
 		case "withdrawal_pending", "confirming":
 			if !announced {
 				setupProgress(ui, "Withdrawal submitted; waiting for Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress.")
+				announced = true
+			}
+		case "relay_submitted":
+			if !announced {
+				setupProgress(ui, "The operator's relay holds the close and lands it in a batch; if it does not in time, this client submits it itself. Ctrl+C preserves progress.")
 				announced = true
 			}
 		case "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":

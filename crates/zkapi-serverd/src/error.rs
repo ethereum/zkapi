@@ -111,6 +111,13 @@ pub enum ServerError {
         reason: String,
         retry_after_seconds: u64,
     },
+
+    /// A refusal of the close relay (`crate::close_relay`), with its own
+    /// `relay_*` error code. Never retriable as sent: the client either
+    /// changes the request (new terms, another ticket) or submits its close
+    /// itself.
+    #[error("{message}")]
+    CloseRelay { code: &'static str, message: String },
 }
 
 impl ServerError {
@@ -140,6 +147,7 @@ impl ServerError {
             ServerError::RequestLimitExceeded { .. } => "request_limit_exceeded",
             ServerError::Published => "published",
             ServerError::ChainReadUnavailable(_) => "chain_read_unavailable",
+            ServerError::CloseRelay { code, .. } => code,
         }
     }
 
@@ -171,6 +179,7 @@ impl ServerError {
             ServerError::RequestLimitExceeded { .. } => false,
             ServerError::Published => false,
             ServerError::ChainReadUnavailable(_) => true,
+            ServerError::CloseRelay { .. } => false,
         }
     }
 }

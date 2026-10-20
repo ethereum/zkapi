@@ -32,6 +32,23 @@ export const BATCH_MAX_ITEMS_LIMIT = 64n;
 // challengeBatch calldata of n items: selector, 4 offsets, 3 lengths, and per
 // item a note ID, an amount, 12 request words and 8 proof words.
 const batchCalldataBytes = items => 4 + 32 * (8 + 22 * Number(items));
+// The close-relay role (ZKAPI_SIGNER_ROLE=close-relay): a separate instance with
+// its own key that serverd's close relay sends through. It signs only
+// cooperative closes of this deployment: vault.mutualClose, and the exit
+// batcher's mutualCloseBatch of 1 to batchMaxItems closes, each kind 1 with no
+// successor or concession and a payable destination, with distinct
+// nullifiers. It refuses every challenger call, and the challenger role
+// refuses these.
+export const SIGNER_ROLES = Object.freeze(['challenger', 'close-relay']);
+const WITHDRAWAL_TUPLE = '(uint16 protocolVersion,uint64 chainId,address contractAddress,uint256 activeRoot,uint256 stateSigningKeyX,uint256 stateSigningKeyY,uint256 clearanceSigningKeyX,uint256 clearanceSigningKeyY,uint32 noteId,uint128 finalBalance,address destination,uint256 withdrawalNullifier,uint8 kind,uint256 nextNullifier,uint128 conceded,uint64 validUntil)';
+export const MUTUAL_CLOSE_ABI = `function mutualClose(${WITHDRAWAL_TUPLE} inputs,bytes proof)`;
+export const MUTUAL_CLOSE_BATCH_ABI = `function mutualCloseBatch(${WITHDRAWAL_TUPLE}[] inputs,bytes proofs) returns (uint256 applied)`;
+export const relayVaultInterface = new Interface([MUTUAL_CLOSE_ABI]);
+export const relayBatcherInterface = new Interface([MUTUAL_CLOSE_BATCH_ABI, 'function vault() view returns (address)']);
+// mutualCloseBatch calldata of n items: selector, 2 offsets, 2 lengths, and
+// per item 16 withdrawal words and 8 proof words.
+const relayBatchCalldataBytes = items => 4 + 32 * (4 + 24 * Number(items));
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 export const GWEI = 1_000_000_000n;
 export const DEFAULT_SEPOLIA_MAX_FEE_PER_GAS = 10n * GWEI;
 export const DEFAULT_PRIORITY_FEE_PER_GAS = 1n * GWEI;
@@ -144,7 +161,10 @@ export function parseSignerConfig(env) {
   }
   const port = envInteger(env, 'ZKAPI_CHALLENGE_PORT') ?? 8547n;
   if (port > 65535n) throw new ConfigError('ZKAPI_CHALLENGE_PORT must be between 1 and 65535');
+  const role = env.ZKAPI_SIGNER_ROLE || 'challenger';
+  if (!SIGNER_ROLES.includes(role)) throw new ConfigError('ZKAPI_SIGNER_ROLE must be challenger or close-relay');
   return {
+    role,
     chainId: parseChainId(env.ZKAPI_CHALLENGE_CHAIN_ID),
     privateKey: env.ZKAPI_CHALLENGE_PRIVATE_KEY,
     vault: env.ZKAPI_CHALLENGE_VAULT,
@@ -204,8 +224,10 @@ export function createUpstream(url, { timeoutMs = UPSTREAM_TIMEOUT_MS } = {}) {
   };
 }
 
-export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, retireOnMiss, retirementLookbackBlocks, exitBatcher, batchMaxItems, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
+export function createSigner({ role = 'challenger', privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, retireOnMiss, retirementLookbackBlocks, exitBatcher, batchMaxItems, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
   requireValid(Object.keys(unsupported).length === 0, 'Unsupported signer option');
+  requireValid(SIGNER_ROLES.includes(role), 'Signer role must be challenger or close-relay');
+  const relay = role === 'close-relay';
   requireValid(chainId === 1n || chainId === 11155111n, 'Explicit challenge chain ID must be 1 or 11155111');
   // Mainnet never inherits the testnet default; null counts as unset.
   requireValid(maxFeePerGas != null || chainId !== 1n, 'Mainnet requires an explicit ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI');
@@ -218,7 +240,10 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   requireValid(destination !== '0x0000000000000000000000000000000000000000', 'Vault must be nonzero');
   const batcher = exitBatcher == null ? null : address(exitBatcher);
   requireValid(batcher !== '0x0000000000000000000000000000000000000000' && batcher !== destination, 'Exit batcher must be nonzero and not the vault');
-  batchMaxItems ??= DEFAULT_BATCH_MAX_ITEMS;
+  // The relay batches through the batcher; the challenger may only use single calls.
+  requireValid(!relay || batcher !== null, 'The close-relay role requires ZKAPI_CHALLENGE_EXIT_BATCHER');
+  // A relay batch may carry the batcher's MAX_ITEMS by default.
+  batchMaxItems ??= relay ? BATCH_MAX_ITEMS_LIMIT : DEFAULT_BATCH_MAX_ITEMS;
   requireValid(typeof batchMaxItems === 'bigint' && batchMaxItems >= 2n && batchMaxItems <= BATCH_MAX_ITEMS_LIMIT, 'Batch item limit is invalid');
   requireValid(typeof maxGas === 'bigint' && maxGas > 0n && maxGas <= 16_777_216n, 'Gas limit cap is invalid');
   const positive = value => typeof value === 'bigint' && value > 0n;
@@ -242,8 +267,11 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   const feeBounds = { max_fee_per_gas: hex(maxFeePerGas), max_priority_fee_per_gas: hex(maxPriorityFeePerGas) };
   let queue = Promise.resolve();
 
+  // Retirements are a challenger's call; the relay never signs one.
+  if (relay) retireOnMiss = false;
+  const eventPrefix = relay ? 'close_relay' : 'challenge';
   const policy = Object.freeze({
-    sender, vault: destination, transaction_type: '0x2', fee_cap_source: feeCapSource,
+    role, sender, vault: destination, transaction_type: '0x2', fee_cap_source: feeCapSource,
     max_fee_per_gas: hex(maxFeePerGas), priority_fee_per_gas: hex(priorityFeePerGas),
     max_priority_fee_per_gas: hex(maxPriorityFeePerGas), fee_ceiling: hex(feeCeiling), tx_fee_cap_wei: hex(txFeeCap),
     max_gas: hex(maxGas), required_balance: hex(maxGas * maxFeePerGas),
@@ -352,7 +380,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     if (loggedHashes.has(hash)) return null;
     evictOldest(loggedHashes, hash); loggedHashes.add(hash);
     return {
-      event: 'challenge_signed', nonce: transaction.nonce, transaction_hash: hash,
+      event: `${eventPrefix}_signed`, nonce: transaction.nonce, transaction_hash: hash,
       max_fee_per_gas_wei: transaction.maxFeePerGas.toString(10),
       max_priority_fee_per_gas_wei: transaction.maxPriorityFeePerGas.toString(10),
     };
@@ -366,7 +394,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     const transition = `${code}|${reason}|${message}`;
     if (lastRefusal.get(nonce) === transition) return null;
     evictOldest(lastRefusal, nonce); lastRefusal.set(nonce, transition);
-    const line = { event: 'challenge_refused', nonce, code, reason, message };
+    const line = { event: `${eventPrefix}_refused`, nonce, code, reason, message };
     for (const [name, value] of Object.entries(details)) {
       if (name === 'transaction_hash') line.transaction_hash = value;
       else line[weiDetails.has(name) ? `${name}_wei` : name] = BigInt(value).toString(10);
@@ -447,9 +475,12 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     requireValid(nonce <= BigInt(Number.MAX_SAFE_INTEGER), 'Nonce is too large');
     const { maxFee, tip } = requestedFees(tx);
     const batch = to !== destination;
-    const maxData = batch ? 2 + 2 * batchCalldataBytes(BATCH_MAX_ITEMS_LIMIT) : 16_386;
+    const batchBytes = relay ? relayBatchCalldataBytes : batchCalldataBytes;
+    const maxData = batch ? 2 + 2 * batchBytes(BATCH_MAX_ITEMS_LIMIT) : 16_386;
     requireValid(isHexString(tx.data) && tx.data.length <= maxData, 'Invalid calldata');
-    const call = batch ? parseBatch(tx.data) : parseVaultCall(tx.data);
+    const call = relay
+      ? (batch ? parseCloseBatch(tx.data) : parseClose(tx.data))
+      : (batch ? parseBatch(tx.data) : parseVaultCall(tx.data));
     return { call, transaction: { type: 2, to, data: tx.data, value: 0n, chainId, gasLimit, nonce: Number(nonce), maxFeePerGas: maxFee, maxPriorityFeePerGas: tip, accessList: [] } };
   }
   // A request proof must be this deployment's.
@@ -488,6 +519,40 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     return call;
   }
 
+  // A cooperative close of this deployment: kind 1, no successor, nothing
+  // conceded, paid to neither zero nor the vault.
+  function requireDeploymentClose(inputs) {
+    requireValid(inputs.protocolVersion === 2n && inputs.chainId === chainId && address(inputs.contractAddress) === destination, 'Close proof targets another deployment');
+    requireValid(inputs.kind === 1n && inputs.nextNullifier === 0n && inputs.conceded === 0n, 'Only cooperative closes (kind 1) are authorized');
+    const payee = address(inputs.destination);
+    requireValid(payee !== ZERO_ADDRESS && payee !== destination, 'Close pays no valid destination');
+  }
+  function parseClose(data) {
+    let call;
+    try {
+      call = relayVaultInterface.parseTransaction({ data });
+      if (!call || relayVaultInterface.encodeFunctionData(call.fragment, call.args).toLowerCase() !== data.toLowerCase()) throw new Error();
+    } catch { throw new RpcError(-32602, 'Only canonical mutualClose calls are authorized'); }
+    requireDeploymentClose(call.args.inputs);
+    requireValid(isHexString(call.args.proof, 256), 'A close requires a 256-byte Groth16 proof');
+    return call;
+  }
+  // 1 to batchMaxItems closes of distinct nullifiers.
+  function parseCloseBatch(data) {
+    let call;
+    try {
+      call = relayBatcherInterface.parseTransaction({ data });
+      if (!call || call.name !== 'mutualCloseBatch' || relayBatcherInterface.encodeFunctionData(call.fragment, call.args).toLowerCase() !== data.toLowerCase()) throw new Error();
+    } catch { throw new RpcError(-32602, 'Only canonical mutualCloseBatch calls are authorized for the exit batcher'); }
+    const { inputs, proofs } = call.args;
+    const items = inputs.length;
+    requireValid(items >= 1 && BigInt(items) <= batchMaxItems, 'Batch size is outside the configured bounds', 'batch_size_out_of_bounds', { batch_max_items: hex(batchMaxItems) });
+    requireValid(isHexString(proofs, 256 * items), 'Batch requires one 256-byte Groth16 proof per item');
+    requireValid(new Set(inputs.map(item => item.withdrawalNullifier.toString())).size === items, 'Batch repeats a nullifier');
+    for (const item of inputs) requireDeploymentClose(item);
+    return call;
+  }
+
   async function simulate(call) {
     try { return await call(); }
     catch (error) {
@@ -508,7 +573,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   // hash and upstream_tx_fee_cap, which the node answers before its pool.
   async function signAndSend(tx) {
     const { call, transaction } = validateTransaction(tx);
-    const batch = call.name === 'challengeBatch';
+    const batch = call.name === 'challengeBatch' || call.name === 'mutualCloseBatch';
     const retiredNote = call.name === 'retireClosedLeaf' ? call.args.noteId.toString(10) : null;
     if (retiredNote !== null && !retireOnMiss) {
       throw new RpcError(-32003, 'Leaf retirements are off (ZKAPI_CHALLENGE_RETIRE_ON_MISS=false)', 'retirement_disabled');
@@ -535,7 +600,11 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       // whose every item would be skipped (escapes already resolved) only
       // burns the verification gas, so it is refused.
       let applied;
-      try { [applied] = batcherInterface.decodeFunctionResult('challengeBatch', simulated); }
+      try {
+        [applied] = relay
+          ? relayBatcherInterface.decodeFunctionResult('mutualCloseBatch', simulated)
+          : batcherInterface.decodeFunctionResult('challengeBatch', simulated);
+      }
       catch { throw new RpcError(-32000, 'Challenge simulation failed', 'simulation_failed'); }
       if (applied === 0n) throw new RpcError(-32003, 'No item of the batch would apply', 'batch_applies_nothing');
     }

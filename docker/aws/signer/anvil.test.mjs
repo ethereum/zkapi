@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Transaction, Wallet } from 'ethers';
-import { ESCAPE_FINALIZED_TOPIC, GWEI, batcherInterface, createSigner, createUpstream, vaultInterface } from './signer.mjs';
+import { ESCAPE_FINALIZED_TOPIC, GWEI, batcherInterface, createSigner, createUpstream, relayBatcherInterface, relayVaultInterface, vaultInterface } from './signer.mjs';
 
 const CHAIN_ID = 11155111n;
 const haveAnvil = spawnSync('anvil', ['--version'], { stdio: 'ignore' }).status === 0;
@@ -292,4 +292,31 @@ test('a challengeBatch to the configured exit batcher is signed only while its v
   await assert.rejects(rebound.handle('eth_sendTransaction', [{ ...tx(1), to: batcher, data: batch }]), { code: -32003, data: { reason: 'batcher_vault_mismatch' } });
   assert.equal(await poolSize(rpc), 0);
   assert.equal(await nonceOf(rpc, 'pending'), 1);
+});
+
+test('the close-relay role signs mutualCloseBatch to its batcher and mutualClose to the vault, which mine; challenges are refused', { skip }, async t => {
+  const rpc = await startAnvil(t);
+  const batcher = '0x000000000000000000000000000000000000ba7c';
+  // vault() returns the vault; any other call returns the applied bitmap 1.
+  const standIn = bound => `0x600035 60e01c 63fbfa77cf 14 6019 57 6001600052 60206000f3 5b 73${bound.slice(2)} 600052 60206000f3`.replace(/ /g, '');
+  await rpc('anvil_setCode', [batcher, standIn(vault)]);
+  const close = (note, nullifier) => [2, CHAIN_ID, vault, 1, 2, 3, 4, 5, note, 900_000, `0x${'11'.repeat(20)}`, nullifier, 1, 0, 0, 2_000_000_000];
+  const batch = relayBatcherInterface.encodeFunctionData('mutualCloseBatch', [[close(4, 40), close(9, 90)], `0x${'00'.repeat(512)}`]);
+  const signer = signerFor(rpc, { role: 'close-relay', maxFeePerGas: 10n * GWEI, exitBatcher: batcher });
+  await signer.checkBatcher();
+  const first = await signer.handle('eth_sendTransaction', [{ ...tx(0), to: batcher, data: batch }]);
+  const single = relayVaultInterface.encodeFunctionData('mutualClose', [close(7, 70), `0x${'00'.repeat(256)}`]);
+  const second = await signer.handle('eth_sendTransaction', [{ ...tx(1), data: single }]);
+  await mine(rpc);
+  for (const [hash, to, data] of [[first, batcher, batch], [second, vault, single]]) {
+    const mined = await receipt(rpc, hash);
+    assert.deepEqual([mined.type, mined.status, mined.to], ['0x2', '0x1', to]);
+    assert.equal(Transaction.from(await rpc('eth_getRawTransactionByHash', [hash])).data, data);
+  }
+  // Every challenger call is refused, and nothing reaches the pool.
+  const challenge = batcherInterface.encodeFunctionData('challengeBatch', [[4, 9], [0, 5], [[2, CHAIN_ID, vault, 0, 1, 2, 0, 1, 0, 0, 0, 0], [2, CHAIN_ID, vault, 0, 1, 2, 0, 1, 0, 0, 0, 0]], `0x${'00'.repeat(512)}`]);
+  await assert.rejects(signer.handle('eth_sendTransaction', [{ ...tx(2), to: batcher, data: challenge }]), { code: -32602 });
+  await assert.rejects(signer.handle('eth_sendTransaction', [tx(2)]), { code: -32602 });
+  assert.equal(await poolSize(rpc), 0);
+  assert.equal(await nonceOf(rpc, 'pending'), 2);
 });

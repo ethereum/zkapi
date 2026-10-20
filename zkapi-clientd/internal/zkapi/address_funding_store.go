@@ -299,8 +299,18 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 		// transit account's balance is still forwarded by a sponsored
 		// operation, journaled under the same phases.
 		gasless := w.Transit != nil
+		// A relayed close (close_relay.go) settles through the relay's
+		// transaction, never through a signed one of its own.
+		relayed := w.FeePayer == "relay"
+		if err := validateRelayRecord(record, w); err != nil {
+			return nil, err
+		}
 		switch w.Phase {
 		case "quoted", "withdrawal_pending", "waiting_settlement", "waiting_funds", "confirming", "reverted", "complete":
+		case "relay_submitted":
+			if !relayed {
+				return nil, errors.New("withdrawal recovery phase is invalid; preserve the file")
+			}
 		case "op_built", "op_submitted", "op_reverted", "forward_op_built", "forward_op_submitted":
 			if !gasless || w.UserOp == nil {
 				return nil, errors.New("withdrawal recovery phase is invalid; preserve the file")
@@ -312,7 +322,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 		default:
 			return nil, errors.New("withdrawal recovery phase is invalid; preserve the file")
 		}
-		if (w.Phase == "complete" || w.Phase == "forward_op_built" || w.Phase == "forward_op_submitted") && ((!isHex(w.TransactionHash, 32) && !(gasless && isHex(w.SettlementHash, 32))) || w.Binding == "") {
+		if (w.Phase == "complete" || w.Phase == "forward_op_built" || w.Phase == "forward_op_submitted") && ((!isHex(w.TransactionHash, 32) && !((gasless || relayed) && isHex(w.SettlementHash, 32))) || w.Binding == "") {
 			return nil, errors.New("completed withdrawal recovery data is invalid; preserve the file")
 		}
 		// Only an independently relayed escape, or the paymaster, can leave
@@ -321,14 +331,14 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 			return nil, errors.New("credited escape payout recovery data is invalid; preserve the file")
 		}
 		if w.SettlementHash != "" {
-			if !isHex(w.SettlementHash, 32) || (!gasless && !isHex(w.TransactionHash, 32)) || strings.EqualFold(w.SettlementHash, w.TransactionHash) || w.Binding == "" || (w.Phase != "confirming" && w.Phase != "complete" && w.Phase != "forward_op_built" && w.Phase != "forward_op_submitted" && w.Phase != "gasless_refused") {
+			if !isHex(w.SettlementHash, 32) || (!gasless && !relayed && !isHex(w.TransactionHash, 32)) || strings.EqualFold(w.SettlementHash, w.TransactionHash) || w.Binding == "" || (w.Phase != "confirming" && w.Phase != "complete" && w.Phase != "forward_op_built" && w.Phase != "forward_op_submitted" && w.Phase != "gasless_refused") {
 				return nil, errors.New("alternate withdrawal settlement is invalid; preserve the file")
 			}
-			if w.Phase == "confirming" && !gasless && (record.Pending == nil || record.Pending.Kind != "withdrawal" || !strings.EqualFold(record.Pending.Hash, w.TransactionHash)) {
+			if w.Phase == "confirming" && !gasless && !relayed && (record.Pending == nil || record.Pending.Kind != "withdrawal" || !strings.EqualFold(record.Pending.Hash, w.TransactionHash)) {
 				return nil, errors.New("alternate withdrawal settlement lost its signed intent; preserve the file")
 			}
 		}
-		if w.Phase == "complete" && w.FeePayer != "payout" && (!gasless || isHex(w.TransactionHash, 32)) {
+		if w.Phase == "complete" && w.FeePayer != "payout" && !relayed && (!gasless || isHex(w.TransactionHash, 32)) {
 			// A wallet-paid close (the plain path, or the fallback of a
 			// gasless record) retired its signed transaction to the history.
 			found := false
@@ -443,6 +453,45 @@ func (h *FundingHandler) saveAddress(record *addressFundingRecord) error {
 // its saved hash, is signed by the owner and carries exactly the exit the
 // record authorizes (the close or escape words, the finalization of the
 // note, or nothing for a forward).
+// validateRelayRecord checks a relayed close's journal: only a close without
+// a transit account is relayed; its relay record holds a known phase and an
+// approved relay quote; and it signs nothing of its own while the relay
+// holds it.
+func validateRelayRecord(record addressFundingRecord, w *addressWithdrawalRecord) error {
+	invalid := errors.New("relayed withdrawal recovery data is invalid; preserve the file")
+	if w.FeePayer != "relay" {
+		if w.Relay != nil && w.Relay.Phase != "self_submitted" {
+			return invalid
+		}
+		return nil
+	}
+	if w.Transit != nil || w.ProofDestination != "" || w.UserOp != nil {
+		return invalid
+	}
+	if w.Relay == nil {
+		// Quoted, not yet approved.
+		if w.Phase != "quoted" && w.Phase != "waiting_settlement" && w.Phase != "waiting_funds" {
+			return invalid
+		}
+		return nil
+	}
+	switch w.Relay.Phase {
+	case "approved", "fee_paid", "submitted":
+	default:
+		return invalid
+	}
+	if w.Relay.FeeUnits == 0 || w.Relay.Fallback.FeePolicy != "relay" || (w.Relay.TicketHash != "" && !isHex(w.Relay.TicketHash, 32)) {
+		return invalid
+	}
+	if w.Phase == "relay_submitted" && (w.Relay.Phase != "submitted" || w.Binding == "" || record.Pending != nil) {
+		return invalid
+	}
+	if (w.Phase == "confirming" || w.Phase == "complete") && !isHex(w.SettlementHash, 32) {
+		return invalid
+	}
+	return nil
+}
+
 func validateGaslessRecord(config fundingConfig, w *addressWithdrawalRecord) error {
 	invalid := errors.New("gasless withdrawal recovery data is invalid; preserve the file")
 	if w.Transit == nil {

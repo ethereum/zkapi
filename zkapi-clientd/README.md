@@ -152,6 +152,11 @@ rest to the destination. On the command line this is `zkapi-clientd withdraw
 --bundler-url URL`); `--collect`, `--sweep` and `--claim-credit` deliver a
 payout that is waiting in the transit account or the paymaster. See
 [gasless withdrawals](docs/CLI_ZKAPI.md#paying-the-fee-from-the-payout-gasless-withdrawals).
+When the operator relays cooperative closes, `withdraw --to ADDRESS --fees
+relay` (default: `config --withdrawal-fees relay`) lets the operator land the
+close in a batch for its relay fee; if it does not in time, the client submits
+the close itself from the local signing address, as the relay quote's approval
+allows. See [the operator's close relay](docs/CLI_ZKAPI.md#the-operators-close-relay---fees-relay).
 
 For chain and protocol access the client uses only the RPC, zkAPI indexer and
 protocol server packaged with the release. A deposit activates only after the

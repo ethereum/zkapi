@@ -514,6 +514,38 @@ that state:
   client clock up to five minutes fast. The SDK proves again after
   `proof_expired` or `unknown_root`.
 
+#### The operator's close relay
+
+When the protocol server relays cooperative closes (`GET
+/v2/withdraw/relay/terms` reports `enabled: true`), a mutual withdrawal can
+be landed by the operator in a batch for its relay fee instead of a network
+fee from the wallet. It is opt-in:
+
+```js
+await client.withdraw('mutual', onStatus, { destination, fees: 'relay' });
+```
+
+The client first pays the fee as one ordinary private request at the note's
+current state: the browser wallet proves it like a chat request (its payload
+is `{"mode":"close_relay_fee","version":1,"fee_units","ticket_hash"}`), and
+installs the signed successor, which carries the fee as spent. The ticket
+secret behind `ticket_hash` is kept with the wallet and sent only with the
+close. The cooperative close is then cleared and proved at that successor, so
+its treasury share holds the fee, and handed to the relay. The call resolves
+like a wallet-paid close once the vault's `MutualClose` of exactly this close
+is on chain, whichever transaction carried it (read through the wallet's
+provider). If the relay reports the close `failed` or `expired`, or has not
+landed it 20 minutes before its proof expires, the same call asks the wallet
+to send the close itself (the ordinary path, MetaMask confirmation included).
+The relay can only submit the proof or not: it binds the destination and the
+amount. Escapes cannot be relayed (`fees: 'relay'` with `'escape'` is a
+`TypeError`); `fees: 'payout'` is unchanged.
+
+The building blocks are exported as `@openanonymity/zkapi-browser-sdk/close-relay`
+(`closeRelayFeePayload`, `closeRelayTicketHash`, `submitCloseRelay`,
+`closeRelayStatus`, `decideCloseRelay`, `followCloseRelay`,
+`mutualCloseLogMatches`).
+
 #### Paying the fee from the payout
 
 On a deployment whose profile pins the gasless contracts (`trusted_deployment.

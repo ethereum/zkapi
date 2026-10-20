@@ -34,6 +34,117 @@ struct Cli {
     command: Commands,
 }
 
+/// The operator's close relay (`zkapi_serverd::close_relay`, see
+/// docs/native-eth-billing.md, "Close relay"). Off unless --relay-fee-units
+/// is set; then --relay-rpc-url, --relay-sender and --relay-max-fee-per-gas
+/// are required, and the deployment manifest must name the exit batcher.
+#[derive(Debug, Clone, clap::Args)]
+struct RelayArgs {
+    /// The fee of one relayed cooperative close, in gwei (the vault's native
+    /// units), charged as one metered request before the close's clearance.
+    #[arg(long, env = "ZKAPI_RELAY_FEE_UNITS", hide_env_values = true)]
+    relay_fee_units: Option<u128>,
+    /// The relayer's signing RPC (eth_sendTransaction for --relay-sender,
+    /// and reads); must serve --chain-id. May embed a key.
+    #[arg(long, env = "ZKAPI_RELAY_RPC_URL", hide_env_values = true)]
+    relay_rpc_url: Option<String>,
+    /// The RPC of the relay's simulations, estimates and receipts (a signer
+    /// sidecar does not pass revert data on). Default: --native-billing-rpc-url.
+    #[arg(long, env = "ZKAPI_RELAY_READ_RPC_URL", hide_env_values = true)]
+    relay_read_rpc_url: Option<String>,
+    /// The dedicated relayer account.
+    #[arg(long, env = "ZKAPI_RELAY_SENDER", hide_env_values = true)]
+    relay_sender: Option<String>,
+    /// The exit batcher; defaults to, and must equal, the manifest's.
+    #[arg(long, env = "ZKAPI_RELAY_BATCHER", hide_env_values = true)]
+    relay_batcher: Option<String>,
+    /// The highest maxFeePerGas the relay pays, in wei; the fee should be
+    /// priced against it.
+    #[arg(long, env = "ZKAPI_RELAY_MAX_FEE_PER_GAS", hide_env_values = true)]
+    relay_max_fee_per_gas: Option<u128>,
+    #[arg(long, env = "ZKAPI_RELAY_PRIORITY_FEE_PER_GAS", default_value_t = zkapi_serverd::close_relay::DEFAULT_PRIORITY_FEE_PER_GAS, hide_env_values = true)]
+    relay_priority_fee_per_gas: u128,
+    /// Send a batch once this many closes are queued.
+    #[arg(long, env = "ZKAPI_RELAY_BATCH_TARGET", default_value_t = zkapi_serverd::close_relay::DEFAULT_BATCH_TARGET, hide_env_values = true)]
+    relay_batch_target: usize,
+    /// The most closes in one batch (at most the batcher's MAX_ITEMS()).
+    #[arg(long, env = "ZKAPI_RELAY_MAX_BATCH", default_value_t = zkapi_serverd::close_relay::DEFAULT_MAX_BATCH, hide_env_values = true)]
+    relay_max_batch: usize,
+    /// Send a batch once the oldest queued close has waited this long (T).
+    #[arg(long, env = "ZKAPI_RELAY_FLUSH_AGE_SECONDS", default_value_t = zkapi_serverd::close_relay::DEFAULT_FLUSH_AGE_SECONDS, hide_env_values = true)]
+    relay_flush_age_seconds: u64,
+    /// Send at once when a queued close comes this near its valid_until.
+    #[arg(long, env = "ZKAPI_RELAY_URGENT_MARGIN_SECONDS", default_value_t = zkapi_serverd::close_relay::DEFAULT_URGENT_MARGIN_SECONDS, hide_env_values = true)]
+    relay_urgent_margin_seconds: u64,
+    /// Never send a close this near its valid_until (it expires to the
+    /// client).
+    #[arg(long, env = "ZKAPI_RELAY_CUTOFF_SECONDS", default_value_t = zkapi_serverd::close_relay::DEFAULT_CUTOFF_SECONDS, hide_env_values = true)]
+    relay_cutoff_seconds: u64,
+    /// A submitted close's valid_until must be at least this far ahead.
+    #[arg(long, env = "ZKAPI_RELAY_MIN_VALIDITY_SECONDS", default_value_t = zkapi_serverd::close_relay::DEFAULT_MIN_VALIDITY_SECONDS, hide_env_values = true)]
+    relay_min_validity_seconds: u64,
+    #[arg(long, env = "ZKAPI_RELAY_POLL_SECONDS", default_value_t = zkapi_serverd::close_relay::DEFAULT_POLL_SECONDS, hide_env_values = true)]
+    relay_poll_seconds: u64,
+    #[arg(long, env = "ZKAPI_RELAY_CONFIRMATIONS", default_value_t = zkapi_serverd::close_relay::DEFAULT_CONFIRMATIONS, hide_env_values = true)]
+    relay_confirmations: u64,
+    /// Replace a pending relay transaction with 25% higher fees after this
+    /// long.
+    #[arg(long, env = "ZKAPI_RELAY_BUMP_AFTER_SECONDS", default_value_t = zkapi_serverd::close_relay::DEFAULT_BUMP_AFTER_SECONDS, hide_env_values = true)]
+    relay_bump_after_seconds: u64,
+    #[arg(long, env = "ZKAPI_RELAY_MAX_GAS", default_value_t = zkapi_serverd::close_relay::DEFAULT_MAX_GAS, hide_env_values = true)]
+    relay_max_gas: u64,
+    /// Whole-batch reverts a close may take part in before it fails.
+    #[arg(long, env = "ZKAPI_RELAY_MAX_ATTEMPTS", default_value_t = zkapi_serverd::close_relay::DEFAULT_MAX_ATTEMPTS, hide_env_values = true)]
+    relay_max_attempts: u32,
+}
+
+impl RelayArgs {
+    fn into_config(self) -> anyhow::Result<Option<zkapi_serverd::close_relay::CloseRelayConfig>> {
+        let Some(fee_units) = self.relay_fee_units else {
+            anyhow::ensure!(
+                self.relay_rpc_url.is_none()
+                    && self.relay_read_rpc_url.is_none()
+                    && self.relay_sender.is_none()
+                    && self.relay_batcher.is_none()
+                    && self.relay_max_fee_per_gas.is_none(),
+                "the close relay is configured without --relay-fee-units"
+            );
+            return Ok(None);
+        };
+        let (Some(rpc_url), Some(sender), Some(max_fee_per_gas)) = (
+            self.relay_rpc_url,
+            self.relay_sender,
+            self.relay_max_fee_per_gas,
+        ) else {
+            anyhow::bail!(
+                "the close relay needs --relay-rpc-url, --relay-sender and --relay-max-fee-per-gas"
+            );
+        };
+        let mut config = zkapi_serverd::close_relay::CloseRelayConfig::new(
+            fee_units,
+            self.relay_batcher.unwrap_or_default(),
+            rpc_url,
+            sender,
+            max_fee_per_gas,
+        );
+        config.read_rpc_url = self.relay_read_rpc_url;
+        config.priority_fee_per_gas = self.relay_priority_fee_per_gas;
+        config.batch_target = self.relay_batch_target;
+        config.max_batch = self.relay_max_batch;
+        config.flush_age_seconds = self.relay_flush_age_seconds;
+        config.urgent_margin_seconds = self.relay_urgent_margin_seconds;
+        config.cutoff_seconds = self.relay_cutoff_seconds;
+        config.min_validity_seconds = self.relay_min_validity_seconds;
+        config.poll_seconds = self.relay_poll_seconds;
+        config.confirmations = self.relay_confirmations;
+        config.bump_after_seconds = self.relay_bump_after_seconds;
+        config.max_gas = self.relay_max_gas;
+        config.max_attempts = self.relay_max_attempts;
+        config.validate()?;
+        Ok(Some(config))
+    }
+}
+
 #[derive(Debug, Clone, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -207,6 +318,8 @@ enum Commands {
         indexer_url: Option<String>,
         #[arg(long, default_value_t = 1_000)]
         root_poll_interval_ms: u64,
+        #[command(flatten)]
+        relay: RelayArgs,
     },
     Indexer {
         #[arg(long, default_value = "127.0.0.1:3001")]
@@ -398,6 +511,7 @@ async fn main() -> anyhow::Result<()> {
             initial_root,
             indexer_url,
             root_poll_interval_ms,
+            relay,
         } => {
             // Fail fast, before any provider or oracle configuration; run_server
             // re-validates the seeds and checks their keys against the vault.
@@ -483,6 +597,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(zkapi_serverd::deployment::DeploymentManifest::load)
                     .transpose()?,
                 allow_key_source_switch,
+                close_relay: relay.into_config()?,
             };
             zkapi_serverd::routes::run_server(config).await?;
         }
@@ -831,6 +946,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The close relay is off without --relay-fee-units, refuses a partial
+    /// configuration, and takes its policy from the flags.
+    #[test]
+    fn the_close_relay_flags_build_its_configuration() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "zkapi",
+                "serverd",
+                "--native-billing-rpc-url",
+                "https://rpc.example",
+                "--native-price-feed-address",
+                "0x694AA1769357215DE4FAC081bf1f309aDC325306",
+                "--oa-org-url",
+                "https://org.example",
+            ];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Commands::Serverd { relay, .. } => relay.into_config(),
+                _ => unreachable!(),
+            }
+        };
+        assert!(parse(&[]).unwrap().is_none());
+        assert!(parse(&["--relay-rpc-url", "http://127.0.0.1:1"]).is_err());
+        assert!(parse(&["--relay-fee-units", "250000"]).is_err());
+        let relay = parse(&[
+            "--relay-fee-units",
+            "250000",
+            "--relay-rpc-url",
+            "http://127.0.0.1:1",
+            "--relay-sender",
+            "0x00000000000000000000000000000000000000A1",
+            "--relay-max-fee-per-gas",
+            "20000000000",
+            "--relay-flush-age-seconds",
+            "600",
+            "--relay-batch-target",
+            "8",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(relay.fee_units, 250_000);
+        assert_eq!(relay.sender, "0x00000000000000000000000000000000000000a1");
+        assert_eq!((relay.flush_age_seconds, relay.batch_target), (600, 8));
+        assert!(relay.batcher_address.is_empty(), "taken from the manifest");
+        // An inconsistent policy is refused.
+        assert!(parse(&[
+            "--relay-fee-units",
+            "250000",
+            "--relay-rpc-url",
+            "http://127.0.0.1:1",
+            "--relay-sender",
+            "0x00000000000000000000000000000000000000a1",
+            "--relay-max-fee-per-gas",
+            "20000000000",
+            "--relay-batch-target",
+            "64",
+        ])
+        .is_err());
     }
 
     #[test]

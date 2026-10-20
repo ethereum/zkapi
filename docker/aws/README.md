@@ -320,6 +320,27 @@ blocked. The daemon opens `/data/server.db` read-only and needs the schema and
 with "run `zkapi db init` first". See
 [challenge operation](../../docs/challenge-service.md).
 
+### Close relay (optional)
+
+serverd can relay cooperative closes through the exit batcher, paid by a fee
+request ([close relay](../../docs/native-eth-billing.md#close-relay)). It
+needs a funded relayer account behind its own signer:
+
+1. Copy [`relay-signer.env.example`](relay-signer.env.example) to
+   `/etc/zkapi/relay-signer.env` (root-owned, mode `0600`) with a fresh key,
+   the vault, the manifest's `exit_batcher_address` and a fee cap; start it with
+   `--profile relay` (service `relay-signer`, port 8548 on the backend network).
+   It signs only `mutualCloseBatch` to the batcher and `mutualClose` to the
+   vault ([close-relay role](signer/README.md#close-relay-role)).
+2. Fund its sender (its `/health`) with ETH for gas.
+3. In `server.env` set `ZKAPI_RELAY_FEE_UNITS`,
+   `ZKAPI_RELAY_RPC_URL=http://relay-signer:8548`, `ZKAPI_RELAY_SENDER` (that
+   sender) and `ZKAPI_RELAY_MAX_FEE_PER_GAS` (at most the signer's fee cap);
+   the other `ZKAPI_RELAY_*` settings are optional. Reads go to
+   `ZKAPI_NATIVE_BILLING_RPC_URL` unless `ZKAPI_RELAY_READ_RPC_URL` is set.
+   serverd refuses to start the relay unless the manifest names the exit
+   batcher and the batcher probes match it.
+
 ## Starting the deployment
 
 Start in this order: the indexer, `zkapi db init` (the one-shot `db-init`

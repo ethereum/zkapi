@@ -3242,9 +3242,11 @@ impl RequestProcessor {
             .store
             .try_lookup_by_nullifier(&nullifier)?
             .ok_or_else(|| ServerError::Internal("the request has no reservation".into()))?;
-        if record.reservation_kind != "openrouter_lease" {
+        // A relay fee request (crate::close_relay) settles at its fee when
+        // it is admitted; it is signed exactly like a lease.
+        if record.reservation_kind != "openrouter_lease" && record.reservation_kind != "relay_fee" {
             return Err(ServerError::InvalidRequest(
-                "only native lease reservations can settle".into(),
+                "only native lease and relay fee reservations can settle".into(),
             ));
         }
         if record.client_request_id.as_deref() != Some(request.client_request_id.as_str())
@@ -3392,6 +3394,24 @@ impl RequestProcessor {
             let Some(_guard) = self.lease_locks.try_lock(id) else {
                 continue;
             };
+            if record.reservation_kind == "relay_fee" {
+                // A relay fee request has no lease row: its ticket holds the
+                // admitted request.
+                match self.store.relay_fee_ticket_of_request(&record.nullifier) {
+                    Ok(Some(ticket)) if ticket.client_request_id == id => {
+                        if let Err(error) = self.sign_successor(&ticket.api_request).await {
+                            tracing::warn!(client_request_id = %id, error = %error, "relay fee successor signing will be retried");
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::error!(client_request_id = %id, "a settled relay fee request has no matching ticket; its successor cannot be signed until it is repaired");
+                    }
+                    Err(error) => {
+                        tracing::error!(client_request_id = %id, error = %error, "a settled relay fee request's ticket cannot be read");
+                    }
+                }
+                continue;
+            }
             let lease = match self.store.try_lookup_openrouter_lease(id) {
                 Ok(Some(lease)) if lease.request_nullifier == record.nullifier => lease,
                 Ok(_) => {
@@ -3986,6 +4006,335 @@ impl RequestProcessor {
     pub fn store(&self) -> &Arc<NullifierStore> {
         &self.store
     }
+}
+
+// --------------------------------------------------------------------------
+// Close relay (`crate::close_relay`)
+// --------------------------------------------------------------------------
+
+impl RequestProcessor {
+    /// The relay's public terms; `enabled: false` without a relay.
+    pub fn close_relay_terms(&self) -> zkapi_types::wire::CloseRelayTermsResponse {
+        self.config
+            .close_relay
+            .as_ref()
+            .map_or_else(crate::close_relay::disabled_terms, |relay| relay.terms())
+    }
+
+    fn close_relay_config(&self) -> Result<&crate::close_relay::CloseRelayConfig, ServerError> {
+        self.config.close_relay.as_ref().ok_or_else(|| {
+            relay_refusal(
+                "relay_disabled",
+                "this server does not relay cooperative closes; submit the close yourself",
+            )
+        })
+    }
+
+    /// `POST /v2/withdraw/relay/fee`: admit the close-relay fee request,
+    /// settled at once at exactly the fee, and return its signed successor
+    /// (O7: only while its nullifier is unspent on chain). An exact retry
+    /// returns the signed successor, or signs it now when a chain read failed
+    /// the first time.
+    pub async fn pay_close_relay_fee(
+        &self,
+        request: &ApiRequestV2,
+    ) -> Result<RequestResponseV2, ServerError> {
+        let relay = self.close_relay_config()?;
+        let authorization = crate::close_relay::parse_fee_authorization(&request.payload)?;
+        if let Some(response) = self.admit_relay_fee(request, relay, &authorization)? {
+            return Ok(response);
+        }
+        // The signing sweep signs under the same lock.
+        let _guard = self.lease_locks.lock(&request.client_request_id).await;
+        match self.sign_successor(request).await? {
+            SignOutcome::Signed(response) => Ok(*response),
+            SignOutcome::Deferred { .. } | SignOutcome::ExitedUnsigned => {
+                Err(ServerError::NullifierUsed)
+            }
+        }
+    }
+
+    /// The admission of a fee request: an exact retry resumes (its signed
+    /// response, or None while it awaits its signature); a new one passes
+    /// every check of a request (deployment, fresh root, state key, time,
+    /// authorization tag, Groth16 proof) with a solvency bound of at least
+    /// the fee, names exactly the current fee, and is reserved with its
+    /// evidence, its charge (the fee) and its ticket in one transaction.
+    fn admit_relay_fee(
+        &self,
+        request: &ApiRequestV2,
+        relay: &crate::close_relay::CloseRelayConfig,
+        authorization: &crate::close_relay::CloseRelayFeeAuthorization,
+    ) -> Result<Option<RequestResponseV2>, ServerError> {
+        let public = &request.public_inputs;
+        let payload_hash = canonical_payload_hash(request.payload.as_bytes());
+        if payload_hash != request.payload_hash {
+            return Err(ServerError::InvalidRequest(
+                "payload_hash does not match payload bytes".to_string(),
+            ));
+        }
+        if public.protocol_version != self.config.protocol_version
+            || public.chain_id != self.config.chain_id
+            || public.contract_address != self.config.contract_address
+        {
+            return Err(ServerError::ProtocolMismatch(
+                "version, chain, or contract mismatch".to_string(),
+            ));
+        }
+        let binding = api_request_binding(request)?;
+        if let Some(existing) = self
+            .store
+            .try_lookup_by_nullifier(&public.request_nullifier)?
+        {
+            let same_request = existing.client_request_id.as_deref()
+                == Some(&request.client_request_id)
+                && existing.payload_hash == Some(request.payload_hash)
+                && existing.reservation_kind == "relay_fee"
+                && existing.api_request_binding.as_deref() == Some(binding.as_str());
+            if !same_request {
+                return Err(ServerError::Replay);
+            }
+            return match existing.status {
+                NullifierStatus::Finalized => {
+                    response_from_record(&existing, &request.client_request_id).map(Some)
+                }
+                NullifierStatus::Reserved => Ok(None),
+                NullifierStatus::ClearanceReserved => Err(ServerError::Replay),
+                NullifierStatus::ExitedUnsigned => Err(ServerError::NullifierUsed),
+            };
+        }
+        if authorization.fee_units != relay.fee_units.to_string() {
+            return Err(relay_refusal(
+                "relay_fee_changed",
+                format!(
+                    "the relay fee is {} units, not {}; read GET /v2/withdraw/relay/terms and prove the fee request again",
+                    relay.fee_units, authorization.fee_units
+                ),
+            ));
+        }
+        let root = self.fresh_root(current_timestamp())?;
+        if public.active_root != root {
+            return Err(ServerError::StaleRoot {
+                latest_root: root.to_hex(),
+            });
+        }
+        let state_key = self.state_signing_key();
+        if public.state_signing_key_x != state_key.x || public.state_signing_key_y != state_key.y {
+            return Err(ServerError::InvalidRequest(
+                "state signing key does not match this deployment".to_string(),
+            ));
+        }
+        let now = current_timestamp();
+        if public.request_time.saturating_add(MAX_REQUEST_AGE_SECONDS) < now
+            || public.request_time > now.saturating_add(MAX_FUTURE_SKEW_SECONDS)
+        {
+            return Err(ServerError::InvalidRequest(
+                "request_time is outside the accepted freshness window".to_string(),
+            ));
+        }
+        // The proof shows a balance of at least the bound, so the fee is
+        // always payable from the state (C2 may fix a higher bound).
+        if public.solvency_bound < relay.fee_units {
+            return Err(ServerError::InvalidRequest(format!(
+                "solvency_bound {} is below the relay fee {}",
+                public.solvency_bound, relay.fee_units
+            )));
+        }
+        let context = canonical_request_context(&request.client_request_id, &payload_hash);
+        if core::authorization_tag(&public.request_nullifier, &context) != public.authorization_tag
+        {
+            return Err(ServerError::InvalidProof(
+                "proof authorization tag does not bind this request id and payload".to_string(),
+            ));
+        }
+        if !self
+            .verifier
+            .verify(public, &request.proof)
+            .map_err(|error| ServerError::InvalidProof(error.to_string()))?
+        {
+            return Err(ServerError::InvalidProof(
+                "Groth16 verification returned false".to_string(),
+            ));
+        }
+        check_signable(request)?;
+        let fee = relay.fee_units.to_string();
+        let settlement = SettledCharge {
+            charge: relay.fee_units,
+            basis: "relay_fee".to_string(),
+            response_code: 200,
+            response_payload: serde_json::json!({
+                "status": "relay_fee_paid",
+                "fee_units": fee,
+                "ticket_hash": authorization.ticket_hash,
+            })
+            .to_string(),
+            settled_at: current_timestamp(),
+        };
+        self.store
+            .reserve_relay_fee(request, &authorization.ticket_hash, &settlement)?;
+        Ok(None)
+    }
+
+    /// `POST /v2/withdraw/relay`: queue a finished cooperative close for the
+    /// relay. Cheap checks first (relay on, kind 1 without successor or
+    /// concession, a payable destination, this deployment and its keys,
+    /// `valid_until` far enough ahead, a well-formed ticket and proof); the
+    /// same close again returns its status before any verification; then the
+    /// proof is verified off chain and its nullifier read unused on chain;
+    /// the store checks this server's clearance at the nullifier and the
+    /// ticket, and redeems it. Returns whether the close is new.
+    pub async fn submit_close_relay(
+        &self,
+        submission: &zkapi_types::wire::CloseRelaySubmissionV2C,
+    ) -> Result<(bool, crate::close_relay::CloseRelayStatusResponse), ServerError> {
+        use crate::close_relay::{parse_ticket_secret, submission_digest, ticket_hash_hex};
+        use crate::nullifier_store::{CloseRelayEnqueued, NewCloseRelay};
+        let relay = self.close_relay_config()?;
+        let inputs = &submission.public_inputs;
+        if inputs.withdrawal_kind() != Some(WithdrawalKind::MutualClose) {
+            return Err(ServerError::InvalidRequest(
+                "the relay takes a kind-1 (mutual close) statement".into(),
+            ));
+        }
+        if !inputs.next_nullifier.is_zero() || inputs.conceded != 0 {
+            return Err(ServerError::InvalidRequest(
+                "a mutual close has no successor nullifier and concedes nothing".into(),
+            ));
+        }
+        if inputs.destination == [0u8; 20]
+            || inputs.destination_field() == self.config.contract_address
+        {
+            return Err(ServerError::InvalidRequest(
+                "the close pays neither the zero address nor the vault".into(),
+            ));
+        }
+        if inputs.protocol_version != self.config.protocol_version
+            || inputs.chain_id != self.config.chain_id
+            || inputs.contract_address != self.config.contract_address
+        {
+            return Err(ServerError::ProtocolMismatch(
+                "the close is for a different deployment".into(),
+            ));
+        }
+        let state_key = self.signer.state_public_key();
+        let clearance_key = self.signer.clearance_public_key();
+        if inputs.state_signing_key_x != state_key.x
+            || inputs.state_signing_key_y != state_key.y
+            || inputs.clearance_signing_key_x != clearance_key.x
+            || inputs.clearance_signing_key_y != clearance_key.y
+        {
+            return Err(ServerError::InvalidRequest(
+                "the close's signing keys do not match this deployment".into(),
+            ));
+        }
+        let secret = parse_ticket_secret(&submission.ticket_secret)?;
+        let ticket_hash = ticket_hash_hex(&secret);
+        let proof = base64::engine::general_purpose::STANDARD
+            .decode(&submission.proof.proof)
+            .ok()
+            .filter(|proof| proof.len() == 256)
+            .ok_or_else(|| {
+                ServerError::InvalidProof("a Groth16 proof is 256 base64-encoded bytes".into())
+            })?;
+        let digest = submission_digest(inputs, &proof);
+        if let Some(existing) = self.store.close_relay(&inputs.withdrawal_nullifier)? {
+            if existing.submission_digest == digest && existing.ticket_hash == ticket_hash {
+                return Ok((false, self.close_relay_response(&existing)?));
+            }
+            return Err(relay_refusal(
+                "relay_conflict",
+                "another close was submitted for this nullifier; the relay keeps the first",
+            ));
+        }
+        let now = current_timestamp();
+        if inputs.valid_until < now.saturating_add(relay.min_validity_seconds) {
+            return Err(relay_refusal(
+                "relay_validity_too_short",
+                format!(
+                    "valid_until must be at least {} s ahead for the relay; prove the close again or submit it yourself",
+                    relay.min_validity_seconds
+                ),
+            ));
+        }
+        crate::watcher::withdrawal_calldata(inputs, &proof).map_err(ServerError::InvalidRequest)?;
+        {
+            let _permit =
+                tokio::time::timeout(CLEARANCE_PERMIT_TIMEOUT, self.clearance_permits.acquire())
+                    .await
+                    .map_err(|_| ServerError::CapacityExhausted)?
+                    .map_err(|_| ServerError::CapacityExhausted)?;
+            if !self
+                .withdrawal_verifier
+                .verify(inputs, &submission.proof)
+                .map_err(|_| ServerError::InvalidProof("the close proof is malformed".into()))?
+            {
+                return Err(ServerError::InvalidProof(
+                    "the close proof failed verification".into(),
+                ));
+            }
+        }
+        match self.request_unspent(&inputs.withdrawal_nullifier).await {
+            Ok(()) => {}
+            Err(ServerError::NullifierUsed) => {
+                return Err(relay_refusal(
+                    "relay_already_closed",
+                    "the withdrawal nullifier is already used on chain",
+                ))
+            }
+            Err(error) => return Err(error),
+        }
+        let enqueued = self.store.enqueue_close_relay(&NewCloseRelay {
+            public_inputs: inputs,
+            proof: &proof,
+            ticket_hash: &ticket_hash,
+            submission_digest: &digest,
+            now: current_timestamp(),
+        })?;
+        match enqueued {
+            CloseRelayEnqueued::New(record) => {
+                tracing::info!(
+                    note_id = record.note_id,
+                    valid_until = record.valid_until,
+                    "close relay: close queued"
+                );
+                Ok((true, self.close_relay_response(&record)?))
+            }
+            CloseRelayEnqueued::Existing(record) => {
+                Ok((false, self.close_relay_response(&record)?))
+            }
+        }
+    }
+
+    /// `GET /v2/withdraw/relay/{N}`: the relay's view of the close at `N`.
+    pub fn close_relay_status(
+        &self,
+        withdrawal_nullifier: &Felt252,
+    ) -> Result<Option<crate::close_relay::CloseRelayStatusResponse>, ServerError> {
+        self.close_relay_config()?;
+        self.store
+            .close_relay(withdrawal_nullifier)?
+            .map(|record| self.close_relay_response(&record))
+            .transpose()
+    }
+
+    fn close_relay_response(
+        &self,
+        record: &crate::nullifier_store::CloseRelayRecord,
+    ) -> Result<crate::close_relay::CloseRelayStatusResponse, ServerError> {
+        let in_flight_hash = match (record.status, record.batch_id) {
+            (crate::nullifier_store::CloseRelayStatus::InFlight, Some(batch_id)) => self
+                .store
+                .pending_relay_batch()?
+                .filter(|batch| batch.batch_id == batch_id)
+                .and_then(|batch| batch.tx_hashes.last().cloned()),
+            _ => None,
+        };
+        Ok(crate::close_relay::status_response(record, in_flight_hash))
+    }
+}
+
+fn relay_refusal(code: &'static str, message: impl Into<String>) -> ServerError {
+    crate::close_relay::relay_refusal(code, message)
 }
 
 fn response_from_record(
@@ -12120,6 +12469,357 @@ mod tests {
         assert_eq!(
             (status, body),
             (StatusCode::NOT_FOUND, serde_json::Value::Null)
+        );
+    }
+}
+
+/// The close relay's fee request and submission (`crate::close_relay`)
+/// through the processor, with real request and withdrawal proofs.
+#[cfg(test)]
+mod close_relay_tests {
+    use super::*;
+    use crate::close_relay::{ticket_hash_hex, CloseRelayConfig};
+    use crate::test_support::{processor_note, setup_directory, TestNote};
+    use zkapi_types::wire::{CloseRelayFeeAuthorization, CloseRelaySubmissionV2C};
+
+    const FEE: u128 = 250_000;
+    const DESTINATION: [u8; 20] = [0x11; 20];
+
+    fn seeds() -> (Felt252, Felt252) {
+        (Felt252::from_u64(11), Felt252::from_u64(12))
+    }
+
+    fn relay_processor(store: Arc<NullifierStore>, relay: bool) -> RequestProcessor {
+        let signer = Arc::new(ServerSigner::new(&seeds().0, &seeds().1));
+        let mut close_relay = CloseRelayConfig::new(
+            FEE,
+            "0x00000000000000000000000000000000000000b7".into(),
+            "http://127.0.0.1:9".into(),
+            "0x00000000000000000000000000000000000000a1".into(),
+            50_000_000_000,
+        );
+        close_relay.validate().unwrap();
+        RequestProcessor::try_new(
+            ServerConfig {
+                request_charge_cap: 1,
+                contract_address: Felt252::from_u64(1),
+                native_billing: Some(crate::test_support::native_config()),
+                proof_setup_dir: setup_directory(),
+                openrouter_leases: Some(crate::test_support::lease_config()),
+                close_relay: relay.then_some(close_relay),
+                ..Default::default()
+            },
+            store,
+            signer,
+            Felt252::ZERO,
+        )
+        .unwrap()
+    }
+
+    fn fee_request(
+        note: &TestNote,
+        id: &str,
+        fee: u128,
+        secret: &[u8; 32],
+        bound: u128,
+    ) -> crate::test_support::PreparedTestRequest {
+        let payload = serde_json::to_string(&CloseRelayFeeAuthorization::new(fee, secret)).unwrap();
+        note.prepare_request(id, payload, current_timestamp(), bound)
+    }
+
+    fn submission(note: &TestNote, secret: &[u8; 32], valid_until: u64) -> CloseRelaySubmissionV2C {
+        let (public_inputs, proof) = note.close_proof(DESTINATION, valid_until);
+        CloseRelaySubmissionV2C {
+            public_inputs,
+            proof,
+            ticket_secret: format!("0x{}", hex::encode(secret)),
+        }
+    }
+
+    fn code(error: ServerError) -> String {
+        error.error_code().to_string()
+    }
+
+    /// The whole flow: the fee request at state k settles at exactly the
+    /// fee, its successor installs with the fee deducted, the clearance at
+    /// N_{k+1} and the close proved there carry the fee inside the treasury
+    /// share, and the relay queues the close once; the fee request is
+    /// evidence the challenger enforces like any request.
+    #[tokio::test]
+    async fn the_fee_request_settles_the_fee_and_its_ticket_queues_one_close() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let processor = relay_processor(store.clone(), true);
+        let deposit = 2_000_000;
+        let mut note = processor_note(&processor, seeds(), deposit);
+        let secret = [0x42; 32];
+
+        // A fee that is not the server's terms is refused before admission.
+        let stale = fee_request(&note, "relay-fee-stale", FEE + 1, &secret, FEE + 1);
+        assert_eq!(
+            code(
+                processor
+                    .pay_close_relay_fee(&stale.request)
+                    .await
+                    .unwrap_err()
+            ),
+            "relay_fee_changed"
+        );
+        // A bound below the fee cannot pay it.
+        let low = fee_request(&note, "relay-fee-low", FEE, &secret, FEE - 1);
+        assert_eq!(
+            code(
+                processor
+                    .pay_close_relay_fee(&low.request)
+                    .await
+                    .unwrap_err()
+            ),
+            "invalid_request"
+        );
+
+        let prepared = fee_request(&note, "relay-fee", FEE, &secret, FEE);
+        let response = processor
+            .pay_close_relay_fee(&prepared.request)
+            .await
+            .unwrap();
+        assert_eq!(response.charge_applied, FEE);
+        let paid: serde_json::Value = serde_json::from_str(&response.response_payload).unwrap();
+        assert_eq!(paid["status"], "relay_fee_paid");
+        assert_eq!(paid["ticket_hash"], ticket_hash_hex(&secret));
+        // An exact retry returns the same signed successor.
+        let again = processor
+            .pay_close_relay_fee(&prepared.request)
+            .await
+            .unwrap();
+        assert_eq!(again.next_state_signature, response.next_state_signature);
+        let fee_nullifier = prepared.request.public_inputs.request_nullifier;
+        let record = store.lookup_by_nullifier(&fee_nullifier).unwrap();
+        assert_eq!(record.reservation_kind, "relay_fee");
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(record.settled_basis.as_deref(), Some("relay_fee"));
+        // The request is evidence, and its charge is what the challenger
+        // raises an escape from state k to.
+        assert_eq!(store.request_evidence(&fee_nullifier).unwrap().len(), 1);
+        let owed = crate::watcher::ChallengeWatcher::new(store.clone())
+            .owed(&fee_nullifier)
+            .unwrap();
+        assert!(matches!(
+            owed.basis,
+            crate::watcher::OwedBasis::Settled { charge } if charge == FEE
+        ));
+        note.complete(&prepared, &response).unwrap();
+        assert_eq!(note.state.balance, deposit - FEE);
+        // The same ticket cannot be paid twice.
+        let twice = fee_request(&note, "relay-fee-twice", FEE, &secret, FEE);
+        assert_eq!(
+            code(
+                processor
+                    .pay_close_relay_fee(&twice.request)
+                    .await
+                    .unwrap_err()
+            ),
+            "relay_ticket_taken"
+        );
+
+        let valid_until = current_timestamp() + 7_200;
+        let close = submission(&note, &secret, valid_until);
+        // No clearance at N_{k+1} yet.
+        assert_eq!(
+            code(processor.submit_close_relay(&close).await.unwrap_err()),
+            "relay_clearance_unknown"
+        );
+        let clearance = note.ownership_request(current_timestamp() + 3_000);
+        processor.process_clearance(&clearance).await.unwrap();
+        assert_eq!(
+            clearance.withdrawal_nullifier,
+            close.public_inputs.withdrawal_nullifier
+        );
+        // deposit - finalBalance, the treasury share, holds the fee.
+        assert_eq!(close.public_inputs.final_balance, deposit - FEE);
+
+        // An unknown ticket, and a validity too short, are refused.
+        let mut unknown = close.clone();
+        unknown.ticket_secret = format!("0x{}", "07".repeat(32));
+        assert_eq!(
+            code(processor.submit_close_relay(&unknown).await.unwrap_err()),
+            "relay_ticket_unknown"
+        );
+        let short = submission(&note, &secret, current_timestamp() + 600);
+        assert_eq!(
+            code(processor.submit_close_relay(&short).await.unwrap_err()),
+            "relay_validity_too_short"
+        );
+        // A tampered proof fails verification.
+        let mut tampered = close.clone();
+        tampered.public_inputs.final_balance += 1;
+        assert_eq!(
+            code(processor.submit_close_relay(&tampered).await.unwrap_err()),
+            "invalid_proof"
+        );
+
+        let (new, status) = processor.submit_close_relay(&close).await.unwrap();
+        assert!(new);
+        assert_eq!(status.status, "queued");
+        assert!(!status.self_submit);
+        // Idempotent: the same close returns its status.
+        let (new, again) = processor.submit_close_relay(&close).await.unwrap();
+        assert!(!new);
+        assert_eq!(again, status);
+        // Another proof of the same close (new valid_until) is refused.
+        let other = submission(&note, &secret, valid_until + 60);
+        assert_eq!(
+            code(processor.submit_close_relay(&other).await.unwrap_err()),
+            "relay_conflict"
+        );
+        let ticket = store
+            .relay_fee_ticket(&ticket_hash_hex(&secret))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ticket.redeemed_by,
+            Some(close.public_inputs.withdrawal_nullifier)
+        );
+        assert_eq!(
+            processor
+                .close_relay_status(&close.public_inputs.withdrawal_nullifier)
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued"
+        );
+    }
+
+    /// A fee request whose signature could not be made at once (the chain
+    /// could not be read) is signed by the signing sweep from its ticket, or
+    /// by the client's exact retry.
+    #[tokio::test]
+    async fn the_signing_sweep_signs_a_fee_request_left_unsigned() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let processor = relay_processor(store.clone(), true);
+        let mut note = processor_note(&processor, seeds(), 1_000_000);
+        let prepared = fee_request(&note, "relay-sweep", FEE, &[3; 32], FEE);
+        processor.test_chain().unavailable = true;
+        let error = processor
+            .pay_close_relay_fee(&prepared.request)
+            .await
+            .unwrap_err();
+        assert!(error.is_retriable());
+        let nullifier = prepared.request.public_inputs.request_nullifier;
+        let record = store.lookup_by_nullifier(&nullifier).unwrap();
+        assert!(record.settled_unsigned());
+        processor.test_chain().unavailable = false;
+        processor.sign_settled_now();
+        let record = store.lookup_by_nullifier(&nullifier).unwrap();
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        let response = processor
+            .pay_close_relay_fee(&prepared.request)
+            .await
+            .unwrap();
+        assert_eq!(response.charge_applied, FEE);
+        note.complete(&prepared, &response).unwrap();
+    }
+
+    /// The relay's routes: terms, the status of an unknown close (404), and
+    /// a relay that is off (404 relay_disabled).
+    #[tokio::test]
+    async fn relay_routes_serve_terms_and_status() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        async fn call(
+            app: &axum::Router,
+            method: &str,
+            uri: &str,
+            body: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice(&body).unwrap())
+        }
+        let on = crate::routes::create_router(Arc::new(relay_processor(
+            Arc::new(NullifierStore::in_memory().unwrap()),
+            true,
+        )));
+        let (status, terms) = call(&on, "GET", "/v2/withdraw/relay/terms", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(terms["enabled"], true);
+        assert_eq!(terms["fee_units"], FEE.to_string());
+        let (status, _) = call(&on, "GET", "/v2/withdraw/relay/0x1234", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, error) = call(&on, "POST", "/v2/withdraw/relay", "{}").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error_code"], "invalid_request");
+
+        let off = crate::routes::create_router(Arc::new(relay_processor(
+            Arc::new(NullifierStore::in_memory().unwrap()),
+            false,
+        )));
+        let (status, terms) = call(&off, "GET", "/v2/withdraw/relay/terms", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(terms, serde_json::json!({"enabled": false}));
+        let (status, error) = call(&off, "GET", "/v2/withdraw/relay/0x1234", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error_code"], "relay_disabled");
+    }
+
+    /// A close whose nullifier is used on chain is refused; the relay off
+    /// refuses everything with relay_disabled and reports its terms as off.
+    #[tokio::test]
+    async fn used_nullifiers_and_a_disabled_relay_are_refused() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let off = relay_processor(store, false);
+        assert!(!off.close_relay_terms().enabled);
+        let note = processor_note(&off, seeds(), 1_000_000);
+        let prepared = fee_request(&note, "relay-off", FEE, &[1; 32], FEE);
+        assert_eq!(
+            code(
+                off.pay_close_relay_fee(&prepared.request)
+                    .await
+                    .unwrap_err()
+            ),
+            "relay_disabled"
+        );
+        assert_eq!(
+            code(off.close_relay_status(&Felt252::ONE).unwrap_err()),
+            "relay_disabled"
+        );
+
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let processor = relay_processor(store, true);
+        assert!(processor.close_relay_terms().enabled);
+        let mut note = processor_note(&processor, seeds(), 1_000_000);
+        let secret = [2; 32];
+        let prepared = fee_request(&note, "relay-used", FEE, &secret, FEE);
+        let response = processor
+            .pay_close_relay_fee(&prepared.request)
+            .await
+            .unwrap();
+        note.complete(&prepared, &response).unwrap();
+        let clearance = note.ownership_request(current_timestamp() + 3_000);
+        processor.process_clearance(&clearance).await.unwrap();
+        let close = submission(&note, &secret, current_timestamp() + 7_200);
+        processor.set_test_spent(close.public_inputs.withdrawal_nullifier, true);
+        assert_eq!(
+            code(processor.submit_close_relay(&close).await.unwrap_err()),
+            "relay_already_closed"
+        );
+        // A destination of zero is refused before anything else.
+        let mut zero = close;
+        zero.public_inputs.destination = [0; 20];
+        assert_eq!(
+            code(processor.submit_close_relay(&zero).await.unwrap_err()),
+            "invalid_request"
         );
     }
 }

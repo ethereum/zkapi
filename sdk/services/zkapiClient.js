@@ -10,6 +10,7 @@ import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHis
 import { externalRecoveryContext, sameAddress, externalTransactionNonce, assertExternalTransaction,
     hasDurableTransactionHash } from './zkapiExternalTransactions.mjs';
 import { matchEscapePayout } from './zkapiExitPolicy.mjs';
+import { MUTUAL_CLOSE_TOPIC, followCloseRelay, mutualCloseLogMatches } from './zkapiCloseRelay.mjs';
 import { gaslessRecordFields, isGaslessWithdrawal } from './browserWalletStore.js';
 import { gaslessDeploymentError, verifyGaslessDeployment } from './zkapiDeploymentCheck.mjs';
 import {
@@ -2217,9 +2218,12 @@ class ZkapiClient extends EventTarget {
         const requestedDestination = normalizeWithdrawalDestination(destination, this.config?.funding);
         if (!['zero', 'bound'].includes(concede)) throw new TypeError('Choose zero or bound for a forced escape.');
         // `fees: 'payout'` pays the network fee from the payout through the
-        // withdrawal paymaster (design §3.2); 'wallet' is today's path.
-        if (!['wallet', 'payout'].includes(fees)) throw new TypeError('Choose wallet or payout for the withdrawal fees.');
-        const operationKey = `${mode}:${requestedDestination || ''}:${concede}${fees === 'payout' ? ':payout' : ''}`;
+        // withdrawal paymaster (design §3.2); 'wallet' is today's path;
+        // 'relay' (a cooperative close only) has the operator's close relay
+        // land the close for its fee, with the wallet-paid close as fallback.
+        if (!['wallet', 'payout', 'relay'].includes(fees)) throw new TypeError('Choose wallet, payout or relay for the withdrawal fees.');
+        if (fees === 'relay' && mode !== 'mutual') throw new TypeError('The close relay carries cooperative closes only.');
+        const operationKey = `${mode}:${requestedDestination || ''}:${concede}${fees === 'wallet' ? '' : `:${fees}`}`;
         if (this.withdrawPromise) {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
@@ -2271,7 +2275,7 @@ class ZkapiClient extends EventTarget {
         const note = this.note;
         if (!note) throw new Error('There is no active private note to withdraw.');
         if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
-        if (!['wallet', 'payout'].includes(fees)) throw new TypeError('Choose wallet or payout for the withdrawal fees.');
+        if (!['wallet', 'payout', 'relay'].includes(fees)) throw new TypeError('Choose wallet, payout or relay for the withdrawal fees.');
         await this.assertBalanceNotClaimed(note.note_id);
 
         onStatus('Connecting to MetaMask…');
@@ -2326,6 +2330,14 @@ class ZkapiClient extends EventTarget {
         // original payout destination, so recovery remains permissionless and
         // a harmless account switch cannot strand the note.
         const destination = prepared?.destination || requestedDestination || from;
+        // The operator's close relay (fees 'relay'): the fee request comes
+        // first, before the close is prepared; a close already sent from the
+        // wallet is followed as such.
+        let relayMode = fees === 'relay' && mode === 'mutual' && !prepared?.transaction_hash;
+        if (relayMode) {
+            onStatus('Paying the operator’s relay fee from this balance…');
+            await browserWalletRuntime.payCloseRelayFee({ onProgress: (_phase, message) => onStatus(message) });
+        }
 
         const withdrawal = {
             phase: 'prepared',
@@ -2443,6 +2455,17 @@ class ZkapiClient extends EventTarget {
                         clearance_granted: mode === 'mutual' && Boolean(plan.clearance?.signature)
                     };
                 }
+                if (relayMode && plan.mode === 'mutual' && !submittedHash) {
+                    // The relay lands it, or gives it back by the deadline:
+                    // then it is submitted from the wallet below.
+                    relayMode = false;
+                    const relayed = await this.followRelayedClose(plan, destination, onStatus);
+                    if (relayed) {
+                        receipt = relayed;
+                        break;
+                    }
+                    onStatus('The relay did not land the close in time. Confirm it in MetaMask to submit it yourself…');
+                }
                 const calldata = encodeWithdrawal(
                     plan,
                     mode,
@@ -2548,7 +2571,9 @@ class ZkapiClient extends EventTarget {
             }
             if (!receipt) throw error;
         }
-        const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, mode);
+        // This note's event: a relayed close's batch receipt carries other
+        // notes' closes too.
+        const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, mode, { noteId: note.note_id });
         if (!event || event.noteId !== BigInt(note.note_id)
             || event.destination.toLowerCase() !== destination.toLowerCase()
             || event.finalBalance !== BigInt(plan.public_inputs.final_balance)) {
@@ -2624,6 +2649,56 @@ class ZkapiClient extends EventTarget {
             pathSource: plan.pathSource || null,
             ...(destinationWarning ? { destinationWarning } : {})
         };
+    }
+
+    /**
+     * Hand a prepared cooperative close to the operator's relay and follow it
+     * (followCloseRelay): the receipt of the transaction that carried the
+     * vault's MutualClose of exactly this close, read through the wallet's
+     * provider, or null when the client must submit it itself (the relay gave
+     * it back, or has not landed it by valid_until minus the margin).
+     * `closeRelayTiming` ({ now, sleep, pollMs, marginSeconds }) is for tests.
+     */
+    async followRelayedClose(plan, destination, onStatus = () => {}) {
+        const vault = this.config.funding.contract_address;
+        const inputs = plan.public_inputs;
+        const nullifier = inputs.withdrawal_nullifier;
+        let fromBlock = '0x0';
+        try {
+            fromBlock = await this.ethereum.request({ method: 'eth_blockNumber' });
+        } catch {
+            // Search the vault's whole history instead.
+        }
+        try {
+            await browserWalletRuntime.submitCloseRelay(plan);
+            onStatus('The operator’s relay holds this close and lands it in a batch. If it has not landed in time, it is submitted from your wallet.');
+        } catch (error) {
+            onStatus(`The relay has not accepted this close yet (${error?.message || error}).`);
+        }
+        let landedHash = null;
+        const noteTopic = `0x${BigInt(inputs.note_id).toString(16).padStart(64, '0')}`;
+        const outcome = await followCloseRelay({
+            validUntil: inputs.valid_until,
+            status: () => browserWalletRuntime.closeRelayStatus(nullifier),
+            resubmit: () => browserWalletRuntime.submitCloseRelay(plan),
+            closeSeen: async () => {
+                const logs = await this.ethereum.request({
+                    method: 'eth_getLogs',
+                    params: [{ address: vault, fromBlock, toBlock: 'latest', topics: [MUTUAL_CLOSE_TOPIC, noteTopic] }]
+                });
+                const hit = (logs || []).find(log => mutualCloseLogMatches([log], {
+                    vault, noteId: inputs.note_id, nullifier, finalBalance: inputs.final_balance, destination
+                }));
+                if (!/^0x[0-9a-fA-F]{64}$/.test(String(hit?.transactionHash || ''))) return false;
+                landedHash = hit.transactionHash;
+                return true;
+            },
+            selfSubmit: async () => {},
+            ...(this.closeRelayTiming || {})
+        });
+        if (outcome !== 'relayed' || !landedHash) return null;
+        onStatus(`The relay landed this close in ${this.compact(landedHash)} · waiting for confirmation…`);
+        return this.waitForReceipt(landedHash);
     }
 
     async recoverFailedWithdrawalSubmission({

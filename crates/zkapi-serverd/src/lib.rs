@@ -7,6 +7,7 @@
 pub mod adversary;
 pub mod challenge_service;
 pub mod challenge_status;
+pub mod close_relay;
 pub mod config;
 pub mod dashboard;
 pub mod deployment;

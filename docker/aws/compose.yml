@@ -141,6 +141,40 @@ services:
         max-size: 10m
         max-file: "5"
 
+  # The close relay's signer (docs/native-eth-billing.md, "Close relay"): the
+  # same image in the close-relay role, with its own key and env file. It signs
+  # only cooperative closes (mutualCloseBatch to the exit batcher, mutualClose
+  # to the vault) and refuses every challenger call. Enable the profile and set
+  # ZKAPI_RELAY_* in server.env, with ZKAPI_RELAY_RPC_URL=http://relay-signer:8548.
+  relay-signer:
+    image: zkapi/signer:${ZKAPI_IMAGE_TAG:-concession-v1}
+    build:
+      context: ./signer
+    profiles: ["relay"]
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m"]
+    env_file:
+      - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/relay-signer.env
+    environment:
+      ZKAPI_SIGNER_ROLE: close-relay
+      ZKAPI_CHALLENGE_LISTEN_HOST: 0.0.0.0
+      ZKAPI_CHALLENGE_PORT: "8548"
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "node", "--input-type=module", "-e", "const r = await fetch('http://127.0.0.1:8548/health', {signal: AbortSignal.timeout(5000)}); if (!r.ok) process.exit(1);"]
+      interval: 10s
+      timeout: 6s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
   gateway:
     image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v1}
     build:

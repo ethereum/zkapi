@@ -28,6 +28,8 @@ import { decodeFailedOp, encodeHandleOps, packUserOperation, startMiniBundler, u
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH, accountCreationCode, hexToBytes,
     keccak256 } from './expected-codehashes.mjs';
 import { deriveTransitOwnerKey } from '../sdk/services/zkapiGasless.mjs';
+import { MUTUAL_CLOSE_TOPIC, closeRelayFeePayload, closeRelayTicketHash, mutualCloseLogMatches, newTicketSecret }
+    from '../sdk/services/zkapiCloseRelay.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SETUP_DIR = path.join(ROOT, 'protocol/setup/v2-concession-dev');
@@ -37,7 +39,7 @@ const SETUP_DIR = path.join(ROOT, 'protocol/setup/v2-concession-dev');
 export const CHAIN_ID = 11155111;
 const GWEI = 1_000_000_000n;
 const DEPOSIT = 1_000_000; // gwei: 0.001 ETH per note
-const CAP = 50_000; // request_charge_cap: every request's solvency bound
+export const CAP = 50_000; // request_charge_cap: every request's solvency bound
 const MOCK_USAGE_MICRO_USD = 1_000;
 const MOCK_PRICE = 250_000_000_000n; // $2,500 / ETH, eight decimal places.
 // One accepted inference ($0.001 at $2,500) costs ceil(1e3 µUSD → gwei) = 400.
@@ -81,8 +83,9 @@ const CHALLENGE_PRIORITY_FEE_PER_GAS = 2n * GWEI;
 const MNEMONIC = 'test test test test test test test test test test test junk';
 // Every role has its own account: the deployer/owner, the challenger, the
 // treasury, the clients, destinations, a third party and, for gasless
-// withdrawals, the mini bundler's sender, the gasless SDK owner and a griefer.
-const ANVIL_ACCOUNTS = 13;
+// withdrawals, the mini bundler's sender, the gasless SDK owner and a griefer;
+// last, the operator's close relayer (index 13, its key derived from the mnemonic).
+const ANVIL_ACCOUNTS = 14;
 // The paymaster's and the factory's EntryPoint stakes and the paymaster's
 // initial float (Deploy.s.sol requires them explicitly off local chain IDs).
 const PAYMASTER_STAKE_WEI = 100_000_000_000_000_000n;
@@ -578,6 +581,50 @@ export function gasLedger() {
     };
 }
 
+// The operator's close relay of the relayed-close scenario
+// (docs/native-eth-billing.md, "Close relay"): the fee of one relayed close in
+// gwei (below CAP, so a request of any bound pays it), and the relay's fee cap.
+export const RELAY_FEE = 20_000;
+export const RELAY_MAX_FEE_PER_GAS = 100n * GWEI;
+export const RELAY_BATCH_TARGET = 2;
+// The batch selector the relay sends, and the vault's single close.
+export const MUTUAL_CLOSE_BATCH_SELECTOR = '0x178cd980';
+export const MUTUAL_CLOSE_SELECTOR = '0x72cd2e44';
+
+// serverd's relay flags (appended after `serverd`): sends through `rpcUrl`
+// (the close-relay signer) from `sender`; simulations, estimates and receipts
+// over the native billing RPC (the default). A batch goes out once
+// `batchTarget` closes wait, polled every second, final after one block.
+export function relayServerArgs({ rpcUrl, sender, feeUnits = RELAY_FEE, batchTarget = RELAY_BATCH_TARGET,
+    maxFeePerGas = RELAY_MAX_FEE_PER_GAS } = {}) {
+    assert.ok(rpcUrl && sender, 'the relay needs its RPC and its sender');
+    return ['--relay-fee-units', String(feeUnits), '--relay-rpc-url', rpcUrl, '--relay-sender', sender,
+        '--relay-max-fee-per-gas', String(maxFeePerGas), '--relay-batch-target', String(batchTarget), '--relay-max-batch', '4',
+        '--relay-flush-age-seconds', '1200', '--relay-poll-seconds', '1', '--relay-confirmations', '1',
+        '--relay-bump-after-seconds', '30'];
+}
+
+// What is wrong with a relay transaction that should carry exactly `closes`
+// ({ noteId, nullifier, finalBalance, destination }) through the batcher:
+// mined, sent by the relayer to the batcher with mutualCloseBatch, and one
+// MutualClose of the vault per close (none other). Empty when it is right.
+export function relayedCloseProblems(receipt, transaction, { batcher, vault, sender, closes }) {
+    const problems = [];
+    const lower = value => String(value ?? '').toLowerCase();
+    if (receipt?.status !== '0x1') problems.push(`status ${receipt?.status}`);
+    if (lower(receipt?.to) !== lower(batcher)) problems.push(`sent to ${receipt?.to}, not the batcher`);
+    if (lower(receipt?.from) !== lower(sender)) problems.push(`sent from ${receipt?.from}, not the relayer`);
+    if (!lower(transaction?.input).startsWith(MUTUAL_CLOSE_BATCH_SELECTOR)) problems.push(`not mutualCloseBatch (${String(transaction?.input).slice(0, 10)})`);
+    if (BigInt(transaction?.value ?? 0) !== 0n) problems.push('carries value');
+    const logs = receipt?.logs ?? [];
+    const closeLogs = logs.filter(log => lower(log.address) === lower(vault) && lower(log.topics?.[0]) === MUTUAL_CLOSE_TOPIC);
+    if (closeLogs.length !== closes.length) problems.push(`${closeLogs.length} MutualClose events, expected ${closes.length}`);
+    for (const close of closes) {
+        if (!mutualCloseLogMatches(logs, { vault, ...close })) problems.push(`no MutualClose of note ${close.noteId}`);
+    }
+    return problems;
+}
+
 function options(args) {
     const parsed = { binDir: path.join(ROOT, 'target/acceptance/release'), outputDir: path.join(ROOT, '.zkapi/acceptance'),
         stopAfter: null };
@@ -612,12 +659,12 @@ async function main() {
         console.log('Usage: node scripts/v2-acceptance.mjs [--bin-dir target/acceptance/release] [--output-dir .zkapi/acceptance] [--stop-after STEP]\n'
             + 'Runs only disposable loopback services, with mock provider, OA org and price feed. See docs/v2-acceptance.md.\n'
             + '--stop-after ends a development run early, after one of: deploy, stack, honest, stale, clients, mismatch, sdk-honest,\n'
-            + 'sdk-close, raise, companion, companion-close, gasless-close, gasless-bundler, gasless-griefing, gasless-replay,\n'
+            + 'sdk-close, relay-close, raise, companion, companion-close, gasless-close, gasless-bundler, gasless-griefing, gasless-replay,\n'
             + 'gasless-fallback, gasless-escape, gasless-reuse, gasless-sdk-escape, pause, gasless-pause, pause-max, gasless-reopen, anchors,\n'
             + 'lie-expired, withhold, rebuild, hang, missed, late-successor.');
         return;
     }
-    const { AbiCoder, Interface, Wallet, getBytes } = await import(
+    const { AbiCoder, HDNodeWallet, Interface, Wallet, getBytes } = await import(
         pathToFileURL(path.join(ROOT, 'docker/aws/signer/node_modules/ethers/lib.esm/index.js')).href);
     const coder = AbiCoder.defaultAbiCoder();
     const started = Date.now();
@@ -794,7 +841,7 @@ async function main() {
         const [owner, challengerAccount, treasury] = accounts;
         // Each client and destination has its own account.
         const account = Object.fromEntries(['driver', 'companion', 'sdk', 'destination', 'thirdParty', 'sdkDestination', 'companionDestination',
-            'bundler', 'gaslessSdk', 'griefer'].map((name, index) => [name, accounts[3 + index]]));
+            'bundler', 'gaslessSdk', 'griefer', 'relayer'].map((name, index) => [name, accounts[3 + index]]));
         assert.ok(Object.values(account).every(Boolean), 'Anvil serves an account for every role');
         // Mines a block every second, so block time follows the wall clock
         // (CHAIN_LAG_SECONDS behind it) and confirmations and the finalized
@@ -1124,7 +1171,7 @@ async function main() {
         const oaOrgMock = mockOaOrg(mock, oaOptions);
         oaOptions.verifierUrl = await serve(oaOrgMock.verifier);
         const oaOrgUrl = await serve(oaOrgMock.org);
-        const serverArgs = (listenPort, db, { adversary = null, manifest = manifestPath, keySource = 'openrouter' } = {}) => [
+        const serverArgs = (listenPort, db, { adversary = null, manifest = manifestPath, keySource = 'openrouter', relay = null } = {}) => [
             '--chain-id', String(CHAIN_ID), '--contract-address', vaultAddress, '--request-charge-cap', String(CAP),
             '--proof-setup-dir', SETUP_DIR, ...(adversary ? ['--adversary', adversary] : []), 'serverd',
             '--listen', `127.0.0.1:${listenPort}`, '--openrouter-api-base', providerUrl,
@@ -1134,7 +1181,7 @@ async function main() {
             '--openrouter-settlement-poll-seconds', String(TIMING.settlementPoll),
             '--openrouter-settlement-deadline-seconds', String(TIMING.settlementDeadline),
             '--deployment', manifest, '--native-billing-rpc-url', pinnedRpcUrl, '--native-price-feed-address', feed,
-            '--db-path', db, '--indexer-url', indexerUrl, '--root-poll-interval-ms', '100'];
+            '--db-path', db, '--indexer-url', indexerUrl, '--root-poll-interval-ms', '100', ...(relay ? relayServerArgs(relay) : [])];
         // Each refused start uses its own database path and must exit non-zero.
         async function refusedStart(label, env, refusal, argsFor = (port, db) => serverArgs(port, db)) {
             const db = path.join(runDir, `refused-${label}.db`);
@@ -1157,10 +1204,10 @@ async function main() {
             port => serverArgs(port, tamperedDb, { manifest: tamperedManifest }));
         let server = null;
         let serverStarts = 0;
-        async function startServer(adversary = null, { keySource = 'openrouter' } = {}) {
+        async function startServer(adversary = null, { keySource = 'openrouter', relay = null } = {}) {
             if (server) await stop(server);
-            server = launch(zkapi, serverArgs(serverPort, dbPath, { adversary, keySource }),
-                `server-${++serverStarts}-${adversary ?? 'honest'}${keySource === 'oa_org' ? '-oa-org' : ''}.log`,
+            server = launch(zkapi, serverArgs(serverPort, dbPath, { adversary, keySource, relay }),
+                `server-${++serverStarts}-${adversary ?? 'honest'}${keySource === 'oa_org' ? '-oa-org' : ''}${relay ? '-relay' : ''}.log`,
                 { env: { ...seedEnv, ...(keySource === 'oa_org' ? { ZKAPI_OA_ORG_SHARED_SECRET: oaSecret } : {}) } });
             gate.target = serverUrl;
             await waitFor('serverd ready at the chain root', async () => {
@@ -1809,6 +1856,185 @@ async function main() {
             return { note_id: noteId, ...closed };
         });
         stopAfter('sdk-close');
+
+        // The operator's close relay (docs/native-eth-billing.md, "Close
+        // relay"): serverd relays cooperative closes through the exit batcher
+        // from its own account, sending through the signer sidecar in its
+        // close-relay role. A wallet-driver note and an SDK note (fees:
+        // 'relay') each pay the fee as one request at their state, clear and
+        // prove the close at the successor, and hand it over with the
+        // ticket's secret; the relay lands both in one mutualCloseBatch, and
+        // the treasury's share of each close is the fee.
+        await scenario('relayed cooperative close: the driver and the SDK pay the relay fee, and both closes land in one mutualCloseBatch sent through the close-relay signer', async () => {
+            const batcher = trusted.exit_batcher_address;
+            assert.ok(batcher, 'the manifest names the exit batcher');
+            const relayer = account.relayer.toLowerCase();
+            const relayerKey = HDNodeWallet.fromPhrase(MNEMONIC, undefined, `m/44'/60'/0'/0/${ANVIL_ACCOUNTS - 1}`).privateKey;
+            assert.equal(new Wallet(relayerKey).address.toLowerCase(), relayer, 'the relayer key is the last Anvil account\'s');
+            const relaySignerPort = await freePort();
+            const relaySignerUrl = `http://127.0.0.1:${relaySignerPort}`;
+            const relaySigner = launch(process.execPath, [path.join(ROOT, 'docker/aws/signer/server.mjs')], 'relay-signer.log', { env: {
+                ZKAPI_SIGNER_ROLE: 'close-relay', ZKAPI_CHALLENGE_CHAIN_ID: String(CHAIN_ID), ZKAPI_CHALLENGE_PRIVATE_KEY: relayerKey,
+                ZKAPI_CHALLENGE_VAULT: vaultAddress, ZKAPI_CHALLENGE_EXIT_BATCHER: batcher, ZKAPI_CHALLENGE_RPC_URL: rpcUrl,
+                ZKAPI_CHALLENGE_PORT: String(relaySignerPort), ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: String(RELAY_MAX_FEE_PER_GAS) } });
+            const relaySignerHealth = await waitFor('relay signer health', async () => {
+                const health = await request(`${relaySignerUrl}/health`);
+                return health.status === 200 && health.value;
+            });
+            assert.equal(relaySignerHealth.role, 'close-relay');
+            assert.equal(relaySignerHealth.sender.toLowerCase(), relayer);
+            // Every transaction serverd sends reaches the signer through this
+            // recorder: only mutualCloseBatch to the batcher, from the relayer.
+            const relaySends = [];
+            const relayRpcUrl = await serve(async (req, res) => {
+                const call = await body(req);
+                let send;
+                if (call.method === 'eth_sendTransaction') {
+                    try {
+                        const tx = call.params[0];
+                        // Beside the challenger's EIP-1559 fields, only this
+                        // chain's ID and a zero value.
+                        const { chainId, value, ...fields } = tx;
+                        assert.equal(BigInt(chainId), BigInt(CHAIN_ID));
+                        assert.equal(BigInt(value), 0n);
+                        send = { to: tx.to.toLowerCase(), selector: tx.data.slice(0, 10), gas: Number(BigInt(tx.gas)),
+                            fees: challengeFees(fields, RELAY_MAX_FEE_PER_GAS), at: Date.now() };
+                        assert.equal(tx.from.toLowerCase(), relayer);
+                        assert.ok(send.to === batcher && send.selector === MUTUAL_CLOSE_BATCH_SELECTOR, json(send));
+                        relaySends.push(send);
+                    } catch (error) {
+                        fatal ??= error;
+                        throw error;
+                    }
+                }
+                const reply = await proxyJsonRpc(relaySignerUrl, call);
+                if (send) Object.assign(send, reply.error ? { error: reply.error } : { hash: reply.result });
+                respond(res, 200, reply);
+            });
+            await startServer(null, { relay: { rpcUrl: relayRpcUrl, sender: relayer } });
+            const terms = await get(`${gateUrl}/v2/withdraw/relay/terms`);
+            assert.equal(terms.enabled, true);
+            assert.equal(terms.fee_units, String(RELAY_FEE));
+            assert.equal(terms.exit_batcher.toLowerCase(), batcher);
+            assert.equal(terms.batch_target, RELAY_BATCH_TARGET);
+
+            // The driver: the fee request at the deposit's state.
+            const client = await wallet('relay');
+            const note = await driverDeposit(client);
+            const secret = newTicketSecret();
+            const feeId = `acceptance-relay-fee-${randomUUID()}`;
+            const feePath = await treePath(client, note.noteId);
+            const prepared = await client('prepare_request', { args: { payload: closeRelayFeePayload(RELAY_FEE, secret),
+                active_root: feePath.active_root, merkle_siblings: feePath.siblings, client_request_id: feeId, request_time: wallNow(),
+                created_at_ms: Date.now() } });
+            const paid = await request(`${gateUrl}/v2/withdraw/relay/fee`, { method: 'POST', value: prepared.request });
+            assert.equal(paid.status, 200, `relay fee refused: ${json(paid.value)}`);
+            assert.equal(Number(paid.value.charge_applied), RELAY_FEE, 'the fee request charges exactly the fee');
+            const receiptPayload = JSON.parse(paid.value.response_payload);
+            assert.equal(receiptPayload.status, 'relay_fee_paid');
+            assert.equal(receiptPayload.ticket_hash, closeRelayTicketHash(secret));
+            const installed = await client('complete_response', { response: paid.value });
+            assert.equal(installed.state.note.current_balance, DEPOSIT - RELAY_FEE);
+            // The close at the successor, cleared like any other.
+            const closePath = await treePath(client, note.noteId);
+            const { granted } = await clearance(client, closePath);
+            assert.equal(granted.status, 200, `clearance refused: ${json(granted.value)}`);
+            const driverDestination = '0x000000000000000000000000000000000000c1a1';
+            const close = await client('prepare_withdrawal', { args: { mode: 'mutual', destination: driverDestination,
+                valid_until: wallNow() + 10_800, active_root: closePath.active_root, merkle_siblings: closePath.siblings, clearance: granted.value } });
+            assert.equal(Number(close.public_inputs.final_balance), DEPOSIT - RELAY_FEE);
+            assert.ok(close.calldata.startsWith(MUTUAL_CLOSE_SELECTOR));
+            const nullifier = close.public_inputs.withdrawal_nullifier;
+            const relayUrl = `${gateUrl}/v2/withdraw/relay`;
+            // A secret that paid no fee is refused; the paid one queues, once.
+            const unknown = await request(relayUrl, { method: 'POST',
+                value: { public_inputs: close.public_inputs, proof: close.proof, ticket_secret: newTicketSecret() } });
+            assert.equal(unknown.status, 400, json(unknown.value));
+            assert.equal(unknown.value.error_code, 'relay_ticket_unknown');
+            const submission = { public_inputs: close.public_inputs, proof: close.proof, ticket_secret: secret };
+            const queued = await request(relayUrl, { method: 'POST', value: submission });
+            assert.equal(queued.status, 202, `relay refused: ${json(queued.value)}`);
+            assert.equal(queued.value.status, 'queued');
+            assert.equal(queued.value.self_submit, false);
+            const resent = await request(relayUrl, { method: 'POST', value: submission });
+            assert.equal(resent.status, 200, json(resent.value));
+            // One close is below the batch target: it waits.
+            await delay(3_000);
+            assert.equal((await get(`${relayUrl}/${nullifier}`)).status, 'queued');
+            assert.equal(relaySends.length, 0, 'nothing is sent below the batch target');
+            // The relay signer refuses anything but a close (here an escape
+            // with the close's arguments); the challenger's refuses the relay.
+            const notAClose = `${vault.getFunction('initiateEscapeWithdrawal').selector}${close.calldata.slice(10)}`;
+            const refusedByRelaySigner = await rpcRaw(relaySignerUrl, 'eth_sendTransaction', [{ from: relayer, to: vaultAddress,
+                data: notAClose, gas: hex(1_000_000), nonce: hex(0) }]);
+            assert.match(refusedByRelaySigner.error?.message ?? '', /Only canonical mutualClose calls are authorized/);
+
+            // The SDK: deposit, then a relayed close (its fee request proved in
+            // the WebAssembly worker), which lands in the same batch.
+            const sdk = await sdkAgent('relay', { walletAccount: account.sdk });
+            await sdk('init');
+            const deposited = await sdk('deposit', { amount: '0.001' });
+            const sdkNoteId = Number(deposited.note.note_id);
+            // The fee request proves at the indexer's tree: wait until it
+            // holds the new note (the SDK does not wait for the indexer).
+            await synchronizedTree();
+            await sdk('close_relay_timing', { timing: { pollMs: 1_000 } });
+            const sdkDestination = '0x000000000000000000000000000000000000c1a2';
+            const before = await balances(vaultAddress, treasury, driverDestination, sdkDestination, relayer);
+            const sentBefore = deposited.sent.length;
+            const closed = await sdk('withdraw', { mode: 'mutual', destination: sdkDestination, fees: 'relay' }, 900_000);
+            assert.equal(closed.result?.status, 'closed', json(closed.result));
+            assert.equal(closed.sent.length, sentBefore, `the SDK wallet sent nothing: ${json(closed.sent.slice(sentBefore))}`);
+            assert.ok(closed.statuses.some(message => /relay landed this close/.test(message)), json(closed.statuses));
+
+            const landed = await waitFor('the relay reports the driver\'s close landed', async () => {
+                const status = await get(`${relayUrl}/${nullifier}`);
+                return status.status === 'landed' && status;
+            }, 120_000, 500);
+            const receipt = await rpc('eth_getTransactionReceipt', [landed.transaction_hash]);
+            const transaction = await rpc('eth_getTransactionByHash', [landed.transaction_hash]);
+            gas.record('mutual_close_batch', receipt, { items: 2, client: 'relay' });
+            const sdkEvent = vaultEvents(receipt).find(event => event.name === 'MutualClose' && Number(event.args.noteId) === sdkNoteId);
+            assert.ok(sdkEvent, 'the SDK close is in the relay\'s batch');
+            const sdkNullifier = felt(sdkEvent.args.nullifier);
+            const problems = relayedCloseProblems(receipt, transaction, { batcher, vault: vaultAddress, sender: relayer, closes: [
+                { noteId: note.noteId, nullifier, finalBalance: DEPOSIT - RELAY_FEE, destination: driverDestination },
+                { noteId: sdkNoteId, nullifier: sdkNullifier, finalBalance: DEPOSIT - RELAY_FEE, destination: sdkDestination }] });
+            assert.deepEqual(problems, []);
+            const sdkStatus = await get(`${relayUrl}/${sdkNullifier}`);
+            assert.equal(sdkStatus.status, 'landed');
+            assert.equal(sdkStatus.transaction_hash, landed.transaction_hash);
+            assert.ok(relaySends.some(send => send.hash === landed.transaction_hash), 'the batch went through the relay signer');
+            const after = await balances(vaultAddress, treasury, driverDestination, sdkDestination, relayer);
+            const payout = BigInt(DEPOSIT - RELAY_FEE) * GWEI;
+            assert.equal(after[driverDestination] - before[driverDestination], payout);
+            assert.equal(after[sdkDestination] - before[sdkDestination], payout);
+            assert.equal(after[treasury] - before[treasury], 2n * BigInt(RELAY_FEE) * GWEI, 'each close\'s treasury share is the fee');
+            assert.equal(before[vaultAddress] - after[vaultAddress], 2n * BigInt(DEPOSIT) * GWEI);
+            const batchCost = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice);
+            assert.equal(before[relayer] - after[relayer], batchCost, 'the relayer paid the batch\'s gas and nothing else');
+            for (const noteId of [note.noteId, sdkNoteId]) assert.equal((await noteView(noteId)).status, NOTE.Closed);
+            const synced = await waitFor('the SDK closes the relayed record', async () => {
+                const state = await sdk('sync');
+                const record = state.withdrawals.find(item => Number(item.noteId) === sdkNoteId);
+                return record?.phase === 'closed' && { state, record };
+            }, 90_000, 2_000);
+            assert.equal(synced.state.note, null, 'the SDK holds no note after the relayed close');
+            await sdk.close();
+
+            // The relay stops with it: serverd without the relay flags.
+            await startServer();
+            assert.equal((await get(`${gateUrl}/v2/withdraw/relay/terms`)).enabled, false);
+            await stop(relaySigner);
+            return { batch_transaction: landed.transaction_hash, block: Number(BigInt(receipt.blockNumber)), batcher, relayer,
+                gas_used: Number(BigInt(receipt.gasUsed)), relayer_paid_wei: batchCost.toString(), fee_gwei: RELAY_FEE,
+                treasury_gwei: 2 * RELAY_FEE, payout_gwei: DEPOSIT - RELAY_FEE,
+                closes: [{ client: 'driver', note_id: note.noteId, nullifier }, { client: 'sdk', note_id: sdkNoteId, nullifier: sdkNullifier }],
+                sends: relaySends.map(({ to, selector, gas: limit, hash, error }) => ({ to, selector, gas: limit, hash, error })),
+                refused: { unknown_ticket: unknown.value.error_code, relay_signer_non_close: refusedByRelaySigner.error.message },
+                sdk_statuses: closed.statuses };
+        });
+        stopAfter('relay-close');
 
         // A destination whose receive() needs more than ESCAPE_PAYOUT_GAS
         // (five fresh SSTOREs): finalization credits it, claimEscapePayout

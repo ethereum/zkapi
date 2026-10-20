@@ -26,6 +26,13 @@ import {
     recordClearanceOutcome, recordReleasedProof, releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
 } from './zkapiExitPolicy.mjs';
 import { rebuildNotePath } from './zkapiTreeRebuild.mjs';
+import {
+    RELAY_FEE_UNADMITTABLE_AFTER_SECONDS,
+    closeRelayFeeOf,
+    closeRelayFeePayload,
+    closeRelayTicketHash,
+    newTicketSecret
+} from './zkapiCloseRelay.mjs';
 import { buildExitKitPayload, sealExitKit } from './zkapiExitKit.mjs';
 import { canaryLimits, canaryRefusal, deploymentMismatchError, verifyDeployment } from './zkapiDeploymentCheck.mjs';
 import { GASLESS_TIMING, bundlerClient, bundlerUrl as validBundlerUrl, gaslessError, gaslessPins } from './zkapiGasless.mjs';
@@ -476,6 +483,16 @@ function withDepositPath(next, previous) {
     return previous?.deposit_path && next && Number(next.note_id) === Number(previous.note_id)
         ? { ...next, deposit_path: previous.deposit_path }
         : next;
+}
+
+/** The public view of a close relay ticket: never its secret. */
+function publicCloseRelay(relay) {
+    return {
+        status: relay.phase === 'paid' ? 'paid' : relay.phase,
+        noteId: Number(relay.noteId),
+        feeUnits: String(relay.feeUnits),
+        ticketHash: closeRelayTicketHash(relay.secret)
+    };
 }
 
 function nowSeconds() {
@@ -2732,6 +2749,193 @@ class BrowserWalletRuntime extends EventTarget {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // The operator's close relay (zkapiCloseRelay.mjs): the fee is one
+    // ordinary request at the note's state, made before the withdrawal is
+    // prepared, whose successor carries the fee as spent; the ticket secret
+    // behind its payload's hash is kept in `runtime.closeRelay` and sent only
+    // with the close.
+    // ---------------------------------------------------------------------
+
+    /** The protocol server's relay terms ({ enabled: false } without a relay). */
+    async closeRelayTerms({ signal = null } = {}) {
+        await this.init();
+        return this.remoteJson(`${this.config.funding.protocol_server_url}/v2/withdraw/relay/terms`, { signal });
+    }
+
+    /**
+     * Pay the relay fee at the current state, or resume paying it: idempotent
+     * per note. Refused once the withdrawal is prepared, while another request
+     * is pending, and when the server does not relay.
+     */
+    async payCloseRelayFee({ onProgress = () => {}, signal = null } = {}) {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            return this.payCloseRelayFeeLocked({ onProgress, signal });
+        });
+    }
+
+    async payCloseRelayFeeLocked({ onProgress = () => {}, signal = null } = {}) {
+        throwIfAborted(signal);
+        const state = this.runtime.state;
+        if (!state) throw new Error('There is no active private note to withdraw.');
+        const serverUrl = this.config.funding.protocol_server_url;
+        let relay = this.runtime.closeRelay;
+        if (relay && Number(relay.noteId) !== Number(state.note_id)) relay = null;
+        if (relay?.phase === 'paid') return publicCloseRelay(relay);
+        const journal = this.runtime.journal;
+        if (relay?.clientRequestId && !journal) {
+            // The journal ended: installed by a recovery (the fee is paid), or
+            // set aside (start over with a fresh ticket).
+            const installed = (this.requestArchive || []).some(entry => entry.clientRequestId === relay.clientRequestId
+                && entry.disposition === 'installed');
+            if (installed) {
+                await this.commit({ ...this.runtime, closeRelay: { ...relay, phase: 'paid' } });
+                return publicCloseRelay(this.runtime.closeRelay);
+            }
+            relay = null;
+        }
+        if (journal) {
+            const ours = Boolean(relay?.clientRequestId) && journalClientRequestId(journal) === relay.clientRequestId;
+            if (!ours) {
+                throw new BrowserWalletHttpError('Finish the pending private request before paying the relay fee.', 409, 'lease_pending');
+            }
+            const request = journal.prepared_request;
+            if (nowSeconds() > Number(request.public_inputs.request_time) + RELAY_FEE_UNADMITTABLE_AFTER_SECONDS) {
+                // Too old to be admitted now: install it if the server holds
+                // it, set it aside if the server never will.
+                const observed = await this.nullifierServerStatus(journal.nullifier, signal);
+                if (observed.status === 'finalized' && observed.response) {
+                    await this.installRecoveredResponse(request.client_request_id, onProgress,
+                        { response: observed.response, signal });
+                    await this.commit({ ...this.runtime, closeRelay: { ...this.runtime.closeRelay, phase: 'paid' } });
+                    return publicCloseRelay(this.runtime.closeRelay);
+                }
+                if (observed.status !== 'unknown') {
+                    throw new BrowserWalletHttpError('The server is still settling the relay fee request. Try again shortly.',
+                        409, 'request_settlement_pending');
+                }
+                const record = this.tryRequestJournalRecord(journal, state, {
+                    disposition: 'discarded_expired_unaccepted',
+                    observations: [requestObservation('unaccepted', 'recovery')]
+                });
+                await this.commit({ ...this.runtime, journal: null, closeRelay: null }, record ? { requestArchive: [record] } : {});
+                return this.payCloseRelayFeeLocked({ onProgress, signal });
+            }
+            return this.sendCloseRelayFeeLocked(request, { onProgress, signal });
+        }
+        if (this.runtime.exitLock || this.runtime.preparedWithdrawal) {
+            throw new BrowserWalletHttpError(
+                'The relay fee is paid before the withdrawal is prepared; this withdrawal is already prepared, so submit it from your wallet.',
+                409, 'withdrawal_prepared');
+        }
+        if (!this.archiveKey(state)) throw new Error('The prepared request journal is incomplete.');
+        this.assertAnchorAcceptsRequest(state);
+        const terms = await this.closeRelayTerms({ signal });
+        if (terms?.enabled !== true || !/^[1-9][0-9]*$/.test(String(terms.fee_units ?? ''))) {
+            throw new BrowserWalletHttpError('This server does not relay withdrawals; submit it from your wallet.', 409, 'relay_disabled');
+        }
+        const fee = Number(terms.fee_units);
+        const boundAtState = Number(state.bound_at_state || 0);
+        if (!Number.isSafeInteger(fee) || Number(state.current_balance) <= fee || (boundAtState > 0 && boundAtState < fee)) {
+            throw new BrowserWalletHttpError('This balance cannot pay the relay fee; submit the withdrawal from your wallet.', 409, 'relay_fee_unpayable');
+        }
+        const bound = boundAtState > 0 ? boundAtState : fee;
+        // The secret is durable before its hash can leave this device.
+        relay = { noteId: Number(state.note_id), secret: newTicketSecret(), feeUnits: String(fee),
+            clientRequestId: null, phase: 'proving', createdAt: Date.now() };
+        await this.commit({ ...this.runtime, closeRelay: relay });
+        onProgress('syncing', 'Checking your private balance…');
+        const path = await this.treePath(state.note_id, true, null, signal);
+        throwIfAborted(signal);
+        onProgress('proving', 'Proving the relay fee is funded…');
+        const now = Date.now();
+        const prepared = await this.worker.call('prepareRequest', {
+            config: {
+                ...this.config.wallet_core,
+                request_charge_cap: bound,
+                policy_charge_cap: this.config.policy_enabled ? bound : this.config.wallet_core.policy_charge_cap
+            },
+            state,
+            args: {
+                payload: closeRelayFeePayload(fee, relay.secret),
+                active_root: path.active_root,
+                merkle_siblings: path.siblings,
+                client_request_id: uuid(),
+                request_time: Math.floor(now / 1000),
+                created_at_ms: now
+            },
+            provingKey: this.config.proving_keys.request
+        });
+        throwIfAborted(signal);
+        const record = this.tryRequestJournalRecord(prepared.journal, state);
+        if (!record || !sameFelt(prepared.request?.public_inputs?.request_nullifier, prepared.journal.nullifier)
+            || !sameStateExceptBound(prepared.state, state)
+            || Number(prepared.state.bound_at_state) !== Number(prepared.request?.public_inputs?.solvency_bound)) {
+            throw new Error('The prepared request journal is incomplete.');
+        }
+        // State, journal, archive record and ticket in one durable write
+        // before the request can leave (design §6.2).
+        await this.commit({ ...this.runtime, state: withDepositPath(prepared.state, state), journal: prepared.journal,
+            closeRelay: { ...relay, phase: 'sent', clientRequestId: prepared.request.client_request_id } },
+        { requestArchive: [record] });
+        return this.sendCloseRelayFeeLocked(prepared.request, { onProgress, signal });
+    }
+
+    /** POST the journaled fee request and install its signed successor. */
+    async sendCloseRelayFeeLocked(request, { onProgress = () => {}, signal = null } = {}) {
+        onProgress('relay_fee', 'Paying the relay fee…');
+        let response;
+        try {
+            response = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/withdraw/relay/fee`, {
+                method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal
+            });
+        } catch (error) {
+            if (['stale_root', 'relay_fee_changed', 'relay_ticket_taken'].includes(error?.code)) {
+                // Never admitted: set aside (a later receipt still installs
+                // from the archive) and start over with fresh terms.
+                const record = this.tryRequestJournalRecord(this.runtime.journal, this.runtime.state, {
+                    disposition: 'discarded_stale_root',
+                    observations: [requestObservation('unaccepted', 'recovery')]
+                });
+                await this.commit({ ...this.runtime, journal: null, closeRelay: null }, record ? { requestArchive: [record] } : {});
+            }
+            throw error;
+        }
+        const installed = await this.installRecoveredResponse(request.client_request_id, onProgress, { response, signal });
+        if (installed !== true) throw new Error('The relay fee receipt could not be applied to this balance.');
+        await this.commit({ ...this.runtime, closeRelay: { ...this.runtime.closeRelay, phase: 'paid' } });
+        return publicCloseRelay(this.runtime.closeRelay);
+    }
+
+    /**
+     * Hand a prepared cooperative close to the relay with the paid ticket.
+     * Idempotent on the server: the same close returns its status.
+     */
+    async submitCloseRelay(plan, { signal = null } = {}) {
+        await this.init();
+        const relay = this.runtime?.closeRelay;
+        if (relay?.phase !== 'paid' || Number(relay.noteId) !== Number(plan?.public_inputs?.note_id)) {
+            throw new BrowserWalletHttpError('No relay fee is paid for this withdrawal.', 409, 'relay_fee_unpaid');
+        }
+        return this.remoteJson(`${this.config.funding.protocol_server_url}/v2/withdraw/relay`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, signal,
+            body: JSON.stringify({ public_inputs: plan.public_inputs, proof: plan.proof, ticket_secret: relay.secret })
+        });
+    }
+
+    /** The relay's status of the close at `withdrawalNullifier` ({ status: 'unknown' } if none). */
+    async closeRelayStatus(withdrawalNullifier, { signal = null } = {}) {
+        await this.init();
+        try {
+            return await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/withdraw/relay/${encodeURIComponent(withdrawalNullifier)}`, { signal });
+        } catch (error) {
+            if (error?.status === 404 && error?.data?.status === 'not_found') return { status: 'unknown', self_submit: false };
+            throw error;
+        }
+    }
+
     async verifyLease(lease, expectedLimitCredits, expectedRequestId, onProgress = () => {}, signal = null, expectedQuote = null, {
         proofBoundQuote = false
     } = {}) {
@@ -3438,13 +3642,23 @@ class BrowserWalletRuntime extends EventTarget {
             throw new BrowserWalletHttpError(RECEIPT_UNRECOVERABLE_MESSAGE, 409, 'receipt_unrecoverable',
                 { nullifier_status: 'finalized' });
         }
-        // The quote was validated against the pins when the proof was made; a
-        // receipt only has to carry exactly that proof-bound quote.
-        const quote = requestBillingQuote(journal.prepared_request);
-        validateProofBoundQuote(quote, this.config.funding);
         let payload;
         try { payload = JSON.parse(receipt.response_payload); } catch { /* Reject below. */ }
-        if (!sameNativeQuote(payload?.billing_quote, quote)) throw new Error('The settlement receipt changed the authorized ETH/USD quote.');
+        const relayFee = closeRelayFeeOf(journal.prepared_request);
+        if (relayFee) {
+            // A close relay fee request: charged exactly the fee it named,
+            // for the ticket it named.
+            if (payload?.status !== 'relay_fee_paid' || payload?.ticket_hash !== relayFee.ticketHash
+                || String(receipt.charge_applied) !== relayFee.feeUnits) {
+                throw new Error('The relay fee receipt does not match the fee request.');
+            }
+        } else {
+            // The quote was validated against the pins when the proof was made; a
+            // receipt only has to carry exactly that proof-bound quote.
+            const quote = requestBillingQuote(journal.prepared_request);
+            validateProofBoundQuote(quote, this.config.funding);
+            if (!sameNativeQuote(payload?.billing_quote, quote)) throw new Error('The settlement receipt changed the authorized ETH/USD quote.');
+        }
         const lock = this.runtime.exitLock;
         const lockHere = Boolean(lock && state && Number(lock.noteId) === Number(state.note_id)
             && sameFelt(lock.anchor, state.current_anchor));
@@ -3684,6 +3898,19 @@ class BrowserWalletRuntime extends EventTarget {
                         onProgress,
                         { response: recovery.request_response }
                     );
+                }
+                if (recovery.status === 'not_found'
+                    && recovery.nullifier_status === 'unknown' && !recovery.request_response
+                    && closeRelayFeeOf(request)) {
+                    // A relay fee request the server never admitted, and is
+                    // now too old for it to admit: set aside.
+                    if (nowSeconds() <= Number(request.public_inputs.request_time) + RELAY_FEE_UNADMITTABLE_AFTER_SECONDS) return false;
+                    const record = this.tryRequestJournalRecord(this.runtime.journal, this.runtime.state, {
+                        disposition: 'discarded_expired_unaccepted',
+                        observations: [requestObservation('unaccepted', 'recovery')]
+                    });
+                    await this.commit({ ...this.runtime, journal: null, closeRelay: null }, record ? { requestArchive: [record] } : {});
+                    return true;
                 }
                 if (recovery.status === 'not_found'
                     && recovery.nullifier_status === 'unknown' && !recovery.request_response) {

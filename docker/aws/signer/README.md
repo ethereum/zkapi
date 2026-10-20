@@ -111,6 +111,50 @@ before any upstream call when the signer has no batcher (`Destination is not
 authorized`), which the challenger takes as a reason to send single calls until
 it restarts.
 
+## Close-relay role
+
+The same image signs for serverd's close relay
+([close relay](../../../docs/native-eth-billing.md#close-relay)) when started
+with `ZKAPI_SIGNER_ROLE=close-relay` (default `challenger`). Run it as a
+separate instance (Compose service `relay-signer`, profile `relay`, port 8548,
+[`../relay-signer.env.example`](../relay-signer.env.example)) with a key of its
+own: the relay's sends must never spend the challenger's float. The variables
+keep their `ZKAPI_CHALLENGE_` names; `ZKAPI_CHALLENGE_EXIT_BATCHER` is required
+in this role, and leaf retirements are off.
+
+In this role it signs only, from its key and with zero value:
+
+| Call | Selector | To |
+| --- | --- | --- |
+| `mutualCloseBatch(WithdrawalPublicInputs[], bytes)` | `0x178cd980` | the exit batcher |
+| `mutualClose(WithdrawalPublicInputs, bytes)` | `0x72cd2e44` | the vault |
+
+and only when:
+
+- the calldata is canonical ABI, with one 256-byte proof per close;
+- a batch has 1 to `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` closes (default 64 in
+  this role) of distinct withdrawal nullifiers;
+- every close is a cooperative close of this deployment: protocol version 2,
+  this chain, this vault, kind 1, no successor nullifier, nothing conceded,
+  and a destination that is neither zero nor the vault;
+- the batcher's `vault()` is the vault (read at startup, as for the
+  challenger's batches);
+- the simulation succeeds and, for a batch, applies at least one close
+  (`batch_applies_nothing`).
+
+The gas limit cap, fee and tip caps, transaction fee cap, balance check,
+estimate check, nonce handling and refusal reasons are those of the challenger
+role. Every challenger call (defeat, raise, retirement, `challengeBatch`) is
+refused in this role, and the challenger role refuses both relay calls. Audit
+lines are `close_relay_signed` and `close_relay_refused`; `/health` and status
+report `role`.
+
+serverd sends through it with `--relay-rpc-url http://relay-signer:8548` and
+`--relay-sender` set to its `/health` sender. The signer returns no revert data
+for a simulation, so serverd's simulations, estimates and receipts go to
+`--relay-read-rpc-url` (default: `--native-billing-rpc-url`); only
+`eth_sendTransaction` and the sender's nonces use the signer.
+
 ## Fee model
 
 Every transaction is type 2. The chain charges `min(maxFeePerGas, baseFee +
@@ -493,9 +537,13 @@ budget (nonces per rolling day, free same-nonce replacements, one pending nonce
 per note, what counts), the no-broadcast
 guarantee, candidate hashes, idempotent re-sends, status warnings, mismatched
 deployment bindings, forbidden methods, durable nonce retries and sanitized
-HTTP errors. `npm run test:anvil` runs a disposable anvil (`--chain-id
+HTTP errors; and the close-relay role: its two calls, every refused close
+(kind, deployment, destination, repeated nullifier, size, proof length,
+encoding), the refusal of every challenger call (and the challenger role's
+refusal of relay calls), and its role switch. `npm run test:anvil` runs a disposable anvil (`--chain-id
 11155111`, automine off). It checks the price actually charged, the base-fee and
-balance refusals, and same-nonce replacement. Anvil has no `--rpc.txfeecap`, so
+balance refusals, same-nonce replacement, and relay batches and closes that
+mine. Anvil has no `--rpc.txfeecap`, so
 the fee-cap test puts a JSON-RPC proxy in front of it that refuses broadcasts
 above 1 ETH with geth's exact error. Without anvil those tests are skipped
 unless `ZKAPI_REQUIRE_ANVIL=1`, which makes a missing anvil a failure. No test

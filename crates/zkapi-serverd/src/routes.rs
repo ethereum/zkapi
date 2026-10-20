@@ -13,6 +13,11 @@
 //!   server reserved at a nullifier (clients' stale-device check); 404 when it
 //!   holds none, 410 once the nullifier is published on chain
 //! - GET  /v1/dashboard/settlement  -- operator-only pending leases and reviews
+//! - GET  /v2/withdraw/relay/terms  -- the close relay's fee and timing
+//! - POST /v2/withdraw/relay/fee    -- the relay fee request (a request proof
+//!   whose successor carries the fee)
+//! - POST /v2/withdraw/relay        -- queue a finished cooperative close
+//! - GET  /v2/withdraw/relay/:nullifier -- a relayed close's status
 
 use std::convert::Infallible;
 use std::future::IntoFuture;
@@ -130,6 +135,7 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
     // O7: how long a settled request's signature waits for a consuming exit
     // to be defeated.
     config.challenge_period_seconds = Some(binding.challenge_period_seconds);
+    let relay_chain = prepare_close_relay(&mut config, &manifest, retry).await?;
     let store = Arc::new(NullifierStore::new(&config.db_path)?);
     let initial_root = if let Some(indexer_url) = config.indexer_url.as_deref() {
         match fetch_indexer_root(indexer_url).await {
@@ -173,6 +179,20 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
             Duration::from_secs(lease.settlement_poll_seconds.max(1)),
         );
     }
+    if let (Some(chain), Some(relay)) = (relay_chain, config.close_relay.clone()) {
+        tracing::info!(
+            batcher = %relay.batcher_address,
+            sender = %relay.sender,
+            fee_units = relay.fee_units,
+            "close relay enabled"
+        );
+        crate::close_relay::spawn_relay_worker(Arc::new(crate::close_relay::RelayWorker::new(
+            processor.store().clone(),
+            relay,
+            chain,
+            vault_address_hex(&config.contract_address),
+        )));
+    }
     let router = create_router(processor);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!("Server listening on {}", config.listen_addr);
@@ -190,6 +210,82 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         serve.await?;
     }
     Ok(())
+}
+
+/// The close relay's startup (`crate::close_relay`): None without
+/// `--relay-*`. The relay needs the deployment manifest's exit batcher,
+/// which must pass `probe_exit_batcher` (runtime codehash, vault, adapter,
+/// item gas caps) over the native billing RPC; `--relay-batcher`, when
+/// given, must name it. The relayer's own RPC must serve this chain and see
+/// the batcher bound to this vault. Unavailable reads are retried like the
+/// vault binding's; a mismatch refuses to start.
+async fn prepare_close_relay(
+    config: &mut ServerConfig,
+    manifest: &DeploymentManifest,
+    retry: StartupRetry,
+) -> anyhow::Result<Option<crate::close_relay::RpcRelayChain>> {
+    let Some(relay) = config.close_relay.as_mut() else {
+        return Ok(None);
+    };
+    relay
+        .validate()
+        .context("refusing to start: invalid close relay")?;
+    let oracle = NativeBillingOracle::for_server(config)?;
+    let mut delay = retry.first_delay;
+    let mut attempt = 1;
+    let report = loop {
+        match crate::deployment::probe_exit_batcher(&oracle, manifest).await {
+            Ok(report) => break report,
+            Err(ProbeError::Unavailable(error)) if attempt < retry.attempts => {
+                tracing::warn!(attempt, error = %error, "exit batcher probe unavailable; retrying");
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+                attempt += 1;
+            }
+            Err(error) => {
+                anyhow::bail!("refusing to start the close relay: {error}")
+            }
+        }
+    };
+    let relay = config.close_relay.as_mut().expect("checked above");
+    let report = report.ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing to start: the close relay needs the deployment manifest's exit_batcher_address, which this manifest does not name"
+        )
+    })?;
+    if !relay.batcher_address.is_empty() && relay.batcher_address != report.address {
+        anyhow::bail!(
+            "refusing to start: --relay-batcher {} is not the deployment manifest's exit batcher {}",
+            relay.batcher_address,
+            report.address
+        );
+    }
+    relay.batcher_address = report.address.clone();
+    anyhow::ensure!(
+        relay.max_batch as u64 <= report.max_items,
+        "refusing to start: --relay-max-batch {} exceeds the exit batcher's MAX_ITEMS() {}",
+        relay.max_batch,
+        report.max_items
+    );
+    // Simulations need revert data, which a signer sidecar does not pass on:
+    // reads go to the native billing RPC unless --relay-read-rpc-url is set.
+    if relay.read_rpc_url.is_none() {
+        relay.read_rpc_url = config
+            .native_billing
+            .as_ref()
+            .map(|native| native.rpc_url.clone());
+    }
+    let chain = crate::close_relay::RpcRelayChain::new(relay, config.chain_id)?;
+    crate::close_relay::verify_batcher(
+        &chain,
+        relay,
+        config.chain_id,
+        &vault_address_hex(&config.contract_address),
+        Some(&manifest.proof_adapter_address),
+    )
+    .await
+    .context("refusing to start the close relay")?;
+    Ok(Some(chain))
 }
 
 /// The vault's currentRoot() for a server whose indexer cannot serve a
@@ -803,6 +899,13 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
             post(handle_native_lease_expiry),
         )
         .route("/v2/withdraw/clearance", post(handle_clearance))
+        .route("/v2/withdraw/relay", post(handle_close_relay_submit))
+        .route("/v2/withdraw/relay/terms", get(handle_close_relay_terms))
+        .route("/v2/withdraw/relay/fee", post(handle_close_relay_fee))
+        .route(
+            "/v2/withdraw/relay/{nullifier}",
+            get(handle_close_relay_status),
+        )
         .route(
             "/v2/requests/{client_request_id}",
             get(handle_recovery_by_id),
@@ -999,6 +1102,80 @@ async fn handle_clearance(
         .map_err(|e| {
             error_to_response(&e, &clearance_req.withdrawal_nullifier.to_hex(), &processor)
         })
+}
+
+/// GET /v2/withdraw/relay/terms -- the close relay's terms (`enabled: false`
+/// without a relay).
+async fn handle_close_relay_terms(
+    State(processor): State<AppState>,
+) -> Json<zkapi_types::wire::CloseRelayTermsResponse> {
+    Json(processor.close_relay_terms())
+}
+
+/// POST /v2/withdraw/relay/fee -- the relay fee request: its signed
+/// successor, with the fee as its charge.
+async fn handle_close_relay_fee(
+    State(processor): State<AppState>,
+    Json(request): Json<ApiRequestV2>,
+) -> Result<Json<zkapi_types::wire::RequestResponseV2>, ErrorHttpResponse> {
+    processor
+        .pay_close_relay_fee(&request)
+        .await
+        .map(Json)
+        .map_err(|error| error_to_response(&error, &request.client_request_id, &processor))
+}
+
+/// POST /v2/withdraw/relay -- queue a cooperative close: 202 when queued
+/// now, 200 for the same close submitted before.
+async fn handle_close_relay_submit(
+    State(processor): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<
+    (
+        StatusCode,
+        Json<zkapi_types::wire::CloseRelayStatusResponse>,
+    ),
+    ErrorHttpResponse,
+> {
+    let submission: zkapi_types::wire::CloseRelaySubmissionV2C = serde_json::from_slice(&body)
+        .map_err(|error| {
+            let error = ServerError::InvalidRequest(format!("invalid relay submission: {error}"));
+            error_to_response(&error, "relay", &processor)
+        })?;
+    let nullifier = submission.public_inputs.withdrawal_nullifier.to_hex();
+    processor
+        .submit_close_relay(&submission)
+        .await
+        .map(|(new, status)| {
+            let code = if new {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            (code, Json(status))
+        })
+        .map_err(|error| error_to_response(&error, &nullifier, &processor))
+}
+
+/// GET /v2/withdraw/relay/:nullifier -- a relayed close's status; 404 when
+/// the relay holds none.
+async fn handle_close_relay_status(
+    State(processor): State<AppState>,
+    Path(nullifier_hex): Path<String>,
+) -> Result<Response, ErrorHttpResponse> {
+    let nullifier = Felt252::from_hex(&nullifier_hex).map_err(|e| {
+        let err = ServerError::InvalidRequest(format!("invalid nullifier hex: {e}"));
+        error_to_response(&err, &nullifier_hex, &processor)
+    })?;
+    match processor.close_relay_status(&nullifier) {
+        Ok(Some(status)) => Ok(Json(status).into_response()),
+        Ok(None) => Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"status":"not_found"})),
+        )
+            .into_response()),
+        Err(error) => Err(error_to_response(&error, &nullifier_hex, &processor)),
+    }
 }
 
 /// GET /v1/requests/:client_request_id -- recover a response by client request ID.
@@ -1267,6 +1444,15 @@ fn build_error_response(
         }
         ServerError::RequestLimitExceeded { .. } => StatusCode::BAD_REQUEST,
         ServerError::Published => StatusCode::GONE,
+        ServerError::CloseRelay { code, .. } => match *code {
+            "relay_disabled" => StatusCode::NOT_FOUND,
+            "relay_conflict"
+            | "relay_ticket_redeemed"
+            | "relay_ticket_taken"
+            | "relay_fee_changed"
+            | "relay_already_closed" => StatusCode::CONFLICT,
+            _ => StatusCode::BAD_REQUEST,
+        },
     };
 
     let retry_after_seconds = match err {
@@ -3517,5 +3703,60 @@ pub(crate) mod settlement_route_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(summary["settlement"]["pending"], 1);
         assert_eq!(summary["settlement"]["provisioning"], 1);
+    }
+
+    /// The close relay needs the manifest's exit batcher: without one the
+    /// server refuses to start with the relay configured, before any relay
+    /// RPC; a --relay-batcher other than the manifest's is refused too.
+    #[tokio::test]
+    async fn the_close_relay_needs_the_manifests_exit_batcher() {
+        let seeds = crate::signer::strong_test_seeds();
+        let relay = crate::close_relay::CloseRelayConfig::new(
+            250_000,
+            String::new(),
+            "http://127.0.0.1:9".into(),
+            "0x00000000000000000000000000000000000000a1".into(),
+            50_000_000_000,
+        );
+        let mut config = ServerConfig {
+            contract_address: Felt252::from_hex("0xaa").unwrap(),
+            native_billing: Some(crate::test_support::native_config()),
+            close_relay: Some(relay),
+            ..Default::default()
+        };
+        let signer = ServerSigner::try_new(&seeds.0, &seeds.1).unwrap();
+        let manifest = DeploymentManifest::parse(
+            &crate::deployment::tests::manifest_json(
+                "0x00000000000000000000000000000000000000aa",
+                &VaultSigningKeys {
+                    state: signer.state_public_key(),
+                    clearance: signer.clearance_public_key(),
+                },
+                &crate::deployment::tests::dev_identity(),
+            )
+            .to_string(),
+        )
+        .unwrap();
+        let retry = StartupRetry {
+            attempts: 1,
+            first_delay: Duration::from_millis(1),
+        };
+        let error = prepare_close_relay(&mut config, &manifest, retry)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exit_batcher_address"), "{error}");
+        // Off: nothing is read or checked.
+        let mut off = ServerConfig::default();
+        assert!(prepare_close_relay(&mut off, &manifest, retry)
+            .await
+            .unwrap()
+            .is_none());
+        // An invalid relay policy is refused first.
+        let mut invalid = config.clone();
+        invalid.close_relay.as_mut().unwrap().fee_units = 0;
+        assert!(prepare_close_relay(&mut invalid, &manifest, retry)
+            .await
+            .is_err());
     }
 }

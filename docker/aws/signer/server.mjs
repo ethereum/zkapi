@@ -71,7 +71,7 @@ async function main() {
   server.headersTimeout = 10_000;
   server.listen(port, listenHost, () => {
     console.log(JSON.stringify({
-      status: 'listening', chain_id: Number(signer.chainId), sender: signer.sender, vault: signer.vault,
+      status: 'listening', role: status.role, chain_id: Number(signer.chainId), sender: signer.sender, vault: signer.vault,
       fee_model: 'eip1559', fee_cap_source: status.fee_cap_source,
       max_fee_per_gas_wei: decimal(status.max_fee_per_gas), priority_fee_per_gas_wei: decimal(status.priority_fee_per_gas),
       max_priority_fee_per_gas_wei: decimal(status.max_priority_fee_per_gas), fee_ceiling_wei: decimal(status.fee_ceiling),

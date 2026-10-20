@@ -120,7 +120,7 @@ func requestPaymentQuote(ctx context.Context, c config.Config, method, path, kin
 	// A kind of "" accepts the withdrawal route's kinds: the withdrawal and
 	// the gasless path's wallet-paid transit transactions.
 	kindAccepted := q.Kind == kind || (kind == "" && (q.Kind == "withdrawal" || zkapi.TransitKind(q.Kind)))
-	if err != nil || q.ChainID != chain || !kindAccepted || !validQuoteID(q.ID) || !fundingAddress(q.Address) || !fundingAddress(q.Contract) || (q.FeePolicy != "low" && q.FeePolicy != "payout") || q.EstimatedGas == 0 || q.GasLimit < q.EstimatedGas || q.ExpiresAt <= time.Now().UnixMilli() {
+	if err != nil || q.ChainID != chain || !kindAccepted || !validQuoteID(q.ID) || !fundingAddress(q.Address) || !fundingAddress(q.Contract) || (q.FeePolicy != "low" && q.FeePolicy != "payout" && q.FeePolicy != "relay") || q.EstimatedGas == 0 || q.GasLimit < q.EstimatedGas || q.ExpiresAt <= time.Now().UnixMilli() {
 		return q, errors.New("invalid payment quote or network")
 	}
 	if q.FeePolicy == "payout" {
@@ -144,6 +144,9 @@ func requestPaymentQuote(ctx context.Context, c config.Config, method, path, kin
 				return q, errors.New("invalid payout quote quantity")
 			}
 		}
+	}
+	if q.FeePolicy == "relay" && (q.Kind != "withdrawal" || !fundingBalance(q.RelayFeeUnits) || strings.TrimLeft(q.RelayFeeUnits, "0") == "") {
+		return q, errors.New("invalid relay quote")
 	}
 	if !zkapi.MatchesDeployment(c.ZKAPI.Network, q.DeploymentID, q.Contract) {
 		return q, errors.New("payment quote does not match the pinned deployment")
@@ -182,6 +185,10 @@ func printPaymentQuote(out io.Writer, q zkapi.AddressPaymentQuote, command strin
 	fmt.Fprintf(out, "Fixed amount: %s ETH\n", fundingUnits(principal, 18))
 	if q.Destination != "" {
 		fmt.Fprintln(out, "Destination:", q.Destination)
+	}
+	if q.FeePolicy == "relay" {
+		printRelayQuote(out, q, command)
+		return
 	}
 	if q.FeePolicy == "payout" {
 		printPayoutQuote(out, q)
@@ -235,4 +242,27 @@ func printPayoutQuote(out io.Writer, q zkapi.AddressPaymentQuote) {
 	if q.UserOpGas != nil {
 		fmt.Fprintf(out, "Signed gas limits: call %d, verification %d, pre-verification %d, paymaster verification %d, postOp %d; max fee %s wei/gas, priority %s wei/gas\n", q.UserOpGas.CallGasLimit, q.UserOpGas.VerificationGasLimit, q.UserOpGas.PreVerificationGas, q.UserOpGas.PaymasterVerificationGasLimit, q.UserOpGas.PaymasterPostOpGasLimit, q.MaxFeePerGas, q.MaxPriorityFeePerGas)
 	}
+}
+
+// printRelayQuote prints a relay quote: the operator's close relay lands the
+// cooperative close for its fee, taken from the private balance, and the
+// approval also pre-authorizes the wallet-paid close if the relay does not
+// land it in time.
+func printRelayQuote(out io.Writer, q zkapi.AddressPaymentQuote, command string) {
+	fmt.Fprintf(out, "The operator's close relay lands the close in a batch for its fee of %s ETH, taken from the private balance (the fixed amount above is the payout after it); no ETH is needed from the local signing address.\n", fundingUnits(new(big.Int).Mul(fundingInt(q.RelayFeeUnits), big.NewInt(1_000_000_000)).String(), 18))
+	fmt.Fprintf(out, "If the relay has not landed the close 20 minutes before its proof expires, this client submits it itself from the local signing address %s, within a fee allowance of %s ETH (available now: %s ETH); approving this quote authorizes that fallback too.\n", q.Address, fundingUnits(q.FeeReserveWei, 18), fundingUnits(q.BalanceWei, 18))
+	if command == "" {
+		fmt.Fprintf(out, "Quote expires: %s\nQuoting does not pay, sign or send.\n", time.UnixMilli(q.ExpiresAt).Format(time.RFC3339))
+		return
+	}
+	fmt.Fprintf(out, "Quote expires: %s\nTo authorize the relay fee and this close: %s --approve %s\nKeep the same --config-dir if used. Quoting does not pay, sign or send.\n", time.UnixMilli(q.ExpiresAt).Format(time.RFC3339), command, q.ID)
+}
+
+// fundingInt is a decimal quantity the quote validation accepted.
+func fundingInt(value string) *big.Int {
+	parsed, ok := new(big.Int).SetString(value, 10)
+	if !ok {
+		return new(big.Int)
+	}
+	return parsed
 }

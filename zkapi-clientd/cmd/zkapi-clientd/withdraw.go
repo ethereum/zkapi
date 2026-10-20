@@ -40,7 +40,7 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	earlyExitText := flags.String("early-exit", "", "with --escape: exit before a sent request can settle, conceding nothing or the state's bound (nothing|bound)")
 	claim := flags.Bool("claim", false, "deliver an escape payout the vault credited to --to")
 	cancel := flags.Bool("cancel", false, "with --escape: cancel an escape that released no exit proof, so chats resume")
-	feesText := flags.String("fees", "", "how the network fee is paid: wallet (the local signing address; the default, or zkapi.withdrawal_fees) or payout (a sponsored operation paid from the payout; the payout address needs no ETH)")
+	feesText := flags.String("fees", "", "how the network fee is paid: wallet (the local signing address; the default, or zkapi.withdrawal_fees), payout (a sponsored operation paid from the payout; the payout address needs no ETH) or relay (the operator's close relay lands the close for its fee, taken from the private balance; if it does not land it in time, the close is submitted from the local signing address)")
 	feeCapGwei := flags.Uint64("fee-cap-gwei", 0, "with --fees payout: the most the payout may lose to the network fee and the paymaster's flat fee (for a contract destination, plus the credit surcharge of a failed push), in gwei")
 	bundlerText := flags.String("bundler-url", "", "with --fees payout: your own ERC-4337 bundler (HTTPS, or http:// to this machine); overrides zkapi.bundler_url and the deployment's bundler")
 	allowExpensiveGas := flags.Bool("allow-expensive-gas", false, "with --fees payout: accept a sponsored fee above the deployment's uneconomic fraction of the payout")
@@ -181,7 +181,9 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 		return errors.New("withdrawal requires recovery; preserve the local funding and companion files")
 	}
 	if *resume {
-		if (state.Phase != "withdrawal_pending" && state.Phase != "confirming" && !zkapi.GaslessPendingPhase(state.Phase)) || state.Destination == "" || (state.TransactionHash == "" && state.UserOpHash == "") {
+		if state.Phase == "relay_submitted" && state.Destination != "" {
+			// The relay holds the close: follow it.
+		} else if (state.Phase != "withdrawal_pending" && state.Phase != "confirming" && !zkapi.GaslessPendingPhase(state.Phase)) || state.Destination == "" || (state.TransactionHash == "" && state.UserOpHash == "") {
 			return errors.New("no signed withdrawal to resume; use --to to prepare and approve a quote")
 		}
 		destination = state.Destination
@@ -218,7 +220,7 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 			if err != nil {
 				return err
 			}
-		} else if state.Phase == "withdrawal_pending" || state.Phase == "confirming" || zkapi.GaslessPendingPhase(state.Phase) {
+		} else if state.Phase == "withdrawal_pending" || state.Phase == "confirming" || state.Phase == "relay_submitted" || zkapi.GaslessPendingPhase(state.Phase) {
 			submitted = true
 			state, err = requestWithdrawal(ctx, c, http.MethodPost, map[string]any{"destination": destination, "note_id": noteID})
 			if err != nil {
@@ -269,7 +271,7 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 		switch state.Phase {
 		case "complete":
 			return nil
-		case "withdrawal_pending", "confirming", "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
+		case "withdrawal_pending", "confirming", "relay_submitted", "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
 		case "op_reverted":
 			return errors.New("the sponsored operation reverted; follow the status message (withdraw --collect or --sweep when the payout waits in the transit account, or rerun --to to prove again)")
 		case "gasless_refused":
@@ -333,7 +335,7 @@ func withdrawalResumeInstructions(out io.Writer, state zkapi.AddressWithdrawalSt
 		return
 	}
 	if state.Destination != "" && state.Phase != "ready" {
-		if state.Phase == "withdrawal_pending" || state.Phase == "confirming" || zkapi.GaslessPendingPhase(state.Phase) {
+		if state.Phase == "withdrawal_pending" || state.Phase == "confirming" || state.Phase == "relay_submitted" || zkapi.GaslessPendingPhase(state.Phase) {
 			fmt.Fprintln(out, "To recover this signed withdrawal, run zkapi-clientd withdraw --resume (keep the same --config-dir if used).")
 		} else {
 			fmt.Fprintf(out, "To quote this saved withdrawal again, run zkapi-clientd withdraw --to %s (keep the same --config-dir if used).\n", state.Destination)
@@ -449,8 +451,8 @@ func resolveGaslessOptions(c config.Config, fees string, feeCapGwei uint64, bund
 	if fees == "" {
 		fees = "wallet"
 	}
-	if fees != "wallet" && fees != "payout" {
-		return gaslessOptions{}, errors.New("--fees must be wallet or payout")
+	if fees != "wallet" && fees != "payout" && fees != "relay" {
+		return gaslessOptions{}, errors.New("--fees must be wallet, payout or relay")
 	}
 	if bundlerURL == "" {
 		bundlerURL = c.ZKAPI.BundlerURL
@@ -471,7 +473,7 @@ func (o gaslessOptions) transitAction() bool { return o.collect || o.sweep || o.
 // mode, so a record the owner moved to the wallet is not switched back to
 // the sponsored path. The wallet default adds nothing.
 func (o gaslessOptions) apply(body map[string]any, saved bool) {
-	if o.feesNamed || (o.fees == "payout" && !saved) {
+	if o.feesNamed || ((o.fees == "payout" || o.fees == "relay") && !saved) {
 		body["fees"] = o.fees
 	}
 	if o.bundlerURL != "" {

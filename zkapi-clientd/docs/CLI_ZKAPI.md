@@ -842,6 +842,49 @@ your client IP before inclusion (the operator's bundler, unless you set your
 own); the chain shows the bundler's transaction, the transit account and the
 destination, never the funding address.
 
+### The operator's close relay (`--fees relay`)
+
+When the protocol server runs a close relay (its `GET /v2/withdraw/relay/terms`
+reports `enabled: true`), a cooperative close can be landed by the operator in
+a batch through the deployment's exit batcher, for the relay's fee instead of
+a network fee. It is opt-in: `zkapi-clientd withdraw --to 0xDESTINATION
+--fees relay`, or `config --withdrawal-fees relay` as the default (a named
+`--fees` overrides it; `--fees wallet` on a relayed withdrawal takes it back
+to the wallet-paid close).
+
+```sh
+zkapi-clientd withdraw --to 0xDESTINATION --fees relay    # quote: the relay fee and the fallback allowance
+zkapi-clientd withdraw --approve QUOTE_ID                 # pay the fee, prepare the close, hand it to the relay
+zkapi-clientd withdraw --resume                           # follow it after an interruption
+```
+
+The quote names the fee (taken from the private balance; the amount shown is
+the payout after it) and the fee allowance of a wallet-paid close. Quoting pays
+and reserves nothing. Approving it:
+
+1. pays the fee as one ordinary metered request at the note's current state
+   (its successor carries the fee as spent, so the close's treasury share holds
+   it; nothing new is proved);
+2. prepares the cooperative close at that successor, as a wallet-paid close
+   would (clearance, proof);
+3. hands the proof to the relay through the companion, over the same
+   transport as every protocol request (Tor when configured).
+
+The relay can only submit the proof or not: it binds the destination and the
+amount, and the client keeps it. The withdrawal stays pending (`relay_submitted`)
+until the vault's `MutualClose` for exactly this close is final on the
+payment RPC, whichever transaction carried it, and the vault and indexer show
+the note closed. If the relay reports the close `failed` or `expired`, or has
+not landed it 20 minutes before its proof expires, the client submits it itself
+from the local signing address: the approval of the relay quote authorized this
+one wallet-paid close (same binding, amount, destination and nonce, within the
+quoted fee allowance). When that authority no longer applies (another
+transaction took the nonce, or fees rose above the allowance) the withdrawal
+returns to `quoted` and asks for a wallet-paid quote. A wallet-paid fallback
+that reverts because the relay landed the close meanwhile is confirmed with
+`--confirm` and the relay's transaction, as for any relayed payout. The relay
+is for cooperative closes only; escapes and `--fees payout` are unchanged.
+
 ### Escape withdrawals
 
 An escape exits without the operator: the vault pays after its challenge

@@ -4,7 +4,8 @@ import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
-    CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, clientdTransitOwner, drillTiming, gasLedger, gaslessProfile, localJSON,
+    CAP, CHAIN_ID, INFERENCE_CHARGE, MUTUAL_CLOSE_BATCH_SELECTOR, RELAY_BATCH_TARGET, RELAY_FEE, RELAY_MAX_FEE_PER_GAS, SDK_REQUEST_BOUND,
+    relayServerArgs, relayedCloseProblems, TIMING, challengeFees, clientdTransitOwner, drillTiming, gasLedger, gaslessProfile, localJSON,
     mockOaOrg, isProfileBundlerUrl, mockProvider, proxyAuthorized, proxyJsonRpc, transitReuseProblems, trustedDeployment,
 } from './v2-acceptance.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
@@ -797,4 +798,59 @@ test('transitReuseProblems: the second close to one payout address reuses the fi
     assert.match(problems({ deployed: false }, 'first').join(), /first close does not create/);
     assert.match(problems({ verificationGasLimit: 70_000n }, 'first').join(), /first close is not at the verification default with initCode/);
     assert.ok(transitReuseProblems(null, second, { payee, gasPolicy }).length > 0);
+});
+
+test('relayServerArgs: serverd\'s relay flags, each one zkapi serverd defines, within its startup checks', async () => {
+    const { readFileSync } = await import('node:fs');
+    const sender = `0x${'4e'.repeat(20)}`;
+    const args = relayServerArgs({ rpcUrl: 'http://127.0.0.1:1', sender });
+    assert.equal(args.length % 2, 0);
+    const flags = Object.fromEntries(Array.from({ length: args.length / 2 }, (_, i) => [args[2 * i], args[2 * i + 1]]));
+    assert.equal(Object.keys(flags).length, args.length / 2, 'no flag is repeated');
+    // Every flag is a field of the CLI's RelayArgs.
+    const cli = readFileSync(new URL('../crates/zkapi-cli/src/main.rs', import.meta.url), 'utf8');
+    const relayArgs = cli.slice(cli.indexOf('struct RelayArgs'), cli.indexOf('\n}\n', cli.indexOf('struct RelayArgs')));
+    const defined = new Set([...relayArgs.matchAll(/^\s+(relay_[a-z_]+):/gm)].map(match => `--${match[1].replaceAll('_', '-')}`));
+    for (const flag of Object.keys(flags)) assert.ok(defined.has(flag), `${flag} is not a zkapi serverd flag`);
+    assert.equal(flags['--relay-rpc-url'], 'http://127.0.0.1:1');
+    assert.equal(flags['--relay-sender'], sender);
+    // The fee is one request any bound pays; the startup checks hold (the
+    // defaults: urgent margin 1800 s, cutoff 300 s, min validity 3600 s).
+    const fee = Number(flags['--relay-fee-units']);
+    assert.ok(fee === RELAY_FEE && fee > 0 && fee <= CAP);
+    assert.ok(Number(flags['--relay-batch-target']) === RELAY_BATCH_TARGET
+        && RELAY_BATCH_TARGET <= Number(flags['--relay-max-batch']) && Number(flags['--relay-max-batch']) <= 64);
+    const poll = Number(flags['--relay-poll-seconds']);
+    assert.ok(poll > 0 && poll < 300 && Number(flags['--relay-bump-after-seconds']) >= poll);
+    assert.ok(Number(flags['--relay-confirmations']) >= 1 && Number(flags['--relay-flush-age-seconds']) > 0);
+    assert.equal(BigInt(flags['--relay-max-fee-per-gas']), RELAY_MAX_FEE_PER_GAS);
+    assert.throws(() => relayServerArgs({ sender }), /RPC and its sender/);
+});
+
+test('relayedCloseProblems: one mined mutualCloseBatch from the relayer to the batcher, with exactly the expected MutualClose events', () => {
+    const vault = `0x${'7a'.repeat(20)}`;
+    const batcher = `0x${'ba'.repeat(20)}`;
+    const sender = `0x${'4e'.repeat(20)}`;
+    const topic = '0x1f43fa4711ca18e1d26398f26bf598bd3a62992cdd0e84f055f2bb506e9d7031';
+    const word = value => BigInt(value).toString(16).padStart(64, '0');
+    const closes = [
+        { noteId: 7, nullifier: `0x${'11'.repeat(32)}`, finalBalance: 980_000, destination: `0x${'c1'.repeat(20)}` },
+        { noteId: 9, nullifier: `0x${'22'.repeat(32)}`, finalBalance: 980_000, destination: `0x${'c2'.repeat(20)}` },
+    ];
+    const logOf = close => ({ address: vault.toUpperCase().replace('0X', '0x'), removed: false, topics: [topic, `0x${word(close.noteId)}`],
+        data: `0x${word(close.nullifier)}${word(close.finalBalance)}${word(close.destination)}` });
+    const receipt = { status: '0x1', to: batcher, from: sender, logs: [{ address: batcher, topics: [`0x${'ee'.repeat(32)}`], data: '0x' }, ...closes.map(logOf)] };
+    const transaction = { input: `${MUTUAL_CLOSE_BATCH_SELECTOR}${'00'.repeat(64)}`, value: '0x0' };
+    const problems = (receiptChanges = {}, transactionChanges = {}, expected = closes) =>
+        relayedCloseProblems({ ...receipt, ...receiptChanges }, { ...transaction, ...transactionChanges }, { batcher, vault, sender, closes: expected });
+    assert.deepEqual(problems(), []);
+    assert.match(problems({ status: '0x0' }).join(), /status 0x0/);
+    assert.match(problems({ to: vault }).join(), /not the batcher/);
+    assert.match(problems({ from: batcher }).join(), /not the relayer/);
+    assert.match(problems({}, { input: '0x72cd2e44' }).join(), /not mutualCloseBatch/);
+    assert.match(problems({}, { value: '0x1' }).join(), /carries value/);
+    assert.match(problems({ logs: receipt.logs.slice(0, 2) }).join(), /1 MutualClose events, expected 2.*no MutualClose of note 9/);
+    assert.match(problems({}, {}, closes.slice(0, 1)).join(), /2 MutualClose events, expected 1/);
+    assert.match(problems({}, {}, [closes[0], { ...closes[1], finalBalance: 1 }]).join(), /no MutualClose of note 9/);
+    assert.match(problems({ logs: [receipt.logs[0], logOf(closes[0]), { ...logOf(closes[1]), address: batcher }] }).join(), /no MutualClose of note 9/);
 });
