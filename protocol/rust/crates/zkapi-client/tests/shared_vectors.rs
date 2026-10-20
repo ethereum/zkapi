@@ -10,6 +10,8 @@
 //!   S4, S5) or be rejected (S1, S2, S6).
 //!   `ZKAPI_WRITE_VECTORS=1 cargo test -p zkapi-client --test shared_vectors`
 //!   regenerates that section;
+//! - `exit_inputs`: an exit needs no Merkle path (vault revision 4), the
+//!   note leaf vectors and the withdrawal statement's fields;
 //! - `exit_kit` (E7), which zkapi-companion's exit-kit tests read.
 
 use std::path::{Path, PathBuf};
@@ -23,13 +25,16 @@ use zkapi_client::journal::{read_archive, PendingRequestJournal};
 use zkapi_client::note_state::NoteState;
 use zkapi_client::wallet::Wallet;
 use zkapi_core::v2 as core;
-use zkapi_proof::compact::{random_scalar, rerandomize, server_update, CompactSigner};
+use zkapi_proof::compact::{
+    random_scalar, rerandomize, server_update, withdrawal_public_inputs, CompactSigner,
+    WithdrawalStatementParams, WithdrawalWitnessData,
+};
 use zkapi_types::wire::{
     ApiRequestV2, CurvePointWire, Groth16ProofWire, ProofBackendWire, RequestResponseV2,
 };
 use zkapi_types::{
     canonical_payload_hash, canonical_request_context, canonical_response_hash, Felt252,
-    RequestPublicInputsV2,
+    RequestPublicInputsV2, WithdrawalKind, WithdrawalPublicInputsV2C,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -211,6 +216,126 @@ fn exit_policy_vectors() {
             case["expected"].as_bool().unwrap()
         );
     }
+}
+
+fn text_u128(value: &Value) -> u128 {
+    value.as_str().unwrap().parse().unwrap()
+}
+
+/// Vault revision 4: an exit is bound to the note's leaf and needs no Merkle
+/// path. The leaf vectors, the statement's fields, and the refused and
+/// ignored fields every client shares.
+#[test]
+fn exit_input_vectors() {
+    let vectors = load();
+    let inputs = &vectors["exit_inputs"];
+    assert_eq!(inputs["needs_merkle_path"], false);
+    let fields: Vec<&str> = inputs["statement_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect();
+    let refused: Vec<&str> = inputs["refused_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect();
+    let signer = CompactSigner::from_seed(&Felt252::from_u64(0x5151));
+    let mut statements = Vec::new();
+    for case in inputs["leaf"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let secret = Felt252::from_hex(case["secret"].as_str().unwrap()).unwrap();
+        let note_id = case["note_id"].as_u64().unwrap() as u32;
+        let deposit = text_u128(&case["deposit_amount"]);
+        let expiry = text_u128(&case["expiry_ts"]) as u64;
+        let felt = |field: &str| Felt252::from_hex(case[field].as_str().unwrap()).unwrap();
+        let registration = core::registration_commitment(&secret);
+        assert_eq!(registration, felt("registration"), "{name}");
+        let packed = core::note_fields(note_id, deposit, expiry);
+        assert_eq!(packed, felt("note_fields"), "{name}");
+        assert_eq!(
+            core::unpack_note_fields(&packed),
+            Some((note_id, deposit, expiry))
+        );
+        let leaf = core::note_leaf(note_id, &registration, deposit, expiry);
+        assert_eq!(leaf, felt("note_leaf"), "{name}");
+        assert_eq!(core::note_leaf_from_fields(&registration, &packed), leaf);
+
+        // The statement of an exit from the genesis state binds the leaf and
+        // its fields; it is built from the note alone, with no path or root.
+        let public = withdrawal_public_inputs(
+            &WithdrawalStatementParams {
+                protocol_version: 2,
+                chain_id: 11_155_111,
+                contract_address: Felt252::from_u64(0x99),
+                state_signing_key: signer.public_key(),
+                clearance_signing_key: signer.public_key(),
+                note_id,
+                destination: [0x11; 20],
+            },
+            &WithdrawalWitnessData {
+                secret,
+                deposit_amount: deposit,
+                expiry,
+                state_balance: deposit,
+                state_blinding: random_scalar(),
+                current_anchor: core::GENESIS_ANCHOR,
+                kind: WithdrawalKind::Escape,
+                conceded: 0,
+                valid_until: 1_800_000_000,
+                state_signature: None,
+                clearance_signature: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(public.note_leaf, leaf, "{name}");
+        assert_eq!(public.note_fields(), packed, "{name}");
+        statements.push(public);
+    }
+
+    // The statement's JSON has exactly the shared fields, in order, and
+    // refuses each removed one (the first case: JSON numbers above 2^64 do
+    // not round-trip through `serde_json::Value`).
+    for public in &statements[..1] {
+        let text = serde_json::to_string(public).unwrap();
+        let positions: Vec<usize> = fields
+            .iter()
+            .map(|field| text.find(&format!("\"{field}\":")).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+        let json = serde_json::to_value(public).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), fields.len());
+        for field in &refused {
+            let mut extended = json.clone();
+            extended[*field] = serde_json::json!("0x1");
+            assert!(
+                serde_json::from_value::<WithdrawalPublicInputsV2C>(extended).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    // A saved note state's ignored fields are read and dropped.
+    let dir = std::env::temp_dir().join(format!("zkapi-vectors-{}", uuid::Uuid::new_v4()));
+    let key = CompactSigner::from_seed(&Felt252::from_u64(0x5151)).public_key();
+    let mut wallet = Wallet::new(successor_config(&dir, &key)).unwrap();
+    wallet
+        .confirm_deposit(Felt252::from_u64(42), 7, 5_000_000, 4_000_000_000)
+        .unwrap();
+    let path = dir.join("note_state.json");
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for field in inputs["ignored_state_fields"].as_array().unwrap() {
+        saved[field.as_str().unwrap()] = serde_json::json!({"root": "0x5", "siblings": []});
+    }
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let reopened = Wallet::new(successor_config(&dir, &key)).unwrap();
+    assert_eq!(
+        reopened.current_note_leaf(),
+        Some(Felt252::from_hex(inputs["leaf"][0]["note_leaf"].as_str().unwrap()).unwrap())
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -452,7 +577,7 @@ fn generate_successor_vectors() -> SuccessorVectors {
         "reject",
     );
     SuccessorVectors {
-        description: "S1-S6 (design §6.1) for circuit zkapi-v2-concession-v1. Load `state` and `journal` (a case's own `journal` replaces it), deliver each `response` for the journal's request, and expect `install`, `invalid_successor` (a correctly signed successor failing S3, S4 or S5, archived and treated as withheld) or `reject` (S1, S2 or S6 fails; nothing changes). For `install`, `installed` is the resulting balance, anchor, prev_anchor, blinding and bound_at_state.".into(),
+        description: "S1-S6 (design §6.1) for circuit zkapi-v2-concession-v2. Load `state` and `journal` (a case's own `journal` replaces it), deliver each `response` for the journal's request, and expect `install`, `invalid_successor` (a correctly signed successor failing S3, S4 or S5, archived and treated as withheld) or `reject` (S1, S2 or S6 fails; nothing changes). For `install`, `installed` is the resulting balance, anchor, prev_anchor, blinding and bound_at_state.".into(),
         state_signing_key: key,
         state,
         journal,

@@ -5,8 +5,9 @@
 //!
 //! The fixture asks the bundle for a genesis request and an escape (kind 0,
 //! `conceded = 0`, `valid_until`) to the destination below; both proofs and
-//! the escape's canonical fields are checked here. It needs a bundle built
-//! for circuit `zkapi-v2-concession-v2` with the development setup.
+//! the escape's canonical fields are checked here. The escape takes no Merkle
+//! path or root: it is bound to the note's leaf. It needs a bundle built for
+//! circuit `zkapi-v2-concession-v2` with the development setup.
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::{
@@ -45,7 +46,7 @@ fn main() -> Result<()> {
         "request": { "payload": "browser artifact test", "active_root": root, "merkle_siblings": siblings,
             "client_request_id": "wasm-roundtrip", "request_time": 2000000000u64, "created_at_ms": 2000000000000u64 },
         "withdrawal": { "mode": "escape", "destination": "0x1111111111111111111111111111111111111111",
-            "conceded": 0, "valid_until": VALID_UNTIL, "active_root": root, "merkle_siblings": siblings }
+            "conceded": 0, "valid_until": VALID_UNTIL }
     });
     let mut child = Command::new("node")
         .args(&args[1..])
@@ -88,6 +89,12 @@ fn main() -> Result<()> {
         withdrawal.kind == 0
             && withdrawal.conceded == 0
             && withdrawal.valid_until == VALID_UNTIL
+            && withdrawal.note_leaf == leaf
+            && (
+                withdrawal.note_id,
+                withdrawal.deposit_amount,
+                withdrawal.expiry_ts
+            ) == (0, 1_000_000, expiry)
             && withdrawal.next_nullifier
                 == core::successor_nullifier(&secret, 0, &core::GENESIS_ANCHOR),
         "WASM escape statement is not canonical"
