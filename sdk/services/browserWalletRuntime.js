@@ -404,6 +404,25 @@ function unresolvedLateWithdrawalForNote(runtime, noteId) {
         && !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status)) || null;
 }
 
+// Wallet status reaches host subscribers and the window-wide change event.
+// The current anchor and commitment are private proof witnesses: the server
+// issued that anchor, so exposing it to host telemetry would link the host
+// account to the private lease chain. Copy only an explicit public allowlist.
+function publicWalletStatus(status) {
+    const note = status?.note;
+    return {
+        has_note: Boolean(status?.has_note),
+        pending_request: Boolean(status?.pending_request),
+        note: note ? {
+            note_id: note.note_id,
+            deposit_amount: note.deposit_amount,
+            current_balance: note.current_balance,
+            expiry_ts: note.expiry_ts,
+            is_genesis: note.is_genesis
+        } : null
+    };
+}
+
 async function responsePayload(response) {
     const text = await response.text();
     try {
@@ -1601,7 +1620,7 @@ class BrowserWalletRuntime extends EventTarget {
         if (this.runtime.state || this.runtime.pendingDeposit) {
             void this.prewarmRequestProver();
         }
-        return status;
+        return publicWalletStatus(status);
     }
 
     prewarmRequestProver() {
