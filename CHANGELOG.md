@@ -75,6 +75,14 @@ Folded into 0.2.0's notes at release.
   or that has not landed by `valid_until` minus 20 minutes, and count a
   withdrawal done only when its `MutualClose` appears
   ([close relay](docs/native-eth-billing.md)).
+- **zkapi-clientd can opt out of transit-account reuse.**
+  `withdraw --fees payout --fresh-transit` gives one gasless withdrawal a
+  fresh transit account, and `config --transit-accounts fresh`
+  (`zkapi.transit_accounts`; `per-payee`, the default, clears it) does so
+  for every one. The owner key is then drawn at random and journaled without
+  `owner_derivation`, and the withdrawal pays `S`'s creation again (about
+  89,000 gas on mainnet, about 535,000 under EIP-8037) in exchange for not
+  linking it to the wallet's other withdrawals to that payout address.
 
 ### Changed
 
@@ -235,7 +243,7 @@ Folded into 0.2.0's notes at release.
   refuse a second sponsored escape from one transit account while the first
   is open (`transit_escape_pending`, before any proof). Exits of one wallet to
   one payout address are now visibly linked through their shared transit
-  account.
+  account; zkapi-clientd can opt out (see Added).
 - **Single defeats and raises cost about 600 gas more** (the adapter's
   request-record lookup), and the adapter's larger dispatch adds about 170 to
   every single exit; the adapter's runtime is 19,885 bytes.

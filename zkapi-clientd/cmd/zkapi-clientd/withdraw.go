@@ -47,10 +47,12 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	collect := flags.Bool("collect", false, "with --to: forward a payout waiting in the transit account with a sponsored operation (its fee is taken from the payout)")
 	sweep := flags.Bool("sweep", false, "with --to: deliver a payout waiting in the transit account with a wallet-paid sweep (the account is created first when it has no code)")
 	claimCredit := flags.Bool("claim-credit", false, "with --to: deliver a payout the paymaster credited (wallet-paid claimCredit)")
+	freshTransit := flags.Bool("fresh-transit", false, "with --fees payout: use a fresh transit account (a random owner key) for this withdrawal instead of the payout address's reused one; it is not linked to your other exits to that address, and its creation is paid again (about 89,000 gas); zkapi.transit_accounts \"fresh\" makes it the default")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	options, err := resolveGaslessOptions(c, *feesText, *feeCapGwei, *bundlerText, *allowExpensiveGas, *collect, *sweep, *claimCredit)
+	options.freshTransit = options.freshTransit || *freshTransit
 	if err != nil {
 		return err
 	}
@@ -441,6 +443,9 @@ type gaslessOptions struct {
 	collect           bool
 	sweep             bool
 	claimCredit       bool
+	// freshTransit: a fresh transit account for a gasless withdrawal
+	// (--fresh-transit, or zkapi.transit_accounts "fresh").
+	freshTransit bool
 }
 
 func resolveGaslessOptions(c config.Config, fees string, feeCapGwei uint64, bundlerURL string, allowExpensiveGas, collect, sweep, claimCredit bool) (gaslessOptions, error) {
@@ -462,7 +467,7 @@ func resolveGaslessOptions(c config.Config, fees string, feeCapGwei uint64, bund
 			return gaslessOptions{}, err
 		}
 	}
-	return gaslessOptions{fees: fees, feesNamed: feesNamed, feeCapGwei: feeCapGwei, bundlerURL: bundlerURL, allowExpensiveGas: allowExpensiveGas, collect: collect, sweep: sweep, claimCredit: claimCredit}, nil
+	return gaslessOptions{fees: fees, feesNamed: feesNamed, feeCapGwei: feeCapGwei, bundlerURL: bundlerURL, allowExpensiveGas: allowExpensiveGas, collect: collect, sweep: sweep, claimCredit: claimCredit, freshTransit: c.ZKAPI.TransitAccounts == "fresh"}, nil
 }
 
 func (o gaslessOptions) transitAction() bool { return o.collect || o.sweep || o.claimCredit }
@@ -493,6 +498,9 @@ func (o gaslessOptions) apply(body map[string]any, saved bool) {
 	}
 	if o.claimCredit {
 		body["claim_credit"] = true
+	}
+	if o.freshTransit {
+		body["fresh_transit"] = true
 	}
 }
 

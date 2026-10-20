@@ -231,8 +231,11 @@ type withdrawalRequestOptions struct {
 	Collect           bool   `json:"collect,omitempty"`
 	Sweep             bool   `json:"sweep,omitempty"`
 	ClaimCredit       bool   `json:"claim_credit,omitempty"`
+	// FreshTransit: a fresh transit account for this gasless withdrawal
+	// instead of the payout address's reused one (addressWithdrawalOptions).
+	FreshTransit bool `json:"fresh_transit,omitempty"`
 }
 
 func (o withdrawalRequestOptions) options() addressWithdrawalOptions {
-	return addressWithdrawalOptions{Fees: o.Fees, FeeCapGwei: o.FeeCapGwei, BundlerURL: o.BundlerURL, AllowExpensiveGas: o.AllowExpensiveGas, Collect: o.Collect, Sweep: o.Sweep, ClaimCredit: o.ClaimCredit}
+	return addressWithdrawalOptions{Fees: o.Fees, FeeCapGwei: o.FeeCapGwei, BundlerURL: o.BundlerURL, AllowExpensiveGas: o.AllowExpensiveGas, Collect: o.Collect, Sweep: o.Sweep, ClaimCredit: o.ClaimCredit, FreshTransit: o.FreshTransit}
 }

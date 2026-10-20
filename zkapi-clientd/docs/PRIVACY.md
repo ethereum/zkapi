@@ -180,8 +180,11 @@ to one payout address uses the same transit account, so they are visibly
 withdrawals of one wallet: withdrawals to a payout address that others use
 too (an exchange deposit address, for example) can be told apart from other
 users' by their transit account, which a fresh account per withdrawal did
-not reveal. Use `--fees wallet`, or another payout address, where that
-matters. The owner addresses cannot be linked to each other or to the
+not reveal. Where that matters, use `--fresh-transit` (one withdrawal) or
+`config --transit-accounts fresh` (every gasless withdrawal): a random owner
+key and a new transit account per withdrawal, whose creation is paid again
+each time (about 89,000 gas on mainnet), or use `--fees wallet`, or another
+payout address. The owner addresses cannot be linked to each other or to the
 payment key. The bundler (the deployment's, or your own `--bundler-url`)
 sees the operation and your client IP before inclusion, as an RPC does.
 

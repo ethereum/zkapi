@@ -54,6 +54,9 @@ func (s localGuidedWithdrawal) Quote(ctx context.Context, destination string, no
 	if fees == "payout" && s.config.ZKAPI.BundlerURL != "" {
 		body["bundler_url"] = s.config.ZKAPI.BundlerURL
 	}
+	if fees == "payout" && s.config.ZKAPI.TransitAccounts == "fresh" {
+		body["fresh_transit"] = true
+	}
 	return requestPaymentQuote(ctx, s.config, http.MethodPost, "/admin/withdrawal/quote", "withdrawal", body)
 }
 func (s localGuidedWithdrawal) GaslessAvailability(ctx context.Context) (zkapi.GaslessAvailability, error) {

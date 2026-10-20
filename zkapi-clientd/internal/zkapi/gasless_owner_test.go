@@ -231,6 +231,47 @@ func TestGaslessWithdrawalsToOnePayeeReuseTheTransitAccount(t *testing.T) {
 	}
 }
 
+// The opt-out (--fresh-transit, zkapi.transit_accounts "fresh"): a gasless
+// withdrawal with FreshTransit gets a random owner key for itself alone, not
+// the payout address's derived one, so its transit account is new (created
+// through its own initCode) and not the reused one; the record journals the
+// key without a derivation, which signs and settles it like a record of an
+// earlier build. Without the option the same payout address keeps its
+// derived account.
+func TestGaslessFreshTransitOptsOutOfThePayeesReusedAccount(t *testing.T) {
+	f, g := newGaslessWithdrawalFixture(t)
+	derivedOwner, derivedAccount, _ := g.expectedTransit(t, f.journal(t), withdrawalTestDestination)
+	fresh := addressWithdrawalOptions{Fees: "payout", FreshTransit: true}
+	hash := f.sponsoredCloseWith(t, fresh)
+	w := f.journal(t).Withdrawal
+	if w.Transit.OwnerDerivation != "" || w.Transit.OwnerKey == "" {
+		t.Fatalf("a fresh transit account's key is journaled without a derivation: %+v", w.Transit)
+	}
+	if strings.EqualFold(w.Transit.Owner, derivedOwner.Hex()) || strings.EqualFold(w.Transit.Account, derivedAccount.Hex()) {
+		t.Fatalf("the fresh withdrawal reused the payout address's derived account: %+v", w.Transit)
+	}
+	key, err := crypto.HexToECDSA(w.Transit.OwnerKey)
+	if err != nil || crypto.PubkeyToAddress(key.PublicKey).Hex() != w.Transit.Owner {
+		t.Fatalf("the journaled key is not the owner's: %v", err)
+	}
+	if !strings.EqualFold(w.Transit.Account, g.transitAccount(crypto.PubkeyToAddress(key.PublicKey), common.HexToAddress(withdrawalTestDestination)).Hex()) || !strings.EqualFold(w.ProofDestination, w.Transit.Account) {
+		t.Fatalf("the proof does not bind the fresh transit account: %+v", w)
+	}
+	sent := g.sentOp(t, hash)
+	if !w.UserOp.InitCode || len(sent.InitCode) == 0 || !strings.EqualFold(sent.Sender.Hex(), w.Transit.Account) {
+		t.Fatalf("the fresh account is not created by the operation's initCode: %+v", w.UserOp)
+	}
+	if signer, err := recoverUserOpSigner(sent.hash(g.entryPoint, 1), sent.Signature); err != nil || signer.Hex() != w.Transit.Owner {
+		t.Fatal("the operation is not signed by the fresh owner")
+	}
+	charged := big.NewInt(2_000_000_000_000_000)
+	g.mineUserOp(t, hash, true, fixtureSettlement{Received: gaslessPayoutWei, Charged: charged, PaidOut: new(big.Int).Sub(gaslessPayoutWei, charged)})
+	f.finalized = "0x20"
+	if status, err := f.h.WithdrawAddress(payoutContext(fresh), withdrawalTestDestination, f.noteID); err != nil || status.Phase != "complete" {
+		t.Fatalf("the fresh withdrawal does not settle: %+v %v", status, err)
+	}
+}
+
 // A record of an earlier build holds a random owner key (no
 // owner_derivation) and is still followed and settled with it; a derived
 // record whose journaled key is not the derived one is refused, and one

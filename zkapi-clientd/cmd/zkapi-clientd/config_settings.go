@@ -53,7 +53,7 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	for _, arg := range args {
 		name := strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]
 		switch name {
-		case "web-search", "rewriter-instruction-file", "rewriter-default-instruction", "network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "relay-url", "listen", "require-api-key", "key-reuse-window-seconds", "status", "vault-protocol", "model", "clear-model", "rewriter-url", "rewriter-model", "rewriter-api-key-env", "rewriter-clear-api-key", "rewriter-notice", "clear-rewriter", "cover-urls", "cover-rate", "cover-concurrency", "clear-cover":
+		case "web-search", "rewriter-instruction-file", "rewriter-default-instruction", "network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "transit-accounts", "relay-url", "listen", "require-api-key", "key-reuse-window-seconds", "status", "vault-protocol", "model", "clear-model", "rewriter-url", "rewriter-model", "rewriter-api-key-env", "rewriter-clear-api-key", "rewriter-notice", "clear-rewriter", "cover-urls", "cover-rate", "cover-concurrency", "clear-cover":
 			selected = true
 		}
 	}
@@ -84,7 +84,7 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	requireKey := f.Bool("require-api-key", false, "require local inference key")
 	webSearch := f.Bool("web-search", true, "automatically enable OpenRouter web search (search charges apply)")
 	oldFields := map[string]*string{}
-	for _, name := range []string{"network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees"} {
+	for _, name := range []string{"network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "transit-accounts"} {
 		oldFields[name] = f.String(name, "", "saved "+name+" setting")
 	}
 	if err := f.Parse(args); err != nil {

@@ -651,7 +651,9 @@ zkapi-clientd withdraw --to 0xDESTINATION --fees payout --fee-cap-gwei 2000000 \
 zkapi-clientd withdraw --to 0xDESTINATION --collect                           # forward a payout waiting in the transit account (sponsored)
 zkapi-clientd withdraw --to 0xDESTINATION --sweep                             # ... or sweep it, paid by the local signing address
 zkapi-clientd withdraw --to 0xDESTINATION --claim-credit                      # deliver a payout the paymaster credited
+zkapi-clientd withdraw --to 0xDESTINATION --fees payout --fresh-transit       # a fresh transit account for this withdrawal
 zkapi-clientd config --withdrawal-fees payout --bundler-url https://bundler.example/rpc   # defaults
+zkapi-clientd config --transit-accounts fresh                                 # a fresh transit account for every gasless withdrawal (per-payee restores reuse)
 ```
 
 The guided **withdraw** menu offers "Pay the network fee from the payout (no
@@ -715,7 +717,21 @@ hex-encoded, in the mode-0600 payment journal (`transit.owner_key`, with
 `transit.owner_derivation` naming the derivation), and is checked against
 the derivation on every load; records of earlier builds, whose owner key was
 drawn at random for one withdrawal and has no `owner_derivation`, keep
-working from their journaled key. The transit account `S` is
+working from their journaled key.
+
+Reuse links the wallet's gasless withdrawals to one destination through their
+shared `S` (see [privacy](PRIVACY.md)). To opt out, `--fresh-transit` gives one
+withdrawal a fresh transit account, and `config --transit-accounts fresh`
+(saved as `zkapi.transit_accounts: "fresh"`; `per-payee`, the default, clears
+it) does so for every gasless withdrawal: the owner key is then drawn at
+random for that withdrawal alone, as earlier builds drew it, and saved in the
+payment journal without `owner_derivation`, so the journaled key is its only
+copy (back up the journal as for any pending withdrawal). Each such withdrawal
+creates its own `S` through `initCode` and pays its creation again (about
+89,000 gas on mainnet, about 535,000 under EIP-8037), and is not linked to the
+wallet's other withdrawals to that destination through a transit account. The
+option is read when the withdrawal is prepared; a saved withdrawal keeps the
+transit account it was prepared with. The transit account `S` is
 `CREATE2(factory, 0, creationCode ‖ abi.encode(entryPoint, vault, paymaster,
 owner, destination))`, cross-checked with the factory's `getAddress`; the
 pre-proof fee check prices the operation with `initCode` only while `S` has

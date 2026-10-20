@@ -20,14 +20,15 @@ import (
 // The gasless withdrawal flow of design section 3.3: a withdrawal whose
 // network fee is paid from the payout. The proof binds a transit account S
 // (an owner key derived per payout address from the local payment key, and
-// the payout address Y, so every exit of this wallet to Y reuses one S); the
-// exit is carried by a user operation the paymaster sponsors; the record
+// the payout address Y, so every exit of this wallet to Y reuses one S,
+// unless the owner opts out with FreshTransit: then a random owner key per
+// withdrawal and a new S each time); the exit is carried by a user operation the paymaster sponsors; the record
 // journals the owner key and every operation before it is sent, and a resume
 // follows the operation on the bundler and, authoritatively, on chain.
 
 // addressWithdrawalOptions are the per-request choices of a withdrawal
 // command (the CLI's --fees, --fee-cap-gwei, --bundler-url,
-// --allow-expensive-gas, --collect, --sweep and --claim-credit), carried in
+// --allow-expensive-gas, --collect, --sweep, --claim-credit and --fresh-transit), carried in
 // the context like the quote mode.
 type addressWithdrawalOptions struct {
 	// Fees is "payout" for a gasless withdrawal, "wallet" or "" for the
@@ -46,6 +47,14 @@ type addressWithdrawalOptions struct {
 	// createAccount first); ClaimCredit delivers a payout the paymaster
 	// credited (claimCredit(Y), wallet-paid).
 	Collect, Sweep, ClaimCredit bool
+	// FreshTransit opts this gasless withdrawal out of the per-payee transit
+	// account (--fresh-transit, or zkapi.transit_accounts "fresh"): its
+	// owner key is drawn at random for this withdrawal alone (journaled with
+	// the record, which is then its only copy, as for records of earlier
+	// builds), so its transit account S is new and its creation is paid
+	// again (about 89,000 gas on mainnet), but it is not linked to the
+	// wallet's other exits to the same payout address through a shared S.
+	FreshTransit bool
 }
 
 type addressWithdrawalOptionsKey struct{}
@@ -317,17 +326,33 @@ func fundingSeed(record *addressFundingRecord) ([]byte, error) {
 // creation code, cross-checked with the factory's getAddress through the
 // read RPC. S may exist already (an earlier withdrawal to payee created it):
 // the operation then carries no initCode (buildGaslessOp reads its code).
-func (h *FundingHandler) newTransit(ctx context.Context, config fundingConfig, profile gaslessProfile, payee string, record *addressFundingRecord) (*addressTransit, error) {
+// With fresh (the owner opted out of reuse), the owner key is drawn at
+// random instead, for this withdrawal alone, and journaled without a
+// derivation: a new S, created by this withdrawal's initCode, that links no
+// two exits of this wallet to payee.
+func (h *FundingHandler) newTransit(ctx context.Context, config fundingConfig, profile gaslessProfile, payee string, record *addressFundingRecord, fresh bool) (*addressTransit, error) {
 	if err := checkGaslessPayee(profile, config.Contract, payee); err != nil {
 		return nil, err
 	}
-	seed, err := fundingSeed(record)
-	if err != nil {
-		return nil, err
-	}
-	key, _, err := deriveTransitOwnerKey(seed, transitOwnerScopeOf(config.ChainID, config.Contract, profile.EntryPoint, profile.Factory, profile.Paymaster, profile.AccountCreationCodeHash, payee))
-	if err != nil {
-		return nil, err
+	derivation := transitOwnerDerivationV1
+	var key *ecdsa.PrivateKey
+	if fresh {
+		// Opted out of reuse: a random owner for this withdrawal alone, as
+		// earlier builds drew one (no derivation; the journaled key is its
+		// only copy, which transitOwnerKey reads back).
+		generated, err := crypto.GenerateKey()
+		if err != nil {
+			return nil, errors.New("cannot generate the transit account's owner key")
+		}
+		key, derivation = generated, ""
+	} else {
+		seed, err := fundingSeed(record)
+		if err != nil {
+			return nil, err
+		}
+		if key, _, err = deriveTransitOwnerKey(seed, transitOwnerScopeOf(config.ChainID, config.Contract, profile.EntryPoint, profile.Factory, profile.Paymaster, profile.AccountCreationCodeHash, payee)); err != nil {
+			return nil, err
+		}
 	}
 	owner := crypto.PubkeyToAddress(key.PublicKey)
 	creation, _ := hex.DecodeString(strings.TrimPrefix(profile.AccountCreationCode, "0x"))
@@ -339,7 +364,7 @@ func (h *FundingHandler) newTransit(ctx context.Context, config fundingConfig, p
 	if !isHex(derived, 32) || !strings.EqualFold(derived[2:], addressABIWord(strings.ToLower(account.Hex()))) {
 		return nil, fmt.Errorf("%w: the factory derives another transit account than this client (gasless_deployment_mismatch)", errGaslessUnavailable)
 	}
-	return &addressTransit{Factory: common.HexToAddress(profile.Factory).Hex(), Paymaster: common.HexToAddress(profile.Paymaster).Hex(), EntryPoint: common.HexToAddress(profile.EntryPoint).Hex(), Account: account.Hex(), Owner: owner.Hex(), OwnerKey: hex.EncodeToString(crypto.FromECDSA(key)), OwnerDerivation: transitOwnerDerivationV1, CreationCodeKeccak: profile.AccountCreationCodeHash}, nil
+	return &addressTransit{Factory: common.HexToAddress(profile.Factory).Hex(), Paymaster: common.HexToAddress(profile.Paymaster).Hex(), EntryPoint: common.HexToAddress(profile.EntryPoint).Hex(), Account: account.Hex(), Owner: owner.Hex(), OwnerKey: hex.EncodeToString(crypto.FromECDSA(key)), OwnerDerivation: derivation, CreationCodeKeccak: profile.AccountCreationCodeHash}, nil
 }
 
 // GaslessRecordNotPinned is the refusal of a sponsored operation (a
@@ -2479,7 +2504,7 @@ func (h *FundingHandler) gaslessPrepareCheck(ctx context.Context, config funding
 	if err != nil {
 		return nil, false, err
 	}
-	if transit, err = h.newTransit(ctx, config, profile, payee, record); err != nil {
+	if transit, err = h.newTransit(ctx, config, profile, payee, record, options.FreshTransit); err != nil {
 		return nil, false, err
 	}
 	env.payee, env.account, env.owner = common.HexToAddress(payee), common.HexToAddress(transit.Account), common.HexToAddress(transit.Owner)

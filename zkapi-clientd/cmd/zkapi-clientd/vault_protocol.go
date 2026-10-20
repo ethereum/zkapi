@@ -80,7 +80,7 @@ func legacyDispatchPlan(dir string, explicitDir bool, c config.Config, args []st
 	}
 	// Shared rewriter/cover settings pass unchanged to the privacy-enabled
 	// legacy engine. Never fall back to the older privacy-less executable.
-	if c.ZKAPI.ExitRPCURL != "" || c.ZKAPI.BundlerURL != "" || c.ZKAPI.WithdrawalFees != "" {
+	if c.ZKAPI.ExitRPCURL != "" || c.ZKAPI.BundlerURL != "" || c.ZKAPI.WithdrawalFees != "" || c.ZKAPI.TransitAccounts != "" {
 		return "", nil, errors.New("preserved legacy client cannot interpret concession exit options")
 	}
 	if c.ZKAPI.ExternalCompanion {

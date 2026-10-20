@@ -75,6 +75,14 @@ type ZKAPI struct {
 	// (the operator's close relay for a cooperative close, paid by its fee,
 	// with a pre-approved wallet-paid fallback, --fees relay).
 	WithdrawalFees string `json:"withdrawal_fees,omitempty"`
+	// TransitAccounts is how gasless withdrawals choose their transit
+	// account S: "" (the default, per payee: an owner key derived from the
+	// payment key for each payout address, so every gasless exit to one
+	// payout address reuses one S and is visibly linked to the others
+	// through it) or "fresh" (a random owner key and a new S for every
+	// gasless withdrawal, paying S's creation each time; --fresh-transit
+	// does the same for one withdrawal).
+	TransitAccounts string `json:"transit_accounts,omitempty"`
 	// BundlerURL is the owner's ERC-4337 bundler for gasless withdrawals
 	// (--bundler-url); empty uses the deployment's published bundler.
 	BundlerURL string `json:"bundler_url,omitempty"`
@@ -244,6 +252,9 @@ func Validate(c Config) error {
 	}
 	if c.ZKAPI.WithdrawalFees != "" && c.ZKAPI.WithdrawalFees != "wallet" && c.ZKAPI.WithdrawalFees != "payout" && c.ZKAPI.WithdrawalFees != "relay" {
 		return errors.New("ZKAPI withdrawal_fees must be wallet, payout or relay")
+	}
+	if c.ZKAPI.TransitAccounts != "" && c.ZKAPI.TransitAccounts != "fresh" {
+		return errors.New("ZKAPI transit_accounts must be fresh, or absent for one transit account per payout address")
 	}
 	return nil
 }

@@ -455,6 +455,67 @@ func TestConfigureBundlerAndWithdrawalFeesFlags(t *testing.T) {
 	}
 }
 
+// The transit-account opt-out: --fresh-transit, or zkapi.transit_accounts
+// "fresh" (config --transit-accounts fresh; per-payee clears it), sends
+// fresh_transit with a withdrawal's requests; the default sends nothing.
+// Invalid values are refused before anything is saved.
+func TestFreshTransitFlagAndSetting(t *testing.T) {
+	body := func(o gaslessOptions) map[string]any {
+		b := map[string]any{}
+		o.apply(b, false)
+		return b
+	}
+	options, err := resolveGaslessOptions(config.Config{}, "payout", 0, "", false, false, false, false)
+	if err != nil || body(options)["fresh_transit"] != nil {
+		t.Fatalf("the default reuses the payout address's transit account: %+v %v", body(options), err)
+	}
+	options.freshTransit = true
+	if body(options)["fresh_transit"] != true {
+		t.Fatalf("--fresh-transit is not sent: %+v", body(options))
+	}
+	var c config.Config
+	c.ZKAPI.TransitAccounts = "fresh"
+	if options, err := resolveGaslessOptions(c, "payout", 0, "", false, false, false, false); err != nil || !options.freshTransit {
+		t.Fatalf("the saved setting is not the default: %+v %v", options, err)
+	}
+
+	dir, _ := startTestConfig(t)
+	var seen config.Config
+	record := func(_ context.Context, _ string, c config.Config, _ string, _ setupPrompter, _ io.Writer) error {
+		seen = c
+		return nil
+	}
+	ui := &startTestUI{}
+	if err := configure(context.Background(), dir, []string{"--transit-accounts", "fresh"}, ui, &bytes.Buffer{}, record); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := config.Load(dir); err != nil || seen.ZKAPI.TransitAccounts != "fresh" || loaded.ZKAPI.TransitAccounts != "fresh" {
+		t.Fatalf("not saved: %+v %v", seen.ZKAPI, err)
+	}
+	if !strings.Contains(ui.output.String(), "Transit accounts: a fresh one for every gasless withdrawal") {
+		t.Fatalf("summary: %s", ui.output.String())
+	}
+	if err := configure(context.Background(), dir, []string{"--transit-accounts", "per-payee"}, &startTestUI{}, &bytes.Buffer{}, record); err != nil || seen.ZKAPI.TransitAccounts != "" {
+		t.Fatalf("per-payee does not clear the setting: %+v %v", seen.ZKAPI, err)
+	}
+	for _, args := range [][]string{{"--transit-accounts", "random"}, {"--transit-accounts", ""}} {
+		if err := configure(context.Background(), dir, args, &startTestUI{}, &bytes.Buffer{}, func(_ context.Context, _ string, _ config.Config, _ string, _ setupPrompter, _ io.Writer) error {
+			t.Errorf("invalid %v reached the action", args)
+			return nil
+		}); err == nil {
+			t.Fatalf("invalid %v accepted", args)
+		}
+	}
+	loaded, err := config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.ZKAPI.TransitAccounts = "always"
+	if err := config.Validate(loaded); err == nil || !strings.Contains(err.Error(), "transit_accounts") {
+		t.Fatalf("an unknown saved transit_accounts value is accepted: %v", err)
+	}
+}
+
 // Design 3.3: the guided withdrawal offers to pay the fee from the payout
 // whenever the pre-flight says it can, before any fee QR; the choice goes
 // into the quote, no payment QR is shown, the approval prompt states what
