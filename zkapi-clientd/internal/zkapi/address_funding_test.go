@@ -51,10 +51,10 @@ type addressFixture struct {
 	// pinnedNoteStatus, by note, is the status the pinned RPC alone
 	// answers for noteRecord (a lying pinned RPC); the exit RPC serves
 	// vaultNotes.
-	pinnedNoteStatus           map[uint32]uint8
+	pinnedNoteStatus map[uint32]uint8
 	// exitNotes, by note, is what the exit RPC alone answers for noteRecord
 	// (an exit RPC that disagrees with the pinned one).
-	exitNotes map[uint32]fixtureNote
+	exitNotes                  map[uint32]fixtureNote
 	vaultReadsAt               []string
 	leaves                     []*big.Int
 	indexer                    *httptest.Server
