@@ -1045,9 +1045,9 @@ test('challenge evidence is never inferred from a reorged-out start, another nul
 
     const client = new ZkapiClient();
     client.config = { funding: { contract_address: VAULT, chain_id: 11155111 } };
-    const topic = keccak256Hex('EscapeWithdrawalChallenged(uint32,uint256,uint256)');
+    const topic = keccak256Hex('EscapeWithdrawalChallenged(uint32,uint256)');
     assert.equal(walletCodec.ABI.escapeChallengedEvent, topic);
-    const challenged = { address: VAULT, topics: [topic, word(7)], data: `${word(nullifier)}${word(1).slice(2)}`,
+    const challenged = { address: VAULT, topics: [topic, word(7)], data: word(nullifier),
         blockNumber: '0x78', transactionHash: `0x${'cd'.repeat(32)}`, removed: false };
     let logs = [challenged];
     const queries = [];
@@ -1148,11 +1148,11 @@ test('a failing automatic settlement backs off instead of polling every two seco
     t.mock.timers.tick(60_000);
 });
 
-test('capabilities come only from the build-pinned trust anchor: vault revision 3, required ownership proofs', async () => {
+test('capabilities come only from the build-pinned trust anchor: vault revision 4, required ownership proofs', async () => {
     const runtime = new BrowserWalletRuntime();
     runtime.manifest = { vault_revision: 2, clearance_ownership_proof: 'optional' };
     runtime.browserConfig = { trusted_deployment: {} };
-    assert.deepEqual(runtime.vaultCapabilities(), { vaultRevision: 3, exitConcession: true, payoutCredits: true,
+    assert.deepEqual(runtime.vaultCapabilities(), { vaultRevision: 4, exitConcession: true, leafBoundExit: true, payoutCredits: true,
         sendOwnershipProof: true });
 
     const config = deployedProfile();
@@ -1166,8 +1166,11 @@ test('capabilities come only from the build-pinned trust anchor: vault revision 
     assert.doesNotThrow(() => runtime.validateManifestTrust(manifest));
     // A served manifest cannot change them: only the pinned profile counts.
     assert.doesNotThrow(() => runtime.validateManifestTrust({ ...manifest, vault_revision: 2, clearance_ownership_proof: 'optional' }));
-    for (const change of [{ vault_revision: 0 }, { vault_revision: '3' }, { vault_revision: 2 },
-        { clearance_ownership_proof: 'always' }, { clearance_ownership_proof: 'optional' }]) {
+    for (const change of [{ vault_revision: 0 }, { vault_revision: '4' }, { vault_revision: 3 }, { vault_revision: 2 }]) {
+        runtime.browserConfig = { ...config, trusted_deployment: { ...trusted, ...change } };
+        assert.throws(() => runtime.validateManifestTrust(manifest), { code: 'vault_revision_unsupported' }, JSON.stringify(change));
+    }
+    for (const change of [{ clearance_ownership_proof: 'always' }, { clearance_ownership_proof: 'optional' }]) {
         runtime.browserConfig = { ...config, trusted_deployment: { ...trusted, ...change } };
         assert.throws(() => runtime.validateManifestTrust(manifest), /invalid trusted/, JSON.stringify(change));
     }

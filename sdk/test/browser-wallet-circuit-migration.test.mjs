@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BrowserWalletRuntime } from '../services/browserWalletRuntime.js';
 
-const CIRCUIT_ID = 'zkapi-v2-concession-v1';
+const CIRCUIT_ID = 'zkapi-v2-concession-v2';
 
 function manifest() {
     return {
@@ -33,7 +33,7 @@ function manifest() {
 
 test('browser rejects missing, legacy, and unknown circuits with migration guidance', () => {
     const runtime = new BrowserWalletRuntime();
-    for (const circuitId of [undefined, '', 'legacy-unbound', 'zkapi-v2-note-bound-v1', 'unknown-future-circuit']) {
+    for (const circuitId of [undefined, '', 'legacy-unbound', 'zkapi-v2-note-bound-v1', 'zkapi-v2-concession-v1', 'unknown-future-circuit']) {
         const deployment = manifest();
         deployment.proof_setup.circuit_id = circuitId;
         assert.throws(() => runtime.validateManifest(deployment), error => {
@@ -59,7 +59,10 @@ test('browser requires its trusted configuration to pin the same circuit', () =>
         ...deployment.privacy_mode,
         setup_id: 'dev',
         exit_concession: 1,
-        vault_revision: 3,
+        vault_revision: 4,
+        leaf_bound_exit: 1,
+        min_deposit_units: 1_000_000,
+        fresh_slot_gas: 22_100,
         clearance_ownership_proof: 'required'
     } };
     runtime.validateManifestTrust(deployment);
@@ -72,7 +75,8 @@ test('browser requires its trusted configuration to pin the same circuit', () =>
 /** A build-pinned profile (browser-config.json's trusted_deployment) for a manifest. */
 function trustedFor(deployment, changes = {}) {
     return { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode, setup_id: 'dev',
-        exit_concession: 1, vault_revision: 3, clearance_ownership_proof: 'required', ...changes };
+        exit_concession: 1, vault_revision: 4, leaf_bound_exit: 1, min_deposit_units: 1_000_000, fresh_slot_gas: 22_100,
+        clearance_ownership_proof: 'required', ...changes };
 }
 
 // A build's own profile is checked before anything else: a profile that pins
@@ -141,7 +145,8 @@ test('a placeholder profile, a profile without the concession exit or an unknown
     const runtime = new BrowserWalletRuntime();
     const deployment = manifest();
     const trusted = { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode,
-        setup_id: 'dev', exit_concession: 1, vault_revision: 3, clearance_ownership_proof: 'required' };
+        setup_id: 'dev', exit_concession: 1, vault_revision: 4, leaf_bound_exit: 1, min_deposit_units: 1_000_000,
+        fresh_slot_gas: 22_100, clearance_ownership_proof: 'required' };
     runtime.browserConfig = { trusted_deployment: trusted };
     runtime.validateManifestTrust(deployment);
     runtime.browserConfig = { trusted_deployment: { ...trusted, deployment_status: 'not_deployed' } };
@@ -157,9 +162,21 @@ test('a placeholder profile, a profile without the concession exit or an unknown
         runtime.browserConfig = { trusted_deployment: { ...trusted, setup_id: setupId } };
         assert.throws(() => runtime.validateManifestTrust(deployment), /invalid trusted setup_id/);
     }
-    // Only vault revision 3 with required ownership proofs and a positive W.
-    for (const change of [{ vault_revision: 2 }, { vault_revision: undefined }, { clearance_ownership_proof: 'optional' },
-        { clearance_ownership_proof: undefined }, { settlement_window_seconds: 0 }, { settlement_window_seconds: '14705' }]) {
+    // Only vault revision 4 (leaf-bound exits): a revision-3 profile names
+    // root-bound exits, which this build's statement cannot make.
+    for (const change of [{ vault_revision: 3 }, { vault_revision: 2 }, { vault_revision: undefined }, { vault_revision: '4' }]) {
+        runtime.browserConfig = { trusted_deployment: { ...trusted, ...change } };
+        assert.throws(() => runtime.validateManifestTrust(deployment), { code: 'vault_revision_unsupported' }, JSON.stringify(change));
+    }
+    for (const leafBoundExit of [undefined, 0, 2, '1']) {
+        runtime.browserConfig = { trusted_deployment: { ...trusted, leaf_bound_exit: leafBoundExit } };
+        assert.throws(() => runtime.validateManifestTrust(deployment), { code: 'leaf_bound_exit_required' });
+    }
+    // Required ownership proofs, a positive W and the deposit pins.
+    for (const change of [{ clearance_ownership_proof: 'optional' },
+        { clearance_ownership_proof: undefined }, { settlement_window_seconds: 0 }, { settlement_window_seconds: '14705' },
+        { min_deposit_units: undefined }, { min_deposit_units: 0 }, { min_deposit_units: '1000000' },
+        { fresh_slot_gas: undefined }, { fresh_slot_gas: -1 }]) {
         runtime.browserConfig = { trusted_deployment: { ...trusted, ...change } };
         assert.throws(() => runtime.validateManifestTrust(deployment), /invalid trusted/, JSON.stringify(change));
     }

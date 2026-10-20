@@ -1,7 +1,7 @@
 // The proof worker against the shipped WebAssembly and keys (no mocks of the
 // WASM): bundle identity, pinned key loading, one bound per state, the
-// successor nullifier, the log rebuild with per-event root checks and the
-// stale-device verifier.
+// successor nullifier, exits without a path, the request tree from the
+// vault's state or logs, the note leaf, and the stale-device verifier.
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -57,13 +57,13 @@ async function genesisNote(noteId = 0) {
 
 test('the worker runs the shipped bundle of the manifest circuit and setup', async () => {
     assert.deepEqual(await execute('identity', {}),
-        { circuit_id: 'zkapi-v2-concession-v1', setup_id: manifest.setupId });
+        { circuit_id: 'zkapi-v2-concession-v2', setup_id: manifest.setupId });
     assert.ok(fetched.some(url => url.endsWith('/wasm/zkapi_browser_bg.wasm')));
 });
 
 test('every key is loaded only with its SHA-256 pin', async () => {
     const { state } = await genesisNote();
-    const args = { mode: 'ownership', valid_until: 1, active_root: '0x1', merkle_siblings: [] };
+    const args = { mode: 'ownership', valid_until: 1 };
     await assert.rejects(execute('prepareWithdrawal', { config, state, args, provingKey: { url: `${KEY_ORIGIN}withdrawal.pk` } }),
         /pinned SHA-256/);
     await assert.rejects(execute('verifyRequest', { publicInputs: {}, proof: '', verifyingKey: { ...key('request.vk'), sha256: '0'.repeat(64) } }),
@@ -86,28 +86,46 @@ test('the successor nullifier is the nullifier an escape publishes, not the curr
     assert.notEqual(await execute('withdrawalNullifier', { state: other }), nullifier);
 });
 
-test('the log rebuild checks the root after every event and yields the note path', async () => {
+test('an exit takes no path: prepare_withdrawal refuses a root or siblings before proving', async () => {
+    const { state } = await genesisNote(2);
+    for (const extra of [{ active_root: '0x1' }, { merkle_siblings: [] }]) {
+        await assert.rejects(execute('prepareWithdrawal', { config, state,
+            args: { mode: 'ownership', valid_until: 4_000_000_000, ...extra }, provingKey: key('withdrawal.pk') }),
+        new RegExp(`unknown field \`${Object.keys(extra)[0]}\``));
+    }
+});
+
+test('the request tree from the vault\'s state or logs yields the note path; the state form checks count and root', async () => {
     const notes = await Promise.all([0, 1, 2].map(() => execute('generateDeposit', {})));
     const reference = new glue.BrowserNoteTree();
-    const events = notes.map((deposit, noteId) => {
-        const event = { event: 'note_deposited', note_id: noteId, commitment: deposit.registration_commitment,
-            amount: String(1_000_000 + noteId), expiry_ts: 4_000_000_000 };
-        return { ...event, root: JSON.parse(reference.apply(JSON.stringify(event))) };
-    });
-    const retired = { event: 'closed_leaf_retired', note_id: 1 };
-    events.push({ ...retired, root: JSON.parse(reference.apply(JSON.stringify(retired))) });
-    const path2 = await execute('rebuildTreePath', { events, noteId: 2 });
-    assert.deepEqual(path2, JSON.parse(reference.path(2)));
-    assert.equal(path2.siblings.length, 32);
+    const events = notes.map((deposit, noteId) => ({ event: 'note_deposited', note_id: noteId,
+        commitment: deposit.registration_commitment, amount: String(1_000_000 + noteId), expiry_ts: 4_000_000_000 }));
+    events.push({ event: 'closed_leaf_retired', note_id: 1 });
+    for (const event of events) reference.apply(JSON.stringify(event));
+    const expected = JSON.parse(reference.path(2));
+    const root = JSON.parse(reference.root());
     reference.free();
-    // A log whose root disagrees with the rebuilt tree stops the rebuild.
-    const tampered = events.map((event, index) => index === 1 ? { ...event, root: '0x5' } : event);
-    await assert.rejects(execute('rebuildTreePath', { events: tampered, noteId: 2 }), /tree_root_mismatch: the vault log 1/);
-    // A retired note has no path, and an out-of-order deposit is refused.
-    await assert.rejects(execute('rebuildTreePath', { events, noteId: 1 }), /tree_event_invalid/);
-    await assert.rejects(execute('rebuildTreePath', { events: events.slice(1), noteId: 1 }), /tree_event_invalid/);
+    // From the logs (no event carries a root; the caller checks currentRoot()).
+    assert.deepEqual(await execute('treePathFromEvents', { events, noteId: 2 }), expected);
+    await assert.rejects(execute('treePathFromEvents', { events, noteId: 1 }), /tree_event_invalid/);
+    await assert.rejects(execute('treePathFromEvents', { events: events.slice(1), noteId: 1 }), /tree_event_invalid/);
+    // A revision-3 event with its root field is refused (deny_unknown_fields).
+    await assert.rejects(execute('treePathFromEvents', { events: [{ ...events[0], root: root }], noteId: 0 }), /unknown field/);
+    // From the state: the leaves, nextNoteId() and currentRoot() at one block.
+    const leaves = await Promise.all(notes.map((deposit, noteId) => execute('noteLeafFromFields', { noteId,
+        commitment: deposit.registration_commitment, amount: 1_000_000 + noteId, expiryTs: 4_000_000_000 })));
+    leaves[1] = '0x0';
+    const snapshot = { root, next_note_id: 3, leaves };
+    assert.deepEqual(await execute('treePathFromState', { snapshot, noteId: 2 }), expected);
+    await assert.rejects(execute('treePathFromState', { snapshot: { ...snapshot, root: '0x5' }, noteId: 2 }), /^Error: tree_root_mismatch|tree_root_mismatch/);
+    await assert.rejects(execute('treePathFromState', { snapshot: { ...snapshot, next_note_id: 4 }, noteId: 2 }), /tree_root_mismatch/);
+    await assert.rejects(execute('treePathFromState', { snapshot, noteId: 1 }), /tree_event_invalid/, 'a retired note has no path');
     // The dense-leaves form agrees once the leaves are known.
     await assert.rejects(execute('treePathFromLeaves', { leaves: ['0x0'], noteId: 0 }), /tree_event_invalid/);
+    // A state's leaf is the leaf of its public fields.
+    const state = await execute('confirmDeposit', { config, args: { secret: notes[2].secret, note_id: 2, amount: 1_000_002,
+        expiry_ts: 4_000_000_000 } });
+    assert.equal(BigInt(await execute('noteLeaf', { state })), BigInt(leaves[2]));
 });
 
 test('a request proof fixes the state bound, and only a valid proof verifies under the pinned request.vk', async () => {

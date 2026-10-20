@@ -184,6 +184,9 @@ test('the gas policy normalizes from both spellings, compares with the contract�
     assert.equal(profile.defaults.postOpDefault, 270_000n);
     assert.equal(vectors.finalizeReserveGas, vectors.pvgFloor + vectors.verificationFloor + vectors.callFloor[2] + vectors.pmVerificationFloor + vectors.postOpFloor);
     assert.equal(vectors.finalizeReserveGas.toString(), V.gas_policy.finalize_reserve_gas);
+    // Vault revision 4's paymaster (zkapi-clientd pins the same figures).
+    assert.equal(BigInt(vectors.pmVerificationFloor), 340_000n);
+    assert.equal(BigInt(vectors.finalizeReserveGas), 880_000n);
     // gasPolicy() is two uint256[4] then 22 scalars (30 words).
     const words = [...vectors.callFloor, ...vectors.callHardCap, vectors.postOpFloor, vectors.postOpCap, vectors.verificationFloor,
         vectors.verificationFloorInit, vectors.verificationCap, vectors.pvgFloor, vectors.pvgCap, vectors.pmVerificationFloor,
@@ -225,7 +228,7 @@ test('gas fields come from the pinned policy within every floor and cap, never f
     const fields = gasFields({ gasPolicy, kind: KIND.close, withInitCode: true, calldataBytes: 1_764 });
     assert.deepEqual(fields, {
         callGasLimit: 395_000n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
-        paymasterVerificationGasLimit: 380_000n, paymasterPostOpGasLimit: 275_000n
+        paymasterVerificationGasLimit: 370_000n, paymasterPostOpGasLimit: 275_000n
     });
     assert.equal(gasFields({ gasPolicy, kind: KIND.close, withInitCode: false, calldataBytes: 0 }).verificationGasLimit, 80_000n);
     assert.equal(gasFields({ gasPolicy, kind: KIND.forward, calldataBytes: 0 }).callGasLimit, 60_000n);
@@ -316,8 +319,10 @@ test('preVerificationGas follows the rule zkapi-clientd shares, to the gas, on t
     });
     const cases = [
         // label, op, A (LIM-070 term), B (reference minimum), handleOps bytes (C = 21,000 + 16 × bytes + 10,000), PVG
-        ['close with initCode', operation(), 66_316n, 52_668n, 1_764, 66_316n],
-        ['close without initCode', operation({ initCode: '0x' }), 65_356n, 51_696n, 1_668, 65_356n],
+        // Vault revision 4's close carries six more nonzero calldata bytes
+        // (the leaf and the packed note fields): A and B each grow by 6 × 12 = 72.
+        ['close with initCode', operation(), 66_388n, 52_740n, 1_764, 66_388n],
+        ['close without initCode', operation({ initCode: '0x' }), 65_428n, 51_768n, 1_668, 65_428n],
         ['forward', operation({ initCode: '0x', callData: encodeTransitWithdraw('0x'), nonce: packNonce(FORWARD_NONCE_KEY, 0n), callGasLimit: 97_500n }),
             57_904n, 44_136n, 804, 57_904n],
         ['finalize', operation({ initCode: '0x', callData: encodeTransitWithdraw(encodeFinalizeEscape(C.note_id)), nonce: packNonce(C.nonce_key, 1n),
@@ -484,7 +489,8 @@ test('AA codes and the paymaster’s errors decode from FailedOp / FailedOpWithR
         ['NotPendingEscape()', 'not_pending_escape', '', {}], ['NotStranded()', 'not_stranded', '', {}],
         ['NotRepayable()', 'not_repayable', '', {}], ['NothingToSweep()', 'nothing_to_sweep', '', {}],
         ['InvalidPayee()', 'invalid_payee', '', {}], ['FeeAboveCeiling()', 'gas_above_paymaster_ceiling', '', {}],
-        ['UnknownRoot()', 'unknown_root', '', {}], ['NoteNotActive()', 'note_not_active', '', {}],
+        ['NoteLeafMismatch()', 'note_leaf_mismatch', '', {}], ['InvalidNoteFields()', 'invalid_note_fields', '', {}],
+        ['NoteNotActive()', 'note_not_active', '', {}],
         ['ChallengedNullifier()', 'challenged_nullifier', '', {}], ['SupersededState()', 'superseded_state', '', {}],
         ['InvalidProof()', 'invalid_proof', '', {}], ['SponsorshipInFlight(bytes32)', 'sponsorship_in_flight', word(1), { key: `0x${word(1)}` }]
     ];

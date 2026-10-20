@@ -2,8 +2,10 @@
 /* eslint-disable */
 
 /**
- * The note tree rebuilt from vault logs (§6.6): `apply` one event, in log
- * order, and compare the returned root with the event's.
+ * The vault's note tree for request paths: `from_state` with the
+ * vault's leaves, `nextNoteId()` and `currentRoot()` read at one block
+ * hash, or `new` and `apply` one event at a time in log order, then
+ * compare `root` with `currentRoot()` at the last event's block.
  */
 export class BrowserNoteTree {
     free(): void;
@@ -12,6 +14,12 @@ export class BrowserNoteTree {
      * Apply one `TreeEvent` (JSON) and return the new root (JSON felt).
      */
     apply(event_json: string): string;
+    /**
+     * The tree of a `TreeSnapshot` (JSON `{root, next_note_id, leaves}`)
+     * read from the vault at one block hash; refused with
+     * `tree_root_mismatch` unless the leaves reproduce the root.
+     */
+    static from_state(snapshot_json: string): BrowserNoteTree;
     constructor();
     next_note_id(): number;
     path(note_id: number): string;
@@ -40,9 +48,18 @@ export function browser_confirm_deposit(config_json: string, args_json: string):
 export function browser_generate_deposit(): string;
 
 /**
- * Whether `{active_root, siblings}` (JSON) is a path of the state's note.
+ * The state's note leaf (JSON felt): the vault's stored leaf for the
+ * note, which every exit statement binds.
  */
-export function browser_note_path_matches(state_json: string, path_json: string): boolean;
+export function browser_note_leaf(state_json: string): string;
+
+/**
+ * The leaf of a deposit from its public fields (JSON felt), for
+ * recovery against `noteRecord(note_id).leaf`: `commitment` is the
+ * registration commitment in hex, `amount` and `expiry_ts` decimal or
+ * 0x-hex strings.
+ */
+export function browser_note_leaf_from_fields(note_id: number, commitment: string, amount: string, expiry_ts: string): string;
 
 export function browser_prepare_request(config_json: string, state_json: string, args_json: string, proving_key: Uint8Array): string;
 
@@ -82,7 +99,8 @@ export interface InitOutput {
     readonly browser_complete_response: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly browser_confirm_deposit: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly browser_generate_deposit: () => [number, number, number, number];
-    readonly browser_note_path_matches: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly browser_note_leaf: (a: number, b: number) => [number, number, number, number];
+    readonly browser_note_leaf_from_fields: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly browser_prepare_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
     readonly browser_prepare_withdrawal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
     readonly browser_setup_id: () => [number, number];
@@ -93,6 +111,7 @@ export interface InitOutput {
     readonly browser_wallet_status: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly browser_withdrawal_nullifier: (a: number, b: number) => [number, number, number, number];
     readonly browsernotetree_apply: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly browsernotetree_from_state: (a: number, b: number) => [number, number, number];
     readonly browsernotetree_new: () => number;
     readonly browsernotetree_next_note_id: (a: number) => number;
     readonly browsernotetree_path: (a: number, b: number) => [number, number, number, number];

@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    DEPLOYMENT, VAULT, createHarness, depositPath, memoryIndexedDb, noteState, nullifierFor, within
+    DEPLOYMENT, VAULT, createHarness, memoryIndexedDb, noteState, nullifierFor, within
 } from './helpers/request-archive-harness.mjs';
 import { deployedProfile } from './helpers/deployed-profile.mjs';
 import {
@@ -49,7 +49,7 @@ const wei = units => BigInt(units) * GWEI;
  * chain (the exit RPC and the pinned RPC), a scripted bundler over fetch and a
  * fake wallet that only signs.
  */
-async function scenario({ state = noteState({ current_balance: 500_000_000, deposit_path: depositPath('0x51') }), profile = {},
+async function scenario({ state = noteState({ current_balance: 500_000_000 }), profile = {},
     gasless = gaslessProfileFromVectors({ spelling: 'profile', ...profile }), from = OWNER, allow = [] } = {}) {
     indexedDB.clear();
     storage.clear();
@@ -163,7 +163,8 @@ test('a sponsored close creates the transit account, signs the hash once, journa
     assert.equal(BigInt(op.callGasLimit), 395_000n, 'the profile default, not the bundler estimate');
     assert.equal(BigInt(op.verificationGasLimit), 180_000n, 'verification_default_init');
     assert.equal(BigInt(op.paymasterPostOpGasLimit), 270_000n);
-    assert.equal(BigInt(op.paymasterVerificationGasLimit), 380_000n);
+    // The transit vectors' default (PM_VERIFICATION_FLOOR 340,000 plus margin).
+    assert.equal(BigInt(op.paymasterVerificationGasLimit), 370_000n);
     // Journaled before eth_sendUserOperation, with the signature; two dry runs (unsigned, then signed) and the EntryPoint hash cross-check.
     assert.equal(journalAtSend.userOpPhase, 'op_built');
     assert.deepEqual(journalAtSend.userOp, op);
@@ -454,10 +455,10 @@ test('refusals before any prompt: the wrong owner account, AA31, a paused paymas
     assert.equal(spike.wallet.signatures.length, 0);
     assert.equal(proofs(spike.h, 'mutual').length, 0, 'the fee ceiling refuses in the pre-flight, before the proof binds S');
 
-    const small = await scenario({ state: noteState({ current_balance: 20_000_000, deposit_path: depositPath('0x51') }) });
+    const small = await scenario({ state: noteState({ current_balance: 20_000_000 }) });
     await assert.rejects(small.withdraw('mutual'), { code: 'payout_below_gas' });
 
-    const uneconomic = await scenario({ state: noteState({ current_balance: 100_000_000, deposit_path: depositPath('0x51') }) });
+    const uneconomic = await scenario({ state: noteState({ current_balance: 100_000_000 }) });
     await assert.rejects(uneconomic.withdraw('mutual'), error => error.code === 'gasless_uneconomic' && error.data.uneconomicFractionPercent === 25n);
     assert.equal(uneconomic.wallet.signatures.length, 0);
     uneconomic.bundler.autoMine = uneconomic.closeBundle();

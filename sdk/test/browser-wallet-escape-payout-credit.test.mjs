@@ -38,7 +38,8 @@ const TOPIC = Object.freeze({
     finalized: keccak256Hex('EscapeWithdrawalFinalized(uint32,uint256,uint128,address)')
 });
 const SELECTOR = Object.freeze({
-    notes: selectorOf('notes(uint32)'),
+    // noteRecord(uint32): (leaf, status)
+    notes: selectorOf('noteRecord(uint32)'),
     pending: selectorOf('pendingWithdrawals(uint32)'),
     credits: selectorOf('escapePayoutCredits(address)'),
     claim: selectorOf('claimEscapePayout(address)'),
@@ -140,7 +141,7 @@ function scriptedChain() {
                 assert.equal(to, VAULT);
                 if (data.startsWith(SELECTOR.notes)) {
                     const noteId = Number(BigInt(`0x${data.slice(10)}`));
-                    return `0x${[0, 0, 0, chain.noteStatus.get(noteId) ?? 3].map(word).join('')}`;
+                    return `0x${[0x1eaf, chain.noteStatus.get(noteId) ?? 3].map(word).join('')}`;
                 }
                 if (data.startsWith(SELECTOR.pending)) {
                     return `0x${[1, 0x11, 0x99, FINAL_BALANCE, DESTINATION, CLOSE_BLOCK].map(word).join('')}`;
@@ -208,7 +209,7 @@ test('signature-derived selectors and topics match the SDK table', () => {
     assert.equal(TOPIC.finalized, ABI.escapeFinalizedEvent);
     assert.equal(SELECTOR.credits, `0x${ABI.escapePayoutCredits}`);
     assert.equal(SELECTOR.claim, `0x${ABI.claimEscapePayout}`);
-    assert.equal(SELECTOR.notes, `0x${ABI.notes}`);
+    assert.equal(SELECTOR.notes, `0x${ABI.noteRecord}`);
     assert.equal(SELECTOR.nativeTransferFailed, '0xf4b3b1bc');
     assert.equal(SELECTOR.zeroAmount, '0x1f2a2005');
 });

@@ -3,16 +3,38 @@ const CONTRACT_ERRORS = Object.freeze({
         code: 'invalid_proof',
         message: 'The vault rejected the withdrawal proof. Refresh the page and prepare the withdrawal again.'
     },
-    // StaleRoot(): a deposit's (or retirement's) siblings no longer match
-    // the live root. Exits do no Merkle work on vault revision 3.
+    // StaleRoot(): since vault revision 4 only retireClosedLeaf raises it (a
+    // retirement's siblings no longer lead to the live frontier). Deposits
+    // and exits do no Merkle work.
     '0x607447de': {
         code: 'stale_root',
-        message: 'The vault changed while the deposit was being prepared. Its Merkle path must be refreshed.'
+        message: 'The vault changed while the retirement was being prepared. Its Merkle path must be refreshed.'
     },
-    // UnknownRoot(): the vault never held the proof's root.
-    '0x8c520116': {
-        code: 'unknown_root',
-        message: 'The vault does not know this withdrawal proof’s Merkle root. The proof must be generated again.'
+    // NoteLeafMismatch(): the exit's (or claimExpired's) note leaf is not
+    // the leaf the vault stored for the note at deposit.
+    '0xf2b1d50f': {
+        code: 'note_leaf_mismatch',
+        message: 'The vault holds another leaf for this private note: the saved note does not match its deposit. Restore the newest backup or exit kit of this balance.'
+    },
+    // InvalidNoteFields(): public input 8 is not below 2^224.
+    '0xaa6aef76': {
+        code: 'invalid_note_fields',
+        message: 'The withdrawal proof carries malformed note fields.'
+    },
+    // DepositTooSmall(): the amount is below the vault's minDeposit().
+    '0x6ba4a1c7': {
+        code: 'deposit_too_small',
+        message: 'The deposit is below the vault’s minimum deposit.'
+    },
+    // TreeFull(): the vault holds 2^32 − 1 notes and accepts no more.
+    '0xb48f2cf8': {
+        code: 'tree_full',
+        message: 'The vault accepts no more deposits: its note tree is full.'
+    },
+    // InvalidNoteRange(): noteLeaves(start, count) past nextNoteId.
+    '0x9fe6fd7a': {
+        code: 'invalid_note_range',
+        message: 'The vault holds fewer notes than the range read.'
     },
     // ChallengedNullifier(): an escape from this state was defeated by
     // successor evidence: another device spent the next state.
@@ -61,9 +83,10 @@ const CONTRACT_ERRORS = Object.freeze({
         code: 'invalid_deployment',
         message: 'The withdrawal proof does not match this zkAPI deployment.'
     },
+    // InvalidSiblings(): a retirement's sibling list is malformed.
     '0xd9876be8': {
         code: 'invalid_siblings',
-        message: 'The vault rejected the withdrawal Merkle path. Prepare a fresh withdrawal and try again.'
+        message: 'The vault rejected the retirement’s Merkle path.'
     },
     '0x3be553f2': {
         code: 'not_pending_withdrawal',
@@ -122,6 +145,8 @@ const CONTRACT_ERRORS = Object.freeze({
     '0xedab562d': { code: 'destination_not_sender', message: 'The withdrawal proof does not pay the transit account.' },
     // InvalidValidUntil()
     '0x488b16b7': { code: 'invalid_valid_until', message: 'The withdrawal proof has no usable expiry.' },
+    // NoteLeafMismatch(), InvalidNoteFields() and NoteNotActive() of the
+    // paymaster share the vault's selectors above (one entry each).
     // NullifierUsed()
     '0x92814985': { code: 'nullifier_used', message: 'This private state was already used. Check the withdrawal’s on-chain status before retrying.' },
     // InvalidFelt()

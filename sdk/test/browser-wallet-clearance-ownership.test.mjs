@@ -127,7 +127,7 @@ test('a mismatched ownership proof fails closed before any server reservation', 
     const other = `0x${'56'.repeat(20)}`;
     for (const change of [{ chain_id: 1 }, { contract_address: other }, { state_signing_key_x: '0x1' },
         { clearance_signing_key_y: '0x1' }, { withdrawal_nullifier: '0x1' }, { note_id: 8 },
-        { active_root: '0x1' }, { final_balance: 1 }, { destination: destinationBytes(other) },
+        { note_leaf: '0x1' }, { deposit_amount: '1' }, { expiry_ts: '1' }, { active_root: '0x1' }, { final_balance: 1 }, { destination: destinationBytes(other) },
         { kind: 0 }, { kind: 1 }, { conceded: 1 }, { next_nullifier: '0x5' }, { valid_until: 1 },
         { valid_until: Math.floor(Date.now() / 1000) + 7_200 }, { destination: destinationBytes(DESTINATION) },
         { protocol_version: 1 }, { request_nullifier: '0x1' },
@@ -198,8 +198,8 @@ test('a persisted clearance is reused without a second ownership proof or server
     const first = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
     h.chain.root = '0x79';
     const second = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
-    // The vault accepts any root it ever held: the close proof is reused.
-    assert.equal(second.public_inputs.active_root, first.public_inputs.active_root);
+    // An exit is bound to the note's leaf, not to a root: the close proof is reused.
+    assert.equal(second.public_inputs.note_leaf, first.public_inputs.note_leaf);
     assert.deepEqual(second.proof, first.proof);
     assert.deepEqual(second.clearance, first.clearance);
     // A mutual lock may always become an escape (E2.5).
@@ -220,10 +220,11 @@ test('a persisted clearance is reused without a second ownership proof or server
     // A forced re-proof of the close reuses the persisted clearance.
     const again = await freshWallet();
     again.server.clearance = body => clearanceFor(body);
-    await again.runtime.prepareWithdrawal('mutual', DESTINATION);
+    const firstClose = await again.runtime.prepareWithdrawal('mutual', DESTINATION);
     again.chain.root = '0x7a';
     const reproved = await again.runtime.prepareWithdrawal('mutual', DESTINATION, { reprove: true });
-    assert.equal(reproved.public_inputs.active_root, '0x7a');
+    assert.notDeepEqual(reproved.proof, firstClose.proof);
+    assert.equal(mutualProofs(again).length, 2, 'the close was proved again');
     assert.equal(clearancePosts(again).length, 1);
     assert.equal(ownershipProofs(again).length, 1);
 });
@@ -336,7 +337,7 @@ test('background mutual sends the ownership proof and persists its clearance', a
             destination: DESTINATION, clearanceReserved: true, withdrawalNullifier: nullifier } });
     await h.runtime.reload();
     h.server.clearance = body => clearanceFor(body);
-    const plan = await h.runtime.prepareBackgroundWithdrawal(RECORD_ID, { expectedActiveRoot: h.chain.root });
+    const plan = await h.runtime.prepareBackgroundWithdrawal(RECORD_ID);
     const [{ body }] = clearancePosts(h);
     assert.equal(body.withdrawal_nullifier, nullifier);
     assert.equal(body.ownership_proof.public_inputs.note_id, 7);
@@ -347,13 +348,13 @@ test('background mutual sends the ownership proof and persists its clearance', a
     assert.equal((await store.readBrowserWallet()).state.note_id, 8, 'the selected chat note is untouched');
 
     h.chain.root = '0x79';
-    await h.runtime.prepareBackgroundWithdrawal(RECORD_ID, { expectedActiveRoot: '0x79' });
+    await h.runtime.prepareBackgroundWithdrawal(RECORD_ID);
     assert.equal(clearancePosts(h).length, 1, 'the persisted clearance is reused');
     assert.equal(ownershipProofs(h).length, 1);
     assert.equal(mutualProofs(h).length, 2);
 });
 
-test('a withdrawal proof is reused at any root until near its valid_until', async () => {
+test('a withdrawal proof is reused, whatever the vault root, until near its valid_until', async () => {
     const h = await freshWallet();
     const first = await h.runtime.prepareWithdrawal('escape', DESTINATION);
     const validity = first.public_inputs.valid_until - Math.floor(Date.now() / 1000);
@@ -367,7 +368,7 @@ test('a withdrawal proof is reused at any root until near its valid_until', asyn
 
     const reproved = await h.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true });
     assert.equal(escapeProofs(h).length, 2);
-    assert.equal(reproved.public_inputs.active_root, '0x78');
+    assert.equal(reproved.public_inputs.note_leaf, first.public_inputs.note_leaf, 'the same leaf at any root');
 
     // A proof close to its valid_until is never handed out again.
     const saved = await store.readBrowserWallet();
@@ -380,7 +381,9 @@ test('a withdrawal proof is reused at any root until near its valid_until', asyn
 });
 
 test('vault errors decode from selectors computed from their signatures', () => {
-    for (const [signature, code] of [['UnknownRoot()', 'unknown_root'], ['ChallengedNullifier()', 'challenged_nullifier'],
+    for (const [signature, code] of [['NoteLeafMismatch()', 'note_leaf_mismatch'], ['InvalidNoteFields()', 'invalid_note_fields'],
+        ['DepositTooSmall()', 'deposit_too_small'], ['TreeFull()', 'tree_full'], ['InvalidNoteRange()', 'invalid_note_range'],
+        ['NoteNotActive()', 'note_not_active'], ['ChallengedNullifier()', 'challenged_nullifier'],
         ['InvalidDestination()', 'invalid_destination'], ['Paused()', 'vault_paused'], ['StaleRoot()', 'stale_root'],
         ['SupersededState()', 'superseded_state'], ['ProofExpired()', 'proof_expired'],
         ['WrongWithdrawalKind()', 'wrong_withdrawal_kind']]) {
@@ -389,6 +392,8 @@ test('vault errors decode from selectors computed from their signatures', () => 
         assert.equal(error.selector, selectorOf(signature));
     }
     assert.match(contractEstimateError({ data: selectorOf('Paused()') }).message, /paused/i);
+    // UnknownRoot() is gone with vault revision 4: an unknown selector.
+    assert.equal(contractEstimateError({ data: selectorOf('UnknownRoot()') }).code, 'gas_estimation_failed');
 });
 
 
@@ -420,7 +425,8 @@ test('only a close the server granted can be set aside; every other withdrawal-o
     }
 });
 
-test('a granted close set aside shows its deadlines and closes later without the operator, from the deposit-time path', async () => {
+test('a granted close set aside shows its deadlines and closes later without the operator or any path', async () => {
+    // A state saved by a revision-3 build still names its deposit-time path: ignored.
     const depositPath = { active_root: '0x51', siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`) };
     const soon = Math.floor(Date.now() / 1_000) + 43_200 + 3 * 86_400;
     for (const [expiry, near] of [[2_000_000_000, false], [soon, true]]) {
@@ -437,22 +443,18 @@ test('a granted close set aside shows its deadlines and closes later without the
         assert.equal(summary.must_initiate_by, (expiry - 43_200) * 1_000);
         assert.equal(summary.exit_deadline_near, near, `expiry ${expiry}`);
         assert.equal(summary.state, undefined, 'no private state in the snapshot');
-        // Later, with the indexer and the server gone: the kept clearance and
-        // the deposit-time path close it.
-        h.runtime.treePath = () => assert.fail('no indexer for a set-aside close with a saved path');
+        // Later, with the indexer, the server and the pinned RPC gone: the
+        // kept clearance closes it, bound to the note's leaf.
+        h.runtime.indexerPath = () => assert.fail('no indexer for a set-aside close');
+        h.runtime.pinnedRpc = () => async () => assert.fail('no chain read for a set-aside close');
         h.server.clearance = () => assert.fail('no second clearance');
         const posts = clearancePosts(h).length;
-        const background = await h.runtime.prepareBackgroundWithdrawal(record.recordId, { expectedActiveRoot: '0x99' });
+        const background = await h.runtime.prepareBackgroundWithdrawal(record.recordId);
         assert.equal(background.mode, 'mutual');
-        assert.equal(background.pathSource, 'deposit');
-        assert.equal(background.public_inputs.active_root, '0x51');
+        assert.equal('pathSource' in background, false);
+        assert.equal(background.public_inputs.note_leaf, plan.public_inputs.note_leaf);
+        assert.equal(background.public_inputs.active_root, undefined);
         assert.equal(background.public_inputs.final_balance, 5_000_000);
         assert.equal(clearancePosts(h).length, posts);
-        // After an UnknownRoot refusal of that root, another one is used.
-        h.runtime.treePath = async noteId => ({ active_root: '0x99', note_id: noteId,
-            siblings: Array.from({ length: 32 }, (_, index) => `0x99${index.toString(16)}`) });
-        const again = await h.runtime.prepareBackgroundWithdrawal(record.recordId, { expectedActiveRoot: '0x99', refusedRoot: '0x51' });
-        assert.equal(again.pathSource, 'indexer');
-        assert.equal(again.public_inputs.active_root, '0x99');
     }
 });

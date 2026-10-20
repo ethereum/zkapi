@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    DESTINATION, createHarness, depositPath, memoryIndexedDb, noteState, within
+    DESTINATION, createHarness, memoryIndexedDb, noteState, stateNoteLeaf, within
 } from './helpers/request-archive-harness.mjs';
 import { deployedProfile } from './helpers/deployed-profile.mjs';
 import { nativeFunding, nativeQuote } from './helpers/native-fixtures.mjs';
@@ -151,7 +151,7 @@ async function savedWallet({ liveRequest = true } = {}) {
     proofWorker = seed.runtime.worker;
     proofLog = seed.worker;
     await store.writeBrowserWallet({ deploymentId: DEPLOYMENT_ID, billingAsset: 'native_eth',
-        state: noteState({ chain_id: Number(TRUSTED.chain_id), deposit_path: depositPath() }) });
+        state: noteState({ chain_id: Number(TRUSTED.chain_id), registration_commitment: '0x52' }) });
     await seed.runtime.reload();
     if (liveRequest) {
         seed.server.leasePost = body => seed.activeLease(body, { billing_quote: quote });
@@ -192,7 +192,8 @@ test('an operator holding every connection open cannot stall initialization or a
     // A request may be reserved: before T a forced escape concedes 0 (E3).
     assert.equal(plan.decision.rule, 'E3.forced');
     assert.equal(plan.public_inputs.conceded, 0);
-    assert.equal(plan.pathSource, 'deposit');
+    // No path: the escape is bound to the note's leaf, read from nobody.
+    assert.equal(plan.public_inputs.note_leaf, stateNoteLeaf(noteState({ chain_id: Number(TRUSTED.chain_id) })));
     assert.equal(await within(1_000, runtime.startupRecovery, 'the stopped startup recovery'), false);
     const saved = await store.readBrowserWallet();
     assert.deepEqual(saved.exitLock.released.map(entry => entry.kind), [0]);
@@ -327,7 +328,9 @@ test('a hung non-exit call in another tab holds an exit only until its own timeo
     assert.equal(plan.mode, 'escape');
     assert.ok(elapsed(started) < FAST.operatorCallTimeoutMs + 2_000, `the exit waited ${elapsed(started)} ms`);
     const error = await within(FAST.operatorCallTimeoutMs + 1_000, chat, 'the chat');
-    assert.equal(error.name, 'TimeoutError', String(error));
+    // The indexer timed out; the request's path rebuild from the vault then
+    // fails on this RPC: either way the chat ends, after the exit.
+    assert.ok(error.name === 'TimeoutError' || error.data?.request_path_unavailable === true, String(error));
 });
 
 test('the client does not keep a failed start either', async () => {
@@ -390,5 +393,6 @@ test('an exit RPC that hangs and ignores its abort signal still ends at E0\'s ca
     assert.equal(plan.mode, 'escape');
     assert.equal(plan.decision.rule, 'E2.escape');
     assert.ok(elapsed(started) < 3_000, `the escape took ${elapsed(started)} ms`);
+    // E0 reads effectiveExpiry (with the leaf's preimage) through it.
     assert.ok(net.calls.some(url => url.startsWith('https://exit-rpc.example/')), 'the escape read the exit RPC');
 });
