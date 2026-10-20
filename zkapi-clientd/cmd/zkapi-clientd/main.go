@@ -425,6 +425,7 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 		fmt.Fprintln(out, "WARNING: rewriter enabled: uncached user text goes DIRECTLY to the configured rewriter, outside Tor/zkAPI. Target history replays saved rewrites; cache misses rewrite historical user turns. Style rewriting does not guarantee anonymity.")
 	}
 	api.RequireAPIKey = c.RequireAPIKey
+	api.WebSearch = c.WebSearch
 	api.Status = server.ServiceStatus{Backend: c.Backend}
 	api.Status.Network = c.ZKAPI.Network
 	api.Status.RequestBudgetPolicy = "model"
@@ -452,6 +453,11 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	}
 	logger.Printf("zkAPI client %s listening at http://%s/v1 (%s); %s", version, c.Listen, c.Backend, transport)
 	logger.Printf("zkAPI network: %s", c.ZKAPI.Network)
+	if c.WebSearch {
+		logger.Print("Web search: on by default (OpenRouter; search charges apply)")
+	} else {
+		logger.Print("Web search: off by default")
+	}
 	if c.RequireAPIKey {
 		logger.Print("Use zkapi-clientd config --api-key to configure your client; Ctrl+C stops the service")
 	} else {

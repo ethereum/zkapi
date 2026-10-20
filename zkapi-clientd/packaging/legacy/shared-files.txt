@@ -1,6 +1,8 @@
 cmd/zkapi-clientd/config_display.go
 internal/config/vault_protocol.go
 internal/config/inspect.go
+internal/config/web_search_test.go
+cmd/zkapi-clientd/web_search_test.go
 cmd/zkapi-clientd/access_errors.go
 cmd/zkapi-clientd/access_errors_test.go
 cmd/zkapi-clientd/cover.go
@@ -26,6 +28,8 @@ internal/server/server.go
 internal/server/logging.go
 internal/server/cost.go
 internal/server/cost_test.go
+internal/server/default_model_test.go
+internal/server/web_search_test.go
 internal/zkapi/rewriter.go
 internal/zkapi/rewriter_reuse_test.go
 internal/zkapi/rewriter_safety_test.go

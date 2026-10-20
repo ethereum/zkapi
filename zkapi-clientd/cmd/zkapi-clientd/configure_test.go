@@ -139,7 +139,7 @@ func TestConfigureEditPreservesCredentialsAndAdvancedSettings(t *testing.T) {
 	if err := config.Update(dir, prior, original); err != nil {
 		t.Fatal(err)
 	}
-	ui := &startTestUI{answers: []string{"sepolia", "127.0.0.1:9876", "direct"}}
+	ui := &startTestUI{answers: []string{"sepolia", "127.0.0.1:9876", "direct", ""}}
 	called := false
 	err = configure(context.Background(), dir, []string{"--edit"}, ui, io.Discard, func(_ context.Context, _ string, c config.Config, action string, _ setupPrompter, _ io.Writer) error {
 		called = true
@@ -208,7 +208,7 @@ func TestConfigureNetworkEditsFollowDefaultVerifier(t *testing.T) {
 					ui := &startTestUI{}
 					if interactive {
 						args = []string{"--edit"}
-						ui.answers = []string{to, c.Listen, "direct"}
+						ui.answers = []string{to, c.Listen, "direct", ""}
 					}
 					want := c
 					want.ZKAPI.Network = to

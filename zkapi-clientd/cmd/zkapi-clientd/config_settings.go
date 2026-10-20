@@ -16,6 +16,7 @@ import (
 const settingsHelp = `Saved settings (stop serve before edits; no setup or payment):
   config --vault-protocol legacy|concession|default  (use alone)
   config --model MODEL | --clear-model
+  config --web-search=true|false  (default: true)
   config --rewriter-url URL --rewriter-model MODEL
          [--rewriter-api-key-env ENV | --rewriter-clear-api-key]
          [--rewriter-notice reasoning|metadata|off]
@@ -52,7 +53,7 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	for _, arg := range args {
 		name := strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]
 		switch name {
-		case "rewriter-instruction-file", "rewriter-default-instruction", "network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "relay-url", "listen", "require-api-key", "key-reuse-window-seconds", "status", "vault-protocol", "model", "clear-model", "rewriter-url", "rewriter-model", "rewriter-api-key-env", "rewriter-clear-api-key", "rewriter-notice", "clear-rewriter", "cover-urls", "cover-rate", "cover-concurrency", "clear-cover":
+		case "web-search", "rewriter-instruction-file", "rewriter-default-instruction", "network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "relay-url", "listen", "require-api-key", "key-reuse-window-seconds", "status", "vault-protocol", "model", "clear-model", "rewriter-url", "rewriter-model", "rewriter-api-key-env", "rewriter-clear-api-key", "rewriter-notice", "clear-rewriter", "cover-urls", "cover-rate", "cover-concurrency", "clear-cover":
 			selected = true
 		}
 	}
@@ -81,6 +82,7 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	reuse := f.Int("key-reuse-window-seconds", config.DefaultKeyReuseWindowSeconds, "key reuse window")
 	listen := f.String("listen", "", "local listener")
 	requireKey := f.Bool("require-api-key", false, "require local inference key")
+	webSearch := f.Bool("web-search", true, "automatically enable OpenRouter web search (search charges apply)")
 	oldFields := map[string]*string{}
 	for _, name := range []string{"network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees"} {
 		oldFields[name] = f.String(name, "", "saved "+name+" setting")
@@ -239,6 +241,9 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	}
 	if seen["require-api-key"] {
 		next.RequireAPIKey = *requireKey
+	}
+	if seen["web-search"] {
+		next.WebSearch = *webSearch
 	}
 	saved, err := config.LoadVaultProtocol(dir)
 	if err != nil {

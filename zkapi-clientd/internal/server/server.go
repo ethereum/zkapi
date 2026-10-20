@@ -42,6 +42,9 @@ type API struct {
 	RewriterNotice string
 	DefaultModel   string
 	RequireAPIKey  bool
+	// WebSearch adds OpenRouter's web plugin to every chat completion. Explicit
+	// :online model selections still request search when this default is off.
+	WebSearch bool
 	// Admin is optional local wallet management. All of its routes require the
 	// private CLI credential; an inference API key cannot authorize wallet use.
 	Admin           http.Handler
@@ -64,7 +67,7 @@ func New(backend Backend, key string, concurrency int) (*API, error) {
 	if concurrency < 1 || concurrency > 64 {
 		return nil, errors.New("concurrency must be between 1 and 64")
 	}
-	return &API{backend: backend, key: sha256.Sum256([]byte(key)), slots: make(chan struct{}, concurrency), pending: make(chan struct{}, concurrency+64)}, nil
+	return &API{backend: backend, key: sha256.Sum256([]byte(key)), slots: make(chan struct{}, concurrency), pending: make(chan struct{}, concurrency+64), WebSearch: true}, nil
 }
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +185,7 @@ var fields = map[string]bool{
 	"modalities": true, "audio": true, "prediction": true,
 }
 
-func sanitizeWithDefault(body []byte, model string) (json.RawMessage, bool, error) {
+func sanitizeWithDefault(body []byte, model string, webSearch bool) (json.RawMessage, bool, error) {
 	if model != "" {
 		var values map[string]json.RawMessage
 		if json.Unmarshal(body, &values) == nil && values != nil {
@@ -192,10 +195,10 @@ func sanitizeWithDefault(body []byte, model string) (json.RawMessage, bool, erro
 			}
 		}
 	}
-	return sanitize(body)
+	return sanitize(body, webSearch)
 }
 
-func sanitize(body []byte) (json.RawMessage, bool, error) {
+func sanitize(body []byte, webSearch bool) (json.RawMessage, bool, error) {
 	var values map[string]json.RawMessage
 	if err := json.Unmarshal(body, &values); err != nil || values == nil {
 		return nil, false, errors.New("body must be a JSON object")
@@ -240,6 +243,11 @@ func sanitize(body []byte) (json.RawMessage, bool, error) {
 		options["include_usage"] = json.RawMessage("true")
 		values["stream_options"], _ = json.Marshal(options)
 	}
+	// Only this locally configured plugin crosses the boundary. Keep caller
+	// plugins filtered and preserve the model ID, tools, and generation options.
+	if webSearch {
+		values["plugins"] = json.RawMessage(`[{"id":"web"}]`)
+	}
 	clean, err := json.Marshal(values)
 	return clean, stream, err
 }
@@ -271,7 +279,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 413, "invalid_body", "Request body is too large or unreadable (16 MiB maximum).")
 		return
 	}
-	clean, streaming, err := sanitizeWithDefault(body, a.DefaultModel)
+	clean, streaming, err := sanitizeWithDefault(body, a.DefaultModel, a.WebSearch)
 	if err != nil {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return

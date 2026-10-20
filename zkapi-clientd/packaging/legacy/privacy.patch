@@ -75,7 +75,7 @@
  	var remote *zkapi.Error
  	if errors.As(err, &remote) {
  		switch remote.Code {
-@@ -360,6 +363,10 @@
+@@ -360,7 +363,12 @@
  		return err
  	}
  	api.DefaultModel = c.DefaultModel
@@ -84,9 +84,11 @@
 +		fmt.Fprintln(out, "WARNING: rewriter enabled: uncached user text goes DIRECTLY to the configured rewriter, outside Tor/zkAPI. Target history replays saved rewrites; cache misses rewrite historical user turns. Style rewriting does not guarantee anonymity.")
 +	}
  	api.RequireAPIKey = c.RequireAPIKey
++	api.WebSearch = c.WebSearch
  	api.Status = server.ServiceStatus{Backend: c.Backend}
  	api.Status.Network = c.ZKAPI.Network
-@@ -370,6 +377,11 @@
+ 	api.Status.RequestBudgetPolicy = "model"
+@@ -370,6 +378,11 @@
  		api.ManagementToken = c.ManagementToken
  		api.Admin = http.HandlerFunc(funding.ServeAdminHTTP)
  	}
@@ -98,11 +100,35 @@
  	httpServer := &http.Server{Handler: server.LogRequests(api, logger), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 32 << 10, ErrorLog: log.New(io.Discard, "", 0), BaseContext: func(net.Listener) context.Context { return life }}
  	serverDone := make(chan error, 1)
  	go func() { serverDone <- httpServer.Serve(listener) }()
+@@ -383,6 +396,11 @@
+ 	}
+ 	logger.Printf("zkAPI client %s listening at http://%s/v1 (%s); %s", version, c.Listen, c.Backend, transport)
+ 	logger.Printf("zkAPI network: %s", c.ZKAPI.Network)
++	if c.WebSearch {
++		logger.Print("Web search: on by default (OpenRouter; search charges apply)")
++	} else {
++		logger.Print("Web search: off by default")
++	}
+ 	if c.RequireAPIKey {
+ 		logger.Print("Use zkapi-clientd config --api-key to configure your client; Ctrl+C stops the service")
+ 	} else {
 --- a/zkapi-clientd/cmd/zkapi-clientd/configure.go
 +++ b/zkapi-clientd/cmd/zkapi-clientd/configure.go
-@@ -39,13 +39,14 @@
+@@ -19,6 +19,7 @@
+ 	network, listen, relay, binary, proofs    string
+ 	usd                                       string
+ 	keyReuseWindowSeconds                     int
++	webSearch                                 bool
+ 	status, apiKey, edit, menu, requireAPIKey bool
+ 	fields                                    map[string]bool
+ }
+@@ -37,15 +38,17 @@
+ 	f.BoolVar(&o.apiKey, "api-key", false, "print the local inference API key explicitly")
+ 	f.IntVar(&o.keyReuseWindowSeconds, "key-reuse-window-seconds", config.DefaultKeyReuseWindowSeconds, "fixed ephemeral key reuse window (default 60 seconds; 1-300 shares keys across chats and local clients; 0 uses a fresh key per inference request)")
  	f.BoolVar(&o.requireAPIKey, "require-api-key", false, "require a local API key for inference (default: no key required)")
- 	f.BoolVar(&o.edit, "edit", false, "edit network, listener, and transport interactively")
+-	f.BoolVar(&o.edit, "edit", false, "edit network, listener, and transport interactively")
++	f.BoolVar(&o.webSearch, "web-search", true, "automatically enable OpenRouter web search for chat completions; use --web-search=false to disable (search charges apply)")
++	f.BoolVar(&o.edit, "edit", false, "edit network, listener, transport, and web search interactively")
  	f.BoolVar(&o.menu, "menu", false, "open configuration and wallet management actions")
 +	f.Bool("setup", false, "explicit wallet setup")
  	if err := f.Parse(args); err != nil {
@@ -116,8 +142,25 @@
  			return
  		}
  		if field.Name != "usd" {
-@@ -271,7 +272,7 @@
+@@ -243,6 +246,9 @@
+ 	if o.fields["require-api-key"] {
+ 		c.RequireAPIKey = o.requireAPIKey
+ 	}
++	if o.fields["web-search"] {
++		c.WebSearch = o.webSearch
++	}
+ 	if o.fields["listen"] {
+ 		c.Listen = o.listen
+ 	}
+@@ -269,9 +275,14 @@
+ 	}
+ 	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", c.ZKAPI.Network, transport)
  	showClientConnection(c, ui)
++	if c.WebSearch {
++		ui.Printf("Web search: on by default (OpenRouter; search charges apply).\n")
++	} else {
++		ui.Printf("Web search: off by default.\n")
++	}
  	if c.KeyReuseWindowSeconds == 0 {
  		ui.Printf("Ephemeral key reuse: disabled; fresh key per inference request. New keys may wait for earlier settlement.\n")
 -	} else if strings.HasPrefix(c.RelayURL, "tor://") {
@@ -125,6 +168,22 @@
  		ui.Printf("Ephemeral key reuse: up to %d seconds within prefix-continuing conversations only; fresh key on each conversation change.\n", c.KeyReuseWindowSeconds)
  	} else {
  		ui.Printf("Ephemeral key reuse: fixed window up to %d seconds; different chats and local clients can share a key and its spending cap. The provider can link those requests.\n", c.KeyReuseWindowSeconds)
+@@ -350,6 +361,15 @@
+ 		c = candidate
+ 		break
+ 	}
++	searchDefault := "off"
++	if c.WebSearch {
++		searchDefault = "on"
++	}
++	search, err := configureChoice(ctx, ui, "Web search by default (OpenRouter search charges apply): on or off", searchDefault, "on", "off")
++	if err != nil {
++		return c, err
++	}
++	c.WebSearch = search == "on"
+ 	return c, nil
+ }
+ 
 --- a/zkapi-clientd/internal/config/config.go
 +++ b/zkapi-clientd/internal/config/config.go
 @@ -14,7 +14,9 @@
@@ -146,7 +205,20 @@
  	// ManagementToken is a separate owner-only credential. It must never be
  	// published with config.json or shared with inference API clients.
  	ManagementToken       string `json:"-"`
-@@ -161,6 +165,12 @@
+@@ -73,6 +77,7 @@
+ 	Listen                string `json:"listen"`
+ 	APIKey                string `json:"api_key"`
+ 	KeyReuseWindowSeconds int    `json:"key_reuse_window_seconds"`
++	WebSearch             bool   `json:"web_search"`
+ 	RequireAPIKey         bool   `json:"require_api_key"`   // opt in to bearer authentication for loopback inference
+ 	Backend               string `json:"backend"`           // fixed to zkapi; retained for existing profile compatibility
+ 	OrgURL                string `json:"org_url,omitempty"` // legacy profile field; unused
+@@ -157,10 +162,16 @@
+ 		return Config{}, err
+ 	}
+ 	bridge, err := Secret()
+-	return Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, Listen: "127.0.0.1:8787", APIKey: key, Backend: "zkapi", VerifierURL: DefaultVerifierURL("mainnet"), Concurrency: 4, ZKAPI: ZKAPI{ClientURL: "http://127.0.0.1:8790", BridgeToken: bridge, Network: "mainnet"}}, err
++	return Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, WebSearch: true, Listen: "127.0.0.1:8787", APIKey: key, Backend: "zkapi", VerifierURL: DefaultVerifierURL("mainnet"), Concurrency: 4, ZKAPI: ZKAPI{ClientURL: "http://127.0.0.1:8790", BridgeToken: bridge, Network: "mainnet"}}, err
  }
  
  func Validate(c Config) error {
@@ -159,6 +231,37 @@
  	if c.DefaultModel != "" && !ValidModelID(c.DefaultModel) {
  		return errors.New("invalid default model ID")
  	}
+@@ -290,12 +301,13 @@
+ 		return Config{}, err
+ 	}
+ 	defer f.Close()
+-	// Missing fields in older profiles adopt the default window. Preserve
+-	// explicitly saved reuse windows, including zero for strict per-request keys.
+-	c := Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds}
++	// Missing fields in older profiles adopt the defaults. Preserve explicit
++	// opt-outs, including zero for strict per-request keys and web_search=false.
++	c := Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, WebSearch: true}
+ 	decoded := struct {
+ 		*Config
+ 		ReuseWindow json.RawMessage `json:"key_reuse_window_seconds"`
++		WebSearch   json.RawMessage `json:"web_search"`
+ 	}{Config: &c}
+ 	d := json.NewDecoder(io.LimitReader(f, 1<<20))
+ 	d.DisallowUnknownFields()
+@@ -309,6 +321,13 @@
+ 		}
+ 		c.KeyReuseWindowSeconds = *seconds
+ 	}
++	if len(decoded.WebSearch) > 0 {
++		var enabled *bool
++		if json.Unmarshal(decoded.WebSearch, &enabled) != nil || enabled == nil {
++			return Config{}, errors.New("web_search must be a boolean")
++		}
++		c.WebSearch = *enabled
++	}
+ 	var trailing any
+ 	if d.Decode(&trailing) != io.EOF {
+ 		return Config{}, errors.New("config.json must contain one JSON object")
 --- a/zkapi-clientd/internal/zkapi/client.go
 +++ b/zkapi-clientd/internal/zkapi/client.go
 @@ -10,6 +10,7 @@
@@ -260,3 +363,23 @@
  	}
  	lease, err := c.waitForLease(ctx, body)
  	if err != nil {
+--- a/zkapi-clientd/cmd/zkapi-clientd/configure_test.go
++++ b/zkapi-clientd/cmd/zkapi-clientd/configure_test.go
+@@ -139,7 +139,7 @@
+ 	if err := config.Update(dir, prior, original); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	ui := &startTestUI{answers: []string{"sepolia", "127.0.0.1:9876", "direct"}}
++	ui := &startTestUI{answers: []string{"sepolia", "127.0.0.1:9876", "direct", ""}}
+ 	called := false
+ 	err = configure(context.Background(), dir, []string{"--edit"}, ui, io.Discard, func(_ context.Context, _ string, c config.Config, action string, _ setupPrompter, _ io.Writer) error {
+ 		called = true
+@@ -208,7 +208,7 @@
+ 					ui := &startTestUI{}
+ 					if interactive {
+ 						args = []string{"--edit"}
+-						ui.answers = []string{to, c.Listen, "direct"}
++						ui.answers = []string{to, c.Listen, "direct", ""}
+ 					}
+ 					want := c
+ 					want.ZKAPI.Network = to

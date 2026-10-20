@@ -27,12 +27,21 @@ the profile lock and never run setup, send requests or make payments:
 "$CLIENT" config --rewriter-notice metadata
 "$CLIENT" config --cover-urls 'https://your-controlled-domain.example/cover' --cover-rate 5
 "$CLIENT" config --key-reuse-window-seconds 60
+"$CLIENT" config --web-search=false
 ```
 
 Tor must already listen on the configured port with `IsolateSOCKSAuth`. The
 client does not launch Tor. Rewriting connects directly, outside Tor. Cover
 requires explicit destinations you control or have permission to poll; 5/s can
 consume substantial bandwidth. Neither feature guarantees anonymity.
+
+Web search is on by default, including for older profiles without `web_search`.
+Use `config --web-search=false` to disable automatic search or
+`config --web-search=true` to restore it. The saved boolean appears in `config`
+and `config --status`; omitted settings preserve an explicit opt-out. Search
+charges apply to all completions, including background UI requests. An explicit
+`:online` model still requests search when the default is off. See
+[web search](CLI_ZKAPI.md#web-search).
 
 Related fields can be changed together (for example Tor endpoint and cover).
 Omitted fields retain their existing values, including rewriter credentials.

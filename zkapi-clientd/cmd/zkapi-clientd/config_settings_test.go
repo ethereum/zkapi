@@ -141,3 +141,50 @@ func TestConfigSettingsRejectsLockedProfile(t *testing.T) {
 		t.Fatal("edited locked profile")
 	}
 }
+
+func TestConfigSettingsWebSearch(t *testing.T) {
+	dir, original := startTestConfig(t)
+	for _, test := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"--web-search=false"}, false},
+		{[]string{"--model", "provider/model"}, false},
+		{[]string{"--web-search=true", "--clear-model"}, true},
+	} {
+		var out bytes.Buffer
+		if handled, err := runConfigSettings(dir, test.args, &out); !handled || err != nil {
+			t.Fatalf("web search edit: handled=%v err=%v", handled, err)
+		}
+		saved, err := config.Load(dir)
+		if err != nil || saved.WebSearch != test.want || saved.APIKey != original.APIKey || saved.ManagementToken != original.ManagementToken || saved.ZKAPI != original.ZKAPI {
+			t.Fatal("web search edit lost the preference or changed wallet settings", err)
+		}
+		out.Reset()
+		if handled, err := runConfigSettings(dir, []string{"--status"}, &out); !handled || err != nil {
+			t.Fatal("status failed", err)
+		}
+		var status struct {
+			WebSearch *bool `json:"web_search"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &status); err != nil || status.WebSearch == nil || *status.WebSearch != test.want {
+			t.Fatal("status omitted or changed the search preference", err)
+		}
+		for _, name := range []string{"funding", "zkapi"} {
+			if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+				t.Fatalf("settings edit started wallet setup: %s", name)
+			}
+		}
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := runConfigSettings(dir, []string{"--web-search=invalid"}, &bytes.Buffer{}); !handled || err == nil {
+		t.Fatal("invalid web search preference was not rejected")
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("invalid web search edit changed the profile", err)
+	}
+}

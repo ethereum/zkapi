@@ -88,6 +88,7 @@ type Config struct {
 	Listen                string `json:"listen"`
 	APIKey                string `json:"api_key"`
 	KeyReuseWindowSeconds int    `json:"key_reuse_window_seconds"`
+	WebSearch             bool   `json:"web_search"`        // automatically enable OpenRouter web search for chat completions
 	RequireAPIKey         bool   `json:"require_api_key"`   // opt in to bearer authentication for loopback inference
 	Backend               string `json:"backend"`           // fixed to zkapi; retained for existing profile compatibility
 	OrgURL                string `json:"org_url,omitempty"` // legacy profile field; unused
@@ -172,7 +173,7 @@ func Default() (Config, error) {
 		return Config{}, err
 	}
 	bridge, err := Secret()
-	return Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, Listen: "127.0.0.1:8787", APIKey: key, Backend: "zkapi", VerifierURL: DefaultVerifierURL("mainnet"), Concurrency: 4, ZKAPI: ZKAPI{ClientURL: "http://127.0.0.1:8790", BridgeToken: bridge, Network: "mainnet"}}, err
+	return Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, WebSearch: true, Listen: "127.0.0.1:8787", APIKey: key, Backend: "zkapi", VerifierURL: DefaultVerifierURL("mainnet"), Concurrency: 4, ZKAPI: ZKAPI{ClientURL: "http://127.0.0.1:8790", BridgeToken: bridge, Network: "mainnet"}}, err
 }
 
 func Validate(c Config) error {
@@ -340,12 +341,13 @@ func readConfig(dir string) (Config, error) {
 		return Config{}, err
 	}
 	defer f.Close()
-	// Missing fields in older profiles adopt the default window. Preserve
-	// explicitly saved reuse windows, including zero for strict per-request keys.
-	c := Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds}
+	// Missing fields in older profiles adopt the defaults. Preserve explicit
+	// opt-outs, including zero for strict per-request keys and web_search=false.
+	c := Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, WebSearch: true}
 	decoded := struct {
 		*Config
 		ReuseWindow json.RawMessage `json:"key_reuse_window_seconds"`
+		WebSearch   json.RawMessage `json:"web_search"`
 	}{Config: &c}
 	d := json.NewDecoder(io.LimitReader(f, 1<<20))
 	d.DisallowUnknownFields()
@@ -358,6 +360,13 @@ func readConfig(dir string) (Config, error) {
 			return Config{}, errors.New("key_reuse_window_seconds must be an integer between 0 and 300")
 		}
 		c.KeyReuseWindowSeconds = *seconds
+	}
+	if len(decoded.WebSearch) > 0 {
+		var enabled *bool
+		if json.Unmarshal(decoded.WebSearch, &enabled) != nil || enabled == nil {
+			return Config{}, errors.New("web_search must be a boolean")
+		}
+		c.WebSearch = *enabled
 	}
 	var trailing any
 	if d.Decode(&trailing) != io.EOF {

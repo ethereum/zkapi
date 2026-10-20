@@ -53,7 +53,7 @@ func TestResponseCosts(t *testing.T) {
 }
 func TestStreamingAlwaysRequestsUsage(t *testing.T) {
 	for _, extra := range []string{"", `,"stream_options":{"include_usage":false,"extra":true}`} {
-		body, _, err := sanitize([]byte(`{"model":"m","messages":[{"role":"user","content":"x"}],"stream":true` + extra + `}`))
+		body, _, err := sanitize([]byte(`{"model":"m","messages":[{"role":"user","content":"x"}],"stream":true`+extra+`}`), true)
 		if err != nil || !bytes.Contains(body, []byte(`"include_usage":true`)) {
 			t.Fatal(string(body), err)
 		}

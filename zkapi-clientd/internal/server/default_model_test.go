@@ -16,7 +16,7 @@ func TestDefaultModel(t *testing.T) {
 		{`{"messages":[{"role":"user","content":"hi"}]}`, "", "", true},
 		{`null`, "saved/model", "", true},
 	} {
-		raw, _, err := sanitizeWithDefault([]byte(test.body), test.fallback)
+		raw, _, err := sanitizeWithDefault([]byte(test.body), test.fallback, true)
 		if (err != nil) != test.fail {
 			t.Fatal(test, err)
 		}

@@ -75,6 +75,7 @@ zkapi-clientd config --menu             # withdrawal and wallet actions
 zkapi-clientd config --require-api-key  # require a local inference key
 zkapi-clientd config --api-key          # show that key when requested
 zkapi-clientd config --key-reuse-window-seconds 0  # fresh key per inference request
+zkapi-clientd config --web-search=false  # disable automatic web search (default: on)
 zkapi-clientd config --exit-rpc-url https://rpc.example  # your own RPC for exits ('none' clears it)
 ```
 
@@ -158,6 +159,33 @@ Actual fees can be lower than the reserved maximum, leaving a public remainder.
 Both work without a running daemon by owning a temporary runtime, and leave an
 existing compatible daemon running. Missing installation/network prerequisites
 still point to `config`. Stop a running service before editing configuration.
+
+## Web search
+
+Web search defaults to on for new profiles and older profiles without a
+`web_search` setting. Each chat completion includes OpenRouter's
+[`web` plugin](https://openrouter.ai/blog/announcements/introducing-web-search-via-the-api/),
+which supplies web results across models. The selected model ID, tools, and
+generation options are preserved. Both ordinary JSON responses and streamed
+responses retain the provider's citations and annotations.
+
+Stop `serve` before changing the setting, then restart it:
+
+```sh
+zkapi-clientd config --web-search=false  # turn the default off
+zkapi-clientd config --web-search=true   # turn it back on
+```
+
+You can also choose on or off in `config --edit`. The preference is saved as
+`"web_search": true` or `false` in `config.json`, shown by `config --status`,
+and preserved across updates. Use the same `--config-dir` if set.
+
+Search applies to every completion, including background title and follow-up
+requests. OpenRouter's search charges count toward the key's existing spending
+cap. OpenRouter or its search provider processes the search query; see
+[privacy boundaries](PRIVACY.md). Turning the default off stops automatic plugin
+injection; an explicitly selected `:online` model still requests search.
+Caller-supplied `plugins` remain filtered by the local API.
 
 ## Sepolia
 
