@@ -3,21 +3,15 @@ pragma solidity ^0.8.28;
 
 /// @title Events – All events emitted by ZkApiVault
 abstract contract Events {
-    event NoteDeposited(
-        uint32 indexed noteId, bytes32 indexed commitment, uint128 amount, uint64 expiryTs, uint256 newRoot
-    );
+    /// @notice The note's leaf is P(d_leaf', commitment, noteId * 2^192 + amount * 2^64 + expiryTs)[1];
+    ///         currentRoot() is the request tree's root with it appended.
+    event NoteDeposited(uint32 indexed noteId, bytes32 indexed commitment, uint128 amount, uint64 expiryTs);
 
     event MutualClose(uint32 indexed noteId, uint256 nullifier, uint128 finalBalance, address destination);
 
-    /// @notice An escape started. Escapes do no Merkle work, so `currentRoot` is the unchanged root.
-    ///         EscapeConcessionRecorded follows in the same call.
+    /// @notice An escape started. EscapeConcessionRecorded follows in the same call.
     event EscapeWithdrawalInitiated(
-        uint32 indexed noteId,
-        uint256 nullifier,
-        uint128 finalBalance,
-        address destination,
-        uint64 challengeDeadline,
-        uint256 currentRoot
+        uint32 indexed noteId, uint256 nullifier, uint128 finalBalance, address destination, uint64 challengeDeadline
     );
 
     /// @notice The concession side of the escape just initiated: `nextNullifier` (N_{k+1}) is the
@@ -30,12 +24,16 @@ abstract contract Events {
     ///         `finalBalance` is the new payout.
     event EscapeConcessionRaised(uint32 indexed noteId, uint256 nullifier, uint128 conceded, uint128 finalBalance);
 
-    /// @notice A request proof at the successor nullifier defeated the escape. `currentRoot` is the
-    ///         unchanged root (the leaf was never removed).
-    event EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier, uint256 currentRoot);
+    /// @notice A request proof at the successor nullifier defeated the escape; the note is Active
+    ///         again.
+    event EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier);
 
-    /// @notice A Closed note's leaf was removed from the tree.
-    event ClosedLeafRetired(uint32 indexed noteId, uint256 newRoot);
+    /// @notice A Closed note's leaf was removed from the request tree.
+    event ClosedLeafRetired(uint32 indexed noteId);
+
+    /// @notice recordRoot found `root` to be the request tree's root at `blockNumber`, over
+    ///         `noteCount` notes. An audit record only: nothing in the vault reads it.
+    event RootRecorded(uint256 indexed root, uint32 noteCount, uint64 blockNumber);
 
     /// @notice The escape closed. It does not by itself mean `destination` received
     ///         `finalBalance`: when an EscapePayoutDeferred for the same noteId and destination
@@ -45,8 +43,8 @@ abstract contract Events {
         uint32 indexed noteId, uint256 nullifier, uint128 finalBalance, address destination
     );
 
-    /// @notice `currentRoot` is the unchanged root: an expiry claim leaves the leaf in place.
-    event ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount, uint256 currentRoot);
+    /// @notice An expiry claim leaves the leaf in place.
+    event ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount);
 
     event ProofAdapterSet(address indexed newAdapter);
 

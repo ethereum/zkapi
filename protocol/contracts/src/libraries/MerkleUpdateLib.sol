@@ -5,18 +5,18 @@ import {Errors} from "./Errors.sol";
 import {IBn254Poseidon} from "../interfaces/IBn254Poseidon.sol";
 
 /// @title MerkleUpdateLib
-/// @notice The note tree: depth 32, zero leaves, node = compress("zkapi.v2.node", left, right) of the
-///         vault's Poseidon (zkapi_core::v2::merkle_node), note ID as the leaf index. Leaves are appended in
-///         order (insert) and only ever changed back to zero (retire), so the tree is kept as its
-///         frontier: `filled[i]` holds the complete left subtree of height i that the next right
-///         subtree at that height will be hashed with.
-/// @dev `filled[i]` is read by an insertion whose index has bit i set, and holds the subtree of
-///      index `(index >> i) - 1` then. It is written at the one level where an insertion completes
-///      a subtree (the index's lowest zero bit), and by a retirement that changes the subtree the
-///      frontier still refers to (the level below the lowest common ancestor of the retired leaf and
-///      the next free slot; see retire). Every root the vault ever held stays a valid proof root for
-///      the notes that were not retired, since no other leaf ever changes. The hashing is done by
-///      the vault's IBn254Poseidon, called with STATICCALL (its failure reverts the caller).
+/// @notice The request tree: depth 32, zero leaves, node = compress("zkapi.v2.node", left, right) of
+///         the vault's Poseidon (zkapi_core::v2::merkle_node), note ID as the leaf index, each note's
+///         leaf its stored leaf (zero once retired). Only request proofs use the tree; exits are
+///         bound to the stored leaf itself. The vault keeps the tree as its frontier and computes
+///         the root on demand (root, the currentRoot() view): `filled[t]`, t >= 1, holds the
+///         complete left subtree of height t that the next right subtree at that height is hashed
+///         with; `filled[0]` is never stored, the left leaf being the note's own word.
+/// @dev `filled[t]` is meaningful while bit t of the next index is set: it is written by the append
+///      that completes a subtree of height t (the index's trailing ones), and by a retirement inside
+///      that subtree (retire). Entries at zero bits are subtrees already absorbed into higher ones.
+///      The hashing is done by the vault's IBn254Poseidon (compress), called with STATICCALL; a
+///      failed call reverts the caller.
 library MerkleUpdateLib {
     uint256 internal constant MERKLE_DEPTH = 32;
     uint256 internal constant FIELD_MODULUS =
@@ -61,8 +61,30 @@ library MerkleUpdateLib {
     /// @notice The root of the empty tree (ZERO_HASHES[32]).
     uint256 internal constant EMPTY_ROOT = 0x1eb94e909bac5b6e3331993876bdde00f84b31e0103a29af6617fc021318b81e;
 
-    function poseidonNodeHash(IBn254Poseidon poseidon, uint256 left, uint256 right) internal pure returns (uint256) {
-        return poseidon.compress(DOMAIN_NODE, left, right);
+    /// @notice One permutation of (capacity, left, right), its lane 1: `poseidon.compress`, called
+    ///         with STATICCALL from scratch memory (the call's revert data is bubbled).
+    function compress(IBn254Poseidon poseidon, uint256 capacity, uint256 left, uint256 right)
+        internal
+        view
+        returns (uint256 out)
+    {
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            // compress(uint256,uint256,uint256)
+            mstore(m, shl(224, 0x2d0c7694))
+            mstore(add(m, 0x04), capacity)
+            mstore(add(m, 0x24), left)
+            mstore(add(m, 0x44), right)
+            if iszero(and(gt(returndatasize(), 0x1f), staticcall(gas(), poseidon, m, 0x64, 0x00, 0x20))) {
+                returndatacopy(m, 0x00, returndatasize())
+                revert(m, returndatasize())
+            }
+            out := mload(0x00)
+        }
+    }
+
+    function poseidonNodeHash(IBn254Poseidon poseidon, uint256 left, uint256 right) internal view returns (uint256) {
+        return compress(poseidon, DOMAIN_NODE, left, right);
     }
 
     /// @notice The root of an empty subtree of height `level` (0 for a leaf, 32 for the tree).
@@ -73,62 +95,107 @@ library MerkleUpdateLib {
         }
     }
 
-    /// @notice Appends `leaf` at `index`, the next free slot of the tree whose frontier is `filled`,
-    ///         and returns the new root: 32 compressions, no proof needed.
-    function insert(IBn254Poseidon poseidon, uint256[32] storage filled, uint32 index, uint256 leaf)
+    /// @notice Appends `leaf` at the odd `index`, the next free slot, next to `leftLeaf` (the leaf at
+    ///         index - 1): hashes the pair, then once per further trailing one of `index` with the
+    ///         frontier entry of that level, and stores the completed subtree at the level of the
+    ///         index's lowest zero bit. trailing_ones(index) compressions, one per append on average.
+    ///         An even index completes nothing and needs no call.
+    /// @dev The caller guarantees index < 2^32 - 1 (TreeFull), so the stored level is at most 31.
+    function append(IBn254Poseidon poseidon, uint256[32] storage filled, uint32 index, uint256 leftLeaf, uint256 leaf)
         internal
-        returns (uint256 newRoot)
+    {
+        uint256 node = compress(poseidon, DOMAIN_NODE, leftLeaf, leaf);
+        uint256 level = 1;
+        while ((index >> level) & 1 == 1) {
+            node = compress(poseidon, DOMAIN_NODE, filled[level], node);
+            unchecked {
+                ++level;
+            }
+        }
+        filled[level] = node;
+    }
+
+    /// @notice The root of the tree with `nextIndex` leaves whose last leaf is `lastLeaf` (zero when
+    ///         nextIndex is even, where it is unused): over the bits of nextIndex from the bottom, a
+    ///         set bit hashes the frontier entry (the last leaf at level 0) to the left of the node so
+    ///         far, a clear bit hashes the node with an empty subtree on the right, and below the
+    ///         lowest set bit the node is an empty subtree. At most 32 compressions.
+    function root(IBn254Poseidon poseidon, uint256[32] storage filled, uint32 nextIndex, uint256 lastLeaf)
+        internal
+        view
+        returns (uint256 node)
     {
         bytes memory zeros = ZERO_HASHES;
-        uint256[32] memory siblings;
-        uint256 completedLevel = MERKLE_DEPTH;
+        bool empty = true;
         for (uint256 level = 0; level < MERKLE_DEPTH;) {
-            if (((index >> level) & 1) == 1) {
-                siblings[level] = filled[level];
-            } else {
+            if ((nextIndex >> level) & 1 == 1) {
+                node = compress(poseidon, DOMAIN_NODE, level == 0 ? lastLeaf : filled[level], node);
+                empty = false;
+            } else if (empty) {
                 assembly ("memory-safe") {
-                    mstore(add(siblings, mul(level, 0x20)), mload(add(add(zeros, 0x20), mul(level, 0x20))))
+                    node := mload(add(add(zeros, 0x40), mul(level, 0x20)))
                 }
-                if (completedLevel == MERKLE_DEPTH) completedLevel = level;
+            } else {
+                uint256 zero;
+                assembly ("memory-safe") {
+                    zero := mload(add(add(zeros, 0x20), mul(level, 0x20)))
+                }
+                node = compress(poseidon, DOMAIN_NODE, node, zero);
             }
             unchecked {
                 ++level;
             }
         }
-        uint256 completed;
-        (newRoot, completed) = poseidon.insertPath32(DOMAIN_NODE, index, leaf, siblings);
-        // The subtree this insertion completes: the path's node at the lowest zero bit of index.
-        // With every bit set (the last slot) nothing is stored; no insertion follows.
-        if (completedLevel < MERKLE_DEPTH) filled[completedLevel] = completed;
     }
 
-    /// @notice Sets the leaf at `index` (below `nextIndex`, the next free slot) back to zero, given
-    ///         the leaf's siblings at `currentRoot`, and returns the new root. Reverts StaleRoot
-    ///         when the siblings and `oldLeaf` do not reproduce `currentRoot`.
-    /// @dev The one frontier entry the change can reach is at the level just below the lowest
-    ///      common ancestor of `index` and `nextIndex` (the highest bit where they differ): there
-    ///      the two are siblings, the retired leaf's side is the complete left subtree `filled`
-    ///      holds, and above it both share the frontier node, which the next insertion recomputes.
-    function retire(
-        IBn254Poseidon poseidon,
-        uint256[32] storage filled,
-        uint32 nextIndex,
-        uint256 currentRoot,
-        uint32 index,
-        uint256 oldLeaf,
-        uint256[32] calldata siblings
-    ) internal returns (uint256 newRoot) {
+    /// @notice The level whose frontier entry a retirement of `index` rewrites while `nextIndex` is
+    ///         the next free slot: the highest bit where the two differ. Below it, `index` lies in the
+    ///         complete left subtree `filled[level]` (or, at level 0, it is the last leaf).
+    function retireLevel(uint32 index, uint32 nextIndex) internal pure returns (uint256 level) {
         uint256 differing = uint256(index ^ nextIndex);
-        uint256 level = MERKLE_DEPTH - 1;
+        level = MERKLE_DEPTH - 1;
         while ((differing >> level) & 1 == 0) {
             unchecked {
                 --level;
             }
         }
-        (uint256 computedOldRoot, uint256 root, uint256 node) =
-            poseidon.compressPairPath32(DOMAIN_NODE, index, oldLeaf, 0, siblings, level);
-        if (computedOldRoot != currentRoot) revert Errors.StaleRoot();
-        filled[level] = node;
-        newRoot = root;
+    }
+
+    /// @notice Sets the leaf at `index` (below `nextIndex`) from `oldLeaf` to zero in the frontier:
+    ///         nothing to rewrite at level 0 (the leaf is the caller's own word); otherwise the old
+    ///         and new nodes of `index`'s subtree of that level are computed from siblings[0..level)
+    ///         (bottom up), the old one must equal `filled[level]` (else StaleRoot), and the new one
+    ///         replaces it. siblings[level..32) are never read; callers zero-fill them. 2 * level
+    ///         compressions.
+    /// @dev A retirement elsewhere in the same subtree changes `filled[level]`, so a path read
+    ///      before it is stale; deposits only ever change it by completing a subtree, which moves
+    ///      `level` instead (a fresh path then gives the new level).
+    function retire(
+        IBn254Poseidon poseidon,
+        uint256[32] storage filled,
+        uint32 nextIndex,
+        uint32 index,
+        uint256 oldLeaf,
+        uint256[32] calldata siblings
+    ) internal {
+        uint256 level = retireLevel(index, nextIndex);
+        if (level == 0) return;
+        uint256 oldNode = oldLeaf;
+        uint256 newNode = 0;
+        for (uint256 height = 0; height < level;) {
+            uint256 sibling = siblings[height];
+            if ((index >> height) & 1 == 0) {
+                oldNode = compress(poseidon, DOMAIN_NODE, oldNode, sibling);
+                newNode = compress(poseidon, DOMAIN_NODE, newNode, sibling);
+            } else {
+                oldNode = compress(poseidon, DOMAIN_NODE, sibling, oldNode);
+                newNode = compress(poseidon, DOMAIN_NODE, sibling, newNode);
+            }
+            unchecked {
+                ++height;
+            }
+        }
+        if (oldNode != filled[level]) revert Errors.StaleRoot();
+        filled[level] = newNode;
     }
 }

@@ -7,13 +7,15 @@ import {Types} from "../../src/libraries/Types.sol";
 import {Bn254PoseidonReference} from "../reference/Bn254PoseidonReference.sol";
 import {MerkleUpdateLib} from "../../src/libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "../../src/libraries/NoteLeafLib.sol";
-import {MockProofAdapter} from "../mocks/MockProofAdapters.sol";
+import {LeafBindingMockAdapter, MockProofAdapter} from "../mocks/MockProofAdapters.sol";
 import {PoseidonRuntime, ReferenceHashes} from "./PoseidonRuntime.sol";
 
-/// @dev A vault with the MockProofAdapter (every withdrawal verifies; a request verifies once
-///      registered) and builders for its statements. Nullifiers are arbitrary nonzero numbers:
-///      the mock does not relate them to states. Times come from vm.getBlockTimestamp(): via-IR
-///      may reuse a block.timestamp read from before a warp.
+/// @dev A vault with the LeafBindingMockAdapter (a withdrawal verifies when its noteLeaf is the leaf
+///      of the registration commitment deposited under its noteFields' note ID, over those fields; a
+///      request verifies once registered) and builders for its statements. The base records each
+///      deposit's commitment, amount and expiry (the vault keeps only the leaf). Nullifiers are
+///      arbitrary nonzero numbers: the mock does not relate them to states. Times come from
+///      vm.getBlockTimestamp(): via-IR may reuse a block.timestamp read from before a warp.
 abstract contract VaultTestBase is Test {
     uint256 internal constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465; // "zkapi.v2.node"
     uint256 internal constant SCALAR_MODULUS =
@@ -26,11 +28,16 @@ abstract contract VaultTestBase is Test {
     uint64 internal constant CHALLENGE_PERIOD = 24 hours;
     uint64 internal constant MAX_PAUSE = 7 days;
     uint64 internal constant VALIDITY = 3 hours;
+    uint64 internal constant NOTE_TTL = 30 days;
+    /// @dev The test vaults' minDeposit: 1 unit, so that amounts are unconstrained.
+    uint128 internal constant MIN_DEPOSIT = 1;
     uint8 internal constant KIND_ESCAPE = 0;
     uint8 internal constant KIND_CLOSE = 1;
     uint8 internal constant KIND_OWNERSHIP = 2;
     bytes internal constant PROOF = hex"cafe";
 
+    /// @dev A LeafBindingMockAdapter for the vault suites; the gasless suites deploy the plain
+    ///      MockProofAdapter (no storage read in the paymaster's validation).
     MockProofAdapter internal adapter;
     ZkApiVault internal vault;
     address internal user = address(0x1234);
@@ -42,7 +49,7 @@ abstract contract VaultTestBase is Test {
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = MerkleUpdateLib.zeroHash(level);
         }
-        adapter = new MockProofAdapter();
+        adapter = new LeafBindingMockAdapter();
         vault = _newVault(CHALLENGE_PERIOD, MAX_PAUSE);
         vm.deal(user, 100 ether);
     }
@@ -50,7 +57,7 @@ abstract contract VaultTestBase is Test {
     function _newVault(uint64 challengePeriod, uint64 maxPauseDuration) internal returns (ZkApiVault) {
         return new ZkApiVault(
             treasury,
-            30 days,
+            NOTE_TTL,
             challengePeriod,
             100_000,
             address(adapter),
@@ -60,17 +67,48 @@ abstract contract VaultTestBase is Test {
             CLEAR_Y,
             address(this),
             maxPauseDuration,
-            PoseidonRuntime.etch()
+            PoseidonRuntime.etch(),
+            MIN_DEPOSIT
         );
     }
 
     // ------------------------------------------------------------------- deposits and paths
 
+    /// @dev What the vault hashed into each note's leaf (its NoteDeposited event), by note ID.
+    struct NoteData {
+        bytes32 commitment;
+        uint128 amount;
+        uint64 expiryTs;
+    }
+
+    mapping(uint32 => NoteData) internal noteData;
+
     /// Deposits a note with `commitment` at the next slot.
     function _deposit(uint256 commitment) internal returns (uint32 id) {
+        return _depositAmount(commitment, DEPOSIT);
+    }
+
+    /// Deposits `amount` units under `commitment` at the next slot and records the note's data.
+    function _depositAmount(uint256 commitment, uint128 amount) internal returns (uint32 id) {
         id = vault.nextNoteId();
         vm.prank(user);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(commitment), DEPOSIT);
+        vault.deposit{value: uint256(amount) * 1 gwei}(bytes32(commitment), amount);
+        _recordNote(id, bytes32(commitment), amount);
+    }
+
+    /// Records a deposit made by the current block (the vault's bucketed expiry) and registers its
+    /// commitment with the mock adapter.
+    function _recordNote(uint32 noteId, bytes32 commitment, uint128 amount) internal {
+        uint256 raw = vm.getBlockTimestamp() + NOTE_TTL;
+        noteData[noteId] = NoteData(commitment, amount, uint64(((raw + 1 days - 1) / 1 days) * 1 days));
+        adapter.register(noteId, commitment);
+        assertEq(_storedLeaf(noteId), _leafOf(noteId), "recorded note data reproduces the stored leaf");
+    }
+
+    /// The note's packed fields: noteId * 2^192 + amount * 2^64 + expiryTs.
+    function _fields(uint32 noteId) internal view returns (uint256) {
+        NoteData storage data = noteData[noteId];
+        return NoteLeafLib.pack(noteId, data.amount, data.expiryTs);
     }
 
     /// The node hash of the note tree.
@@ -78,9 +116,15 @@ abstract contract VaultTestBase is Test {
         return Bn254PoseidonReference.compress(DOMAIN_NODE, left, right);
     }
 
+    /// The leaf of the recorded note data, by the reference Poseidon.
     function _leafOf(uint32 noteId) internal view returns (uint256) {
-        (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(noteId);
-        return ReferenceHashes.leaf(noteId, commitment, amount, expiryTs);
+        NoteData storage data = noteData[noteId];
+        return ReferenceHashes.leaf(noteId, data.commitment, data.amount, data.expiryTs);
+    }
+
+    /// The vault's stored leaf (zero once retired).
+    function _storedLeaf(uint32 noteId) internal view returns (uint256 leaf) {
+        (leaf,) = vault.noteRecord(noteId);
     }
 
     /// The leaf the tree holds at `index`, given which leaves were retired.
@@ -110,6 +154,23 @@ abstract contract VaultTestBase is Test {
         retired[noteId] = true;
     }
 
+    /// The full tree's root over the recorded leaves (reference Poseidon), for at most 8 notes.
+    function _referenceRoot() internal view returns (uint256 root) {
+        uint32 count = vault.nextNoteId();
+        require(count <= 8, "test tree");
+        uint256[8] memory leaves;
+        for (uint32 i = 0; i < count; ++i) {
+            leaves[i] = _treeLeaf(i);
+        }
+        root = _node(
+            _node(_node(leaves[0], leaves[1]), _node(leaves[2], leaves[3])),
+            _node(_node(leaves[4], leaves[5]), _node(leaves[6], leaves[7]))
+        );
+        for (uint256 level = 3; level < 32; ++level) {
+            root = _node(root, emptySiblings[level]);
+        }
+    }
+
     // ------------------------------------------------------------------------- statements
 
     function _withdrawal(
@@ -124,12 +185,12 @@ abstract contract VaultTestBase is Test {
             protocolVersion: 2,
             chainId: uint64(block.chainid),
             contractAddress: address(vault),
-            activeRoot: vault.currentRoot(),
+            noteLeaf: _leafOf(noteId),
             stateSigningKeyX: STATE_X,
             stateSigningKeyY: STATE_Y,
             clearanceSigningKeyX: CLEAR_X,
             clearanceSigningKeyY: CLEAR_Y,
-            noteId: noteId,
+            noteFields: _fields(noteId),
             finalBalance: finalBalance,
             destination: user,
             withdrawalNullifier: nullifier,
@@ -203,7 +264,19 @@ abstract contract VaultTestBase is Test {
     // ------------------------------------------------------------------------------ reads
 
     function _status(uint32 noteId) internal view returns (Types.NoteStatus status) {
-        (,,, status) = vault.notes(noteId);
+        (, status) = vault.noteRecord(noteId);
+    }
+
+    /// The vault's effective expiry of a recorded note.
+    function _effectiveExpiry(uint32 noteId) internal view returns (uint64) {
+        NoteData storage data = noteData[noteId];
+        return vault.effectiveExpiry(noteId, data.commitment, data.amount, data.expiryTs);
+    }
+
+    /// claimExpired of a recorded note.
+    function _claimExpired(uint32 noteId) internal {
+        NoteData storage data = noteData[noteId];
+        vault.claimExpired(noteId, data.commitment, data.amount, data.expiryTs);
     }
 
     function _deadline(uint32 noteId) internal view returns (uint64 deadline) {

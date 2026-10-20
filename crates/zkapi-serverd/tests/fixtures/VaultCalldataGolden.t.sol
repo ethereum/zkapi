@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 // Golden calldata, getter selectors and layouts, and event layouts of the
-// revision-3 vault, taken from the real contracts (protocol/contracts/src:
+// revision-4 vault (leaf-bound exits), taken from the real contracts (protocol/contracts/src:
 // ZkApiVault, Types, Events and IZkApiProofAdapter), never from a copy of
 // their declarations: vault_calldata_golden.json is this test's output.
 // check-calldata-golden.sh runs it with forge and compares (CI), or rewrites
@@ -20,19 +20,20 @@ import {IZkApiProofAdapter} from "zkapi/interfaces/IZkApiProofAdapter.sol";
 /// layouts are the compiler's.
 contract VaultEvents is Events {
     function emitAll() external {
-        emit NoteDeposited(7, bytes32(uint256(0x0c0c)), 1_000_000, 2_000_000_000, 0x0a0a);
+        emit NoteDeposited(7, bytes32(uint256(0x0c0c)), 1_000_000, 2_000_000_000);
         emit MutualClose(7, 0x0101, 900_000, address(0x1111111111111111111111111111111111111111));
         emit EscapeWithdrawalInitiated(
-            7, 0x0101, 900_000, address(0x1111111111111111111111111111111111111111), 2_000_086_400, 0x0a0a
+            7, 0x0101, 900_000, address(0x1111111111111111111111111111111111111111), 2_000_086_400
         );
         emit EscapeConcessionRecorded(7, 0x0202, 1_000_000, 100_000);
         emit EscapeConcessionRaised(7, 0x0101, 150_000, 850_000);
-        emit EscapeWithdrawalChallenged(7, 0x0101, 0x0a0a);
+        emit EscapeWithdrawalChallenged(7, 0x0101);
         emit EscapeWithdrawalFinalized(7, 0x0101, 850_000, address(0x1111111111111111111111111111111111111111));
-        emit ExpiredClaimed(7, 1_000_000, 0x0a0a);
-        emit ClosedLeafRetired(7, 0x0b0b);
+        emit ExpiredClaimed(7, 1_000_000);
+        emit ClosedLeafRetired(7);
         emit EscapePayoutDeferred(7, address(0x1111111111111111111111111111111111111111), 850_000);
         emit EscapePayoutClaimed(address(0x1111111111111111111111111111111111111111), 850_000);
+        emit RootRecorded(0x0a0a, 8, 123_456);
     }
 }
 
@@ -63,12 +64,13 @@ contract GoldenTest is Test {
         w.protocolVersion = 2;
         w.chainId = 1;
         w.contractAddress = 0x00112233445566778899AABbCCdDeeFf00112233;
-        w.activeRoot = 0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9;
+        w.noteLeaf = 0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9;
         w.stateSigningKeyX = 0x1111111111111111111111111111111111111111111111111111111111111111;
         w.stateSigningKeyY = 0x2222222222222222222222222222222222222222222222222222222222222222;
         w.clearanceSigningKeyX = 0x0555555555555555555555555555555555555555555555555555555555555555;
         w.clearanceSigningKeyY = 0x0666666666666666666666666666666666666666666666666666666666666666;
-        w.noteId = type(uint32).max;
+        // noteId 2^32 - 1, deposit 2^53 - 1, expiry 2^64 - 1: every field at its top bit.
+        w.noteFields = (uint256(type(uint32).max) << 192) | (uint256(9_007_199_254_740_991) << 64) | type(uint64).max;
         w.finalBalance = 1_000_000_000_000_000_000;
         w.destination = 0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF;
         w.withdrawalNullifier = 0x0102030405060708091011121314151617181920212223242526272829303132;
@@ -118,7 +120,7 @@ contract GoldenTest is Test {
         // runtime, which its constructor checks).
         address poseidon = deployCode("out/Bn254PoseidonRuntime.sol/Bn254PoseidonRuntime.json");
         ZkApiVault vault = new ZkApiVault(
-            address(0xbeef), 30 days, 1 days, 100_000, address(0xada), 11, 12, 13, 14, address(this), 2 days, poseidon
+            address(0xbeef), 30 days, 1 days, 100_000, address(0xada), 11, 12, 13, 14, address(this), 2 days, poseidon, 1
         );
         IZkApiProofAdapter adapter = IZkApiProofAdapter(address(0xada));
         selector("challengeEscapeWithdrawal", vault.challengeEscapeWithdrawal.selector);
@@ -130,18 +132,24 @@ contract GoldenTest is Test {
         selector("finalizeEscapeWithdrawal", vault.finalizeEscapeWithdrawal.selector);
         selector("claimEscapePayout", vault.claimEscapePayout.selector);
         selector("claimExpired", vault.claimExpired.selector);
-        selector("knownRoots", vault.knownRoots.selector);
-        selector("isKnownRoot", vault.isKnownRoot.selector);
         selector("currentRoot", vault.currentRoot.selector);
+        selector("noteRecord", vault.noteRecord.selector);
+        selector("noteLeaves", vault.noteLeaves.selector);
+        selector("frontier", vault.frontier.selector);
+        selector("minDeposit", vault.minDeposit.selector);
+        selector("pausedBefore", vault.pausedBefore.selector);
+        selector("graceUntil", vault.graceUntil.selector);
+        selector("pauseEpochCount", vault.pauseEpochCount.selector);
+        selector("recordRoot", vault.recordRoot.selector);
+        selector("recordedRoot", vault.recordedRoot.selector);
         selector("usedNullifiers", vault.usedNullifiers.selector);
         selector("challengedNullifiers", vault.challengedNullifiers.selector);
         selector("pendingWithdrawals", vault.pendingWithdrawals.selector);
         selector("pendingConcessions", vault.pendingConcessions.selector);
-        selector("notes", vault.notes.selector);
         selector("escapePayoutCredits", vault.escapePayoutCredits.selector);
         selector("effectiveExpiry", vault.effectiveExpiry.selector);
         selector("CONCESSION_ESCAPE_VERSION", vault.CONCESSION_ESCAPE_VERSION.selector);
-        selector("ROOT_HISTORY_WINDOW", vault.ROOT_HISTORY_WINDOW.selector);
+        selector("LEAF_BOUND_EXIT_VERSION", vault.LEAF_BOUND_EXIT_VERSION.selector);
         selector("proofAdapter", vault.proofAdapter.selector);
         selector("challengePeriod", vault.challengePeriod.selector);
         selector("noteTtl", vault.noteTtl.selector);
@@ -154,18 +162,22 @@ contract GoldenTest is Test {
         selector("CIRCUIT_ID_HASH", adapter.CIRCUIT_ID_HASH.selector);
         selector("REQUEST_VK_HASH", adapter.REQUEST_VK_HASH.selector);
         selector("WITHDRAWAL_VK_HASH", adapter.WITHDRAWAL_VK_HASH.selector);
+        selector("assertValidWithdrawal", adapter.assertValidWithdrawal.selector);
+        selector("verifyWithdrawalOnce", adapter.verifyWithdrawalOnce.selector);
+        selector("assertValidRequest", adapter.assertValidRequest.selector);
 
         // The words each struct getter returns (the adapter is never called
         // by these reads).
         getterWords(address(vault), "pendingWithdrawals", abi.encodeCall(vault.pendingWithdrawals, (0)));
         getterWords(address(vault), "pendingConcessions", abi.encodeCall(vault.pendingConcessions, (0)));
-        getterWords(address(vault), "notes", abi.encodeCall(vault.notes, (0)));
-        getterWords(address(vault), "knownRoots", abi.encodeCall(vault.knownRoots, (0)));
+        getterWords(address(vault), "noteRecord", abi.encodeCall(vault.noteRecord, (0)));
+        getterWords(address(vault), "recordedRoot", abi.encodeCall(vault.recordedRoot, (0)));
+        getterWords(address(vault), "frontier", abi.encodeCall(vault.frontier, ()));
 
         // topic0, every topic (32-byte words, topic0 first) and the data of
         // each event as the vault emits it.
         VaultEvents events = new VaultEvents();
-        string[11] memory names = [
+        string[12] memory names = [
             "NoteDeposited",
             "MutualClose",
             "EscapeWithdrawalInitiated",
@@ -176,7 +188,8 @@ contract GoldenTest is Test {
             "ExpiredClaimed",
             "ClosedLeafRetired",
             "EscapePayoutDeferred",
-            "EscapePayoutClaimed"
+            "EscapePayoutClaimed",
+            "RootRecorded"
         ];
         vm.recordLogs();
         events.emitAll();

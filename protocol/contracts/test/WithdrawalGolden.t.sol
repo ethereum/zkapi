@@ -73,7 +73,8 @@ contract WithdrawalGoldenTest is Test {
             escape.clearanceSigningKeyY,
             OWNER,
             MAX_PAUSE_DURATION,
-            PoseidonRuntime.etch()
+            PoseidonRuntime.etch(),
+            1
         );
         assertEq(address(vault), escape.contractAddress);
         vm.deal(USER, 10 * uint256(DEPOSIT) * 1 gwei);
@@ -99,14 +100,22 @@ contract WithdrawalGoldenTest is Test {
             abi.encodeCall(ZkApiVault.deposit, (vm.parseJsonBytes32(fixtures, ".note_b_registration"), DEPOSIT));
         _call(depositB, uint256(DEPOSIT) * 1 gwei);
         assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_ab"));
-        assertEq(vault.currentRoot(), escape.activeRoot);
+        // Leaf-bound exits: each statement carries its note's stored leaf and packed fields.
+        (uint256 leafA,) = vault.noteRecord(0);
+        (uint256 leafB,) = vault.noteRecord(1);
+        assertEq(escape.noteLeaf, leafA);
+        assertEq(close.noteLeaf, leafB);
+        assertEq(escape.noteFields >> 192, 0);
+        assertEq(close.noteFields >> 192, 1);
 
         if (printing) {
             _print("deposit_a", depositA);
             _print("deposit_b", depositB);
             _print("escape", escapeCalldata);
             _print("close", closeCalldata);
-            console.log(string.concat("active_root=", vm.toString(bytes32(vault.currentRoot()))));
+            console.log(string.concat("note_leaf_a=", vm.toString(bytes32(leafA))));
+            console.log(string.concat("note_leaf_b=", vm.toString(bytes32(leafB))));
+            console.log(string.concat("request_root=", vm.toString(bytes32(vault.currentRoot()))));
         } else {
             assertEq(vm.parseJsonBytes(golden, ".deposits[0].calldata"), depositA, "deposit A");
             assertEq(vm.parseJsonBytes(golden, ".deposits[1].calldata"), depositB, "deposit B");
@@ -114,7 +123,9 @@ contract WithdrawalGoldenTest is Test {
             assertEq(vm.parseJsonBytes(golden, ".close.calldata"), closeCalldata, "close");
             assertEq(vm.parseJsonBytes(golden, ".escape.proof_hex"), escapeProof, "escape proof");
             assertEq(vm.parseJsonBytes(golden, ".close.proof_hex"), closeProof, "close proof");
-            assertEq(vm.parseJsonUint(golden, ".active_root"), vault.currentRoot(), "root");
+            assertEq(vm.parseJsonUint(golden, ".deposits[0].note_leaf"), leafA, "leaf A");
+            assertEq(vm.parseJsonUint(golden, ".deposits[1].note_leaf"), leafB, "leaf B");
+            assertEq(vm.parseJsonUint(golden, ".request_root"), vault.currentRoot(), "root");
             assertEq(vm.parseJsonAddress(golden, ".deployment.vault"), address(vault), "vault");
         }
 
@@ -145,20 +156,7 @@ contract WithdrawalGoldenTest is Test {
     }
 
     function _status(uint32 noteId) private view returns (Types.NoteStatus status) {
-        (,,, status) = vault.notes(noteId);
-    }
-
-    function _leafOf(uint32 noteId) private view returns (uint256) {
-        if (noteId >= vault.nextNoteId()) return 0;
-        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return ReferenceHashes.leaf(noteId, commitment, amount, expiry);
-    }
-
-    /// Siblings of slot `index` (0 or 1) in a tree holding only notes 0 and 1.
-    function _path(uint32 index) private view returns (uint256[32] memory siblings) {
-        require(index < 2, "golden tree");
-        siblings = emptySiblings;
-        siblings[0] = _leafOf(index ^ 1);
+        (, status) = vault.noteRecord(noteId);
     }
 
     function _withdrawal(string memory name) private view returns (Types.WithdrawalPublicInputs memory, bytes memory) {

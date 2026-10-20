@@ -56,6 +56,7 @@ function manifest(keyY) {
   "challengePeriod": 86400,
   "maxPauseDuration": 604800,
   "requestChargeCap": 1000000,
+  "minDeposit": 1000000,
   "stateSigningKeyX": "${BigInt(WIDE_Y_X)}",
   "stateSigningKeyY": ${keyY},
   "clearanceSigningKeyX": "13",
@@ -90,6 +91,14 @@ test('immutables refuse a JavaScript number that was already rounded', () => {
     // eslint-disable-next-line no-loss-of-precision
     assert.throws(() => vaultImmutables({ ...inputs, stateSigningKeyY: 9223372036854775867 }), /not a safe integer/);
     assert.throws(() => vaultImmutables({ ...inputs, noteTtl: 2 ** 60 }), /not a safe integer/);
+});
+
+test('the vault immutables include minDeposit (revision 4), bounded as the constructor bounds it', () => {
+    const inputs = parseDeployment(manifest(`"${WIDE_Y_Y}"`));
+    assert.equal(vaultImmutables(inputs).minDeposit, (1_000_000n).toString(16).padStart(64, '0'));
+    assert.throws(() => vaultImmutables({ ...inputs, minDeposit: undefined }), /minDeposit is required/);
+    assert.throws(() => vaultImmutables({ ...inputs, minDeposit: 0 }), /minDeposit must be 1 to 2\^53 - 1/);
+    assert.throws(() => vaultImmutables({ ...inputs, minDeposit: 9007199254740992n }), /minDeposit must be 1 to 2\^53 - 1/);
 });
 
 test('a bare wide key and its decimal string give the same codehashes', { skip: !existsSync(ARTIFACTS) && 'run forge build in protocol/contracts first' }, () => {
@@ -290,11 +299,11 @@ test('g1Add and g1Mul are the ecAdd and ecMul precompiles', () => {
     const scalars = [2n, 31337n, BigInt(FIXTURE_FOLD.vault), BigInt(FIXTURE_FOLD.stateSigningKeyX), BigInt(FIXTURE_FOLD.stateSigningKeyY),
         BigInt(FIXTURE_FOLD.clearanceSigningKeyX), BigInt(FIXTURE_FOLD.clearanceSigningKeyY)];
     const fold = (kind, points) => points.reduce((sum, point, k) => g1Add(sum, g1Mul(devIc(kind, point), scalars[k])), devIc(kind, 0));
-    assert.deepEqual(hex(fold('request', [1, 2, 3, 5, 6])), ['0x108152802ebd421ca665b59d609905dbc1ef170be4aa8f21ddc99c4223cf171c', '0x03038d95d6f9a546e1648a82db840fb8a1920ec65054c42b2a412c57705d3b40']);
-    assert.deepEqual(hex(fold('withdrawal', [1, 2, 3, 5, 6, 7, 8])), ['0x0e88be9d38d7b75825e3e8aa73808b1a28e5272439c71597bdc1795b0ed4adf3', '0x1765c84ead23e7992ad624c7e273098305bb8165551a6c5c806e81c308baad64']);
+    assert.deepEqual(hex(fold('request', [1, 2, 3, 5, 6])), ['0x01662807b9b640021ed02e625e2c7abdcbd960e16b585ff6df2fd91e2c9127aa', '0x22a554985d0ea2f024e304e4d84ca72494caaceacd108881ab380d1357564402']);
+    assert.deepEqual(hex(fold('withdrawal', [1, 2, 3, 5, 6, 7, 8])), ['0x059bcf0ebb61a2464e963d028b4aa225da81bb2568b4b25d62675a0555802a8d', '0x0d8471806e88cc206aaa84cc388fb99dac9c03b3754a00f626a9627bd341d273']);
     // Chain 1, the zero address and zero keys: IC0 + 2 · IC1 + IC2 (the precompiles' 1 and 2 paths).
     assert.deepEqual(hex(g1Add(g1Add(devIc('withdrawal', 0), g1Mul(devIc('withdrawal', 1), 2n)), devIc('withdrawal', 2))),
-        ['0x2d03832b99646021efdd649f928a779987e12ce082efe209d728089541ab0c1e', '0x0f52d30609b8930db2a759a780075c6aaf901c6bab9e01ac208a2592198cd990']);
+        ['0x2b7cab9c583569f11134382c8696dc48d3c5b43b691409d2675d6fc1553dc136', '0x1336d43ad6df240e10e04b36a884e3b19e7aa834516007966896daf415b71726']);
 });
 
 test('the adapter\'s immutables are its fold for the vault, chain and keys, from the artifact\'s verifying keys', { skip: NO_ARTIFACTS }, () => {
@@ -303,8 +312,8 @@ test('the adapter\'s immutables are its fold for the vault, chain and keys, from
     assert.equal(values.foldedChainId, (31337).toString(16).padStart(64, '0'));
     assert.equal(values.foldedVault, FIXTURE_FOLD.vault.slice(2).toLowerCase().padStart(64, '0'));
     assert.equal(values.foldedClearanceSigningKeyY, FIXTURE_FOLD.clearanceSigningKeyY.slice(2));
-    assert.equal(`0x${values.foldedWithdrawalIc0X}`, '0x0e88be9d38d7b75825e3e8aa73808b1a28e5272439c71597bdc1795b0ed4adf3');
-    assert.equal(`0x${values.foldedRequestIc0Y}`, '0x03038d95d6f9a546e1648a82db840fb8a1920ec65054c42b2a412c57705d3b40');
+    assert.equal(`0x${values.foldedWithdrawalIc0X}`, '0x059bcf0ebb61a2464e963d028b4aa225da81bb2568b4b25d62675a0555802a8d');
+    assert.equal(`0x${values.foldedRequestIc0Y}`, '0x22a554985d0ea2f024e304e4d84ca72494caaceacd108881ab380d1357564402');
     // The runtime code fills exactly these words (filledRuntimeCode refuses a missing or extra one),
     // so another vault, chain or key is another codehash.
     const base = parseDeployment(manifest(`"${WIDE_Y_Y}"`));

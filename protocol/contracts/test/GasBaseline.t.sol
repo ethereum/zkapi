@@ -11,17 +11,20 @@ import {MerkleUpdateLib} from "../src/libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 import {IBn254Poseidon} from "../src/interfaces/IBn254Poseidon.sol";
 import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
+import {VaultStorage} from "./helpers/VaultStorage.sol";
 
-/// @dev Gas baseline of the vault, its Poseidon runtime and its Groth16 adapter. Logs only (no
-///      snapshot files). Run: forge test --match-path test/GasBaseline.t.sol -vv
+/// @dev Gas baseline of the vault (revision 4, leaf-bound exits), its Poseidon runtime and its
+///      Groth16 adapter. Logs only (no snapshot files). Run:
+///      forge test --match-path test/GasBaseline.t.sol -vv
 ///
 ///      Methodology. Every measured call goes from the test contract to the vault with the vault,
 ///      the adapter, the Poseidon runtime, the treasury and USER marked cold (vm.cool), as at the
 ///      start of a real transaction; the pranked sender is warm, as tx.origin is. Each line logs:
 ///        frame   vm.lastCallGas().gasTotalUsed, the callee's execution gas before refunds: what a
 ///                real transaction spends after its intrinsic cost.
-///        tx      21,000 + calldata (16 per nonzero byte, 4 per zero byte) + frame, before refunds;
-///                the EIP-7623 floor (21,000 + 40 / 10 per byte) never binds here.
+///        tx      21,000 + calldata (16 per nonzero byte, 4 per zero byte) + frame, before refunds,
+///                or the EIP-7623 floor (21,000 + 10 per zero byte and 40 per nonzero byte) when
+///                that is higher (only a retirement with full siblings at a low level reaches it).
 ///        net     tx - min(refund, tx / 5) (EIP-3529).
 ///        delta   gasleft() before minus after the CALL in the test contract: the frame plus the
 ///                CALL's own costs (2,600 cold vault, 9,000 for a value transfer less the unused
@@ -32,10 +35,11 @@ import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 ///      committed in setUp (one contract per starting state), never after another write of the
 ///      same test. test_snapshotMethodologyReplica reproduces the pinned
 ///      snapshots/concession-exit-gas.json method (deposits inside the test, no treasury account)
-///      to show the difference. The EVM rules are Foundry's (Prague): no Glamsterdam state gas.
+///      to show the difference. The EVM rules are Foundry's (Prague): no Glamsterdam state gas, so
+///      a fresh slot costs 22,100 here and about 110,000 under EIP-8037 (count them with the
+///      fresh-slot lines).
 abstract contract GasBaselineBase is Test {
     uint256 internal constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465; // "zkapi.v2.node"
-    uint256 internal constant DOMAIN_LEAF = 0x7a6b6170692e76322e6c656166; // "zkapi.v2.leaf"
     uint256 internal constant SCALAR_MODULUS =
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint128 internal constant DEPOSIT = 1_000_000;
@@ -44,10 +48,6 @@ abstract contract GasBaselineBase is Test {
     address internal constant USER = 0x1111111111111111111111111111111111111111;
     address internal constant TREASURY = address(0xbeef);
     address internal constant OPERATOR = address(0x0D0D);
-    /// Storage layout (forge inspect ZkApiVault storageLayout).
-    uint256 internal constant SLOT_CURRENT_ROOT = 3;
-    uint256 internal constant SLOT_NEXT_NOTE_ID = 4;
-    uint256 internal constant SLOT_FILLED = 13;
 
     Groth16ProofAdapter internal adapter;
     ZkApiVault internal vault;
@@ -93,7 +93,8 @@ abstract contract GasBaselineBase is Test {
             parameters.clearanceSigningKeyY,
             address(this),
             7 days,
-            PoseidonRuntime.etch()
+            PoseidonRuntime.etch(),
+            1
         );
         assertEq(address(vault), parameters.contractAddress);
         vm.deal(USER, 100_000 ether);
@@ -113,6 +114,14 @@ abstract contract GasBaselineBase is Test {
         for (uint256 i = 0; i < data.length; ++i) {
             gas += data[i] == 0 ? 4 : 16;
         }
+    }
+
+    /// The EIP-7623 floor of a transaction carrying `data` to a contract.
+    function _floorGas(bytes memory data) internal pure returns (uint256 tokens) {
+        for (uint256 i = 0; i < data.length; ++i) {
+            tokens += data[i] == 0 ? 1 : 4;
+        }
+        tokens = 21_000 + 10 * tokens;
     }
 
     /// Calls the vault from `sender` with everything cold (sender warm) and logs the costs.
@@ -137,6 +146,8 @@ abstract contract GasBaselineBase is Test {
         m.txGas = 21_000 + m.calldataGas + m.frame;
         uint256 cap = m.txGas / 5;
         m.net = m.txGas - (m.refund < cap ? m.refund : cap);
+        uint256 floor = _floorGas(data);
+        if (floor > m.net) m.net = floor;
         _log(label, m);
     }
 
@@ -183,9 +194,25 @@ abstract contract GasBaselineBase is Test {
         assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_ab"));
     }
 
-    function _leafOf(uint32 noteId) internal view returns (uint256) {
-        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return ReferenceHashes.leaf(noteId, commitment, amount, expiry);
+    function _storedLeaf(uint32 noteId) internal view returns (uint256 leaf) {
+        (leaf,) = vault.noteRecord(noteId);
+    }
+
+    /// The fixture's expiry, which notes A and B carry.
+    function _expiry() internal view returns (uint64) {
+        // casting to 'uint64' is safe because the fixture's expiry is a bucketed uint64 time
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint64(vm.parseJsonUint(fixtures, ".expiry"));
+    }
+
+    function _claimData() internal view returns (bytes memory) {
+        return abi.encodeCall(
+            ZkApiVault.claimExpired, (0, vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT, _expiry())
+        );
+    }
+
+    function _effectiveExpiryA() internal view returns (uint64) {
+        return vault.effectiveExpiry(0, vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT, _expiry());
     }
 
     function _request(string memory name) internal view returns (Types.RequestPublicInputs memory, bytes memory) {
@@ -226,12 +253,12 @@ abstract contract GasBaselineBase is Test {
         v[0] = w.protocolVersion;
         v[1] = w.chainId;
         v[2] = uint160(w.contractAddress);
-        v[3] = w.activeRoot;
+        v[3] = w.noteLeaf;
         v[4] = w.stateSigningKeyX;
         v[5] = w.stateSigningKeyY;
         v[6] = w.clearanceSigningKeyX;
         v[7] = w.clearanceSigningKeyY;
-        v[8] = w.noteId;
+        v[8] = w.noteFields;
         v[9] = w.finalBalance;
         v[10] = uint160(w.destination);
         v[11] = w.withdrawalNullifier;
@@ -300,14 +327,79 @@ abstract contract GasBaselineBase is Test {
         emit log_named_uint(string.concat(label, " | precompiles incl. call overhead"), precompile);
         emit log_named_uint(string.concat(label, " | adapter non-precompile"), frame - precompile);
     }
+
+    /// Writes a synthetic request tree of `n` notes (frontier, last note word, nextNoteId) as the
+    /// vault would hold it after n deposits: every frontier level written by an index below n
+    /// holds a nonzero node, as on a live vault (stale entries included), so the SSTOREs of the
+    /// next deposit are priced exactly. The leaves are synthetic nonzero words; the Poseidon cost
+    /// does not depend on them.
+    function _seedTree(uint32 n) internal {
+        uint256[32] memory filled;
+        uint256 previous;
+        for (uint32 j = 0; j < n; ++j) {
+            uint256 leaf = uint256(keccak256(abi.encode("leaf", j))) % SCALAR_MODULUS;
+            if (j & 1 == 1) {
+                uint256 node = Bn254PoseidonReference.compress(DOMAIN_NODE, previous, leaf);
+                uint256 level = 1;
+                while ((j >> level) & 1 == 1) {
+                    node = Bn254PoseidonReference.compress(DOMAIN_NODE, filled[level], node);
+                    ++level;
+                }
+                filled[level] = node;
+            }
+            previous = leaf;
+        }
+        for (uint256 level = 1; level < 32; ++level) {
+            if (filled[level] != 0) VaultStorage.setFilled(address(vault), level, filled[level]);
+        }
+        if (n != 0) VaultStorage.setNote(address(vault), n - 1, previous, VaultStorage.ACTIVE);
+        VaultStorage.setNextNoteId(address(vault), n);
+    }
+
+    /// A synthetic state of `n` notes of any size: nonzero frontier entries at every level some
+    /// index below n wrote (2^l - 1 < n), the last note's word and nextNoteId. Its root is not a
+    /// real tree's; the gas of what reads it (the computed root, recordRoot) does not depend on
+    /// the values.
+    function _seedSynthetic(uint32 n) internal {
+        for (uint256 level = 1; level < 32; ++level) {
+            if ((uint256(1) << level) - 1 >= n) break;
+            VaultStorage.setFilled(
+                address(vault), level, uint256(keccak256(abi.encode("synthetic", level))) % SCALAR_MODULUS
+            );
+        }
+        if (n != 0) VaultStorage.setNote(address(vault), n - 1, 0x1234, VaultStorage.ACTIVE);
+        VaultStorage.setNextNoteId(address(vault), n);
+    }
+
+    /// Slots of the vault that a call writes from zero to nonzero (fresh slots). The state is left
+    /// as before the call.
+    function _freshSlots(bytes memory data, uint256 value, address sender) internal returns (uint256 fresh) {
+        uint256 before = vm.snapshotState();
+        vm.record();
+        vm.prank(sender);
+        (bool ok,) = address(vault).call{value: value}(data);
+        require(ok, "fresh-slot call");
+        (, bytes32[] memory writes) = vm.accesses(address(vault));
+        bytes32[] memory values = new bytes32[](writes.length);
+        for (uint256 i = 0; i < writes.length; ++i) {
+            values[i] = vm.load(address(vault), writes[i]);
+        }
+        vm.revertToState(before);
+        for (uint256 i = 0; i < writes.length; ++i) {
+            bool counted;
+            for (uint256 j = 0; j < i; ++j) {
+                if (writes[j] == writes[i]) counted = true;
+            }
+            if (!counted && values[i] != 0 && vm.load(address(vault), writes[i]) == 0) ++fresh;
+        }
+    }
 }
 
 // ============================================================================ deposits by index
 
-/// A deposit at index N, measured against a committed tree of N leaves. N <= 64: real deposits
-/// in setUp. N > 64: nextNoteId and the frontier written with vm.store in setUp, for a tree of
-/// synthetic nonzero leaves (Poseidon cost does not depend on the values; the SSTORE costs depend
-/// only on which slots are zero, which the synthetic frontier reproduces exactly).
+/// A deposit at index N against a committed tree of N notes: N <= 64 real deposits in setUp, larger
+/// N the synthetic tree _seedTree writes. Deposit gas depends on N through trailing_ones(N)
+/// compressions and, at N = 2^t - 1, the first write of the frontier entry of level t.
 abstract contract DepositAtBase is GasBaselineBase {
     function _n() internal pure virtual returns (uint32);
 
@@ -319,79 +411,34 @@ abstract contract DepositAtBase is GasBaselineBase {
                 _plainDeposit(_commitment(1_000 + i));
             }
         } else {
-            _seed(n);
+            _seedTree(n);
         }
-    }
-
-    function _seed(uint32 n) internal {
-        uint256[32] memory frontier;
-        for (uint32 j = 0; j < n; ++j) {
-            uint256 node = uint256(keccak256(abi.encode("leaf", j))) % SCALAR_MODULUS;
-            for (uint256 level = 0; level < 32; ++level) {
-                if ((j >> level) & 1 == 0) {
-                    frontier[level] = node;
-                    break;
-                }
-                node = Bn254PoseidonReference.compress(DOMAIN_NODE, frontier[level], node);
-            }
-        }
-        for (uint256 level = 0; level < 32; ++level) {
-            vm.store(address(vault), bytes32(SLOT_FILLED + level), bytes32(frontier[level]));
-        }
-        vm.store(address(vault), bytes32(SLOT_NEXT_NOTE_ID), bytes32(uint256(n)));
-        // Any nonzero root: the deposit overwrites it (nonzero to nonzero, as live).
-        vm.store(address(vault), bytes32(SLOT_CURRENT_ROOT), bytes32(uint256(0x1234)));
     }
 
     function test_depositAtIndex() public {
         uint32 n = _n();
         assertEq(vault.nextNoteId(), n);
-        uint256[32] memory frontier;
-        for (uint256 level = 0; level < 32; ++level) {
-            frontier[level] = uint256(vm.load(address(vault), bytes32(SLOT_FILLED + level)));
-        }
         uint256 commitment = _commitment(n);
-        Measured memory m = _measure(
-            USER,
-            uint256(DEPOSIT) * 1 gwei,
-            _depositData(commitment),
-            string.concat("deposit #", vm.toString(uint256(n)))
-        );
-        // The deposit appended the expected leaf to the expected tree.
-        uint256 node = _leafOf(n);
-        for (uint256 level = 0; level < 32; ++level) {
-            node = ((n >> level) & 1) == 1
-                ? Bn254PoseidonReference.compress(DOMAIN_NODE, frontier[level], node)
-                : Bn254PoseidonReference.compress(DOMAIN_NODE, node, MerkleUpdateLib.zeroHash(level));
-        }
-        assertEq(vault.currentRoot(), node, "root");
+        string memory label = string.concat("deposit #", vm.toString(uint256(n)));
+        uint256 fresh = _freshSlots(_depositData(commitment), uint256(DEPOSIT) * 1 gwei, USER);
+        Measured memory m = _measure(USER, uint256(DEPOSIT) * 1 gwei, _depositData(commitment), label);
         assertEq(vault.nextNoteId(), n + 1);
-
-        // Vault-own execution: frame minus the two runtime frames and their STATICCALL access
-        // (2,600 cold, then 100 warm). The runtime frames are data independent.
-        (uint256 hash5Frame,) = _staticFrame(
-            poseidon,
-            abi.encodeWithSelector(
-                IBn254Poseidon.hash5.selector, DOMAIN_LEAF, uint256(n), commitment, uint256(DEPOSIT), uint256(1)
-            ),
-            false
-        );
-        uint256[32] memory siblings;
-        (uint256 insertFrame,) = _staticFrame(
-            poseidon,
-            abi.encodeWithSelector(IBn254Poseidon.insertPath32.selector, DOMAIN_NODE, n, node, siblings),
-            false
-        );
-        uint256 own = m.frame - hash5Frame - insertFrame - 2_700;
-        emit log_named_uint(string.concat("deposit #", vm.toString(uint256(n)), " | vault-own (frame - hashing)"), own);
-        emit log_named_uint(
-            string.concat("deposit #", vm.toString(uint256(n)), " | popcount(N) frontier SLOADs"), _popcount(n)
-        );
+        // casting to 'uint64' is safe because the bucketed expiry of a test time fits
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 expiry = uint64(((vm.getBlockTimestamp() + 30 days + 1 days - 1) / 1 days) * 1 days);
+        assertEq(_storedLeaf(n), ReferenceHashes.leaf(n, bytes32(commitment), DEPOSIT, expiry), "stored leaf");
+        // One fresh slot (the note's word), plus the frontier entry of level t at N = 2^t - 1.
+        uint256 t = _trailingOnes(n);
+        bool firstWrite = t >= 1 && uint256(n) == (uint256(1) << t) - 1;
+        assertEq(fresh, firstWrite ? 2 : 1, "fresh slots");
+        emit log_named_uint(string.concat(label, " | trailing ones (compressions beyond the pair)"), t);
+        emit log_named_uint(string.concat(label, " | fresh slots"), fresh);
+        emit log_named_uint(string.concat(label, " | frame per compression (t >= 1)"), t == 0 ? 0 : m.frame / (t + 1));
     }
 
-    function _popcount(uint32 x) internal pure returns (uint256 c) {
-        while (x != 0) {
-            c += x & 1;
+    function _trailingOnes(uint32 x) internal pure returns (uint256 c) {
+        while (x & 1 == 1) {
+            ++c;
             x >>= 1;
         }
     }
@@ -445,6 +492,47 @@ contract GasBaselineDeposit1023 is DepositAtBase {
     }
 }
 
+/// N = 1,535 (t = 1) and 1,791 (t = 8): levels already written, the common case at those depths.
+contract GasBaselineDeposit1535 is DepositAtBase {
+    function _n() internal pure override returns (uint32) {
+        return 1535;
+    }
+}
+
+contract GasBaselineDeposit1791 is DepositAtBase {
+    function _n() internal pure override returns (uint32) {
+        return 1791;
+    }
+}
+
+/// The deepest append: N = 2^31 - 1 (t = 31, the first write of level 31). The NatSpec gas floors
+/// (650,000 mainnet, 850,000 under EIP-8037 pricing) must cover it.
+contract GasBaselineDepositDeepest is GasBaselineBase {
+    function setUp() public {
+        _deploy(true);
+        // Every level below 31 written, as after 2^31 - 1 deposits.
+        for (uint256 level = 1; level < 31; ++level) {
+            VaultStorage.setFilled(
+                address(vault), level, uint256(keccak256(abi.encode("node", level))) % SCALAR_MODULUS
+            );
+        }
+        uint32 n = uint32((uint256(1) << 31) - 1);
+        VaultStorage.setNote(address(vault), n - 1, 0x1234, VaultStorage.ACTIVE);
+        VaultStorage.setNextNoteId(address(vault), n);
+    }
+
+    function test_deepestDepositFitsTheStaticFloors() public {
+        uint32 n = vault.nextNoteId();
+        Measured memory m =
+            _measure(USER, uint256(DEPOSIT) * 1 gwei, _depositData(_commitment(n)), "deposit #2^31-1 (t = 31)");
+        // Two fresh slots (the note and filled[31]); at 110,000 each under EIP-8037.
+        uint256 glamsterdam = m.txGas + 2 * (110_000 - 22_100);
+        emit log_named_uint("deposit #2^31-1 | tx with 110,000-gas fresh slots", glamsterdam);
+        assertLt(m.txGas, 650_000, "mainnet floor");
+        assertLt(glamsterdam, 850_000, "EIP-8037 floor");
+    }
+}
+
 // ================================================================ components, adapter, averages
 
 contract GasBaselineComponents is GasBaselineBase {
@@ -452,11 +540,9 @@ contract GasBaselineComponents is GasBaselineBase {
         _deploy(true);
     }
 
-    /// One compress, hash5, insertPath32 and compressPairPath32: the runtime frame alone (direct
-    /// STATICCALL, cold and warm), and as the vault reaches it (an interface call, measured as a
-    /// gasleft() delta that includes access, ABI encoding and decoding). The reference (the
-    /// former Bn254Poseidon library, which the vault DELEGATECALLed) is measured the same way for
-    /// comparison.
+    /// One compress: the runtime frame alone (direct STATICCALL, cold and warm), and as the vault
+    /// reaches it (MerkleUpdateLib.compress, measured as a gasleft() delta that includes access
+    /// and the call). NoteLeafLib.computeLeaf is one compress.
     function test_poseidonComponents() public {
         (uint256 compressCold, bytes memory r1) = _staticFrame(
             poseidon,
@@ -474,73 +560,29 @@ contract GasBaselineComponents is GasBaselineBase {
 
         vm.cool(poseidon);
         uint256 before = gasleft();
-        uint256 h = IBn254Poseidon(poseidon).compress(DOMAIN_NODE, 1, 2);
-        emit log_named_uint("compress | interface call from Solidity, cold (gasleft delta)", before - gasleft());
+        uint256 h = MerkleUpdateLib.compress(IBn254Poseidon(poseidon), DOMAIN_NODE, 1, 2);
+        emit log_named_uint("compress | MerkleUpdateLib.compress, cold (gasleft delta)", before - gasleft());
         before = gasleft();
-        h = IBn254Poseidon(poseidon).compress(DOMAIN_NODE, h, 2);
-        emit log_named_uint("compress | interface call from Solidity, warm (gasleft delta)", before - gasleft());
+        h = MerkleUpdateLib.compress(IBn254Poseidon(poseidon), DOMAIN_NODE, h, 2);
+        emit log_named_uint("compress | MerkleUpdateLib.compress, warm (gasleft delta)", before - gasleft());
 
-        (uint256 hash5Frame, bytes memory r2) = _staticFrame(
-            poseidon,
-            abi.encodeWithSelector(
-                IBn254Poseidon.hash5.selector, uint256(1), uint256(2), uint256(3), uint256(4), uint256(5)
-            ),
-            true
-        );
-        assertEq(abi.decode(r2, (uint256)), 0x26081ccbe44f775603e118e5d9152fbbff51c9d7af1a96c9d25ddc7cbed55457);
-        emit log_named_uint("hash5 | runtime frame (3 permutations)", hash5Frame);
-
+        uint256 fields = NoteLeafLib.pack(7, DEPOSIT, 1_800_000_000);
         vm.cool(poseidon);
         before = gasleft();
-        h = NoteLeafLib.computeLeaf(IBn254Poseidon(poseidon), 7, bytes32(_commitment(7)), DEPOSIT, 1_800_000_000);
+        h = NoteLeafLib.computeLeaf(IBn254Poseidon(poseidon), bytes32(_commitment(7)), fields);
         emit log_named_uint("NoteLeafLib.computeLeaf | cold runtime (gasleft delta)", before - gasleft());
         assertEq(h, ReferenceHashes.leaf(7, bytes32(_commitment(7)), DEPOSIT, 1_800_000_000));
-
-        uint256[32] memory siblings;
-        for (uint256 level = 0; level < 32; ++level) {
-            siblings[level] = MerkleUpdateLib.zeroHash(level);
-        }
-        bytes memory insertData =
-            abi.encodeWithSelector(IBn254Poseidon.insertPath32.selector, DOMAIN_NODE, uint32(5), h, siblings);
-        (uint256 insertFrame,) = _staticFrame(poseidon, insertData, true);
-        emit log_named_uint("insertPath32 | runtime frame (32 compressions)", insertFrame);
-        emit log_named_uint("insertPath32 | per compression", insertFrame / 32);
-
-        bytes memory pairData = abi.encodeWithSelector(
-            IBn254Poseidon.compressPairPath32.selector, DOMAIN_NODE, uint32(5), h, uint256(0), siblings, uint256(3)
-        );
-        (uint256 pairFrame,) = _staticFrame(poseidon, pairData, true);
-        emit log_named_uint("compressPairPath32 | runtime frame (64 compressions)", pairFrame);
-
-        // The permutation alone: the difference between hash5 (3 permutations) and compress (1),
-        // both paying one entry (dispatch, ABI checks, return) each.
-        emit log_named_uint("permutation | marginal ((hash5 - compress) / 2)", (hash5Frame - compressWarm) / 2);
-        emit log_named_uint(
-            "runtime entry overhead | compress - permutation", compressWarm - (hash5Frame - compressWarm) / 2
-        );
 
         address oracle = address(Bn254PoseidonReference);
         (uint256 refCompress,) = _staticFrame(
             oracle, abi.encodeWithSelector(IBn254Poseidon.compress.selector, DOMAIN_NODE, uint256(1), uint256(2)), false
         );
-        (uint256 refHash5,) = _staticFrame(
-            oracle,
-            abi.encodeWithSelector(
-                IBn254Poseidon.hash5.selector, uint256(1), uint256(2), uint256(3), uint256(4), uint256(5)
-            ),
-            false
-        );
-        (uint256 refInsert,) = _staticFrame(oracle, insertData, true);
-        (uint256 refPair,) = _staticFrame(oracle, pairData, true);
         emit log_named_uint("reference | compress frame (warm)", refCompress);
-        emit log_named_uint("reference | hash5 frame (warm)", refHash5);
-        emit log_named_uint("reference | insertPath32 frame", refInsert);
-        emit log_named_uint("reference | compressPairPath32 frame", refPair);
-        emit log_named_uint("reference | permutation marginal", (refHash5 - refCompress) / 2);
     }
 
     /// The Groth16 adapter alone, cold, with the real vault-challenge proofs, and its precompile
-    /// share. The adapter only reads its inputs, so the vault state does not matter.
+    /// share. The adapter only reads its inputs, so the vault state does not matter. Inputs 3
+    /// (noteLeaf) and 8 (noteFields) always take a full scalar multiplication.
     function test_adapterIsolated() public {
         string[3] memory withdrawals = ["close_a2", "escape_a2", "escape_a2_concede"];
         for (uint256 i = 0; i < withdrawals.length; ++i) {
@@ -600,7 +642,7 @@ contract GasBaselineComponents is GasBaselineBase {
     }
 
     /// The same loop without isolation, to show the dirty-slot discount a single test transaction
-    /// gives repeated deposits (currentRoot, nextNoteId and frontier rewrites priced at 100).
+    /// gives repeated deposits (nextNoteId and frontier rewrites priced at 100).
     function test_depositAverageFirst64SameTx() public {
         uint256 total;
         for (uint256 i = 0; i < 64; ++i) {
@@ -612,50 +654,6 @@ contract GasBaselineComponents is GasBaselineBase {
             total += vm.lastCallGas().gasTotalUsed;
         }
         emit log_named_uint("first 64 deposits (one test tx, dirty slots) | average frame", total / 64);
-    }
-}
-
-/// Returns constants for the two runtime entry points deposit uses, at the runtime's selectors,
-/// so a deposit through it costs the vault's own work only (plus two trivial frames).
-contract PoseidonStub {
-    function hash5(uint256, uint256, uint256, uint256, uint256) external pure returns (uint256) {
-        return 0x1111;
-    }
-
-    function insertPath32(uint256, uint32, uint256, uint256[32] memory) external pure returns (uint256, uint256) {
-        return (0x2222, 0x3333);
-    }
-}
-
-/// Deposit #2 with the Poseidon runtime replaced by PoseidonStub (vm.etch): the vault's own
-/// execution (storage, event, calldata and memory work) measured directly, not by subtraction.
-contract GasBaselineDepositStubbedHashing is GasBaselineBase {
-    function setUp() public {
-        _deploy(true);
-        _plainDeposit(_commitment(1_000));
-        _plainDeposit(_commitment(1_001));
-    }
-
-    function test_depositWithoutHashing() public {
-        assertEq(PoseidonStub.hash5.selector, IBn254Poseidon.hash5.selector);
-        assertEq(PoseidonStub.insertPath32.selector, IBn254Poseidon.insertPath32.selector);
-        vm.etch(poseidon, address(new PoseidonStub()).code);
-        Measured memory m =
-            _measure(USER, uint256(DEPOSIT) * 1 gwei, _depositData(_commitment(2)), "deposit #2, stubbed Poseidon");
-        assertEq(vault.currentRoot(), 0x2222);
-        uint256[32] memory siblings;
-        (bool ok,) = poseidon.staticcall(abi.encodeWithSelector(PoseidonStub.hash5.selector, 1, 2, 3, 4, uint256(5)));
-        require(ok, "stub hash5");
-        uint256 stubHash5 = vm.lastCallGas().gasTotalUsed;
-        (ok,) =
-            poseidon.staticcall(abi.encodeWithSelector(PoseidonStub.insertPath32.selector, 1, uint32(2), 3, siblings));
-        require(ok, "stub insertPath32");
-        uint256 stubInsert = vm.lastCallGas().gasTotalUsed;
-        emit log_named_uint("deposit #2, stubbed Poseidon | stub frames", stubHash5 + stubInsert);
-        emit log_named_uint(
-            "deposit #2, stubbed Poseidon | vault-own (frame - stub frames - 2,700 access)",
-            m.frame - stubHash5 - stubInsert - 2_700
-        );
     }
 }
 
@@ -684,15 +682,18 @@ contract GasBaselineExits is GasBaselineBase {
 
     function test_initiateEscape() public {
         (Types.WithdrawalPublicInputs memory escape, bytes memory proof) = _withdrawal("escape_a2");
-        Measured memory m = _measure(
-            USER, 0, abi.encodeCall(ZkApiVault.initiateEscapeWithdrawal, (escape, proof)), "initiateEscapeWithdrawal"
-        );
+        bytes memory data = abi.encodeCall(ZkApiVault.initiateEscapeWithdrawal, (escape, proof));
+        uint256 fresh = _freshSlots(data, 0, USER);
+        assertEq(fresh, 4, "the escape record (2 slots) and both nullifier words");
+        emit log_named_uint("initiateEscapeWithdrawal | fresh slots", fresh);
+        Measured memory m = _measure(USER, 0, data, "initiateEscapeWithdrawal");
         _vaultOverhead("initiateEscapeWithdrawal", m.frame, escape, proof);
     }
 
+    /// No pause ever: no pause epoch to read.
     function test_claimExpired() public {
-        vm.warp(vault.effectiveExpiry(0));
-        _measure(OPERATOR, 0, abi.encodeCall(ZkApiVault.claimExpired, (0)), "claimExpired");
+        vm.warp(_effectiveExpiryA());
+        _measure(OPERATOR, 0, _claimData(), "claimExpired (no pause epochs)");
     }
 
     /// The vault's own share of an exit: its frame minus the adapter frame (measured on the same
@@ -707,6 +708,40 @@ contract GasBaselineExits is GasBaselineBase {
         emit log_named_uint(
             string.concat(label, " | vault-own (frame - adapter - 2,700 access)"), frame - adapterFrame - 2_700
         );
+    }
+}
+
+/// claimExpired of note A after pause epochs: one epoch (A in the latest one: the one-read fast
+/// path), and 32 epochs with A before the latest (the binary search).
+contract GasBaselineClaimAfterEpochs is GasBaselineBase {
+    function setUp() public {
+        _deploy(true);
+        _depositAB();
+    }
+
+    function _pauseRound() internal {
+        vault.pause();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vault.unpause();
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+    }
+
+    function test_claimExpiredAfterOneEpoch() public {
+        _pauseRound();
+        assertEq(vault.pauseEpochCount(), 1);
+        vm.warp(_effectiveExpiryA());
+        _measure(OPERATOR, 0, _claimData(), "claimExpired (1 epoch, latest-epoch fast path)");
+    }
+
+    function test_claimExpiredAfterThirtyTwoEpochs() public {
+        for (uint256 i = 0; i < 32; ++i) {
+            _plainDeposit(_commitment(9_000 + i));
+            _pauseRound();
+        }
+        assertEq(vault.pauseEpochCount(), 32);
+        assertEq(vault.pausedBefore(0), 0);
+        vm.warp(_effectiveExpiryA() + 1);
+        _measure(OPERATOR, 0, _claimData(), "claimExpired (32 epochs, binary search)");
     }
 }
 
@@ -728,15 +763,17 @@ contract GasBaselinePendingEscape is GasBaselineBase {
         _requestOverhead("raiseEscapeConcession", m.frame, r2, proof);
     }
 
+    /// The defeat far from the note's expiry: the fast path (no grace, no epoch read).
     function test_challengeEscapeWithdrawal() public {
         (Types.RequestPublicInputs memory r3, bytes memory proof) = _request("request_a3");
         Measured memory m = _measure(
             OPERATOR,
             0,
             abi.encodeCall(ZkApiVault.challengeEscapeWithdrawal, (0, r3, proof)),
-            "challengeEscapeWithdrawal"
+            "challengeEscapeWithdrawal (fast path)"
         );
-        _requestOverhead("challengeEscapeWithdrawal", m.frame, r3, proof);
+        assertEq(vault.graceUntil(0), 0);
+        _requestOverhead("challengeEscapeWithdrawal (fast path)", m.frame, r3, proof);
     }
 
     function test_finalizeEscapeWithdrawal() public {
@@ -757,27 +794,204 @@ contract GasBaselinePendingEscape is GasBaselineBase {
     }
 }
 
-/// Note A closed (mutual close), committed in setUp.
+/// The defeat's slow path: an escape initiated within a challenge period of the note's expiry,
+/// after one pause epoch, defeated at its deadline: the exact pausedBefore lookup and a fresh
+/// graceUntil slot.
+contract GasBaselineDefeatNearExpiry is GasBaselineBase {
+    function setUp() public {
+        _deploy(true);
+        _depositAB();
+        vault.pause();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vault.unpause();
+        vm.warp(uint256(_expiry()) - 1 hours);
+        (Types.WithdrawalPublicInputs memory escape, bytes memory proof) = _withdrawal("escape_a2_late");
+        vm.prank(USER);
+        vault.initiateEscapeWithdrawal(escape, proof);
+        vm.warp(_deadline(0) - 1);
+    }
+
+    function test_challengeNearExpiry() public {
+        (Types.RequestPublicInputs memory r3, bytes memory proof) = _request("request_a3");
+        _measure(
+            OPERATOR,
+            0,
+            abi.encodeCall(ZkApiVault.challengeEscapeWithdrawal, (0, r3, proof)),
+            "challengeEscapeWithdrawal (slow path: grace written)"
+        );
+        assertGt(vault.graceUntil(0), 0);
+    }
+}
+
+/// retireClosedLeaf at a chosen level: the retired note's word, the frontier entry of its subtree
+/// and nextNoteId written so that the leaf's level is `level` (note 0 against nextNoteId 2^level,
+/// or the last leaf of an odd count for level 0), with real siblings below the level. Measured
+/// with the unused siblings zero-filled (what the challenger sends) and full.
+abstract contract RetireAtBase is GasBaselineBase {
+    uint256 internal constant LEAF = 0x0a11ce;
+    uint256[32] internal path;
+    uint32 internal retired;
+
+    function _level() internal pure virtual returns (uint256);
+
+    function setUp() public {
+        _deploy(true);
+        uint256 level = _level();
+        // casting to 'uint32' is safe because the levels measured are below 32
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 next = level == 0 ? 3 : uint32(uint256(1) << level);
+        retired = level == 0 ? 2 : 0;
+        uint256 node = LEAF;
+        for (uint256 h = 0; h < level; ++h) {
+            path[h] = uint256(keccak256(abi.encode("sibling", h))) % SCALAR_MODULUS;
+            node = Bn254PoseidonReference.compress(DOMAIN_NODE, node, path[h]);
+        }
+        if (level > 0) VaultStorage.setFilled(address(vault), level, node);
+        // The other levels hold live-looking nonzero entries too.
+        for (uint256 l = 1; l < level; ++l) {
+            VaultStorage.setFilled(address(vault), l, uint256(keccak256(abi.encode("stale", l))) % SCALAR_MODULUS);
+        }
+        VaultStorage.setNote(address(vault), retired, LEAF, VaultStorage.CLOSED);
+        if (level == 0) VaultStorage.setNote(address(vault), 0, 0x1234, VaultStorage.ACTIVE);
+        VaultStorage.setNextNoteId(address(vault), next);
+    }
+
+    function test_retireZeroFilled() public {
+        string memory label = string.concat("retireClosedLeaf (level ", vm.toString(_level()), ", zero-filled)");
+        _measure(OPERATOR, 0, abi.encodeCall(ZkApiVault.retireClosedLeaf, (retired, path)), label);
+        assertEq(_storedLeaf(retired), 0);
+    }
+
+    function test_retireFullSiblings() public {
+        uint256[32] memory full = path;
+        for (uint256 h = _level(); h < 32; ++h) {
+            full[h] = uint256(keccak256(abi.encode("unused", h))) % SCALAR_MODULUS;
+        }
+        string memory label = string.concat("retireClosedLeaf (level ", vm.toString(_level()), ", full siblings)");
+        bytes memory data = abi.encodeCall(ZkApiVault.retireClosedLeaf, (retired, full));
+        _measure(OPERATOR, 0, data, label);
+        emit log_named_uint(string.concat(label, " | EIP-7623 floor"), _floorGas(data));
+    }
+}
+
+contract GasBaselineRetire0 is RetireAtBase {
+    function _level() internal pure override returns (uint256) {
+        return 0;
+    }
+}
+
+contract GasBaselineRetire4 is RetireAtBase {
+    function _level() internal pure override returns (uint256) {
+        return 4;
+    }
+}
+
+contract GasBaselineRetire8 is RetireAtBase {
+    function _level() internal pure override returns (uint256) {
+        return 8;
+    }
+}
+
+contract GasBaselineRetire16 is RetireAtBase {
+    function _level() internal pure override returns (uint256) {
+        return 16;
+    }
+}
+
+/// The retirement the old baseline measured: note A closed next to B (level 1), real path.
 contract GasBaselineRetire is GasBaselineBase {
     function setUp() public {
         _deploy(true);
         _depositAB();
+        _plainDeposit(_commitment(77));
         (Types.WithdrawalPublicInputs memory close, bytes memory proof) = _withdrawal("close_a2");
         vault.mutualClose(close, proof);
     }
 
     function test_retireClosedLeaf() public {
         uint256[32] memory siblings;
-        siblings[0] = _leafOf(1);
-        for (uint256 level = 1; level < 32; ++level) {
-            siblings[level] = MerkleUpdateLib.zeroHash(level);
-        }
-        _measure(OPERATOR, 0, abi.encodeCall(ZkApiVault.retireClosedLeaf, (0, siblings)), "retireClosedLeaf");
-        uint256 node = Bn254PoseidonReference.compress(DOMAIN_NODE, 0, siblings[0]);
-        for (uint256 level = 1; level < 32; ++level) {
-            node = Bn254PoseidonReference.compress(DOMAIN_NODE, node, siblings[level]);
+        siblings[0] = _storedLeaf(1);
+        // Level msb(0 ^ 3) = 1: only siblings[0] is read.
+        _measure(
+            OPERATOR, 0, abi.encodeCall(ZkApiVault.retireClosedLeaf, (0, siblings)), "retireClosedLeaf (A, level 1)"
+        );
+        uint256 node = Bn254PoseidonReference.compress(
+            DOMAIN_NODE,
+            Bn254PoseidonReference.compress(DOMAIN_NODE, 0, siblings[0]),
+            Bn254PoseidonReference.compress(DOMAIN_NODE, _storedLeaf(2), 0)
+        );
+        for (uint256 level = 2; level < 32; ++level) {
+            node = Bn254PoseidonReference.compress(DOMAIN_NODE, node, MerkleUpdateLib.zeroHash(level));
         }
         assertEq(vault.currentRoot(), node, "retired root");
+    }
+}
+
+/// recordRoot and the computed views: at 2 notes (two compressions below the top) and at a full
+/// 31-bit pattern (32 compressions), and a noteLeaves page of 2,048 leaves.
+contract GasBaselineViews is GasBaselineBase {
+    function setUp() public {
+        _deploy(true);
+        _depositAB();
+    }
+
+    function test_recordRootAtTwoNotes() public {
+        _measure(OPERATOR, 0, abi.encodeCall(ZkApiVault.recordRoot, ()), "recordRoot (2 notes)");
+        (uint32 count, uint64 blockNumber) = vault.recordedRoot(vault.currentRoot());
+        assertEq(count, 2);
+        assertEq(blockNumber, block.number);
+    }
+
+    function test_recordRootAtFullPattern() public {
+        _seedSynthetic(uint32((uint256(1) << 31) - 1));
+        _measure(OPERATOR, 0, abi.encodeCall(ZkApiVault.recordRoot, ()), "recordRoot (2^31 - 1 notes)");
+    }
+
+    function test_viewsAsEthCalls() public {
+        _seedSynthetic(uint32((uint256(1) << 31) - 1));
+        _coolAll();
+        uint256 before = gasleft();
+        vault.currentRoot();
+        emit log_named_uint("currentRoot() eth_call (2^31 - 1 notes) | gasleft delta", before - gasleft());
+        _seedSynthetic(2_048);
+        _coolAll();
+        before = gasleft();
+        vault.noteLeaves(0, 2_048);
+        emit log_named_uint("noteLeaves(0, 2048) eth_call | gasleft delta", before - gasleft());
+    }
+}
+
+/// unpause: a new pause epoch (a fresh slot), and one that overwrites the previous epoch (no
+/// deposit since).
+contract GasBaselineUnpause is GasBaselineBase {
+    function setUp() public {
+        _deploy(true);
+        _depositAB();
+        vault.pause();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+    }
+
+    function test_unpauseNewEpoch() public {
+        _measureOwner(abi.encodeCall(ZkApiVault.unpause, ()), "unpause (new epoch)");
+        assertEq(vault.pauseEpochCount(), 1);
+    }
+
+    function test_unpauseOverwritingTheEpoch() public {
+        vault.unpause();
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vault.pause();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        // Committed above in this test, so measured warm: a lower bound; logged for comparison.
+        _measureOwner(abi.encodeCall(ZkApiVault.unpause, ()), "unpause (overwrite, same tx: lower bound)");
+        assertEq(vault.pauseEpochCount(), 1);
+    }
+
+    function _measureOwner(bytes memory data, string memory label) internal {
+        _coolAll();
+        (bool ok,) = address(vault).call(data);
+        require(ok, label);
+        emit log_named_uint(string.concat(label, " | frame"), vm.lastCallGas().gasTotalUsed);
+        emit log_named_uint(string.concat(label, " | tx"), 21_000 + _calldataGas(data) + vm.lastCallGas().gasTotalUsed);
     }
 }
 
@@ -820,8 +1034,8 @@ contract GasBaselineSnapshotReplica is GasBaselineBase {
         _replica("mutualClose", abi.encodeCall(ZkApiVault.mutualClose, (close, closeProof)), pinned);
         vm.revertToState(snapshot);
 
-        vm.warp(vault.effectiveExpiry(0));
-        _replica("claimExpired", abi.encodeCall(ZkApiVault.claimExpired, (0)), pinned);
+        vm.warp(_effectiveExpiryA());
+        _replica("claimExpired", _claimData(), pinned);
     }
 
     function _replica(string memory label, bytes memory data, string memory pinned) internal {

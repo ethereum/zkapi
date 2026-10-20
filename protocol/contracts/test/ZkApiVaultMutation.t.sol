@@ -36,7 +36,8 @@ contract ZkApiVaultMutationTest is Test {
     /// Bit widths of the request inputs in order (256: a field element).
     uint16[12] REQUEST_BITS = [16, 64, 160, 256, 256, 256, 64, 128, 256, 256, 256, 256];
     /// Bit widths of the withdrawal inputs in order.
-    uint16[16] WITHDRAWAL_BITS = [16, 64, 160, 256, 256, 256, 256, 256, 32, 128, 160, 256, 8, 256, 128, 64];
+    /// Input 8 (noteFields) is a uint256 in the ABI; every note packs it below 2^224.
+    uint16[16] WITHDRAWAL_BITS = [16, 64, 160, 256, 256, 256, 256, 256, 256, 128, 160, 256, 8, 256, 128, 64];
 
     function setUp() public {
         vm.chainId(31_337);
@@ -86,11 +87,13 @@ contract ZkApiVaultMutationTest is Test {
             for (uint256 i = 0; i < solidity.length; ++i) {
                 _mutateWithdrawal("test/fixtures/solidity-fixture.json", solidity[i]);
             }
-            string[6] memory vault = [
+            string[8] memory vault = [
                 "escape_a2",
                 "escape_a2_concede",
                 "escape_a2_expired",
                 "escape_b0_genesis_concede",
+                "escape_b0_forged_deposit",
+                "escape_b0_forged_expiry",
                 "close_a2",
                 "ownership_a2"
             ];

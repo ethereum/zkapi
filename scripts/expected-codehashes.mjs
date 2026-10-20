@@ -19,7 +19,7 @@
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json.pending --rpc URL \
 //     --finalize .demo/deployment.json [--broadcast-log FILE] [--confirmations N]
 //   node scripts/expected-codehashes.mjs --poseidon 0x.. --note-ttl 2592000 --challenge-period 172800 \
-//     --max-pause-duration 3888000 --request-charge-cap 50000 --proof-adapter 0x.. \
+//     --max-pause-duration 3888000 --request-charge-cap 50000 --min-deposit 1000000 --proof-adapter 0x.. \
 //     --state-key-x .. --state-key-y .. --clearance-key-x .. --clearance-key-y .. --vault 0x.. --chain-id 1 \
 //     [--entry-point 0x.. --paymaster 0x.. --factory 0x.. --account-implementation 0x.. \
 //      --wei-per-unit 1000000000 --creation-code-keccak 0x..]
@@ -382,7 +382,17 @@ export function vaultImmutables(inputs) {
         clearanceSigningKeyY: word(inputs.clearanceSigningKeyY, 'clearanceSigningKeyY'),
         maxPauseDuration: word(maxPauseDuration, 'maxPauseDuration'),
         poseidon: word(address(inputs.poseidonLibrary, 'poseidonLibrary'), 'poseidonLibrary'),
+        minDeposit: word(minDeposit(inputs.minDeposit), 'minDeposit'),
     };
+}
+
+/// The vault's minDeposit immutable (revision 4): 1 to 2^53 - 1 gwei units, as its constructor
+/// requires.
+function minDeposit(value) {
+    if (value === undefined || value === null) fail('minDeposit is required (vault revision 4)');
+    const units = uint(value, 128, 'minDeposit');
+    if (units === 0n || units > 9_007_199_254_740_991n) fail('minDeposit must be 1 to 2^53 - 1 gwei units');
+    return units;
 }
 
 // ------------------------------------------------------------- gasless withdrawals (ERC-4337)
@@ -625,6 +635,7 @@ export function deploymentInputs(deployment, overrides = {}) {
         challengePeriod: deployment.challengePeriod,
         maxPauseDuration: deployment.maxPauseDuration,
         requestChargeCap: deployment.requestChargeCap,
+        minDeposit: deployment.minDeposit,
         stateSigningKeyX: deployment.stateSigningKeyX,
         stateSigningKeyY: deployment.stateSigningKeyY,
         clearanceSigningKeyX: deployment.clearanceSigningKeyX,
@@ -852,6 +863,7 @@ const FLAGS = {
     '--challenge-period': 'challengePeriod',
     '--max-pause-duration': 'maxPauseDuration',
     '--request-charge-cap': 'requestChargeCap',
+    '--min-deposit': 'minDeposit',
     '--state-key-x': 'stateSigningKeyX',
     '--state-key-y': 'stateSigningKeyY',
     '--clearance-key-x': 'clearanceSigningKeyX',

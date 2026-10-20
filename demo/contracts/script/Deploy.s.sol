@@ -13,11 +13,11 @@ import {ZkApiWithdrawalPaymaster} from "zkapi-contracts/gasless/ZkApiWithdrawalP
 import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 import {SetupPolicy} from "./SetupPolicy.sol";
 
-/// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v1, vault revision 3).
+/// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v2, vault revision 4).
 /// @notice Deploys (or reuses) the vault's Poseidon, Bn254PoseidonRuntime, after checking its
 ///         runtime codehash against the setup's poseidon-runtime.json, deploys the circuit-specific
 ///         Groth16 verifier folded for the vault (the address the vault gets next, the chain and the
-///         signing keys) and the native ETH ZkApiVault with its 12 constructor arguments, checks the
+///         signing keys) and the native ETH ZkApiVault with its 13 constructor arguments, checks the
 ///         adapter's circuit and verifying-key hashes against the setup manifest, its folded
 ///         constants against the vault's and its folded points against the manifest's verifying
 ///         keys, and the vault's getters against the inputs, then (unless GASLESS=0) deploys the
@@ -39,8 +39,9 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///         that created the vault) and deploymentStatus "deployed". Profiles take their pins and
 ///         deploy_block from $OUTPUT_PATH only. A dry run (no --broadcast) writes deploymentStatus
 ///         "simulated", which finalize refuses.
-///         The vault links no library: it takes the Poseidon runtime's address as its last
-///         constructor argument (an immutable, called with STATICCALL). The runtime is compiled
+///         The vault links no library: it takes the Poseidon runtime's address as its twelfth
+///         constructor argument (an immutable, called with STATICCALL), and minDeposit as its
+///         thirteenth. The runtime is compiled
 ///         with the legacy pipeline (foundry.toml compilation_restrictions; script/PoseidonRuntime
 ///         Artifact.sol pulls it into out/) and deployed from its artifact.
 ///         The gasless block needs the canonical EntryPoint v0.7.0 runtime at ENTRY_POINT and the
@@ -75,6 +76,9 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///           MAX_PAUSE_DURATION_SECONDS – longest a pause blocks exits; at least twice the
 ///                         challenge period. Required except on local chains (default 7 days).
 ///           REQUEST_CHARGE_CAP – positive per-request gwei limit; defaults to 1,000,000.
+///           MIN_DEPOSIT – the smallest deposit in gwei units (the vault's minDeposit immutable,
+///                         1 to 2^53 - 1); defaults to 1,000,000 (0.001 ETH). Every leaf of the
+///                         request tree locks at least this much, so spam leaves lock capital.
 ///           SETUP_MANIFEST – the setup's manifest.json; the adapter's CIRCUIT_ID_HASH and VK hashes
 ///                         must match it. Required except on local chains (default
 ///                         protocol/setup/v2-concession-dev). SetupPolicy decides which setups
@@ -133,7 +137,8 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     uint64 internal constant DEFAULT_NOTE_TTL = 30 days;
     uint64 internal constant LOCAL_MAX_PAUSE_DURATION = 7 days;
-    uint256 internal constant VAULT_REVISION = 3;
+    uint256 internal constant VAULT_REVISION = 4;
+    uint256 internal constant DEFAULT_MIN_DEPOSIT = 1_000_000;
     string internal constant DEFAULT_SETUP_MANIFEST = "../../protocol/setup/v2-concession-dev/manifest.json";
     /// The vault's Poseidon, legacy-compiled, by its artifact path (a name lookup does not find
     /// artifacts of the additional compiler profile).
@@ -142,6 +147,9 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     string internal constant POSEIDON_RUNTIME_MANIFEST = "poseidon-runtime.json";
     /// Largest integer a JSON number carries exactly in JavaScript (Number.MAX_SAFE_INTEGER).
     uint256 internal constant MAX_SAFE_INTEGER = 9_007_199_254_740_991;
+    /// The empty request tree's root (MerkleUpdateLib.EMPTY_ROOT), which a fresh vault's computed
+    /// currentRoot() must return.
+    uint256 internal constant EMPTY_ROOT = 0x1eb94e909bac5b6e3331993876bdde00f84b31e0103a29af6617fc021318b81e;
 
     /// The canonical ERC-4337 EntryPoint v0.7.0 and the SenderCreator it created (its nonce 1,
     /// an immutable of its runtime), pinned by the keccak256 of their runtime code on every chain.
@@ -175,6 +183,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         uint64 challengePeriod;
         uint64 maxPauseDuration;
         uint128 requestChargeCap;
+        uint128 minDeposit;
         uint256 stateKeyX;
         uint256 stateKeyY;
         uint256 clearanceKeyX;
@@ -266,7 +275,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             p.clearanceKeyY,
             p.owner,
             p.maxPauseDuration,
-            d.poseidon
+            d.poseidon,
+            p.minDeposit
         );
         if (g.enabled) _deployGasless(d, p, g);
         vm.stopBroadcast();
@@ -350,6 +360,11 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         // casting to 'uint128' is safe because cap is at most MAX_SAFE_INTEGER
         // forge-lint: disable-next-line(unsafe-typecast)
         p.requestChargeCap = uint128(cap);
+        uint256 minDeposit = vm.envOr("MIN_DEPOSIT", DEFAULT_MIN_DEPOSIT);
+        require(minDeposit > 0 && minDeposit <= MAX_SAFE_INTEGER, "MIN_DEPOSIT must be positive safe gwei units");
+        // casting to 'uint128' is safe because minDeposit is at most MAX_SAFE_INTEGER
+        // forge-lint: disable-next-line(unsafe-typecast)
+        p.minDeposit = uint128(minDeposit);
     }
 
     function _setup(bool local) internal view returns (Setup memory setup) {
@@ -375,7 +390,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             require(
                 _eq(vm.parseJsonString(ceremony, ".circuit_id"), CIRCUIT_ID)
                     && _eq(vm.parseJsonString(ceremony, ".setup_id"), CEREMONY_SETUP_ID),
-                "protocol/setup/v2-concession/manifest.json is not the zkapi-v2-concession-v1 mpc-1 setup"
+                "protocol/setup/v2-concession/manifest.json is not the zkapi-v2-concession-v2 mpc-1 setup"
             );
             facts.ceremonyRequestVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.request");
             facts.ceremonyWithdrawalVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.withdrawal");
@@ -602,21 +617,25 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         ZkApiVault vault = d.vault;
         require(vault.PROTOCOL_VERSION() == 2, "PROTOCOL_VERSION");
         require(vault.CONCESSION_ESCAPE_VERSION() == 1, "CONCESSION_ESCAPE_VERSION");
-        require(vault.ROOT_HISTORY_WINDOW() == 1 days, "ROOT_HISTORY_WINDOW");
+        require(vault.LEAF_BOUND_EXIT_VERSION() == 1, "LEAF_BOUND_EXIT_VERSION");
         require(address(vault.proofAdapter()) == address(d.adapter), "proofAdapter");
         require(address(vault.poseidon()) == d.poseidon, "poseidon");
         require(vault.owner() == p.owner && vault.treasury() == p.treasury, "owner or treasury");
         require(
             vault.noteTtl() == p.noteTtl && vault.challengePeriod() == p.challengePeriod
-                && vault.maxPauseDuration() == p.maxPauseDuration && vault.requestChargeCap() == p.requestChargeCap,
-            "periods or cap"
+                && vault.maxPauseDuration() == p.maxPauseDuration && vault.requestChargeCap() == p.requestChargeCap
+                && vault.minDeposit() == p.minDeposit,
+            "periods, cap or minDeposit"
         );
         require(
             vault.stateSigningKeyX() == p.stateKeyX && vault.stateSigningKeyY() == p.stateKeyY
                 && vault.clearanceSigningKeyX() == p.clearanceKeyX && vault.clearanceSigningKeyY() == p.clearanceKeyY,
             "signing keys"
         );
-        require(vault.isKnownRoot(vault.currentRoot()), "empty root not recorded");
+        require(
+            vault.currentRoot() == EMPTY_ROOT && vault.nextNoteId() == 0 && vault.pauseEpochCount() == 0,
+            "not an empty vault"
+        );
     }
 
     /// Post-deploy checks of the gasless block: the paymaster's and the factory's pins equal the
@@ -705,6 +724,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeUint(m, "protocolVersion", vault.PROTOCOL_VERSION());
         vm.serializeUint(m, "vaultRevision", VAULT_REVISION);
         vm.serializeUint(m, "concessionEscapeVersion", vault.CONCESSION_ESCAPE_VERSION());
+        vm.serializeUint(m, "leafBoundExitVersion", vault.LEAF_BOUND_EXIT_VERSION());
         vm.serializeString(m, "circuitId", setup.circuitId);
         vm.serializeString(m, "setupId", setup.setupId);
         vm.serializeBool(m, "allowDevSetup", setup.allowDevSetup);
@@ -722,6 +742,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeBytes32(m, "poseidonRuntimeCodehash", d.poseidon.codehash);
         vm.serializeAddress(m, "treasury", p.treasury);
         vm.serializeUint(m, "requestChargeCap", p.requestChargeCap);
+        vm.serializeUint(m, "minDeposit", p.minDeposit);
         vm.serializeString(m, "billing_asset", "native_eth");
         vm.serializeString(m, "billing_unit", "gwei");
         vm.serializeUint(m, "nativeAssetWeiPerUnit", vault.nativeAssetWeiPerUnit());
@@ -730,7 +751,6 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeUint(m, "pauseCooldown", vault.PAUSE_COOLDOWN());
         vm.serializeUint(m, "treasuryChangeDelay", vault.treasuryChangeDelay());
         vm.serializeUint(m, "unpauseClaimGrace", vault.unpauseClaimGrace());
-        vm.serializeUint(m, "rootHistoryWindow", vault.ROOT_HISTORY_WINDOW());
         // serializeUint writes values up to 2^64 - 1 as bare JSON numbers, which JavaScript rounds
         // above 2^53 - 1; key coordinates can be any field element, so they are decimal strings.
         vm.serializeString(m, "stateSigningKeyX", vm.toString(p.stateKeyX));

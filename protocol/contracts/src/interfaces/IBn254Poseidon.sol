@@ -6,11 +6,12 @@ pragma solidity ^0.8.28;
 ///         deployed once and passed to the vault's constructor. Every function is pure, so the
 ///         vault calls it with STATICCALL and a failed call reverts the vault's call.
 interface IBn254Poseidon {
-    /// @notice One permutation of the state (capacity, left, right), its lane 1: the note tree's
-    ///         node hash with capacity = DOMAIN_NODE (zkapi_core::v2::compress_fields).
+    /// @notice One permutation of the state (capacity, left, right), its lane 1: the request tree's
+    ///         node hash with capacity = DOMAIN_NODE and the note leaf with capacity = DOMAIN_LEAF
+    ///         (zkapi_core::v2::compress_fields). The vault (revision 4) uses only this function.
     function compress(uint256 capacity, uint256 left, uint256 right) external pure returns (uint256);
 
-    /// @notice The sponge over five inputs (zkapi_core::v2::hash_fields), the note leaf.
+    /// @notice The sponge over five inputs (zkapi_core::v2::hash_fields), revision 3's note leaf.
     function hash5(uint256 a, uint256 b, uint256 c, uint256 d, uint256 e) external pure returns (uint256);
 
     /// @notice The root of the depth-32 tree with leaf at index, from the leaf's siblings (bottom

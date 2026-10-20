@@ -40,6 +40,7 @@ const DEPLOYMENT = Object.freeze({
   deployer: '0x000000000000000000000000000000000000f00d', deployer_nonce: 0,
   treasury: '0x000000000000000000000000000000000000beef', owner: '0x0000000000000000000000000000000000000d0d',
   note_ttl: 30 * 86_400, challenge_period: 86_400, request_charge_cap: 100_000, max_pause_duration: 7 * 86_400,
+  min_deposit: 1,
 });
 const DEPOSITOR = '0x1111111111111111111111111111111111111111';
 const DEPOSIT_WEI = 1_000_000n * 1_000_000_000n;
@@ -63,7 +64,9 @@ function update() {
   });
   const printed = Object.fromEntries(log.split('\n').map(line => /^\s*([a-z_]+)=(0x[0-9a-f]+)\s*$/.exec(line))
     .filter(Boolean).map(([, key, value]) => [key, value]));
-  for (const key of ['deposit_a', 'deposit_b', 'escape', 'close', 'active_root']) assert.ok(printed[key], `forge printed no ${key}`);
+  for (const key of ['deposit_a', 'deposit_b', 'escape', 'close', 'note_leaf_a', 'note_leaf_b', 'request_root']) {
+    assert.ok(printed[key], `forge printed no ${key}`);
+  }
   const statement = name => ({
     public_inputs: fixtures[name].public_inputs,
     proof: Buffer.from(fixtures[name].proof_hex.slice(2), 'hex').toString('base64'),
@@ -71,7 +74,7 @@ function update() {
     inputs_abi: fixtures[name].inputs_abi,
   });
   const golden = {
-    description: 'Shared withdrawal golden vector (design §11 WP-F): a real kind-0 escape (conceding 100,000) and a real kind-1 close of circuit zkapi-v2-concession-v1, setup dev, with their calldata as Solidity abi.encodeCall encodes them against the real vault (WithdrawalGoldenTest), and the deployment and deposits they land on. The Rust (zkapi-serverd, zkapi-companion), JS (sdk/wallet.js) and Go (zkapi-clientd) encoders must produce exactly `calldata`; scripts/check-withdrawal-golden.mjs submits each encoder\'s output to this deployment on Anvil. Regenerate: node scripts/check-withdrawal-golden.mjs --update.',
+    description: 'Shared withdrawal golden vector (design §11 WP-F): a real kind-0 escape (conceding 100,000) and a real kind-1 close of circuit zkapi-v2-concession-v2 (leaf-bound exits: no root, the notes\' stored leaves), setup dev, with their calldata as Solidity abi.encodeCall encodes them against the real vault (WithdrawalGoldenTest), and the deployment and deposits they land on. The Rust (zkapi-serverd, zkapi-companion), JS (sdk/wallet.js) and Go (zkapi-clientd) encoders must produce exactly `calldata`; scripts/check-withdrawal-golden.mjs submits each encoder\'s output to this deployment on Anvil. Regenerate: node scripts/check-withdrawal-golden.mjs --update.',
     source: { fixture: 'protocol/contracts/test/fixtures/vault-challenge.json', escape: 'escape_a2_concede', close: 'close_b0' },
     circuit_id: fixtures.circuit_id,
     setup_id: fixtures.setup_id,
@@ -83,10 +86,10 @@ function update() {
     },
     depositor: DEPOSITOR,
     deposits: [
-      { note_id: 0, value_wei: DEPOSIT_WEI.toString(), calldata: printed.deposit_a },
-      { note_id: 1, value_wei: DEPOSIT_WEI.toString(), calldata: printed.deposit_b },
+      { note_id: 0, value_wei: DEPOSIT_WEI.toString(), calldata: printed.deposit_a, note_leaf: printed.note_leaf_a },
+      { note_id: 1, value_wei: DEPOSIT_WEI.toString(), calldata: printed.deposit_b, note_leaf: printed.note_leaf_b },
     ],
-    active_root: printed.active_root,
+    request_root: printed.request_root,
     escape: { ...statement('escape_a2_concede'), state_balance: '790000', calldata: printed.escape },
     close: { ...statement('close_b0'), calldata: printed.close },
   };
@@ -200,7 +203,7 @@ async function deploy(rpc, golden) {
   const args = [addressWord(d.treasury), word(d.note_ttl), word(d.challenge_period), word(d.request_charge_cap),
     addressWord(adapter.contractAddress), word(d.state_signing_key.x), word(d.state_signing_key.y),
     word(d.clearance_signing_key.x), word(d.clearance_signing_key.y), addressWord(d.owner), word(d.max_pause_duration),
-    addressWord(poseidon.contractAddress)];
+    addressWord(poseidon.contractAddress), word(d.min_deposit)];
   const vault = await send(rpc, { from: d.deployer, data: linked(artifact('ZkApiVault'), {}) + args.join('') });
   assert.equal(vault.status, '0x1');
   assert.equal(vault.contractAddress.toLowerCase(), d.vault.toLowerCase(), 'the vault is at the address the proofs bind');
@@ -212,13 +215,21 @@ async function deploy(rpc, golden) {
     const receipt = await send(rpc, { from: golden.depositor, to: d.vault, value: hex(deposit.value_wei), data: deposit.calldata });
     assert.equal(receipt.status, '0x1', `deposit of note ${deposit.note_id}`);
   }
+  // Each deposit stored the leaf its exit statement carries (noteRecord, 0xd154f5bf).
+  for (const deposit of golden.deposits) {
+    const record = await rpc('eth_call', [{ to: d.vault, data: `0xd154f5bf${word(deposit.note_id)}` }, 'latest']);
+    assert.equal(BigInt(record.slice(0, 66)), BigInt(deposit.note_leaf), `the vault stored note ${deposit.note_id}'s leaf`);
+  }
+  assert.equal(BigInt(golden.escape.public_inputs.note_leaf), BigInt(golden.deposits[0].note_leaf), 'escape leaf');
+  assert.equal(BigInt(golden.close.public_inputs.note_leaf), BigInt(golden.deposits[1].note_leaf), 'close leaf');
   const root = await rpc('eth_call', [{ to: d.vault, data: '0xfdab463d' }, 'latest']);
-  assert.equal(BigInt(root), BigInt(golden.active_root), 'the deposits rebuild the proofs\' root');
+  assert.equal(BigInt(root), BigInt(golden.request_root), 'the computed request root over the two deposits');
 }
 
+// noteRecord(uint32) -> (uint256 leaf, uint8 status): the status is word 1.
 async function noteStatus(rpc, vault, noteId) {
-  const words = await rpc('eth_call', [{ to: vault, data: `0x9f18e4ed${word(noteId)}` }, 'latest']);
-  return Number(BigInt(`0x${words.slice(2 + 3 * 64, 2 + 4 * 64)}`));
+  const words = await rpc('eth_call', [{ to: vault, data: `0xd154f5bf${word(noteId)}` }, 'latest']);
+  return Number(BigInt(`0x${words.slice(2 + 64, 2 + 2 * 64)}`));
 }
 
 async function submit(rpc, golden, name, output) {

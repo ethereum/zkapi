@@ -5,6 +5,7 @@ import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
+import {MerkleUpdateLib} from "../src/libraries/MerkleUpdateLib.sol";
 import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {VaultTestBase} from "./helpers/VaultTestBase.sol";
 import {ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
@@ -15,9 +16,9 @@ contract ZkApiVaultTest is VaultTestBase {
         _setUpVault();
     }
 
-    function test_depositInsertsTheLeafAndRecordsTheRoot() public {
+    function test_depositStoresTheLeafAndAppendsIt() public {
         uint256 emptyRoot = vault.currentRoot();
-        assertTrue(vault.isKnownRoot(emptyRoot));
+        assertEq(emptyRoot, MerkleUpdateLib.EMPTY_ROOT);
         uint256 depositedAt = 1_700_000_123;
         vm.warp(depositedAt);
         // Rounded up to the day (a literal expression would divide exactly).
@@ -29,18 +30,15 @@ contract ZkApiVaultTest is VaultTestBase {
             root = _hashNode(root, emptySiblings[level]);
         }
         vm.expectEmit(address(vault));
-        emit Events.NoteDeposited(0, bytes32(uint256(42)), DEPOSIT, expiry, root);
+        emit Events.NoteDeposited(0, bytes32(uint256(42)), DEPOSIT, expiry);
         vm.prank(user);
         vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(42)), DEPOSIT);
         uint32 id = 0;
         assertEq(vault.nextNoteId(), 1);
-        (bytes32 commitment, uint128 amount, uint64 expiryTs, Types.NoteStatus status) = vault.notes(id);
-        assertEq(commitment, bytes32(uint256(42)));
-        assertEq(amount, DEPOSIT);
-        assertEq(expiryTs, expiry);
+        (uint256 storedLeaf, Types.NoteStatus status) = vault.noteRecord(id);
+        assertEq(storedLeaf, leaf);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
         assertEq(vault.currentRoot(), root);
-        assertTrue(vault.knownRoots(root));
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
 
@@ -128,7 +126,7 @@ contract ZkApiVaultTest is VaultTestBase {
 
     function test_defeatNearExpiryGrantsGraceBeforeClaim() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = noteData[id].expiryTs;
         vm.warp(uint256(expiry) - 1 hours);
         vault.initiateEscapeWithdrawal(_escape(id, 101, 102, 800_000, 0), PROOF);
         uint64 deadline = _deadline(id);
@@ -136,12 +134,13 @@ contract ZkApiVaultTest is VaultTestBase {
         vm.warp(deadline - 1);
         vault.challengeEscapeWithdrawal(id, successor, PROOF);
         uint256 graceEnd = uint256(deadline) - 1 + vault.challengePeriod();
-        assertEq(vault.effectiveExpiry(id), graceEnd);
+        assertEq(_effectiveExpiry(id), graceEnd);
+        assertEq(vault.graceUntil(id), graceEnd);
         vm.warp(graceEnd - 1);
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(graceEnd);
-        vault.claimExpired(id);
+        _claimExpired(id);
         assertEq(treasury.balance, uint256(DEPOSIT) * 1 gwei);
     }
 
@@ -149,37 +148,39 @@ contract ZkApiVaultTest is VaultTestBase {
     /// expiry where it was, rather than pulling it in to challengePeriod after the defeat.
     function test_earlyDefeatNeverLowersExpiry() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = noteData[id].expiryTs;
         vault.initiateEscapeWithdrawal(_escape(id, 101, 102, 800_000, 0), PROOF);
         vault.challengeEscapeWithdrawal(id, _evidence(102, 100_000), PROOF);
         uint256 defeatedAt = vm.getBlockTimestamp();
         assertLt(defeatedAt + vault.challengePeriod(), expiry);
-        assertEq(vault.effectiveExpiry(id), expiry);
+        assertEq(_effectiveExpiry(id), expiry);
+        // The fast path: no grace written.
+        assertEq(vault.graceUntil(id), 0);
         vm.warp(defeatedAt + vault.challengePeriod());
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(uint256(expiry) - 1);
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(expiry);
-        vault.claimExpired(id);
+        _claimExpired(id);
         assertEq(treasury.balance, uint256(DEPOSIT) * 1 gwei);
     }
 
     /// The same at the last moment of a challenge window that closes well before expiry.
     function test_defeatAtDeadlineFarFromExpiryKeepsExpiry() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = noteData[id].expiryTs;
         vm.warp(vm.getBlockTimestamp() + 10 days);
         vault.initiateEscapeWithdrawal(_escape(id, 101, 102, 800_000, 0), PROOF);
         Types.RequestPublicInputs memory successor = _evidence(102, 100_000);
         uint64 deadline = _deadline(id);
         vm.warp(deadline - 1);
         vault.challengeEscapeWithdrawal(id, successor, PROOF);
-        assertEq(vault.effectiveExpiry(id), expiry);
+        assertEq(_effectiveExpiry(id), expiry);
         vm.warp(uint256(deadline) - 1 + vault.challengePeriod());
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
     }
 
     function _hashNode(uint256 left, uint256 right) private pure returns (uint256) {

@@ -28,7 +28,9 @@
 //!   of genesis escapes for note B's ID and secret with another deposit
 //!   (2,000,000) or expiry (one bucket later): self-consistent statements whose
 //!   leaf is not the one the vault stored (NoteLeafMismatch).
-//!   `escape_a2_expired` has `valid_until = timestamp - 1`; `ownership_a2` is
+//!   `escape_a2_expired` has `valid_until = timestamp - 1`; `escape_a2_late`
+//!   stays valid until a week after the note's expiry (an escape near expiry,
+//!   whose defeat writes the grace); `ownership_a2` is
 //!   kind 2 (rejected by the vault); `escape_b0_genesis_concede`, `close_b0`
 //!   and `request_b0` use note B (same secret, disjoint nullifiers).
 use anyhow::{Context, Result};
@@ -238,6 +240,16 @@ fn main() -> Result<()> {
             WithdrawalKind::Escape,
             DESTINATION,
             0,
+        )?,
+    )?;
+    put(
+        "escape_a2_late",
+        generator.withdrawal(
+            &a2,
+            WithdrawalKind::Escape,
+            DESTINATION,
+            0,
+            expiry + 7 * 86_400,
         )?,
     )?;
     put(

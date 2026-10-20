@@ -61,7 +61,7 @@ contract VerifyOnceCaller {
 ///      binding (chain 31337, contract 0x1234 and its signing keys), so its proofs take the folded
 ///      path, and `generic`, folded for another vault, so they take the path over every input.
 contract Groth16ProofAdapterTest is Test {
-    string constant CIRCUIT_ID = "zkapi-v2-concession-v1";
+    string constant CIRCUIT_ID = "zkapi-v2-concession-v2";
     uint256 constant SCALAR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint256 constant BASE_MODULUS = 21888242871839275222246405745257275088696311157297823662689037894645226208583;
     address constant OTHER_VAULT = address(0xdead);
@@ -107,7 +107,7 @@ contract Groth16ProofAdapterTest is Test {
         assertEq(vm.parseJsonString(manifest, ".circuit_id"), CIRCUIT_ID);
         assertEq(vm.parseJsonString(manifest, ".setup_id"), vm.parseJsonString(fixtures, ".setup_id"));
         assertEq(folded.CIRCUIT_ID_HASH(), keccak256(bytes(CIRCUIT_ID)));
-        assertEq(folded.CIRCUIT_ID_HASH(), 0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687);
+        assertEq(folded.CIRCUIT_ID_HASH(), 0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1);
         assertEq(folded.REQUEST_VK_HASH(), vm.parseJsonBytes32(manifest, ".vk_keccak256.request"));
         assertEq(folded.WITHDRAWAL_VK_HASH(), vm.parseJsonBytes32(manifest, ".vk_keccak256.withdrawal"));
         assertEq(vm.parseJsonUint(manifest, ".circuits.request.public_inputs"), 12);
@@ -166,7 +166,15 @@ contract Groth16ProofAdapterTest is Test {
         new Groth16ProofAdapter(OTHER_VAULT, 1, 2, 3, binding.clearanceSigningKeyY + SCALAR_MODULUS);
     }
 
+    /// The leaf-bound statement's tuple (word 8 a uint256 noteFields) moved the withdrawal
+    /// selectors and so the interface ID, which the paymaster checks through ERC-165: pinned here
+    /// and in the clients.
     function test_supportsTheAdapterInterface() public view {
+        assertEq(IZkApiProofAdapter.assertValidWithdrawal.selector, bytes4(0xa730baaa));
+        assertEq(IZkApiProofAdapter.verifyWithdrawalOnce.selector, bytes4(0x04f7ff68));
+        assertEq(IZkApiProofAdapter.assertValidRequest.selector, bytes4(0x69078eaf));
+        assertEq(type(IZkApiProofAdapter).interfaceId, bytes4(0x90c99ce1));
+        assertFalse(folded.supportsInterface(0xd6b84058), "zkapi-v2-concession-v1's interface ID");
         assertTrue(folded.supportsInterface(type(IZkApiProofAdapter).interfaceId));
         assertTrue(folded.supportsInterface(0x01ffc9a7));
         assertFalse(folded.supportsInterface(0xffffffff));
@@ -300,8 +308,9 @@ contract Groth16ProofAdapterTest is Test {
     /// with an empty revert, on both paths and before the proof is looked at.
     function test_rejectsDirtyNarrowFieldsAsTheAbiDecoder() public view {
         (Types.WithdrawalPublicInputs memory inputs, bytes memory proof) = _withdrawal("close");
-        uint256[9] memory narrow = [uint256(0), 1, 2, 8, 9, 10, 12, 14, 15];
-        uint16[9] memory bits = [uint16(16), 64, 160, 32, 128, 160, 8, 128, 64];
+        // Input 8 (noteFields) is a uint256 in the ABI: the vault bounds it (InvalidNoteFields).
+        uint256[8] memory narrow = [uint256(0), 1, 2, 9, 10, 12, 14, 15];
+        uint16[8] memory bits = [uint16(16), 64, 160, 128, 160, 8, 128, 64];
         for (uint256 a = 0; a < 2; ++a) {
             for (uint256 i = 0; i < narrow.length; ++i) {
                 bytes memory words = abi.encode(inputs);

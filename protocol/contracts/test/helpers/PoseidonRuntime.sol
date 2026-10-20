@@ -41,14 +41,17 @@ library ReferenceHashes {
         return Bn254PoseidonReference.compress(DOMAIN_NODE, left, right);
     }
 
-    /// @dev NoteLeafLib.computeLeaf's leaf.
+    /// @dev NoteLeafLib.computeLeaf's leaf: one permutation of (DOMAIN_LEAF, commitment, F).
     function leaf(uint32 noteId, bytes32 commitment, uint128 depositAmount, uint64 expiryTs)
         internal
         pure
         returns (uint256)
     {
-        return Bn254PoseidonReference.hash5(
-            NoteLeafLib.DOMAIN_LEAF, uint256(noteId), uint256(commitment), uint256(depositAmount), uint256(expiryTs)
-        );
+        return leafOfFields(commitment, NoteLeafLib.pack(noteId, depositAmount, expiryTs));
+    }
+
+    /// @dev The leaf over packed fields.
+    function leafOfFields(bytes32 commitment, uint256 fields) internal pure returns (uint256) {
+        return Bn254PoseidonReference.compress(NoteLeafLib.DOMAIN_LEAF, uint256(commitment), fields);
     }
 }

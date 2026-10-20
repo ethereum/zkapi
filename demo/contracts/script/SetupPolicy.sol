@@ -13,7 +13,7 @@ pragma solidity ^0.8.28;
 ///         and equal to the pins afterwards, so before the ceremony no mpc-1 setup deploys off a
 ///         local chain.
 abstract contract SetupPolicy {
-    string internal constant CIRCUIT_ID = "zkapi-v2-concession-v1";
+    string internal constant CIRCUIT_ID = "zkapi-v2-concession-v2";
     string internal constant DEV_SETUP_ID = "dev";
     string internal constant REHEARSAL_SETUP_ID = "rehearsal";
     string internal constant CEREMONY_SETUP_ID = "mpc-1";
@@ -35,7 +35,7 @@ abstract contract SetupPolicy {
     /// Reverts unless a vault may be deployed for `setup`. `local` is a local chain (31337 or
     /// 1337); `allowDevSetup` is ALLOW_DEV_SETUP=1, the single-party opt-in.
     function _checkSetupPolicy(SetupFacts memory setup, bool local, bool allowDevSetup) internal pure {
-        require(_eq(setup.circuitId, CIRCUIT_ID), "SETUP_MANIFEST is not a zkapi-v2-concession-v1 setup");
+        require(_eq(setup.circuitId, CIRCUIT_ID), "SETUP_MANIFEST is not a zkapi-v2-concession-v2 setup");
         bool singleParty = _eq(setup.setupId, DEV_SETUP_ID) || _eq(setup.setupId, REHEARSAL_SETUP_ID);
         if (singleParty) {
             require(

@@ -6,7 +6,7 @@ import {Types} from "../libraries/Types.sol";
 /// @title IZkApiProofAdapter – Proof verification boundary
 /// @notice The vault delegates Groth16 verification to this boundary.
 interface IZkApiProofAdapter {
-    /// @notice keccak256 of the circuit ID ("zkapi-v2-concession-v1"): the statement verified.
+    /// @notice keccak256 of the circuit ID ("zkapi-v2-concession-v2"): the statement verified.
     function CIRCUIT_ID_HASH() external view returns (bytes32);
 
     /// @notice keccak256 of the request verifying key (request.vk without its header). Identifies

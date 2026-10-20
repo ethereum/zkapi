@@ -365,9 +365,7 @@ abstract contract GaslessTestBase is VaultTestBase {
 
     /// Deposits a note of `amount` gwei units at the next slot.
     function _depositUnits(uint256 commitment, uint128 amount) internal returns (uint32 id) {
-        id = vault.nextNoteId();
-        vm.prank(user);
-        vault.deposit{value: uint256(amount) * 1 gwei}(bytes32(commitment), amount);
+        id = _depositAmount(commitment, amount);
     }
 
     function _bigNote(uint256 commitment) internal returns (uint32 id) {

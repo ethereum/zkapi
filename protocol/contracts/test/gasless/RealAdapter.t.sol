@@ -128,7 +128,8 @@ abstract contract RealAdapterBase is GaslessTestBase {
             escape.clearanceSigningKeyY,
             GOLDEN_OWNER,
             7 days,
-            PoseidonRuntime.etch()
+            PoseidonRuntime.etch(),
+            1
         );
         assertEq(address(vault), escape.contractAddress, "golden vault");
         vm.deal(GOLDEN_USER, 10 ether);
@@ -136,7 +137,8 @@ abstract contract RealAdapterBase is GaslessTestBase {
         vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT);
         vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(vm.parseJsonBytes32(fixtures, ".note_b_registration"), DEPOSIT);
         vm.stopPrank();
-        assertEq(vault.currentRoot(), closeInputs.activeRoot, "golden root");
+        (uint256 leafB,) = vault.noteRecord(1);
+        assertEq(leafB, closeInputs.noteLeaf, "golden leaf");
         paymaster = new ZkApiWithdrawalPaymaster(
             entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
         );
@@ -233,10 +235,8 @@ abstract contract RealAdapterBase is GaslessTestBase {
         );
     }
 
-    function _goldenLeaf(uint32 noteId) internal view returns (uint256) {
-        if (noteId >= vault.nextNoteId()) return 0;
-        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return ReferenceHashes.leaf(noteId, commitment, amount, expiry);
+    function _goldenLeaf(uint32 noteId) internal view returns (uint256 leaf) {
+        (leaf,) = vault.noteRecord(noteId);
     }
 
     function _goldenPath(uint32 index) internal view returns (uint256[32] memory siblings) {
@@ -389,7 +389,7 @@ contract RealAdapterTest is RealAdapterBase {
         op.accountGasLimits = bytes32((uint256(op.accountGasLimits) >> 128 << 128) | gp.callFloor[1]);
         (success,,) = _userOpEvent(_handle(_sign(op, OWNER_KEY)));
         assertTrue(success, "the escape executed at its floor");
-        (bool pending,,,,,) = vault.pendingWithdrawals(escapeInputs.noteId);
+        (bool pending,,,,,) = vault.pendingWithdrawals(uint32(escapeInputs.noteFields >> 192));
         assertTrue(pending);
     }
 }
@@ -397,14 +397,13 @@ contract RealAdapterTest is RealAdapterBase {
 /// @dev The paymaster's validation on the dearest inputs an exit can carry, which sets
 ///      PM_VERIFICATION_FLOOR: the golden escape from an S that carries a settled sponsored-escape
 ///      record (its earlier sponsored escape of note B was defeated, so note B is active again and
-///      validation reads it to see that the record is settled), and the scalar multiplication the
-///      golden proof's noteId 0 skips. Every other input that can skip one skips it in every exit
-///      (protocolVersion 2, kind, a close's zero nextNullifier and conceded) or does not skip it in
-///      the golden escape (the root, the nullifiers, the destination, validUntil, the final balance
-///      and the concession). No valid proof with noteId 3 or more exists among the fixtures, so the
-///      multiplication is the adapter's gas for the golden statement with noteId 3 (it reaches the
-///      pairing and fails there) less its gas for the golden one. setUp writes the record, so the
-///      test's measurement runs cold.
+///      validation reads it to see that the record is settled). Every input that can skip its
+///      scalar multiplication skips it in every exit (protocolVersion 2, kind, a close's zero
+///      nextNullifier and conceded) or does not skip it in the golden escape (the note leaf, the
+///      note fields, which are at least 2^192 for any note but note 0 and still above 2 for note 0,
+///      the nullifiers, the destination, validUntil, the final balance and the concession), so the
+///      golden escape is the worst case. setUp writes the record, so the test's measurement runs
+///      cold.
 contract RealAdapterWorstCaseTest is RealAdapterBase {
     uint32 constant DEFEATED_NOTE = 1;
     /// The paymaster's storage slot of escapeNotePlusOne (forge inspect ... storageLayout); setUp
@@ -413,8 +412,8 @@ contract RealAdapterWorstCaseTest is RealAdapterBase {
 
     function setUp() public {
         _setUpGolden();
-        assertEq(escapeInputs.noteId, 0, "the golden escape skips the noteId multiplication");
-        (,,, Types.NoteStatus status) = vault.notes(DEFEATED_NOTE);
+        assertGt(escapeInputs.noteFields, 2, "the golden escape's noteFields takes a scalar multiplication");
+        (, Types.NoteStatus status) = vault.noteRecord(DEFEATED_NOTE);
         assertEq(uint8(status), uint8(Types.NoteStatus.Active), "the defeated escape's note is active again");
         // escapeNotePlusOne[GOLDEN_USER] = DEFEATED_NOTE + 1
         bytes32 slot = keccak256(abi.encode(GOLDEN_USER, uint256(ESCAPE_NOTE_PLUS_ONE_SLOT)));
@@ -427,18 +426,10 @@ contract RealAdapterWorstCaseTest is RealAdapterBase {
         PackedUserOperation memory op = _op(goldenEscape);
         (uint256 recorded,) = driver.validateTwice(paymaster, op, entryPoint.getUserOpHash(op), _maxCostOf(op));
         vm.revertToState(fresh);
-        (bool ok,, uint256 golden) = driver.tryVerify(real, escapeInputs, escapeProof);
+        (bool ok,,) = driver.tryVerify(real, escapeInputs, escapeProof);
         assertTrue(ok, "the golden escape verifies");
         vm.revertToState(fresh);
-        Types.WithdrawalPublicInputs memory worst = escapeInputs;
-        worst.noteId = 3;
-        (bool worstOk, bytes memory reason, uint256 worstGas) = driver.tryVerify(real, worst, escapeProof);
-        assertFalse(worstOk);
-        assertEq(reason, abi.encodeWithSelector(Errors.InvalidProof.selector), "refused at the pairing");
-        uint256 multiplication = worstGas - golden;
-        assertGt(multiplication, 6_000, "an ecMul (6,000) and an ecAdd (150)");
-        assertLt(multiplication, 7_000);
-        uint256 need = recorded + multiplication;
+        uint256 need = recorded;
         console.log("worst-case escape validation", need, "recorded", recorded);
         assertLt(need, gp.pmVerificationCap - 20_000, "under the cap with 20k to spare");
         assertGe(gp.pmVerificationFloor, need + 4_000, "floor above the worst cold need plus VALIDATION_GAS_SLACK");

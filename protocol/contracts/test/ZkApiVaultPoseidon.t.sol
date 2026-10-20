@@ -26,6 +26,12 @@ contract RevertingHasher {
 contract WritingHasher {
     uint256 internal calls;
 
+    /// @dev The only entry point the revision-4 vault calls.
+    function compress(uint256, uint256, uint256) external returns (uint256) {
+        ++calls;
+        return 1;
+    }
+
     function hash5(uint256, uint256, uint256, uint256, uint256) external returns (uint256) {
         ++calls;
         return 1;
@@ -86,6 +92,10 @@ contract ZkApiVaultPoseidonTest is VaultTestBase {
         vm.expectRevert(bytes("hasher down"));
         vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(43)), DEPOSIT);
         assertEq(vault.nextNoteId(), id + 1);
+        // The computed root is the hasher's too: it fails with it, and is unchanged once it is back.
+        vm.expectRevert(bytes("hasher down"));
+        vault.currentRoot();
+        vm.etch(PoseidonRuntime.ADDRESS, vm.getDeployedCode(PoseidonRuntime.ARTIFACT));
         assertEq(bytes32(vault.currentRoot()), root);
     }
 
@@ -101,9 +111,9 @@ contract ZkApiVaultPoseidonTest is VaultTestBase {
         vm.etch(PoseidonRuntime.ADDRESS, address(new WritingHasher()).code);
         assertFalse(_cappedDeposit(43), "deposit with a writing hasher");
         assertEq(vault.nextNoteId(), nextId);
-        assertEq(bytes32(vault.currentRoot()), root);
         assertEq(vm.load(PoseidonRuntime.ADDRESS, 0), 0, "nothing written");
         vm.etch(PoseidonRuntime.ADDRESS, code);
+        assertEq(bytes32(vault.currentRoot()), root);
         assertTrue(_cappedDeposit(43), "the same deposit with the runtime");
         assertEq(vault.nextNoteId(), nextId + 1);
     }
@@ -128,7 +138,8 @@ contract ZkApiVaultPoseidonTest is VaultTestBase {
             CLEAR_Y,
             address(this),
             MAX_PAUSE,
-            poseidon
+            poseidon,
+            1
         );
     }
 

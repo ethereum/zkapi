@@ -44,7 +44,7 @@ contract DeploySetupPolicyTest is Test {
         pure
         returns (SetupPolicy.SetupFacts memory facts)
     {
-        facts.circuitId = "zkapi-v2-concession-v1";
+        facts.circuitId = "zkapi-v2-concession-v2";
         facts.setupId = setupId;
         facts.requestVkHash = request;
         facts.withdrawalVkHash = withdrawal;
@@ -99,7 +99,7 @@ contract DeploySetupPolicyTest is Test {
     function test_refusesOtherCircuitsAndUnknownSetupIds() public {
         SetupPolicy.SetupFacts memory facts = _facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false);
         facts.circuitId = "zkapi-v2-note-bound-v1";
-        vm.expectRevert(bytes("SETUP_MANIFEST is not a zkapi-v2-concession-v1 setup"));
+        vm.expectRevert(bytes("SETUP_MANIFEST is not a zkapi-v2-concession-v2 setup"));
         harness.check(facts, true, false);
         string[3] memory unknown = ["mpc-2", "", "DEV"];
         for (uint256 i = 0; i < unknown.length; ++i) {

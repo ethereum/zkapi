@@ -7,13 +7,15 @@ import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
-import {MockProofAdapter} from "./mocks/MockProofAdapters.sol";
+import {LeafBindingMockAdapter} from "./mocks/MockProofAdapters.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
 import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
-/// @dev Drives a vault (mock adapter) through random deposits, escapes with concessions, raises,
-///      defeats, finalizations, closes, expiry claims, payout claims, retirements, pauses, time and
-///      attempts to exit Closed notes again, and keeps the ghost accounting the invariants check.
+/// @dev Drives a vault (leaf-binding mock adapter) through random deposits, escapes with
+///      concessions, raises, defeats, finalizations, closes, expiry claims, payout claims,
+///      retirements, pauses, time, attempts to exit Closed notes again and exits whose fields or
+///      leaf are not the note's, and keeps the ghost accounting and the ghost tree the invariants
+///      check.
 ///      Note n's states have nullifiers N(n, i) = 1 + n * 1000 + i; an escape from S_i names
 ///      N(n, i + 1) as its successor.
 contract VaultHandler is Test {
@@ -22,7 +24,7 @@ contract VaultHandler is Test {
     uint256 constant STATES = 6;
 
     ZkApiVault public vault;
-    MockProofAdapter public adapter;
+    LeafBindingMockAdapter public adapter;
     ToggleableDestination public treasury;
     address[3] public destinations;
     uint256[32] emptySiblings;
@@ -35,14 +37,17 @@ contract VaultHandler is Test {
     uint256 public ghostCreditsClaimed;
     uint256 public calls;
     /// Successful operations, by kind: deposit, escape, raise, defeat, finalize, close, claim
-    /// expired, claim payout, retire, and refused exits of a Closed note.
-    uint256[10] public done;
-    /// Every root the vault set: the empty tree's, then each deposit's and retirement's.
-    uint256[] public roots;
+    /// expired, claim payout, retire, refused exits of a Closed note, and refused exits with
+    /// fields or a leaf that are not the note's.
+    uint256[11] public done;
+    /// What each deposit hashed into its leaf.
+    mapping(uint32 => bytes32) public ghostCommitment;
+    mapping(uint32 => uint128) public ghostAmount;
+    mapping(uint32 => uint64) public ghostExpiry;
 
     constructor(
         ZkApiVault vault_,
-        MockProofAdapter adapter_,
+        LeafBindingMockAdapter adapter_,
         ToggleableDestination treasury_,
         ToggleableDestination wallet
     ) {
@@ -56,11 +61,30 @@ contract VaultHandler is Test {
             zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
         vm.deal(address(this), 1_000 ether);
-        roots.push(vault_.currentRoot());
     }
 
-    function rootCount() external view returns (uint256) {
-        return roots.length;
+    /// The ghost leaf of note `id`: the reference leaf over its deposit, zero once retired or
+    /// beyond nextNoteId.
+    function ghostLeaf(uint32 id) public view returns (uint256) {
+        if (id >= vault.nextNoteId() || retired[id]) return 0;
+        return ReferenceHashes.leaf(id, ghostCommitment[id], ghostAmount[id], ghostExpiry[id]);
+    }
+
+    /// The full tree's root over the ghost leaves (at most MAX_NOTES = 8), by the reference Poseidon.
+    function ghostRoot() external view returns (uint256 root) {
+        uint256[8] memory level;
+        for (uint32 i = 0; i < 8; ++i) {
+            level[i] = ghostLeaf(i);
+        }
+        for (uint256 width = 4; width > 0; width /= 2) {
+            for (uint256 i = 0; i < width; ++i) {
+                level[i] = Bn254PoseidonReference.compress(DOMAIN_NODE, level[2 * i], level[2 * i + 1]);
+            }
+        }
+        root = level[0];
+        for (uint256 height = 3; height < 32; ++height) {
+            root = Bn254PoseidonReference.compress(DOMAIN_NODE, root, emptySiblings[height]);
+        }
     }
 
     // -------------------------------------------------------------------------- actions
@@ -69,8 +93,13 @@ contract VaultHandler is Test {
         uint32 id = vault.nextNoteId();
         if (id >= MAX_NOTES || vault.paused()) return;
         uint128 amount = uint128(bound(amountSeed, 1, 2_000_000));
-        vault.deposit{value: uint256(amount) * 1 gwei}(bytes32(uint256(1000 + id)), amount);
-        roots.push(vault.currentRoot());
+        bytes32 commitment = bytes32(uint256(1000 + id));
+        vault.deposit{value: uint256(amount) * 1 gwei}(commitment, amount);
+        uint256 raw = vm.getBlockTimestamp() + vault.noteTtl();
+        ghostCommitment[id] = commitment;
+        ghostAmount[id] = amount;
+        ghostExpiry[id] = uint64(((raw + 1 days - 1) / 1 days) * 1 days);
+        adapter.register(id, commitment);
         ++calls;
         ++done[0];
     }
@@ -150,10 +179,10 @@ contract VaultHandler is Test {
     function claimExpired(uint32 noteSeed) external {
         (bool ok, uint32 id,) = _note(noteSeed, Types.NoteStatus.Active);
         if (!ok || vault.paused()) return;
-        uint64 at = vault.effectiveExpiry(id);
+        uint64 at = vault.effectiveExpiry(id, ghostCommitment[id], ghostAmount[id], ghostExpiry[id]);
         if (vm.getBlockTimestamp() < at) vm.warp(at);
         uint256 treasuryBefore = _treasuryHoldings();
-        vault.claimExpired(id);
+        vault.claimExpired(id, ghostCommitment[id], ghostAmount[id], ghostExpiry[id]);
         _recordExit(id, 0, treasuryBefore);
         ++done[6];
     }
@@ -168,21 +197,20 @@ contract VaultHandler is Test {
         } catch {}
     }
 
-    /// An escape or a close of a Closed note, from any of its states, at any root the vault ever
-    /// held (Amendment A1 keeps them all valid, so a closed note's leaf stays provable). It must
-    /// revert: NoteNotActive, or for an escape ChallengedNullifier or SupersededState when a defeat
+    /// An escape or a close of a Closed note, from any of its states, with the note's leaf (an
+    /// exit proof needs nothing else, so a closed note's leaf stays provable). It must revert:
+    /// NoteNotActive, or for an escape ChallengedNullifier or SupersededState when a defeat
     /// flagged its state or the successor. A success is recorded as a second payout of the note,
     /// which invariant_onePayoutPerNoteSplittingItsDeposit refuses.
-    function exitClosed(uint32 noteSeed, uint256 stateSeed, uint256 rootSeed, bool asClose, uint128 balanceSeed)
-        external
-    {
+    function exitClosed(uint32 noteSeed, uint256 stateSeed, bool asClose, uint128 balanceSeed) external {
         (bool ok, uint32 id, uint128 deposit_) = _note(noteSeed, Types.NoteStatus.Closed);
         if (!ok) return;
         uint256 i = stateSeed % STATES;
         uint128 balance = uint128(bound(balanceSeed, 0, deposit_));
         Types.WithdrawalPublicInputs memory inputs =
             _withdrawal(asClose ? 1 : 0, id, _n(id, i), asClose ? 0 : _n(id, i + 1), balance);
-        inputs.activeRoot = roots[rootSeed % roots.length];
+        // The leaf the note had before any retirement: what its owner's proof carries.
+        inputs.noteLeaf = ReferenceHashes.leaf(id, ghostCommitment[id], ghostAmount[id], ghostExpiry[id]);
         bytes4 expected = Errors.NoteNotActive.selector;
         if (vault.paused() && vm.getBlockTimestamp() < uint256(vault.pausedAt()) + vault.maxPauseDuration()) {
             expected = Errors.Paused.selector;
@@ -210,13 +238,48 @@ contract VaultHandler is Test {
         ++done[9];
     }
 
+    /// An exit of an Active note whose statement is not the note's: its deposit raised (with the
+    /// leaf of the raised fields, which the mock accepts as self-consistent), its expiry moved, or
+    /// another note's leaf. The vault must refuse each before paying anything.
+    function exitInconsistent(uint32 noteSeed, uint8 kindSeed, bool asClose) external {
+        (bool ok, uint32 id, uint128 deposit_) = _note(noteSeed, Types.NoteStatus.Active);
+        if (!ok) return;
+        if (vault.paused() && vm.getBlockTimestamp() < uint256(vault.pausedAt()) + vault.maxPauseDuration()) return;
+        Types.WithdrawalPublicInputs memory inputs =
+            _withdrawal(asClose ? 1 : 0, id, _n(id, 900), asClose ? 0 : _n(id, 901), deposit_ + 1);
+        uint256 variant = kindSeed % 3;
+        uint128 amount = variant == 0 ? deposit_ + 1 : deposit_;
+        uint64 expiry = variant == 1 ? ghostExpiry[id] + 1 days : ghostExpiry[id];
+        inputs.noteFields = NoteLeafLib.pack(id, amount, expiry);
+        inputs.noteLeaf = ReferenceHashes.leaf(id, ghostCommitment[id], amount, expiry);
+        if (variant == 2) {
+            inputs.noteLeaf = ReferenceHashes.leaf(id ^ 1, bytes32(uint256(7)), deposit_, ghostExpiry[id]);
+        }
+        bytes memory reason;
+        if (asClose) {
+            try vault.mutualClose(inputs, "") {
+                ++payouts[id];
+            } catch (bytes memory r) {
+                reason = r;
+            }
+        } else {
+            try vault.initiateEscapeWithdrawal(inputs, "") {
+                ++payouts[id];
+            } catch (bytes memory r) {
+                reason = r;
+            }
+        }
+        if (payouts[id] > 1) return;
+        assertEq(reason, abi.encodeWithSelector(Errors.NoteLeafMismatch.selector), "an inconsistent exit");
+        ++done[10];
+    }
+
     function retire(uint32 noteSeed) external {
         (bool ok, uint32 id,) = _note(noteSeed, Types.NoteStatus.Closed);
         if (!ok || retired[id]) return;
         uint256[32] memory path = _path(id);
         vault.retireClosedLeaf(id, path);
         retired[id] = true;
-        roots.push(vault.currentRoot());
         ++done[8];
     }
 
@@ -255,8 +318,8 @@ contract VaultHandler is Test {
         uint32 count = vault.nextNoteId();
         for (uint32 k = 0; k < count; ++k) {
             uint32 id = uint32((uint256(seed) + k) % count);
-            (, uint128 amount,, Types.NoteStatus status) = vault.notes(id);
-            if (status == wanted) return (true, id, amount);
+            (, Types.NoteStatus status) = vault.noteRecord(id);
+            if (status == wanted) return (true, id, ghostAmount[id]);
         }
         return (false, 0, 0);
     }
@@ -274,12 +337,12 @@ contract VaultHandler is Test {
             protocolVersion: 2,
             chainId: uint64(block.chainid),
             contractAddress: address(vault),
-            activeRoot: vault.currentRoot(),
+            noteLeaf: ghostLeaf(id),
             stateSigningKeyX: 11,
             stateSigningKeyY: 12,
             clearanceSigningKeyX: 13,
             clearanceSigningKeyY: 14,
-            noteId: id,
+            noteFields: NoteLeafLib.pack(id, ghostAmount[id], ghostExpiry[id]),
             finalBalance: finalBalance,
             destination: destinations[0],
             withdrawalNullifier: nullifier,
@@ -312,9 +375,7 @@ contract VaultHandler is Test {
     }
 
     function _treeLeaf(uint32 index) private view returns (uint256) {
-        if (index >= vault.nextNoteId() || retired[index]) return 0;
-        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(index);
-        return ReferenceHashes.leaf(index, commitment, amount, expiry);
+        return ghostLeaf(index);
     }
 
     function _path(uint32 index) private view returns (uint256[32] memory siblings) {
@@ -338,11 +399,11 @@ contract VaultHandler is Test {
 ///        arrears and the credited escape payouts, nothing more or less;
 ///      - every pending escape has finalBalance + conceded == stateBalance <= its deposit and a
 ///        nonzero successor nullifier, and no other note has a pending record;
-///      - each note pays out at most once (an escape or close that a Closed note gets through,
-///        at any root the vault held, counts as a second payout), and each exit splits its
-///        deposit exactly between the owner (pushed or credited) and the treasury (pushed or in
-///        arrears);
-///      - every root the vault held stays known.
+///      - each note pays out at most once (an escape or close that a Closed note gets through
+///        counts as a second payout), and each exit splits its deposit exactly between the owner
+///        (pushed or credited) and the treasury (pushed or in arrears);
+///      - the stored leaves are the ghost leaves (zero once retired) and the computed
+///        currentRoot() is the ghost tree's root.
 ///      The handler expects every call it makes outside try/catch to succeed (and asserts each
 ///      exit's split as it happens), so a revert fails the campaign.
 /// forge-config: default.invariant.fail-on-revert = true
@@ -352,7 +413,7 @@ contract ZkApiVaultInvariantTest is Test {
 
     function setUp() public {
         vm.warp(1_700_000_000);
-        MockProofAdapter adapter = new MockProofAdapter();
+        LeafBindingMockAdapter adapter = new LeafBindingMockAdapter();
         ToggleableDestination treasury = new ToggleableDestination();
         treasury.setAccepting(true);
         ToggleableDestination wallet = new ToggleableDestination();
@@ -368,7 +429,8 @@ contract ZkApiVaultInvariantTest is Test {
             14,
             address(this),
             7 days,
-            PoseidonRuntime.etch()
+            PoseidonRuntime.etch(),
+            1
         );
         handler = new VaultHandler(vault, adapter, treasury, wallet);
         // The handler is the owner, so it can pause and unpause.
@@ -386,7 +448,8 @@ contract ZkApiVaultInvariantTest is Test {
         uint256 held;
         uint32 count = vault.nextNoteId();
         for (uint32 id = 0; id < count; ++id) {
-            (, uint128 amount,, Types.NoteStatus status) = vault.notes(id);
+            (, Types.NoteStatus status) = vault.noteRecord(id);
+            uint128 amount = handler.ghostAmount(id);
             if (status == Types.NoteStatus.Active || status == Types.NoteStatus.PendingWithdrawal) held += amount;
         }
         held += vault.treasuryArrears();
@@ -399,7 +462,8 @@ contract ZkApiVaultInvariantTest is Test {
     function invariant_pendingConcessionsAreConsistent() public view {
         uint32 count = vault.nextNoteId();
         for (uint32 id = 0; id < count; ++id) {
-            (, uint128 amount,, Types.NoteStatus status) = vault.notes(id);
+            (, Types.NoteStatus status) = vault.noteRecord(id);
+            uint128 amount = handler.ghostAmount(id);
             (
                 bool exists,
                 uint256 activeRoot,
@@ -439,7 +503,8 @@ contract ZkApiVaultInvariantTest is Test {
     function invariant_onePayoutPerNoteSplittingItsDeposit() public view {
         uint32 count = vault.nextNoteId();
         for (uint32 id = 0; id < count; ++id) {
-            (, uint128 amount,, Types.NoteStatus status) = vault.notes(id);
+            (, Types.NoteStatus status) = vault.noteRecord(id);
+            uint128 amount = handler.ghostAmount(id);
             uint256 payouts = handler.payouts(id);
             assertLe(payouts, 1);
             assertEq(payouts == 1, status == Types.NoteStatus.Closed);
@@ -447,11 +512,16 @@ contract ZkApiVaultInvariantTest is Test {
         }
     }
 
-    function invariant_everyRootTheVaultHeldStaysKnown() public view {
-        uint256 count = handler.rootCount();
-        assertEq(handler.roots(count - 1), vault.currentRoot());
-        for (uint256 i = 0; i < count; ++i) {
-            assertTrue(vault.isKnownRoot(handler.roots(i)));
+    function invariant_storedLeavesAndRootMatchTheGhostTree() public view {
+        uint32 count = vault.nextNoteId();
+        for (uint32 id = 0; id < count; ++id) {
+            (uint256 leaf,) = vault.noteRecord(id);
+            assertEq(leaf, handler.ghostLeaf(id));
+        }
+        assertEq(vault.currentRoot(), handler.ghostRoot());
+        uint256[] memory leaves = vault.noteLeaves(0, count);
+        for (uint32 id = 0; id < count; ++id) {
+            assertEq(leaves[id], handler.ghostLeaf(id));
         }
     }
 }

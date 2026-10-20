@@ -11,6 +11,9 @@ import {ZkApiWithdrawalAccount} from "../../src/gasless/ZkApiWithdrawalAccount.s
 import {ZkApiWithdrawalPaymaster} from "../../src/gasless/ZkApiWithdrawalPaymaster.sol";
 import {MockAdapterIdentity} from "../mocks/MockProofAdapters.sol";
 import {GaslessTestBase} from "./GaslessTestBase.sol";
+import {NoteLeafLib} from "../../src/libraries/NoteLeafLib.sol";
+import {ReferenceHashes} from "../helpers/PoseidonRuntime.sol";
+import {VaultStorage} from "../helpers/VaultStorage.sol";
 
 /// @dev An account with code that is not a transit account: validates every operation.
 contract ForeignAccount {
@@ -62,6 +65,8 @@ contract OtherInterfaceAdapter {
 contract VersionedVault {
     uint16 public immutable PROTOCOL_VERSION;
     uint16 public immutable CONCESSION_ESCAPE_VERSION;
+    uint16 public immutable LEAF_BOUND_EXIT_VERSION;
+    uint128 public constant MAX_NATIVE_UNITS = 9_007_199_254_740_991;
     address public immutable proofAdapter;
     uint256 public constant nativeAssetWeiPerUnit = 1 gwei;
     uint256 public constant stateSigningKeyX = 11;
@@ -73,8 +78,15 @@ contract VersionedVault {
     constructor(uint16 protocolVersion, uint16 concessionVersion, address adapter_) {
         PROTOCOL_VERSION = protocolVersion;
         CONCESSION_ESCAPE_VERSION = concessionVersion;
+        LEAF_BOUND_EXIT_VERSION = 1;
         proofAdapter = adapter_;
     }
+}
+
+/// @dev A revision-3 vault: the concession exit without the leaf-bound version getter.
+contract RevisionThreeVault {
+    uint16 public constant PROTOCOL_VERSION = 2;
+    uint16 public constant CONCESSION_ESCAPE_VERSION = 1;
 }
 
 /// @dev Every refusal of validatePaymasterUserOp, one test per error selector, each shown to be
@@ -168,6 +180,10 @@ contract ValidationTest is GaslessTestBase {
         VersionedVault wrongConcession = new VersionedVault(2, 2, address(adapter));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
         _deploy(ENTRY_POINT, address(wrongConcession));
+        // A revision-3 vault has no LEAF_BOUND_EXIT_VERSION: the call itself reverts.
+        RevisionThreeVault revisionThree = new RevisionThreeVault();
+        vm.expectRevert();
+        _deploy(ENTRY_POINT, address(revisionThree));
         VersionedVault codelessAdapter = new VersionedVault(2, 1, address(0x1234));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
         _deploy(ENTRY_POINT, address(codelessAdapter));
@@ -533,19 +549,47 @@ contract ValidationTest is GaslessTestBase {
         assertTrue(ok, "closes resume");
     }
 
-    function test_unknownRoot() public {
+    /// The vault's leaf-bound checks run in validation, before the proof: a leaf that is not the
+    /// note's stored leaf, fields at or above 2^224, and a deposit above MAX_NATIVE_UNITS.
+    function test_noteLeafMismatch() public {
         (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
-        inputs.activeRoot += 1;
-        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.UnknownRoot.selector);
+        inputs.noteLeaf += 1;
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteLeafMismatch.selector);
+        // The fields of another (Active) note with this note's leaf.
+        (, Types.WithdrawalPublicInputs memory other,) = _closeReady();
+        inputs.noteLeaf -= 1;
+        inputs.noteFields = other.noteFields;
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteLeafMismatch.selector);
+    }
+
+    function test_invalidNoteFields() public {
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
+        inputs.noteFields += uint256(1) << 224;
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.InvalidNoteFields.selector);
+    }
+
+    function test_depositAboveTheUnitBound() public {
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
+        // casting to 'uint32' is safe because the fields are below 2^224
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 id = uint32(inputs.noteFields >> 192);
+        uint128 tooMuch = vault.MAX_NATIVE_UNITS() + 1;
+        inputs.noteFields = NoteLeafLib.pack(id, tooMuch, uint64(inputs.noteFields));
+        inputs.noteLeaf = ReferenceHashes.leafOfFields(noteData[id].commitment, inputs.noteFields);
+        VaultStorage.setNote(address(vault), id, inputs.noteLeaf, VaultStorage.ACTIVE);
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.InvalidBalance.selector);
     }
 
     function test_noteNotActive() public {
         (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
+        // casting to 'uint32' is safe because the fields are below 2^224
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 id = uint32(inputs.noteFields >> 192);
         vm.prank(user);
-        vault.mutualClose(_close(inputs.noteId, 9, BIG), PROOF);
+        vault.mutualClose(_close(id, 9, BIG), PROOF);
         _refused(op, ZkApiWithdrawalPaymaster.NoteNotActive.selector);
         // a note that was never deposited
-        inputs.noteId = 7;
+        inputs.noteFields = NoteLeafLib.pack(7, BIG, 1);
         _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteNotActive.selector);
     }
 
@@ -745,12 +789,12 @@ contract ValidationTest is GaslessTestBase {
 
     /// The adapter is consulted last: a refused proof is reported only when every cheap check passed.
     function test_adapterIsCalledLast() public {
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs, uint32 id) = _closeReady();
         vm.etch(address(adapter), address(new RejectingWithdrawals()).code);
-        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
         _refused(op, Errors.InvalidProof.selector);
         inputs.kind = KIND_ESCAPE;
         _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.WrongKind.selector);
-        inputs = _closeTo(inputs.noteId, 1001, BIG + 1, op.sender);
+        inputs = _closeTo(id, 1001, BIG + 1, op.sender);
         _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.InvalidBalance.selector);
     }
 
