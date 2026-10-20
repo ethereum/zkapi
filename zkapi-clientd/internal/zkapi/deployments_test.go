@@ -15,11 +15,10 @@ import (
 	"testing"
 )
 
-// The packaged deployments are not_deployed placeholders of the
-// concession-exit vault that pin the same circuit, setup, proving-key hashes
-// and vault parameters as the browser SDK's build profiles; nothing starts
-// against them.
-func TestPackagedDeploymentsArePlaceholdersMatchingTheBrowserProfiles(t *testing.T) {
+// Sepolia ships the deployed concession vault and gasless paymaster. Mainnet
+// remains an undeployed placeholder; the legacy route owns existing notes.
+// Both profiles must match the browser's circuit, keys and deployment pins.
+func TestPackagedDeploymentsMatchTheBrowserProfiles(t *testing.T) {
 	restore := SetPackagedDeploymentsForTesting(deploymentFiles)
 	defer restore()
 	for _, network := range []string{"mainnet", "sepolia"} {
@@ -28,11 +27,27 @@ func TestPackagedDeploymentsArePlaceholdersMatchingTheBrowserProfiles(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			if identity.deployed() || identity.Status != "not_deployed" {
-				t.Fatal("the packaged deployment must stay a not_deployed placeholder until the vault exists")
-			}
-			if _, _, err := deployedDeployment(network); !errors.Is(err, ErrDeploymentNotDeployed) {
-				t.Fatalf("a placeholder was used as a deployment: %v", err)
+			if network == "mainnet" {
+				if identity.deployed() || identity.Status != "not_deployed" {
+					t.Fatal("mainnet must remain an undeployed placeholder")
+				}
+				if _, _, err := deployedDeployment(network); !errors.Is(err, ErrDeploymentNotDeployed) {
+					t.Fatalf("a placeholder was used as a deployment: %v", err)
+				}
+			} else {
+				if !identity.deployed() || identity.Status != "deployed" {
+					t.Fatal("Sepolia must ship the deployed vault")
+				}
+				if _, _, err := deployedDeployment(network); err != nil {
+					t.Fatal(err)
+				}
+				if !MatchesDeployment(network, identity.ID, identity.Contract) {
+					t.Fatal("the deployed vault did not match its manifest")
+				}
+				gasless, err := identity.Gasless.validate()
+				if err != nil || gasless.BundlerURL == "" || gasless.GasSchedule == nil || *gasless.GasSchedule != 1 {
+					t.Fatalf("Sepolia must publish a usable Glamsterdam gasless profile: %v", err)
+				}
 			}
 			if MatchesDeployment(network, identity.ID, "0x0000000000000000000000000000000000000000") {
 				t.Fatal("a placeholder matched a deployment")
@@ -54,6 +69,20 @@ func TestPackagedDeploymentsArePlaceholdersMatchingTheBrowserProfiles(t *testing
 			for field, browser := range map[string]string{"deployment_status": "deployment_status", "chain_id": "chain_id", "contract_address": "contract_address", "billing_asset": "billing_asset", "billing_unit": "billing_unit", "billing_token_address": "billing_token_address", "native_asset_wei_per_unit": "native_asset_wei_per_unit", "native_price_feed_address": "native_price_feed_address", "native_price_feed_decimals": "native_price_feed_decimals", "native_price_max_age_seconds": "native_price_max_age_seconds", "rpc_url": "rpc_url", "request_charge_cap": "request_charge_cap", "challenge_period_seconds": "challenge_period", "note_ttl_seconds": "note_ttl", "max_pause_duration_seconds": "max_pause_duration", "settlement_window_seconds": "settlement_window_seconds", "vault_revision": "vault_revision", "exit_concession": "exit_concession", "leaf_bound_exit": "leaf_bound_exit", "min_deposit_units": "min_deposit_units", "fresh_slot_gas": "fresh_slot_gas", "clearance_ownership_proof": "clearance_ownership_proof"} {
 				if !reflect.DeepEqual(manifest[field], profile.Trusted[browser]) {
 					t.Errorf("%s differs from the browser profile's %s", field, browser)
+				}
+			}
+			for _, field := range []string{"proof_adapter_address", "poseidon_library_address", "deploy_block", "protocol_server_url", "indexer_url", "state_signing_key", "clearance_signing_key", "gasless"} {
+				if !reflect.DeepEqual(manifest[field], profile.Trusted[field]) {
+					t.Errorf("%s differs from the browser profile", field)
+				}
+			}
+			if identity.deployed() && manifest["deployment_id"] != profile.Trusted["deployment_id"] {
+				t.Error("deployment ID differs from the browser profile")
+			}
+			evidence := manifest["deployment_evidence"].(map[string]any)
+			for field, browser := range map[string]string{"vault_runtime_keccak256": "vault_runtime_codehash", "adapter_runtime_keccak256": "adapter_runtime_codehash", "poseidon_runtime_keccak256": "poseidon_runtime_codehash"} {
+				if !reflect.DeepEqual(evidence[field], profile.Trusted[browser]) {
+					t.Errorf("%s differs from the browser profile's runtime pin", field)
 				}
 			}
 			proof := manifest["proof_setup"].(map[string]any)
@@ -273,7 +302,7 @@ func TestAPlaceholderDeploymentStartsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	stateDir := t.TempDir()
-	cmd, err := CompanionCommand(context.Background(), Config{Network: "sepolia", BridgeToken: testBridgeToken, HTTPClient: &http.Client{}}, CompanionConfig{Binary: binary, SetupDir: devSetupDir, StateDir: stateDir, ProxyURL: "http://bridge:private-local-token@127.0.0.1:8791"})
+	cmd, err := CompanionCommand(context.Background(), Config{Network: "mainnet", BridgeToken: testBridgeToken, HTTPClient: &http.Client{}}, CompanionConfig{Binary: binary, SetupDir: devSetupDir, StateDir: stateDir, ProxyURL: "http://bridge:private-local-token@127.0.0.1:8791"})
 	if !errors.Is(err, ErrDeploymentNotDeployed) || cmd != nil {
 		t.Fatalf("a placeholder started the companion: %v", err)
 	}
@@ -283,7 +312,7 @@ func TestAPlaceholderDeploymentStartsNothing(t *testing.T) {
 	if entries, _ := os.ReadDir(stateDir); len(entries) != 0 {
 		t.Fatal("a placeholder created wallet state")
 	}
-	client, err := New(Config{Network: "sepolia", BridgeToken: testBridgeToken, HTTPClient: &http.Client{}})
+	client, err := New(Config{Network: "mainnet", BridgeToken: testBridgeToken, HTTPClient: &http.Client{}})
 	if err != nil {
 		t.Fatal(err)
 	}

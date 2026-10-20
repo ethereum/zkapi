@@ -28,7 +28,7 @@ func TestUndeployedStartStopsBeforeAttachingOrFunding(t *testing.T) {
 	// Unlike the default deployed fixtures, use the actual shipping manifests.
 	restore := zkapi.SetPackagedDeploymentsForTesting(os.DirFS("../../internal/zkapi"))
 	defer restore()
-	for _, network := range []string{"mainnet", "sepolia"} {
+	for _, network := range []string{"mainnet"} {
 		c := config.Config{}
 		c.ZKAPI.Network = network
 		// Nil runtime callbacks deliberately fail if startup tries to probe a
