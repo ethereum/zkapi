@@ -417,10 +417,21 @@ func decodeUint256Array(encoded string, count int) ([]string, error) {
 // vault, read at the receipt's own canonical block, holds exactly this
 // deposit at the receipt's note ID: an Active note whose stored leaf is
 // noteLeaf(noteID, commitment, amount, expiry), with the expiry the receipt's
-// NoteDeposited names. The leaf commits to every value of the note, so the
-// indexer is not needed for this check. It only corroborates: an indexer
-// view that has applied the receipt block on the canonical chain must show
-// the same leaf there, and a lagging or unavailable indexer is skipped.
+// NoteDeposited names. The leaf commits to every value of the note, but the
+// payment RPC served both the receipt and that read, so a second source must
+// agree before the note is activated:
+//
+//   - the indexer's view, once it has applied the receipt block on the payment
+//     RPC's canonical chain, must show the same leaf there (a different one is
+//     a conflict);
+//   - when the indexer has no such view (down, lagging, forked or malformed),
+//     the owner's exit RPC (--exit-rpc-url), if one is configured, must serve
+//     the receipt's block hash as canonical (EIP-1898 requireCanonical) and
+//     the same Active leaf at it (another leaf there is a conflict; a read it
+//     cannot serve, or a note it does not show yet, is pending);
+//   - with neither, the deposit stays pending (verifying) until the indexer
+//     catches up: one RPC alone never activates a note.
+//
 // Called before the companion receives the note secret.
 func (h *FundingHandler) corroborateDeposit(ctx context.Context, config fundingConfig, record depositRecord, receipt ethReceipt, noteID uint32, expiry uint64) (*depositBinding, error) {
 	pending := func(reason string) error { return fmt.Errorf("%w (%s)", errDepositVerificationPending, reason) }
@@ -455,7 +466,26 @@ func (h *FundingHandler) corroborateDeposit(ctx context.Context, config fundingC
 			return nil, conflict("the zkAPI indexer does not show this deposit at note %d", noteID)
 		}
 		binding.IndexerBlock = snapshot.BlockNumber
+		return binding, nil
 	}
+	if config.ExitRPC == "" || config.exitOnly {
+		return nil, pending("the zkAPI indexer has no view of the receipt block yet, and no exit RPC is configured to confirm it")
+	}
+	exit := config.exitConfig()
+	if err := h.assertAddressChain(ctx, exit); err != nil {
+		return nil, pending("the exit RPC network check is unavailable")
+	}
+	second, err := h.vaultNoteAtReceipt(ctx, exit, noteID, block.Uint64(), receipt.BlockHash)
+	if err != nil {
+		return nil, pending("the exit RPC cannot read the vault at the receipt block")
+	}
+	if second.Leaf.Sign() != 0 && second.Leaf.Cmp(note.Leaf) != 0 {
+		return nil, conflict("the exit RPC's vault note %d does not hold this deposit", noteID)
+	}
+	if second.Status != noteActive || !second.holds(noteID, commitment, record.Amount, expiry) {
+		return nil, pending("the exit RPC does not show the note active at the receipt block yet")
+	}
+	binding.ExitRPCConfirmed = true
 	return binding, nil
 }
 

@@ -100,6 +100,10 @@ type depositBinding struct {
 	BlockNumber  uint64 `json:"block_number"`
 	BlockHash    string `json:"block_hash"`
 	IndexerBlock uint64 `json:"indexer_applied_block"`
+	// ExitRPCConfirmed: the indexer had no view of the receipt block, and
+	// the owner's exit RPC read the same leaf at the receipt's canonical
+	// block (corroborateDeposit).
+	ExitRPCConfirmed bool `json:"exit_rpc_confirmed,omitempty"`
 }
 
 // depositRebind journals a companion note replacement before /wallet/reset,

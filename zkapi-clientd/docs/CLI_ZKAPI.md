@@ -409,14 +409,19 @@ private state:
   and the note must be Active with exactly that leaf. When the indexer's
   whole-tree snapshot (the same response for every client, so it does not
   reveal which note is yours) has applied that block, it must hold the same
-  leaf there; an indexer that is behind, unavailable or an older version
-  without snapshot block metadata is skipped. The note secret is handed to the
-  wallet only after this. While the vault does not show the note yet, or
-  cannot be read, the deposit stays in phase `confirming` with stage
-  `verifying` and polling continues. Disagreement sets phase
+  leaf there. The RPC served both the receipt and that read, so it never
+  activates a note alone: when the indexer has no view of the receipt block
+  (behind, unavailable, forked, malformed, or an older version without
+  snapshot block metadata), your exit RPC (`--exit-rpc-url`), if one is set,
+  must serve the receipt's block hash as canonical and the same Active leaf
+  at it; without one the deposit waits for the indexer. The note secret is
+  handed to the wallet only after this. While the vault, the indexer or the
+  exit RPC does not show the note yet, or cannot be read, the deposit stays
+  in phase `confirming` with stage `verifying` and polling continues. Disagreement sets phase
   `verification_conflict`. The conflict is not final: running
-  `zkapi-clientd config` again checks the saved transaction against the vault
-  and the indexer once more, and activates the deposit if they now agree.
+  `zkapi-clientd config` again checks the saved transaction against the vault,
+  the indexer and the exit RPC once more, and activates the deposit if they
+  now agree.
   Otherwise it stops and points to the repair below.
 - **Deposit gas limit and minimum.** A deposit's gas grows with the number of
   trailing ones `t` of the note ID it lands at (about 16,100 gas per level,

@@ -1323,10 +1323,11 @@ impl AuthService {
 
     /// Install a deposited note. Its exits are bound to the leaf the vault
     /// stored at deposit, which the secret, note id, amount and expiry must
-    /// reproduce: when the deployment's RPC answers, `noteRecord(note_id)`
-    /// holding another leaf refuses the note (with a wrong amount or expiry
-    /// every exit would revert `NoteLeafMismatch`). An unreadable or not yet
-    /// visible record confirms the note as given.
+    /// reproduce: `noteRecord(note_id)`, read through the deployment's RPC,
+    /// must hold exactly that leaf. Another leaf refuses the note (with a
+    /// wrong amount or expiry every exit would revert `NoteLeafMismatch`);
+    /// an empty record (the RPC may lag the deposit) or one that cannot be
+    /// read is `deposit_pending` (503): nothing is installed, retry.
     pub async fn confirm_deposit(
         &self,
         request: ConfirmDepositRequest,
@@ -1337,6 +1338,23 @@ impl AuthService {
             request.amount,
             request.expiry_ts,
         );
+        // The local refusals first (a reserved withdrawal, an active note),
+        // then the vault, then the install, which checks them again.
+        let config = self.config.clone();
+        let wallet_mutex = self.wallet_mutex.clone();
+        spawn_blocking(move || {
+            let _guard = wallet_mutex
+                .lock()
+                .map_err(|err| AuthError::Wallet(err.to_string()))?;
+            let _lockfile = acquire_wallet_lock(&config.state_dir)?;
+            let wallet = load_wallet(&config)?;
+            crate::oa_withdrawal::check_spending(
+                &config,
+                wallet.state().map(|state| state.note_id),
+            )?;
+            crate::oa_withdrawal::check_spending(&config, Some(request.note_id))
+        })
+        .await?;
         self.check_deposited_leaf(request.note_id, &leaf).await?;
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
@@ -1362,12 +1380,15 @@ impl AuthService {
         .await
     }
 
-    /// `noteRecord(note_id)` through the deployment's RPC: a nonzero stored
-    /// leaf other than `leaf` is refused; no RPC, a failed read or an empty
-    /// slot (the RPC may lag the deposit) is not.
+    /// `noteRecord(note_id)` through the deployment's RPC must hold `leaf`:
+    /// a nonzero other leaf is refused (`note_leaf_mismatch`); an empty slot
+    /// or a failed read is `deposit_pending`, never a confirmation. Without
+    /// an RPC the deposit cannot be checked against the vault and is refused.
     async fn check_deposited_leaf(&self, note_id: u32, leaf: &Felt252) -> Result<(), AuthError> {
         let Some(url) = self.config.demo_rpc_url.as_deref() else {
-            return Ok(());
+            return Err(AuthError::InvalidInput(
+                "the deployment names no RPC to read the vault's note record; a deposit is confirmed only against the vault".into(),
+            ));
         };
         let vault = crate::chain::vault_address(&self.config.contract_address)?;
         let read = async {
@@ -1380,9 +1401,11 @@ impl AuthService {
                 tracing::warn!(
                     note_id,
                     status,
-                    "the vault holds no leaf at this note id yet; the note is confirmed as given"
+                    "the vault holds no leaf at this note id yet; the deposit stays pending"
                 );
-                Ok(())
+                Err(AuthError::DepositPending(format!(
+                    "the vault shows no leaf at note {note_id} yet (the RPC may lag the deposit); retry"
+                )))
             }
             Ok(_) => Err(AuthError::InvalidInput(format!(
                 "note_leaf_mismatch: the vault's note {note_id} holds another leaf than this secret, amount and expiry make; every exit of the note would revert. Check the deposit's NoteDeposited amount and expiryTs"
@@ -1391,9 +1414,11 @@ impl AuthService {
                 tracing::warn!(
                     note_id,
                     %error,
-                    "the vault's note record could not be read; the note is confirmed as given"
+                    "the vault's note record could not be read; the deposit stays pending"
                 );
-                Ok(())
+                Err(AuthError::DepositPending(format!(
+                    "the vault's note record for note {note_id} could not be read ({error}); retry"
+                )))
             }
         }
     }
@@ -4536,14 +4561,11 @@ mod wallet_lifecycle_tests {
             ..Default::default()
         })
         .unwrap();
-        service
-            .confirm_deposit(ConfirmDepositRequest {
-                secret: Felt252::ONE,
-                note_id: 18,
-                amount: balance,
-                expiry_ts: 4_000_000_000,
-            })
-            .await
+        // Installed directly: confirm_deposit checks the note against the
+        // vault, which these tests have none of.
+        load_wallet(&service.config)
+            .unwrap()
+            .confirm_deposit(Felt252::ONE, 18, balance, 4_000_000_000)
             .unwrap();
         (directory, service)
     }

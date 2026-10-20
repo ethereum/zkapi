@@ -221,6 +221,19 @@ Folded into 0.2.0's notes at release.
   operations of one sender, and states that verify-once's record on a
   first-use operation relies on STO-022, which makes the factory's stake
   load-bearing.
+- **A deposit activated on one RPC's word.** zkapi-clientd activated a
+  deposit from the payment RPC's receipt and `noteRecord` whenever the
+  indexer had no view of the receipt block. It now needs a second source: the
+  indexer's view once it has applied that block, or else the owner's exit
+  RPC serving the receipt's block hash as canonical (EIP-1898
+  `requireCanonical`) and the same `Active` leaf at it (the binding records
+  `exit_rpc_confirmed`). Without either the deposit stays pending and is
+  checked again on every poll; another leaf on the exit RPC is a
+  verification conflict.
+- **The companion confirmed a deposit it could not see.** `/deposit/confirm`
+  installed the note when `noteRecord` was empty (an RPC lagging the
+  deposit) or unreadable. Both now answer `deposit_pending` (HTTP 503,
+  retry) and install nothing, and a deployment without an RPC is refused.
 
 ### Breaking
 - **`deposit(bytes32 commitment, uint128 amount)`** (selector `0x56d2e1ea`)

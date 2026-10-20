@@ -52,6 +52,9 @@ type addressFixture struct {
 	// answers for noteRecord (a lying pinned RPC); the exit RPC serves
 	// vaultNotes.
 	pinnedNoteStatus           map[uint32]uint8
+	// exitNotes, by note, is what the exit RPC alone answers for noteRecord
+	// (an exit RPC that disagrees with the pinned one).
+	exitNotes map[uint32]fixtureNote
 	vaultReadsAt               []string
 	leaves                     []*big.Int
 	indexer                    *httptest.Server
@@ -369,6 +372,9 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				note := f.vaultNotes[id]
 				if status, lying := f.pinnedNoteStatus[id]; lying && !exit {
 					note.status = status
+				}
+				if other, ok := f.exitNotes[id]; ok && exit {
+					note = other
 				}
 				result = encodeVaultNote(id, note)
 				break

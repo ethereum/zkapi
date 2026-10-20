@@ -122,8 +122,10 @@ func TestDepositActivationRequiresTheVaultLeafAndNoIndexerDisagreement(t *testin
 			}
 		})
 	}
-	// Without the indexer's view of the receipt block, the vault's leaf
-	// alone activates the note.
+	// Without the indexer's view of the receipt block, the payment RPC's
+	// receipt and vault read alone never activate the note: it stays pending
+	// without an exit RPC, and activates once the owner's exit RPC reads the
+	// same leaf at the receipt's canonical block.
 	unavailable := map[string]func(f *addressFixture){
 		"indexer 503":           func(f *addressFixture) { f.indexerStatus = http.StatusServiceUnavailable },
 		"indexer 404":           func(f *addressFixture) { f.indexerStatus = http.StatusNotFound },
@@ -135,17 +137,57 @@ func TestDepositActivationRequiresTheVaultLeafAndNoIndexerDisagreement(t *testin
 		"indexer inconsistent":  func(f *addressFixture) { f.indexerStatus = -1 },
 	}
 	for name, mutate := range unavailable {
-		t.Run("vault only/"+name, func(t *testing.T) {
+		t.Run("one RPC stays pending/"+name, func(t *testing.T) {
 			f, hash := minedNativeDeposit(t)
 			f.mu.Lock()
 			mutate(f)
 			f.mu.Unlock()
 			status, err := f.h.FundAddress(context.Background(), 100000)
-			if err != nil || status.Phase != "active" || f.activated != 1 || status.TransactionHash != hash {
-				t.Fatalf("the vault's leaf did not activate the deposit: %+v %v", status, err)
+			if err != nil || status.Phase != "confirming" || status.DepositStage != "verifying" || status.TransactionHash != hash {
+				t.Fatalf("the payment RPC alone did not leave the deposit pending: %+v %v", status, err)
 			}
-			if binding := f.savedDeposit(t).Binding; binding == nil || binding.NoteID != 12 || binding.IndexerBlock != 0 {
-				t.Fatalf("binding claims an indexer view: %+v", binding)
+			if f.activated != 0 || len(f.confirmBodies) != 0 || f.savedDeposit(t).Active {
+				t.Fatal("the note secret reached the companion on one RPC's word")
+			}
+			// The owner's exit RPC reads the same leaf at the receipt block.
+			f.mu.Lock()
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			f.mu.Unlock()
+			status, err = f.h.FundAddress(context.Background(), 100000)
+			if err != nil || status.Phase != "active" || f.activated != 1 || status.TransactionHash != hash {
+				t.Fatalf("the exit RPC's agreement did not activate the deposit: %+v %v", status, err)
+			}
+			if binding := f.savedDeposit(t).Binding; binding == nil || binding.NoteID != 12 || binding.IndexerBlock != 0 || !binding.ExitRPCConfirmed {
+				t.Fatalf("binding does not record the exit RPC's confirmation: %+v", binding)
+			}
+		})
+	}
+	exitDisagrees := map[string]struct {
+		mutate func(f *addressFixture)
+		phase  string
+	}{
+		"other leaf": {func(f *addressFixture) {
+			note := f.vaultNotes[12]
+			note.amount++
+			f.exitNotes = map[uint32]fixtureNote{12: note}
+		}, "verification_conflict"},
+		"note not there": {func(f *addressFixture) { f.exitNotes = map[uint32]fixtureNote{12: {}} }, "confirming"},
+		"unreachable":    {func(f *addressFixture) { f.h.client.config.ExitRPCURL = "https://127.0.0.1:1" }, "confirming"},
+	}
+	for name, c := range exitDisagrees {
+		t.Run("exit RPC/"+name, func(t *testing.T) {
+			f, _ := minedNativeDeposit(t)
+			f.mu.Lock()
+			f.indexerStatus = http.StatusServiceUnavailable
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			c.mutate(f)
+			f.mu.Unlock()
+			status, err := f.h.FundAddress(context.Background(), 100000)
+			if err != nil || status.Phase != c.phase || f.activated != 0 || len(f.confirmBodies) != 0 {
+				t.Fatalf("an exit RPC that does not confirm the deposit activated it or was misread: %+v %v", status, err)
+			}
+			if c.phase == "confirming" && status.DepositStage != "verifying" {
+				t.Fatalf("not pending: %+v", status)
 			}
 		})
 	}

@@ -2000,6 +2000,39 @@ async fn a_deposit_confirmation_must_reproduce_the_stored_leaf() {
         "{refused}"
     );
     assert!(service.status().await.unwrap().note.is_none());
+    // An empty record (an RPC that lags the deposit) or one that cannot be
+    // read never confirms the note: deposit_pending (503), nothing installed.
+    let stored = harness.world.lock().unwrap().note_leaf;
+    harness.world.lock().unwrap().note_leaf = Felt252::ZERO;
+    let empty = service
+        .confirm_deposit(confirm(4_000_000_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(empty, AuthError::DepositPending(_)), "{empty:?}");
+    assert_eq!(empty.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(empty.code(), "deposit_pending");
+    assert!(service.status().await.unwrap().note.is_none());
+    harness.world.lock().unwrap().note_leaf = stored;
+    harness.world.lock().unwrap().pinned_down = true;
+    let failed = service
+        .confirm_deposit(confirm(4_000_000_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(failed, AuthError::DepositPending(_)), "{failed:?}");
+    assert!(service.status().await.unwrap().note.is_none());
+    harness.world.lock().unwrap().pinned_down = false;
+    // Without an RPC the deposit cannot be checked against the vault.
+    let mut without = harness.config.clone();
+    without.state_dir = directory.path().join("without-rpc");
+    without.demo_rpc_url = None;
+    let without = AuthService::new(without).unwrap();
+    let refused = without
+        .confirm_deposit(confirm(4_000_000_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, AuthError::InvalidInput(_)), "{refused:?}");
+    assert!(without.status().await.unwrap().note.is_none());
+    // The stored leaf confirms it.
     let status = service
         .confirm_deposit(confirm(4_000_000_000))
         .await
