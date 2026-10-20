@@ -41,6 +41,11 @@ async function ensureInitialized() {
                 throw new Error('The loaded proof WASM is built for an unknown proof setup.');
             }
             return result;
+        }).catch(error => {
+            // A failed download must not poison later wallet operations. Share
+            // the in-flight attempt, but allow the next message to retry it.
+            initialized = null;
+            throw error;
         });
         // A failed initialization must not poison every later operation.
         initialized.catch(() => { initialized = null; });
