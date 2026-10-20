@@ -1595,7 +1595,7 @@ mod startup_tests {
     use crate::native_billing::{
         NativeBillingConfig, CHALLENGE_PERIOD_SELECTOR, CLEARANCE_SIGNING_KEY_X_SELECTOR,
         CLEARANCE_SIGNING_KEY_Y_SELECTOR, CURRENT_ROOT_SELECTOR, NEXT_NOTE_ID_SELECTOR,
-        STATE_SIGNING_KEY_X_SELECTOR, STATE_SIGNING_KEY_Y_SELECTOR,
+        RETIREMENT_EPOCH_SELECTOR, STATE_SIGNING_KEY_X_SELECTOR, STATE_SIGNING_KEY_Y_SELECTOR,
     };
     use crate::signer::strong_test_seeds;
     use serde_json::{json, Value};
@@ -1778,7 +1778,8 @@ mod startup_tests {
                     let probes = &vault.probes;
                     let block_hash = format!("0x{}", "07".repeat(32));
                     if method == "eth_getBlockByNumber" && vault.root.is_some() {
-                        let block = json!({"number": "0x7", "hash": block_hash});
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                        let block = json!({"number": "0x7", "hash": block_hash, "timestamp": format!("0x{now:x}")});
                         return Ok(Json(json!({"jsonrpc":"2.0", "id":1, "result":block})));
                     }
                     let pinned = request["params"][1]["blockHash"] == json!(block_hash);
@@ -1841,6 +1842,7 @@ mod startup_tests {
                                 word(vault.root.as_ref().unwrap())
                             }
                             NEXT_NOTE_ID_SELECTOR if vault.root.is_some() && pinned => number(1),
+                            RETIREMENT_EPOCH_SELECTOR if vault.root.is_some() && pinned => number(0),
                             _ => return Err(StatusCode::BAD_REQUEST),
                         },
                         _ => return Err(StatusCode::BAD_REQUEST),
@@ -2361,7 +2363,8 @@ mod startup_tests {
             .to_string();
         assert!(error.contains("after 3 attempts"), "{error}");
         assert!(!error.contains(&rpc), "{error}");
-        assert_eq!(methods(&calls).len(), 3);
+        // Three startup probes, each with four bounded transport retries.
+        assert_eq!(methods(&calls).len(), 3 * 4);
         assert!(!db_path.exists());
     }
 
@@ -2627,6 +2630,7 @@ mod startup_tests {
             },
             VaultRpc::serving(keys_of(seeds)),
         ] {
+            let unavailable = vault.unavailable;
             let matching =
                 vault.keys == Some(keys_of(seeds)) && !vault.unavailable && vault.chain == "0x1";
             let (rpc, calls) = vault_rpc(vault).await;
@@ -2649,6 +2653,9 @@ mod startup_tests {
             if matching {
                 // Verified once, probes included, then idle.
                 assert_eq!(calls.len(), 1 + KEY_READS.len() + PROBE_CALLS);
+            } else if unavailable {
+                // Transport retries back off 500ms rather than hammering an outage.
+                assert_eq!(calls.len(), 1);
             } else {
                 assert!(calls.len() > 2);
             }

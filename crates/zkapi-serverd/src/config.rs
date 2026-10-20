@@ -280,8 +280,8 @@ pub struct ServerConfig {
     /// it set.
     pub allow_legacy_clearance: bool,
     /// O5': a request may use a root the server read from the vault for
-    /// this many seconds after the vault replaced it (0..=600; 0 accepts only
-    /// the latest vault root).
+    /// this many seconds after additions replaced it (0..=600; 0 accepts only
+    /// the latest vault root). A retirement or reorg clears all older roots.
     pub request_root_grace_seconds: u64,
     /// O5': admission refuses (`root_unavailable`) unless the server read
     /// the vault's currentRoot() at most this many seconds ago.

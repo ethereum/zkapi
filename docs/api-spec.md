@@ -95,13 +95,16 @@ earlier circuit; the circuit ID and keys are `zkapi-v2-concession-v2`'s.
 
 Admission (O5') accepts a request whose `active_root` is the vault's latest
 `currentRoot()`, read by the server at the latest block hash, or a root the
-server read from the vault that the vault replaced no more than
+server read from the vault that additions replaced no more than
 `--request-root-grace-seconds` ago (`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`,
 default 60, 0 to 600; 0 accepts only the latest root). Any other root answers
 retriable `409 stale_root` with the latest root in `latest_root`. Only roots
 read from the vault enter that window; when a recorded block hash is no longer
-canonical, the server keeps only the latest root. Without a successful vault
-read within `--root-max-staleness-seconds` (default 60) every request answers
+canonical, the server keeps only the latest root. The root poller also reads
+`retirementEpoch()` at that canonical block hash and discards historical roots
+as soon as a retirement is observed. A regressing RPC head or a latest block
+older than the freshness bound makes every root unavailable until recovery.
+Without a successful vault read within `--root-max-staleness-seconds` (default 60) every request answers
 retriable `503 root_unavailable`. The indexer is a health signal only: a
 disagreement between its root and `currentRoot()` at its block hash is a
 warning, the `zkapi_indexer_root_disagreement` metric and a `degraded`

@@ -158,8 +158,8 @@ merged; a section gives the figure of its pull request alone where it differs.
 
 **Off-chain.**
 - **Request roots (server):** the server accepts any request root it has itself read from the vault in the last `request_root_grace_seconds` (default 60), because cheap deposits change the root often.
-  - Only vault-read roots enter the window, and the tree only grows, so an older root contains only real notes.
-  - Closed notes are still refused through their spent nullifiers.
+  - Only vault-read roots enter the window. Grace applies across additions only: each poll checks `retirementEpoch()` at the same canonical block hash as the root and discards every historical root after a retirement.
+  - Spent nullifiers reject the consumed state. Retiring a missed-challenge note also blocks its unspent newer states once the server observes the retirement.
 - **Clearance:** reads `noteRecord` fresh every time.
 - **Indexer:** can bootstrap from state.
 - **Clients** (Rust, Go, SDK, companion): exit from the leaf and rebuild request paths from pinned vault state.
@@ -177,7 +177,7 @@ merged; a section gives the figure of its pull request alone where it differs.
 **Trade-offs.**
 - **Circuit and client migration.** It must ship before the ceremony; after it, C would require a new ceremony.
 - **Single-transaction drain (layout C1, chosen by the owner).** The deposit amount used for payouts comes from the proof, not from storage. With a sound verifier and setup this is exactly as safe as before, because the amount is bound into the leaf. If the verifier or the trusted setup were broken, one forged exit could claim the whole vault instead of one note's deposit. The two-slot layout C2 would keep a storage cap per note for +22.1k per deposit (+~110k under EIP-8037).
-- **Request root window.** The server accepts roots up to 60 s old instead of exactly the current one. Clients should always use the latest root to avoid standing out.
+- **Request root window.** The server accepts roots replaced by additions up to 60 s ago, with no intervening retirement or reorg, instead of exactly the current one. Clients should always use the latest root to avoid standing out.
 - **`claimExpired`** costs ~12k more (operator-paid).
 - **`currentRoot()` cost.** It needs an RPC that allows ~0.6M gas per `eth_call` and block-hash-pinned reads.
 - **Root history.** Historical roots are not stored unless someone calls `recordRoot()`. Nothing in the protocol needs them.

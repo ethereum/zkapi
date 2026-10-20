@@ -164,6 +164,8 @@ struct VaultRoots {
     entries: VecDeque<VaultRootEntry>,
     /// Server time of the last successful vault read.
     last_read_at: Option<u64>,
+    /// The removal fence read at the same block as the latest root.
+    retirement_epoch: Option<[u8; 32]>,
 }
 
 impl VaultRoots {
@@ -429,6 +431,8 @@ pub struct RequestProcessor {
     initial_root: Felt252,
     /// O5': the roots read from the vault that admission accepts.
     vault_roots: Mutex<VaultRoots>,
+    /// A slower earlier poll must not overwrite a newer removal fence.
+    root_refresh_lock: tokio::sync::Mutex<()>,
     /// The root poller's last comparison of the indexer with the vault, and
     /// the number of disagreements found.
     indexer_root: Mutex<(IndexerRootStatus, u64)>,
@@ -555,6 +559,7 @@ impl RequestProcessor {
             withdrawal_verifier,
             initial_root,
             vault_roots: Mutex::new(VaultRoots::default()),
+            root_refresh_lock: tokio::sync::Mutex::new(()),
             indexer_root: Mutex::new((indexer_root, 0)),
             clearance_permits: tokio::sync::Semaphore::new(CLEARANCE_VERIFY_PERMITS),
             publication: Mutex::new(PublicationCache::default()),
@@ -679,43 +684,76 @@ impl RequestProcessor {
         }
     }
 
-    /// One refresh of the root poller (O5'): read the latest block, then the
-    /// vault's currentRoot() and nextNoteId() at its hash, and record the
-    /// root. A block no longer canonical at the height the last read found
-    /// it is a reorg: the window then keeps only the new latest root. With
-    /// an indexer, its root is compared with the vault's currentRoot() at
-    /// the indexer's block hash, for `/health` and `/metrics` only. An error
-    /// means the vault read failed and nothing was recorded; the indexer
-    /// never makes it fail.
+    /// Refresh the vault root and its retirement fence at one canonical block.
+    /// Historical roots receive grace only across additions. A retirement or
+    /// reorg drops all earlier roots. A regressing RPC head fails closed until
+    /// it catches up: it cannot revive a leaf from before an observed removal.
     pub async fn refresh_roots(&self, indexer_url: Option<&str>) -> anyhow::Result<()> {
+        let _refresh = self.root_refresh_lock.lock().await;
         let read = self.native_oracle.vault_root_read().await?;
-        let previous = self
-            .vault_roots
-            .lock()
-            .ok()
-            .and_then(|roots| roots.latest().and_then(|latest| latest.block.clone()));
+        let now = current_timestamp();
+        if now.saturating_sub(read.block_timestamp) > self.config.root_max_staleness_seconds {
+            if let Ok(mut roots) = self.vault_roots.lock() {
+                roots.last_read_at = None;
+            }
+            anyhow::bail!("vault RPC latest block is too old for request admission");
+        }
+        let (previous, retirement) = {
+            let mut roots = self
+                .vault_roots
+                .lock()
+                .map_err(|_| anyhow::anyhow!("root state lock poisoned"))?;
+            let previous = roots.latest().and_then(|latest| latest.block.clone());
+            let retirement = roots
+                .retirement_epoch
+                .is_some_and(|epoch| epoch != read.retirement_epoch);
+            // Invalidate before another awaited RPC: once a removal is known,
+            // no concurrent admission may keep using a cached earlier root.
+            if retirement
+                || previous
+                    .as_ref()
+                    .is_some_and(|(number, _)| *number > read.block_number)
+            {
+                roots.last_read_at = None;
+            }
+            (previous, retirement)
+        };
         let reorg = match previous {
             None => false,
             Some((number, hash)) if number == read.block_number => hash != read.block_hash,
-            // The head went back: a reorg, or an RPC node behind the one
-            // the last read reached. Either way, keep only what it reports.
-            Some((number, _)) if number > read.block_number => true,
+            Some((number, _)) if number > read.block_number => {
+                anyhow::bail!("vault RPC head regressed from block {number} to {}; request roots unavailable until it catches up", read.block_number);
+            }
+            // The pinned new root is canonical and all historical roots are
+            // already fenced. No previous-block lookup is needed for removal.
+            Some(_) if retirement => false,
             Some((number, hash)) => {
                 self.native_oracle.canonical_block_hash(number).await? != Some(hash)
             }
         };
-        if reorg {
+        if reorg || retirement {
             tracing::warn!(
                 block = read.block_number,
-                "the vault root's block is no longer canonical: dropping every root but the latest"
+                reorg,
+                retirement,
+                "dropping historical request roots after a retirement or reorg"
             );
         }
-        self.record_vault_root(
-            read.root,
-            Some((read.block_number, read.block_hash.clone())),
-            current_timestamp(),
-            reorg,
-        );
+        {
+            let mut roots = self
+                .vault_roots
+                .lock()
+                .map_err(|_| anyhow::anyhow!("root state lock poisoned"))?;
+            roots.record(
+                read.root,
+                Some((read.block_number, read.block_hash.clone())),
+                current_timestamp(),
+                self.config.request_root_grace_seconds,
+                self.vault_roots_capacity(),
+                reorg || retirement,
+            );
+            roots.retirement_epoch = Some(read.retirement_epoch);
+        }
         if let Some(url) = indexer_url {
             let status = self.check_indexer_root(url, &read).await;
             if let Ok(mut indexer) = self.indexer_root.lock() {
@@ -777,7 +815,8 @@ impl RequestProcessor {
 
     /// O5': admit `root` if the server read the vault within
     /// `root_max_staleness_seconds` and `root` is the latest vault root, or
-    /// a vault root replaced at most `request_root_grace_seconds` ago.
+    /// a vault root replaced by additions at most `request_root_grace_seconds`
+    /// ago, with no intervening retirement or reorg.
     fn admissible_root(&self, root: &Felt252, now: u64) -> Result<(), ServerError> {
         let roots = self
             .vault_roots
@@ -7276,9 +7315,11 @@ mod tests {
     struct RootChain {
         canonical: std::collections::BTreeMap<u64, String>,
         roots: std::collections::HashMap<String, Felt252>,
+        epochs: std::collections::HashMap<String, u64>,
         /// The indexer's (root, block hash); None answers 503.
         indexer: Option<(Felt252, String)>,
         vault_down: bool,
+        head_timestamp: Option<u64>,
         /// The `{"blockHash"}` of every pinned currentRoot() read.
         pinned_reads: Vec<String>,
     }
@@ -7322,7 +7363,8 @@ mod tests {
                                 };
                                 match number.and_then(|n| chain.canonical.get(&n).map(|h| (n, h))) {
                                     Some((n, hash)) => {
-                                        json!({"number": format!("0x{n:x}"), "hash": hash})
+                                        json!({"number": format!("0x{n:x}"), "hash": hash,
+                                            "timestamp": format!("0x{:x}", chain.head_timestamp.unwrap_or_else(current_timestamp))})
                                     }
                                     None => Value::Null,
                                 }
@@ -7335,6 +7377,11 @@ mod tests {
                                     chain.pinned_reads.push(hash.clone());
                                     let root = chain.roots[&hash];
                                     json!(format!("0x{}", hex::encode(root.as_bytes())))
+                                } else if data == crate::native_billing::RETIREMENT_EPOCH_SELECTOR {
+                                    json!(format!(
+                                        "0x{:064x}",
+                                        chain.epochs.get(&hash).copied().unwrap_or(0)
+                                    ))
                                 } else {
                                     assert_eq!(data, crate::native_billing::NEXT_NOTE_ID_SELECTOR);
                                     json!(format!("0x{:064x}", 3))
@@ -7452,6 +7499,88 @@ mod tests {
         server.abort();
     }
 
+    /// A responsive but frozen RPC cannot refresh the age of an obsolete root.
+    #[tokio::test]
+    async fn a_stale_chain_head_makes_all_roots_unavailable_until_recovery() {
+        let chain = Arc::new(std::sync::Mutex::new(RootChain::default()));
+        chain.lock().unwrap().mine(10, "a10", 0xa);
+        let (url, server) = root_chain_server(chain.clone()).await;
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        configure_issuance_rpc(&mut processor, url);
+        processor.refresh_roots(None).await.unwrap();
+        chain.lock().unwrap().head_timestamp = Some(current_timestamp() - 61);
+        assert!(processor.refresh_roots(None).await.is_err());
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xa), current_timestamp()),
+            Err(ServerError::RootUnavailable(_))
+        ));
+        chain.lock().unwrap().head_timestamp = None;
+        processor.refresh_roots(None).await.unwrap();
+        processor
+            .admissible_root(&Felt252::from_u64(0xa), current_timestamp())
+            .unwrap();
+        server.abort();
+    }
+
+    /// A removal is a hard barrier even when the same block also adds notes.
+    /// Later additions can receive grace, but no pre-removal root comes back.
+    #[tokio::test]
+    async fn retirement_discards_old_roots_immediately_and_lagging_rpc_cannot_revive_them() {
+        let chain = Arc::new(std::sync::Mutex::new(RootChain::default()));
+        chain.lock().unwrap().mine(10, "a10", 0xa);
+        let (url, server) = root_chain_server(chain.clone()).await;
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        configure_issuance_rpc(&mut processor, url);
+        processor.refresh_roots(None).await.unwrap();
+        chain.lock().unwrap().mine(11, "a11", 0xb);
+        processor.refresh_roots(None).await.unwrap();
+        processor
+            .admissible_root(&Felt252::from_u64(0xa), current_timestamp())
+            .unwrap();
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.mine(12, "a12", 0xc);
+            let hash = chain.hash(12);
+            chain.epochs.insert(hash, 1);
+        }
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(window_roots(&processor), [Felt252::from_u64(0xc)]);
+        for old in [0xa, 0xb] {
+            assert!(matches!(
+                processor.admissible_root(&Felt252::from_u64(old), current_timestamp()),
+                Err(ServerError::StaleRoot { .. })
+            ));
+        }
+        // A load-balanced RPC might now answer from before that retirement.
+        chain.lock().unwrap().canonical.remove(&12);
+        assert!(processor.refresh_roots(None).await.is_err());
+        for root in [0xb, 0xc] {
+            assert!(matches!(
+                processor.admissible_root(&Felt252::from_u64(root), current_timestamp()),
+                Err(ServerError::RootUnavailable(_))
+            ));
+        }
+        // Recover at the observed height, then allow grace across additions.
+        chain.lock().unwrap().mine(12, "a12", 0xc);
+        processor.refresh_roots(None).await.unwrap();
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.mine(13, "a13", 0xd);
+            let hash = chain.hash(13);
+            chain.epochs.insert(hash, 1);
+        }
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(
+            window_roots(&processor),
+            [Felt252::from_u64(0xc), Felt252::from_u64(0xd)]
+        );
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xb), current_timestamp()),
+            Err(ServerError::StaleRoot { .. })
+        ));
+        server.abort();
+    }
+
     /// A recorded block that is no longer canonical at its height is a
     /// reorg: every root but the new latest leaves the window.
     #[tokio::test]
@@ -7492,10 +7621,21 @@ mod tests {
         chain.lock().unwrap().mine(13, "c13", 0xf);
         processor.refresh_roots(None).await.unwrap();
         assert_eq!(window_roots(&processor), [Felt252::from_u64(0xf)]);
-        // The head going back is treated the same way.
+        // A lagging provider must not revive an older root after a removal.
         chain.lock().unwrap().canonical.remove(&13);
+        assert!(processor.refresh_roots(None).await.is_err());
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xf), current_timestamp()),
+            Err(ServerError::RootUnavailable(_))
+        ));
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xe), current_timestamp()),
+            Err(ServerError::RootUnavailable(_))
+        ));
+        // A true chain rollback resumes once its head reaches the last height.
+        chain.lock().unwrap().mine(13, "d13", 0x10);
         processor.refresh_roots(None).await.unwrap();
-        assert_eq!(window_roots(&processor), [Felt252::from_u64(0xe)]);
+        assert_eq!(window_roots(&processor), [Felt252::from_u64(0x10)]);
         server.abort();
     }
 
@@ -11551,8 +11691,8 @@ mod tests {
                 "{error}"
             );
             assert!(error.is_retriable());
-            // One failed eth_chainId per attempt.
-            assert_eq!(*calls.lock().unwrap(), attempt);
+            // Four bounded read retries of the failed eth_chainId per attempt.
+            assert_eq!(*calls.lock().unwrap(), attempt * 4);
         }
         assert!(processor.store.get_all_nullifiers().is_empty());
         server.abort();

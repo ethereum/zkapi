@@ -26,6 +26,9 @@ pub const CHALLENGE_PERIOD_SELECTOR: &str = "0xf3f480d9"; // challengePeriod()
 pub const CURRENT_ROOT_SELECTOR: &str = "0xfdab463d"; // currentRoot()
 /// Read by the root poller with currentRoot(), at the same block hash.
 pub const NEXT_NOTE_ID_SELECTOR: &str = "0x7a2043a3"; // nextNoteId()
+/// Every effective removal advances this counter; roots from earlier epochs
+/// must never receive the addition-only request grace period.
+pub const RETIREMENT_EPOCH_SELECTOR: &str = "0xe442740e"; // retirementEpoch()
 /// Nullifier flags, read before signing (O7) and before serving request data.
 pub const USED_NULLIFIERS_SELECTOR: &str = "0xaad24061"; // usedNullifiers(uint256)
 pub const CHALLENGED_NULLIFIERS_SELECTOR: &str = "0x6cda756a"; // challengedNullifiers(uint256)
@@ -44,6 +47,29 @@ pub const PUBLICATION_SCAN_CHUNK_BLOCKS: u64 = 1_000;
 /// header with its transaction hashes, or a chunk of logs.
 const MAX_RESPONSE_BYTES: usize = 65_536;
 const MAX_BLOCK_OR_LOGS_RESPONSE_BYTES: usize = 4 << 20;
+const RPC_READ_ATTEMPTS: usize = 4;
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+enum RpcReadFailure {
+    Transient {
+        message: String,
+        retry_after: Duration,
+    },
+    Terminal(ServerError),
+}
+
+impl From<ServerError> for RpcReadFailure {
+    fn from(error: ServerError) -> Self {
+        Self::Terminal(error)
+    }
+}
+
+fn unavailable(message: &str) -> RpcReadFailure {
+    RpcReadFailure::Transient {
+        message: message.to_owned(),
+        retry_after: Duration::ZERO,
+    }
+}
 
 #[derive(Clone)]
 pub struct NativeBillingConfig {
@@ -114,14 +140,17 @@ pub fn decode_note_record(raw: &str) -> Result<VaultNoteRecord, ServerError> {
 }
 
 /// One read of the vault's root (O5'): the latest block, and currentRoot()
-/// and nextNoteId() at that block's hash.
+/// nextNoteId() and retirementEpoch() at that canonical block's hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultRootRead {
     pub block_number: u64,
+    pub block_timestamp: u64,
     /// `0x` and 64 lowercase hex digits.
     pub block_hash: String,
     pub root: Felt252,
     pub next_note_id: u32,
+    /// Full uint256 ABI word, compared without truncation.
+    pub retirement_epoch: [u8; 32],
 }
 
 /// The vault's immutable signing keys.
@@ -455,18 +484,47 @@ impl NativeBillingOracle {
     }
 
     /// The root poller's read (O5'): the latest block, then currentRoot()
-    /// and nextNoteId() at its hash, after one eth_chainId check.
+    /// nextNoteId() and retirementEpoch() at its canonical hash, after one
+    /// eth_chainId check. The block timestamp is returned for freshness checks.
     pub async fn vault_root_read(&self) -> Result<VaultRootRead, ServerError> {
         async {
             self.assert_chain().await?;
-            let (block_number, block_hash) = self.block_id(json!("latest")).await?;
+            let block = self
+                .rpc_limited(
+                    "eth_getBlockByNumber",
+                    json!(["latest", false]),
+                    MAX_BLOCK_OR_LOGS_RESPONSE_BYTES,
+                )
+                .await?;
+            let (block_number, block_hash) = block_id_of(&block)?;
+            let block_timestamp = block
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(quantity)
+                .ok_or_else(|| invalid("invalid vault block timestamp"))?;
             let root = self.current_root_at(&block_hash).await?;
             let next_note_id = self.next_note_id_at(&block_hash).await?;
+            let epoch = self
+                .call_pinned(
+                    &self.contract_address,
+                    RETIREMENT_EPOCH_SELECTOR,
+                    block_hash_param(&block_hash)?,
+                )
+                .await?;
+            let word = epoch
+                .strip_prefix("0x")
+                .filter(|word| word.len() == 64)
+                .ok_or_else(|| invalid("invalid vault retirementEpoch response length"))?;
+            let mut retirement_epoch = [0u8; 32];
+            hex::decode_to_slice(word, &mut retirement_epoch)
+                .map_err(|_| invalid("invalid vault retirementEpoch response"))?;
             Ok::<_, ServerError>(VaultRootRead {
                 block_number,
+                block_timestamp,
                 block_hash,
                 root,
                 next_note_id,
+                retirement_epoch,
             })
         }
         .await
@@ -570,18 +628,6 @@ impl NativeBillingOracle {
         }
     }
 
-    /// The number and hash of block `tag` ("latest" or a quantity).
-    async fn block_id(&self, tag: Value) -> Result<(u64, String), ServerError> {
-        let block = self
-            .rpc_limited(
-                "eth_getBlockByNumber",
-                json!([tag, false]),
-                MAX_BLOCK_OR_LOGS_RESPONSE_BYTES,
-            )
-            .await?;
-        block_id_of(&block)
-    }
-
     /// The number and timestamp of block `tag` ("latest" or a quantity).
     async fn block_time(&self, tag: Value) -> Result<(u64, u64), ServerError> {
         let block = self
@@ -681,27 +727,89 @@ impl NativeBillingOracle {
         params: Value,
         limit: usize,
     ) -> Result<Value, ServerError> {
+        // These are reads only. Retry transient transport/rate-limit failures
+        // without caching any root, price or nullifier result. The deadline is
+        // shared by all attempts, including Retry-After, not reset per attempt.
+        tokio::time::timeout(RPC_READ_TIMEOUT, async {
+            for attempt in 0..RPC_READ_ATTEMPTS {
+                match self.rpc_read_once(method, &params, limit).await {
+                    Ok(value) => return Ok(value),
+                    Err(RpcReadFailure::Terminal(error)) => return Err(error),
+                    Err(RpcReadFailure::Transient {
+                        message,
+                        retry_after,
+                    }) => {
+                        if attempt + 1 == RPC_READ_ATTEMPTS {
+                            return Err(ServerError::ChainReadUnavailable(message));
+                        }
+                        let delay = Duration::from_millis(500 << attempt).max(retry_after);
+                        tracing::warn!(method, attempt = attempt + 1, %message,
+                            "transient chain RPC read failed; retrying");
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+            unreachable!("the final attempt returns")
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(ServerError::ChainReadUnavailable(
+                "native billing oracle RPC read timed out".into(),
+            ))
+        })
+    }
+
+    async fn rpc_read_once(
+        &self,
+        method: &str,
+        params: &Value,
+        limit: usize,
+    ) -> Result<Value, RpcReadFailure> {
         let response = self
             .http
             .post(&self.config.rpc_url)
             .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
             .send()
             .await
-            .map_err(|_| invalid("native billing oracle RPC unavailable"))?;
-        if !response.status().is_success()
-            || response.content_length().is_some_and(|n| n > limit as u64)
-        {
-            return Err(invalid("native billing oracle RPC rejected the read"));
+            .map_err(|_| unavailable("native billing oracle RPC unavailable"))?;
+        let status = response.status();
+        if status.as_u16() == 429 || status.as_u16() == 408 || status.is_server_error() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| Duration::from_secs(seconds).min(RPC_READ_TIMEOUT))
+                .unwrap_or_default();
+            return Err(RpcReadFailure::Transient {
+                message: format!(
+                    "native billing oracle RPC returned HTTP {}",
+                    status.as_u16()
+                ),
+                retry_after,
+            });
+        }
+        if !status.is_success() {
+            // A provider refusal is not a malformed client request. Do not
+            // hammer permanent HTTP failures (auth, wrong URL, redirects).
+            return Err(ServerError::ChainReadUnavailable(format!(
+                "native billing oracle RPC returned HTTP {}",
+                status.as_u16(),
+            ))
+            .into());
+        }
+        if response.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(invalid("native billing oracle RPC response too large").into());
         }
         let mut response = response;
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| invalid("native billing oracle RPC unavailable"))?
+            .map_err(|_| unavailable("native billing oracle RPC unavailable"))?
         {
             if body.len().saturating_add(chunk.len()) > limit {
-                return Err(invalid("native billing oracle RPC response too large"));
+                return Err(invalid("native billing oracle RPC response too large").into());
             }
             body.extend_from_slice(&chunk);
         }
@@ -710,17 +818,15 @@ impl NativeBillingOracle {
         if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
             || value.get("id").and_then(Value::as_u64) != Some(1)
         {
-            return Err(invalid(
-                "native billing oracle RPC response identity mismatch",
-            ));
+            return Err(invalid("native billing oracle RPC response identity mismatch").into());
         }
         if value.get("error").is_some() {
-            return Err(invalid("native billing oracle RPC call failed"));
+            return Err(invalid("native billing oracle RPC call failed").into());
         }
         value
             .get("result")
             .cloned()
-            .ok_or_else(|| invalid("missing native billing oracle RPC result"))
+            .ok_or_else(|| invalid("missing native billing oracle RPC result").into())
     }
 
     async fn call(&self, address: &str, data: &str) -> Result<String, ServerError> {
@@ -933,7 +1039,7 @@ fn block_hash_param(block_hash: &str) -> Result<Value, ServerError> {
     if !is_block_hash(block_hash) {
         return Err(invalid("invalid block hash"));
     }
-    Ok(json!({ "blockHash": block_hash.to_ascii_lowercase() }))
+    Ok(json!({ "blockHash": block_hash.to_ascii_lowercase(), "requireCanonical": true }))
 }
 
 fn is_block_hash(value: &str) -> bool {
@@ -1189,13 +1295,18 @@ mod tests {
                     let result = match request["method"].as_str() {
                         Some("eth_chainId") => json!("0xaa36a7"),
                         Some("eth_getBlockByNumber") => match request["params"][0].as_str() {
-                            Some("latest") | Some("0x2a") => json!({"number":"0x2a","hash":hash}),
+                            Some("latest") | Some("0x2a") => {
+                                json!({"number":"0x2a","hash":hash,"timestamp":"0x1234"})
+                            }
                             _ => Value::Null,
                         },
                         _ if data == CURRENT_ROOT_SELECTOR => {
                             json!(format!("0x{}", hex::encode(root.as_bytes())))
                         }
                         _ if data == NEXT_NOTE_ID_SELECTOR => json!(format!("0x{:064x}", 9)),
+                        _ if data == RETIREMENT_EPOCH_SELECTOR => {
+                            json!(format!("0x{}", "ab".repeat(32)))
+                        }
                         _ if data.starts_with(NOTE_RECORD_SELECTOR) => {
                             json!(format!("0x{}{:064x}", hex::encode(leaf.as_bytes()), 2))
                         }
@@ -1224,28 +1335,34 @@ mod tests {
             oracle.vault_root_read().await.unwrap(),
             VaultRootRead {
                 block_number: 42,
+                block_timestamp: 0x1234,
                 block_hash: hash.clone(),
                 root,
                 next_note_id: 9,
+                retirement_epoch: [0xab; 32],
             }
         );
         assert_eq!(oracle.vault_challenge_period().await.unwrap(), 86_400);
         {
             let calls = calls.lock().unwrap();
-            assert_eq!(calls.len(), 5);
+            assert_eq!(calls.len(), 6);
             assert_eq!(calls[0]["method"], "eth_chainId");
             assert_eq!(calls[1]["params"], json!(["latest", false]));
-            // EIP-1898: both reads at the hash of the block just read.
+            // EIP-1898: all three reads at the canonical block hash just read.
             assert_eq!(
                 calls[2]["params"],
-                json!([{"to":vault, "data":"0xfdab463d"}, {"blockHash": hash}])
+                json!([{"to":vault, "data":"0xfdab463d"}, {"blockHash": hash, "requireCanonical": true}])
             );
             assert_eq!(
                 calls[3]["params"],
-                json!([{"to":vault, "data":"0x7a2043a3"}, {"blockHash": hash}])
+                json!([{"to":vault, "data":"0x7a2043a3"}, {"blockHash": hash, "requireCanonical": true}])
             );
             assert_eq!(
                 calls[4]["params"],
+                json!([{"to":vault, "data":RETIREMENT_EPOCH_SELECTOR}, {"blockHash": hash, "requireCanonical": true}])
+            );
+            assert_eq!(
+                calls[5]["params"],
                 json!([{"to":vault, "data":"0xf3f480d9"}, "latest"])
             );
         }
@@ -1343,6 +1460,7 @@ mod tests {
             ("challengePeriod()", CHALLENGE_PERIOD_SELECTOR),
             ("currentRoot()", CURRENT_ROOT_SELECTOR),
             ("nextNoteId()", NEXT_NOTE_ID_SELECTOR),
+            ("retirementEpoch()", RETIREMENT_EPOCH_SELECTOR),
             ("noteRecord(uint32)", NOTE_RECORD_SELECTOR),
         ] {
             let digest = Keccak256::digest(signature.as_bytes());
@@ -1650,6 +1768,127 @@ mod tests {
         assert!(q.validate_identity(&c, 11155111).is_ok());
         q.expires_at += 1;
         assert!(q.validate_identity(&c, 11155111).is_err());
+    }
+
+    async fn scripted_read_rpc(
+        replies: Vec<(u16, String)>,
+    ) -> (
+        NativeBillingOracle,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let last = replies.last().unwrap().clone();
+        let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(replies)));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/",
+            post({
+                let calls = calls.clone();
+                move |Json(request): Json<Value>| {
+                    calls.lock().unwrap().push(request);
+                    let (status, body) = replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| last.clone());
+                    async move { (axum::http::StatusCode::from_u16(status).unwrap(), body) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let oracle = NativeBillingOracle::new(
+            NativeBillingConfig {
+                rpc_url,
+                feed_address: quote().feed_address,
+                decimals: 8,
+                max_age_seconds: 3600,
+            },
+            11155111,
+            "0x0000000000000000000000000000000000000001".into(),
+        )
+        .unwrap();
+        (oracle, calls, task)
+    }
+
+    fn rpc_reply(value: Value) -> (u16, String) {
+        (
+            200,
+            json!({"jsonrpc":"2.0","id":1,"result":value}).to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn rpc_reads_retry_transient_failures_without_changing_the_read() {
+        let (oracle, calls, task) = scripted_read_rpc(vec![
+            (429, "rate limited".into()),
+            (503, "unavailable".into()),
+            rpc_reply(json!("0x1234")),
+        ])
+        .await;
+        let params = json!([{"to": oracle.config.feed_address, "data":"0xfeaf968c"}, "finalized"]);
+        assert_eq!(
+            oracle.rpc("eth_call", params.clone()).await.unwrap(),
+            json!("0x1234")
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        for call in calls.iter() {
+            assert_eq!(call["method"], "eth_call");
+            assert_eq!(call["params"], params);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rpc_read_retry_exhaustion_is_bounded_and_retriable() {
+        let (oracle, calls, task) = scripted_read_rpc(vec![(429, "rate limited".into())]).await;
+        let error = oracle.rpc_chain_id().await.unwrap_err();
+        assert!(matches!(error, ServerError::ChainReadUnavailable(_)));
+        assert!(error.is_retriable());
+        assert!(error.to_string().contains("HTTP 429"));
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rpc_reads_do_not_retry_permanent_or_malformed_responses() {
+        for reply in [
+            (403, "provider auth failure".into()),
+            (
+                200,
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"revert"}}).to_string(),
+            ),
+            (
+                200,
+                json!({"jsonrpc":"2.0","id":2,"result":"0xaa36a7"}).to_string(),
+            ),
+            (200, "x".repeat(MAX_RESPONSE_BYTES + 1)),
+        ] {
+            let (oracle, calls, task) = scripted_read_rpc(vec![reply]).await;
+            assert!(oracle.rpc_chain_id().await.is_err());
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_retry_cannot_authorize_a_spent_note() {
+        let (oracle, calls, task) = scripted_read_rpc(vec![
+            rpc_reply(json!("0xaa36a7")),
+            (429, "rate limited".into()),
+            rpc_reply(json!(format!("0x{:064x}", 1))),
+        ])
+        .await;
+        assert!(matches!(
+            oracle.assert_request_unspent(&Felt252::from_u64(123)).await,
+            Err(ServerError::NullifierUsed)
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        task.abort();
     }
 
     #[tokio::test]

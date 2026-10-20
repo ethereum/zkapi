@@ -294,13 +294,21 @@ one key source; to change it, see
 deadline described below. The server also requires `--deployment` (the
 deployment manifest the database was initialized from with `zkapi db init`),
 admits a request only at a root it read from the vault's `currentRoot()`:
-the current one, or one the vault replaced no more than
+the current one, or one additions replaced no more than
 `--request-root-grace-seconds` ago (`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`, default
-60, 0 to 600; otherwise `409 stale_root` with the latest root). It refuses every
-request (`503 root_unavailable`) only when it has had no successful vault read
-for `--root-max-staleness-seconds` (default 60); the indexer's root is a
+60, 0 to 600; otherwise `409 stale_root` with the latest root). The poller reads
+`retirementEpoch()` with the root at the same canonical block hash. A changed
+epoch or a reorg clears every historical root immediately, without grace.
+Retirement takes effect at the next successful poll, so the polling interval
+and RPC latency still matter. Every request is refused (`503 root_unavailable`)
+when no successful read is within `--root-max-staleness-seconds` (default 60),
+when the RPC's latest block timestamp is older than that bound, or when its
+head regresses below the last observed height (until it catches up); the indexer's root is a
 health signal (`zkapi_indexer_root_disagreement`, degraded `/health`), never
-an admission gate. With
+an admission gate. Read-only RPC calls retry transport errors and HTTP
+408/429/5xx up to four attempts within one 15-second deadline, honoring bounded
+`Retry-After`. These failures are retriable service failures, not invalid user
+requests; no price, root or nullifier result is cached by that retry loop. With
 `--request-limit-max-usd-micros` (6,000,000 during the canary, and recommended
 permanently), it refuses a request whose lease budget exceeds that ceiling before
 anything is reserved (`400 request_limit_exceeded`). This ceiling bounds the

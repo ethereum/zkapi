@@ -28,7 +28,8 @@ The indexer mirrors deposits and leaf retirements (the tree is append-only
 otherwise), keeps each note's leaf and deposit preimage and every published
 nullifier, and serves only a view it has verified against the vault's computed
 `currentRoot()` and next note ID. The server admits requests at roots it read
-from the vault itself (within `request_root_grace_seconds`); the indexer's
+from the vault itself (within `request_root_grace_seconds` across additions
+only); a changed `retirementEpoch()` discards all historical roots. The indexer's
 root is only a health signal there. The
 challenger defeats an escape with a verified request proof at its successor
 nullifier, raises an under-conceded escape with the request at its nullifier,

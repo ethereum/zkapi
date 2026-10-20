@@ -576,10 +576,20 @@ raise lead fits the challenge period. See
 
 The server admits a request proof at the vault's current root or at any root
 it read from the vault's `currentRoot()` (at a block hash it fetched) and the
-vault replaced no more than `--request-root-grace-seconds`
+vault replaced through additions no more than `--request-root-grace-seconds`
 (`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`, default 60, 0 to 600; 0 admits only the
-current root) ago, and refuses every request `root_unavailable` only after
-`--root-max-staleness-seconds` (default 60) without a successful vault read.
+current root) ago. Each poll pins `retirementEpoch()` and `currentRoot()` to
+the same canonical block hash; a changed epoch or reorg discards all older
+roots immediately. No grace applies across retirements. The retirement is
+observed on the next successful poll, subject to RPC latency.
+Every request is `root_unavailable` after `--root-max-staleness-seconds`
+(default 60) without a successful read, when the latest block is older than
+that bound, or when the RPC head regresses (until it reaches the prior height).
+The new vault must expose `retirementEpoch()`; deploy server and vault together.
+Use a fresh server database bound to the new deployment manifest and a fresh
+indexer checkpoint, replaying from its deployment block. State-only indexer
+bootstrap omits historical deposit preimages and escape evidence; it should
+not replace full log replay for the operator's challenger and expiry sweeper.
 The indexer's root is a health signal, never an admission gate: a
 disagreement with `currentRoot()` at the indexer's block hash logs a warning,
 sets `zkapi_indexer_root_disagreement` on the server's `/metrics` (with

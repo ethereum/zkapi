@@ -85,7 +85,7 @@ paths:
               schema: {$ref: "#/components/schemas/OpenRouterLease"}
         "400": {description: "Invalid request, proof, or disabled lease mode, or request_limit_exceeded: the lease budget exceeds the server's per-request ceiling (nothing reserved)"}
         "404": {$ref: "#/components/responses/LeaseRecordUnreadable"}
-        "409": {description: "Existing active or settling lease, a used nullifier, or stale_root (retriable): the request's root is neither the vault's latest root nor a vault root the server read that was replaced within request_root_grace_seconds; latest_root is the latest"}
+        "409": {description: "Existing active or settling lease, a used nullifier, or stale_root (retriable): the request's root is neither the vault's latest root nor a vault root the server read that additions replaced within request_root_grace_seconds with no intervening retirement or reorg; latest_root is the latest"}
         "429":
           description: >-
             OA key capacity is temporarily limited, or the reference gateway

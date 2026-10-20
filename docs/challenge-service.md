@@ -464,10 +464,12 @@ against the vault's root at the path's block (the siblings below `ℓ`, the rest
 zero-filled; see
 [Building and sending a transaction](#building-and-sending-a-transaction)).
 That bounds the operator's loss: the API server admits requests only at the
-vault's current root or at one the vault replaced at most
+vault's current root or at one additions replaced at most
 `request_root_grace_seconds` ago (`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`, 60 by
-default), so once that grace has passed after the retirement mines it refuses
-every request built on the note, including from the owner's newer state. The obligation stays a
+default). A retirement increments `retirementEpoch()`: on the next successful
+root poll the server discards all older roots, refusing every new request
+built on the note, including from the owner's newer state. No grace applies
+after the server observes that removal. The obligation stays a
 warning until the retirement mines; a zero leaf means it is done. Set
 `ZKAPI_CHALLENGE_RETIRE_ON_MISS` to the same value for the signer sidecar,
 which refuses every retirement when it is `false`.
@@ -510,8 +512,8 @@ own fix:
 | `retirement_in_flight` | A retirement of the note on a new nonce while an earlier counted nonce may still mine | The daemon misbehaves, or a lagging upstream answered the nonce count; it clears once the earlier nonce mines |
 | `retirement_disabled` | `ZKAPI_CHALLENGE_RETIRE_ON_MISS` differs between `deployment.env` and `signer.env` | Set the same value in both and recreate the signer |
 
-Until the retirement mines, and for at most `request_root_grace_seconds`
-after it, the loss bound of a missed defeat (design §7.4 and Amendment A3,
+Until the retirement mines and the next successful root poll observes its
+`retirementEpoch()`, the loss bound of a missed defeat (design §7.4 and Amendment A3,
 service from the owner's newest state) keeps running. `zkapi_signerStatus`
 and the signer's `/health` report `max_retirements_per_day`,
 `retirements_last_24h` (nonces), `retirement_refusals` and
