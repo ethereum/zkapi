@@ -160,6 +160,7 @@ name the runtime contract.
 | `PAYMASTER_ESCAPES` | `1` sponsors escape initiations; default `0` (finalizations are always sponsored) |
 | `PAYMASTER_MAX_FEE_CEILING_WEI`, `PAYMASTER_PRIORITY_FEE_CEILING_WEI` | Fee ceilings per gas the paymaster accepts; defaults 100 gwei and 3 gwei (a testnet: 200 gwei), at most 500 gwei and 20 gwei, and the priority ceiling must not exceed the max ceiling |
 | `PAYMASTER_FEE_KEEPER` | Optional key that may re-set the fee ceilings (`setFeeCeilings`) |
+| `EXIT_BATCHER_CLOSE_GAS`, `EXIT_BATCHER_ESCAPE_GAS`, `EXIT_BATCHER_DEFEAT_GAS`, `EXIT_BATCHER_RAISE_GAS`, `EXIT_BATCHER_FINALIZE_GAS` | Gas of each kind's vault call in a [batch](#batched-exits) (50,000 to 2,000,000). Defaults follow the gas schedule the script measures: 250,000, 250,000, 150,000, 150,000 and 300,000 under EIP-2929 storage pricing (Mainnet today); 500,000, 600,000, 150,000, 150,000 and 400,000 under EIP-8037 (Sepolia today) |
 
 The setup policy is enforced by the script: off local chains (Mainnet
 included) a single-party setup needs `ALLOW_DEV_SETUP=1`, and an `mpc-1` setup
@@ -468,6 +469,94 @@ A deployment made with `GASLESS=0` gives `gasless: null`, as the
 policy, loss metrics and open debts of a finalized deployment as JSON; see
 [Operating gasless withdrawals](#operating-gasless-withdrawals) for the
 float, the bundler, the fee ceilings, alerts and incident levers.
+
+### Batched exits
+
+The generated adapter verifies many proofs of one kind at once
+(`IZkApiBatchProofAdapter`: `verifyWithdrawalBatch`, `verifyRequestBatch`
+and their `Once` variants). One random linear combination checks n proofs
+with n + 3 pairings and one shared multi-scalar multiplication: about
+49,600 gas per extra proof instead of about 217,000, and a batch of 16
+withdrawals verifies in 998,220 gas against 3,609,818 one by one
+(`protocol/contracts/snapshots/batch-verifier-gas.json`). The challenges are
+128-bit Fiat-Shamir challenges over every byte the batch reads (r_0 = 1),
+and every item gets the single verifier's checks, so a batch is valid
+exactly when each of its items is. The `Once` variants then write the
+record a single verification would have left: for a withdrawal, the record
+of `verifyWithdrawalOnce`; for a request, a record under `REQUEST_RECORD`
+(at or above 2^160, a namespace no withdrawal record can reach) that
+`assertValidRequest` now consults. The vault's own verification of a
+recorded item in the same transaction is a lookup (1,352 gas).
+`zkapi-proof`'s `batch` module is the reference implementation of the
+transcript and the checks; the shared vectors in
+`protocol/contracts/test/fixtures/batch-verifier-vectors.json` pin both.
+The adapter is immutable per vault (`vault.proofAdapter`), so the batch
+verifier ships with the next vault deployment.
+
+`Deploy.s.sol` then deploys `ZkApiExitBatcher`
+(`protocol/contracts/src/periphery/ZkApiExitBatcher.sol`), which lands many
+exits of one kind in one transaction. It verifies every item's proof up
+front (`verify*BatchOnce`, all or nothing) and then makes each item's
+ordinary vault call (`mutualClose`, `initiateEscapeWithdrawal`,
+`challengeEscapeWithdrawal`, `raiseEscapeConcession`,
+`finalizeEscapeWithdrawal`) with exactly its kind's gas cap. An item whose
+state changed (its owner closed or escaped the note first, an escape
+already defeated or finalized) is skipped with `ItemSkipped`, as is one
+whose call runs out of its cap or whose payout push fails. The batch itself
+is never starved into a skip: after verification it requires every item's
+worst case up front (`n · cap · 64/63` plus overheads), and before each
+call that the call can get its whole cap; otherwise the whole transaction
+reverts `BatchOutOfGas`. So `eth_estimateGas` of the exact batch already
+covers destinations that burn their gas at inclusion. It is stateless,
+holds no ETH, takes no admin and is bound to one vault, so it can be
+redeployed at will. `gasBound(kinds)` returns an upper bound of a batch's
+execution gas (`VERIFY_BASE_GAS + n · VERIFY_ITEM_GAS` for the
+verification, measured on the worst case with 10% to spare, plus the
+reserve); a relayer sends at least that and never less than
+`eth_estimateGas`. The challenger batches defeats and raises through it
+([challenge operation](challenge-service.md)), and serverd's close relay
+lands cooperative closes through it ([API](api-spec.md)).
+
+Its per-kind caps are immutables chosen for the chain's gas schedule.
+`test/batch/BatcherGas.t.sol` measures each kind's vault call in a batch,
+cold: a close about 61,000, an escape 114,000, a defeat 42,000, a raise
+18,000 and a finalization 36,000. The caps add what the call may hand on: a
+close pays the treasury with up to 100,000 gas (`TREASURY_PAYOUT_GAS`) and
+the destination with all that is left, and a finalization pushes up to
+100,000 to each. Under EIP-8037 a fresh storage slot costs about 88,000
+more and a new account 158,600 more: an escape writes four fresh slots, a
+close one plus, for a never-used destination, the account. The defaults are
+therefore 250,000 (close), 250,000 (escape), 150,000 (defeat), 150,000
+(raise) and 300,000 (finalize) under EIP-2929 pricing, and 500,000, 600,000,
+150,000, 150,000 and 400,000 under EIP-8037. The script measures a fresh
+slot (`FRESH_SLOT_PROBE`, through the RPC when there is one) to choose
+between them, and `EXIT_BATCHER_*_GAS` overrides either. A cap too small for
+a kind only skips its items (their owners can always submit them alone); a
+larger cap only raises the reserve a batch must carry.
+
+Measured transaction gas per exit on this tree (21,000 + calldata +
+execution, every account cold, refunds capped at a fifth; `snapshots/exit-batcher-gas.json`):
+
+| Exit | Single | Batch of 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|---|
+| close | 307,710 | 322,077 | 231,114 | 172,960 | 143,909 | 129,395 |
+| escape | 367,185 | 381,998 | 284,908 | 226,768 | 197,723 | 183,212 |
+| defeat | 286,960 | 301,972 | 198,426 | 140,315 | 111,272 | 96,765 |
+| raise | 277,479 | 292,546 | 191,970 | 135,353 | 107,069 | 92,932 |
+| finalize | 45,063 | 49,814 | 37,520 | 32,514 | 30,011 | 28,759 |
+
+A batch of one costs 5,000 to 15,000 more than the single call, so a relayer
+with one item calls the vault directly. Manifest fields: `exitBatcher`,
+`exitBatcherRuntimeCodehash`, `exitBatcherGasSchedule` (`eip2929` or
+`eip8037`), `exitBatcherFreshSlotGas` and `exitBatcherItemGas { close,
+escape, defeat, raise, finalize }`. `expected-codehashes.mjs` derives the
+batcher's runtime code with its immutables (the vault, the adapter, the five
+caps) filled from the manifest, `--check` and `--rpc` compare
+`exit_batcher_runtime_codehash`, and `--finalize` requires its creation
+receipt (`deployTransactions.exitBatcher`). The `trusted_deployment`
+profile carries `exit_batcher_address`, `exit_batcher_runtime_codehash` and
+`exit_batcher_item_gas` (null for a manifest without the batcher), which
+serverd and the challenger read; clients ignore them.
 
 ## Runtime
 

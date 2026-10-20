@@ -29,6 +29,8 @@ import {
     deploymentInputs,
     expectedCodehashes,
     expectedRuntimeCode,
+    EXIT_BATCHER_KINDS,
+    exitBatcherImmutables,
     finalizeDeployment,
     g1Add,
     g1Mul,
@@ -109,7 +111,7 @@ const ADAPTER = '0xe7f1725e7734ce288f8367e1bb143e90bb3f0512';
 const VAULT = '0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0';
 const OWNER = '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266';
 const TREASURY = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8';
-const TX = { poseidon: `0x${'a1'.repeat(32)}`, adapter: `0x${'a2'.repeat(32)}`, vault: `0x${'a3'.repeat(32)}`, paymaster: `0x${'a4'.repeat(32)}` };
+const TX = { poseidon: `0x${'a1'.repeat(32)}`, adapter: `0x${'a2'.repeat(32)}`, vault: `0x${'a3'.repeat(32)}`, paymaster: `0x${'a4'.repeat(32)}`, batcher: `0x${'a5'.repeat(32)}` };
 const selector = signature => keccak256(new TextEncoder().encode(signature)).slice(0, 10);
 const word = addr => `0x${addr.slice(2).padStart(64, '0')}`;
 const words = values => `0x${values.map(value => BigInt(value).toString(16).padStart(64, '0')).join('')}`;
@@ -640,4 +642,87 @@ test('--check re-audits every recorded codehash, the gasless ones included', { s
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+// ------------------------------------------------------------------ the exit batcher
+
+const BATCHER = '0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9';
+const BATCHER_GAS = Object.freeze({ close: 250000, escape: 250000, defeat: 150000, raise: 150000, finalize: 300000 });
+
+/// The provisional manifest with Deploy.s.sol's exit batcher (created after the vault).
+function batcherManifest(itemGas = BATCHER_GAS) {
+    const deployment = { ...pendingManifest(), exitBatcher: BATCHER, exitBatcherItemGas: { ...itemGas } };
+    deployment.exitBatcherRuntimeCodehash = expectedCodehashes(ARTIFACTS, deploymentInputs(deployment)).exit_batcher_runtime_codehash;
+    return deployment;
+}
+
+/// The chain of `deployment` with its batcher created in the vault's block.
+function batcherChain(deployment) {
+    const fake = chain(deployment);
+    fake.state.code[BATCHER] = expectedRuntimeCode(ARTIFACTS, deploymentInputs(deployment)).exitBatcher;
+    const receipt = { transactionHash: TX.batcher, status: '0x1', blockNumber: '0x7', contractAddress: BATCHER };
+    fake.state.receipts[TX.batcher] = receipt;
+    fake.log.receipts.push({ ...receipt });
+    return fake;
+}
+
+test('the exit batcher runtime code fills exactly its immutables: the vault, its adapter and the five caps', { skip: NO_ARTIFACTS }, () => {
+    const deployment = batcherManifest();
+    const inputs = deploymentInputs(deployment);
+    const values = exitBatcherImmutables(inputs);
+    assert.deepEqual(Object.keys(values), ['vault', 'adapter', ...EXIT_BATCHER_KINDS.map(kind => `${kind}Gas`)]);
+    assert.equal(values.vault, word(VAULT).slice(2));
+    assert.equal(values.adapter, word(ADAPTER).slice(2));
+    assert.equal(values.finalizeGas, BigInt(BATCHER_GAS.finalize).toString(16).padStart(64, '0'));
+    const art = JSON.parse(readFileSync(join(ARTIFACTS, 'ZkApiExitBatcher.sol', 'ZkApiExitBatcher.json'), 'utf8'));
+    const original = art.deployedBytecode.object.replace(/^0x/, '');
+    const body = expectedRuntimeCode(ARTIFACTS, inputs).exitBatcher.slice(2);
+    assert.equal(body.length, original.length);
+    const names = new Map();
+    const visit = node => {
+        if (Array.isArray(node)) return node.forEach(visit);
+        if (!node || typeof node !== 'object') return;
+        if (node.nodeType === 'VariableDeclaration' && node.mutability === 'immutable') names.set(String(node.id), node.name);
+        for (const value of Object.values(node)) if (value && typeof value === 'object') visit(value);
+    };
+    visit(art.ast);
+    const patched = new Set();
+    for (const [id, refs] of Object.entries(art.deployedBytecode.immutableReferences)) {
+        for (const ref of refs) {
+            assert.equal(body.slice(2 * ref.start, 2 * (ref.start + ref.length)), values[names.get(id)], names.get(id));
+            for (let i = ref.start; i < ref.start + ref.length; i++) patched.add(i);
+        }
+    }
+    for (let i = 0; i < original.length / 2; i++) {
+        if (!patched.has(i)) assert.equal(body.slice(2 * i, 2 * i + 2), original.slice(2 * i, 2 * i + 2), `byte ${i}`);
+    }
+    // Every cap counts: another one is another codehash; out-of-range and missing caps are refused.
+    const other = batcherManifest({ ...BATCHER_GAS, raise: 160000 });
+    assert.notEqual(other.exitBatcherRuntimeCodehash, deployment.exitBatcherRuntimeCodehash);
+    assert.throws(() => exitBatcherImmutables({ ...inputs, exitBatcherItemGas: { ...BATCHER_GAS, close: 49999 } }), /outside 50000\.\.2000000/);
+    assert.throws(() => exitBatcherImmutables({ ...inputs, exitBatcherItemGas: { ...BATCHER_GAS, escape: undefined } }), /missing exitBatcherItemGas\.escape/);
+    // A manifest without the batcher (an earlier Deploy.s.sol) has no batcher codehash.
+    assert.equal(expectedCodehashes(ARTIFACTS, deploymentInputs(pendingManifest())).exit_batcher_runtime_codehash, undefined);
+});
+
+test('finalize records the exit batcher creation and checks its code', { skip: NO_ARTIFACTS }, async () => {
+    const deployment = batcherManifest();
+    const { manifest: final, mismatches, expected } = await finalize(deployment, batcherChain(deployment));
+    assert.deepEqual(mismatches, []);
+    assert.equal(expected.exit_batcher_runtime_codehash, deployment.exitBatcherRuntimeCodehash);
+    assert.deepEqual(final.deployTransactions, { vault: TX.vault, proofAdapter: TX.adapter, poseidonLibrary: TX.poseidon, exitBatcher: TX.batcher });
+    // A batcher on chain with other caps than the manifest's
+    const wrong = batcherChain(deployment);
+    wrong.state.code[BATCHER] = expectedRuntimeCode(ARTIFACTS, deploymentInputs(batcherManifest({ ...BATCHER_GAS, close: 120000 }))).exitBatcher;
+    const { manifest: none, mismatches: reported } = await finalize(deployment, wrong);
+    assert.equal(none, undefined);
+    assert.deepEqual(reported.map(m => `${m.source}:${m.field}`), ['rpc:exit_batcher_runtime_codehash']);
+    // Its creation must be in the log and on chain
+    const missing = batcherChain(deployment);
+    missing.log.receipts = missing.log.receipts.filter(receipt => receipt.contractAddress !== BATCHER);
+    await assert.rejects(finalize(deployment, missing), /0 receipts creating the exitBatcher/);
+    // --check compares the recorded codehash
+    const recorded = { ...deployment, exitBatcherRuntimeCodehash: `0x${'44'.repeat(32)}` };
+    const audit = await auditDeployment({ artifacts: ARTIFACTS, deployment: recorded, check: true });
+    assert.deepEqual(audit.mismatches.map(m => `${m.source}:${m.field}`), ['deployment:exit_batcher_runtime_codehash']);
 });

@@ -200,6 +200,16 @@ test('profiles come only from a finalized Deploy.s.sol manifest', () => {
         assert.throws(() => trustedDeployment({ ...finalized, deploymentStatus: status }, services), /finalized manifest/);
     }
     assert.throws(() => trustedDeployment({ ...finalized, deployBlock: undefined }, services), /deployBlock/);
+    // The exit batcher: null from a manifest without it, its pins (lowercased) from one with it.
+    assert.equal(profile.exit_batcher_address, null);
+    assert.equal(profile.exit_batcher_runtime_codehash, null);
+    assert.equal(profile.exit_batcher_item_gas, null);
+    const itemGas = { close: 250000, escape: 250000, defeat: 150000, raise: 150000, finalize: 300000 };
+    const batched = trustedDeployment({ ...finalized, exitBatcher: '0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9',
+        exitBatcherRuntimeCodehash: `0x${'66'.repeat(32)}`, exitBatcherItemGas: itemGas }, services);
+    assert.equal(batched.exit_batcher_address, '0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9');
+    assert.equal(batched.exit_batcher_runtime_codehash, `0x${'66'.repeat(32)}`);
+    assert.deepEqual(batched.exit_batcher_item_gas, itemGas);
 });
 
 test('the companion\'s proxy admits only its own basic credentials', () => {

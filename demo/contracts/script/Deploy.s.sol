@@ -10,6 +10,7 @@ import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.
 import {IEntryPoint} from "zkapi-contracts/gasless/IERC4337.sol";
 import {ZkApiWithdrawalAccountFactory} from "zkapi-contracts/gasless/ZkApiWithdrawalAccountFactory.sol";
 import {ZkApiWithdrawalPaymaster} from "zkapi-contracts/gasless/ZkApiWithdrawalPaymaster.sol";
+import {ZkApiExitBatcher} from "zkapi-contracts/periphery/ZkApiExitBatcher.sol";
 import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 import {SetupPolicy} from "./SetupPolicy.sol";
 
@@ -23,8 +24,10 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///         keys, and the vault's getters against the inputs, then (unless GASLESS=0) deploys the
 ///         gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same
 ///         broadcast, stakes it and its transit-account factory, funds its deposit and checks its
-///         getters, and writes the provisional deployment manifest, including the Poseidon address
-///         and every runtime codehash, to $OUTPUT_PATH.pending.
+///         getters, deploys the ZkApiExitBatcher of the vault (batched exits through the adapter's
+///         batch verification; stateless, permissionless and redeployable) with per-kind item gas
+///         caps for the chain's gas schedule, and writes the provisional deployment manifest,
+///         including the Poseidon address and every runtime codehash, to $OUTPUT_PATH.pending.
 /// @dev    forge runs run() locally before it sends any transaction, so every check here and the
 ///         provisional manifest describe the simulated deployment: its addresses assume the
 ///         deployer's nonces at simulation time, and deployBlockLowerBound is the chain head the
@@ -127,6 +130,17 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///                         ceilings per gas (defaults 100 gwei and 3 gwei; at most 500 gwei and
 ///                         20 gwei, and the priority ceiling must not exceed the max ceiling).
 ///           PAYMASTER_FEE_KEEPER – optional key that may re-set the fee ceilings.
+///         Batched exits (ZkApiExitBatcher, always deployed after the vault and the gasless block):
+///           EXIT_BATCHER_CLOSE_GAS, EXIT_BATCHER_ESCAPE_GAS, EXIT_BATCHER_DEFEAT_GAS,
+///           EXIT_BATCHER_RAISE_GAS, EXIT_BATCHER_FINALIZE_GAS – the gas of each kind's vault
+///                         call in a batch (50,000 to 2,000,000). Defaults follow the chain's gas
+///                         schedule, measured with FRESH_SLOT_PROBE (through the RPC when there is
+///                         one, else on forge's own EVM): under EIP-2929 storage pricing (a fresh
+///                         slot at most FRESH_SLOT_GAS_BOUND, mainnet today) 250,000, 250,000,
+///                         150,000, 150,000 and 300,000; under EIP-8037 state-creation pricing
+///                         (Sepolia today) 500,000, 600,000, 150,000, 150,000 and 400,000
+///                         (docs/deployment.md#batched-exits). The manifest records the caps and
+///                         the schedule (exitBatcherItemGas, exitBatcherGasSchedule).
 ///         Every JSON number in the manifest is a safe integer (at most 2^53 - 1, so JavaScript
 ///         reads it exactly); the four signing-key coordinates and every wei amount of the
 ///         paymaster block are decimal strings.
@@ -163,6 +177,15 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     /// mstore(0, used) and return(0, 32). It measures 22,107 under EIP-2929 storage pricing.
     uint256 internal constant FRESH_SLOT_GAS_BOUND = 25_000;
     bytes internal constant FRESH_SLOT_PROBE = hex"5a60015f555a90035f5f555f5260205ff3";
+    /// The exit batcher's default item gas caps per gas schedule (kind order close, escape, defeat,
+    /// raise, finalize): test/batch/BatcherGas.t.sol measures each kind's vault call (about 61k,
+    /// 114k, 42k, 18k and 36k cold under EIP-2929 pricing) and the caps add what the call may hand on
+    /// (a treasury push of up to 100,000, a destination's payout, a finalization's two pushes) and
+    /// the fresh slots and account EIP-8037 reprices (an escape writes four, a close one plus a
+    /// never-used destination's account).
+    uint256[5] internal BATCHER_GAS_MAINNET = [uint256(250_000), 250_000, 150_000, 150_000, 300_000];
+    uint256[5] internal BATCHER_GAS_EIP8037 = [uint256(500_000), 600_000, 150_000, 150_000, 400_000];
+
     /// Placeholder the manifest serializer writes for withdrawalPaymaster with GASLESS=0; it is
     /// replaced by a JSON null before the file is written (vm.serialize* has no null).
     string internal constant NULL_PLACEHOLDER = "__null__";
@@ -219,6 +242,14 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         address implementation;
         /// The deployer still owns the paymaster and PAYMASTER_OWNER must accept the transfer.
         bool paymasterOwnershipPending;
+        ZkApiExitBatcher batcher;
+    }
+
+    /// The exit batcher's inputs: its item gas caps and the schedule that chose their defaults.
+    struct Batcher {
+        uint256[5] itemGas;
+        uint256 freshSlotGas;
+        string schedule;
     }
 
     function run() external {
@@ -233,6 +264,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         Setup memory setup = _setup(local);
         Gasless memory g = _gasless(p, local);
         if (g.enabled) _requireSponsorableGasSchedule();
+        Batcher memory b = _batcher();
 
         address poseidonIn = vm.envOr("POSEIDON_ADDRESS", address(0));
         require(
@@ -269,6 +301,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             d.poseidon
         );
         if (g.enabled) _deployGasless(d, p, g);
+        d.batcher = new ZkApiExitBatcher(d.vault, b.itemGas);
         vm.stopBroadcast();
 
         // Before anything is written: the vault's Poseidon is the pinned runtime.
@@ -276,10 +309,11 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         _checkAdapter(d, setup);
         _checkVault(d, p);
         if (g.enabled) _checkGasless(d, p, g);
+        _checkBatcher(d, b);
         bool broadcast =
             vm.isContext(VmSafe.ForgeContext.ScriptBroadcast) || vm.isContext(VmSafe.ForgeContext.ScriptResume);
         string memory pendingPath = string.concat(outputPath, ".pending");
-        _writeManifest(pendingPath, d, p, setup, g, broadcast ? "pending" : "simulated");
+        _writeManifest(pendingPath, d, p, setup, g, b, broadcast ? "pending" : "simulated");
 
         console2.log("vault        ", address(d.vault));
         console2.log("treasury     ", p.treasury);
@@ -303,6 +337,9 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         console2.logBytes32(d.poseidon.codehash);
         if (g.enabled) _logGasless(d, g);
         else console2.log("gasless      none (GASLESS=0): withdrawalPaymaster is null");
+        console2.log("exitBatcher  ", address(d.batcher), b.schedule);
+        console2.log("exitBatcher codehash");
+        console2.logBytes32(address(d.batcher).codehash);
         console2.log("provisional manifest", pendingPath);
         if (broadcast) {
             console2.log("Not final until checked on chain. After the broadcast, run from the repository root:");
@@ -502,6 +539,58 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         console2.log("gas schedule fresh slot", freshSlotGas);
     }
 
+    /// The exit batcher's item gas caps: EXIT_BATCHER_*_GAS, else the defaults of the chain's gas
+    /// schedule, which a fresh storage slot's measured price decides (EIP-8037 above
+    /// FRESH_SLOT_GAS_BOUND).
+    function _batcher() internal returns (Batcher memory b) {
+        b.freshSlotGas = _freshSlotGas();
+        bool repriced = b.freshSlotGas > FRESH_SLOT_GAS_BOUND;
+        b.schedule = repriced ? "eip8037" : "eip2929";
+        string[5] memory names = [
+            "EXIT_BATCHER_CLOSE_GAS",
+            "EXIT_BATCHER_ESCAPE_GAS",
+            "EXIT_BATCHER_DEFEAT_GAS",
+            "EXIT_BATCHER_RAISE_GAS",
+            "EXIT_BATCHER_FINALIZE_GAS"
+        ];
+        for (uint256 k = 0; k < 5; ++k) {
+            uint256 fallbackGas = repriced ? BATCHER_GAS_EIP8037[k] : BATCHER_GAS_MAINNET[k];
+            b.itemGas[k] = vm.envOr(names[k], fallbackGas);
+            require(
+                b.itemGas[k] >= 50_000 && b.itemGas[k] <= 2_000_000,
+                string.concat(names[k], " must be between 50000 and 2000000")
+            );
+        }
+    }
+
+    /// What one write of a nonzero word to a cold, zero slot costs on the target chain:
+    /// FRESH_SLOT_PROBE's creation through the RPC (eth_call), or, without one (a dry run), on
+    /// forge's own EVM, where the probe's runtime code is the 32-byte measurement.
+    function _freshSlotGas() internal returns (uint256 freshSlotGas) {
+        try vm.rpc("eth_call", string.concat('[{"data":"', vm.toString(FRESH_SLOT_PROBE), '"},"latest"]')) returns (
+            bytes memory result
+        ) {
+            require(result.length == 32, "fresh-slot probe: unexpected eth_call result");
+            return abi.decode(result, (uint256));
+        } catch {
+            address probe = _create(FRESH_SLOT_PROBE);
+            bytes memory measured = probe.code;
+            require(measured.length == 32, "fresh-slot probe: unexpected local result");
+            return abi.decode(measured, (uint256));
+        }
+    }
+
+    /// Post-deploy checks of the exit batcher: bound to this vault and its adapter, which reports
+    /// the batch interface (the constructor checked it), with the chosen caps.
+    function _checkBatcher(Deployed memory d, Batcher memory b) internal view {
+        ZkApiExitBatcher batcher = d.batcher;
+        require(address(batcher.vault()) == address(d.vault), "exitBatcher vault");
+        require(address(batcher.adapter()) == address(d.adapter), "exitBatcher adapter");
+        for (uint8 kind = 0; kind < 5; ++kind) {
+            require(batcher.itemGas(kind) == b.itemGas[kind], "exitBatcher item gas");
+        }
+    }
+
     /// Deploys the paymaster (which deploys the factory, which deploys the account logic), stakes
     /// both with the EntryPoint and funds the float, inside the broadcast. The first stake may only
     /// be set by the paymaster's owner, so when PAYMASTER_OWNER is not the deployer the paymaster
@@ -695,6 +784,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         Params memory p,
         Setup memory setup,
         Gasless memory g,
+        Batcher memory b,
         string memory status
     ) internal {
         ZkApiVault vault = d.vault;
@@ -737,6 +827,16 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeString(m, "stateSigningKeyY", vm.toString(p.stateKeyY));
         vm.serializeString(m, "clearanceSigningKeyX", vm.toString(p.clearanceKeyX));
         vm.serializeString(m, "clearanceSigningKeyY", vm.toString(p.clearanceKeyY));
+        vm.serializeAddress(m, "exitBatcher", address(d.batcher));
+        vm.serializeBytes32(m, "exitBatcherRuntimeCodehash", address(d.batcher).codehash);
+        vm.serializeString(m, "exitBatcherGasSchedule", b.schedule);
+        vm.serializeUint(m, "exitBatcherFreshSlotGas", b.freshSlotGas);
+        string memory itemGas = "exitBatcherItemGas";
+        vm.serializeUint(itemGas, "close", b.itemGas[0]);
+        vm.serializeUint(itemGas, "escape", b.itemGas[1]);
+        vm.serializeUint(itemGas, "defeat", b.itemGas[2]);
+        vm.serializeUint(itemGas, "raise", b.itemGas[3]);
+        vm.serializeString(m, "exitBatcherItemGas", vm.serializeUint(itemGas, "finalize", b.itemGas[4]));
         if (g.enabled) _serializeGasless(m, d, p, g);
         else vm.serializeString(m, "withdrawalPaymaster", NULL_PLACEHOLDER);
         string memory serialized = vm.serializeUint(m, "noteTtl", uint256(p.noteTtl));

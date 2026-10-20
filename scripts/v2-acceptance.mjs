@@ -377,6 +377,11 @@ export function trustedDeployment(finalized, services) {
         verifier_url: services.verifierUrl,
         openrouter_inference_base: services.inferenceBase,
         gasless: gaslessProfile(finalized, services.bundlerUrl ?? null),
+        // The deployment's ZkApiExitBatcher (serverd's close relay and the challenger's batched
+        // defeats and raises; clients ignore it), null for a manifest from before the batcher.
+        exit_batcher_address: finalized.exitBatcher ? finalized.exitBatcher.toLowerCase() : null,
+        exit_batcher_runtime_codehash: finalized.exitBatcher ? finalized.exitBatcherRuntimeCodehash : null,
+        exit_batcher_item_gas: finalized.exitBatcher ? { ...finalized.exitBatcherItemGas } : null,
     };
 }
 
