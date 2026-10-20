@@ -12,11 +12,26 @@ export function parseChainId(value) {
 // successor nullifier, a raise by one at its escaped nullifier, and the
 // retirement of a closed note's leaf after a missed defeat. The revision-2
 // challenge with siblings (0x8a43467c) is refused.
-const REQUEST_INPUTS = '(uint16 protocolVersion,uint64 chainId,address contractAddress,uint256 activeRoot,uint256 stateSigningKeyX,uint256 stateSigningKeyY,uint64 requestTime,uint128 solvencyBound,uint256 requestNullifier,uint256 authorizationTag,uint256 anonymousCommitmentX,uint256 anonymousCommitmentY) inputs';
+const REQUEST_TUPLE = '(uint16 protocolVersion,uint64 chainId,address contractAddress,uint256 activeRoot,uint256 stateSigningKeyX,uint256 stateSigningKeyY,uint64 requestTime,uint128 solvencyBound,uint256 requestNullifier,uint256 authorizationTag,uint256 anonymousCommitmentX,uint256 anonymousCommitmentY)';
+const REQUEST_INPUTS = `${REQUEST_TUPLE} inputs`;
 export const CHALLENGE_ABI = `function challengeEscapeWithdrawal(uint32 noteId,${REQUEST_INPUTS},bytes proof)`;
 export const RAISE_ABI = `function raiseEscapeConcession(uint32 noteId,${REQUEST_INPUTS},bytes proof,uint128 amount)`;
 export const RETIRE_ABI = 'function retireClosedLeaf(uint32 noteId,uint256[32] siblings)';
 export const vaultInterface = new Interface([CHALLENGE_ABI, RAISE_ABI, RETIRE_ABI]);
+// The deployment's permissionless exit batcher (ZkApiExitBatcher), when
+// ZKAPI_CHALLENGE_EXIT_BATCHER names it: zkapi-challenged batches defeats
+// (amount 0) and raises through its challengeBatch, which verifies every
+// proof once and makes one ordinary vault call per item, skipping an item the
+// vault refuses. Only that call is signed for it, and only while its vault()
+// is the configured vault.
+export const CHALLENGE_BATCH_ABI = `function challengeBatch(uint32[] noteIds,uint128[] amounts,${REQUEST_TUPLE}[] inputs,bytes proofs) returns (uint256 applied)`;
+export const batcherInterface = new Interface([CHALLENGE_BATCH_ABI, 'function vault() view returns (address)']);
+export const DEFAULT_BATCH_MAX_ITEMS = 16n;
+// The batcher's MAX_ITEMS(): its applied bitmap has one bit per item.
+export const BATCH_MAX_ITEMS_LIMIT = 64n;
+// challengeBatch calldata of n items: selector, 4 offsets, 3 lengths, and per
+// item a note ID, an amount, 12 request words and 8 proof words.
+const batchCalldataBytes = items => 4 + 32 * (8 + 22 * Number(items));
 export const GWEI = 1_000_000_000n;
 export const DEFAULT_SEPOLIA_MAX_FEE_PER_GAS = 10n * GWEI;
 export const DEFAULT_PRIORITY_FEE_PER_GAS = 1n * GWEI;
@@ -145,7 +160,19 @@ export function parseSignerConfig(env) {
     maxRetirementsPerDay: envCount(env, 'ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY', MAX_RETIREMENTS_PER_DAY_LIMIT),
     retireOnMiss: envBoolean(env, 'ZKAPI_CHALLENGE_RETIRE_ON_MISS'),
     retirementLookbackBlocks: envLookback(env, 'ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS'),
+    // Unset or empty: no batcher, so only single vault calls are signed.
+    exitBatcher: env.ZKAPI_CHALLENGE_EXIT_BATCHER || undefined,
+    batchMaxItems: envBatchItems(env, 'ZKAPI_CHALLENGE_BATCH_MAX_ITEMS'),
   };
+}
+// The most items of a signed batch, 2 to BATCH_MAX_ITEMS_LIMIT: unset or empty
+// means the default.
+function envBatchItems(env, name) {
+  const value = envInteger(env, name);
+  if (value !== undefined && (value < 2n || value > BATCH_MAX_ITEMS_LIMIT)) {
+    throw new ConfigError(`${name} must be a decimal integer from 2 to ${BATCH_MAX_ITEMS_LIMIT}`);
+  }
+  return value;
 }
 
 // Upstream exceptions are never returned or logged: provider errors can contain
@@ -177,7 +204,7 @@ export function createUpstream(url, { timeoutMs = UPSTREAM_TIMEOUT_MS } = {}) {
   };
 }
 
-export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, retireOnMiss, retirementLookbackBlocks, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
+export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, retireOnMiss, retirementLookbackBlocks, exitBatcher, batchMaxItems, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
   requireValid(Object.keys(unsupported).length === 0, 'Unsupported signer option');
   requireValid(chainId === 1n || chainId === 11155111n, 'Explicit challenge chain ID must be 1 or 11155111');
   // Mainnet never inherits the testnet default; null counts as unset.
@@ -189,6 +216,10 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   const sender = wallet.address.toLowerCase();
   const destination = address(vault);
   requireValid(destination !== '0x0000000000000000000000000000000000000000', 'Vault must be nonzero');
+  const batcher = exitBatcher == null ? null : address(exitBatcher);
+  requireValid(batcher !== '0x0000000000000000000000000000000000000000' && batcher !== destination, 'Exit batcher must be nonzero and not the vault');
+  batchMaxItems ??= DEFAULT_BATCH_MAX_ITEMS;
+  requireValid(typeof batchMaxItems === 'bigint' && batchMaxItems >= 2n && batchMaxItems <= BATCH_MAX_ITEMS_LIMIT, 'Batch item limit is invalid');
   requireValid(typeof maxGas === 'bigint' && maxGas > 0n && maxGas <= 16_777_216n, 'Gas limit cap is invalid');
   const positive = value => typeof value === 'bigint' && value > 0n;
   requireValid(positive(feeCeiling) && feeCeiling <= ABSOLUTE_FEE_CEILING, 'Fee ceiling is invalid');
@@ -218,6 +249,8 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     max_gas: hex(maxGas), required_balance: hex(maxGas * maxFeePerGas),
     max_retirements_per_day: Number(maxRetirementsPerDay),
     retire_on_miss: retireOnMiss, retirement_lookback_blocks: Number(retirementLookbackBlocks),
+    // zkapi-challenged batches only through this batcher (null: none).
+    exit_batcher: batcher, batch_max_items: Number(batchMaxItems),
   });
 
   // The leaf retirements broadcast (or possibly broadcast) in the last
@@ -345,6 +378,20 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     const upstream = upstreamQuantity(await rpc('eth_chainId', []), 'Upstream RPC returned an invalid chain ID');
     if (upstream !== chainId) throw new RpcError(-32000, 'Upstream RPC does not match the configured chain', 'upstream_chain_mismatch');
   }
+  // The batcher must be bound to the configured vault: its immutable vault()
+  // is read once, at startup (fatal on a mismatch) or before the first batch.
+  let batcherBound = false;
+  async function checkBatcher() {
+    if (batcher === null || batcherBound) return;
+    const result = await rpc('eth_call', [{ to: batcher, data: batcherInterface.encodeFunctionData('vault', []) }, 'latest']);
+    let bound;
+    try { [bound] = batcherInterface.decodeFunctionResult('vault', result); }
+    catch { throw new RpcError(-32000, 'Upstream RPC returned an invalid exit batcher vault', 'upstream_unavailable'); }
+    if (address(bound) !== destination) {
+      throw new RpcError(-32003, 'The exit batcher is bound to another vault', 'batcher_vault_mismatch', {});
+    }
+    batcherBound = true;
+  }
   // There is no legacy pricing fallback: a block without a base fee fails closed.
   async function latestBaseFee() {
     const block = await rpc('eth_getBlockByNumber', ['latest', false]);
@@ -389,7 +436,8 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     requireValid(tx && typeof tx === 'object' && !Array.isArray(tx), 'Expected transaction object');
     requireValid(Object.keys(tx).every(key => transactionFields.has(key)), 'Unsupported transaction field');
     requireValid(address(tx.from) === sender, 'Sender is not authorized');
-    requireValid(address(tx.to) === destination, 'Destination is not authorized');
+    const to = address(tx.to);
+    requireValid(to === destination || (batcher !== null && to === batcher), 'Destination is not authorized');
     requireValid(tx.value === undefined || quantity(tx.value, 'value') === 0n, 'Value must be zero');
     requireValid(tx.chainId === undefined || quantity(tx.chainId, 'chain ID') === chainId, 'Chain ID does not match the configured chain');
     const gasLimit = quantity(tx.gas, 'gas');
@@ -398,18 +446,46 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     const nonce = quantity(tx.nonce, 'nonce');
     requireValid(nonce <= BigInt(Number.MAX_SAFE_INTEGER), 'Nonce is too large');
     const { maxFee, tip } = requestedFees(tx);
-    requireValid(isHexString(tx.data) && tx.data.length <= 16_386, 'Invalid calldata');
+    const batch = to !== destination;
+    const maxData = batch ? 2 + 2 * batchCalldataBytes(BATCH_MAX_ITEMS_LIMIT) : 16_386;
+    requireValid(isHexString(tx.data) && tx.data.length <= maxData, 'Invalid calldata');
+    const call = batch ? parseBatch(tx.data) : parseVaultCall(tx.data);
+    return { call, transaction: { type: 2, to, data: tx.data, value: 0n, chainId, gasLimit, nonce: Number(nonce), maxFeePerGas: maxFee, maxPriorityFeePerGas: tip, accessList: [] } };
+  }
+  // A request proof must be this deployment's.
+  function requireDeploymentInputs(inputs) {
+    requireValid(inputs.protocolVersion === 2n && inputs.chainId === chainId && address(inputs.contractAddress) === destination, 'Challenge proof targets another deployment');
+  }
+  function parseVaultCall(data) {
     let call;
     try {
-      call = vaultInterface.parseTransaction({ data: tx.data });
-      if (!call || vaultInterface.encodeFunctionData(call.fragment, call.args).toLowerCase() !== tx.data.toLowerCase()) throw new Error();
+      call = vaultInterface.parseTransaction({ data });
+      if (!call || vaultInterface.encodeFunctionData(call.fragment, call.args).toLowerCase() !== data.toLowerCase()) throw new Error();
     } catch { throw new RpcError(-32602, 'Only canonical challengeEscapeWithdrawal, raiseEscapeConcession and retireClosedLeaf calls are authorized'); }
     if (call.name !== 'retireClosedLeaf') {
       // A defeat or raise carries a request proof, which must be this deployment's.
-      requireValid(call.args.inputs.protocolVersion === 2n && call.args.inputs.chainId === chainId && address(call.args.inputs.contractAddress) === destination, 'Challenge proof targets another deployment');
+      requireDeploymentInputs(call.args.inputs);
       requireValid(isHexString(call.args.proof, 256), 'Challenge requires a 256-byte Groth16 proof');
     }
-    return { type: 2, to: destination, data: tx.data, value: 0n, chainId, gasLimit, nonce: Number(nonce), maxFeePerGas: maxFee, maxPriorityFeePerGas: tip, accessList: [] };
+    return call;
+  }
+  // A batch of 2 to batchMaxItems defeats (amount 0) and raises of distinct
+  // notes, each with this deployment's request proof: the challenger sends a
+  // lone item as a single vault call.
+  function parseBatch(data) {
+    let call;
+    try {
+      call = batcherInterface.parseTransaction({ data });
+      if (!call || call.name !== 'challengeBatch' || batcherInterface.encodeFunctionData(call.fragment, call.args).toLowerCase() !== data.toLowerCase()) throw new Error();
+    } catch { throw new RpcError(-32602, 'Only canonical challengeBatch calls are authorized for the exit batcher'); }
+    const { noteIds, amounts, inputs, proofs } = call.args;
+    const items = noteIds.length;
+    requireValid(items >= 2 && BigInt(items) <= batchMaxItems, 'Batch size is outside the configured bounds', 'batch_size_out_of_bounds', { batch_max_items: hex(batchMaxItems) });
+    requireValid(amounts.length === items && inputs.length === items, 'Batch arrays differ in length');
+    requireValid(isHexString(proofs, 256 * items), 'Batch requires one 256-byte Groth16 proof per item');
+    requireValid(new Set(noteIds.map(String)).size === items, 'Batch repeats a note');
+    for (const item of inputs) requireDeploymentInputs(item);
+    return call;
   }
 
   async function simulate(call) {
@@ -431,8 +507,8 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   // From the broadcast on, the only failures are broadcast_ambiguous with the
   // hash and upstream_tx_fee_cap, which the node answers before its pool.
   async function signAndSend(tx) {
-    const transaction = validateTransaction(tx);
-    const call = vaultInterface.parseTransaction({ data: transaction.data });
+    const { call, transaction } = validateTransaction(tx);
+    const batch = call.name === 'challengeBatch';
     const retiredNote = call.name === 'retireClosedLeaf' ? call.args.noteId.toString(10) : null;
     if (retiredNote !== null && !retireOnMiss) {
       throw new RpcError(-32003, 'Leaf retirements are off (ZKAPI_CHALLENGE_RETIRE_ON_MISS=false)', 'retirement_disabled');
@@ -447,12 +523,22 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       });
     }
     await checkChain();
+    if (batch) await checkBatcher();
     if (newRetirement) {
       await requireNoRetirementInFlight(retiredNote);
       await requireEscapeFinalized(retiredNote);
     }
-    const simulation = { from: sender, to: destination, data: transaction.data, value: '0x0' };
-    await simulate(() => rpc('eth_call', [simulation, 'latest']));
+    const simulation = { from: sender, to: transaction.to, data: transaction.data, value: '0x0' };
+    const simulated = await simulate(() => rpc('eth_call', [simulation, 'latest']));
+    if (batch) {
+      // A batch never reverts on an item the vault refuses, it skips it: one
+      // whose every item would be skipped (escapes already resolved) only
+      // burns the verification gas, so it is refused.
+      let applied;
+      try { [applied] = batcherInterface.decodeFunctionResult('challengeBatch', simulated); }
+      catch { throw new RpcError(-32000, 'Challenge simulation failed', 'simulation_failed'); }
+      if (applied === 0n) throw new RpcError(-32003, 'No item of the batch would apply', 'batch_applies_nothing');
+    }
     const estimate = upstreamQuantity(await simulate(() => rpc('eth_estimateGas', [simulation])), 'Upstream RPC returned an invalid gas estimate');
     requireValid(estimate <= transaction.gasLimit, 'Gas limit is below current estimate', 'gas_estimate_exceeds_limit', { estimate: hex(estimate) });
     const [{ baseFee }, balance] = await Promise.all([latestBaseFee(), senderBalance()]);
@@ -470,7 +556,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       signed = Transaction.from(raw);
     } catch { throw new RpcError(-32603, 'Signer self-check failed'); }
     const hash = keccak256(raw);
-    if (signed.type !== 2 || signed.hash !== hash || signed.from?.toLowerCase() !== sender || signed.to?.toLowerCase() !== destination
+    if (signed.type !== 2 || signed.hash !== hash || signed.from?.toLowerCase() !== sender || signed.to?.toLowerCase() !== transaction.to
         || signed.data.toLowerCase() !== transaction.data.toLowerCase() || signed.value !== 0n || signed.chainId !== chainId
         || signed.nonce !== transaction.nonce || signed.gasLimit !== transaction.gasLimit
         || signed.maxFeePerGas !== transaction.maxFeePerGas || signed.maxPriorityFeePerGas !== transaction.maxPriorityFeePerGas
@@ -499,7 +585,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   }
 
   return {
-    sender, vault: destination, chainId, policy, checkChain, status,
+    sender, vault: destination, chainId, policy, checkChain, checkBatcher, status,
     retirementStatus: () => {
       const { refused_recently: _, ...retirement } = retirementStatus();
       return retirement;

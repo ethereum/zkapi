@@ -12,6 +12,13 @@ canonical ABI encoding, for one configured vault and explicitly configured chain
 | `raiseEscapeConcession(uint32, RequestPublicInputs, bytes, uint128)` | `0xdd0064ba` | Raise an escape's concession with a request proof at its escaped nullifier. |
 | `retireClosedLeaf(uint32, uint256[32])` | `0xe41f4c31` | Retire a closed note's leaf after a missed defeat. |
 
+With `ZKAPI_CHALLENGE_EXIT_BATCHER` set, it also signs one call to the
+deployment's exit batcher (see [Batched challenges](#batched-challenges)):
+
+| Call | Selector | Purpose |
+| --- | --- | --- |
+| `challengeBatch(uint32[], uint128[], RequestPublicInputs[], bytes)` | `0xab41c746` | Defeat (amount 0) and raise several escapes in one transaction. |
+
 The revision-2 challenge with a Merkle path (`0x8a43467c`) and every other
 vault call are refused, so this signer cannot serve an earlier challenger or
 vault: run it only in the stack of a concession-exit vault. It decodes the
@@ -48,6 +55,8 @@ leading zeros are refused, and an empty value means the default.
 | `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | `true`; `true` or `false` | The operator's retire-on-miss policy (design §5.4). Keep it equal to the challenger's `ZKAPI_CHALLENGE_RETIRE_ON_MISS` in `deployment.env`; `false` refuses every leaf retirement with `retirement_disabled`. |
 | `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` | 50,400 (about 7 days of 12 s blocks); 1 to 5,000,000 | How far back a leaf retirement's note must show an `EscapeWithdrawalFinalized` log. See [Retirement policy and budget](#retirement-policy-and-budget). |
 | `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` | 2; 0 to 1,000 | Nonces on which the signer signs a leaf retirement (`retireClosedLeaf`) per rolling 24 hours; fee replacements on a counted nonce are free, and 0 refuses every retirement. See [Retirement policy and budget](#retirement-policy-and-budget). |
+| `ZKAPI_CHALLENGE_EXIT_BATCHER` | none | The deployment's exit batcher (the manifest's `exit_batcher_address`). Unset or empty: batches are refused. See [Batched challenges](#batched-challenges). |
+| `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` | 16; 2 to 64 | The most items of a signed batch. Keep it at least the challenger's `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS`. |
 | `ZKAPI_CHALLENGE_LISTEN_HOST`, `ZKAPI_CHALLENGE_PORT` | `127.0.0.1`, `8547` | Bind address. Compose sets the host to `0.0.0.0` on its private backend network and publishes no signer port. |
 | `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` | removed | Startup refuses while it is present, even when empty, because its meaning changed. |
 
@@ -69,6 +78,38 @@ the highest `maxFeePerGas` a `MAX_GAS` transaction can bid within it. It
 refuses to start when the upstream is unreachable, reports another chain or
 returns a block without a base fee; balance and fee warnings do not block
 startup.
+
+## Batched challenges
+
+`zkapi-challenged` sends defeats and raises that are not near their deadline
+together through the deployment's permissionless `ZkApiExitBatcher`, whose
+`challengeBatch` verifies every proof once and then makes one ordinary vault
+call per item, skipping an item the vault refuses
+([batched defeats and raises](../../../docs/challenge-service.md#batched-defeats-and-raises)).
+With `ZKAPI_CHALLENGE_EXIT_BATCHER` set to the manifest's
+`exit_batcher_address`, the signer signs such a call only when:
+
+- the batcher's `vault()` is `ZKAPI_CHALLENGE_VAULT`. It reads it at startup
+  and refuses to start otherwise (`batcher_vault_mismatch`); a signer created
+  without that check reads it before its first batch;
+- the calldata is canonical `challengeBatch` ABI of 2 to
+  `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` items (`batch_size_out_of_bounds`), with
+  arrays of equal length, one 256-byte proof per item, no note twice, and every
+  item's request proof naming this deployment (protocol version 2, this chain,
+  this vault);
+- its simulation applies at least one item: a batch whose every item the vault
+  would refuse (all already resolved) only burns the verification gas and is
+  refused (`batch_applies_nothing`). A batch with some items skipped, such as a
+  fee replacement after another party resolved some of them, is signed.
+
+The gas limit cap, fee and tip caps, transaction fee cap, balance check,
+estimate check and nonce handling are those of the single calls. `/health` and
+`zkapi_signerStatus` report `exit_batcher` (null without one) and
+`batch_max_items`; the challenger batches only when the signer reports the
+manifest's batcher, and at most `batch_max_items` items. A batch is refused
+before any upstream call when the signer has no batcher (`Destination is not
+authorized`), which the challenger takes as a reason to send single calls until
+it restarts.
 
 ## Fee model
 

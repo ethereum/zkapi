@@ -57,6 +57,7 @@ fn build_adapter(directory: &Path) -> String {
         "foundry.toml",
         "src/libraries/Types.sol",
         "src/interfaces/IZkApiProofAdapter.sol",
+        "src/interfaces/IZkApiBatchProofAdapter.sol",
     ] {
         let target = directory.join(relative);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();

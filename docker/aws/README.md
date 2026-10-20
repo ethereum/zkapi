@@ -214,6 +214,23 @@ note whose escape finalized within `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS`
 (default 50,400; `retirement_not_after_escape` otherwise), never for one closed
 by a mutual close or an expiry claim.
 
+When the deployment manifest names an exit batcher (`exit_batcher_address`),
+the challenger batches defeats and raises that are not near their deadline
+through its `challengeBatch` (see
+[batched defeats and raises](../../docs/challenge-service.md#batched-defeats-and-raises)).
+Set `ZKAPI_CHALLENGE_EXIT_BATCHER` in `signer.env` to that address: the signer
+then also signs canonical `challengeBatch` calls to it, of 2 to
+`ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` (default 16, at most 64) distinct notes, each
+with this deployment's 256-byte request proof, only while the batcher's
+`vault()` is `ZKAPI_CHALLENGE_VAULT` (checked at startup, which fails with
+`batcher_vault_mismatch` otherwise), and never one whose simulation applies no
+item (`batch_applies_nothing`). Gas, fee, transaction fee and balance bounds
+are those of every call. Without the variable the signer reports
+`exit_batcher: null` and refuses batches, and the challenger, which reads that
+from `zkapi_signerStatus`, keeps every call single and warns on `/status`. Keep
+`ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` at least the challenger's: it batches at most
+the lower of the two.
+
 The node behind the signer refuses to relay a transaction whose gas limit x
 `maxFeePerGas` exceeds its RPC fee cap, `--rpc.txfeecap`, which is 1 ETH by
 default in geth and reth. `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` (decimal wei, default
@@ -232,6 +249,7 @@ allows at the default 1 ETH are:
 | Defeat (`challengeEscapeWithdrawal`) | 600,000, or the estimate plus 20% when higher | about 1,666 gwei |
 | Raise (`raiseEscapeConcession`) | 450,000, or the estimate plus 20% when higher | about 2,222 gwei |
 | Leaf retirement (`retireClosedLeaf`, after a missed defeat) | the estimate plus 20%, about 7.2M | about 138.9 gwei |
+| Batch of n defeats and raises (`challengeBatch`) | the batcher's `gasBound(kinds)` plus intrinsic and calldata gas, or the estimate plus 20% when higher; about 3M for 16 items at the Mainnet item caps | about 333 gwei for 16 items |
 
 Defeats and raises are deadline-bound and fit any realistic fee cap at 1 ETH.
 A leaf retirement has no deadline; to let it bid a fee cap above about 138.9
@@ -278,6 +296,10 @@ The challenger also reads from `deployment.env` (see
 | `ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS` | Default 21600 (Mainnet and Sepolia); 1800 for the drill. An escape whose charge is still unsettled is raised to its proof's solvency bound at its deadline minus this. Startup refuses unless `LEASE_TTL_SECONDS + SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS` + this + 4 x 2 + 1200 is at most `challengePeriod()`. |
 | `ZKAPI_CHALLENGE_RAISE_MIN_UNITS` | Optional; default 0. The smallest raise, in gwei, worth its gas. |
 | `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 7.2M gas), within the signer's `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`. Set the same value in `signer.env`: the signer refuses retirements when it is `false`, and signs one only for a note an escape finalized within its `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS`. |
+| `ZKAPI_CHALLENGE_BATCHING` | Optional; default `true`. Batch defeats and raises through the manifest's exit batcher; `false`, or a manifest without `exit_batcher_address`, keeps every call single. Batches also need `ZKAPI_CHALLENGE_EXIT_BATCHER` in `signer.env`. |
+| `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` | Optional; default 16, 2 to the batcher's `MAX_ITEMS()` (64). A batch flushes once it holds this many items. |
+| `ZKAPI_CHALLENGE_BATCH_MAX_AGE_SECONDS` | Optional; default 600. A batch flushes once its oldest item has waited this long. |
+| `ZKAPI_CHALLENGE_BATCH_DEADLINE_MARGIN_SECONDS` | Optional; default 1800. A batch flushes at once when an item's deadline is within the critical threshold (`challengePeriod()` / 4) plus this; within the critical threshold every defeat and raise is single. |
 
 The launcher passes the server's settlement window (`LEASE_TTL_SECONDS +
 SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS`, which
@@ -285,7 +307,9 @@ may not exceed the manifest's `settlement_window_seconds`) and the mounted
 manifest to the challenger. At startup it checks the manifest against the vault:
 `CONCESSION_ESCAPE_VERSION() == 1`, `ROOT_HISTORY_WINDOW() == 86400`, the
 adapter's circuit and verifying-key hashes, the three runtime codehashes and
-`challengePeriod()`, and the timing checks above. It retries a failed RPC read
+`challengePeriod()`, and the timing checks above; with batching on, also the
+exit batcher's runtime codehash, its `vault()` and `adapter()`, its item gas
+caps and its `MAX_ITEMS()`. It retries a failed RPC read
 and exits on a mismatch.
 
 The launcher binds the daemon's status listener to `127.0.0.1:3002` inside the

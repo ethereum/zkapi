@@ -30,7 +30,8 @@ export function createHttpServer(signer) {
       const chunks = [];
       for await (const chunk of request) {
         size += chunk.length;
-        if (size > 65_536) throw new RpcError(-32600, 'Request body is too large');
+        // A 64-item challengeBatch is about 90,000 hex digits.
+        if (size > 262_144) throw new RpcError(-32600, 'Request body is too large');
         chunks.push(chunk);
       }
       let payload;
@@ -63,6 +64,8 @@ async function main() {
   // Fails on a wrong chain or a block without a base fee. A low balance or a
   // base fee above the cap only warns: the challenger waits for a healthy signer.
   const status = await signer.status();
+  // Fails when the configured exit batcher is bound to another vault.
+  await signer.checkBatcher();
   const server = createHttpServer(signer);
   server.requestTimeout = 30_000;
   server.headersTimeout = 10_000;
@@ -77,6 +80,7 @@ async function main() {
       max_gas: decimal(status.max_gas), required_balance_wei: decimal(status.required_balance), balance_wei: decimal(status.balance),
       max_retirements_per_day: status.max_retirements_per_day, retire_on_miss: status.retire_on_miss,
       retirement_lookback_blocks: status.retirement_lookback_blocks,
+      exit_batcher: status.exit_batcher, batch_max_items: status.batch_max_items,
       base_fee_per_gas_wei: decimal(status.base_fee_per_gas), warnings: status.warnings,
     }));
   });

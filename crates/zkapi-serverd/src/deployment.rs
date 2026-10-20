@@ -18,6 +18,14 @@
 //!   equal the manifest's.
 //!
 //! Every probe fails closed.
+//!
+//! A manifest may also name the deployment's permissionless exit batcher
+//! (`ZkApiExitBatcher`, optional: manifests from before it have none, which
+//! means batching is unavailable and every exit or challenge is a single
+//! vault call). A component that batches through it first runs
+//! `probe_exit_batcher`: the batcher's runtime codehash is the manifest's, it
+//! is bound to the manifest's vault and adapter, and its per-kind item gas
+//! caps are the ones the manifest pins.
 
 use std::path::Path;
 
@@ -42,6 +50,68 @@ pub const PROOF_ADAPTER_SELECTOR: &str = "0xefc91e58"; // proofAdapter()
 pub const CIRCUIT_ID_HASH_SELECTOR: &str = "0xda0e8385"; // CIRCUIT_ID_HASH()
 pub const REQUEST_VK_HASH_SELECTOR: &str = "0xfe351488"; // REQUEST_VK_HASH()
 pub const WITHDRAWAL_VK_HASH_SELECTOR: &str = "0x7fcd0926"; // WITHDRAWAL_VK_HASH()
+pub const EXIT_BATCHER_VAULT_SELECTOR: &str = "0xfbfa77cf"; // vault()
+pub const EXIT_BATCHER_ADAPTER_SELECTOR: &str = "0x03eadcfc"; // adapter()
+pub const EXIT_BATCHER_MAX_ITEMS_SELECTOR: &str = "0x57d4c4ee"; // MAX_ITEMS()
+pub const EXIT_BATCHER_ITEM_GAS_SELECTOR: &str = "0x3b2fee5c"; // itemGas(uint8)
+/// The most items a `ZkApiExitBatcher` call may carry (its `MAX_ITEMS()`,
+/// which the probe reads; the bitmap it returns has one bit per item).
+pub const EXIT_BATCHER_MAX_ITEMS: u64 = 64;
+
+/// The item kinds of `ZkApiExitBatcher` (`uint8`), in its order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExitBatchKind {
+    Close = 0,
+    Escape = 1,
+    Defeat = 2,
+    Raise = 3,
+    Finalize = 4,
+}
+
+impl ExitBatchKind {
+    pub const ALL: [Self; 5] = [
+        Self::Close,
+        Self::Escape,
+        Self::Defeat,
+        Self::Raise,
+        Self::Finalize,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Close => "close",
+            Self::Escape => "escape",
+            Self::Defeat => "defeat",
+            Self::Raise => "raise",
+            Self::Finalize => "finalize",
+        }
+    }
+}
+
+/// The per-kind item gas caps a deployment's exit batcher was built with
+/// (`exit_batcher_item_gas`): immutables of its runtime code, chain-specific
+/// (larger under EIP-8037).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExitBatcherItemGas {
+    pub close: u64,
+    pub escape: u64,
+    pub defeat: u64,
+    pub raise: u64,
+    pub finalize: u64,
+}
+
+impl ExitBatcherItemGas {
+    pub fn of(&self, kind: ExitBatchKind) -> u64 {
+        match kind {
+            ExitBatchKind::Close => self.close,
+            ExitBatchKind::Escape => self.escape,
+            ExitBatchKind::Defeat => self.defeat,
+            ExitBatchKind::Raise => self.raise,
+            ExitBatchKind::Finalize => self.finalize,
+        }
+    }
+}
 
 /// The fields of a deployment profile the server stack uses. Other fields
 /// of the profile are ignored.
@@ -76,6 +146,19 @@ pub struct DeploymentManifest {
     pub exit_concession: Option<u64>,
     #[serde(default)]
     pub vault_revision: Option<u64>,
+    /// The deployment's `ZkApiExitBatcher`, bound to this vault and its
+    /// adapter. None in manifests from before the batcher (or a JSON null):
+    /// batching is unavailable and every call stays a single vault call.
+    /// `exitBatcher` is the spelling of Deploy.s.sol's provisional manifest.
+    #[serde(default, alias = "exitBatcher")]
+    pub exit_batcher_address: Option<String>,
+    /// Required with `exit_batcher_address`.
+    #[serde(default, alias = "exitBatcherRuntimeCodehash")]
+    pub exit_batcher_runtime_codehash: Option<String>,
+    /// The batcher's per-kind item gas caps; optional, checked on chain when
+    /// present (the runtime codehash pins them anyway).
+    #[serde(default, alias = "exitBatcherItemGas")]
+    pub exit_batcher_item_gas: Option<ExitBatcherItemGas>,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +268,37 @@ impl DeploymentManifest {
             ),
         ] {
             *value = hash32(value, field)?;
+        }
+        match (
+            manifest.exit_batcher_address.take(),
+            manifest.exit_batcher_runtime_codehash.take(),
+        ) {
+            (Some(batcher), Some(codehash)) => {
+                let batcher = address(&batcher, "exit_batcher_address")?;
+                ensure!(
+                    batcher != manifest.contract_address
+                        && batcher != manifest.proof_adapter_address,
+                    "deployment manifest exit_batcher_address is the vault or the adapter"
+                );
+                manifest.exit_batcher_address = Some(batcher);
+                manifest.exit_batcher_runtime_codehash =
+                    Some(hash32(&codehash, "exit_batcher_runtime_codehash")?);
+            }
+            (Some(_), None) => bail!(
+                "deployment manifest names an exit_batcher_address without its \
+                 exit_batcher_runtime_codehash"
+            ),
+            (None, codehash) => ensure!(
+                codehash.is_none() && manifest.exit_batcher_item_gas.is_none(),
+                "deployment manifest pins an exit batcher codehash or item gas without an \
+                 exit_batcher_address"
+            ),
+        }
+        if let Some(gas) = &manifest.exit_batcher_item_gas {
+            ensure!(
+                ExitBatchKind::ALL.iter().all(|kind| gas.of(*kind) > 0),
+                "deployment manifest exit_batcher_item_gas has a zero cap"
+            );
         }
         Ok(manifest)
     }
@@ -555,9 +669,130 @@ pub async fn probe_deployment<R: ContractReader + Sync>(
     Ok(report)
 }
 
+/// What `probe_exit_batcher` read of the manifest's exit batcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitBatcherReport {
+    pub address: String,
+    pub runtime_codehash: String,
+    /// `MAX_ITEMS()`: the most items one batch call may carry.
+    pub max_items: u64,
+    /// `itemGas(kind)` of each kind, in `ExitBatchKind` order.
+    pub item_gas: [u64; 5],
+}
+
+/// The startup probes of the manifest's exit batcher, at "latest": None when
+/// the manifest names none (batching unavailable). Its runtime codehash must
+/// be the manifest's, its `vault()` and `adapter()` the manifest's vault and
+/// adapter, its `MAX_ITEMS()` between 1 and EXIT_BATCHER_MAX_ITEMS and each
+/// `itemGas(kind)` positive and, when the manifest pins them, equal to
+/// `exit_batcher_item_gas`. Run it after `probe_deployment`, which checks the
+/// vault and adapter themselves. `ContractReader::contract_word` is given the
+/// full calldata of `itemGas(kind)`.
+pub async fn probe_exit_batcher<R: ContractReader + Sync>(
+    oracle: &R,
+    manifest: &DeploymentManifest,
+) -> Result<Option<ExitBatcherReport>, ProbeError> {
+    let (Some(batcher), Some(expected)) = (
+        manifest.exit_batcher_address.clone(),
+        manifest.exit_batcher_runtime_codehash.clone(),
+    ) else {
+        return Ok(None);
+    };
+    let mismatch = |message: String| Err(ProbeError::Mismatch(message));
+    let codehash = hex32(&oracle.code_hash(&batcher).await.map_err(|error| {
+        ProbeError::Unavailable(format!("exit batcher runtime code at {batcher}: {error}"))
+    })?);
+    if codehash != expected {
+        return mismatch(format!(
+            "the exit batcher at {batcher} has runtime codehash {codehash}, but the deployment \
+             manifest pins {expected}"
+        ));
+    }
+    let word = |data: String, name: String| {
+        let batcher = batcher.clone();
+        async move {
+            oracle
+                .contract_word(&batcher, &data)
+                .await
+                .map_err(|error| ProbeError::Unavailable(format!("{name} at {batcher}: {error}")))
+        }
+    };
+    for (selector, name, expected) in [
+        (
+            EXIT_BATCHER_VAULT_SELECTOR,
+            "exit batcher vault()",
+            &manifest.contract_address,
+        ),
+        (
+            EXIT_BATCHER_ADAPTER_SELECTOR,
+            "exit batcher adapter()",
+            &manifest.proof_adapter_address,
+        ),
+    ] {
+        let value = word(selector.into(), name.into()).await?;
+        let bound = format!("0x{}", hex::encode(&value[12..]));
+        if value[..12].iter().any(|byte| *byte != 0) || &bound != expected {
+            return mismatch(format!(
+                "{name} is {}, but the deployment manifest pins {expected}",
+                hex32(&value)
+            ));
+        }
+    }
+    let small = |bytes: [u8; 32]| -> Option<u64> {
+        bytes[..24]
+            .iter()
+            .all(|byte| *byte == 0)
+            .then(|| u64::from_be_bytes(bytes[24..].try_into().expect("8 bytes")))
+    };
+    let max_items = word(
+        EXIT_BATCHER_MAX_ITEMS_SELECTOR.into(),
+        "exit batcher MAX_ITEMS()".into(),
+    )
+    .await?;
+    let max_items = match small(max_items) {
+        Some(items) if (1..=EXIT_BATCHER_MAX_ITEMS).contains(&items) => items,
+        _ => {
+            return mismatch(format!(
+                "exit batcher MAX_ITEMS() is {}, not between 1 and {EXIT_BATCHER_MAX_ITEMS}",
+                hex32(&max_items)
+            ))
+        }
+    };
+    let mut item_gas = [0u64; 5];
+    for kind in ExitBatchKind::ALL {
+        let name = format!("exit batcher itemGas({})", kind as u8);
+        let value = word(
+            format!("{EXIT_BATCHER_ITEM_GAS_SELECTOR}{:064x}", kind as u8),
+            name.clone(),
+        )
+        .await?;
+        let gas = small(value).filter(|gas| *gas > 0);
+        let pinned = manifest.exit_batcher_item_gas.map(|caps| caps.of(kind));
+        match (gas, pinned) {
+            (Some(gas), None) => item_gas[kind as usize] = gas,
+            (Some(gas), Some(pinned)) if gas == pinned => item_gas[kind as usize] = gas,
+            _ => {
+                return mismatch(format!(
+                    "{name} ({}) is {}, but the deployment manifest pins {}",
+                    kind.as_str(),
+                    hex32(&value),
+                    pinned.map_or("a positive cap".into(), |pinned| pinned.to_string())
+                ))
+            }
+        }
+    }
+    Ok(Some(ExitBatcherReport {
+        address: batcher,
+        runtime_codehash: codehash,
+        max_items,
+        item_gas,
+    }))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use serde_json::json;
     use zkapi_types::Felt252;
 
     /// A manifest for the development setup at `contract`, signed by `keys`.
@@ -684,6 +919,317 @@ pub(crate) mod tests {
         let mut zero = bare;
         zero["proof_adapter_address"] = "0x0000000000000000000000000000000000000000".into();
         assert!(DeploymentManifest::parse(&zero.to_string()).is_err());
+    }
+
+    /// The batcher section of vault_calldata_golden.json (from the compiled
+    /// protocol/contracts ZkApiExitBatcher, by check-calldata-golden.sh).
+    pub(crate) fn real_batcher_layout() -> serde_json::Value {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/vault_calldata_golden.json"))
+                .unwrap();
+        golden["batcher"].clone()
+    }
+
+    #[test]
+    fn exit_batcher_probe_selectors_are_the_real_batchers() {
+        let layout = real_batcher_layout();
+        for (name, selector) in [
+            ("vault", EXIT_BATCHER_VAULT_SELECTOR),
+            ("adapter", EXIT_BATCHER_ADAPTER_SELECTOR),
+            ("MAX_ITEMS", EXIT_BATCHER_MAX_ITEMS_SELECTOR),
+            ("itemGas", EXIT_BATCHER_ITEM_GAS_SELECTOR),
+        ] {
+            assert_eq!(layout["selectors"][name], selector, "{name}");
+        }
+    }
+
+    const BATCHER: &str = "0x00000000000000000000000000000000000ba7c4";
+
+    fn batcher_manifest(extra: serde_json::Value) -> serde_json::Value {
+        let mut json = manifest_json(
+            "0x00000000000000000000000000000000000000aa",
+            &keys(),
+            &dev_identity(),
+        );
+        for (key, value) in extra.as_object().unwrap() {
+            json[key] = value.clone();
+        }
+        json
+    }
+
+    #[test]
+    fn the_exit_batcher_is_an_optional_manifest_field() {
+        // Manifests from before the batcher, or a null one: batching is off.
+        let none = DeploymentManifest::parse(&batcher_manifest(json!({})).to_string()).unwrap();
+        assert_eq!(none.exit_batcher_address, None);
+        let null = DeploymentManifest::parse(
+            &batcher_manifest(json!({"exit_batcher_address": null})).to_string(),
+        )
+        .unwrap();
+        assert_eq!(null, none);
+        let gas = json!({"close": 150_000, "escape": 200_000, "defeat": 120_000, "raise": 120_000, "finalize": 150_000});
+        let snake = DeploymentManifest::parse(
+            &batcher_manifest(json!({
+                "exit_batcher_address": BATCHER.to_ascii_uppercase().replace("0X", "0x"),
+                "exit_batcher_runtime_codehash": format!("0x{}", "AB".repeat(32)),
+                "exit_batcher_item_gas": gas,
+            }))
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(snake.exit_batcher_address.as_deref(), Some(BATCHER));
+        assert_eq!(
+            snake.exit_batcher_runtime_codehash,
+            Some(format!("0x{}", "ab".repeat(32)))
+        );
+        let caps = snake.exit_batcher_item_gas.unwrap();
+        assert_eq!(
+            ExitBatchKind::ALL.map(|kind| caps.of(kind)),
+            [150_000, 200_000, 120_000, 120_000, 150_000]
+        );
+        // Deploy.s.sol's spelling reads the same.
+        let camel = DeploymentManifest::parse(
+            &batcher_manifest(json!({
+                "exitBatcher": BATCHER,
+                "exitBatcherRuntimeCodehash": format!("0x{}", "ab".repeat(32)),
+                "exitBatcherItemGas": gas,
+            }))
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(camel, snake);
+        // A batcher without its codehash, a codehash or caps without a
+        // batcher, a batcher at the vault, a zero cap and an unknown kind are
+        // refused.
+        for (extra, expected) in [
+            (json!({"exit_batcher_address": BATCHER}), "without its"),
+            (
+                json!({"exit_batcher_runtime_codehash": format!("0x{}", "ab".repeat(32))}),
+                "without an",
+            ),
+            (json!({"exit_batcher_item_gas": gas}), "without an"),
+            (
+                json!({"exit_batcher_address": "0x00000000000000000000000000000000000000aa",
+                    "exit_batcher_runtime_codehash": format!("0x{}", "ab".repeat(32))}),
+                "the vault or the adapter",
+            ),
+            (
+                json!({"exit_batcher_address": BATCHER,
+                    "exit_batcher_runtime_codehash": format!("0x{}", "ab".repeat(32)),
+                    "exit_batcher_item_gas": {"close": 0, "escape": 1, "defeat": 1, "raise": 1, "finalize": 1}}),
+                "zero cap",
+            ),
+            (
+                json!({"exit_batcher_address": BATCHER,
+                    "exit_batcher_runtime_codehash": format!("0x{}", "ab".repeat(32)),
+                    "exit_batcher_item_gas": {"close": 1, "escape": 1, "defeat": 1, "raise": 1, "finalize": 1, "relay": 1}}),
+                "invalid deployment manifest",
+            ),
+            (
+                json!({"exit_batcher_address": "0x1234",
+                    "exit_batcher_runtime_codehash": format!("0x{}", "ab".repeat(32))}),
+                "exit_batcher_address is not a 20-byte",
+            ),
+        ] {
+            let error = DeploymentManifest::parse(&batcher_manifest(extra.clone()).to_string())
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{extra}: {error:#}"
+            );
+        }
+    }
+
+    /// Getter words and runtime codehashes by address.
+    #[derive(Default)]
+    struct FakeChain {
+        words: std::collections::BTreeMap<(String, String), [u8; 32]>,
+        code: std::collections::BTreeMap<String, [u8; 32]>,
+    }
+
+    impl ContractReader for FakeChain {
+        async fn contract_word(&self, address: &str, selector: &str) -> Result<[u8; 32], String> {
+            self.words
+                .get(&(address.to_string(), selector.to_string()))
+                .copied()
+                .ok_or_else(|| "execution reverted".into())
+        }
+
+        async fn code_hash(&self, address: &str) -> Result<[u8; 32], String> {
+            self.code
+                .get(address)
+                .copied()
+                .ok_or_else(|| "no contract code at this address on this chain".into())
+        }
+    }
+
+    fn word(value: u64) -> [u8; 32] {
+        *Felt252::from_u64(value).as_bytes()
+    }
+
+    fn address_word(address: &str) -> [u8; 32] {
+        *Felt252::from_hex(address).unwrap().as_bytes()
+    }
+
+    #[tokio::test]
+    async fn the_exit_batcher_probe_checks_code_binding_and_caps() {
+        let gas = json!({"close": 150_000, "escape": 200_000, "defeat": 120_000, "raise": 120_000, "finalize": 150_000});
+        let manifest = DeploymentManifest::parse(
+            &batcher_manifest(json!({
+                "exit_batcher_address": BATCHER,
+                "exit_batcher_runtime_codehash": format!("0x{}", "ab".repeat(32)),
+                "exit_batcher_item_gas": gas,
+            }))
+            .to_string(),
+        )
+        .unwrap();
+        let healthy = || {
+            let mut chain = FakeChain::default();
+            chain.code.insert(BATCHER.into(), [0xab; 32]);
+            let mut set = |selector: &str, value: [u8; 32]| {
+                chain.words.insert((BATCHER.into(), selector.into()), value);
+            };
+            set(
+                EXIT_BATCHER_VAULT_SELECTOR,
+                address_word(&manifest.contract_address),
+            );
+            set(
+                EXIT_BATCHER_ADAPTER_SELECTOR,
+                address_word(&manifest.proof_adapter_address),
+            );
+            set(EXIT_BATCHER_MAX_ITEMS_SELECTOR, word(64));
+            for (kind, cap) in [150_000, 200_000, 120_000, 120_000, 150_000]
+                .into_iter()
+                .enumerate()
+            {
+                set(
+                    &format!("{EXIT_BATCHER_ITEM_GAS_SELECTOR}{kind:064x}"),
+                    word(cap),
+                );
+            }
+            chain
+        };
+        let report = probe_exit_batcher(&healthy(), &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report,
+            ExitBatcherReport {
+                address: BATCHER.into(),
+                runtime_codehash: format!("0x{}", "ab".repeat(32)),
+                max_items: 64,
+                item_gas: [150_000, 200_000, 120_000, 120_000, 150_000],
+            }
+        );
+        // A manifest without a batcher reads nothing.
+        let without = DeploymentManifest::parse(&batcher_manifest(json!({})).to_string()).unwrap();
+        assert_eq!(
+            probe_exit_batcher(&FakeChain::default(), &without).await,
+            Ok(None)
+        );
+        type Change = Box<dyn Fn(&mut FakeChain)>;
+        let set = |selector: String, value: [u8; 32]| -> Change {
+            Box::new(move |chain: &mut FakeChain| {
+                chain
+                    .words
+                    .insert((BATCHER.into(), selector.clone()), value);
+            })
+        };
+        let cases: Vec<(Change, &str, bool)> = vec![
+            (
+                Box::new(|chain: &mut FakeChain| {
+                    chain.code.insert(BATCHER.into(), [0xac; 32]);
+                }),
+                "runtime codehash",
+                true,
+            ),
+            (
+                Box::new(|chain: &mut FakeChain| {
+                    chain.code.clear();
+                }),
+                "runtime code at",
+                false,
+            ),
+            (
+                set(
+                    EXIT_BATCHER_VAULT_SELECTOR.into(),
+                    address_word("0x00000000000000000000000000000000000000bb"),
+                ),
+                "vault()",
+                true,
+            ),
+            (
+                set(EXIT_BATCHER_ADAPTER_SELECTOR.into(), [0xff; 32]),
+                "adapter()",
+                true,
+            ),
+            (
+                set(EXIT_BATCHER_MAX_ITEMS_SELECTOR.into(), word(0)),
+                "MAX_ITEMS()",
+                true,
+            ),
+            (
+                set(EXIT_BATCHER_MAX_ITEMS_SELECTOR.into(), word(65)),
+                "MAX_ITEMS()",
+                true,
+            ),
+            (
+                set(
+                    format!("{EXIT_BATCHER_ITEM_GAS_SELECTOR}{:064x}", 2),
+                    word(350_000),
+                ),
+                "itemGas(2) (defeat)",
+                true,
+            ),
+            (
+                Box::new(|chain: &mut FakeChain| {
+                    chain
+                        .words
+                        .retain(|(_, data), _| data != EXIT_BATCHER_ADAPTER_SELECTOR);
+                }),
+                "adapter() at",
+                false,
+            ),
+        ];
+        for (change, expected, is_mismatch) in cases {
+            let mut chain = healthy();
+            change(&mut chain);
+            let error = probe_exit_batcher(&chain, &manifest).await.unwrap_err();
+            assert_eq!(
+                matches!(error, ProbeError::Mismatch(_)),
+                is_mismatch,
+                "{expected}: {error}"
+            );
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
+        // Without pinned caps, any positive cap is taken; a zero one never.
+        let mut unpinned = manifest.clone();
+        unpinned.exit_batcher_item_gas = None;
+        let mut chain = healthy();
+        chain.words.insert(
+            (
+                BATCHER.into(),
+                format!("{EXIT_BATCHER_ITEM_GAS_SELECTOR}{:064x}", 3),
+            ),
+            word(350_000),
+        );
+        let report = probe_exit_batcher(&chain, &unpinned)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.item_gas[ExitBatchKind::Raise as usize], 350_000);
+        chain.words.insert(
+            (
+                BATCHER.into(),
+                format!("{EXIT_BATCHER_ITEM_GAS_SELECTOR}{:064x}", 3),
+            ),
+            word(0),
+        );
+        assert!(matches!(
+            probe_exit_batcher(&chain, &unpinned).await,
+            Err(ProbeError::Mismatch(_))
+        ));
     }
 
     #[test]

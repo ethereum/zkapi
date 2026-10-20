@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Transaction, Wallet } from 'ethers';
-import { ESCAPE_FINALIZED_TOPIC, GWEI, createSigner, createUpstream, vaultInterface } from './signer.mjs';
+import { ESCAPE_FINALIZED_TOPIC, GWEI, batcherInterface, createSigner, createUpstream, vaultInterface } from './signer.mjs';
 
 const CHAIN_ID = 11155111n;
 const haveAnvil = spawnSync('anvil', ['--version'], { stdio: 'ignore' }).status === 0;
@@ -267,4 +267,29 @@ test('a leaf retirement is signed only for a note whose EscapeWithdrawalFinalize
   await mine(rpc);
   assert.equal((await receipt(rpc, hash)).status, '0x1');
   assert.equal((await signer.handle('zkapi_signerStatus', [])).retirements_last_24h, 1);
+});
+
+test('a challengeBatch to the configured exit batcher is signed only while its vault() is the vault, and mines', { skip }, async t => {
+  const rpc = await startAnvil(t);
+  // A batcher stand-in: vault() returns the vault; any other call returns
+  // the applied bitmap 1 (as challengeBatch would).
+  const batcher = '0x000000000000000000000000000000000000ba7c';
+  const standIn = bound => `0x600035 60e01c 63fbfa77cf 14 6019 57 6001600052 60206000f3 5b 73${bound.slice(2)} 600052 60206000f3`.replace(/ /g, '');
+  await rpc('anvil_setCode', [batcher, standIn(vault)]);
+  const inputs = [2, CHAIN_ID, vault, 0, 1, 2, 0, 1, 0, 0, 0, 0];
+  const batch = batcherInterface.encodeFunctionData('challengeBatch', [[4, 9], [0, 5], [inputs, inputs], `0x${'00'.repeat(512)}`]);
+  const signer = signerFor(rpc, { maxFeePerGas: 10n * GWEI, exitBatcher: batcher });
+  await signer.checkBatcher();
+  const hash = await signer.handle('eth_sendTransaction', [{ ...tx(0), to: batcher, data: batch }]);
+  await mine(rpc);
+  const mined = await receipt(rpc, hash);
+  assert.deepEqual([mined.type, mined.status, mined.to], ['0x2', '0x1', batcher]);
+  const signed = Transaction.from(await rpc('eth_getRawTransactionByHash', [hash]));
+  assert.deepEqual([signed.to.toLowerCase(), signed.data, signed.nonce], [batcher, batch, 0]);
+  // Bound to another vault: refused before anything is broadcast.
+  await rpc('anvil_setCode', [batcher, standIn(sender.toLowerCase())]);
+  const rebound = signerFor(rpc, { maxFeePerGas: 10n * GWEI, exitBatcher: batcher });
+  await assert.rejects(rebound.handle('eth_sendTransaction', [{ ...tx(1), to: batcher, data: batch }]), { code: -32003, data: { reason: 'batcher_vault_mismatch' } });
+  assert.equal(await poolSize(rpc), 0);
+  assert.equal(await nonceOf(rpc, 'pending'), 1);
 });

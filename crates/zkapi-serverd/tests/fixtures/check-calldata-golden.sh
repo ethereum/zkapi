@@ -3,10 +3,11 @@
 # event layouts with Forge (VaultCalldataGolden.t.sol, which compiles the real
 # protocol/contracts sources: abi.encodeCall against ZkApiVault, and the
 # vault's own Events) and compare them with vault_calldata_golden.json, which
-# zkapi-serverd (watcher, native_billing) and zkapi-indexerd (poller) pin
-# their encoders, selectors and decoders against. With --update, rewrite the
-# JSON instead. Needs forge and node; uses the vendored forge-std of
-# protocol/contracts and its compiler settings.
+# zkapi-serverd (watcher, native_billing, challenge_service) and
+# zkapi-indexerd (poller) pin their encoders, selectors and decoders against;
+# its `batcher` section is the periphery ZkApiExitBatcher's. With --update,
+# rewrite the JSON instead. Needs forge and node; uses the vendored forge-std
+# of protocol/contracts and its compiler settings.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
@@ -65,12 +66,20 @@ const lines = fs.readFileSync(log, "utf8").split("\n").map((line) => line.trim()
 const start = lines.indexOf("Logs:");
 if (start < 0) throw new Error("forge printed no logs");
 const vectors = { selectors: {}, getter_words: {}, events: {} };
+const batcher = { selectors: {}, errors: {}, vault_errors: {}, calldata: {}, events: {} };
 for (const line of lines.slice(start + 1)) {
   const match = /^([A-Za-z0-9_.]+)=(\S+)$/.exec(line);
   if (!match) break;
   const [, key, value] = match;
-  const [kind, name, field] = key.split(".");
-  if (kind === "calldata") vectors[name] = value;
+  const [kind, name, field, detail] = key.split(".");
+  if (kind === "batcher") {
+    const section = { selector: "selectors", error: "errors", vault_error: "vault_errors", calldata: "calldata" }[name];
+    if (section) batcher[section][field] = value;
+    else if (name === "event") {
+      batcher.events[field] ??= {};
+      batcher.events[field][detail] = value;
+    } else throw new Error(`unexpected forge line: ${line}`);
+  } else if (kind === "calldata") vectors[name] = value;
   else if (kind === "selector") vectors.selectors[name] = value;
   else if (kind === "getter_words") vectors.getter_words[name] = Number(value);
   else if (kind === "event") {
@@ -82,6 +91,11 @@ const names = ["defeat", "raise", "escape", "close", "retire"];
 for (const name of names) {
   if (!vectors[name]) throw new Error(`forge did not print ${name}`);
 }
+for (const name of ["challengeBatch", "gasBound", "mutualCloseBatch", "initiateEscapeBatch", "finalizeBatch"]) {
+  if (!batcher.calldata[name]) throw new Error(`forge did not print the batcher's ${name}`);
+}
+if (!batcher.events.ItemSkipped) throw new Error("forge did not print the batcher's ItemSkipped");
+vectors.batcher = batcher;
 const golden = JSON.parse(fs.readFileSync(goldenPath, "utf8"));
 if (mode === "--update") {
   fs.writeFileSync(goldenPath, `${JSON.stringify({ generator: golden.generator, ...vectors }, null, 2)}\n`);
@@ -96,5 +110,5 @@ try {
   console.error(error.message);
   process.exit(1);
 }
-console.log(`golden vectors match the real contracts: ${names.join(", ")}, ${Object.keys(vectors.selectors).length} selectors, ${Object.keys(vectors.getter_words).length} getters, ${Object.keys(vectors.events).length} events`);
+console.log(`golden vectors match the real contracts: ${names.join(", ")}, ${Object.keys(vectors.selectors).length} selectors, ${Object.keys(vectors.getter_words).length} getters, ${Object.keys(vectors.events).length} events; batcher: ${Object.keys(batcher.calldata).length} calls, ${Object.keys(batcher.selectors).length} selectors`);
 JS
