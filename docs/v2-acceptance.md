@@ -240,6 +240,11 @@ It also carries the committed Forge snapshot (`protocol/contracts/snapshots/conc
 
 ## Coverage boundary
 
+After a successful SDK deposit, the harness waits for the indexer's root to
+match the vault before starting the next operation, as the wallet driver's
+request path does. The run does not test immediate inference while the
+indexer is still catching up to that deposit.
+
 | Component | Execution |
 | --- | --- |
 | Vault, adapter, Poseidon library | Actual contracts from `Deploy.s.sol` on Anvil, finalized and codehash-checked |
