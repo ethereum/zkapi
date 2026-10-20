@@ -35,6 +35,47 @@ Folded into 0.2.0's notes at release.
   without asking. A single-party vault trusts its setup's generator, who can
   forge every proof ([Single-party setup](docs/deployment.md#single-party-setup)).
 
+- **Batched exits.** The generated adapter verifies many proofs of one kind
+  at once (`IZkApiBatchProofAdapter`: `verifyWithdrawalBatch`,
+  `verifyRequestBatch` and their `Once` variants), with one random linear
+  combination (128-bit Fiat-Shamir challenges over every byte read, `r_0 = 1`)
+  and every check of the single verifier: n + 3 pairings and one shared
+  multi-scalar multiplication, so 16 withdrawals verify in 998,220 gas
+  instead of 3,609,818. The `Once` variants leave the records a single
+  verification would (requests under `REQUEST_RECORD`, which
+  `assertValidRequest` now consults). `zkapi-proof`'s `batch` module is the
+  reference implementation; shared vectors pin both. The new
+  `ZkApiExitBatcher` (`src/periphery`), deployed with every vault by
+  `Deploy.s.sol` (`EXIT_BATCHER_*_GAS`; manifest `exitBatcher*`, profile
+  `exit_batcher_*`), verifies a batch once and makes each item's ordinary
+  vault call under a per-kind gas cap, skipping an item whose state changed
+  and never starving one (`BatchOutOfGas`). Per exit at 16 items: close
+  129,395 gas instead of 307,710, escape 183,214 instead of 367,185, defeat
+  96,766 instead of 286,960, raise 92,933 instead of 277,479, finalize 28,760
+  instead of 45,063 ([Batched exits](docs/deployment.md#batched-exits)).
+- **The challenger batches defeats and raises** through the exit batcher's
+  `challengeBatch` when the profile names one: deadline-aware flushing (full,
+  aged, or near a deadline; single calls inside the critical threshold), an
+  exact simulation with bisection, `gasBound` gas limits, and single-call
+  fallback for any anomaly. New `zkapi-challenged` flags `--batching`,
+  `--batch-max-items`, `--batch-max-age-seconds`,
+  `--batch-deadline-margin-seconds`; the signer signs `challengeBatch` for
+  `ZKAPI_CHALLENGE_EXIT_BATCHER` once its `vault()` is the configured vault
+  ([challenge operation](docs/challenge-service.md)).
+- **Operator close relay (optional).** `zkapi serverd --relay-*` relays
+  cooperative closes through the exit batcher from a dedicated relayer whose
+  signer runs in the new `ZKAPI_SIGNER_ROLE=close-relay`. The fee is one
+  metered request at the note's state before the clearance, settled at
+  exactly the fee and redeemed by a ticket secret, so it lands in the treasury
+  share with no circuit change. New endpoints `GET /v2/withdraw/relay/terms`,
+  `POST /v2/withdraw/relay/fee`, `POST /v2/withdraw/relay` and
+  `GET /v2/withdraw/relay/{nullifier}`; clients opt in with
+  `zkapi-clientd withdraw --fees relay` or the SDK's
+  `withdraw(..., { fees: 'relay' })`, self-submit a close the relay gives back
+  or that has not landed by `valid_until` minus 20 minutes, and count a
+  withdrawal done only when its `MutualClose` appears
+  ([close relay](docs/native-eth-billing.md)).
+
 ### Changed
 
 - **Network fees cut across the board (vault revision 3, circuit setup
@@ -182,6 +223,23 @@ Folded into 0.2.0's notes at release.
   `SponsorshipRetired` unless paused). See
   [Gas schedule](docs/deployment.md#gas-schedule).
 
+- **Gasless withdrawals reuse one transit account per payout address.**
+  zkapi-clientd derives the transit account's owner key with HKDF-SHA256 from
+  its payment key (salt `zkapi/transit-owner/v1`; info the chain, the
+  EntryPoint, vault, factory, paymaster, the creation code's hash and the
+  payee), so every later exit to the same payout address carries no initCode
+  and skips the account's creation (about 89,000 gas on mainnet, about
+  535,000 under EIP-8037). Records name the derivation
+  (`transit.owner_derivation`); earlier records keep their random key. The
+  SDK already reused the connected account's transit account. Both clients
+  refuse a second sponsored escape from one transit account while the first
+  is open (`transit_escape_pending`, before any proof). Exits of one wallet to
+  one payout address are now visibly linked through their shared transit
+  account.
+- **Single defeats and raises cost about 600 gas more** (the adapter's
+  request-record lookup), and the adapter's larger dispatch adds about 170 to
+  every single exit; the adapter's runtime is 19,885 bytes.
+
 ### Fixed
 
 - **Two sponsored escapes from one transit account in one bundle** were both
@@ -247,6 +305,19 @@ Folded into 0.2.0's notes at release.
   storage layout changed (the merged nullifier words). No client reads either
   through `eth_getStorageAt`.
 
+- **The adapter's code and codehash change** (the batch verifier;
+  `IZkApiBatchProofAdapter` is a new interface it reports besides
+  `IZkApiProofAdapter`), and the deployment manifest gains `exitBatcher`,
+  `exitBatcherRuntimeCodehash`, `exitBatcherGasSchedule`,
+  `exitBatcherFreshSlotGas`, `exitBatcherItemGas` and
+  `deployTransactions.exitBatcher`, the `trusted_deployment` profile
+  `exit_batcher_address`, `exit_batcher_runtime_codehash` and
+  `exit_batcher_item_gas`. A vault deployed before this release keeps its
+  adapter (it is immutable) and has no batch verifier: its profile carries
+  null batcher fields and every exit stays a single call.
+- **The challenge signer** accepts `ZKAPI_CHALLENGE_EXIT_BATCHER`,
+  `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` and `ZKAPI_SIGNER_ROLE`; a request body may
+  now be up to 256 KB.
 - None: the change is additive. Profiles without `gasless` (or with
   `gasless: null`) keep working with the wallet-pays path.
 

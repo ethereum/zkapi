@@ -179,10 +179,16 @@ withdrawal proof names a transit account `S` derived from (owner, payee). A
 user operation from `S` makes the vault call, the paymaster sponsors it, and
 the payout less the measured charge reaches the payee, which holds no ETH.
 The SDK's connected account owns its transit accounts. For zkapi-clientd the
-harness generates an ephemeral owner key per withdrawal, and the companion
-proves the escape. The harness then builds, signs and sends clientd-shaped
-operations: the ephemeral owner key, the profile's default gas limits and an
-EIP-191 signature over the operation hash. Its preVerificationGas (21,000 +
+harness derives the owner key per payout address as zkapi-clientd does
+(HKDF-SHA256 over the chain, the gasless contracts and the payee, from a
+random seed standing for clientd's payment key; `zkapi-clientd/internal/zkapi/testdata/transit-owner-vectors.json`),
+so later exits to one payout address reuse one transit account, and the
+companion proves the escape. The harness then builds, signs and sends
+clientd-shaped operations: the derived owner key, the profile's default gas
+limits and an EIP-191 signature over the operation hash. "Two closes to one
+payout address as zkapi-clientd" (`--stop-after gasless-reuse`) checks the
+reuse: the first close creates `S` through its initCode, the second reuses it
+without one, and both settle to the payee. Its preVerificationGas (21,000 +
 16 per byte + 10,000, clamped) and its tip (`eth_maxPriorityFeePerGas`, capped
 at `priorityFeeCeiling`) are simplified, so the bytes differ from what
 zkapi-clientd would sign (it takes the largest of three preVerificationGas
@@ -252,7 +258,7 @@ It also carries the committed Forge snapshot (`protocol/contracts/snapshots/conc
 | Companion | Actual `zkapi-walletd` routes as `zkapi-clientd` calls them; the harness plays clientd and signs its transactions |
 | Gasless contracts | The canonical EntryPoint v0.7.0 and SenderCreator runtimes, etched and codehash-checked. The paymaster, its factory and the account logic come from the same `Deploy.s.sol` broadcast, finalized and codehash-checked |
 | Bundler | In-process mini bundler (`scripts/acceptance/mini-bundler.mjs`). It checks each operation's shape and hash (local and the EntryPoint's `getUserOpHash`), dry-runs `handleOps` with `eth_call` and returns its `FailedOp` as the JSON-RPC error, then bundles with `handleOps` from an Anvil account. Drill knobs: hold, drop, defer, two-operation bundles, forgotten receipts |
-| zkapi-clientd's gasless path | The harness plays it: an ephemeral owner key, the profile's pinned gas fields, an EIP-191 signature and the bundler's JSON-RPC. The companion proves |
+| zkapi-clientd's gasless path | The harness plays it: the owner key derived per payout address, the profile's pinned gas fields, an EIP-191 signature and the bundler's JSON-RPC. The companion proves |
 | Provider, OA org, price feed | Loopback mocks |
 
 The run does not establish:
