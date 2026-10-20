@@ -651,7 +651,9 @@ zkapi-clientd withdraw --to 0xDESTINATION --fees payout --fee-cap-gwei 2000000 \
 zkapi-clientd withdraw --to 0xDESTINATION --collect                           # forward a payout waiting in the transit account (sponsored)
 zkapi-clientd withdraw --to 0xDESTINATION --sweep                             # ... or sweep it, paid by the local signing address
 zkapi-clientd withdraw --to 0xDESTINATION --claim-credit                      # deliver a payout the paymaster credited
+zkapi-clientd withdraw --to 0xDESTINATION --fees payout --fresh-transit       # a fresh transit account for this withdrawal
 zkapi-clientd config --withdrawal-fees payout --bundler-url https://bundler.example/rpc   # defaults
+zkapi-clientd config --transit-accounts fresh                                 # a fresh transit account for every gasless withdrawal (per-payee restores reuse)
 ```
 
 The guided **withdraw** menu offers "Pay the network fee from the payout (no
@@ -686,7 +688,8 @@ a refusal (`gasless_unavailable`, `bundler_unavailable`, `sponsorship_paused`,
 `exits_paused`, `payout_below_gas`, `gasless_uneconomic` — the fee would take
 more than the deployment's uneconomic fraction, 25%, of the payout, unless
 `--allow-expensive-gas` — `gas_above_paymaster_ceiling`, `paymaster_underfunded`,
-`gasless_attempts_exhausted`) disables only `--fees payout`; deposits and
+`gasless_attempts_exhausted`, and for an escape `transit_escape_pending`,
+below) disables only `--fees payout`; deposits and
 wallet-paid exits are unaffected. A payout address the transit account's
 factory never accepts as a payee (the vault, the EntryPoint, the withdrawal
 paymaster or the withdrawal account factory of the deployment) is refused with
@@ -694,11 +697,45 @@ paymaster or the withdrawal account factory of the deployment) is refused with
 could never be created, so neither a sponsored operation nor `--sweep` could
 deliver the payout.
 
-A fresh owner key is generated for every withdrawal and saved, hex-encoded, in
-the mode-0600 payment journal (`transit.owner_key`); the funding key never owns
-a transit account. The transit account `S` is `CREATE2(factory, 0,
-creationCode ‖ abi.encode(entryPoint, vault, paymaster, owner, destination))`,
-cross-checked with the factory's `getAddress`; the companion prepares the
+The transit account's owner key is derived per destination from the local
+payment key (the funding key itself never owns a transit account), so every
+gasless withdrawal of this wallet to one destination uses one transit
+account: the first one's operation creates `S` through its `initCode`, every
+later one finds `S`'s code and carries no `initCode` (it saves `S`'s creation,
+about 89,000 gas on mainnet, and is checked under the paymaster's lower
+verification floor without `initCode`). The derivation is HKDF-SHA256 with the
+32 bytes of the payment key as input key material, the salt
+`zkapi/transit-owner/v1` and as info the chain ID (32 bytes, big-endian), the
+EntryPoint, vault, factory and paymaster addresses (20 bytes each), the
+keccak-256 of the account creation code, the destination (20 bytes) and a
+4-byte big-endian counter; the 32-byte output is the key, unless it is 0 or
+not below the secp256k1 order, in which case the counter is raised (this
+happens with probability about 2^-128). Another deployment, paymaster or
+destination therefore gets an unrelated key, and the owner addresses on chain
+cannot be linked to each other or to the payment key. The key is still saved,
+hex-encoded, in the mode-0600 payment journal (`transit.owner_key`, with
+`transit.owner_derivation` naming the derivation), and is checked against
+the derivation on every load; records of earlier builds, whose owner key was
+drawn at random for one withdrawal and has no `owner_derivation`, keep
+working from their journaled key.
+
+Reuse links the wallet's gasless withdrawals to one destination through their
+shared `S` (see [privacy](PRIVACY.md)). To opt out, `--fresh-transit` gives one
+withdrawal a fresh transit account, and `config --transit-accounts fresh`
+(saved as `zkapi.transit_accounts: "fresh"`; `per-payee`, the default, clears
+it) does so for every gasless withdrawal: the owner key is then drawn at
+random for that withdrawal alone, as earlier builds drew it, and saved in the
+payment journal without `owner_derivation`, so the journaled key is its only
+copy (back up the journal as for any pending withdrawal). Each such withdrawal
+creates its own `S` through `initCode` and pays its creation again (about
+89,000 gas on mainnet, about 535,000 under EIP-8037), and is not linked to the
+wallet's other withdrawals to that destination through a transit account. The
+option is read when the withdrawal is prepared; a saved withdrawal keeps the
+transit account it was prepared with. The transit account `S` is
+`CREATE2(factory, 0, creationCode ‖ abi.encode(entryPoint, vault, paymaster,
+owner, destination))`, cross-checked with the factory's `getAddress`; the
+pre-proof fee check prices the operation with `initCode` only while `S` has
+no code and deducts what `S` still owes; the companion prepares the
 proof with `S` as its destination (`proof_destination` in the journal, while
 `destination` stays the payout address), so nothing after proving can change
 where the money goes. The quote shows the payout, the most the fee can take
@@ -821,6 +858,49 @@ your client IP before inclusion (the operator's bundler, unless you set your
 own); the chain shows the bundler's transaction, the transit account and the
 destination, never the funding address.
 
+### The operator's close relay (`--fees relay`)
+
+When the protocol server runs a close relay (its `GET /v2/withdraw/relay/terms`
+reports `enabled: true`), a cooperative close can be landed by the operator in
+a batch through the deployment's exit batcher, for the relay's fee instead of
+a network fee. It is opt-in: `zkapi-clientd withdraw --to 0xDESTINATION
+--fees relay`, or `config --withdrawal-fees relay` as the default (a named
+`--fees` overrides it; `--fees wallet` on a relayed withdrawal takes it back
+to the wallet-paid close).
+
+```sh
+zkapi-clientd withdraw --to 0xDESTINATION --fees relay    # quote: the relay fee and the fallback allowance
+zkapi-clientd withdraw --approve QUOTE_ID                 # pay the fee, prepare the close, hand it to the relay
+zkapi-clientd withdraw --resume                           # follow it after an interruption
+```
+
+The quote names the fee (taken from the private balance; the amount shown is
+the payout after it) and the fee allowance of a wallet-paid close. Quoting pays
+and reserves nothing. Approving it:
+
+1. pays the fee as one ordinary metered request at the note's current state
+   (its successor carries the fee as spent, so the close's treasury share holds
+   it; nothing new is proved);
+2. prepares the cooperative close at that successor, as a wallet-paid close
+   would (clearance, proof);
+3. hands the proof to the relay through the companion, over the same
+   transport as every protocol request (Tor when configured).
+
+The relay can only submit the proof or not: it binds the destination and the
+amount, and the client keeps it. The withdrawal stays pending (`relay_submitted`)
+until the vault's `MutualClose` for exactly this close is final on the
+payment RPC, whichever transaction carried it, and the vault and indexer show
+the note closed. If the relay reports the close `failed` or `expired`, or has
+not landed it 20 minutes before its proof expires, the client submits it itself
+from the local signing address: the approval of the relay quote authorized this
+one wallet-paid close (same binding, amount, destination and nonce, within the
+quoted fee allowance). When that authority no longer applies (another
+transaction took the nonce, or fees rose above the allowance) the withdrawal
+returns to `quoted` and asks for a wallet-paid quote. A wallet-paid fallback
+that reverts because the relay landed the close meanwhile is confirmed with
+`--confirm` and the relay's transaction, as for any relayed payout. The relay
+is for cooperative closes only; escapes and `--fees payout` are unchanged.
+
 ### Escape withdrawals
 
 An escape exits without the operator: the vault pays after its challenge
@@ -861,7 +941,18 @@ finalization from the transit account (the sponsored path takes over a
 wallet-paid escape bound to the transit account whenever none of its
 transactions is pending). When a sponsored finalization would be refused too,
 nothing is reserved and the refusal names only `--fees wallet`: that escape
-is bound to the payout address and its finalization is wallet-paid as well. Phases: `op_built`/`op_submitted` →
+is bound to the payout address and its finalization is wallet-paid as well.
+The paymaster keeps one open sponsored escape per transit account (its
+record is the evidence a sponsored forward of that escape's payout needs),
+and since every escape of this wallet to one destination uses one transit
+account, a sponsored escape is refused before anything is reserved or proved
+(`transit_escape_pending`) while the paymaster records an earlier sponsored
+escape from it that is still pending, or finalized with its payout still in
+the transit account: rerun once that escape is finalized and its payout
+delivered (a sponsored close to the same destination delivers it too, as
+does the permissionless sweep of the transit account), or escape with
+`--fees wallet`, bound to the payout address. Sponsored closes from one
+transit account are never refused this way. Phases: `op_built`/`op_submitted` →
 `escape_pending` → `escape_initiated` → `finalize_op_built` /
 `finalize_op_submitted` → `finalize_pending` → `complete`. When someone else
 finalized the escape (the vault paid the transit account), the same

@@ -186,6 +186,141 @@ pub struct ClearanceOwnershipProofV2C {
     pub proof: Groth16ProofWire,
 }
 
+/// `payload.mode` of a close-relay fee request.
+pub const CLOSE_RELAY_FEE_MODE: &str = "close_relay_fee";
+/// `payload.version` of a close-relay fee request.
+pub const CLOSE_RELAY_FEE_VERSION: u16 = 1;
+/// Domain of [`close_relay_ticket_hash`].
+pub const CLOSE_RELAY_TICKET_DOMAIN: &[u8] = b"zkapi:v2c:close-relay-ticket\0";
+
+/// The prompt-free payload of a close-relay fee request
+/// (`POST /v2/withdraw/relay/fee`): one metered request at the note's current
+/// state whose charge is exactly the relay fee. Its successor carries the fee
+/// as spent, so the cooperative close proved from that successor pays the fee
+/// inside the treasury share (`deposit - finalBalance`) and needs no circuit
+/// change. The ticket links the paid fee to exactly one relay submission:
+/// only the holder of the 32-byte secret behind `ticket_hash` can redeem it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloseRelayFeeAuthorization {
+    /// Always [`CLOSE_RELAY_FEE_MODE`].
+    pub mode: String,
+    /// Always [`CLOSE_RELAY_FEE_VERSION`].
+    pub version: u16,
+    /// The fee the client accepts, in the vault's native units (gwei), as a
+    /// decimal string. It must equal the server's current terms exactly.
+    pub fee_units: String,
+    /// `0x` and 64 lowercase hex digits: [`close_relay_ticket_hash`] of the
+    /// client's ticket secret.
+    pub ticket_hash: String,
+}
+
+impl CloseRelayFeeAuthorization {
+    /// The canonical payload for `fee_units` and the ticket secret's hash.
+    pub fn new(fee_units: u128, ticket_secret: &[u8; 32]) -> Self {
+        Self {
+            mode: CLOSE_RELAY_FEE_MODE.to_string(),
+            version: CLOSE_RELAY_FEE_VERSION,
+            fee_units: fee_units.to_string(),
+            ticket_hash: format!("0x{}", hex32(&close_relay_ticket_hash(ticket_secret))),
+        }
+    }
+}
+
+/// `keccak256(CLOSE_RELAY_TICKET_DOMAIN || secret)`: the public handle of a
+/// relay ticket. The secret itself is sent only with the relay submission.
+pub fn close_relay_ticket_hash(secret: &[u8; 32]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let mut digest = Keccak256::new();
+    digest.update(CLOSE_RELAY_TICKET_DOMAIN);
+    digest.update(secret);
+    digest.finalize().into()
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A finished cooperative close handed to the operator's relay
+/// (`POST /v2/withdraw/relay`): the kind-1 statement and its proof exactly as
+/// `mutualClose` takes them, and the secret of the ticket whose fee paid for
+/// it. The payout stays bound by the proof: the relay can only submit it or
+/// not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloseRelaySubmissionV2C {
+    pub public_inputs: crate::WithdrawalPublicInputsV2C,
+    pub proof: Groth16ProofWire,
+    /// `0x` and 64 hex digits.
+    pub ticket_secret: String,
+}
+
+/// The relay's view of one submitted close (`GET /v2/withdraw/relay/{N}`).
+///
+/// `status` is one of
+/// * `queued`: accepted, waiting for a batch;
+/// * `submitted`: in a relay transaction that has not been confirmed yet;
+/// * `landed`: the vault's `MutualClose` for this nullifier was emitted in the
+///   relay's transaction (`transaction_hash`);
+/// * `closed`: the note was closed by another transaction (the client's own
+///   submission, or anyone's);
+/// * `failed`: the relay will never submit it again (for example the payout
+///   push to the destination failed, or the vault refused it): submit it
+///   yourself;
+/// * `expired`: it came too close to its `valid_until` before landing.
+///
+/// Neither `landed` nor `closed` replaces the client's own check of the
+/// vault's `MutualClose` event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloseRelayStatusResponse {
+    pub status: String,
+    pub withdrawal_nullifier: crate::Felt252,
+    pub note_id: u32,
+    pub valid_until: u64,
+    pub queued_at: u64,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+    /// Why a close failed or was closed elsewhere, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// True when the client should submit the close itself now (`failed`
+    /// or `expired`).
+    pub self_submit: bool,
+}
+
+/// The relay's terms (`GET /v2/withdraw/relay/terms`). When `enabled` is
+/// false the other fields are absent and clients submit their closes
+/// themselves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloseRelayTermsResponse {
+    pub enabled: bool,
+    /// Decimal native units (gwei) of the one fee request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_units: Option<String>,
+    /// A submission's `valid_until` must be at least this far ahead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_validity_seconds: Option<u64>,
+    /// The relay sends a batch once this many closes are queued...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_target: Option<u64>,
+    /// ...or once the oldest has waited this long...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_age_seconds: Option<u64>,
+    /// ...or at once when a close comes within this many seconds of its
+    /// `valid_until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgent_margin_seconds: Option<u64>,
+    /// No relay transaction is sent for a close this near its `valid_until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutoff_seconds: Option<u64>,
+    /// The `ZkApiExitBatcher` the relay submits through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_batcher: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ClearanceRequestV2C, ErrorResponse};
@@ -266,5 +401,46 @@ mod tests {
         assert_eq!(response.retry_after_seconds, None);
         let serialized = serde_json::to_value(response).unwrap();
         assert!(serialized.get("retry_after_seconds").is_none());
+    }
+
+    /// The cross-language vector of the ticket hash (the Go and JS clients
+    /// pin the same value) and the strict fee payload and submission.
+    #[test]
+    fn close_relay_ticket_hash_and_payloads_are_pinned_and_strict() {
+        use super::{close_relay_ticket_hash, CloseRelayFeeAuthorization, CloseRelaySubmissionV2C};
+        assert_eq!(
+            close_relay_ticket_hash(&[0x11; 32]),
+            [
+                0x09, 0x1e, 0xa4, 0x39, 0x25, 0x9b, 0x6c, 0x58, 0x73, 0x7d, 0xd5, 0x12, 0xe9, 0x17,
+                0x7a, 0x15, 0x36, 0xe0, 0x8c, 0xfe, 0xc8, 0xc2, 0x7c, 0xb5, 0xc2, 0xae, 0xcc, 0x45,
+                0x24, 0x48, 0x0f, 0xfe
+            ]
+        );
+        let payload = CloseRelayFeeAuthorization::new(250_000, &[0x11; 32]);
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap(),
+            r#"{"mode":"close_relay_fee","version":1,"fee_units":"250000","ticket_hash":"0x091ea439259b6c58737dd512e9177a1536e08cfec8c27cb5c2aecc4524480ffe"}"#
+        );
+        let mut extra = serde_json::to_value(&payload).unwrap();
+        extra["prompt"] = "not allowed".into();
+        assert!(serde_json::from_value::<CloseRelayFeeAuthorization>(extra).is_err());
+
+        let destination = [17u8; 20];
+        let inputs = serde_json::json!({
+            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "active_root":"0x2",
+            "state_signing_key_x":"0x3", "state_signing_key_y":"0x4",
+            "clearance_signing_key_x":"0x5", "clearance_signing_key_y":"0x6",
+            "note_id":7, "final_balance":1950000, "destination":destination,
+            "withdrawal_nullifier":"0x7", "kind":1, "next_nullifier":"0x0", "conceded":0,
+            "valid_until":2000003600u64
+        });
+        let body = serde_json::json!({"public_inputs":inputs,
+            "proof":{"backend":"groth16_bn254","proof":"AA=="},
+            "ticket_secret":format!("0x{}", "11".repeat(32))});
+        let parsed: CloseRelaySubmissionV2C = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(parsed.public_inputs.kind, 1);
+        let mut extra = body;
+        extra["fee"] = 1.into();
+        assert!(serde_json::from_value::<CloseRelaySubmissionV2C>(extra).is_err());
     }
 }

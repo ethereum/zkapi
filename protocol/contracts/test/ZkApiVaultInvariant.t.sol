@@ -5,10 +5,11 @@ import {Test} from "forge-std/Test.sol";
 import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 import {MockProofAdapter} from "./mocks/MockProofAdapters.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
+import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
 /// @dev Drives a vault (mock adapter) through random deposits, escapes with concessions, raises,
 ///      defeats, finalizations, closes, expiry claims, payout claims, retirements, pauses, time and
@@ -52,7 +53,7 @@ contract VaultHandler is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
         vm.deal(address(this), 1_000 ether);
         roots.push(vault_.currentRoot());
@@ -313,19 +314,19 @@ contract VaultHandler is Test {
     function _treeLeaf(uint32 index) private view returns (uint256) {
         if (index >= vault.nextNoteId() || retired[index]) return 0;
         (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(index);
-        return NoteLeafLib.computeLeaf(index, commitment, amount, expiry);
+        return ReferenceHashes.leaf(index, commitment, amount, expiry);
     }
 
     function _path(uint32 index) private view returns (uint256[32] memory siblings) {
         siblings = emptySiblings;
         siblings[0] = _treeLeaf(index ^ 1);
         uint32 pair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
+        siblings[1] = Bn254PoseidonReference.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
         uint32 quad = (index >> 2) ^ 1;
-        siblings[2] = Bn254Poseidon.compress(
+        siblings[2] = Bn254PoseidonReference.compress(
             DOMAIN_NODE,
-            Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(quad * 4), _treeLeaf(quad * 4 + 1)),
-            Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(quad * 4 + 2), _treeLeaf(quad * 4 + 3))
+            Bn254PoseidonReference.compress(DOMAIN_NODE, _treeLeaf(quad * 4), _treeLeaf(quad * 4 + 1)),
+            Bn254PoseidonReference.compress(DOMAIN_NODE, _treeLeaf(quad * 4 + 2), _treeLeaf(quad * 4 + 3))
         );
     }
 
@@ -356,7 +357,18 @@ contract ZkApiVaultInvariantTest is Test {
         treasury.setAccepting(true);
         ToggleableDestination wallet = new ToggleableDestination();
         vault = new ZkApiVault(
-            address(treasury), 30 days, 24 hours, 100_000, address(adapter), 11, 12, 13, 14, address(this), 7 days
+            address(treasury),
+            30 days,
+            24 hours,
+            100_000,
+            address(adapter),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            7 days,
+            PoseidonRuntime.etch()
         );
         handler = new VaultHandler(vault, adapter, treasury, wallet);
         // The handler is the owner, so it can pause and unpause.
@@ -388,18 +400,35 @@ contract ZkApiVaultInvariantTest is Test {
         uint32 count = vault.nextNoteId();
         for (uint32 id = 0; id < count; ++id) {
             (, uint128 amount,, Types.NoteStatus status) = vault.notes(id);
-            (bool exists,, uint256 nullifier, uint128 finalBalance,,) = vault.pendingWithdrawals(id);
+            (
+                bool exists,
+                uint256 activeRoot,
+                uint256 nullifier,
+                uint128 finalBalance,
+                address destination,
+                uint64 deadline
+            ) = vault.pendingWithdrawals(id);
             (uint256 next, uint128 stateBalance, uint128 conceded) = vault.pendingConcessions(id);
+            // The proof's root is never stored.
+            assertEq(activeRoot, 0);
             if (status == Types.NoteStatus.PendingWithdrawal) {
                 assertTrue(exists);
                 assertEq(uint256(finalBalance) + conceded, stateBalance);
                 assertLe(stateBalance, amount);
                 assertNotEq(next, 0);
                 assertNotEq(next, nullifier);
+                assertNotEq(destination, address(0));
+                assertNotEq(deadline, 0);
                 assertTrue(vault.usedNullifiers(nullifier));
                 assertTrue(vault.usedNullifiers(next));
+                assertFalse(vault.challengedNullifiers(nullifier));
+                assertFalse(vault.challengedNullifiers(next));
             } else {
                 assertFalse(exists);
+                assertEq(nullifier, 0);
+                assertEq(finalBalance, 0);
+                assertEq(destination, address(0));
+                assertEq(deadline, 0);
                 assertEq(next, 0);
                 assertEq(stateBalance, 0);
                 assertEq(conceded, 0);

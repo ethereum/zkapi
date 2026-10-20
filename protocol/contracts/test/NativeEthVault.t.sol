@@ -8,14 +8,16 @@ import {IZkApiProofAdapter} from "../src/interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {Groth16ProofAdapter} from "../src/adapters/Groth16ProofAdapter.sol";
 import {MockAdapterIdentity} from "./mocks/MockProofAdapters.sol";
+import {PoseidonRuntime} from "./helpers/PoseidonRuntime.sol";
 
 /// Accepts every proof. It has no receive function, so it also serves as a non-payable payee.
 contract NativeProofFixture is MockAdapterIdentity {
     function assertValidRequest(Types.RequestPublicInputs calldata, bytes calldata) external pure {}
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {}
+    function verifyWithdrawalOnce(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {}
 }
 
 contract RejectNativePayout {
@@ -103,11 +105,22 @@ contract NativeEthVaultTest is Test {
         uint256 zero;
         for (uint256 level; level < 32; ++level) {
             siblings[level] = zero;
-            zero = Bn254Poseidon.compress(0x7a6b6170692e76322e6e6f6465, zero, zero);
+            zero = Bn254PoseidonReference.compress(0x7a6b6170692e76322e6e6f6465, zero, zero);
         }
         adapter = new NativeProofFixture();
         vault = new ZkApiVault(
-            treasury, 30 days, 24 hours, 100_000, address(adapter), 11, 12, 13, 14, address(this), 7 days
+            treasury,
+            30 days,
+            24 hours,
+            100_000,
+            address(adapter),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            7 days,
+            PoseidonRuntime.etch()
         );
         vm.deal(user, 1 ether);
     }
@@ -178,9 +191,35 @@ contract NativeEthVaultTest is Test {
     function test_nativeRejectsInvalidRequestChargeCap() public {
         uint128 unsafeCap = vault.MAX_NATIVE_UNITS() + 1;
         vm.expectRevert(Errors.InvalidBalance.selector);
-        new ZkApiVault(treasury, 30 days, 24 hours, 0, address(adapter), 11, 12, 13, 14, address(this), 7 days);
+        new ZkApiVault(
+            treasury,
+            30 days,
+            24 hours,
+            0,
+            address(adapter),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            7 days,
+            PoseidonRuntime.etch()
+        );
         vm.expectRevert(Errors.InvalidBalance.selector);
-        new ZkApiVault(treasury, 30 days, 24 hours, unsafeCap, address(adapter), 11, 12, 13, 14, address(this), 7 days);
+        new ZkApiVault(
+            treasury,
+            30 days,
+            24 hours,
+            unsafeCap,
+            address(adapter),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            7 days,
+            PoseidonRuntime.etch()
+        );
     }
 
     function test_rejectedPayoutPreservesNoteAndFunds() public {

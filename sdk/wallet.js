@@ -624,7 +624,10 @@ function encodePendingConcessions(noteId) {
   return callData(ABI.pendingConcessions, [uintWord(noteId, 32, "note id")]);
 }
 
-/** pendingWithdrawals(noteId): exactly 6 words (unchanged from revision 2). */
+/**
+ * pendingWithdrawals(noteId): exactly 6 words (the shape of revision 2). The
+ * vault does not store the escape proof's activeRoot: that word is zero.
+ */
 function decodePendingWithdrawals(result) {
   const [exists, activeRoot, withdrawalNullifier, finalBalance, destination, challengeDeadline] =
     dataWords(result, 6, "pendingWithdrawals");

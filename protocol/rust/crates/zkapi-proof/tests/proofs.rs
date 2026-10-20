@@ -19,7 +19,8 @@ use ark_std::rand::{rngs::StdRng, SeedableRng};
 use common::*;
 use zkapi_core::v2 as core;
 use zkapi_proof::compact::{
-    circuit_shape, decode_compressed, decode_compressed_for, keccak256, proof_from_wire,
+    circuit_shape, decode_compressed, decode_compressed_for, keccak256,
+    poseidon_runtime_manifest_json, poseidon_runtime_solidity_source, proof_from_wire,
     proof_to_wire, request_circuit, sha256, verifying_key_keccak256, withdrawal_circuit, KeyKind,
     RequestProver, RequestVerifier, SetupManifest, VkPins, WithdrawalProver, WithdrawalVerifier,
     CEREMONY_SETUP_ID, CEREMONY_VK_KECCAK256, DEV_SETUP_ID, REHEARSAL_SETUP_ID,
@@ -132,9 +133,24 @@ fn setup_matches_its_manifest_and_adapter() {
     )));
     assert!(adapter.contains(&format!("REQUEST_VK_HASH = {}", hex(request_vk))));
     assert!(adapter.contains(&format!("WITHDRAWAL_VK_HASH = {}", hex(withdrawal_vk))));
-    assert!(adapter.contains("uint256[16] memory values"));
-    assert!(adapter.contains("if (index == 16) return"));
-    assert!(!adapter.contains("if (index == 17) return"));
+    // Every IC point of the manifest is a named constant of the adapter, and no other is.
+    for (prefix, ic) in [
+        ("REQUEST", &manifest.request.ic),
+        ("WITHDRAWAL", &manifest.withdrawal.ic),
+    ] {
+        for (index, [x, y]) in ic.iter().enumerate() {
+            assert!(
+                adapter.contains(&format!("{prefix}_IC{index}_X = {x};")),
+                "{prefix} IC{index}"
+            );
+            assert!(
+                adapter.contains(&format!("{prefix}_IC{index}_Y = {y};")),
+                "{prefix} IC{index}"
+            );
+        }
+        assert!(!adapter.contains(&format!("{prefix}_IC{}_X", ic.len())));
+    }
+    assert!(adapter.contains("function verifyWithdrawalOnce("));
     assert_eq!(manifest.request.ic.len(), 13);
     assert_eq!(manifest.withdrawal.ic.len(), 17);
     assert_eq!(
@@ -144,6 +160,21 @@ fn setup_matches_its_manifest_and_adapter() {
     assert_eq!(
         manifest.circuits.withdrawal,
         circuit_shape(KeyKind::Withdrawal).unwrap()
+    );
+}
+
+/// The setup's Poseidon runtime and its sidecar are this build's generator output, byte for byte
+/// (the Forge suite compiles the contracts' copy, which CI diffs with the setup's, and checks the
+/// sidecar's source hash and runtime codehash; protocol/formal checks the same source).
+#[test]
+fn setup_poseidon_runtime_is_the_generator_output() {
+    assert_eq!(
+        String::from_utf8(read("Bn254PoseidonRuntime.sol")).unwrap(),
+        poseidon_runtime_solidity_source()
+    );
+    assert_eq!(
+        String::from_utf8(read("poseidon-runtime.json")).unwrap(),
+        String::from_utf8(poseidon_runtime_manifest_json().unwrap()).unwrap()
     );
 }
 

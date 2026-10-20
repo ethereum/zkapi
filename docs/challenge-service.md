@@ -13,7 +13,10 @@ append-only request evidence, and, before each escape's deadline:
 - after a missed defeat, **retires** the closed note's leaf with
   `retireClosedLeaf`.
 
-It sends EIP-1559 transactions whose fees rise as the deadline approaches. It
+It sends EIP-1559 transactions whose fees rise as the deadline approaches. When
+the deployment has an exit batcher, defeats and raises that are not near their
+deadline go together in one transaction
+([Batched defeats and raises](#batched-defeats-and-raises)). It
 never signs a balance or changes usage accounting. The design is in §5.4 of
 the [concession exit design](design/concession-exit.md).
 
@@ -73,6 +76,10 @@ so two instances cannot share a checkpoint.
 | `--stale-poll-seconds`, `--startup-grace-seconds` | | 300, 300 | Liveness and first-poll grace. |
 | `--observe-interval-seconds` | | 15 | Sender balance and indexer root observations. |
 | `--min-sender-balance-wei` | | 600,000 gas x `--max-fee-per-gas-wei`, at most `--tx-fee-cap-wei` | Balance warning threshold. |
+| `--batching` | `ZKAPI_CHALLENGE_BATCHING` | true | Batch defeats and raises through the manifest's exit batcher; false, or a manifest without `exit_batcher_address`, keeps every call single. |
+| `--batch-max-items` | `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` | 16 | A batch flushes once it holds this many items; 2 to the batcher's `MAX_ITEMS()` (64). |
+| `--batch-max-age-seconds` | `ZKAPI_CHALLENGE_BATCH_MAX_AGE_SECONDS` | 600 | A batch flushes once its oldest item has waited this long (chain time). |
+| `--batch-deadline-margin-seconds` | `ZKAPI_CHALLENGE_BATCH_DEADLINE_MARGIN_SECONDS` | 1800 | A batch flushes at once when an item's deadline is within `--critical-remaining-seconds` plus this. |
 
 For the AWS deployment, [the bounded signer sidecar](../docker/aws/signer/README.md)
 provides the signer RPC on a private container network, and
@@ -81,7 +88,10 @@ requires an explicit `ZKAPI_CHALLENGE_CHAIN_ID` of 1 (Mainnet) or 11155111
 (Sepolia) and accepts only zero-value, canonically encoded defeat
 (`0xda0ce43d`), raise (`0xdd0064ba`) and leaf-retirement (`0xe41f4c31`) calls
 to that chain's configured vault; a defeat or raise must carry protocol
-version 2, that chain, that vault and a 256-byte proof. It checks a live
+version 2, that chain, that vault and a 256-byte proof. With
+`ZKAPI_CHALLENGE_EXIT_BATCHER` it also accepts `challengeBatch` (`0xab41c746`)
+to that batcher while its `vault()` is the vault
+([Batched defeats and raises](#batched-defeats-and-raises)). It checks a live
 simulation, preserves the daemon's nonce, and signs EIP-1559 (type 2)
 transactions with the fees the daemon proposes, within its own fee and tip
 caps and transaction fee cap. It refuses with a structured reason
@@ -114,6 +124,11 @@ row that `zkapi db init` writes, and refuses an older database with "run
   the runtime code hashes of the vault, adapter and Poseidon library equal the
   manifest's;
 - the vault's `challengePeriod()` equals the manifest's and the binding's;
+- with batching on and an exit batcher in the manifest: the batcher's runtime
+  code hash is the manifest's `exit_batcher_runtime_codehash`, its `vault()`
+  and `adapter()` are the manifest's vault and adapter, its `itemGas(kind)`
+  caps are positive and equal the manifest's `exit_batcher_item_gas` when it
+  pins them, and its `MAX_ITEMS()` is at least `--batch-max-items`;
 - the timing checks: the settlement window + 2 x poll + 600 seconds is at
   most half of `challengePeriod()`, and the settlement window + the raise lead
   + 4 x poll + 1,200 seconds is at most `challengePeriod()`.
@@ -291,6 +306,141 @@ replacements. The daemon then sees nonces as held by unknown attempts and keeps
 re-bidding at the replacement pace. Prefer a full-node RPC, and verify a relay's
 pending visibility and replacement behaviour on Sepolia first.
 
+## Batched defeats and raises
+
+When the deployment manifest names an exit batcher (`exit_batcher_address`,
+the permissionless `ZkApiExitBatcher` bound to this vault and its adapter) and
+`--batching` is on, defeats and raises can share one transaction:
+`challengeBatch(noteIds, amounts, inputs, proofs)` verifies every request
+proof once through the adapter's batch verifier, then makes one ordinary vault
+call per item (`challengeEscapeWithdrawal` for amount 0, else
+`raiseEscapeConcession` with that amount) under the batcher's per-item gas cap.
+An item the vault refuses (its escape was already defeated, raised or
+finalized, or its call ran out of its cap) is skipped with an `ItemSkipped`
+log and the rest continue; one bad proof reverts the whole batch, and so does
+a batch with too little gas (`BatchOutOfGas`). The vault's own events stay the
+source of truth: each note's obligation is reconciled from the vault exactly
+as for a single call. Each defeat costs about a third of a single one in a
+batch of 16. Without a batcher in the manifest, with `--batching false`, or
+while the signer does not allow the batcher, every call is single, exactly as
+described above.
+
+**When it batches.** A defeat or raise that becomes due on a note without a
+reserved nonce waits for a batch, unless its deadline is within the critical
+threshold (`--critical-remaining-seconds`, `challengePeriod()` / 4 by default,
+the point where fee escalation spends its reserve): inside it, every call is
+single, so no batching risk is left near a deadline. A leaf retirement is
+never batched, and neither is a note excluded after an anomaly (below). The
+wait starts at the chain time it was first queued, which the checkpoint keeps,
+so a restart does not reset it.
+
+**When it flushes.** After each poll's pass over the obligations, and only when
+no earlier nonce is unresolved, the queue flushes when any of these holds:
+
+- it holds `--batch-max-items` items (or the signer's lower `batch_max_items`);
+- its oldest item has waited `--batch-max-age-seconds`;
+- an item's deadline is within the critical threshold plus
+  `--batch-deadline-margin-seconds`.
+
+Otherwise its obligations stay `ready` with the detail `queued for a batch
+with N due item(s); it flushes when full, or by chain time T at the latest`.
+A flush takes the items by deadline, earliest first, in batches of the maximum
+size. A lone item goes as a single call, which is cheaper than a batch of one.
+
+**Simulation and bisection.** Each batch is simulated first with `eth_call` of
+its exact calldata from the sender, which returns the bitmap of the items that
+would apply:
+
+- every item applies: the batch is sent;
+- some items are skipped: they leave the batch, and the rest is simulated
+  again;
+- the call reverts (any RPC error, since the bundled signer passes no revert
+  data): the batch is halved and each half simulated, down to single items. An
+  item that reverts a batch of its own goes the single path (below); items
+  that bisection left alone but that passed a simulation are batched together
+  once more.
+
+At most about two simulations per item. An unreachable RPC stops the flush;
+its items stay due for the next poll.
+
+**The single path for items taken out.** An item a simulation skipped is
+simulated as its own vault call. If that reverts with a changed escape
+(`NotPendingWithdrawal()`, `ReplayedNullifier()`, `NotARaise()`,
+`ChallengeExpired()`), nothing is sent and the obligation shows it as a single
+call would (`resolved_unconfirmed` or `raised`); its vault state decides the
+next poll. If the single call simulates, the skip was an anomaly: the note is
+sent single at once. An item that reverts a batch of its own, or a simulation
+that answers something other than a bitmap, is also an anomaly, and the item
+goes to the single path, whose own simulation reports invalid evidence as
+usual (`evidence_invalid`). A note with an anomaly, or whose single call
+reverts for an unknown reason after a skip, is excluded from batching for the
+rest of its escape (`batch_excluded` on `/status`): it is never relayed in a
+batch again.
+
+**Gas limit.** The batch's gas limit is the batcher's `gasBound(kinds)` (read
+with `eth_call`: the verification bound for these items plus each item's gas
+cap with its 64/63 reserve and per-item overhead, plus the batcher's margin)
+plus the 21,000 intrinsic gas and the calldata gas (at least the EIP-7623 floor
+of 10 gas per calldata token), and never below `eth_estimateGas` plus 20%, the
+margin every challenge gets. The estimate already covers the batcher's
+up-front reserve, so a destination or vault call cannot starve the batch. The
+[transaction fee ceiling](#transaction-fee-ceiling) applies at that gas limit:
+about 3M gas for 16 items at the Mainnet item caps allows about 333 gwei per
+gas at 1 ETH.
+
+**The nonce lane.** A batch takes one nonce. Every member's obligation holds
+that nonce with a mirrored attempt record (hashes, fees, gas limit, attempts)
+whose digest is the batch's (`zkapi:v2c:challenge-batch`, the batcher and the
+calldata), and the checkpoint keeps the batch's exact calldata, its members
+(note, escape, call and evidence row, and the item's single-call digest) and
+its gas bound. The nonce, digest and fees are written on every member before
+each send. Replacements, re-sends after a drop, fee bumps, the fee reserve and
+critical escalation work as for a single call, once per batch per poll, at the
+urgency of its most urgent member, and always resend the recorded calldata; a
+re-send whose items would all be skipped is not sent. A failed send rolls back
+every member and, when nothing was broadcast, releases the nonce. While a
+batch holding a note's raise is pending, a defeat that becomes due for that
+note is not swapped into it (the calldata is fixed): the obligation shows `a
+defeat is due; the batch holding this note's raise keeps its calldata, so the
+defeat follows on the next nonce once it mines`, and the defeat goes on the
+next nonce once the batch mines, as after a raise that lands first.
+
+**Receipts.** Each member is reconciled on its own: an escape gone at
+confirmation depth retires its obligation as for a single call, and the nonce
+stays reserved while any member holds it (a member that leaves never detaches
+a nonce another still holds; a replay that tracks its escape again restores
+its membership). When a batch nonce is consumed while a member's escape is
+still pending, the daemon reads the receipt once: an `ItemSkipped` of that
+item with a changed-escape reason is expected; any other reason (for example
+empty revert data: the item ran out of its gas cap), or a reverted batch
+transaction, is an anomaly and excludes the note. Without a receipt, a note
+whose very item is still due is excluded quietly. Either way the defeat or raise
+is sent again as a single call after the confirmation depth.
+
+**Signer.** The bundled signer signs `challengeBatch` only to its
+`ZKAPI_CHALLENGE_EXIT_BATCHER`, and only while that batcher's `vault()` is its
+vault (see [the signer README](../docker/aws/signer/README.md#batched-challenges)).
+The daemon reads `exit_batcher` and `batch_max_items` from
+`zkapi_signerStatus`: a signer that reports another batcher or none turns
+batching off (`/status` warns `batching is off: ...`). A signer that refuses a
+batch itself, without a reason or with `batcher_vault_mismatch` or
+`batch_size_out_of_bounds`, turns batching off until the daemon restarts; the
+members are rolled back and go single on the next poll. Fee, balance and
+simulation refusals of a batch are handled as for a single call.
+
+**Alerts.** `/status` has a `batching` object: `enabled`, `exit_batcher`,
+`disabled_reason`, the policy, `queued`, `batches_sent_total`,
+`batched_items_total`, `single_fallbacks_total`, `anomalies_total` and
+`last_anomaly`. Each obligation shows `batch_notes` (the notes of the batch on
+its nonce) and `batch_excluded`. An anomaly logs `batched challenge anomaly` at
+error level and stays a warning alarm (`batched challenge anomaly of note N`)
+for an hour; the note itself goes on single and its deadline escalates as
+usual. Repeated anomalies mean the batcher's item caps or the vault disagree
+with the daemon: compare the batcher's `itemGas` with the measured call gas,
+or set `--batching false` until it is understood. A batching warning that the
+signer does not allow the batcher means `ZKAPI_CHALLENGE_EXIT_BATCHER` in
+`signer.env` is unset or differs from the manifest.
+
 ## Transaction fee ceiling
 
 geth and reth refuse `eth_sendRawTransaction` before the transaction reaches
@@ -370,7 +520,9 @@ only the fee cap changes nothing. Fund the sender for every transaction that may
 once plus reverted attempts: each needs gas limit x fee cap (600,000 gas for a
 defeat, 450,000 for a raise, about 7.2M for a leaf retirement), but never more
 than the ceiling. Size it for `⌈m/2⌉` defeats per note (a user holding `m`
-archived states can force that many, each about 375,000 gas), at most 64
+archived states can force that many, each about 284,000 gas, the
+`challengeEscapeWithdrawal` figure in
+`protocol/contracts/snapshots/concession-exit-gas.json`), at most 64
 concurrent escapes, and a 20% margin. Status warns when the balance cannot
 cover the outstanding obligations at the proposed fee cap, or is below
 `--min-sender-balance-wei`. There is no spending budget beyond the
@@ -448,8 +600,10 @@ which refuses every retirement when it is `false`.
 
 ### The signer's retirement budget
 
-A leaf retirement costs about 6M gas, far more than a defeat or a raise, so
-the bundled signer bounds what a compromised daemon host could spend on it:
+A leaf retirement costs about 0.94M gas (`GasBaselineRetire` in
+`protocol/contracts/test/GasBaseline.t.sol`), about three times a defeat or a
+raise, so the bundled signer bounds what a compromised daemon host could spend
+on it:
 
 - it signs `retireClosedLeaf` only while `ZKAPI_CHALLENGE_RETIRE_ON_MISS` is
   on (`retirement_disabled` otherwise), and only for a note whose escape
@@ -494,7 +648,10 @@ See [the signer README](../docker/aws/signer/README.md).
 The checkpoint records the deployment and sender, next scan block, block hash,
 pending nullifiers and deadlines, reserved transaction nonces, every candidate
 transaction hash with the latest attempt's fees and gas limit, the evidence
-digest, the missed-deadline count and the nullifiers of the misses it counted.
+digest, the missed-deadline count and the nullifiers of the misses it counted,
+and, with batching, the batches held on a nonce (their calldata and members),
+when each due call started waiting for a batch, the notes excluded from
+batching and the batching counters.
 It is written before each send, with
 atomic replacement after syncing the file. Older checkpoints load unchanged;
 older binaries ignore the new fields. Never delete it: it holds reserved nonces.
@@ -662,7 +819,8 @@ The status listener serves three internal routes, all with
   `challenge_gas_limit`, `tx_fee_cap_max_fee_per_gas_wei`), indexer state,
   every obligation, detached nonces with their latest recorded bid,
   `missed_total`, `escapes_finalized_with_successor_evidence_total`,
-  `missed_raises_total` and `last_missed`. Wei values are decimal strings. It contains
+  `missed_raises_total`, `last_missed` and `batching`
+  ([Batched defeats and raises](#batched-defeats-and-raises)). Wei values are decimal strings. It contains
   no client request IDs.
 
 Remaining time and severity are recomputed at request time from the absolute

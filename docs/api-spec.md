@@ -171,6 +171,72 @@ ownership proofs. This circuit has no proof-less clearance:
 `--allow-legacy-clearance` refuses startup, and public `/health` reports
 `clearance_ownership_proof_required: true`.
 
+## Close relay
+
+An operator may relay cooperative closes through the deployment's
+`ZkApiExitBatcher` (`mutualCloseBatch`). The relay is off unless serverd is
+started with `--relay-*` and the deployment manifest names the exit batcher;
+see [close relay](native-eth-billing.md#close-relay) for its policy, fee and
+trust argument. A client never needs it: a close the relay does not land is
+submitted by the client itself.
+
+`GET /v2/withdraw/relay/terms` returns `CloseRelayTermsResponse`:
+`{"enabled": false}` without a relay, otherwise `enabled: true`, `fee_units`
+(decimal gwei), `min_validity_seconds`, `batch_target`, `flush_age_seconds`,
+`urgent_margin_seconds`, `cutoff_seconds` and `exit_batcher`.
+
+`POST /v2/withdraw/relay/fee` takes an `ApiRequestV2` made at the note's
+current state whose payload is exactly
+`{"mode":"close_relay_fee","version":1,"fee_units":"<fee>","ticket_hash":"0x<64 hex>"}`
+(unknown fields are refused), with `ticket_hash =
+keccak256("zkapi:v2c:close-relay-ticket\0" || secret)` of a fresh 32-byte
+secret. It is admitted like any request (fresh root, state key, request time,
+authorization tag, Groth16 proof) with `solvency_bound >= fee`, settled at
+once at exactly the fee, and answered with the signed successor
+(`RequestResponseV2`, `charge_applied` = fee, payload
+`{"status":"relay_fee_paid",...}`). An exact retry returns the same
+successor; recovery (`GET /v2/requests/{id}`) serves it too. Prove the close
+at that successor.
+
+`POST /v2/withdraw/relay` takes `CloseRelaySubmissionV2C`,
+`{public_inputs, proof, ticket_secret}` (unknown fields refused):
+`public_inputs` is the kind-1 `WithdrawalPublicInputsV2C` and `proof` the
+Groth16 proof exactly as `mutualClose` takes them. The server requires this
+deployment and its keys, kind 1 with no successor or concession, a destination
+that is neither zero nor the vault, `valid_until` at least
+`min_validity_seconds` ahead, a valid proof, a nullifier unused on chain, its
+own clearance at the nullifier, and a paid ticket that redeemed no other
+close. It answers `202` with `CloseRelayStatusResponse` when it queued the
+close, and `200` with the current status for the same close submitted again.
+`GET /v2/withdraw/relay/{withdrawal_nullifier}` returns the status, or `404`
+`{"status":"not_found"}`.
+
+`CloseRelayStatusResponse` is `{status, withdrawal_nullifier, note_id,
+valid_until, queued_at, updated_at, transaction_hash?, block_number?, detail?,
+self_submit}`, where `status` is `queued`, `submitted` (in a relay transaction
+not yet confirmed; `transaction_hash` is its latest hash), `landed` (the
+vault's `MutualClose` for it was emitted in the relay's transaction),
+`closed` (closed by another transaction), `failed` (never relayed again, for
+example a payout push that failed) or `expired` (too near `valid_until`).
+`self_submit` is true for `failed` and `expired`. Clients confirm the payout
+from the vault's `MutualClose` event in every case.
+
+| Status | `error_code` | Meaning |
+| --- | --- | --- |
+| 404 | `relay_disabled` | This server does not relay |
+| 400 | `invalid_request`, `invalid_proof`, `protocol_mismatch` | A malformed fee request or close, or one for another deployment |
+| 400 | `relay_ticket_invalid` | `ticket_secret` is not 32 hex bytes |
+| 400 | `relay_ticket_unknown` | No paid fee has this ticket |
+| 400 | `relay_clearance_unknown` | This server issued no clearance at the nullifier |
+| 400 | `relay_validity_too_short` | `valid_until` is too near; prove again or submit yourself |
+| 409 | `relay_fee_changed` | The payload names another fee than the terms; read them again |
+| 409 | `relay_ticket_taken` | A fee was already paid for this ticket hash; draw a new secret |
+| 409 | `relay_ticket_redeemed` | The ticket paid for another close |
+| 409 | `relay_conflict` | Another close was submitted at this nullifier |
+| 409 | `relay_already_closed` | The nullifier is already used on chain |
+| 409 | `stale_root`, `nullifier_used`, `replay` | As for any request |
+| 500, 503 | `internal_error`, `chain_read_unavailable`, `capacity_exhausted` | Retriable: a chain read or the verifier was unavailable; resend the same body |
+
 ## Indexer
 
 The indexer provides `/v1/tree/root`, `/v1/tree/snapshot`,

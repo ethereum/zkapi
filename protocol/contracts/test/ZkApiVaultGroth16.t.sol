@@ -7,8 +7,9 @@ import {Groth16ProofAdapter} from "../src/adapters/Groth16ProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
+import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
 /// @dev Rust-generated proofs (CircomReduction prover, committed setup), the generated verifier and
 ///      a normally deployed vault. Regenerate test/fixtures/vault-challenge.json with
@@ -44,10 +45,17 @@ contract ZkApiVaultGroth16Test is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
-        adapter = new Groth16ProofAdapter();
         (Types.WithdrawalPublicInputs memory parameters,) = _withdrawal("escape_a2");
+        // Folded for the vault DEPLOYER creates at nonce 0, the address the proofs bind.
+        adapter = new Groth16ProofAdapter(
+            vm.computeCreateAddress(DEPLOYER, 0),
+            parameters.stateSigningKeyX,
+            parameters.stateSigningKeyY,
+            parameters.clearanceSigningKeyX,
+            parameters.clearanceSigningKeyY
+        );
         vm.setNonce(DEPLOYER, 0);
         vm.prank(DEPLOYER);
         vault = new ZkApiVault(
@@ -61,7 +69,8 @@ contract ZkApiVaultGroth16Test is Test {
             parameters.clearanceSigningKeyX,
             parameters.clearanceSigningKeyY,
             address(this),
-            7 days
+            7 days,
+            PoseidonRuntime.etch()
         );
         assertEq(address(vault), parameters.contractAddress);
         vm.deal(USER, 10 * uint256(DEPOSIT) * 1 gwei);
@@ -503,8 +512,9 @@ contract ZkApiVaultGroth16Test is Test {
         assertNotEq(rootAtInitiation, rootA);
         _expectInitiated(escape, rootAtInitiation);
         _initiate("escape_a2_at_root_a");
-        (, uint256 pendingRoot,,,,) = vault.pendingWithdrawals(0);
-        assertEq(pendingRoot, rootA);
+        (bool pending, uint256 pendingRoot,,,,) = vault.pendingWithdrawals(0);
+        assertTrue(pending);
+        assertEq(pendingRoot, 0, "the proof's root is not stored");
 
         _depositOther(2, 0x1234);
         uint256 rootAtDefeat = vault.currentRoot();
@@ -648,7 +658,7 @@ contract ZkApiVaultGroth16Test is Test {
 
     function _leafOf(uint32 noteId) private view returns (uint256) {
         (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiry);
+        return ReferenceHashes.leaf(noteId, commitment, amount, expiry);
     }
 
     function _treeLeaf(uint32 index) private view returns (uint256) {
@@ -662,7 +672,7 @@ contract ZkApiVaultGroth16Test is Test {
         siblings = emptySiblings;
         siblings[0] = _treeLeaf(index ^ 1);
         uint32 pair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
+        siblings[1] = Bn254PoseidonReference.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
     }
 
     function _initiate(string memory name) private returns (Types.WithdrawalPublicInputs memory, bytes memory) {

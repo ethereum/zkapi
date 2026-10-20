@@ -4,10 +4,11 @@ pragma solidity ^0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ZkApiVault} from "../../src/ZkApiVault.sol";
 import {Types} from "../../src/libraries/Types.sol";
-import {Bn254Poseidon} from "../../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "../reference/Bn254PoseidonReference.sol";
 import {MerkleUpdateLib} from "../../src/libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "../../src/libraries/NoteLeafLib.sol";
 import {MockProofAdapter} from "../mocks/MockProofAdapters.sol";
+import {PoseidonRuntime, ReferenceHashes} from "./PoseidonRuntime.sol";
 
 /// @dev A vault with the MockProofAdapter (every withdrawal verifies; a request verifies once
 ///      registered) and builders for its statements. Nullifiers are arbitrary nonzero numbers:
@@ -58,7 +59,8 @@ abstract contract VaultTestBase is Test {
             CLEAR_X,
             CLEAR_Y,
             address(this),
-            maxPauseDuration
+            maxPauseDuration,
+            PoseidonRuntime.etch()
         );
     }
 
@@ -73,12 +75,12 @@ abstract contract VaultTestBase is Test {
 
     /// The node hash of the note tree.
     function _node(uint256 left, uint256 right) internal pure returns (uint256) {
-        return Bn254Poseidon.compress(DOMAIN_NODE, left, right);
+        return Bn254PoseidonReference.compress(DOMAIN_NODE, left, right);
     }
 
     function _leafOf(uint32 noteId) internal view returns (uint256) {
         (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(noteId);
-        return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiryTs);
+        return ReferenceHashes.leaf(noteId, commitment, amount, expiryTs);
     }
 
     /// The leaf the tree holds at `index`, given which leaves were retired.

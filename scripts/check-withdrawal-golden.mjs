@@ -184,20 +184,24 @@ async function send(rpc, transaction) {
 async function deploy(rpc, golden) {
   const artifact = name => JSON.parse(fs.readFileSync(path.join(CONTRACTS, `out/${name}.sol/${name}.json`), 'utf8'));
   const [funder] = await rpc('eth_accounts');
-  const poseidon = await send(rpc, { from: funder, data: linked(artifact('Bn254Poseidon'), {}) });
-  const adapter = await send(rpc, { from: funder, data: linked(artifact('Groth16ProofAdapter'), {}) });
+  const d = golden.deployment;
+  // The vault's Poseidon (legacy-compiled, no constructor arguments); the vault takes its address.
+  const poseidon = await send(rpc, { from: funder, data: linked(artifact('Bn254PoseidonRuntime'), {}) });
+  // The adapter is folded for the vault the proofs bind (on this chain, with its signing keys).
+  const adapterArgs = [addressWord(d.vault), word(d.state_signing_key.x), word(d.state_signing_key.y),
+    word(d.clearance_signing_key.x), word(d.clearance_signing_key.y)];
+  const adapter = await send(rpc, { from: funder, data: linked(artifact('Groth16ProofAdapter'), {}) + adapterArgs.join('') });
   assert.equal(poseidon.status, '0x1');
   assert.equal(adapter.status, '0x1');
-  const d = golden.deployment;
   // The proofs bind the vault address: CREATE by the deployer at its nonce.
   await rpc('anvil_impersonateAccount', [d.deployer]);
   await rpc('anvil_setBalance', [d.deployer, hex(10n ** 20n)]);
   assert.equal(BigInt(await rpc('eth_getTransactionCount', [d.deployer, 'latest'])), BigInt(d.deployer_nonce));
   const args = [addressWord(d.treasury), word(d.note_ttl), word(d.challenge_period), word(d.request_charge_cap),
     addressWord(adapter.contractAddress), word(d.state_signing_key.x), word(d.state_signing_key.y),
-    word(d.clearance_signing_key.x), word(d.clearance_signing_key.y), addressWord(d.owner), word(d.max_pause_duration)];
-  const vault = await send(rpc, { from: d.deployer,
-    data: linked(artifact('ZkApiVault'), { 'src/libraries/Bn254Poseidon.sol:Bn254Poseidon': poseidon.contractAddress }) + args.join('') });
+    word(d.clearance_signing_key.x), word(d.clearance_signing_key.y), addressWord(d.owner), word(d.max_pause_duration),
+    addressWord(poseidon.contractAddress)];
+  const vault = await send(rpc, { from: d.deployer, data: linked(artifact('ZkApiVault'), {}) + args.join('') });
   assert.equal(vault.status, '0x1');
   assert.equal(vault.contractAddress.toLowerCase(), d.vault.toLowerCase(), 'the vault is at the address the proofs bind');
   // The deposits, at the fixture's time (the leaves hold the bucketed expiry).

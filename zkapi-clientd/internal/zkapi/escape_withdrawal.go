@@ -249,23 +249,15 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		if options.Fees == "payout" {
 			// Design 3.3: the gasless pre-flight runs before the companion
 			// reserves the exit for the transit account.
-			payeeHasCode, err := h.gaslessPrepareCheck(ctx, config, options, gaslessKindEscape, wallet.Note.Balance, destination)
+			transit, payeeHasCode, err := h.gaslessPrepareCheck(ctx, config, options, gaslessKindEscape, wallet.Note.Balance, destination, record)
 			if GaslessRefusalCode(err) == "escapes_disabled" {
 				initiationRefused = err
-				if payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindFinalize, wallet.Note.Balance, destination); err != nil {
+				if transit, payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindFinalize, wallet.Note.Balance, destination, record); err != nil {
 					// Nothing is reserved: the escape is wallet-paid
 					// throughout, bound to the payout address.
 					return update(), refuse("escapes_disabled", "the paymaster does not sponsor escape initiations, and a sponsored finalization is not available either (%v); use --fees wallet, which pays both the initiation and the finalization from the local signing address", err)
 				}
 			}
-			if err != nil {
-				return update(), err
-			}
-			profile, _, err := h.gaslessProfile()
-			if err != nil {
-				return update(), err
-			}
-			transit, err := h.newTransit(ctx, config, profile, destination)
 			if err != nil {
 				return update(), err
 			}

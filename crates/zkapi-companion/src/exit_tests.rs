@@ -73,6 +73,11 @@ struct World {
     receipts: HashMap<String, Value>,
     block: u64,
     now: u64,
+    // The close relay: its fee (None: the server does not relay), the fee
+    // requests and closes it received, and the status it reports.
+    relay_fee: Option<u128>,
+    relay_fee_requests: Vec<zkapi_types::wire::ApiRequestV2>,
+    relay_submissions: Vec<Value>,
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -319,6 +324,97 @@ async fn clearance_route(State(world): State<Shared>) -> Response {
     }
 }
 
+async fn relay_terms_route(State(world): State<Shared>) -> Response {
+    match world.lock().unwrap().relay_fee {
+        Some(fee) => Json(json!({"enabled": true, "fee_units": fee.to_string(),
+            "min_validity_seconds": 3_600})),
+        None => Json(json!({"enabled": false})),
+    }
+    .into_response()
+}
+
+/// The operator's successor of the vault at `VAULT` for `request`, charging
+/// `charge` (state key seed 11).
+fn signed_successor(
+    request: &zkapi_types::wire::ApiRequestV2,
+    charge: u128,
+    body: String,
+) -> zkapi_types::wire::RequestResponseV2 {
+    let signer = CompactSigner::from_seed(&Felt252::from_u64(11));
+    let anonymous = zkapi_types::wire::CurvePointWire {
+        x: request.public_inputs.anonymous_commitment_x,
+        y: request.public_inputs.anonymous_commitment_y,
+    };
+    let delta = zkapi_proof::compact::random_scalar();
+    let next = zkapi_proof::compact::server_update(&anonymous, charge, &delta).unwrap();
+    let anchor = core::next_anchor(&request.public_inputs.request_nullifier);
+    zkapi_types::wire::RequestResponseV2 {
+        status: "ok".into(),
+        client_request_id: request.client_request_id.clone(),
+        request_nullifier: request.public_inputs.request_nullifier,
+        response_code: 200,
+        response_hash: zkapi_types::canonical_response_hash(body.as_bytes()),
+        response_payload: body,
+        charge_applied: charge,
+        next_commitment: next.clone(),
+        next_anchor: anchor,
+        blind_delta_srv: delta,
+        next_state_signature: signer.sign(&core::state_message(
+            2,
+            1,
+            &zkapi_types::serialization::address_to_felt(&VAULT),
+            &next.x,
+            &next.y,
+            &anchor,
+        )),
+        policy_reason_code: None,
+        policy_evidence_hash: None,
+    }
+}
+
+async fn relay_fee_route(
+    State(world): State<Shared>,
+    Json(request): Json<zkapi_types::wire::ApiRequestV2>,
+) -> Response {
+    let mut world = world.lock().unwrap();
+    let fee = world.relay_fee.unwrap();
+    world.relay_fee_requests.push(request.clone());
+    Json(signed_successor(
+        &request,
+        fee,
+        "{\"status\":\"relay_fee_paid\"}".into(),
+    ))
+    .into_response()
+}
+
+async fn relay_submit_route(State(world): State<Shared>, Json(body): Json<Value>) -> Response {
+    world.lock().unwrap().relay_submissions.push(body.clone());
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "queued", "withdrawal_nullifier": body["public_inputs"]["withdrawal_nullifier"],
+            "note_id": body["public_inputs"]["note_id"], "valid_until": body["public_inputs"]["valid_until"],
+            "queued_at": 1, "updated_at": 1, "self_submit": false})),
+    )
+        .into_response()
+}
+
+async fn relay_status_route(
+    State(world): State<Shared>,
+    AxumPath(nullifier): AxumPath<String>,
+) -> Response {
+    let world = world.lock().unwrap();
+    match world.relay_submissions.iter().find(|body| {
+        body["public_inputs"]["withdrawal_nullifier"].as_str() == Some(nullifier.as_str())
+    }) {
+        Some(body) => Json(json!({"status": "landed", "withdrawal_nullifier": body["public_inputs"]["withdrawal_nullifier"],
+            "note_id": body["public_inputs"]["note_id"], "valid_until": body["public_inputs"]["valid_until"],
+            "queued_at": 1, "updated_at": 2, "transaction_hash": format!("0x{}", "ab".repeat(32)),
+            "self_submit": false}))
+        .into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"status": "not_found"}))).into_response(),
+    }
+}
+
 struct Harness {
     _directory: tempfile::TempDir,
     config: AuthConfig,
@@ -380,6 +476,10 @@ impl Harness {
             .route("/v2/nullifiers/{nullifier}/evidence", get(evidence_route))
             .route("/v2/requests/{id}", get(request_route))
             .route("/v2/withdraw/clearance", post(clearance_route))
+            .route("/v2/withdraw/relay/terms", get(relay_terms_route))
+            .route("/v2/withdraw/relay/fee", post(relay_fee_route))
+            .route("/v2/withdraw/relay", post(relay_submit_route))
+            .route("/v2/withdraw/relay/{nullifier}", get(relay_status_route))
             .route(
                 "/v1/tree/snapshot",
                 get(|State(world): State<Shared>| async move {
@@ -1953,6 +2053,81 @@ async fn a_refusal_recorded_for_an_earlier_state_does_not_steer_this_one() {
     crate::oa_withdrawal::save(&harness.config, &record).unwrap();
     let decision = harness.prepare(None, None).await.unwrap();
     assert_eq!(decision["reason"], "mutual_refused", "{decision}");
+}
+
+/// The close relay from the wallet: the fee is one request at the current
+/// state whose successor installs with the fee deducted (idempotently), the
+/// close is then reserved and proved at that successor, and the relay gets
+/// exactly that close with the ticket secret whose hash the fee request
+/// named. Refused without a relay, and once a withdrawal is reserved.
+#[tokio::test]
+async fn the_relay_fee_is_one_request_and_the_close_is_relayed_with_its_ticket() {
+    let harness = Harness::new(true).await;
+    // No relay: refused, nothing proved.
+    assert_eq!(
+        harness.service.close_relay_terms().await.unwrap(),
+        json!({"enabled": false})
+    );
+    let error = harness.service.close_relay_fee().await.unwrap_err();
+    assert!(error.to_string().contains("does not relay"), "{error}");
+    assert!(!harness.wallet().has_pending_request());
+
+    let fee = 250_000;
+    harness.world.lock().unwrap().relay_fee = Some(fee);
+    let before = harness.nullifier();
+    let paid = harness.service.close_relay_fee().await.unwrap();
+    assert_eq!(paid["status"], "paid");
+    assert_eq!(paid["fee_units"], fee.to_string());
+    let state = harness.wallet().state().unwrap().clone();
+    assert_eq!(state.current_balance, DEPOSIT - fee);
+    assert_eq!(state.current_anchor, core::next_anchor(&before));
+    // Idempotent: no second request.
+    let again = harness.service.close_relay_fee().await.unwrap();
+    assert_eq!(again, paid);
+    let request = {
+        let world = harness.world.lock().unwrap();
+        assert_eq!(world.relay_fee_requests.len(), 1);
+        world.relay_fee_requests[0].clone()
+    };
+    assert_eq!(request.public_inputs.request_nullifier, before);
+    assert_eq!(request.public_inputs.solvency_bound, fee);
+    let payload: zkapi_types::wire::CloseRelayFeeAuthorization =
+        serde_json::from_str(&request.payload).unwrap();
+    assert_eq!(payload.ticket_hash, paid["ticket_hash"]);
+
+    // Nothing reserved yet: the relay has no close to take.
+    assert!(harness.service.close_relay_submit().await.is_err());
+    harness.grant_clearance();
+    let plan = harness
+        .service
+        .oa_prepare_withdrawal([0x22; 20], false)
+        .await
+        .unwrap();
+    assert_eq!(plan.public_inputs.final_balance, DEPOSIT - fee);
+    // Paying again once the withdrawal is reserved returns the paid ticket;
+    // a fresh fee would be refused.
+    assert_eq!(harness.service.close_relay_fee().await.unwrap(), paid);
+
+    let queued = harness.service.close_relay_submit().await.unwrap();
+    assert_eq!(queued["status"], "queued");
+    let submission = harness.world.lock().unwrap().relay_submissions[0].clone();
+    let submission: zkapi_types::wire::CloseRelaySubmissionV2C =
+        serde_json::from_value(submission).unwrap();
+    assert_eq!(submission.public_inputs, plan.public_inputs);
+    assert_eq!(submission.proof, plan.proof);
+    let secret: [u8; 32] = hex::decode(submission.ticket_secret.strip_prefix("0x").unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        format!(
+            "0x{}",
+            hex::encode(zkapi_types::wire::close_relay_ticket_hash(&secret))
+        ),
+        payload.ticket_hash
+    );
+    let status = harness.service.close_relay_status().await.unwrap();
+    assert_eq!(status["status"], "landed");
 }
 
 #[test]

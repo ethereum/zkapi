@@ -21,8 +21,9 @@ the multi-party ceremony in [`../v2-concession`](../v2-concession/README.md)
 | `request.pk`, `request.vk` | Request circuit keys (12 public inputs, 13 IC points) |
 | `withdrawal.pk`, `withdrawal.vk` | Withdrawal circuit keys (16 public inputs, 17 IC points) |
 | `manifest.json` | `setup_id`, `reduction: "circom"`, SHA-256 of the four key files, `vk_keccak256` per kind, `r1cs_sha256` (this build's `.r1cs` exports), circuit shapes, the verifying keys and the Poseidon parameters. `ptau_sha256`, `transcript_sha256` and `zkey_sha256` are `null`: there was no ceremony. |
-| `Groth16ProofAdapter.sol` | The generated Solidity verifier, with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH` |
-| `Bn254Poseidon.sol` | The generated Poseidon library (unchanged from `setup/v2`) |
+| `Groth16ProofAdapter.sol` | The generated Solidity verifier, with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`; deployed once per vault, folded for that vault's address, chain and signing keys |
+| `Bn254PoseidonRuntime.sol` | The generated Poseidon contract the vault calls (identical in every setup: it depends on the Poseidon parameters only); `protocol/contracts/src/poseidon/` holds the same file |
+| `poseidon-runtime.json` | Its pins: compiler settings, the source's SHA-256, the runtime codehash `Deploy.s.sol` requires, the selectors, the scaled constants and the lane bounds of every round |
 
 The VK hashes are keccak256 of each `.vk` file without its header. They are
 also the adapter constants, so a deployment's adapter identifies its setup.
@@ -61,3 +62,20 @@ the fixtures (`examples/solidity_fixture.rs`,
 `examples/vault_challenge_fixture.rs`), the contracts' adapter and its tests,
 the SDK proving keys and hashes, and the deployment profiles of the drill
 vault. The setup example refuses to overwrite an existing directory.
+
+A change to a generator alone (the adapter template or the Poseidon runtime)
+leaves the keys and rewrites the generated files in place:
+
+```text
+cd protocol/rust
+cargo run --release -p zkapi-proof --example refresh_setup_sources -- ../setup/v2-concession-dev
+cp ../setup/v2-concession-dev/Bn254PoseidonRuntime.sol ../contracts/src/poseidon/
+```
+
+CI requires `protocol/contracts/src/poseidon/Bn254PoseidonRuntime.sol` to be
+this directory's copy, `Bn254PoseidonRuntimeTest` requires the compiled
+runtime to hash to `poseidon-runtime.json`'s `runtime_codehash` (a pin in
+`zkapi-proof`'s `poseidon_runtime.rs`, to update with any change to the
+runtime's source or compiler settings), and `protocol/formal`'s
+`scripts/generate.py --check` re-renders the runtime's permutation and
+requires the file to match it.

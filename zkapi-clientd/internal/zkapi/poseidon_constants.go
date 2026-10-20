@@ -1,8 +1,9 @@
 package zkapi
 
-// Poseidon parameters for zkAPI v2, copied verbatim from
-// protocol/contracts/src/libraries/Bn254Poseidon.sol (ROUND_CONSTANTS and the
-// MDS products in _round), which arkworks find_poseidon_ark_and_mds generated
+// Poseidon parameters for zkAPI v2, copied verbatim from the first, unoptimized
+// Bn254Poseidon library (its ROUND_CONSTANTS and the MDS products in _round; the
+// vault now uses protocol/contracts/src/poseidon/Bn254PoseidonRuntime.sol, the
+// same permutation in a scaled sparse form), which arkworks find_poseidon_ark_and_mds generated
 // for width 3, rate 2, alpha 5, 8 full and 57 partial rounds. Three additive
 // constants per round, 65 rounds; testdata/poseidon-vectors.json checks them
 // against zkapi-core's own sponge.

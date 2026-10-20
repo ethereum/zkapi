@@ -29,6 +29,19 @@
 //! the closed note's leaf (`retireClosedLeaf`, with the indexer's path at the
 //! live root).
 //!
+//! With an exit batcher in the deployment manifest, defeats and raises that
+//! are not near their deadline wait for a batch and go together through
+//! `ZkApiExitBatcher.challengeBatch` on one nonce (see `flush_batches`): the
+//! batch flushes when it is full, when its oldest item has waited
+//! `max_age_seconds`, or at once when any item's deadline is within the
+//! critical threshold plus `deadline_margin_seconds`; within the critical
+//! threshold every call is single. The exact batch is simulated first and
+//! bisected on a revert; an item it skips or reverts on goes to the single
+//! path, and a note whose item a batch skipped for a reason other than a
+//! changed escape is never batched again. Every member keeps its own
+//! obligation, mirrors the batch's nonce record, and is reconciled from the
+//! vault on its own.
+//!
 //! The configured RPC must expose an operator-controlled transaction signer.
 //! Keys are never loaded by this service; the sender must be dedicated to it.
 //! Transactions are EIP-1559, with fees the daemon proposes and escalates,
@@ -39,12 +52,15 @@
 
 use crate::{
     challenge_status::{
-        self, unix_now, AlarmPolicy, BlockedReason, ChainStatus, ChallengeStatus,
-        DetachedNonceStatus, EvidenceKind, IndexerState, IndexerStatus, MissedRecord,
-        ObligationState, ObligationStatus, PollStatus, RemainingThresholds, SenderStatus, Severity,
-        StatusHandle,
+        self, unix_now, AlarmPolicy, BatchAnomaly, BatchingStatus, BlockedReason, ChainStatus,
+        ChallengeStatus, DetachedNonceStatus, EvidenceKind, IndexerState, IndexerStatus,
+        MissedRecord, ObligationState, ObligationStatus, PollStatus, RemainingThresholds,
+        SenderStatus, Severity, StatusHandle,
     },
-    deployment::{probe_deployment, ContractReader, DeploymentManifest, ProbeError},
+    deployment::{
+        probe_deployment, probe_exit_batcher, ContractReader, DeploymentManifest, ExitBatchKind,
+        ProbeError, EXIT_BATCHER_MAX_ITEMS,
+    },
     error::ServerError,
     nullifier_store::{DeploymentBinding, NullifierStore, StatementIdentity},
     watcher::{
@@ -111,6 +127,39 @@ const DEAD_ESCAPE_CONFIRM_SECONDS: u64 = 60;
 /// so such entries cannot spend the per-poll budget of the others.
 const DEAD_ESCAPE_RECHECK_POLLS: u64 = 16;
 const MAX_ERROR_CHARS: usize = 512;
+/// `ZkApiExitBatcher.challengeBatch(uint32[] noteIds, uint128[] amounts,
+/// RequestPublicInputs[] inputs, bytes proofs)`: an item with amount 0 is a
+/// defeat, any other a raise to that amount; `proofs` is the items' 256-byte
+/// proofs in item order. It returns the bitmap of the items it applied.
+pub const CHALLENGE_BATCH_SIGNATURE: &str = "challengeBatch(uint32[],uint128[],(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256)[],bytes)";
+pub const CHALLENGE_BATCH_SELECTOR: [u8; 4] = [0xab, 0x41, 0xc7, 0x46];
+/// `gasBound(uint8[] kinds)`: the execution gas a batch of these kinds may
+/// need, verification and the per-item caps (with their 64/63 reserve)
+/// included; neither the intrinsic 21,000 nor calldata gas.
+pub const GAS_BOUND_SIGNATURE: &str = "gasBound(uint8[])";
+pub const GAS_BOUND_SELECTOR: [u8; 4] = [0xaa, 0x01, 0x29, 0x45];
+/// The batcher's log of an item the vault refused: its index, kind, note and
+/// the vault's revert data.
+const ITEM_SKIPPED_EVENT: &str = "ItemSkipped(uint256,uint8,uint32,bytes)";
+/// Defaults of the batch flush policy (`BatchPolicy`).
+pub const DEFAULT_BATCH_MAX_ITEMS: usize = 16;
+pub const DEFAULT_BATCH_MAX_AGE_SECONDS: u64 = 600;
+pub const DEFAULT_BATCH_DEADLINE_MARGIN_SECONDS: u64 = 1_800;
+/// Vault reverts that mean the escape changed under the item (resolved,
+/// raised or expired by someone else): its skip is expected, not anomalous.
+const STATE_REVERTS: [&str; 4] = [
+    "NotPendingWithdrawal()",
+    "ReplayedNullifier()",
+    "NotARaise()",
+    "ChallengeExpired()",
+];
+/// Intrinsic gas of a transaction, and calldata gas per zero and non-zero
+/// byte (EIP-2028), with the EIP-7623 floor of 10 gas per token (a zero byte
+/// one token, a non-zero byte four).
+const TX_INTRINSIC_GAS: u64 = 21_000;
+const CALLDATA_ZERO_GAS: u64 = 4;
+const CALLDATA_NONZERO_GAS: u64 = 16;
+const CALLDATA_FLOOR_GAS_PER_TOKEN: u64 = 10;
 
 /// EIP-1559 fee proposals. The signer enforces its own caps, which must be at
 /// least these. A same-nonce replacement raises the tip by the minimum valid
@@ -199,6 +248,57 @@ impl FeePolicy {
     }
 }
 
+/// Batching of defeats and raises through the deployment's exit batcher.
+/// Without a batcher every defeat and raise is a single vault call, exactly
+/// as without this policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchPolicy {
+    /// The manifest's exit batcher (0x and 40 lowercase hex digits); None
+    /// when the manifest names none or batching is switched off.
+    pub batcher: Option<String>,
+    /// A batch flushes once it holds this many items (2 to the batcher's
+    /// MAX_ITEMS()); more due items flush as several batches.
+    pub max_items: usize,
+    /// A batch flushes once its oldest item has waited this long (chain
+    /// time).
+    pub max_age_seconds: u64,
+    /// A batch flushes at once when any item's deadline is within the
+    /// critical threshold plus this; within the critical threshold an item
+    /// is never batched.
+    pub deadline_margin_seconds: u64,
+}
+
+impl Default for BatchPolicy {
+    fn default() -> Self {
+        Self {
+            batcher: None,
+            max_items: DEFAULT_BATCH_MAX_ITEMS,
+            max_age_seconds: DEFAULT_BATCH_MAX_AGE_SECONDS,
+            deadline_margin_seconds: DEFAULT_BATCH_DEADLINE_MARGIN_SECONDS,
+        }
+    }
+}
+
+impl BatchPolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            (2..=EXIT_BATCHER_MAX_ITEMS as usize).contains(&self.max_items),
+            "batch max items must be between 2 and {EXIT_BATCHER_MAX_ITEMS}"
+        );
+        if let Some(batcher) = &self.batcher {
+            ensure!(
+                batcher.len() == 42
+                    && batcher.starts_with("0x")
+                    && batcher[2..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "exit batcher must be a lowercase 0x-prefixed 20-byte address"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ChallengeServiceConfig {
     pub rpc_url: String,
@@ -220,6 +320,7 @@ pub struct ChallengeServiceConfig {
     pub retire_on_miss: bool,
     pub defeat_gas_limit: u64,
     pub raise_gas_limit: u64,
+    pub batch: BatchPolicy,
 }
 
 /// What the startup timing checks need beyond the vault (§5.4).
@@ -415,8 +516,69 @@ struct PendingChallenge {
     /// retires the closed note's leaf.
     #[serde(default)]
     retire_leaf: bool,
+    /// Chain time at which the due defeat or raise first waited for a batch;
+    /// cleared once it is sent or no longer due.
+    #[serde(default)]
+    batch_queued_at: Option<u64>,
+    /// A batch skipped or reverted on this obligation for a reason other
+    /// than a changed escape: its calls go single only, never in a batch.
+    #[serde(default)]
+    batch_excluded: bool,
     #[serde(flatten)]
     attempt: NonceAttempts,
+}
+
+/// A batch transaction on one nonce: every attempt on the nonce sends this
+/// exact calldata to the batcher. Each member's obligation holds the nonce
+/// with a mirrored attempt record whose `evidence_digest` is `digest`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BatchRecord {
+    /// The exit batcher it calls.
+    batcher: String,
+    /// The challengeBatch calldata (0x-hex).
+    calldata: String,
+    digest: String,
+    /// batcher.gasBound(kinds) when it was built.
+    gas_bound: u64,
+    /// The items, in calldata order.
+    members: Vec<BatchMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BatchMember {
+    note_id: u32,
+    /// The escape the item challenges.
+    nullifier: Felt252,
+    kind: CallKind,
+    evidence_row: i64,
+    /// `VaultCall::digest` of the item's single call.
+    item_digest: String,
+}
+
+impl BatchRecord {
+    fn member(&self, note: u32, nullifier: Felt252) -> Option<(usize, &BatchMember)> {
+        self.members
+            .iter()
+            .enumerate()
+            .find(|(_, member)| member.note_id == note && member.nullifier == nullifier)
+    }
+
+    fn notes(&self) -> Vec<u32> {
+        self.members.iter().map(|member| member.note_id).collect()
+    }
+}
+
+/// Batching counters, kept in the checkpoint.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct BatchTotals {
+    #[serde(default)]
+    batches_sent: u64,
+    #[serde(default)]
+    batched_items: u64,
+    #[serde(default)]
+    single_fallbacks: u64,
+    #[serde(default)]
+    anomalies: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -478,6 +640,14 @@ struct Checkpoint {
     /// Timestamp of the last block the event scan covered.
     #[serde(default)]
     scanned_through_timestamp: Option<u64>,
+    /// Batch transactions by nonce, while an obligation or a detached nonce
+    /// holds them.
+    #[serde(default)]
+    batches: BTreeMap<u64, BatchRecord>,
+    #[serde(default)]
+    batch_totals: BatchTotals,
+    #[serde(default)]
+    last_batch_anomaly: Option<BatchAnomaly>,
 }
 
 impl Checkpoint {
@@ -786,6 +956,10 @@ impl std::fmt::Display for DeploymentCheckError {
 
 impl std::error::Error for DeploymentCheckError {}
 
+/// An obligation's nonce, hash and attempt record before a send's
+/// write-ahead, restored when nothing was broadcast.
+type Rollback = (Option<u64>, Option<String>, NonceAttempts);
+
 /// Outcome classes of a failed `eth_sendTransaction`.
 enum SendFailure {
     /// -32602/-32601/-32003: a definitive refusal; nothing was broadcast.
@@ -865,6 +1039,38 @@ pub struct ChallengeService {
     logged: BTreeMap<u32, (ObligationState, Severity, Option<BlockedReason>, u64)>,
     /// `eth_getLogs` ranges the outcome search may still read this poll.
     outcome_ranges: usize,
+    /// Defeats and raises due this poll that wait for a batch.
+    batch_queue: Vec<QueuedItem>,
+    /// Items left waiting by the latest flush decision (status).
+    batch_waiting: u64,
+    /// The evaluation of the member that drove a batch nonce this poll: the
+    /// other members show its state, blocking reason and detail.
+    batch_outcomes: BTreeMap<u64, Evaluation>,
+    /// `MAX_ITEMS()` of the exit batcher the startup probes verified; None
+    /// until then, which keeps every call single.
+    batcher_max_items: Option<u64>,
+    /// Why batching is off until restart although a batcher is configured
+    /// (the signer refused a batch).
+    batching_off: Option<String>,
+    /// The exit batcher the signer allows (`zkapi_signerStatus`
+    /// `exit_batcher`): None while unknown, Some(None) when it allows none.
+    signer_batcher: Option<Option<String>>,
+    /// Mined batch items already examined for an anomaly: (nonce, note).
+    batch_items_checked: BTreeSet<(u64, u32)>,
+    /// The most items the signer signs in a batch (`batch_max_items`).
+    signer_batch_max_items: Option<u64>,
+}
+
+/// A due defeat or raise waiting for a batch this poll.
+#[derive(Clone, Debug)]
+struct QueuedItem {
+    note: u32,
+    nullifier: Felt252,
+    call: VaultCall,
+    item: BatchItem,
+    context: SendContext,
+    deadline: u64,
+    queued_at: u64,
 }
 
 impl ChallengeService {
@@ -889,6 +1095,7 @@ impl ChallengeService {
             config.defeat_gas_limit > 0 && config.raise_gas_limit > 0,
             "defeat and raise gas limits must be positive"
         );
+        config.batch.validate()?;
         let checkpoint: Checkpoint = if config.checkpoint.exists() {
             serde_json::from_slice(&std::fs::read(&config.checkpoint)?)?
         } else {
@@ -911,6 +1118,9 @@ impl ChallengeService {
                 pending_at_upgrade: Vec::new(),
                 scan_cursor_at_upgrade: None,
                 scanned_through_timestamp: None,
+                batches: BTreeMap::new(),
+                batch_totals: BatchTotals::default(),
+                last_batch_anomaly: None,
             }
         };
         ensure!(
@@ -1008,6 +1218,14 @@ impl ChallengeService {
             detached_status: Vec::new(),
             logged: BTreeMap::new(),
             outcome_ranges: MAX_OUTCOME_RANGES_PER_POLL,
+            batch_queue: Vec::new(),
+            batch_waiting: 0,
+            batch_outcomes: BTreeMap::new(),
+            batcher_max_items: None,
+            batching_off: None,
+            signer_batcher: None,
+            batch_items_checked: BTreeSet::new(),
+            signer_batch_max_items: None,
             config,
         };
         service.publish();
@@ -1148,6 +1366,36 @@ impl ChallengeService {
                     DeploymentCheckError::Unavailable(anyhow!(message))
                 }
             })?;
+        if let Some(batcher) = self.config.batch.batcher.clone() {
+            // Batches go to the manifest's batcher only, once its code, its
+            // binding to this vault and adapter and its caps are verified.
+            let report =
+                probe_exit_batcher(&reader, manifest)
+                    .await
+                    .map_err(|error| match error {
+                        ProbeError::Mismatch(message) => DeploymentCheckError::Mismatch(message),
+                        ProbeError::Unavailable(message) => {
+                            DeploymentCheckError::Unavailable(anyhow!(message))
+                        }
+                    })?;
+            let report = match report {
+                Some(report) if report.address == batcher => report,
+                _ => {
+                    return Err(DeploymentCheckError::Mismatch(format!(
+                        "batching is configured for exit batcher {batcher}, but the deployment \
+                         manifest names {}",
+                        manifest.exit_batcher_address.as_deref().unwrap_or("none")
+                    )))
+                }
+            };
+            if report.max_items < self.config.batch.max_items as u64 {
+                return Err(DeploymentCheckError::Mismatch(format!(
+                    "--batch-max-items {} exceeds the exit batcher's MAX_ITEMS() {}",
+                    self.config.batch.max_items, report.max_items
+                )));
+            }
+            self.batcher_max_items = Some(report.max_items);
+        }
         let period = self
             .call(selector("challengePeriod()"))
             .await
@@ -1260,6 +1508,8 @@ impl ChallengeService {
             self.observe_indexer(&head).await;
         }
         self.reconcile_detached_nonces().await?;
+        self.batch_queue.clear();
+        self.batch_outcomes.clear();
         // Each note gets a fresh current-root path. A previous successful
         // challenge can change that root before the next submission.
         let mut notes: Vec<_> = self.checkpoint.pending.keys().copied().collect();
@@ -1274,6 +1524,7 @@ impl ChallengeService {
             )
         });
         let mut first_error = None;
+        let mut stopped = false;
         for note in notes {
             // Nonce ownership is independent of the withdrawal's deadline,
             // evidence and current state. In particular, an ambiguous send
@@ -1284,6 +1535,7 @@ impl ChallengeService {
                     self.nonce_failures
                         .insert(note, format!("nonce status unavailable: {error}"));
                     first_error.get_or_insert(error);
+                    stopped = true;
                     break; // No safe new allocation when nonce status is unknown.
                 }
             };
@@ -1307,8 +1559,22 @@ impl ChallengeService {
                 }) || owned_nonce
                     .is_some_and(|nonce| self.checkpoint.detached_nonces.contains_key(&nonce)))
             {
+                stopped = true;
                 break;
             }
+        }
+        // Batches take new nonces, so only once no earlier nonce is
+        // unresolved; otherwise their items wait for the next poll.
+        if stopped {
+            self.hold_batch_queue(
+                "queued for a batch; an unresolved earlier nonce holds new sends",
+            );
+        } else if let Err(error) = self.flush_batches(&head).await {
+            tracing::error!(error = %error, "batch flush requires retry");
+            first_error.get_or_insert(error);
+        }
+        if self.prune_batches() {
+            self.persist()?;
         }
         match first_error {
             Some(error) => Err(error),
@@ -1527,6 +1793,11 @@ impl ChallengeService {
             pending.nonce = Some(nonce);
             pending.transaction_hash = entry.transaction_hash;
             pending.attempt = entry.attempt;
+        } else if let Some((nonce, hash, attempt)) = self.batch_reservation_of(note, nullifier) {
+            // The escape's item is in a batch other members still hold.
+            pending.nonce = Some(nonce);
+            pending.transaction_hash = hash;
+            pending.attempt = attempt;
         }
         self.checkpoint.pending.insert(note, pending);
         true
@@ -1836,16 +2107,27 @@ impl ChallengeService {
         // The bundled signer reports its transaction fee cap; bids stay within
         // the lower of it and this daemon's. Without a report, a cap learned
         // from a refusal stays in force.
-        match self
-            .rpc("zkapi_signerStatus", json!([]))
-            .await
-            .and_then(|status| {
-                status
-                    .get("tx_fee_cap_wei")
-                    .filter(|value| !value.is_null())
-                    .map(quantity_u128)
-                    .transpose()
-            }) {
+        let signer_status = self.rpc("zkapi_signerStatus", json!([])).await;
+        if let Ok(status) = &signer_status {
+            // The bundled signer reports the exit batcher it allows (null:
+            // none); batches go only to the manifest's, when it allows it.
+            self.signer_batcher = match status.get("exit_batcher") {
+                None => None,
+                Some(Value::String(batcher)) => Some(Some(batcher.to_ascii_lowercase())),
+                Some(_) => Some(None),
+            };
+            self.signer_batch_max_items = status
+                .get("batch_max_items")
+                .and_then(Value::as_u64)
+                .filter(|items| *items >= 2);
+        }
+        match signer_status.and_then(|status| {
+            status
+                .get("tx_fee_cap_wei")
+                .filter(|value| !value.is_null())
+                .map(quantity_u128)
+                .transpose()
+        }) {
             Ok(Some(cap)) if cap > 0 => {
                 self.signer_tx_fee_cap = Some(cap);
                 self.sender.signer_status_detail = None;
@@ -2275,7 +2557,14 @@ impl ChallengeService {
         decision: Decision,
     ) -> anyhow::Result<()> {
         let attempt = pending.attempt.kind();
+        let batch = self.batch_member(note);
         if nonce_state == NonceState::Mined {
+            if let Some(nonce) = batch {
+                // Whether its item took effect; one skipped for a reason
+                // other than a changed escape keeps the note out of batches.
+                self.examine_mined_batch_item(note, nonce, pending, &decision)
+                    .await?;
+            }
             if attempt == CallKind::Raise || self.replaced_raise_mined(note, pending).await {
                 // The raise landed, or reverted harmlessly. Its nonce stays
                 // tracked until confirmed; a defeat goes on the next nonce.
@@ -2317,9 +2606,10 @@ impl ChallengeService {
                 evidence.row_id,
             ),
             _ => {
+                self.unqueue_from_batch(note)?;
                 return self
                     .hold_without_call(note, nonce_state, head, pending, decision)
-                    .await
+                    .await;
             }
         };
         let context = SendContext {
@@ -2329,6 +2619,13 @@ impl ChallengeService {
             owed: decision.owed,
             raise_due_at: Some(decision.raise_due_at),
         };
+        if let Some(nonce) = batch {
+            // The note's call is an item of the batch on its nonce, which
+            // keeps its calldata: replacements change only fees.
+            return self
+                .act_in_batch(note, nonce, nonce_state, head, call.kind(), context)
+                .await;
+        }
         match (nonce_state, call.kind(), attempt) {
             // The one transition: a defeat replaces the unmined raise.
             (NonceState::Pending | NonceState::Held, CallKind::Defeat, CallKind::Raise) => {
@@ -2361,7 +2658,7 @@ impl ChallengeService {
                             note,
                             head,
                             nonce_state == NonceState::Pending,
-                            call,
+                            Target::Single(Box::new(call)),
                             context,
                         )
                         .await
@@ -2377,9 +2674,16 @@ impl ChallengeService {
                 }
             }
             (NonceState::Pending, _, _) => {
-                self.maybe_replace(note, head, true, call, context).await
+                self.maybe_replace(note, head, true, Target::Single(Box::new(call)), context)
+                    .await
             }
-            (NonceState::Held, _, _) => self.maybe_replace(note, head, false, call, context).await,
+            (NonceState::Held, _, _) => {
+                self.maybe_replace(note, head, false, Target::Single(Box::new(call)), context)
+                    .await
+            }
+            (NonceState::Free, _, _) if self.batchable(note, &call, head) => {
+                self.enqueue_for_batch(note, call, context, head)
+            }
             (NonceState::Free, _, _) => {
                 self.submit(note, call, None, head, FeePlan::First, context)
                     .await
@@ -2714,9 +3018,9 @@ impl ChallengeService {
         if pending.ended_before_deadline {
             return Ok(true);
         }
-        if !pending
+        if pending
             .challenge_deadline
-            .is_some_and(|deadline| head.timestamp < deadline)
+            .is_none_or(|deadline| head.timestamp >= deadline)
         {
             return Ok(false);
         }
@@ -3224,8 +3528,14 @@ impl ChallengeService {
                 self.mined_unconfirmed(note, EvidenceKind::Leaf).await;
                 Ok(())
             }
-            NonceState::Pending => self.maybe_replace(note, head, true, call, context).await,
-            NonceState::Held => self.maybe_replace(note, head, false, call, context).await,
+            NonceState::Pending => {
+                self.maybe_replace(note, head, true, Target::Single(Box::new(call)), context)
+                    .await
+            }
+            NonceState::Held => {
+                self.maybe_replace(note, head, false, Target::Single(Box::new(call)), context)
+                    .await
+            }
             NonceState::Free => {
                 self.submit(note, call, None, head, FeePlan::First, context)
                     .await
@@ -3250,7 +3560,7 @@ impl ChallengeService {
         note: u32,
         head: &HeadInfo,
         visible: bool,
-        call: VaultCall,
+        target: Target,
         context: SendContext,
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
@@ -3258,7 +3568,7 @@ impl ChallengeService {
         let (submitted, waiting) = if visible {
             (
                 context.evaluation(ObligationState::Submitted),
-                format!("{} pending on nonce {nonce}", call.kind().as_str()),
+                format!("{} pending on nonce {nonce}", target.label()),
             )
         } else {
             (
@@ -3289,7 +3599,7 @@ impl ChallengeService {
             if !visible {
                 // A reservation from an older daemon: its fees are unknown.
                 return self
-                    .submit(note, call, Some(nonce), head, FeePlan::First, context)
+                    .resend(note, target, nonce, head, FeePlan::First, context)
                     .await;
             }
             self.record(
@@ -3298,6 +3608,8 @@ impl ChallengeService {
             );
             return Ok(());
         };
+        // A batch is as urgent as its most urgent member, which
+        // queue_severity counts with the notes on this nonce.
         let critical = self.queue_severity(note, head) == Severity::Critical;
         // The ceiling at the gas limit of the latest attempt; the send itself
         // plans with the exact gas limit.
@@ -3373,8 +3685,37 @@ impl ChallengeService {
                 return Ok(());
             }
         }
-        self.submit(note, call, Some(nonce), head, FeePlan::Bump(old), context)
+        self.resend(note, target, nonce, head, FeePlan::Bump(old), context)
             .await
+    }
+
+    /// Send `target` again on its nonce with `plan`: a single call through
+    /// `submit`, a batch with its recorded calldata through `submit_batch`.
+    async fn resend(
+        &mut self,
+        note: u32,
+        target: Target,
+        nonce: u64,
+        head: &HeadInfo,
+        plan: FeePlan,
+        context: SendContext,
+    ) -> anyhow::Result<()> {
+        match target {
+            Target::Single(call) => {
+                self.submit(note, *call, Some(nonce), head, plan, context)
+                    .await
+            }
+            Target::Batch => {
+                let record = self
+                    .checkpoint
+                    .batches
+                    .get(&nonce)
+                    .cloned()
+                    .context("batch nonce lacks its batch record")?;
+                self.submit_batch(Some(nonce), record, head, plan, vec![(note, context)])
+                    .await
+            }
+        }
     }
 
     /// Build, simulate and send `call` on a new or reused nonce. The nonce,
@@ -3524,30 +3865,7 @@ impl ChallengeService {
             Err(reason) => {
                 // Nothing is sent; retried next poll. A reused nonce that no
                 // attempt was broadcast on is released.
-                let detail = match reason {
-                    BlockedReason::BaseFeeAboveFeeCap => format!(
-                        "base fee {} wei exceeds the usable fee cap",
-                        head.base_fee.unwrap_or_default()
-                    ),
-                    BlockedReason::TxFeeCapReached => format!(
-                        "the transaction fee ceiling of {} wei allows a maxFeePerGas of at most {tx_fee_limit} wei at {gas} gas; base fee {} wei{}",
-                        self.tx_fee_cap(),
-                        head.base_fee.unwrap_or_default(),
-                        if matches!(plan, FeePlan::Bump(_)) {
-                            "; no valid replacement"
-                        } else {
-                            ""
-                        }
-                    ),
-                    BlockedReason::InsufficientBalance => format!(
-                        "sender balance {} wei cannot fund a valid bid at {gas} gas",
-                        self.sender_balance.unwrap_or_default()
-                    ),
-                    BlockedReason::TipCapReached => {
-                        "no valid replacement: the tip cap is reached".into()
-                    }
-                    _ => "no valid replacement: the fee cap is reached".into(),
-                };
+                let detail = self.plan_refusal_detail(reason, head, gas, tx_fee_limit, plan);
                 if reuse.is_some() && self.release_if_never_broadcast(note).await {
                     self.persist()?;
                 }
@@ -3599,6 +3917,7 @@ impl ChallengeService {
                 VaultCall::Raise { amount, .. } => Some(*amount),
                 _ => None,
             };
+            entry.batch_queued_at = None;
             rollback
         };
         self.persist()?;
@@ -3657,6 +3976,39 @@ impl ChallengeService {
         }
     }
 
+    /// The detail of a send `plan_fees` refused with `reason` at `gas`.
+    fn plan_refusal_detail(
+        &self,
+        reason: BlockedReason,
+        head: &HeadInfo,
+        gas: u64,
+        tx_fee_limit: u128,
+        plan: FeePlan,
+    ) -> String {
+        match reason {
+            BlockedReason::BaseFeeAboveFeeCap => format!(
+                "base fee {} wei exceeds the usable fee cap",
+                head.base_fee.unwrap_or_default()
+            ),
+            BlockedReason::TxFeeCapReached => format!(
+                "the transaction fee ceiling of {} wei allows a maxFeePerGas of at most {tx_fee_limit} wei at {gas} gas; base fee {} wei{}",
+                self.tx_fee_cap(),
+                head.base_fee.unwrap_or_default(),
+                if matches!(plan, FeePlan::Bump(_)) {
+                    "; no valid replacement"
+                } else {
+                    ""
+                }
+            ),
+            BlockedReason::InsufficientBalance => format!(
+                "sender balance {} wei cannot fund a valid bid at {gas} gas",
+                self.sender_balance.unwrap_or_default()
+            ),
+            BlockedReason::TipCapReached => "no valid replacement: the tip cap is reached".into(),
+            _ => "no valid replacement: the fee cap is reached".into(),
+        }
+    }
+
     /// `sent` is the gas limit and maxFeePerGas of the failed send.
     #[allow(clippy::too_many_arguments)]
     async fn send_failed(
@@ -3669,10 +4021,40 @@ impl ChallengeService {
         error: anyhow::Error,
         context: &SendContext,
     ) -> anyhow::Result<()> {
+        let (_, error) = self
+            .send_failed_for(
+                vec![(note, rollback)],
+                nonce,
+                sent,
+                base_state,
+                error,
+                &[(note, context.clone())],
+            )
+            .await?;
+        Err(error)
+    }
+
+    /// A failed send on `nonce` of the obligations in `rollbacks` (one for a
+    /// single call, every member for a batch), each with the record it had
+    /// before the write-ahead; `contexts` are the obligations whose status
+    /// shows the failure. Returns the blocked reason the failure maps to and
+    /// the send error, which the caller returns.
+    async fn send_failed_for(
+        &mut self,
+        rollbacks: Vec<(u32, Rollback)>,
+        nonce: u64,
+        sent: (u64, u128),
+        base_state: ObligationState,
+        error: anyhow::Error,
+        contexts: &[(u32, SendContext)],
+    ) -> anyhow::Result<(BlockedReason, anyhow::Error)> {
         let (gas, max_fee) = sent;
+        let first = rollbacks.first().map_or(0, |(note, _)| *note);
         let reason = match classify_send_error(&error) {
             SendFailure::Refused(reason) => {
-                self.roll_back_unsent(note, nonce, rollback).await;
+                for (note, rollback) in rollbacks {
+                    self.roll_back_unsent(note, nonce, rollback).await;
+                }
                 if reason.as_deref() == Some("tx_fee_above_cap") {
                     // Later bids stay within the signer's cap.
                     if let Some(cap) = refused_tx_fee_cap(&error, gas) {
@@ -3680,33 +4062,39 @@ impl ChallengeService {
                     }
                 }
                 if reason.as_deref() == Some("upstream_tx_fee_cap") {
-                    self.learn_node_tx_fee_bound(note, refused_tx_fee(&error, gas, max_fee));
+                    self.learn_node_tx_fee_bound(first, refused_tx_fee(&error, gas, max_fee));
                 }
                 refusal_reason(reason.as_deref())
             }
             SendFailure::NotBroadcast(reason) => {
-                self.roll_back_unsent(note, nonce, rollback).await;
+                for (note, rollback) in rollbacks {
+                    self.roll_back_unsent(note, nonce, rollback).await;
+                }
                 reason
             }
             SendFailure::Ambiguous(hash) => {
                 // Keep the write-ahead record; a candidate hash lets the next
                 // poll find the transaction, otherwise re-sends must bump.
                 if let Some(hash) = hash {
-                    let entry = self.checkpoint.pending.get_mut(&note).unwrap();
-                    entry.transaction_hash = Some(hash);
-                    entry.attempt.unknown_attempt = false;
+                    for (note, _) in &rollbacks {
+                        let entry = self.checkpoint.pending.get_mut(note).unwrap();
+                        entry.transaction_hash = Some(hash.clone());
+                        entry.attempt.unknown_attempt = false;
+                    }
                 }
                 BlockedReason::SendAmbiguous
             }
         };
         self.persist()?;
-        self.record(
-            note,
-            context
-                .evaluation(base_state)
-                .blocked(reason, error.to_string()),
-        );
-        Err(error)
+        for (note, context) in contexts {
+            self.record(
+                *note,
+                context
+                    .evaluation(base_state)
+                    .blocked(reason, error.to_string()),
+            );
+        }
+        Ok((reason, error))
     }
 
     /// Nothing was broadcast: restore the nonce's earlier record, counting the
@@ -3870,6 +4258,17 @@ impl ChallengeService {
     fn detach_nonce(&mut self, note: u32) {
         if let Some(pending) = self.checkpoint.pending.get(&note) {
             if let Some(nonce) = pending.nonce {
+                // Another member of its batch still holds the nonce, and
+                // keeps it until it is consumed; the batch record lists this
+                // note, so a replay that tracks its escape again restores it.
+                if self
+                    .checkpoint
+                    .pending
+                    .iter()
+                    .any(|(other, entry)| *other != note && entry.nonce == Some(nonce))
+                {
+                    return;
+                }
                 self.checkpoint.detached_nonces.insert(
                     nonce,
                     DetachedNonce {
@@ -4061,7 +4460,8 @@ impl ChallengeService {
             .filter(|(other, entry)| {
                 **other == note
                     || match (own_nonce, entry.nonce) {
-                        (Some(own), Some(theirs)) => theirs > own,
+                        // The members of a batch share its nonce.
+                        (Some(own), Some(theirs)) => theirs >= own,
                         (_, None) => true,
                         (None, Some(_)) => false,
                     }
@@ -4217,6 +4617,12 @@ impl ChallengeService {
                 submitted_block: pending.attempt.submitted_block,
                 first_seen_at: pending.first_seen_at,
                 evaluated_at: evaluation.map(|e| e.evaluated_at),
+                batch_notes: self
+                    .batch_member(*note)
+                    .and_then(|nonce| self.checkpoint.batches.get(&nonce))
+                    .map(BatchRecord::notes)
+                    .unwrap_or_default(),
+                batch_excluded: pending.batch_excluded,
             };
             let may_need_gas = matches!(
                 state,
@@ -4318,6 +4724,31 @@ impl ChallengeService {
         status.missed_raises_total = self.checkpoint.missed_raises_total;
         status.last_missed = self.checkpoint.last_missed.clone();
         status.config_warnings = config_warnings;
+        let batch = &self.config.batch;
+        let disabled_reason = self.batching_disabled_reason();
+        if let Some(reason) = disabled_reason
+            .as_ref()
+            .filter(|_| self.batcher_max_items.is_some())
+        {
+            status.config_warnings.push(format!(
+                "batching is off: {reason}; defeats and raises go as single calls"
+            ));
+        }
+        let totals = &self.checkpoint.batch_totals;
+        status.batching = BatchingStatus {
+            enabled: self.batching_enabled(),
+            exit_batcher: batch.batcher.clone(),
+            disabled_reason,
+            max_items: batch.max_items as u64,
+            max_age_seconds: batch.max_age_seconds,
+            deadline_margin_seconds: batch.deadline_margin_seconds,
+            queued: self.batch_waiting,
+            batches_sent_total: totals.batches_sent,
+            batched_items_total: totals.batched_items,
+            single_fallbacks_total: totals.single_fallbacks,
+            anomalies_total: totals.anomalies,
+            last_anomaly: self.checkpoint.last_batch_anomaly.clone(),
+        };
         status
     }
 
@@ -4544,6 +4975,1459 @@ impl ChallengeService {
             .unwrap_or(std::path::Path::new("."));
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
+    }
+}
+
+/// What a nonce's attempts send: one vault call, or the batch recorded for
+/// the nonce.
+enum Target {
+    Single(Box<VaultCall>),
+    Batch,
+}
+
+impl Target {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Single(call) => call.kind().as_str(),
+            Self::Batch => "batch",
+        }
+    }
+}
+
+/// Batched defeats and raises (`ZkApiExitBatcher.challengeBatch`).
+impl ChallengeService {
+    /// Why batching is off although a batcher is configured; None when it
+    /// is on, or when no batcher is configured.
+    fn batching_disabled_reason(&self) -> Option<String> {
+        let batcher = self.config.batch.batcher.as_ref()?;
+        if self.batcher_max_items.is_none() {
+            return Some("the exit batcher is not verified yet".into());
+        }
+        if let Some(off) = &self.batching_off {
+            return Some(off.clone());
+        }
+        match &self.signer_batcher {
+            Some(None) => Some(
+                "the signer allows no exit batcher (set ZKAPI_CHALLENGE_EXIT_BATCHER in signer.env)"
+                    .into(),
+            ),
+            Some(Some(allowed)) if allowed != batcher => Some(format!(
+                "the signer allows exit batcher {allowed}, not the manifest's {batcher}"
+            )),
+            _ => None,
+        }
+    }
+
+    fn batching_enabled(&self) -> bool {
+        self.config.batch.batcher.is_some() && self.batching_disabled_reason().is_none()
+    }
+
+    /// Whether `call`, due on `note` whose nonce is free, waits for a batch:
+    /// batching is on, the note was never excluded, and its deadline is not
+    /// within the critical threshold, inside which every call is single.
+    fn batchable(&self, note: u32, call: &VaultCall, head: &HeadInfo) -> bool {
+        let Some(pending) = self.checkpoint.pending.get(&note) else {
+            return false;
+        };
+        self.batching_enabled()
+            && !pending.batch_excluded
+            && matches!(call.kind(), CallKind::Defeat | CallKind::Raise)
+            // A call its encoder refuses goes the single path, which reports
+            // what the vault would refuse.
+            && batch_item(call).is_ok()
+            && pending.challenge_deadline.is_some_and(|deadline| {
+                batchable_at(
+                    deadline,
+                    head.timestamp,
+                    self.thresholds().critical_remaining_seconds,
+                )
+            })
+    }
+
+    /// The batch nonce `note` is a member of: its nonce has a batch record
+    /// that lists its escape, and its attempt record is the batch's.
+    fn batch_member(&self, note: u32) -> Option<u64> {
+        let pending = self.checkpoint.pending.get(&note)?;
+        let nonce = pending.nonce?;
+        let record = self.checkpoint.batches.get(&nonce)?;
+        (pending.attempt.evidence_digest.as_ref() == Some(&record.digest)
+            && record.member(note, pending.nullifier).is_some())
+        .then_some(nonce)
+    }
+
+    /// The obligations that hold the batch on `nonce`, in item order.
+    fn batch_holders(&self, nonce: u64) -> Vec<u32> {
+        let Some(record) = self.checkpoint.batches.get(&nonce) else {
+            return Vec::new();
+        };
+        record
+            .members
+            .iter()
+            .map(|member| member.note_id)
+            .filter(|note| self.batch_member(*note) == Some(nonce))
+            .collect()
+    }
+
+    /// The reservation of the batch that lists `note`'s escape `nullifier`
+    /// and another obligation still holds: its nonce, hash and attempt
+    /// record, with this item's call.
+    fn batch_reservation_of(
+        &self,
+        note: u32,
+        nullifier: Felt252,
+    ) -> Option<(u64, Option<String>, NonceAttempts)> {
+        self.checkpoint.batches.iter().find_map(|(nonce, record)| {
+            let (_, member) = record.member(note, nullifier)?;
+            let holder = self.batch_holders(*nonce).into_iter().next()?;
+            let held = &self.checkpoint.pending[&holder];
+            let mut attempt = held.attempt.clone();
+            attempt.action = Some(member.kind);
+            attempt.evidence_row = Some(member.evidence_row);
+            attempt.raise_amount = None;
+            attempt.replaced_raise = false;
+            Some((*nonce, held.transaction_hash.clone(), attempt))
+        })
+    }
+
+    /// Drop the batch records no obligation or detached nonce holds any
+    /// more. Returns whether any was dropped (the caller persists).
+    fn prune_batches(&mut self) -> bool {
+        let before = self.checkpoint.batches.len();
+        let held: BTreeSet<(u64, String)> = self
+            .checkpoint
+            .pending
+            .values()
+            .filter_map(|entry| Some((entry.nonce?, entry.attempt.evidence_digest.clone()?)))
+            .chain(
+                self.checkpoint
+                    .detached_nonces
+                    .iter()
+                    .filter_map(|(nonce, entry)| {
+                        Some((*nonce, entry.attempt.evidence_digest.clone()?))
+                    }),
+            )
+            .collect();
+        self.checkpoint
+            .batches
+            .retain(|nonce, record| held.contains(&(*nonce, record.digest.clone())));
+        self.checkpoint.batches.len() != before
+    }
+
+    /// The note's due call no longer waits for a batch.
+    fn unqueue_from_batch(&mut self, note: u32) -> anyhow::Result<()> {
+        let entry = self.checkpoint.pending.get_mut(&note).unwrap();
+        if entry.batch_queued_at.take().is_some() {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Queue `call` for this poll's flush; its wait counts from the poll it
+    /// first queued at.
+    fn enqueue_for_batch(
+        &mut self,
+        note: u32,
+        call: VaultCall,
+        context: SendContext,
+        head: &HeadInfo,
+    ) -> anyhow::Result<()> {
+        let item = batch_item(&call).map_err(anyhow::Error::msg)?;
+        let entry = self.checkpoint.pending.get_mut(&note).unwrap();
+        let queued_at = match entry.batch_queued_at {
+            Some(at) => at,
+            None => {
+                entry.batch_queued_at = Some(head.timestamp);
+                self.persist()?;
+                head.timestamp
+            }
+        };
+        let entry = &self.checkpoint.pending[&note];
+        self.batch_queue.push(QueuedItem {
+            note,
+            nullifier: entry.nullifier,
+            deadline: entry.challenge_deadline.unwrap_or(head.timestamp),
+            call,
+            item,
+            context: context.clone(),
+            queued_at,
+        });
+        self.record(
+            note,
+            context
+                .evaluation(ObligationState::Ready)
+                .detail("queued for a batch"),
+        );
+        Ok(())
+    }
+
+    /// Items queued this poll stay queued: an earlier nonce is unresolved.
+    fn hold_batch_queue(&mut self, detail: &str) {
+        let queue = std::mem::take(&mut self.batch_queue);
+        self.batch_waiting = queue.len() as u64;
+        for item in queue {
+            self.record(
+                item.note,
+                item.context
+                    .evaluation(ObligationState::Ready)
+                    .detail(detail),
+            );
+        }
+    }
+
+    /// Flush this poll's queue when the flush policy says so (full, aged, or
+    /// a deadline within the critical threshold plus the margin): simulate
+    /// the exact batches, bisect a reverting one, send the batches whose
+    /// items all apply, and hand every other item to the single path.
+    async fn flush_batches(&mut self, head: &HeadInfo) -> anyhow::Result<()> {
+        let mut queue = std::mem::take(&mut self.batch_queue);
+        self.batch_waiting = 0;
+        if queue.is_empty() {
+            return Ok(());
+        }
+        queue.sort_by_key(|item| (item.deadline, item.note));
+        // Within the batcher's MAX_ITEMS() and the signer's batch limit.
+        let max_items = self
+            .config
+            .batch
+            .max_items
+            .min(self.batcher_max_items.unwrap_or(EXIT_BATCHER_MAX_ITEMS) as usize)
+            .min(self.signer_batch_max_items.unwrap_or(u64::MAX) as usize);
+        let policy = BatchPolicy {
+            max_items,
+            ..self.config.batch.clone()
+        };
+        let critical = self.thresholds().critical_remaining_seconds;
+        let timing: Vec<(u64, u64)> = queue
+            .iter()
+            .map(|item| (item.deadline, item.queued_at))
+            .collect();
+        match flush_due(&policy, critical, head.timestamp, &timing) {
+            Flush::Wait { by } => {
+                self.batch_waiting = queue.len() as u64;
+                let detail = format!(
+                    "queued for a batch with {} due item(s); it flushes when full, or by chain time {by} at the latest",
+                    queue.len()
+                );
+                for item in queue {
+                    self.record(
+                        item.note,
+                        item.context
+                            .evaluation(ObligationState::Ready)
+                            .detail(detail.clone()),
+                    );
+                }
+                return Ok(());
+            }
+            Flush::Now(reason) => {
+                tracing::info!(
+                    items = queue.len(),
+                    reason = reason.as_str(),
+                    "flushing batched challenges"
+                );
+            }
+        }
+        let mut planner = Bisection::new(queue, max_items);
+        while let Some(group) = planner.next_group() {
+            match self.simulate_batch(&group).await {
+                Ok(outcome) => planner.report(outcome),
+                Err(error) => {
+                    // The RPC is unavailable: every item stays due for the
+                    // next poll.
+                    for item in planner.unsettled().into_iter().chain(group) {
+                        self.record(
+                            item.note,
+                            item.context.evaluation(ObligationState::Ready).blocked(
+                                BlockedReason::RpcError,
+                                format!("batch simulation unavailable: {error}"),
+                            ),
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let (batches, singles) = planner.finish();
+        let mut first_error = None;
+        let mut lane_blocked = false;
+        for group in batches {
+            if lane_blocked {
+                self.hold_items(group);
+                continue;
+            }
+            let notes: Vec<u32> = group.iter().map(|item| item.note).collect();
+            if let Err(error) = self.send_new_batch(group, head).await {
+                first_error.get_or_insert(error);
+            }
+            lane_blocked = notes.iter().any(|note| self.unresolved_send(*note));
+        }
+        for (item, reason) in singles {
+            if lane_blocked {
+                self.hold_items(vec![item]);
+                continue;
+            }
+            let note = item.note;
+            if let Err(error) = self.batch_fallback(item, reason, head).await {
+                first_error.get_or_insert(error);
+            }
+            lane_blocked = self.unresolved_send(note);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// A send on the note's nonce had an unknown outcome and no hash: no new
+    /// nonce is allocated before it is resolved.
+    fn unresolved_send(&self, note: u32) -> bool {
+        self.checkpoint
+            .pending
+            .get(&note)
+            .is_some_and(|pending| pending.nonce.is_some() && pending.transaction_hash.is_none())
+    }
+
+    fn hold_items(&mut self, items: Vec<QueuedItem>) {
+        self.batch_waiting += items.len() as u64;
+        for item in items {
+            self.record(
+                item.note,
+                item.context.evaluation(ObligationState::Ready).detail(
+                    "queued for a batch; an earlier send of this poll has an unknown outcome",
+                ),
+            );
+        }
+    }
+
+    /// `eth_call` of the exact batch of `group` from the sender: the bitmap
+    /// of the items that would apply, or the revert. Only an unreachable
+    /// RPC is an error.
+    async fn simulate_batch(&self, group: &[QueuedItem]) -> anyhow::Result<Simulated> {
+        let items: Vec<BatchItem> = group.iter().map(|item| item.item.clone()).collect();
+        let data = format!("0x{}", hex::encode(challenge_batch_calldata(&items)));
+        let batcher = self
+            .config
+            .batch
+            .batcher
+            .clone()
+            .context("no exit batcher")?;
+        match self
+            .rpc(
+                "eth_call",
+                json!([{ "from": self.config.sender, "to": batcher, "data": data }, "latest"]),
+            )
+            .await
+        {
+            Ok(result) => Ok(match decode_bitmap(&result, group.len()) {
+                Ok(bitmap) => Simulated::Applied(bitmap),
+                Err(error) => Simulated::Malformed(bounded(&error.to_string())),
+            }),
+            // Through the bundled signer every revert is an RPC error
+            // without revert data; any RPC error bisects.
+            Err(error) if error.downcast_ref::<RpcError>().is_some() => {
+                Ok(Simulated::Reverted(bounded(&error.to_string())))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `batcher.gasBound(kinds)`.
+    async fn gas_bound(&self, kinds: &[u8]) -> anyhow::Result<u64> {
+        let batcher = self
+            .config
+            .batch
+            .batcher
+            .clone()
+            .context("no exit batcher")?;
+        let data = format!("0x{}", hex::encode(gas_bound_calldata(kinds)));
+        let result = self
+            .rpc(
+                "eth_call",
+                json!([{ "to": batcher, "data": data }, "latest"]),
+            )
+            .await?;
+        let words = words(&result)?;
+        ensure!(words.len() == 1, "malformed gasBound response");
+        let bound = felt_u64(&words[0])?;
+        ensure!(bound > 0, "the exit batcher reports a zero gas bound");
+        Ok(bound)
+    }
+
+    /// Build and send a new batch of `group`, every item of which applied in
+    /// the simulation.
+    async fn send_new_batch(
+        &mut self,
+        group: Vec<QueuedItem>,
+        head: &HeadInfo,
+    ) -> anyhow::Result<()> {
+        let items: Vec<BatchItem> = group.iter().map(|item| item.item.clone()).collect();
+        let calldata = challenge_batch_calldata(&items);
+        let kinds: Vec<u8> = group
+            .iter()
+            .map(|item| exit_batch_kind(item.call.kind()) as u8)
+            .collect();
+        let contexts: Vec<(u32, SendContext)> = group
+            .iter()
+            .map(|item| (item.note, item.context.clone()))
+            .collect();
+        let gas_bound = match self.gas_bound(&kinds).await {
+            Ok(bound) => bound,
+            Err(error) => {
+                for (note, context) in &contexts {
+                    self.record(
+                        *note,
+                        context.evaluation(ObligationState::Ready).blocked(
+                            BlockedReason::RpcError,
+                            format!("exit batcher gasBound unavailable: {error}"),
+                        ),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let batcher = self
+            .config
+            .batch
+            .batcher
+            .clone()
+            .context("no exit batcher")?;
+        let record = BatchRecord {
+            digest: batch_digest(&batcher, &calldata),
+            calldata: format!("0x{}", hex::encode(&calldata)),
+            batcher,
+            gas_bound,
+            members: group
+                .iter()
+                .map(|item| BatchMember {
+                    note_id: item.note,
+                    nullifier: item.nullifier,
+                    kind: item.call.kind(),
+                    evidence_row: item.context.evidence_row.unwrap_or_default(),
+                    item_digest: item.call.digest(),
+                })
+                .collect(),
+        };
+        self.submit_batch(None, record, head, FeePlan::First, contexts)
+            .await
+    }
+
+    /// Send the batch `record` on a new nonce (`reuse` None: every member of
+    /// the record takes it) or again on its own (the obligations that still
+    /// hold it), as `submit` sends a single call: simulated (a re-send whose
+    /// items would all be skipped is not sent), gas limited to the
+    /// batcher's bound plus intrinsic and calldata gas and never below the
+    /// estimate plus 20%, fees planned for its most urgent member, and the
+    /// nonce, calldata digest and fees written ahead of the send on every
+    /// member. `contexts` are the obligations whose status shows the result.
+    async fn submit_batch(
+        &mut self,
+        reuse: Option<u64>,
+        record: BatchRecord,
+        head: &HeadInfo,
+        plan: FeePlan,
+        contexts: Vec<(u32, SendContext)>,
+    ) -> anyhow::Result<()> {
+        let members: Vec<u32> = match reuse {
+            Some(nonce) => self.batch_holders(nonce),
+            None => record.notes(),
+        };
+        ensure!(!members.is_empty(), "a batch without members");
+        let base_state = if matches!(plan, FeePlan::Bump(_))
+            && members
+                .iter()
+                .any(|note| self.checkpoint.pending[note].transaction_hash.is_some())
+        {
+            ObligationState::Submitted
+        } else {
+            ObligationState::Ready
+        };
+        let calldata = hex::decode(record.calldata.trim_start_matches("0x"))
+            .context("malformed batch calldata in the checkpoint")?;
+        let mut transaction =
+            json!({ "from": self.config.sender, "to": record.batcher, "data": record.calldata });
+        macro_rules! blocked {
+            ($reason:expr, $detail:expr) => {{
+                let detail: String = $detail;
+                for (note, context) in &contexts {
+                    self.record(
+                        *note,
+                        context
+                            .evaluation(base_state)
+                            .blocked($reason, detail.clone()),
+                    );
+                }
+            }};
+        }
+        let simulation_reason = |error: &anyhow::Error| {
+            if error.downcast_ref::<RpcError>().is_some() {
+                BlockedReason::SimulationReverted
+            } else {
+                BlockedReason::RpcError
+            }
+        };
+        if let Some(nonce) = reuse {
+            // The flush simulated a new batch just now; a re-send is
+            // simulated again, as every attempt is.
+            match self.rpc("eth_call", json!([transaction, "latest"])).await {
+                Ok(result) => match decode_bitmap(&result, record.members.len()) {
+                    Ok(0) => {
+                        for (note, context) in &contexts {
+                            self.record(
+                                *note,
+                                context.evaluation(base_state).detail(format!(
+                                    "every item of the batch on nonce {nonce} is resolved or skipped in simulation; it is not sent again"
+                                )),
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        blocked!(
+                            BlockedReason::SimulationReverted,
+                            format!("batch simulation answered {error}")
+                        );
+                        return Err(error);
+                    }
+                },
+                Err(error) => {
+                    blocked!(
+                        simulation_reason(&error),
+                        format!("batch simulation failed: {error}")
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        let estimate = match self
+            .rpc("eth_estimateGas", json!([transaction]))
+            .await
+            .and_then(|value| quantity(&value))
+        {
+            Ok(gas) => gas,
+            Err(error) => {
+                blocked!(
+                    simulation_reason(&error),
+                    format!("batch gas estimate failed: {error}")
+                );
+                return Err(error);
+            }
+        };
+        let gas = batch_gas_limit(record.gas_bound, &calldata, estimate)
+            .context("batch gas limit overflow")?;
+        self.last_gas = Some(gas as u128);
+        let nonce = match reuse {
+            Some(nonce) => nonce,
+            None => {
+                let chain_nonce = self.transaction_count("pending").await?;
+                if self
+                    .checkpoint
+                    .pending
+                    .values()
+                    .any(|entry| entry.nonce == Some(chain_nonce))
+                    || self.checkpoint.detached_nonces.contains_key(&chain_nonce)
+                {
+                    let error =
+                        anyhow!("RPC pending nonce conflicts with a durable challenge reservation");
+                    blocked!(BlockedReason::NonceConflict, error.to_string());
+                    return Err(error);
+                }
+                chain_nonce
+            }
+        };
+        let critical = members
+            .iter()
+            .any(|note| self.queue_severity(*note, head) == Severity::Critical);
+        let affordable = self
+            .sender_balance
+            .map(|balance| balance / (gas as u128).max(1));
+        let tx_fee_limit = self.tx_fee_limit(gas as u128);
+        let fees = match plan_fees(
+            &self.config.fee,
+            plan,
+            head.base_fee,
+            critical,
+            Some(tx_fee_limit),
+            affordable,
+        ) {
+            Ok(Some(fees)) => fees,
+            Ok(None) => {
+                let held = members
+                    .iter()
+                    .any(|note| self.checkpoint.pending[note].transaction_hash.is_some());
+                let (reason, waiting) = if held {
+                    (
+                        BlockedReason::FeeReserveHeld,
+                        format!("batch pending on nonce {nonce}"),
+                    )
+                } else {
+                    (
+                        BlockedReason::SendAmbiguous,
+                        format!("nonce {nonce} may be held by an attempt without a known hash"),
+                    )
+                };
+                blocked!(
+                    reason,
+                    format!("{waiting}; the remaining fee headroom is reserved for the critical threshold")
+                );
+                return Ok(());
+            }
+            Err(reason) => {
+                let detail = self.plan_refusal_detail(reason, head, gas, tx_fee_limit, plan);
+                if reuse.is_some() {
+                    let mut released = false;
+                    for note in &members {
+                        released |= self.release_if_never_broadcast(*note).await;
+                    }
+                    if released {
+                        self.prune_batches();
+                        self.persist()?;
+                    }
+                }
+                blocked!(reason, detail);
+                return Ok(());
+            }
+        };
+        if let FeePlan::Resend(old) = plan {
+            if fees.max_fee < old.max_fee || fees.tip < old.tip {
+                tracing::warn!(
+                    nonce,
+                    previous_max_fee_per_gas = old.max_fee,
+                    previous_max_priority_fee_per_gas = old.tip,
+                    max_fee_per_gas = fees.max_fee,
+                    max_priority_fee_per_gas = fees.tip,
+                    "re-sending a batch nonce no attempt holds below its earlier bid, within the current caps, transaction fee ceiling and balance"
+                );
+            }
+        }
+        // Write ahead on every member, as `submit` does for one obligation.
+        let mut rollbacks = Vec::with_capacity(members.len());
+        for note in &members {
+            let member = record
+                .member(*note, self.checkpoint.pending[note].nullifier)
+                .map(|(_, member)| member.clone())
+                .context("batch member missing from its record")?;
+            let entry = self.checkpoint.pending.get_mut(note).unwrap();
+            rollbacks.push((
+                *note,
+                (
+                    entry.nonce,
+                    entry.transaction_hash.clone(),
+                    entry.attempt.clone(),
+                ),
+            ));
+            entry.nonce = Some(nonce);
+            if let Some(hash) = entry.transaction_hash.take() {
+                push_superseded(&mut entry.attempt, hash);
+            }
+            entry.attempt.max_fee_per_gas = Some(format!("0x{:x}", fees.max_fee));
+            entry.attempt.max_priority_fee_per_gas = Some(format!("0x{:x}", fees.tip));
+            entry.attempt.gas_limit = Some(gas);
+            entry.attempt.attempts = entry.attempt.attempts.saturating_add(1);
+            entry.attempt.submitted_block = Some(head.number);
+            entry.attempt.evidence_digest = Some(record.digest.clone());
+            entry.attempt.submitted_root = None;
+            entry.attempt.unknown_attempt = true;
+            entry.attempt.action = Some(member.kind);
+            entry.attempt.evidence_row = Some(member.evidence_row);
+            entry.attempt.raise_amount = None;
+            entry.batch_queued_at = None;
+        }
+        let first_send = reuse.is_none();
+        if first_send {
+            self.checkpoint.batches.insert(nonce, record.clone());
+        }
+        self.persist()?;
+        transaction["gas"] = json!(format!("0x{gas:x}"));
+        transaction["nonce"] = json!(format!("0x{nonce:x}"));
+        transaction["maxFeePerGas"] = json!(format!("0x{:x}", fees.max_fee));
+        transaction["maxPriorityFeePerGas"] = json!(format!("0x{:x}", fees.tip));
+        let sent = self
+            .rpc_with_timeout(
+                "eth_sendTransaction",
+                json!([transaction]),
+                Some(SEND_TIMEOUT),
+            )
+            .await
+            .and_then(|hash| {
+                hash.as_str()
+                    .map(str::to_owned)
+                    .context("transaction response lacks hash")
+            });
+        match sent {
+            Ok(hash) => {
+                for note in &members {
+                    let entry = self.checkpoint.pending.get_mut(note).unwrap();
+                    entry.transaction_hash = Some(hash.clone());
+                    entry.attempt.unknown_attempt = false;
+                }
+                if first_send {
+                    let totals = &mut self.checkpoint.batch_totals;
+                    totals.batches_sent = totals.batches_sent.saturating_add(1);
+                    totals.batched_items =
+                        totals.batched_items.saturating_add(members.len() as u64);
+                }
+                self.persist()?;
+                tracing::info!(
+                    nonce,
+                    notes = ?members,
+                    transaction_hash = %hash,
+                    gas_limit = gas,
+                    max_fee_per_gas = fees.max_fee,
+                    max_priority_fee_per_gas = fees.tip,
+                    "submitted batched escape challenges"
+                );
+                let detail = format!(
+                    "batch of {} (notes {}) pending on nonce {nonce}",
+                    record.members.len(),
+                    record
+                        .notes()
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                for (note, context) in &contexts {
+                    self.record(
+                        *note,
+                        context
+                            .evaluation(ObligationState::Submitted)
+                            .detail(detail.clone()),
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // A signer that does not allow the batcher, or batches this
+                // large, refuses without a reason or with one of these; fee,
+                // balance and simulation refusals are a send's, as for a
+                // single call.
+                let unauthorized = match classify_send_error(&error) {
+                    SendFailure::Refused(None) => true,
+                    SendFailure::Refused(Some(reason)) => {
+                        ["batcher_vault_mismatch", "batch_size_out_of_bounds"]
+                            .contains(&reason.as_str())
+                    }
+                    _ => false,
+                };
+                let (_, error) = self
+                    .send_failed_for(
+                        rollbacks,
+                        nonce,
+                        (gas, fees.max_fee),
+                        base_state,
+                        error,
+                        &contexts,
+                    )
+                    .await?;
+                if unauthorized {
+                    // It would refuse every batch: single calls until restart.
+                    let detail = format!(
+                        "the signer refused a batch ({}); check ZKAPI_CHALLENGE_EXIT_BATCHER in signer.env",
+                        bounded(&error.to_string())
+                    );
+                    tracing::error!(nonce, detail = %detail, "batching is off until restart; defeats and raises go as single calls");
+                    self.batching_off = Some(detail);
+                }
+                if self.prune_batches() {
+                    self.persist()?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The member of a pending, held or reserved batch: the first member of
+    /// the poll drives the batch's replacement or re-send; the others show
+    /// its outcome. A defeat that becomes due while the note's raise is in
+    /// the batch follows on the next nonce once the batch mines.
+    async fn act_in_batch(
+        &mut self,
+        note: u32,
+        nonce: u64,
+        nonce_state: NonceState,
+        head: &HeadInfo,
+        due: CallKind,
+        context: SendContext,
+    ) -> anyhow::Result<()> {
+        let attempt = self.checkpoint.pending[&note].attempt.kind();
+        let follows = (due != attempt).then(|| {
+            format!(
+                "a {due} is due; the batch holding this note's {attempt} keeps its calldata, so the {due} follows on the next nonce once it mines",
+                due = due.as_str(),
+                attempt = attempt.as_str()
+            )
+        });
+        let result = if let Some(outcome) = self.batch_outcomes.get(&nonce).cloned() {
+            let mut evaluation = context.evaluation(outcome.state);
+            evaluation.blocked = outcome.blocked;
+            evaluation.detail = outcome.detail;
+            self.record(note, evaluation);
+            Ok(())
+        } else {
+            let result = match nonce_state {
+                NonceState::Pending => {
+                    self.maybe_replace(note, head, true, Target::Batch, context.clone())
+                        .await
+                }
+                NonceState::Held => {
+                    self.maybe_replace(note, head, false, Target::Batch, context.clone())
+                        .await
+                }
+                NonceState::Reserved => {
+                    let plan = self
+                        .persisted_fees(note)
+                        .map_or(FeePlan::First, FeePlan::Resend);
+                    self.resend(note, Target::Batch, nonce, head, plan, context.clone())
+                        .await
+                }
+                NonceState::Free | NonceState::Mined => {
+                    unreachable!("a batch member holds an unmined nonce")
+                }
+            };
+            if let Some(evaluation) = self.evaluations.get(&note) {
+                self.batch_outcomes.insert(nonce, evaluation.clone());
+            }
+            result
+        };
+        if let (Some(follows), Some(evaluation)) = (follows, self.evaluations.get_mut(&note)) {
+            let detail = match evaluation.detail.take() {
+                Some(detail) => format!("{detail}; {follows}"),
+                None => follows,
+            };
+            evaluation.detail = Some(bounded(&detail));
+        }
+        result
+    }
+
+    /// An item the flush took out of its batch (or a lone item) goes the
+    /// single path. A skipped item is sent single only when its own call
+    /// simulates (then the skip was an anomaly); one whose escape changed is
+    /// never re-sent. An item that skipped or reverted for another reason
+    /// is never batched again.
+    async fn batch_fallback(
+        &mut self,
+        item: QueuedItem,
+        reason: SingleReason,
+        head: &HeadInfo,
+    ) -> anyhow::Result<()> {
+        let QueuedItem {
+            note,
+            nullifier,
+            call,
+            context,
+            ..
+        } = item;
+        match reason {
+            SingleReason::Alone => {}
+            SingleReason::Skipped => {
+                let data = format!(
+                    "0x{}",
+                    hex::encode(call.calldata().map_err(anyhow::Error::msg)?)
+                );
+                let simulation =
+                    json!({ "from": self.config.sender, "to": self.vault_address(), "data": data });
+                if let Err(error) = self.rpc("eth_call", json!([simulation, "latest"])).await {
+                    let changed =
+                        vault_revert(&error).is_some_and(|name| STATE_REVERTS.contains(&name));
+                    if !changed {
+                        self.exclude_from_batches(
+                            note,
+                            "the batch simulation skipped it and its single call reverts",
+                        )?;
+                    }
+                    // As a single send would report it; nothing is sent.
+                    return self.simulation_failed(note, ObligationState::Ready, error, &context);
+                }
+                self.record_batch_anomaly(
+                    note,
+                    nullifier,
+                    format!(
+                        "the batch simulation skipped the {}, whose single call succeeds",
+                        call.kind().as_str()
+                    ),
+                )?;
+            }
+            SingleReason::Reverted => {
+                self.record_batch_anomaly(
+                    note,
+                    nullifier,
+                    format!("the {} reverts a batch of its own", call.kind().as_str()),
+                )?;
+            }
+            SingleReason::Malformed(detail) => {
+                self.record_batch_anomaly(
+                    note,
+                    nullifier,
+                    format!("the batch simulation answered {detail}"),
+                )?;
+            }
+        }
+        self.submit(note, call, None, head, FeePlan::First, context)
+            .await
+    }
+
+    /// Keep the note out of batches (it goes single), counted as a fallback.
+    fn exclude_from_batches(&mut self, note: u32, why: &str) -> anyhow::Result<()> {
+        let Some(entry) = self.checkpoint.pending.get_mut(&note) else {
+            return Ok(());
+        };
+        if entry.batch_excluded {
+            return Ok(());
+        }
+        entry.batch_excluded = true;
+        let totals = &mut self.checkpoint.batch_totals;
+        totals.single_fallbacks = totals.single_fallbacks.saturating_add(1);
+        tracing::warn!(
+            note_id = note,
+            reason = why,
+            "the note goes as single calls from now on"
+        );
+        self.persist()
+    }
+
+    /// An item a batch skipped or reverted on for a reason other than a
+    /// changed escape: the note is excluded from batches, counted, logged
+    /// and alarmed on for BATCH_ANOMALY_ALARM_SECONDS.
+    fn record_batch_anomaly(
+        &mut self,
+        note: u32,
+        nullifier: Felt252,
+        detail: String,
+    ) -> anyhow::Result<()> {
+        if let Some(entry) = self.checkpoint.pending.get_mut(&note) {
+            entry.batch_excluded = true;
+        }
+        let totals = &mut self.checkpoint.batch_totals;
+        totals.anomalies = totals.anomalies.saturating_add(1);
+        totals.single_fallbacks = totals.single_fallbacks.saturating_add(1);
+        tracing::error!(note_id = note, nullifier = %nullifier, detail = %detail, "batched challenge anomaly; the note goes as single calls from now on");
+        self.checkpoint.last_batch_anomaly = Some(BatchAnomaly {
+            note_id: note,
+            nullifier,
+            detail: bounded(&detail),
+            recorded_at: unix_now(),
+        });
+        self.persist()
+    }
+
+    /// Once a member's batch nonce is consumed while its escape is still
+    /// pending, read from the receipt whether its item took effect. A skip
+    /// for a changed escape is expected; any other skip, a reverted batch,
+    /// or (without a receipt) the very item still due excludes the note.
+    async fn examine_mined_batch_item(
+        &mut self,
+        note: u32,
+        nonce: u64,
+        pending: &PendingChallenge,
+        decision: &Decision,
+    ) -> anyhow::Result<()> {
+        if pending.batch_excluded || self.batch_items_checked.contains(&(nonce, note)) {
+            return Ok(());
+        }
+        let Some(record) = self.checkpoint.batches.get(&nonce).cloned() else {
+            return Ok(());
+        };
+        let Some((index, member)) = record.member(note, pending.nullifier) else {
+            return Ok(());
+        };
+        let member = member.clone();
+        let outcome = match self.batch_item_outcome(&record, index, note, pending).await {
+            Ok(outcome) => outcome,
+            // Read again next poll.
+            Err(_) => return Ok(()),
+        };
+        self.batch_items_checked.insert((nonce, note));
+        let kind = member.kind.as_str();
+        match outcome {
+            Some(ItemOutcome::Applied) => Ok(()),
+            Some(ItemOutcome::Skipped(reason))
+                if STATE_REVERTS
+                    .iter()
+                    .any(|name| reason.starts_with(&selector(name))) =>
+            {
+                tracing::info!(note_id = note, nonce, "the batch skipped the {kind}: its escape changed first");
+                Ok(())
+            }
+            Some(ItemOutcome::Skipped(reason)) => self.record_batch_anomaly(
+                note,
+                pending.nullifier,
+                format!(
+                    "the batch on nonce {nonce} skipped the {kind} with reason 0x{}",
+                    hex::encode(&reason)
+                ),
+            ),
+            Some(ItemOutcome::Reverted(hash)) => self.record_batch_anomaly(
+                note,
+                pending.nullifier,
+                format!("the batch transaction {hash} on nonce {nonce} reverted"),
+            ),
+            None if due_call(note, decision)
+                .is_some_and(|call| call.digest() == member.item_digest) =>
+            {
+                self.exclude_from_batches(
+                    note,
+                    "its batch nonce was consumed without a known receipt and the same call is still due",
+                )
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The outcome of item `index` (note `note`) from the receipt of the
+    /// member's latest known attempt that mined; None without a receipt.
+    async fn batch_item_outcome(
+        &self,
+        record: &BatchRecord,
+        index: usize,
+        note: u32,
+        pending: &PendingChallenge,
+    ) -> anyhow::Result<Option<ItemOutcome>> {
+        let topic = format!(
+            "0x{}",
+            hex::encode(Keccak256::digest(ITEM_SKIPPED_EVENT.as_bytes()))
+        );
+        let index_topic = format!("0x{index:064x}");
+        let note_topic = format!("0x{note:064x}");
+        for hash in pending
+            .transaction_hash
+            .iter()
+            .chain(pending.attempt.superseded_hashes.iter().rev())
+        {
+            let receipt = self.rpc("eth_getTransactionReceipt", json!([hash])).await?;
+            if receipt.is_null() {
+                continue;
+            }
+            if receipt.get("status").and_then(Value::as_str) == Some("0x0") {
+                return Ok(Some(ItemOutcome::Reverted(hash.clone())));
+            }
+            let logs = receipt
+                .get("logs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for log in logs {
+                let topics: Vec<String> = log["topics"]
+                    .as_array()
+                    .map(|topics| {
+                        topics
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_ascii_lowercase)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let from_batcher = log["address"]
+                    .as_str()
+                    .is_some_and(|address| address.eq_ignore_ascii_case(&record.batcher));
+                if from_batcher
+                    && topics.len() == 4
+                    && topics[0] == topic
+                    && topics[1] == index_topic
+                    && topics[3] == note_topic
+                {
+                    return Ok(Some(ItemOutcome::Skipped(skip_reason(&log["data"])?)));
+                }
+            }
+            return Ok(Some(ItemOutcome::Applied));
+        }
+        Ok(None)
+    }
+}
+
+/// What a mined batch did with one item.
+#[derive(Debug, PartialEq, Eq)]
+enum ItemOutcome {
+    Applied,
+    /// ItemSkipped with the vault's revert data.
+    Skipped(Vec<u8>),
+    /// The whole batch transaction (this hash) reverted.
+    Reverted(String),
+}
+
+/// The defeat or raise a decision makes due on `note`.
+fn due_call(note: u32, decision: &Decision) -> Option<VaultCall> {
+    match &decision.due {
+        Due::Defeat { evidence, .. } => Some(VaultCall::Defeat {
+            note_id: note,
+            inputs: evidence.inputs.clone(),
+            proof: evidence.proof.clone(),
+        }),
+        Due::Raise { evidence, amount } => Some(VaultCall::Raise {
+            note_id: note,
+            inputs: evidence.inputs.clone(),
+            proof: evidence.proof.clone(),
+            amount: *amount,
+        }),
+        _ => None,
+    }
+}
+
+/// The revert data in an ItemSkipped log's `bytes reason`.
+fn skip_reason(data: &Value) -> anyhow::Result<Vec<u8>> {
+    let raw = hex::decode(
+        data.as_str()
+            .and_then(|data| data.strip_prefix("0x"))
+            .context("ItemSkipped log lacks data")?,
+    )?;
+    ensure!(raw.len() >= 64, "malformed ItemSkipped data");
+    let word = |at: usize| -> anyhow::Result<usize> {
+        let value = Felt252(raw[at..at + 32].try_into().unwrap());
+        usize::try_from(felt_u64(&value)?).context("malformed ItemSkipped data")
+    };
+    let offset = word(0)?;
+    ensure!(
+        offset.checked_add(32).is_some_and(|end| end <= raw.len()),
+        "malformed ItemSkipped data"
+    );
+    let length = word(offset)?;
+    let start = offset + 32;
+    ensure!(
+        start
+            .checked_add(length)
+            .is_some_and(|end| end <= raw.len()),
+        "malformed ItemSkipped data"
+    );
+    Ok(raw[start..start + length].to_vec())
+}
+
+/// One item of a challengeBatch: the note, its amount (0 for a defeat), and
+/// the request tuple and proof of its single vault call, whose encoder
+/// checks them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BatchItem {
+    note: u32,
+    amount: u128,
+    inputs: Vec<u8>,
+    proof: Vec<u8>,
+}
+
+fn batch_item(call: &VaultCall) -> Result<BatchItem, String> {
+    let data = call.calldata()?;
+    let (amount, proof_at) = match call {
+        VaultCall::Defeat { .. } => (0, crate::watcher::DEFEAT_CALLDATA_LEN - 256),
+        VaultCall::Raise { amount: 0, .. } => {
+            return Err("a raise of 0 would be a defeat in a batch".into())
+        }
+        VaultCall::Raise { amount, .. } => (*amount, crate::watcher::RAISE_CALLDATA_LEN - 256),
+        VaultCall::Retire { .. } => return Err("a leaf retirement is never batched".into()),
+    };
+    Ok(BatchItem {
+        note: call.note_id(),
+        amount,
+        // selector | noteId | the 12 tuple words.
+        inputs: data[36..36 + 12 * 32].to_vec(),
+        proof: data[proof_at..].to_vec(),
+    })
+}
+
+fn exit_batch_kind(kind: CallKind) -> ExitBatchKind {
+    match kind {
+        CallKind::Defeat => ExitBatchKind::Defeat,
+        CallKind::Raise => ExitBatchKind::Raise,
+        CallKind::Retire => unreachable!("a leaf retirement is never batched"),
+    }
+}
+
+/// `challengeBatch` calldata: `selector | 4 offsets | noteIds | amounts |
+/// inputs (12 static words each) | proofs (n x 256 bytes)`, 4 + 32 x (8 +
+/// 22n) bytes.
+fn challenge_batch_calldata(items: &[BatchItem]) -> Vec<u8> {
+    let n = items.len() as u64;
+    let word = |value: u128| *Felt252::from_u128(value).as_bytes();
+    let mut data = Vec::with_capacity(4 + 32 * (8 + 22 * items.len()));
+    data.extend_from_slice(&CHALLENGE_BATCH_SELECTOR);
+    let ids = 4 * 32;
+    let amounts = ids + 32 * (1 + n);
+    let inputs = amounts + 32 * (1 + n);
+    let proofs = inputs + 32 * (1 + 12 * n);
+    for offset in [ids, amounts, inputs, proofs] {
+        data.extend_from_slice(&word(offset.into()));
+    }
+    data.extend_from_slice(&word(n.into()));
+    for item in items {
+        data.extend_from_slice(&word(item.note.into()));
+    }
+    data.extend_from_slice(&word(n.into()));
+    for item in items {
+        data.extend_from_slice(&word(item.amount));
+    }
+    data.extend_from_slice(&word(n.into()));
+    for item in items {
+        data.extend_from_slice(&item.inputs);
+    }
+    data.extend_from_slice(&word(u128::from(n) * 256));
+    for item in items {
+        data.extend_from_slice(&item.proof);
+    }
+    data
+}
+
+/// `gasBound(uint8[] kinds)` calldata.
+fn gas_bound_calldata(kinds: &[u8]) -> Vec<u8> {
+    let mut data = GAS_BOUND_SELECTOR.to_vec();
+    data.extend_from_slice(Felt252::from_u64(32).as_bytes());
+    data.extend_from_slice(Felt252::from_u64(kinds.len() as u64).as_bytes());
+    for kind in kinds {
+        data.extend_from_slice(Felt252::from_u64((*kind).into()).as_bytes());
+    }
+    data
+}
+
+/// What every attempt on a batch nonce sends.
+fn batch_digest(batcher: &str, calldata: &[u8]) -> String {
+    let mut digest = Keccak256::new();
+    digest.update(b"zkapi:v2c:challenge-batch\0");
+    digest.update(batcher.to_ascii_lowercase().as_bytes());
+    digest.update(calldata);
+    format!("0x{}", hex::encode(digest.finalize()))
+}
+
+/// The applied bitmap a challengeBatch of `items` returns: one word with no
+/// bit at or above `items`.
+fn decode_bitmap(result: &Value, items: usize) -> anyhow::Result<u64> {
+    let words = words(result)?;
+    ensure!(
+        words.len() == 1,
+        "a challengeBatch result of {} words",
+        words.len()
+    );
+    let bitmap = felt_u64(&words[0]).context("a bitmap with bits beyond 64 items")?;
+    ensure!(
+        items >= 64 || bitmap >> items == 0,
+        "a bitmap 0x{bitmap:x} with bits beyond its {items} items"
+    );
+    Ok(bitmap)
+}
+
+/// A batch's gas limit: the batcher's execution bound plus the intrinsic
+/// 21,000 and the calldata gas (at least the EIP-7623 floor), and never
+/// below `estimate` plus 20%, the margin every challenge gets.
+fn batch_gas_limit(gas_bound: u64, calldata: &[u8], estimate: u64) -> Option<u64> {
+    let zeros = calldata.iter().filter(|byte| **byte == 0).count() as u64;
+    let nonzeros = calldata.len() as u64 - zeros;
+    let standard = zeros
+        .checked_mul(CALLDATA_ZERO_GAS)?
+        .checked_add(nonzeros.checked_mul(CALLDATA_NONZERO_GAS)?)?;
+    let floor = zeros
+        .checked_add(nonzeros.checked_mul(4)?)?
+        .checked_mul(CALLDATA_FLOOR_GAS_PER_TOKEN)?;
+    let bound = TX_INTRINSIC_GAS.checked_add(standard.checked_add(gas_bound)?.max(floor))?;
+    Some(bound.max(estimate.checked_add(estimate / 5)?))
+}
+
+/// An item with `deadline` may wait for a batch at chain time `now`: its
+/// deadline is beyond the critical threshold.
+fn batchable_at(deadline: u64, now: u64, critical_remaining: u64) -> bool {
+    deadline.saturating_sub(now) > critical_remaining
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlushReason {
+    Full,
+    Aged,
+    DeadlineNear,
+}
+
+impl FlushReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Aged => "aged",
+            Self::DeadlineNear => "deadline_near",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flush {
+    /// Keep waiting; it flushes by chain time `by` at the latest.
+    Wait {
+        by: u64,
+    },
+    Now(FlushReason),
+}
+
+/// The flush policy for queued items `(deadline, queued_at)` at chain time
+/// `now`: flush once they fill a batch, once the oldest has waited
+/// `max_age_seconds`, or once any deadline is within the critical threshold
+/// plus `deadline_margin_seconds`.
+fn flush_due(
+    policy: &BatchPolicy,
+    critical_remaining: u64,
+    now: u64,
+    items: &[(u64, u64)],
+) -> Flush {
+    let lead = critical_remaining.saturating_add(policy.deadline_margin_seconds);
+    if items
+        .iter()
+        .any(|(deadline, _)| deadline.saturating_sub(now) <= lead)
+    {
+        return Flush::Now(FlushReason::DeadlineNear);
+    }
+    if items.len() >= policy.max_items {
+        return Flush::Now(FlushReason::Full);
+    }
+    if items
+        .iter()
+        .any(|(_, queued)| now.saturating_sub(*queued) >= policy.max_age_seconds)
+    {
+        return Flush::Now(FlushReason::Aged);
+    }
+    let by = items
+        .iter()
+        .map(|(deadline, queued)| {
+            queued
+                .saturating_add(policy.max_age_seconds)
+                .min(deadline.saturating_sub(lead))
+        })
+        .min()
+        .unwrap_or(now);
+    Flush::Wait { by }
+}
+
+/// Why an item leaves the batch path for a single call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SingleReason {
+    /// A batch of one: the single call is cheaper.
+    Alone,
+    /// The batch simulation skipped it.
+    Skipped,
+    /// It reverts a batch of its own.
+    Reverted,
+    /// The batch simulation answered something other than a bitmap.
+    Malformed(String),
+}
+
+/// A batch simulation's result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Simulated {
+    /// The bitmap of the items that apply.
+    Applied(u64),
+    /// The whole batch reverts (or the RPC refused the call).
+    Reverted(String),
+    Malformed(String),
+}
+
+/// Splits due items into batches whose simulation applies every item, and
+/// items that go single. Items are taken in order, `max` per batch. A group
+/// whose simulation reverts is halved and both halves simulated, down to
+/// single items, which go single (`Reverted`) if they revert alone and
+/// (`Alone`) otherwise; items a simulation skips go single (`Skipped`) and
+/// the rest is simulated again. Items left alone that way are batched
+/// together once more at the end (they each passed a simulation), and go
+/// single only if fewer than two remain. At most about two simulations per
+/// item.
+struct Bisection<T> {
+    /// Groups to settle, the next last; whether bisection made each.
+    work: Vec<(Vec<T>, bool)>,
+    current: Option<(Vec<T>, bool)>,
+    batches: Vec<Vec<T>>,
+    singles: Vec<(T, SingleReason)>,
+    /// Items a simulation left alone, and whether they were regrouped.
+    orphans: Vec<T>,
+    regrouped: bool,
+    max: usize,
+}
+
+impl<T: Clone> Bisection<T> {
+    fn new(items: Vec<T>, max: usize) -> Self {
+        let mut work: Vec<(Vec<T>, bool)> = items
+            .chunks(max.max(1))
+            .map(|chunk| (chunk.to_vec(), false))
+            .collect();
+        work.reverse();
+        Self {
+            work,
+            current: None,
+            batches: Vec::new(),
+            singles: Vec::new(),
+            orphans: Vec::new(),
+            regrouped: false,
+            max: max.max(1),
+        }
+    }
+
+    /// The next group to simulate; None once every item is settled.
+    fn next_group(&mut self) -> Option<Vec<T>> {
+        debug_assert!(self.current.is_none(), "report the previous group first");
+        loop {
+            while let Some((group, bisected)) = self.work.pop() {
+                match group.len() {
+                    0 => {}
+                    1 if !bisected => self.orphans.extend(group),
+                    _ => {
+                        self.current = Some((group.clone(), bisected));
+                        return Some(group);
+                    }
+                }
+            }
+            if self.regrouped || self.orphans.len() < 2 {
+                return None;
+            }
+            self.regrouped = true;
+            let orphans = std::mem::take(&mut self.orphans);
+            let mut groups: Vec<(Vec<T>, bool)> = orphans
+                .chunks(self.max)
+                .map(|chunk| (chunk.to_vec(), false))
+                .collect();
+            groups.reverse();
+            self.work = groups;
+        }
+    }
+
+    fn report(&mut self, outcome: Simulated) {
+        let (mut group, _) = self.current.take().expect("a group to report on");
+        match outcome {
+            Simulated::Reverted(_) if group.len() == 1 => self
+                .singles
+                .push((group.pop().unwrap(), SingleReason::Reverted)),
+            Simulated::Reverted(_) => {
+                let right = group.split_off(group.len() / 2);
+                self.work.push((right, true));
+                self.work.push((group, true));
+            }
+            Simulated::Malformed(detail) => self.singles.extend(
+                group
+                    .into_iter()
+                    .map(|item| (item, SingleReason::Malformed(detail.clone()))),
+            ),
+            Simulated::Applied(bitmap) => {
+                let (mut applied, mut skipped) = (Vec::new(), Vec::new());
+                for (index, item) in group.into_iter().enumerate() {
+                    if bitmap >> index & 1 == 1 {
+                        applied.push(item);
+                    } else {
+                        skipped.push((item, SingleReason::Skipped));
+                    }
+                }
+                if skipped.is_empty() && applied.len() > 1 {
+                    self.batches.push(applied);
+                } else if skipped.is_empty() {
+                    self.orphans.extend(applied);
+                } else {
+                    // The rest is simulated again without the skipped items.
+                    self.singles.extend(skipped);
+                    self.work.push((applied, false));
+                }
+            }
+        }
+    }
+
+    /// The items not settled yet (when the flush stops early).
+    fn unsettled(self) -> Vec<T> {
+        self.work
+            .into_iter()
+            .flat_map(|(group, _)| group)
+            .chain(self.batches.into_iter().flatten())
+            .chain(self.singles.into_iter().map(|(item, _)| item))
+            .chain(self.orphans)
+            .collect()
+    }
+
+    fn finish(mut self) -> (Vec<Vec<T>>, Vec<(T, SingleReason)>) {
+        self.singles.extend(
+            self.orphans
+                .into_iter()
+                .map(|item| (item, SingleReason::Alone)),
+        );
+        (self.batches, self.singles)
     }
 }
 
@@ -5458,6 +7342,18 @@ mod tests {
         /// pendingWithdrawals reads of the default escape at the head block
         /// fail: the backend serving them lacks it.
         head_block_unknown: bool,
+        /// The exit batcher's address (lowercase), when the mock has one.
+        batcher: Option<String>,
+        /// Notes the batcher's simulated challengeBatch skips, and notes
+        /// whose item makes it revert.
+        batch_skip: BTreeSet<u32>,
+        batch_revert: BTreeSet<u32>,
+        /// The note lists of every simulated challengeBatch.
+        batch_calls: Vec<Vec<u32>>,
+        /// gasBound(kinds) answers this.
+        gas_bound: u64,
+        /// Simulation errors of single defeats and raises, per note.
+        single_errors: BTreeMap<u32, Value>,
     }
 
     impl MockChain {
@@ -5527,6 +7423,20 @@ mod tests {
                 forked_block_reads: 0,
                 latest_active: None,
                 head_block_unknown: false,
+                batcher: None,
+                batch_skip: BTreeSet::new(),
+                batch_revert: BTreeSet::new(),
+                batch_calls: Vec::new(),
+                gas_bound: 2_000_000,
+                single_errors: BTreeMap::new(),
+            }
+        }
+
+        /// Whether `note`'s escape is pending at the latest block.
+        fn escape_active(&self, note: u32) -> bool {
+            match self.withdrawals.get(&note) {
+                Some((active, ..)) => *active,
+                None => self.active,
             }
         }
 
@@ -5566,6 +7476,17 @@ mod tests {
 
     fn call_data(signature: &str) -> String {
         format!("0x{}", hex::encode(selector(signature)))
+    }
+
+    /// The noteIds of challengeBatch calldata (0x-hex).
+    fn batch_notes(data: &str) -> Vec<u32> {
+        let bytes = hex::decode(data.trim_start_matches("0x")).unwrap();
+        let word =
+            |at: usize| u64::from_be_bytes(bytes[at + 24..at + 32].try_into().unwrap()) as usize;
+        let ids = 4 + word(4);
+        (0..word(ids))
+            .map(|index| word(ids + 32 * (index + 1)) as u32)
+            .collect()
     }
 
     async fn rpc(
@@ -5680,6 +7601,39 @@ mod tests {
                     return rpc_error(-32000, "temporary note-state failure");
                 }
                 let concession_read = data.starts_with(&call_data("pendingConcessions(uint32)"));
+                let to = request["params"][0]["to"]
+                    .as_str()
+                    .map(str::to_ascii_lowercase);
+                if state.batcher.is_some() && to == state.batcher {
+                    if data.starts_with(&format!("0x{}", hex::encode(GAS_BOUND_SELECTOR))) {
+                        return Json(json!({ "jsonrpc": "2.0", "id": 1,
+                            "result": encoded(&[Felt252::from_u64(state.gas_bound)]) }))
+                        .into_response();
+                    }
+                    if data.starts_with(&format!("0x{}", hex::encode(CHALLENGE_BATCH_SELECTOR))) {
+                        let notes = batch_notes(data);
+                        state.batch_calls.push(notes.clone());
+                        if notes.iter().any(|note| state.batch_revert.contains(note)) {
+                            return rpc_error(3, "execution reverted");
+                        }
+                        let bitmap =
+                            notes
+                                .iter()
+                                .enumerate()
+                                .fold(0u64, |bitmap, (index, note)| {
+                                    if state.batch_skip.contains(note)
+                                        || !state.escape_active(*note)
+                                    {
+                                        bitmap
+                                    } else {
+                                        bitmap | 1 << index
+                                    }
+                                });
+                        return Json(json!({ "jsonrpc": "2.0", "id": 1,
+                            "result": encoded(&[Felt252::from_u64(bitmap)]) }))
+                        .into_response();
+                    }
+                }
                 if let Some(word) = state.probe_words.get(data) {
                     encoded(&[*word])
                 } else if data.starts_with(&call_data("pendingWithdrawals(uint32)"))
@@ -5816,6 +7770,11 @@ mod tests {
                     .any(|selector| data.starts_with(&format!("0x{}", hex::encode(selector))))
                 {
                     let raise = data.starts_with(&format!("0x{}", hex::encode(RAISE_SELECTOR)));
+                    let note = u32::from_str_radix(&data[10..74], 16).unwrap_or(u32::MAX);
+                    if let Some(error) = state.single_errors.get(&note) {
+                        return Json(json!({ "jsonrpc": "2.0", "id": 1, "error": error }))
+                            .into_response();
+                    }
                     if let Some(error) = state
                         .raise_simulation_error
                         .as_ref()
@@ -6116,6 +8075,7 @@ mod tests {
                 retire_on_miss: false,
                 defeat_gas_limit: DEFAULT_DEFEAT_GAS_LIMIT,
                 raise_gas_limit: DEFAULT_RAISE_GAS_LIMIT,
+                batch: BatchPolicy::default(),
             };
             Self {
                 store,
@@ -11658,5 +13618,1063 @@ mod tests {
             fixture.service().verify_deployment(&manifest, timing).await,
             Err(DeploymentCheckError::Unavailable(_))
         ));
+    }
+
+    // ---- Batched defeats and raises (ZkApiExitBatcher.challengeBatch) ----
+
+    const BATCHER: &str = "0x00000000000000000000000000000000000ba7c4";
+
+    /// A service that batches through the mock's batcher: 16 items, 30 s of
+    /// age, and a 20 s margin over the 10 s critical threshold, so the mock's
+    /// escapes 100 s from their deadlines wait for a batch.
+    fn batching_service(
+        fixture: &Fixture,
+        change: impl FnOnce(&mut BatchPolicy),
+    ) -> ChallengeService {
+        fixture.chain.lock().unwrap().batcher = Some(BATCHER.into());
+        let mut policy = BatchPolicy {
+            batcher: Some(BATCHER.into()),
+            max_items: 16,
+            max_age_seconds: 30,
+            deadline_margin_seconds: 20,
+        };
+        change(&mut policy);
+        let mut service = fixture.service_with(|config| config.batch = policy);
+        // As the startup probes would (the probe test covers them).
+        service.batcher_max_items = Some(64);
+        service
+    }
+
+    /// Notes 1..=extra, each a further escape of the fixture's nullifier
+    /// with the default deadline, which the fixture's evidence defeats.
+    fn track_notes(fixture: &Fixture, service: &mut ChallengeService, extra: u32) {
+        let deadline = fixture.chain.lock().unwrap().deadline;
+        for note in 1..=extra {
+            fixture.track(service, note, deadline);
+        }
+    }
+
+    fn proof_of(request: &ApiRequestV2) -> Vec<u8> {
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &request.proof.proof,
+        )
+        .unwrap()
+    }
+
+    /// The challengeBatch calldata of defeats of `notes` with the fixture's
+    /// evidence.
+    fn defeat_batch(request: &ApiRequestV2, notes: &[u32]) -> String {
+        let items: Vec<BatchItem> = notes
+            .iter()
+            .map(|note| {
+                batch_item(&VaultCall::Defeat {
+                    note_id: *note,
+                    inputs: request.public_inputs.clone(),
+                    proof: proof_of(request),
+                })
+                .unwrap()
+            })
+            .collect();
+        format!("0x{}", hex::encode(challenge_batch_calldata(&items)))
+    }
+
+    fn sent_to_batcher(send: &Value) -> bool {
+        send["to"].as_str().unwrap().eq_ignore_ascii_case(BATCHER)
+    }
+
+    /// (note, kind) of a single vault call, or the notes of a batch.
+    fn sent_notes(send: &Value) -> Vec<u32> {
+        if sent_to_batcher(send) {
+            batch_notes(send["data"].as_str().unwrap())
+        } else {
+            vec![sent_call(send).1]
+        }
+    }
+
+    #[test]
+    fn the_flush_policy_waits_fills_ages_and_flushes_near_deadlines() {
+        let policy = BatchPolicy {
+            batcher: Some(BATCHER.into()),
+            max_items: 3,
+            max_age_seconds: 600,
+            deadline_margin_seconds: 1_800,
+        };
+        // Critical threshold 21,600 s: within 23,400 s of a deadline the
+        // queue flushes at once.
+        let critical = 21_600;
+        let now = 1_000_000;
+        let far = now + 100_000;
+        assert_eq!(
+            flush_due(&policy, critical, now, &[(far, now - 10)]),
+            Flush::Wait { by: now + 590 }
+        );
+        // The wait ends at the earlier of the age and the deadline lead.
+        let near = now + critical + 1_800 + 100;
+        assert_eq!(
+            flush_due(&policy, critical, now, &[(far, now), (near, now)]),
+            Flush::Wait { by: now + 100 }
+        );
+        assert_eq!(
+            flush_due(&policy, critical, now + 100, &[(far, now), (near, now)]),
+            Flush::Now(FlushReason::DeadlineNear)
+        );
+        assert_eq!(
+            flush_due(&policy, critical, now, &[(far, now - 600)]),
+            Flush::Now(FlushReason::Aged)
+        );
+        assert_eq!(
+            flush_due(&policy, critical, now, &[(far, now); 3]),
+            Flush::Now(FlushReason::Full)
+        );
+        assert_eq!(
+            flush_due(&policy, critical, now, &[(far, now); 2]),
+            Flush::Wait { by: now + 600 }
+        );
+        // Within the critical threshold nothing is batched at all.
+        assert!(batchable_at(now + critical + 1, now, critical));
+        assert!(!batchable_at(now + critical, now, critical));
+        assert!(!batchable_at(now - 1, now, critical));
+    }
+
+    #[test]
+    fn bisection_isolates_reverting_items_and_drops_skipped_ones() {
+        // Item 5 reverts any batch holding it; items 2 and 7 are skipped.
+        let simulate = |group: &[u32]| {
+            if group.contains(&5) {
+                Simulated::Reverted("execution reverted".into())
+            } else {
+                Simulated::Applied(
+                    group
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| ![2, 7].contains(*item))
+                        .fold(0, |bitmap, (index, _)| bitmap | 1 << index),
+                )
+            }
+        };
+        let run = |items: Vec<u32>, max: usize| {
+            let mut planner = Bisection::new(items, max);
+            let mut simulated = Vec::new();
+            while let Some(group) = planner.next_group() {
+                planner.report(simulate(&group));
+                simulated.push(group);
+            }
+            let (batches, singles) = planner.finish();
+            (batches, singles, simulated)
+        };
+        let (batches, singles, simulated) = run((0..8).collect(), 16);
+        assert_eq!(batches, [vec![0, 1, 3], vec![4, 6]]);
+        assert_eq!(
+            singles,
+            [
+                (2, SingleReason::Skipped),
+                (5, SingleReason::Reverted),
+                (7, SingleReason::Skipped),
+            ]
+        );
+        assert_eq!(
+            simulated,
+            [
+                vec![0, 1, 2, 3, 4, 5, 6, 7],
+                vec![0, 1, 2, 3],
+                vec![0, 1, 3],
+                vec![4, 5, 6, 7],
+                vec![4, 5],
+                vec![4],
+                vec![5],
+                vec![6, 7],
+                vec![4, 6],
+            ]
+        );
+        // Chunks of the batch size; a lone item is never a batch of one, but
+        // one bisection isolated is simulated alone.
+        let (batches, singles, simulated) = run(vec![0, 1, 3, 4, 6], 2);
+        assert_eq!(batches, [vec![0, 1], vec![3, 4]]);
+        assert_eq!(singles, [(6, SingleReason::Alone)]);
+        assert_eq!(simulated.len(), 2);
+        let (batches, singles, _) = run(vec![5, 6], 16);
+        assert!(batches.is_empty());
+        assert_eq!(
+            singles,
+            [(5, SingleReason::Reverted), (6, SingleReason::Alone)]
+        );
+        // Skips that leave one item send it single.
+        let (batches, singles, _) = run(vec![1, 2], 16);
+        assert!(batches.is_empty());
+        assert_eq!(
+            singles,
+            [(2, SingleReason::Skipped), (1, SingleReason::Alone)]
+        );
+        // A malformed answer sends every item of the group single.
+        let mut planner = Bisection::new(vec![1, 3], 16);
+        let group = planner.next_group().unwrap();
+        planner.report(Simulated::Malformed("0x".into()));
+        assert_eq!(group, [1, 3]);
+        assert!(planner.next_group().is_none());
+        let (batches, singles) = planner.finish();
+        assert!(batches.is_empty());
+        assert_eq!(
+            singles,
+            [
+                (1, SingleReason::Malformed("0x".into())),
+                (3, SingleReason::Malformed("0x".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn bitmaps_gas_limits_and_digests_are_strict() {
+        let bitmap = |value: u64| encoded(&[Felt252::from_u64(value)]);
+        assert_eq!(decode_bitmap(&bitmap(0b101), 3).unwrap(), 0b101);
+        assert_eq!(decode_bitmap(&bitmap(u64::MAX), 64).unwrap(), u64::MAX);
+        assert!(
+            decode_bitmap(&bitmap(0b1000), 3).is_err(),
+            "a bit beyond the items"
+        );
+        assert!(decode_bitmap(&json!("0x"), 3).is_err());
+        assert!(decode_bitmap(&encoded(&[Felt252::ONE, Felt252::ONE]), 3).is_err());
+        assert!(decode_bitmap(&encoded(&[Felt252([0xff; 32])]), 64).is_err());
+
+        // The bound, intrinsic gas and calldata gas; the estimate plus 20%
+        // when it is higher; the EIP-7623 floor for calldata-heavy batches.
+        let data = [0u8, 0, 1, 2];
+        assert_eq!(
+            batch_gas_limit(1_000_000, &data, 100_000),
+            Some(1_000_000 + 21_000 + 2 * 4 + 2 * 16)
+        );
+        assert_eq!(
+            batch_gas_limit(1_000_000, &data, 1_000_000),
+            Some(1_200_000)
+        );
+        let heavy = vec![0xffu8; 10_000];
+        assert_eq!(
+            batch_gas_limit(1_000, &heavy, 0),
+            Some(21_000 + 10_000 * 4 * 10)
+        );
+        assert_eq!(batch_gas_limit(u64::MAX, &data, 0), None);
+        assert_eq!(batch_gas_limit(0, &data, u64::MAX), None);
+
+        // The digest pins the batcher and every calldata byte.
+        let digest = batch_digest(BATCHER, &data);
+        assert_eq!(digest, batch_digest(&BATCHER.to_ascii_uppercase(), &data));
+        assert_ne!(digest, batch_digest(BATCHER, &[0, 0, 1, 3]));
+        assert_ne!(
+            digest,
+            batch_digest("0x00000000000000000000000000000000000ba7c5", &data)
+        );
+
+        // Policies: 2 to 64 items and a canonical batcher address.
+        assert!(BatchPolicy::default().validate().is_ok());
+        for (items, batcher) in [
+            (1, None),
+            (65, None),
+            (16, Some("0x00000000000000000000000000000000000BA7C4")),
+            (16, Some("0x1234")),
+        ] {
+            let policy = BatchPolicy {
+                max_items: items,
+                batcher: batcher.map(str::to_owned),
+                ..BatchPolicy::default()
+            };
+            assert!(policy.validate().is_err(), "{items} {batcher:?}");
+        }
+    }
+
+    /// The inputs of VaultCalldataGolden.t.sol's request().
+    fn golden_request() -> zkapi_types::RequestPublicInputsV2 {
+        let felt = |hex: &str| Felt252::from_hex(hex).unwrap();
+        zkapi_types::RequestPublicInputsV2 {
+            protocol_version: 2,
+            chain_id: 11_155_111,
+            contract_address: felt("0x00112233445566778899aabbccddeeff00112233"),
+            active_root: felt("0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"),
+            state_signing_key_x: felt(
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            state_signing_key_y: felt(
+                "0x2222222222222222222222222222222222222222222222222222222222222222",
+            ),
+            request_time: 1_767_225_600,
+            solvency_bound: u128::MAX,
+            request_nullifier: felt(
+                "0x0102030405060708091011121314151617181920212223242526272829303132",
+            ),
+            authorization_tag: felt(
+                "0x2a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40414243444546474849",
+            ),
+            anonymous_commitment_x: felt(
+                "0x0333333333333333333333333333333333333333333333333333333333333333",
+            ),
+            anonymous_commitment_y: felt(
+                "0x0444444444444444444444444444444444444444444444444444444444444444",
+            ),
+        }
+    }
+
+    /// The challengeBatch and gasBound encoders, the selectors and the
+    /// ItemSkipped decoder are the real batcher's: the batcher section of
+    /// vault_calldata_golden.json, which check-calldata-golden.sh takes
+    /// from the compiled protocol/contracts ZkApiExitBatcher.
+    #[test]
+    fn batch_calldata_matches_forge_abi_encode() {
+        let layout = crate::deployment::tests::real_batcher_layout();
+        let golden = |name: &str| {
+            hex::decode(
+                layout["calldata"][name]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("no batcher calldata {name}"))
+                    .trim_start_matches("0x"),
+            )
+            .unwrap()
+        };
+        let ascending: Vec<u8> = (1..=256).map(|byte| byte as u8).collect();
+        let descending: Vec<u8> = (1..=256).rev().map(|byte| byte as u8).collect();
+        let items = [
+            batch_item(&VaultCall::Defeat {
+                note_id: u32::MAX,
+                inputs: golden_request(),
+                proof: ascending,
+            })
+            .unwrap(),
+            batch_item(&VaultCall::Raise {
+                note_id: 7,
+                inputs: golden_request(),
+                proof: descending,
+                amount: 123_456_789_012_345_678_901_234_567_890,
+            })
+            .unwrap(),
+        ];
+        let calldata = challenge_batch_calldata(&items);
+        assert_eq!(calldata, golden("challengeBatch"));
+        assert_eq!(calldata.len(), 4 + 32 * (8 + 22 * 2));
+        assert_eq!(
+            gas_bound_calldata(&[ExitBatchKind::Defeat as u8, ExitBatchKind::Raise as u8]),
+            golden("gasBound")
+        );
+        for (name, signature, selector_bytes) in [
+            (
+                "challengeBatch",
+                CHALLENGE_BATCH_SIGNATURE,
+                CHALLENGE_BATCH_SELECTOR,
+            ),
+            ("gasBound", GAS_BOUND_SIGNATURE, GAS_BOUND_SELECTOR),
+        ] {
+            assert_eq!(selector(signature), selector_bytes, "{name}");
+            assert_eq!(
+                layout["selectors"][name],
+                format!("0x{}", hex::encode(selector_bytes)),
+                "{name}"
+            );
+        }
+        // The ItemSkipped log: topic0, (index, kind, noteId) topics, and the
+        // vault's revert data.
+        let event = &layout["events"]["ItemSkipped"];
+        assert_eq!(
+            event["topic0"],
+            format!(
+                "0x{}",
+                hex::encode(Keccak256::digest(ITEM_SKIPPED_EVENT.as_bytes()))
+            )
+        );
+        let topics = event["topics"].as_str().unwrap().trim_start_matches("0x");
+        assert_eq!(topics.len(), 4 * 64);
+        assert_eq!(&topics[64..128], format!("{:064x}", 3));
+        assert_eq!(
+            &topics[128..192],
+            format!("{:064x}", ExitBatchKind::Defeat as u8)
+        );
+        assert_eq!(&topics[192..], format!("{:064x}", 7));
+        assert_eq!(
+            skip_reason(&event["data"]).unwrap(),
+            selector("NotPendingWithdrawal()")
+        );
+        // The state reverts are the vault's own errors.
+        for name in STATE_REVERTS {
+            let real = &layout["vault_errors"][name.trim_end_matches("()")];
+            assert_eq!(
+                *real,
+                format!("0x{}", hex::encode(selector(name))),
+                "{name}"
+            );
+        }
+        // A raise of 0 would be a defeat, and a retirement no item.
+        assert!(batch_item(&VaultCall::Raise {
+            note_id: 7,
+            inputs: golden_request(),
+            proof: vec![1; 256],
+            amount: 0,
+        })
+        .is_err());
+        assert!(batch_item(&VaultCall::Defeat {
+            note_id: 7,
+            inputs: golden_request(),
+            proof: vec![1; 255],
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn a_checkpoint_with_a_batch_loads_again_and_older_ones_load_without() {
+        let record = BatchRecord {
+            batcher: BATCHER.into(),
+            calldata: "0xab41c746".into(),
+            digest: batch_digest(BATCHER, &[0xab, 0x41, 0xc7, 0x46]),
+            gas_bound: 2_000_000,
+            members: vec![BatchMember {
+                note_id: 4,
+                nullifier: Felt252::from_u64(7),
+                kind: CallKind::Raise,
+                evidence_row: 3,
+                item_digest: "0x01".into(),
+            }],
+        };
+        let pending = PendingChallenge {
+            nullifier: Felt252::from_u64(7),
+            nonce: Some(9),
+            batch_queued_at: Some(5),
+            batch_excluded: true,
+            attempt: NonceAttempts {
+                evidence_digest: Some(record.digest.clone()),
+                action: Some(CallKind::Raise),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let back: PendingChallenge =
+            serde_json::from_str(&serde_json::to_string(&pending).unwrap()).unwrap();
+        assert_eq!(
+            (back.batch_queued_at, back.batch_excluded, back.attempt),
+            (Some(5), true, pending.attempt.clone())
+        );
+        let back: BatchRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(back, record);
+        // A pending entry an earlier release wrote has neither field.
+        let earlier: PendingChallenge = serde_json::from_str(&format!(
+            r#"{{"nullifier":"0x{}","transaction_hash":null,"nonce":3,"attempts":1}}"#,
+            "0".repeat(63) + "7"
+        ))
+        .unwrap();
+        assert_eq!(
+            (earlier.batch_queued_at, earlier.batch_excluded),
+            (None, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn due_defeats_wait_for_a_batch_flush_once_aged_and_are_replaced_as_one() {
+        let fixture = Fixture::new().await;
+        let (_, request) = finalized_v2_request().await;
+        let mut service = batching_service(&fixture, |_| {});
+        track_notes(&fixture, &mut service, 2);
+        service.poll_once().await.unwrap();
+        assert!(fixture.sends().is_empty(), "they wait for the batch to age");
+        let status = service.status();
+        assert_eq!(status.batching.queued, 3);
+        assert!(status.batching.enabled);
+        for note in 0..3 {
+            let queued = obligation(&status, note);
+            assert_eq!(queued.state, ObligationState::Ready);
+            assert!(queued.detail.unwrap().contains("queued for a batch with 3"));
+            assert_eq!(queued.severity, Severity::Ok);
+            assert_eq!(queued.nonce, None);
+        }
+        let queued_at = service.checkpoint.pending[&0].batch_queued_at.unwrap();
+        // Waiting persists: a restart keeps the age.
+        drop(service);
+        let mut service = batching_service(&fixture, |_| {});
+        fixture.chain.lock().unwrap().head_timestamp = queued_at + 29;
+        service.poll_once().await.unwrap();
+        assert!(fixture.sends().is_empty());
+        fixture.chain.lock().unwrap().head_timestamp = queued_at + 30;
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1, "one transaction for the three notes");
+        assert!(sent_to_batcher(&sends[0]));
+        assert_eq!(sends[0]["data"], defeat_batch(&request, &[0, 1, 2]));
+        assert_eq!(sends[0]["nonce"], "0x3");
+        // The estimate (10M) plus 20% exceeds the bound plus calldata gas.
+        assert_eq!(sends[0]["gas"], "0xb71b00");
+        let chain_calls = fixture.chain.lock().unwrap().batch_calls.clone();
+        assert_eq!(
+            chain_calls,
+            [vec![0, 1, 2]],
+            "the exact batch was simulated"
+        );
+        let status = service.status();
+        for note in 0..3 {
+            let sent = obligation(&status, note);
+            assert_eq!(sent.state, ObligationState::Submitted);
+            assert_eq!(sent.nonce, Some(3));
+            assert_eq!(sent.batch_notes, [0, 1, 2]);
+            assert_eq!(sent.action, Some(CallKind::Defeat));
+            assert!(sent.detail.unwrap().contains("batch of 3"));
+            assert_eq!(service.checkpoint.pending[&note].batch_queued_at, None);
+        }
+        assert_eq!(status.batching.batches_sent_total, 1);
+        assert_eq!(status.batching.batched_items_total, 3);
+        assert_eq!(status.batching.queued, 0);
+        assert_eq!(service.checkpoint.batches.len(), 1);
+
+        // Pending: no further send until the bump interval, then exactly one
+        // replacement of the same calldata on the same nonce, also after a
+        // restart.
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 1);
+        drop(service);
+        let mut service = batching_service(&fixture, |_| {});
+        fixture.chain.lock().unwrap().head_number += 3;
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(
+            sends.len(),
+            2,
+            "one replacement for the batch, not one per note"
+        );
+        for field in ["to", "data", "nonce", "from"] {
+            assert_eq!(sends[0][field], sends[1][field], "{field}");
+        }
+        for field in ["maxFeePerGas", "maxPriorityFeePerGas"] {
+            assert!(fee(&sends[1], field) >= min_bump(fee(&sends[0], field)));
+        }
+        let status = service.status();
+        for note in 0..3 {
+            let replaced = obligation(&status, note);
+            assert_eq!(replaced.state, ObligationState::Submitted);
+            assert_eq!(replaced.superseded_hashes.len(), 1);
+            assert_eq!(replaced.transaction_hash, Some(format!("0x{:064x}", 2)));
+        }
+        assert_eq!(
+            status.batching.batches_sent_total, 1,
+            "a replacement is no new batch"
+        );
+
+        // The batch mines and defeats every escape: each obligation retires
+        // on its own at confirmation depth, and the record with them.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.mined_nonce = 4;
+            chain.active = false;
+            chain.confirmed_active = false;
+            for withdrawal in chain.withdrawals.values_mut() {
+                withdrawal.0 = false;
+            }
+        }
+        service.poll_once().await.unwrap();
+        assert!(
+            service.checkpoint.pending.is_empty(),
+            "{:?}",
+            service.status()
+        );
+        assert!(service.checkpoint.batches.is_empty());
+        assert_eq!(fixture.sends().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_full_batch_flushes_at_once_and_a_lone_remainder_goes_single() {
+        let fixture = Fixture::new().await;
+        let (_, request) = finalized_v2_request().await;
+        let mut service = batching_service(&fixture, |policy| policy.max_items = 2);
+        track_notes(&fixture, &mut service, 2);
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0]["data"], defeat_batch(&request, &[0, 1]));
+        assert_eq!(sends[0]["nonce"], "0x3");
+        // A batch of one would cost more than the single call.
+        assert_eq!(sent_call(&sends[1]), (CallKind::Defeat, 2));
+        assert_eq!(sends[1]["to"], service.vault_address());
+        assert_eq!(sends[1]["nonce"], "0x4");
+        let status = service.status();
+        assert_eq!(obligation(&status, 2).batch_notes, Vec::<u32>::new());
+        assert_eq!(obligation(&status, 1).batch_notes, [0, 1]);
+        assert_eq!(status.batching.single_fallbacks_total, 0);
+    }
+
+    #[tokio::test]
+    async fn near_deadlines_go_single_and_flush_the_queue_at_once() {
+        let fixture = Fixture::new().await;
+        let (_, request) = finalized_v2_request().await;
+        let mut service = batching_service(&fixture, |_| {});
+        let now = fixture.chain.lock().unwrap().head_timestamp;
+        // Within the 10 s critical threshold: single at once.
+        fixture.track(&mut service, 1, now + 10);
+        fixture.track(&mut service, 2, now + 100);
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sent_call(&sends[0]), (CallKind::Defeat, 1));
+        assert_eq!(
+            obligation(&service.status(), 0).state,
+            ObligationState::Ready
+        );
+        // Within the critical threshold plus the 20 s margin: the queue
+        // flushes now, the most urgent item first.
+        fixture.track(&mut service, 3, now + 30);
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[1]["data"], defeat_batch(&request, &[3, 0, 2]));
+        assert_eq!(sends[1]["nonce"], "0x4");
+    }
+
+    #[tokio::test]
+    async fn skipped_items_go_single_and_an_anomalous_skip_excludes_the_note() {
+        let fixture = Fixture::new().await;
+        let (_, request) = finalized_v2_request().await;
+        let mut service = batching_service(&fixture, |policy| policy.max_items = 4);
+        track_notes(&fixture, &mut service, 3);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            // The batch skips notes 1 and 2. Note 1's single call succeeds
+            // (an anomaly); note 2's escape changed under it.
+            chain.batch_skip = [1, 2].into();
+            chain.single_errors.insert(
+                2,
+                json!({ "code": 3, "message": "execution reverted", "data": "0x3be553f2" }),
+            );
+        }
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(
+            fixture.chain.lock().unwrap().batch_calls,
+            [vec![0, 1, 2, 3], vec![0, 3]],
+            "the batch without the skipped items is simulated again"
+        );
+        assert_eq!(sends.len(), 2, "{sends:?}");
+        assert_eq!(sends[0]["data"], defeat_batch(&request, &[0, 3]));
+        assert_eq!(sent_call(&sends[1]), (CallKind::Defeat, 1));
+        let status = service.status();
+        assert!(obligation(&status, 1).batch_excluded);
+        assert!(
+            !obligation(&status, 2).batch_excluded,
+            "a changed escape is no anomaly"
+        );
+        assert_eq!(
+            obligation(&status, 2).state,
+            ObligationState::ResolvedUnconfirmed
+        );
+        assert_eq!(status.batching.anomalies_total, 1);
+        assert_eq!(status.batching.single_fallbacks_total, 1);
+        let anomaly = status.batching.last_anomaly.clone().unwrap();
+        assert_eq!(anomaly.note_id, 1);
+        assert!(anomaly.detail.contains("single call succeeds"));
+        assert_eq!(status.status, Severity::Warning);
+        assert!(status
+            .alarms
+            .iter()
+            .any(|alarm| alarm.contains("batched challenge anomaly of note 1")));
+    }
+
+    #[tokio::test]
+    async fn a_reverting_batch_is_bisected_and_the_culprit_goes_single() {
+        let fixture = Fixture::new().await;
+        let (_, request) = finalized_v2_request().await;
+        let mut service = batching_service(&fixture, |policy| policy.max_items = 4);
+        track_notes(&fixture, &mut service, 3);
+        fixture.chain.lock().unwrap().batch_revert = [2].into();
+        service.poll_once().await.unwrap();
+        assert_eq!(
+            fixture.chain.lock().unwrap().batch_calls,
+            [vec![0, 1, 2, 3], vec![0, 1], vec![2, 3], vec![2], vec![3]]
+        );
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 3);
+        assert_eq!(sends[0]["data"], defeat_batch(&request, &[0, 1]));
+        assert_eq!(sent_call(&sends[1]), (CallKind::Defeat, 2));
+        assert_eq!(sent_call(&sends[2]), (CallKind::Defeat, 3));
+        assert_eq!(
+            sends
+                .iter()
+                .map(|send| send["nonce"].clone())
+                .collect::<Vec<_>>(),
+            ["0x3", "0x4", "0x5"]
+        );
+        let status = service.status();
+        assert!(obligation(&status, 2).batch_excluded);
+        assert!(
+            !obligation(&status, 3).batch_excluded,
+            "innocent in a batch of its own"
+        );
+        assert_eq!(status.batching.anomalies_total, 1);
+        assert!(status
+            .batching
+            .last_anomaly
+            .unwrap()
+            .detail
+            .contains("reverts a batch of its own"));
+    }
+
+    #[tokio::test]
+    async fn an_item_the_mined_batch_skipped_anomalously_is_resent_single() {
+        let fixture = Fixture::new().await;
+        let mut service = batching_service(&fixture, |policy| policy.max_items = 3);
+        track_notes(&fixture, &mut service, 2);
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        let hash = format!("0x{:064x}", 1);
+        // The batch mines: notes 0 and 1 are defeated, note 2's item ran out
+        // of its gas cap (empty revert data).
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.mined_nonce = 4;
+            chain.confirmed_nonce = Some(3);
+            chain.active = false;
+            chain.confirmed_active = false;
+            chain.withdrawals.get_mut(&1).unwrap().0 = false;
+            let topic = |signature: &str| {
+                format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())))
+            };
+            chain.receipts.insert(
+                hash.clone(),
+                json!({ "status": "0x1", "logs": [{
+                    "address": BATCHER,
+                    "topics": [topic(ITEM_SKIPPED_EVENT), format!("0x{:064x}", 2),
+                        format!("0x{:064x}", 2), format!("0x{:064x}", 2)],
+                    "data": encoded(&[Felt252::from_u64(32), Felt252::ZERO]),
+                }]}),
+            );
+        }
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        let skipped = obligation(&status, 2);
+        assert!(skipped.batch_excluded);
+        assert_eq!(skipped.state, ObligationState::MinedUnconfirmed);
+        assert_eq!(status.batching.anomalies_total, 1);
+        assert!(status
+            .batching
+            .last_anomaly
+            .unwrap()
+            .detail
+            .contains("skipped the defeat with reason 0x"));
+        // Examined once only.
+        service.poll_once().await.unwrap();
+        assert_eq!(service.status().batching.anomalies_total, 1);
+        // At confirmation depth the nonce is released and the defeat goes
+        // single on the next nonce, never in a batch again.
+        fixture.chain.lock().unwrap().confirmed_nonce = None;
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 2, "{:?}", service.status());
+        assert_eq!(sent_call(&sends[1]), (CallKind::Defeat, 2));
+        assert_eq!(sends[1]["nonce"], "0x4");
+    }
+
+    #[tokio::test]
+    async fn a_signer_that_refuses_the_batcher_turns_batching_off_for_single_calls() {
+        let fixture = Fixture::new().await;
+        let mut service = batching_service(&fixture, |policy| policy.max_items = 2);
+        track_notes(&fixture, &mut service, 1);
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .send_errors
+            .push_back(json!({ "code": -32602, "message": "Destination is not authorized" }));
+        assert!(service.poll_once().await.is_err());
+        assert_eq!(fixture.sends().len(), 1);
+        for note in 0..2 {
+            assert_eq!(service.checkpoint.pending[&note].nonce, None, "rolled back");
+        }
+        assert!(service.checkpoint.batches.is_empty());
+        let status = service.status();
+        assert!(!status.batching.enabled);
+        assert!(status
+            .config_warnings
+            .iter()
+            .any(|warning| warning.contains("batching is off: the signer refused a batch")));
+        // The next poll sends both as single calls.
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 3);
+        assert_eq!(sent_call(&sends[1]), (CallKind::Defeat, 0));
+        assert_eq!(sent_call(&sends[2]), (CallKind::Defeat, 1));
+    }
+
+    #[tokio::test]
+    async fn a_signer_without_the_batcher_keeps_every_call_single() {
+        let fixture = Fixture::new().await;
+        let mut service = batching_service(&fixture, |_| {});
+        track_notes(&fixture, &mut service, 1);
+        fixture.chain.lock().unwrap().signer_status =
+            Some(json!({ "tx_fee_cap_wei": "0x8ac7230489e80000", "exit_batcher": null }));
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.iter().map(sent_notes).collect::<Vec<_>>(), [[0], [1]]);
+        let status = service.status();
+        assert!(!status.batching.enabled);
+        assert!(status
+            .batching
+            .disabled_reason
+            .unwrap()
+            .contains("ZKAPI_CHALLENGE_EXIT_BATCHER"));
+        // One that allows the manifest's batcher batches.
+        let fixture = Fixture::new().await;
+        let mut service = batching_service(&fixture, |policy| policy.max_items = 2);
+        track_notes(&fixture, &mut service, 1);
+        fixture.chain.lock().unwrap().signer_status =
+            Some(json!({ "tx_fee_cap_wei": "0x8ac7230489e80000", "exit_batcher": BATCHER }));
+        service.poll_once().await.unwrap();
+        assert_eq!(
+            fixture.sends().iter().map(sent_notes).collect::<Vec<_>>(),
+            [[0, 1]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_resolved_by_others_leaves_the_batch_to_the_rest() {
+        let fixture = Fixture::new().await;
+        let mut service = batching_service(&fixture, |policy| policy.max_items = 2);
+        track_notes(&fixture, &mut service, 1);
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 1);
+        // Someone else defeats note 1 at confirmation depth while the batch
+        // is pending: its obligation retires, note 0 keeps the nonce and
+        // replaces the batch alone, still with both items.
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .withdrawals
+            .get_mut(&1)
+            .unwrap()
+            .0 = false;
+        service.poll_once().await.unwrap();
+        assert!(!service.checkpoint.pending.contains_key(&1));
+        assert!(
+            service.checkpoint.detached_nonces.is_empty(),
+            "note 0 holds it"
+        );
+        assert_eq!(service.batch_member(0), Some(3));
+        fixture.chain.lock().unwrap().head_number += 3;
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0]["data"], sends[1]["data"]);
+        assert_eq!(obligation(&service.status(), 0).batch_notes, [0, 1]);
+        // A replay that tracks note 1's escape again restores its membership.
+        let nullifier = fixture.chain.lock().unwrap().nullifier;
+        service.track_escape(1, nullifier, None, None);
+        assert_eq!(service.batch_member(1), Some(3));
+        assert_eq!(
+            service.checkpoint.pending[&1].transaction_hash,
+            service.checkpoint.pending[&0].transaction_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_batcher_every_defeat_stays_single() {
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service();
+        track_notes(&fixture, &mut service, 2);
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(
+            sends.iter().map(sent_notes).collect::<Vec<_>>(),
+            [[0], [1], [2]]
+        );
+        let status = service.status();
+        assert!(!status.batching.enabled);
+        assert_eq!(status.batching.exit_batcher, None);
+        assert_eq!(status.batching.disabled_reason, None);
+        assert!(service
+            .checkpoint
+            .pending
+            .values()
+            .all(|p| p.batch_queued_at.is_none()));
+    }
+
+    #[tokio::test]
+    async fn raises_and_defeats_share_a_batch_and_a_later_defeat_follows_it() {
+        let (fixture, store, first, second) = raise_then_successor().await;
+        let mut service = batching_service(&fixture, |policy| policy.max_items = 2);
+        // Note 1 escaped from the state before `first`: `first` defeats it.
+        let deadline = fixture.chain.lock().unwrap().deadline;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.withdrawals.insert(1, (true, ESCAPED, deadline));
+            chain
+                .concessions
+                .insert(1, (first.public_inputs.request_nullifier, 0));
+        }
+        service.checkpoint.pending.insert(
+            1,
+            PendingChallenge {
+                nullifier: ESCAPED,
+                challenge_deadline: Some(deadline),
+                ..Default::default()
+            },
+        );
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        let items = [
+            batch_item(&VaultCall::Raise {
+                note_id: 0,
+                inputs: first.public_inputs.clone(),
+                proof: proof_of(&first),
+                amount: 1,
+            })
+            .unwrap(),
+            batch_item(&VaultCall::Defeat {
+                note_id: 1,
+                inputs: first.public_inputs.clone(),
+                proof: proof_of(&first),
+            })
+            .unwrap(),
+        ];
+        assert_eq!(
+            sends[0]["data"],
+            format!("0x{}", hex::encode(challenge_batch_calldata(&items)))
+        );
+        let status = service.status();
+        assert_eq!(obligation(&status, 0).action, Some(CallKind::Raise));
+        assert_eq!(obligation(&status, 1).action, Some(CallKind::Defeat));
+        // Evidence at note 0's successor appears while the batch is pending:
+        // the batch keeps its calldata, and the defeat follows it.
+        file_evidence(&store, &second, unix_now());
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 1);
+        let waiting = obligation(&service.status(), 0);
+        assert_eq!(waiting.state, ObligationState::Submitted);
+        assert!(waiting
+            .detail
+            .unwrap()
+            .contains("the defeat follows on the next nonce once it mines"));
+        // The batch mines: the raise lands, note 1 is defeated. The defeat of
+        // note 0 then waits for a batch on its own, and goes single.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.mined_nonce = 4;
+            chain.conceded = 1;
+            chain.withdrawals.get_mut(&1).unwrap().0 = false;
+        }
+        service.poll_once().await.unwrap();
+        assert!(!service.checkpoint.pending.contains_key(&1));
+        assert_eq!(fixture.sends().len(), 1);
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
+        let queued_at = service.checkpoint.pending[&0].batch_queued_at.unwrap();
+        fixture.chain.lock().unwrap().head_timestamp = queued_at + 30;
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(
+            sends[1]["data"],
+            format!("0x{}", hex::encode(defeat_of(&second, 0)))
+        );
+        assert_eq!(sends[1]["nonce"], "0x4");
+        assert!(service.checkpoint.batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_exit_batcher_is_verified_before_any_batch() {
+        let (_, request) = finalized_v2_request().await;
+        let timing = ChallengeTiming {
+            settlement_window_seconds: 21_905,
+            settlement_poll_seconds: 2,
+        };
+        let codehash = format!("0x{}", hex::encode(Keccak256::digest(b"batcher code")));
+        let with_batcher = |fixture: &Fixture, max_items: u64| {
+            let mut manifest = mock_manifest(fixture, &request);
+            manifest.exit_batcher_address = Some(BATCHER.into());
+            manifest.exit_batcher_runtime_codehash = Some(codehash.clone());
+            answer_probes(fixture, &manifest);
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.code.insert(
+                BATCHER.into(),
+                format!("0x{}", hex::encode(b"batcher code")),
+            );
+            let word = |address: &str| Felt252::from_hex(address).unwrap();
+            for (data, value) in [
+                (
+                    crate::deployment::EXIT_BATCHER_VAULT_SELECTOR.to_string(),
+                    word(&manifest.contract_address),
+                ),
+                (
+                    crate::deployment::EXIT_BATCHER_ADAPTER_SELECTOR.to_string(),
+                    word(&manifest.proof_adapter_address),
+                ),
+                (
+                    crate::deployment::EXIT_BATCHER_MAX_ITEMS_SELECTOR.to_string(),
+                    Felt252::from_u64(max_items),
+                ),
+            ] {
+                chain.probe_words.insert(data, value);
+            }
+            for kind in 0..5u64 {
+                chain.probe_words.insert(
+                    format!(
+                        "{}{kind:064x}",
+                        crate::deployment::EXIT_BATCHER_ITEM_GAS_SELECTOR
+                    ),
+                    Felt252::from_u64(120_000),
+                );
+            }
+            manifest
+        };
+        let batching = |fixture: &Fixture| {
+            fixture.service_with(|config| {
+                config.batch = BatchPolicy {
+                    batcher: Some(BATCHER.into()),
+                    ..BatchPolicy::default()
+                }
+            })
+        };
+        let fixture = Fixture::new().await;
+        let manifest = with_batcher(&fixture, 64);
+        let mut service = batching(&fixture);
+        // Before the probes nothing is batched.
+        assert!(!service.batching_enabled());
+        assert_eq!(
+            service.status().batching.disabled_reason.as_deref(),
+            Some("the exit batcher is not verified yet")
+        );
+        service.verify_deployment(&manifest, timing).await.unwrap();
+        assert_eq!(service.batcher_max_items, Some(64));
+        assert!(service.batching_enabled());
+        assert!(service.status().config_warnings.is_empty());
+        // A batcher with fewer items than --batch-max-items, other code, or a
+        // manifest that names none is refused before anything is polled.
+        let fixture = Fixture::new().await;
+        let manifest = with_batcher(&fixture, 8);
+        let error = batching(&fixture)
+            .verify_deployment(&manifest, timing)
+            .await;
+        assert!(
+            matches!(&error, Err(DeploymentCheckError::Mismatch(message)) if message.contains("MAX_ITEMS() 8")),
+            "{error:?}"
+        );
+        let fixture = Fixture::new().await;
+        let manifest = with_batcher(&fixture, 64);
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .code
+            .insert(BATCHER.into(), "0x00".into());
+        let error = batching(&fixture)
+            .verify_deployment(&manifest, timing)
+            .await;
+        assert!(
+            matches!(&error, Err(DeploymentCheckError::Mismatch(message)) if message.contains("exit batcher")),
+            "{error:?}"
+        );
+        let mut without = manifest.clone();
+        without.exit_batcher_address = None;
+        without.exit_batcher_runtime_codehash = None;
+        let error = batching(&fixture).verify_deployment(&without, timing).await;
+        assert!(
+            matches!(&error, Err(DeploymentCheckError::Mismatch(message)) if message.contains("names none")),
+            "{error:?}"
+        );
+        // Without batching configured, the batcher is never read.
+        let fixture = Fixture::new().await;
+        let manifest = with_batcher(&fixture, 64);
+        fixture.chain.lock().unwrap().code.remove(BATCHER);
+        let mut single = fixture.service();
+        single.verify_deployment(&manifest, timing).await.unwrap();
+        assert_eq!(single.batcher_max_items, None);
     }
 }

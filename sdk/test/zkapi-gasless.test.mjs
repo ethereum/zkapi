@@ -11,7 +11,7 @@ import {
     VECTORS, assertUserOperationShape, attemptsKeyOf, create2TransitAccount, decodeGetUserOpHash, decodeHandleOps, failedOpData,
     gaslessProfileFromVectors, hashPacked, logs, revertError, userOperationHashFromJson
 } from './helpers/fake-bundler.mjs';
-import { recover, sign } from './helpers/secp256k1.mjs';
+import { addressOf, recover, sign } from './helpers/secp256k1.mjs';
 import { keccak256Hex, selectorOf } from './helpers/request-archive-harness.mjs';
 import { GASLESS_ABI, encodeFinalizeEscape, encodeTransitWithdraw, parseWithdrawalReceipt } from '../wallet.js';
 import { codehash } from '../services/zkapiKeccak.mjs';
@@ -23,7 +23,8 @@ import {
     encodeGetUserOpHash, encodeHandleOps, gasFields, gaslessAmounts, gaslessPins, handleOpsCalldataBytes, lim070PreVerificationGas, maxCostWei, nonceKeyFor,
     normalizeGasPolicy, packNonce, packUserOperation, parsePayoutCredited, parseSettled, parseSponsorshipFailed, parseStranded,
     parseUserOperationEvent, parseUserOperationRevertReason, preVerificationGasFor, referencePreVerificationGas, sameGasPolicy, selectFees, settlementOf,
-    transitAccountAddress, transitInitCode, unpackNonce, userOpHash, userOperationFromJson, userOperationJson,
+    TRANSIT_OWNER_DERIVATION, TRANSIT_OWNER_SALT, deriveTransitOwnerKey, openSponsoredEscapeRecord, transitAccountAddress,
+    transitInitCode, transitOwnerInfo, unpackNonce, userOpHash, userOperationFromJson, userOperationJson,
     userOperationReceiptTransactionHash
 } from '../services/zkapiGasless.mjs';
 
@@ -180,7 +181,7 @@ test('the gas policy normalizes from both spellings, compares with the contractâ
     const vectors = normalizeGasPolicy(V.gas_policy);
     const profile = normalizeGasPolicy(gaslessProfileFromVectors({ spelling: 'profile' }).gas_policy);
     assert.ok(sameGasPolicy(vectors, profile), 'postop_* / call_cap and post_op_* / call_hard_cap pin the same constants');
-    assert.deepEqual(profile.defaults.callDefault.map(String), ['642500', '680000', '287500', '97500']);
+    assert.deepEqual(profile.defaults.callDefault.map(String), ['395000', '395000', '250000', '60000']);
     assert.equal(profile.defaults.postOpDefault, 270_000n);
     assert.equal(vectors.finalizeReserveGas, vectors.pvgFloor + vectors.verificationFloor + vectors.callFloor[2] + vectors.pmVerificationFloor + vectors.postOpFloor);
     assert.equal(vectors.finalizeReserveGas.toString(), V.gas_policy.finalize_reserve_gas);
@@ -224,21 +225,21 @@ test('the profile pins are read, validated and absent when the deployment has no
 test('gas fields come from the pinned policy within every floor and cap, never from an estimate', () => {
     const fields = gasFields({ gasPolicy, kind: KIND.close, withInitCode: true, calldataBytes: 1_764 });
     assert.deepEqual(fields, {
-        callGasLimit: 642_500n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
-        paymasterVerificationGasLimit: 430_000n, paymasterPostOpGasLimit: 275_000n
+        callGasLimit: 395_000n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
+        paymasterVerificationGasLimit: 380_000n, paymasterPostOpGasLimit: 275_000n
     });
     assert.equal(gasFields({ gasPolicy, kind: KIND.close, withInitCode: false, calldataBytes: 0 }).verificationGasLimit, 80_000n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.forward, calldataBytes: 0 }).callGasLimit, 97_500n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.escape, calldataBytes: 0 }).callGasLimit, 680_000n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.finalize, calldataBytes: 0 }).callGasLimit, 287_500n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.forward, calldataBytes: 0 }).callGasLimit, 60_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.escape, calldataBytes: 0 }).callGasLimit, 395_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.finalize, calldataBytes: 0 }).callGasLimit, 250_000n);
     // Profile defaults win; the live callCap bounds the call limit; the pvg clamps to the floor and the cap.
     const profile = normalizeGasPolicy(gaslessProfileFromVectors({ spelling: 'profile' }).gas_policy);
     assert.equal(gasFields({ gasPolicy: profile, kind: KIND.close, calldataBytes: 0 }).paymasterPostOpGasLimit, 270_000n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, callCap: 600_000n }).callGasLimit, 600_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, callCap: 300_000n }).callGasLimit, 300_000n);
     assert.equal(preVerificationGasFor(gasPolicy, 0), gasPolicy.pvgFloor);
     assert.equal(preVerificationGasFor(gasPolicy, 100_000), gasPolicy.pvgCap);
     // An override outside the range is refused with the field index of GasLimitOutOfRange.
-    assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { callGasLimit: 539_999n } }),
+    assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { callGasLimit: 209_999n } }),
         error => error.code === 'gas_limit_out_of_range' && error.data.field === 2);
     assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { paymasterPostOpGasLimit: 350_001n } }),
         error => error.code === 'gas_limit_out_of_range' && error.data.field === 4);
@@ -648,4 +649,83 @@ test('every sponsored-withdrawal error code the SDK throws is listed in the READ
         .filter(line => line.startsWith('| Sponsored withdrawals')).join('\n');
     assert.ok(table, 'the README has the sponsored-withdrawal rows');
     assert.deepEqual([...thrown].filter(code => !table.includes(`\`${code}\``)), []);
+});
+
+// ---------------------------------------------------------------- the transit owner key (zkapi-clientd's derivation)
+
+const OWNER_VECTORS = JSON.parse(readFileSync(new URL('../../zkapi-clientd/internal/zkapi/testdata/transit-owner-vectors.json', import.meta.url), 'utf8'));
+const SECP256K1_ORDER = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const scopeOf = c => ({ chainId: c.chain_id, entryPoint: c.entry_point, vault: c.vault, factory: c.factory, paymaster: c.paymaster,
+    accountCreationCodeKeccak256: c.account_creation_code_keccak256, payee: c.payee });
+/** HKDF-SHA256 through node:crypto: an implementation independent of the SDK's Web Crypto one. */
+const nodeHkdf = async (seed, info) => {
+    const { hkdfSync } = await import('node:crypto');
+    return new Uint8Array(hkdfSync('sha256', seed, Buffer.from(TRANSIT_OWNER_SALT), info, 32));
+};
+
+test('deriveTransitOwnerKey asserts the owner-key vectors clientd asserts: key, owner, transit account, and the resampling', async () => {
+    assert.equal(OWNER_VECTORS.derivation, TRANSIT_OWNER_DERIVATION);
+    assert.ok(OWNER_VECTORS.cases.length >= 10);
+    let resampled = false;
+    const keys = new Set();
+    for (const c of OWNER_VECTORS.cases) {
+        const creation = c.account_creation_code ?? OWNER_VECTORS.account_creation_code;
+        assert.equal(codehash(creation), c.account_creation_code_keccak256, c.name);
+        const info = transitOwnerInfo(scopeOf(c), 7);
+        assert.equal(info.length, 168, c.name);
+        assert.deepEqual([...info.slice(164)], [0, 0, 0, 7], 'the counter ends the info, big-endian');
+        // A rejection case replaces the expansion at its counters with n, then 0.
+        let rejections = 0;
+        const rejecting = async (seed, info) => {
+            const counter = Buffer.from(info.slice(164)).readUInt32BE(0);
+            if (c.reject_counters.includes(counter)) {
+                rejections += 1;
+                return rejections % 2 === 1 ? Uint8Array.from(Buffer.from(SECP256K1_ORDER.toString(16), 'hex')) : new Uint8Array(32);
+            }
+            return nodeHkdf(seed, info);
+        };
+        const plain = await deriveTransitOwnerKey(c.seed, scopeOf(c));
+        const derived = c.reject_counters ? await deriveTransitOwnerKey(c.seed, scopeOf(c), { derive: rejecting }) : plain;
+        assert.equal(rejections, (c.reject_counters || []).length, c.name);
+        assert.equal(derived.counter, c.counter, c.name);
+        assert.equal(derived.privateKey, c.owner_private_key, c.name);
+        resampled ||= derived.counter > 0;
+        if (!c.reject_counters) {
+            // Web Crypto (the SDK) and node:crypto agree, from hex and from bytes.
+            assert.deepEqual(await deriveTransitOwnerKey(Uint8Array.from(Buffer.from(c.seed.slice(2), 'hex')), scopeOf(c), { derive: nodeHkdf }), plain, c.name);
+            assert.ok(!keys.has(plain.privateKey), `${c.name}: two scopes derived one key`);
+            keys.add(plain.privateKey);
+        }
+        const owner = addressOf(BigInt(derived.privateKey));
+        assert.equal(owner, low(c.owner), c.name);
+        assert.equal(transitAccountAddress({ factory: c.factory, creationCodeHex: creation, entryPoint: c.entry_point, vault: c.vault,
+            paymaster: c.paymaster, owner, payee: c.payee }), low(c.transit_account), c.name);
+    }
+    assert.ok(resampled, 'a vector reaches the resampling');
+    await assert.rejects(deriveTransitOwnerKey(`0x${'11'.repeat(31)}`, scopeOf(OWNER_VECTORS.cases[0])), /at least 32 bytes/);
+    await assert.rejects(deriveTransitOwnerKey(`0x${'11'.repeat(32)}`, scopeOf(OWNER_VECTORS.cases[0]), { derive: async () => new Uint8Array(32) }),
+        /no valid key/, 'every counter rejected ends in an error, not a loop');
+    assert.throws(() => transitOwnerInfo({ ...scopeOf(OWNER_VECTORS.cases[0]), payee: '0x1234' }), TypeError);
+});
+
+test('openSponsoredEscapeRecord finds an open sponsored escape of another balance from the same transit account', () => {
+    const S = `0x${'5a'.repeat(20)}`;
+    const escape = (fields = {}) => ({ recordId: 'r', noteId: 3, mode: 'escape', phase: 'pending', feePayer: 'payout', userOpHash: `0x${'ab'.repeat(32)}`,
+        transit: { account: S.toUpperCase().replace('0X', '0x') }, ...fields });
+    assert.equal(openSponsoredEscapeRecord([escape()], { account: S, noteId: 4 })?.noteId, 3, 'a pending sponsored escape of another note');
+    assert.equal(openSponsoredEscapeRecord([escape()], { account: S, noteId: 3 }), null, 'the same balance (a resumed escape) is not refused');
+    assert.equal(openSponsoredEscapeRecord([escape()], { account: `0x${'5b'.repeat(20)}`, noteId: 4 }), null, 'another transit account');
+    assert.equal(openSponsoredEscapeRecord([escape({ mode: 'mutual' })], { account: S, noteId: 4 }), null, 'a close');
+    assert.equal(openSponsoredEscapeRecord([escape({ feePayer: undefined })], { account: S, noteId: 4 }), null, 'a wallet-paid escape');
+    assert.equal(openSponsoredEscapeRecord([escape({ userOpHash: null })], { account: S, noteId: 4 }), null,
+        'a wallet-paid initiation bound to S leaves the paymaster no record');
+    assert.equal(openSponsoredEscapeRecord([escape({ phase: 'closed' })], { account: S, noteId: 4 }), null, 'settled');
+    assert.equal(openSponsoredEscapeRecord([escape({ phase: 'challenged_unconfirmed' })], { account: S, noteId: 4 }), null, 'defeated');
+    assert.ok(openSponsoredEscapeRecord([escape({ phase: 'closed', fundsWaitingInTransit: true })], { account: S, noteId: 4 }), 'its payout waits in S');
+    assert.ok(openSponsoredEscapeRecord([escape({ phase: 'closed_unconfirmed', finalizeUserOpPhase: 'op_submitted' })], { account: S, noteId: 4 }),
+        'its finalization is in flight');
+    assert.ok(openSponsoredEscapeRecord([escape({ phase: 'closed', forwardUserOpPhase: 'op_built' })], { account: S, noteId: 4 }), 'its forward is in flight');
+    assert.equal(openSponsoredEscapeRecord([], { account: S }), null);
+    assert.equal(openSponsoredEscapeRecord([escape()], { account: null }), null);
+    assert.match(GASLESS_MESSAGES.transit_escape_pending, /fee paid from a wallet/);
 });

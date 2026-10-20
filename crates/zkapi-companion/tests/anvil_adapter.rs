@@ -56,8 +56,8 @@ fn build_adapter(directory: &Path) -> String {
     for relative in [
         "foundry.toml",
         "src/libraries/Types.sol",
-        "src/libraries/Errors.sol",
         "src/interfaces/IZkApiProofAdapter.sol",
+        "src/interfaces/IZkApiBatchProofAdapter.sol",
     ] {
         let target = directory.join(relative);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -124,6 +124,11 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // The adapter is folded for the vault the proofs below bind (on Anvil's chain 31337, with the
+    // wallet's signing keys), as a deployment folds it for its own vault.
+    let vault = [0x42u8; 20];
+    let state_key = CompactSigner::from_seed(&Felt252::from_u64(11)).public_key();
+    let clearance_key = CompactSigner::from_seed(&Felt252::from_u64(12)).public_key();
     let output = Command::new(forge)
         .args([
             "create",
@@ -135,6 +140,12 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
             "--private-key",
             &format!("0x{ANVIL_KEY}"),
             "--broadcast",
+            "--constructor-args",
+            &format!("0x{}", hex::encode(vault)),
+            &state_key.x.to_hex(),
+            &state_key.y.to_hex(),
+            &clearance_key.x.to_hex(),
+            &clearance_key.y.to_hex(),
         ])
         .output()
         .unwrap();
@@ -174,7 +185,6 @@ async fn companion_proofs_verify_in_the_generated_adapter_on_anvil() {
     );
 
     // Proofs from the companion's wallet for a note in a non-trivial tree.
-    let vault = [0x42u8; 20];
     let contract = zkapi_types::serialization::address_to_felt(&vault);
     let secret = Felt252::from_u64(777);
     let leaf = core::note_leaf(

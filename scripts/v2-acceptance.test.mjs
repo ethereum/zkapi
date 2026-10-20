@@ -4,8 +4,9 @@ import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
-    CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, drillTiming, gasLedger, gaslessProfile, localJSON, mockOaOrg,
-    isProfileBundlerUrl, mockProvider, proxyAuthorized, proxyJsonRpc, trustedDeployment,
+    CAP, CHAIN_ID, INFERENCE_CHARGE, MUTUAL_CLOSE_BATCH_SELECTOR, RELAY_BATCH_TARGET, RELAY_FEE, RELAY_MAX_FEE_PER_GAS, SDK_REQUEST_BOUND,
+    relayServerArgs, relayedCloseProblems, TIMING, challengeFees, clientdTransitOwner, drillTiming, gasLedger, gaslessProfile, localJSON,
+    mockOaOrg, isProfileBundlerUrl, mockProvider, proxyAuthorized, proxyJsonRpc, transitReuseProblems, trustedDeployment,
 } from './v2-acceptance.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
     accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
@@ -200,6 +201,16 @@ test('profiles come only from a finalized Deploy.s.sol manifest', () => {
         assert.throws(() => trustedDeployment({ ...finalized, deploymentStatus: status }, services), /finalized manifest/);
     }
     assert.throws(() => trustedDeployment({ ...finalized, deployBlock: undefined }, services), /deployBlock/);
+    // The exit batcher: null from a manifest without it, its pins (lowercased) from one with it.
+    assert.equal(profile.exit_batcher_address, null);
+    assert.equal(profile.exit_batcher_runtime_codehash, null);
+    assert.equal(profile.exit_batcher_item_gas, null);
+    const itemGas = { close: 250000, escape: 250000, defeat: 150000, raise: 150000, finalize: 300000 };
+    const batched = trustedDeployment({ ...finalized, exitBatcher: '0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9',
+        exitBatcherRuntimeCodehash: `0x${'66'.repeat(32)}`, exitBatcherItemGas: itemGas }, services);
+    assert.equal(batched.exit_batcher_address, '0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9');
+    assert.equal(batched.exit_batcher_runtime_codehash, `0x${'66'.repeat(32)}`);
+    assert.deepEqual(batched.exit_batcher_item_gas, itemGas);
 });
 
 test('the companion\'s proxy admits only its own basic credentials', () => {
@@ -646,8 +657,8 @@ test('mini bundler: v0.7 packing and the user operation hash match the golden ve
         paymasterVerificationGasLimit: undefined, paymasterPostOpGasLimit: undefined };
     assert.equal(packUserOperation(plain).paymasterAndData, '0x');
     assert.equal(packUserOperation(plain).initCode, '0x');
-    assert.equal(bundleGas([op]), 642_500n + 180_000n + 50_000n + 430_000n + 270_000n + 300_000n);
-    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 642_500n + 180_000n + 50_000n);
+    assert.equal(bundleGas([op]), 395_000n + 180_000n + 50_000n + 380_000n + 270_000n + 300_000n);
+    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 395_000n + 180_000n + 50_000n);
 });
 
 test('mini bundler: refuses malformed operations by field', () => {
@@ -753,4 +764,93 @@ test('mini bundler: estimates answer the profile\'s pinned defaults by kind', as
     assert.equal(vaultCallOf(finalize), `0xff8f5585${word(9)}`);
     assert.equal(sponsoredKind(withdraw(`0xa38d62aa${'00'.repeat(832)}`)), 2);
     assert.equal(vaultCallOf('0x12345678'), null);
+});
+
+// ---------------------------------------------------------------- two closes to one payout address (the harness as zkapi-clientd)
+
+test('the harness derives a clientd transit owner as clientd does (the shared owner-key vectors)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const vectors = JSON.parse(readFileSync(new URL('../zkapi-clientd/internal/zkapi/testdata/transit-owner-vectors.json', import.meta.url), 'utf8'));
+    for (const c of vectors.cases.filter(entry => !entry.reject_counters)) {
+        const gasless = { entry_point_address: c.entry_point, withdrawal_account_factory_address: c.factory,
+            withdrawal_paymaster_address: c.paymaster, account_creation_code_keccak256: c.account_creation_code_keccak256 };
+        const derived = await clientdTransitOwner(c.seed, { chainId: c.chain_id, vault: c.vault, gasless, payee: c.payee });
+        assert.deepEqual(derived, { privateKey: c.owner_private_key, counter: c.counter }, c.name);
+    }
+});
+
+test('transitReuseProblems: the second close to one payout address reuses the first one\'s transit account without initCode', () => {
+    const gasPolicy = { verification_default: 70_000, verification_default_init: 180_000 };
+    const payee = `0x${'9a'.repeat(20)}`;
+    const S = `0x${'5a'.repeat(20)}`;
+    const first = { sender: S, initCode: true, deployed: true, success: true, settledPayee: payee.toUpperCase().replace('0X', '0x'), verificationGasLimit: 180_000n };
+    const second = { sender: S.toUpperCase().replace('0X', '0x'), initCode: false, deployed: false, success: true, settledPayee: payee, verificationGasLimit: 70_000n };
+    assert.deepEqual(transitReuseProblems(first, second, { payee, gasPolicy }), []);
+    const problems = (changes, which = 'second') => transitReuseProblems(which === 'first' ? { ...first, ...changes } : first,
+        which === 'second' ? { ...second, ...changes } : second, { payee, gasPolicy });
+    assert.match(problems({ sender: `0x${'5b'.repeat(20)}` }).join(), /not sent from the first one's transit account/);
+    assert.match(problems({ initCode: true }).join(), /carries initCode/);
+    assert.match(problems({ deployed: true }).join(), /deploys again/);
+    assert.match(problems({ verificationGasLimit: 180_000n }).join(), /second close is not at the verification default without initCode/);
+    assert.match(problems({ success: false }).join(), /second close did not succeed/);
+    assert.match(problems({ settledPayee: `0x${'01'.repeat(20)}` }).join(), /second close was not settled/);
+    assert.match(problems({ initCode: false }, 'first').join(), /first close does not create/);
+    assert.match(problems({ deployed: false }, 'first').join(), /first close does not create/);
+    assert.match(problems({ verificationGasLimit: 70_000n }, 'first').join(), /first close is not at the verification default with initCode/);
+    assert.ok(transitReuseProblems(null, second, { payee, gasPolicy }).length > 0);
+});
+
+test('relayServerArgs: serverd\'s relay flags, each one zkapi serverd defines, within its startup checks', async () => {
+    const { readFileSync } = await import('node:fs');
+    const sender = `0x${'4e'.repeat(20)}`;
+    const args = relayServerArgs({ rpcUrl: 'http://127.0.0.1:1', sender });
+    assert.equal(args.length % 2, 0);
+    const flags = Object.fromEntries(Array.from({ length: args.length / 2 }, (_, i) => [args[2 * i], args[2 * i + 1]]));
+    assert.equal(Object.keys(flags).length, args.length / 2, 'no flag is repeated');
+    // Every flag is a field of the CLI's RelayArgs.
+    const cli = readFileSync(new URL('../crates/zkapi-cli/src/main.rs', import.meta.url), 'utf8');
+    const relayArgs = cli.slice(cli.indexOf('struct RelayArgs'), cli.indexOf('\n}\n', cli.indexOf('struct RelayArgs')));
+    const defined = new Set([...relayArgs.matchAll(/^\s+(relay_[a-z_]+):/gm)].map(match => `--${match[1].replaceAll('_', '-')}`));
+    for (const flag of Object.keys(flags)) assert.ok(defined.has(flag), `${flag} is not a zkapi serverd flag`);
+    assert.equal(flags['--relay-rpc-url'], 'http://127.0.0.1:1');
+    assert.equal(flags['--relay-sender'], sender);
+    // The fee is one request any bound pays; the startup checks hold (the
+    // defaults: urgent margin 1800 s, cutoff 300 s, min validity 3600 s).
+    const fee = Number(flags['--relay-fee-units']);
+    assert.ok(fee === RELAY_FEE && fee > 0 && fee <= CAP);
+    assert.ok(Number(flags['--relay-batch-target']) === RELAY_BATCH_TARGET
+        && RELAY_BATCH_TARGET <= Number(flags['--relay-max-batch']) && Number(flags['--relay-max-batch']) <= 64);
+    const poll = Number(flags['--relay-poll-seconds']);
+    assert.ok(poll > 0 && poll < 300 && Number(flags['--relay-bump-after-seconds']) >= poll);
+    assert.ok(Number(flags['--relay-confirmations']) >= 1 && Number(flags['--relay-flush-age-seconds']) > 0);
+    assert.equal(BigInt(flags['--relay-max-fee-per-gas']), RELAY_MAX_FEE_PER_GAS);
+    assert.throws(() => relayServerArgs({ sender }), /RPC and its sender/);
+});
+
+test('relayedCloseProblems: one mined mutualCloseBatch from the relayer to the batcher, with exactly the expected MutualClose events', () => {
+    const vault = `0x${'7a'.repeat(20)}`;
+    const batcher = `0x${'ba'.repeat(20)}`;
+    const sender = `0x${'4e'.repeat(20)}`;
+    const topic = '0x1f43fa4711ca18e1d26398f26bf598bd3a62992cdd0e84f055f2bb506e9d7031';
+    const word = value => BigInt(value).toString(16).padStart(64, '0');
+    const closes = [
+        { noteId: 7, nullifier: `0x${'11'.repeat(32)}`, finalBalance: 980_000, destination: `0x${'c1'.repeat(20)}` },
+        { noteId: 9, nullifier: `0x${'22'.repeat(32)}`, finalBalance: 980_000, destination: `0x${'c2'.repeat(20)}` },
+    ];
+    const logOf = close => ({ address: vault.toUpperCase().replace('0X', '0x'), removed: false, topics: [topic, `0x${word(close.noteId)}`],
+        data: `0x${word(close.nullifier)}${word(close.finalBalance)}${word(close.destination)}` });
+    const receipt = { status: '0x1', to: batcher, from: sender, logs: [{ address: batcher, topics: [`0x${'ee'.repeat(32)}`], data: '0x' }, ...closes.map(logOf)] };
+    const transaction = { input: `${MUTUAL_CLOSE_BATCH_SELECTOR}${'00'.repeat(64)}`, value: '0x0' };
+    const problems = (receiptChanges = {}, transactionChanges = {}, expected = closes) =>
+        relayedCloseProblems({ ...receipt, ...receiptChanges }, { ...transaction, ...transactionChanges }, { batcher, vault, sender, closes: expected });
+    assert.deepEqual(problems(), []);
+    assert.match(problems({ status: '0x0' }).join(), /status 0x0/);
+    assert.match(problems({ to: vault }).join(), /not the batcher/);
+    assert.match(problems({ from: batcher }).join(), /not the relayer/);
+    assert.match(problems({}, { input: '0x72cd2e44' }).join(), /not mutualCloseBatch/);
+    assert.match(problems({}, { value: '0x1' }).join(), /carries value/);
+    assert.match(problems({ logs: receipt.logs.slice(0, 2) }).join(), /1 MutualClose events, expected 2.*no MutualClose of note 9/);
+    assert.match(problems({}, {}, closes.slice(0, 1)).join(), /2 MutualClose events, expected 1/);
+    assert.match(problems({}, {}, [closes[0], { ...closes[1], finalBalance: 1 }]).join(), /no MutualClose of note 9/);
+    assert.match(problems({ logs: [receipt.logs[0], logOf(closes[0]), { ...logOf(closes[1]), address: batcher }] }).join(), /no MutualClose of note 9/);
 });

@@ -35,6 +35,55 @@ Folded into 0.2.0's notes at release.
   without asking. A single-party vault trusts its setup's generator, who can
   forge every proof ([Single-party setup](docs/deployment.md#single-party-setup)).
 
+- **Batched exits.** The generated adapter verifies many proofs of one kind
+  at once (`IZkApiBatchProofAdapter`: `verifyWithdrawalBatch`,
+  `verifyRequestBatch` and their `Once` variants), with one random linear
+  combination (128-bit Fiat-Shamir challenges over every byte read, `r_0 = 1`)
+  and every check of the single verifier: n + 3 pairings and one shared
+  multi-scalar multiplication, so 16 withdrawals verify in 998,220 gas
+  instead of 3,609,818. The `Once` variants leave the records a single
+  verification would (requests under `REQUEST_RECORD`, which
+  `assertValidRequest` now consults). `zkapi-proof`'s `batch` module is the
+  reference implementation; shared vectors pin both. The new
+  `ZkApiExitBatcher` (`src/periphery`), deployed with every vault by
+  `Deploy.s.sol` (`EXIT_BATCHER_*_GAS`; manifest `exitBatcher*`, profile
+  `exit_batcher_*`), verifies a batch once and makes each item's ordinary
+  vault call under a per-kind gas cap, skipping an item whose state changed
+  and never starving one (`BatchOutOfGas`). Per exit at 16 items: close
+  129,395 gas instead of 307,710, escape 183,214 instead of 367,185, defeat
+  96,766 instead of 286,960, raise 92,933 instead of 277,479, finalize 28,760
+  instead of 45,063 ([Batched exits](docs/deployment.md#batched-exits)).
+- **The challenger batches defeats and raises** through the exit batcher's
+  `challengeBatch` when the profile names one: deadline-aware flushing (full,
+  aged, or near a deadline; single calls inside the critical threshold), an
+  exact simulation with bisection, `gasBound` gas limits, and single-call
+  fallback for any anomaly. New `zkapi-challenged` flags `--batching`,
+  `--batch-max-items`, `--batch-max-age-seconds`,
+  `--batch-deadline-margin-seconds`; the signer signs `challengeBatch` for
+  `ZKAPI_CHALLENGE_EXIT_BATCHER` once its `vault()` is the configured vault
+  ([challenge operation](docs/challenge-service.md)).
+- **Operator close relay (optional).** `zkapi serverd --relay-*` relays
+  cooperative closes through the exit batcher from a dedicated relayer whose
+  signer runs in the new `ZKAPI_SIGNER_ROLE=close-relay`. The fee is one
+  metered request at the note's state before the clearance, settled at
+  exactly the fee and redeemed by a ticket secret, so it lands in the treasury
+  share with no circuit change. New endpoints `GET /v2/withdraw/relay/terms`,
+  `POST /v2/withdraw/relay/fee`, `POST /v2/withdraw/relay` and
+  `GET /v2/withdraw/relay/{nullifier}`; clients opt in with
+  `zkapi-clientd withdraw --fees relay` or the SDK's
+  `withdraw(..., { fees: 'relay' })`, self-submit a close the relay gives back
+  or that has not landed by `valid_until` minus 20 minutes, and count a
+  withdrawal done only when its `MutualClose` appears
+  ([close relay](docs/native-eth-billing.md)).
+- **zkapi-clientd can opt out of transit-account reuse.**
+  `withdraw --fees payout --fresh-transit` gives one gasless withdrawal a
+  fresh transit account, and `config --transit-accounts fresh`
+  (`zkapi.transit_accounts`; `per-payee`, the default, clears it) does so
+  for every one. The owner key is then drawn at random and journaled without
+  `owner_derivation`, and the withdrawal pays `S`'s creation again (about
+  89,000 gas on mainnet, about 535,000 under EIP-8037) in exchange for not
+  linking it to the wallet's other withdrawals to that payout address.
+
 ### Changed
 
 - **Network fees cut across the board (vault revision 3, circuit setup
@@ -44,10 +93,7 @@ Folded into 0.2.0's notes at release.
   `challengeEscapeWithdrawal` 374,881 → 359,450; `raiseEscapeConcession`
   335,128 → 319,815; `finalizeEscapeWithdrawal` 91,898 → 82,580;
   `claimExpired` 77,509 → 72,703; a Groth16 verification about 282,000
-  instead of 316,000. The sponsored (gasless) shapes carry the lower
-  verification twice, and the paymaster's floors follow the measurements
-  (`callFloor` 540,000 / 540,000 / 250,000 / 80,000, `pmVerificationFloor`
-  400,000; the profile defaults and `finalizeReserveGas` 990,000 follow). What
+  instead of 316,000 (the next item lowers every exit's figure further). What
   changed:
   - The note tree's node hash is one Poseidon permutation of
     `(domain "zkapi.v2.node", left, right)` with the domain in the capacity
@@ -75,6 +121,145 @@ Folded into 0.2.0's notes at release.
     `pendingWithdrawals` and `pendingConcessions` getters keep their shapes.
   - The vault and the paymaster use a transient reentrancy guard
     (`ReentrancyGuardTransient`, EIP-1153), same error selector.
+- **One cheaper Groth16 verification per exit, sponsored ones included.**
+  Measured with CI's pinned Forge against the item above: `mutualClose`
+  387,321 → 327,385; `initiateEscapeWithdrawal` 495,463 → 435,209;
+  `challengeEscapeWithdrawal` 359,450 → 313,190; `raiseEscapeConcession`
+  319,815 → 273,555; a withdrawal verification 281,851 → 221,461 gas. A
+  sponsored close with the real adapter costs the float 905,292 → 530,598 gas
+  (`actualGasUsed`), an escape initiation 1,080,542 → 712,858 (643,294 with
+  the next item). What changed:
+  - `Groth16ProofAdapter` (still generated by `zkapi-proof`) verifies in one
+    assembly block, with the pairing input built in place.
+  - The adapter is deployed for one vault: its constructor takes the vault's
+    address (predicted before it exists) and signing keys and folds the
+    inputs every proof of that vault shares (protocol version, chain ID,
+    vault, keys) into its first IC point, so those proofs skip their scalar
+    multiplications; any other statement is verified over every input.
+  - `verifyWithdrawalOnce` records a verified exit for the transaction
+    (EIP-1153, at a slot ERC-7562 associates with its destination), and
+    `assertValidWithdrawal` of the same bytes then returns after a lookup.
+    The paymaster's validation verifies through it, so the vault's
+    verification of a sponsored exit in the execution phase costs about
+    2,800 gas.
+  - What S forwards to the paymaster during an operation (`received`,
+    `receivedGas`) is transient: no storage write per sponsored operation.
+  - The paymaster's figures follow the measurements, with the next item:
+    `callFloor` 210,000 / 160,000 / 200,000 / 30,000 (close, escape,
+    finalize, forward; the hard caps stay, and still cover a full
+    verification), `pmVerificationFloor` 350,000 (measured on the dearest
+    inputs: an escape from an `S` with a settled sponsored-escape record,
+    with the scalar multiplication a `noteId` of 3 or more adds),
+    `accountCallOverheadGas` 11,500 and `accountCallOverheadEscapeGas` 4,800;
+    `finalizeReserveGas` 890,000 and the profile defaults follow (a
+    `paymasterVerificationGasLimit` of 380,000).
+- **Fewer storage writes per escape.** An escape initiation writes four fresh
+  storage slots instead of seven, and a defeat none instead of one.
+  Measured with CI's pinned Forge against the item above:
+  `initiateEscapeWithdrawal` 435,209 → 364,202; `challengeEscapeWithdrawal`
+  313,190 → 284,281; `raiseEscapeConcession` 273,555 → 271,591;
+  `finalizeEscapeWithdrawal` 82,580 → 80,291; `mutualClose` 327,385 →
+  327,247. A sponsored escape initiation costs the float 712,858 → 643,294 gas
+  (`actualGasUsed`). On a chain that prices a fresh slot at about 110,000 gas
+  (Sepolia), each slot saved is worth that much again. What changed:
+  - `usedNullifiers` and `challengedNullifiers` (same selectors and values)
+    read one word per nullifier: bit 0 used, bit 1 challenged.
+  - A pending escape keeps its successor nullifier and destination in the
+    words of the two nullifiers it consumes, and only its nullifier,
+    deadline and amounts in its record by note. Every check, its order and
+    every revert are unchanged.
+- **Deposits about 40% cheaper, retirements 45% cheaper: a formally verified
+  Poseidon contract replaces the Poseidon library.** Measured with CI's
+  pinned Forge (`GasBaseline.t.sol`, the frame of a cold call): `deposit` at
+  index 0 981,126 → 583,858 (transaction 1,002,866 → 605,598), at index 2
+  949,049 → 551,776, the average of the first 64 deposits 977,172 → 579,889
+  (transaction); `retireClosedLeaf` 1,643,683 → 902,318; one permutation
+  23,432 → 12,728 gas. The exits do not hash; `challengeEscapeWithdrawal`,
+  `raiseEscapeConcession` and `finalizeEscapeWithdrawal` cost 22 gas more
+  (the vault's dispatcher gained the `poseidon()` getter). Every result, root
+  and revert is unchanged. What changed:
+  - The vault's Poseidon is a separate contract,
+    `src/poseidon/Bn254PoseidonRuntime.sol`, generated by `zkapi-proof`
+    (`poseidon_runtime.rs`; `refresh_setup_sources` writes it with the
+    setup) and compiled with solc's legacy pipeline: one inline-assembly
+    block, the permutation fully unrolled in the scaled sparse form (lane 0
+    divided by a per-round factor, seven `MULMOD`s per partial round) with
+    lazy reduction (`ADD` wherever the sum provably stays below 2^256). It
+    keeps the library's four functions, selectors and ABI checks, with the
+    same results for every input.
+  - The vault takes its address as its last constructor argument (the
+    immutable `poseidon()`), refuses an address that does not answer
+    `compress(DOMAIN_NODE, 0, 0)` with the tree's first zero hash
+    (`InvalidDeploymentBinding`), and calls it with `STATICCALL`
+    (`IBn254Poseidon`): it links no library, and the hasher cannot touch
+    the vault's state. A failed call reverts the vault's.
+  - `protocol/formal` (Lean 4 and Mathlib) proves that the body of the
+    runtime's `permute`, parsed from the contract's source, computes zkAPI's
+    Poseidon for all inputs: no `ADD` overflows and the outputs are the
+    canonical reference permutation of the inputs reduced mod p. Its
+    generator pins the rest of the file (the dispatcher and ABI checks); a
+    new CI job runs the generator check, the source audit and `lake build`.
+  - The setup carries `poseidon-runtime.json` (compiler settings, source
+    SHA-256, runtime codehash, selectors, scaled constants, lane bounds).
+    `Deploy.s.sol` requires the compiled and the deployed runtime to hash to
+    its `runtime_codehash` before it writes the manifest.
+  - The former library is kept, renamed, as the tests' reference
+    implementation (`test/reference/Bn254PoseidonReference.sol`): the
+    runtime is tested against it call for call, any calldata included.
+  - Cheaper deposits make griefing sponsored escapes cheaper: a defeated
+    sponsored escape costs the float about 0.93M gas (initiation plus
+    challenge) against the attacker's deposit of about 0.58M, roughly 1.6:1
+    against the operator where it was about 1:1. Escapes stay unsponsored in
+    every published profile; review `minEscapeNetWei` and the deposit floor
+    before enabling `PAYMASTER_ESCAPES` (see
+    [Operating gasless withdrawals](docs/deployment.md#operating-gasless-withdrawals)).
+  - The cost of verifiable source: a permutation of solc's legacy output
+    costs about 1,260 gas more than the hand-scheduled bytecode prototype
+    (12,728 against 11,468; about 46k per deposit and 89k per retirement),
+    the price of a contract whose source `protocol/formal` checks.
+- **The gasless paymaster refuses a gas schedule it was not measured
+  under.** Every gas constant of `ZkApiWithdrawalPaymaster` holds under
+  EIP-2929 storage pricing only. Under EIP-8037, which Sepolia runs, a fresh
+  slot costs about 110,000 gas and a new account 183,600, and sponsored
+  escapes, credit-path postOps and first uses would fail at the float's
+  expense. The constructor measures one fresh `SSTORE` and reverts
+  `UnsupportedGasSchedule` above `FRESH_SLOT_GAS_BOUND` (25,000).
+  `Deploy.s.sol` runs the same probe through the RPC and refuses `GASLESS=1`
+  before broadcasting anything. `checkGasSchedule()` lets anyone pause a
+  deployed paymaster's sponsorship for good once a fork reprices state
+  creation (`scheduleRepriced`, `ScheduleRepriced`; `setPolicy` then reverts
+  `SponsorshipRetired` unless paused). See
+  [Gas schedule](docs/deployment.md#gas-schedule).
+
+- **Gasless withdrawals reuse one transit account per payout address.**
+  zkapi-clientd derives the transit account's owner key with HKDF-SHA256 from
+  its payment key (salt `zkapi/transit-owner/v1`; info the chain, the
+  EntryPoint, vault, factory, paymaster, the creation code's hash and the
+  payee), so every later exit to the same payout address carries no initCode
+  and skips the account's creation (about 89,000 gas on mainnet, about
+  535,000 under EIP-8037). Records name the derivation
+  (`transit.owner_derivation`); earlier records keep their random key. The
+  SDK already reused the connected account's transit account. Both clients
+  refuse a second sponsored escape from one transit account while the first
+  is open (`transit_escape_pending`, before any proof). Exits of one wallet to
+  one payout address are now visibly linked through their shared transit
+  account; zkapi-clientd can opt out (see Added).
+- **Single defeats and raises cost about 600 gas more** (the adapter's
+  request-record lookup), and the adapter's larger dispatch adds about 170 to
+  every single exit; the adapter's runtime is 19,885 bytes.
+
+### Fixed
+
+- **Two sponsored escapes from one transit account in one bundle** were both
+  sponsored, and the second overwrote the first escape's FORWARD evidence
+  (`escapeNotePlusOne` is written in postOp, after the whole bundle is
+  validated; ERC-7562 lets a bundler include several operations of one
+  sender). The paymaster now takes a transient per-transit-account escape lock
+  in validation and refuses the second with `SponsorshipInFlight`.
+  `docs/deployment.md` no longer claims a compliant bundler never bundles two
+  operations of one sender, and states that verify-once's record on a
+  first-use operation relies on STO-022, which makes the factory's stake
+  load-bearing.
 
 ### Breaking
 - **`deposit(bytes32 commitment, uint128 amount)`** (selector `0x56d2e1ea`)
@@ -90,7 +275,57 @@ Folded into 0.2.0's notes at release.
 - **`rootRetiredAt(uint256)` is removed** from the vault (informational, never
   read on chain; `NoteDeposited` and `ClosedLeafRetired` carry every root
   change).
+- **The adapter takes constructor arguments**
+  `(vault, stateSigningKeyX, stateSigningKeyY, clearanceSigningKeyX,
+  clearanceSigningKeyY)` and has immutables (`folded*` getters).
+  `Deploy.s.sol` predicts the vault's address and checks the fold before it
+  writes the manifest; `expected-codehashes.mjs` derives the adapter's
+  codehash from the manifest's `vault` and `chainId` (`--vault`,
+  `--chain-id`). `IZkApiProofAdapter` gains `verifyWithdrawalOnce` and
+  `supportsInterface` (ERC-165), and the paymaster refuses a vault whose
+  adapter lacks them (`BadVault`).
+- **`pendingWithdrawals` word 1 (`activeRoot`) is always zero.** The vault
+  never read the escape proof's root and no longer stores it; the escape's
+  calldata carries it. The getter keeps its 6 words and selector. The SDK's
+  `readBrowserWithdrawalStatus` no longer returns `active_root`.
+- **Gasless withdrawals are not deployed on Sepolia** for now: it prices state
+  creation under EIP-8037, and the paymaster refuses that schedule (see
+  Changed). Deploy Sepolia vaults with `GASLESS=0`, and run the gasless drills
+  on Anvil or a testnet without state-gas pricing.
+- **The transit-account factory refuses a payee up to `0xffff`**, the
+  precompiles' range, with `InvalidPayee` (a push to a precompile was charged
+  as an EOA's, and a credit to one could never be claimed); zkapi-clientd
+  refuses such a payout address before reserving anything.
+- **The vault takes a 12th constructor argument, `address poseidon_`**, the
+  deployed `Bn254PoseidonRuntime` (`Deploy.s.sol` deploys it, or reuses
+  `POSEIDON_ADDRESS` when that holds the pinned runtime), and no longer
+  links `Bn254Poseidon`, which is gone from `src/` and from the setup
+  directories (`Bn254PoseidonRuntime.sol` and `poseidon-runtime.json`
+  replace it). The vault's codehash now includes the runtime's address as
+  an immutable: `expected-codehashes.mjs` fills it from the manifest's
+  `poseidonLibrary`. The manifest and profile fields keep their names
+  (`poseidonLibrary`, `poseidonLibraryReused`, `poseidonRuntimeCodehash`,
+  `poseidon_library_address`, `poseidon_runtime_codehash`) and now name the
+  runtime contract, so profile consumers are unchanged; an existing
+  deployment keeps its library.
+- **Storage reads.** The paymaster's `received(S)` and `receivedGas(S)` read
+  transient storage, so they are 0 outside an operation, and the vault's
+  storage layout changed (the merged nullifier words). No client reads either
+  through `eth_getStorageAt`.
 
+- **The adapter's code and codehash change** (the batch verifier;
+  `IZkApiBatchProofAdapter` is a new interface it reports besides
+  `IZkApiProofAdapter`), and the deployment manifest gains `exitBatcher`,
+  `exitBatcherRuntimeCodehash`, `exitBatcherGasSchedule`,
+  `exitBatcherFreshSlotGas`, `exitBatcherItemGas` and
+  `deployTransactions.exitBatcher`, the `trusted_deployment` profile
+  `exit_batcher_address`, `exit_batcher_runtime_codehash` and
+  `exit_batcher_item_gas`. A vault deployed before this release keeps its
+  adapter (it is immutable) and has no batch verifier: its profile carries
+  null batcher fields and every exit stays a single call.
+- **The challenge signer** accepts `ZKAPI_CHALLENGE_EXIT_BATCHER`,
+  `ZKAPI_CHALLENGE_BATCH_MAX_ITEMS` and `ZKAPI_SIGNER_ROLE`; a request body may
+  now be up to 256 KB.
 - None: the change is additive. Profiles without `gasless` (or with
   `gasless: null`) keep working with the wallet-pays path.
 

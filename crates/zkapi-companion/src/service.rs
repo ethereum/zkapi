@@ -14,6 +14,8 @@
 
 use crate::oa_station_trust::{StationTrust, TRUSTED_STATION};
 
+#[path = "close_relay.rs"]
+pub(crate) mod close_relay;
 #[path = "exit.rs"]
 pub(crate) mod exit;
 use std::collections::BTreeMap;
@@ -4177,8 +4179,13 @@ fn load_wallet(config: &AuthConfig) -> Result<Wallet, AuthError> {
             let request = journal.prepared_request.ok_or_else(|| {
                 AuthError::Wallet("native pending request has no durable authorization".into())
             })?;
-            crate::oa_native::saved_quote(config, &request.payload)?;
-            if request.public_inputs.solvency_bound < config.request_charge_cap
+            // Besides leases, a native wallet journals the close relay's fee
+            // request, whose bound is the fee (at least), not a lease tier.
+            let relay_fee = close_relay::is_fee_payload(&request.payload);
+            if !relay_fee {
+                crate::oa_native::saved_quote(config, &request.payload)?;
+            }
+            if (!relay_fee && request.public_inputs.solvency_bound < config.request_charge_cap)
                 || request.public_inputs.solvency_bound > 9_007_199_254_740_991
             {
                 return Err(AuthError::Wallet(

@@ -10,6 +10,7 @@ import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHis
 import { externalRecoveryContext, sameAddress, externalTransactionNonce, assertExternalTransaction,
     hasDurableTransactionHash } from './zkapiExternalTransactions.mjs';
 import { matchEscapePayout } from './zkapiExitPolicy.mjs';
+import { MUTUAL_CLOSE_TOPIC, followCloseRelay, mutualCloseLogMatches } from './zkapiCloseRelay.mjs';
 import { gaslessRecordFields, isGaslessWithdrawal } from './browserWalletStore.js';
 import { gaslessDeploymentError, verifyGaslessDeployment } from './zkapiDeploymentCheck.mjs';
 import {
@@ -17,7 +18,7 @@ import {
     bumpFees, checkEstimate, decodeAddressWord, decodeBool, decodeGasPolicy, decodePolicy, decodeQuote, decodeWord, dryRunError,
     encodeAttempts, encodeBalanceOf, encodeCallCap, encodeCredits, encodeEscapeNotePlusOne, encodeGetAddress,
     encodeGetNonce, encodeGetUserOpHash, encodeHandleOps, encodeOwed, encodeQuote, encodeStranded, gasFields, gaslessAmounts,
-    gaslessError, gaslessPins as gaslessPinsOf, handleOpsCalldataBytes, journalValue, maxCostWei, nonceKeyFor, packNonce, weiString,
+    gaslessError, gaslessPins as gaslessPinsOf, handleOpsCalldataBytes, journalValue, maxCostWei, nonceKeyFor, openSponsoredEscapeRecord, packNonce, weiString,
     parseCollected, parseCreditClaimed, parsePayoutCredited, sameGasPolicy, selectFees, settlementOf, toBigInt, emittedUserOpHash,
     transitAccountAddress, transitInitCode, unpackNonce, userOpHash, userOperationFromJson, userOperationJson,
     userOperationReceiptTransactionHash
@@ -2217,9 +2218,12 @@ class ZkapiClient extends EventTarget {
         const requestedDestination = normalizeWithdrawalDestination(destination, this.config?.funding);
         if (!['zero', 'bound'].includes(concede)) throw new TypeError('Choose zero or bound for a forced escape.');
         // `fees: 'payout'` pays the network fee from the payout through the
-        // withdrawal paymaster (design §3.2); 'wallet' is today's path.
-        if (!['wallet', 'payout'].includes(fees)) throw new TypeError('Choose wallet or payout for the withdrawal fees.');
-        const operationKey = `${mode}:${requestedDestination || ''}:${concede}${fees === 'payout' ? ':payout' : ''}`;
+        // withdrawal paymaster (design §3.2); 'wallet' is today's path;
+        // 'relay' (a cooperative close only) has the operator's close relay
+        // land the close for its fee, with the wallet-paid close as fallback.
+        if (!['wallet', 'payout', 'relay'].includes(fees)) throw new TypeError('Choose wallet, payout or relay for the withdrawal fees.');
+        if (fees === 'relay' && mode !== 'mutual') throw new TypeError('The close relay carries cooperative closes only.');
+        const operationKey = `${mode}:${requestedDestination || ''}:${concede}${fees === 'wallet' ? '' : `:${fees}`}`;
         if (this.withdrawPromise) {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
@@ -2271,7 +2275,7 @@ class ZkapiClient extends EventTarget {
         const note = this.note;
         if (!note) throw new Error('There is no active private note to withdraw.');
         if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
-        if (!['wallet', 'payout'].includes(fees)) throw new TypeError('Choose wallet or payout for the withdrawal fees.');
+        if (!['wallet', 'payout', 'relay'].includes(fees)) throw new TypeError('Choose wallet, payout or relay for the withdrawal fees.');
         await this.assertBalanceNotClaimed(note.note_id);
 
         onStatus('Connecting to MetaMask…');
@@ -2326,6 +2330,14 @@ class ZkapiClient extends EventTarget {
         // original payout destination, so recovery remains permissionless and
         // a harmless account switch cannot strand the note.
         const destination = prepared?.destination || requestedDestination || from;
+        // The operator's close relay (fees 'relay'): the fee request comes
+        // first, before the close is prepared; a close already sent from the
+        // wallet is followed as such.
+        let relayMode = fees === 'relay' && mode === 'mutual' && !prepared?.transaction_hash;
+        if (relayMode) {
+            onStatus('Paying the operator’s relay fee from this balance…');
+            await browserWalletRuntime.payCloseRelayFee({ onProgress: (_phase, message) => onStatus(message) });
+        }
 
         const withdrawal = {
             phase: 'prepared',
@@ -2443,6 +2455,17 @@ class ZkapiClient extends EventTarget {
                         clearance_granted: mode === 'mutual' && Boolean(plan.clearance?.signature)
                     };
                 }
+                if (relayMode && plan.mode === 'mutual' && !submittedHash) {
+                    // The relay lands it, or gives it back by the deadline:
+                    // then it is submitted from the wallet below.
+                    relayMode = false;
+                    const relayed = await this.followRelayedClose(plan, destination, onStatus);
+                    if (relayed) {
+                        receipt = relayed;
+                        break;
+                    }
+                    onStatus('The relay did not land the close in time. Confirm it in MetaMask to submit it yourself…');
+                }
                 const calldata = encodeWithdrawal(
                     plan,
                     mode,
@@ -2548,7 +2571,9 @@ class ZkapiClient extends EventTarget {
             }
             if (!receipt) throw error;
         }
-        const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, mode);
+        // This note's event: a relayed close's batch receipt carries other
+        // notes' closes too.
+        const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, mode, { noteId: note.note_id });
         if (!event || event.noteId !== BigInt(note.note_id)
             || event.destination.toLowerCase() !== destination.toLowerCase()
             || event.finalBalance !== BigInt(plan.public_inputs.final_balance)) {
@@ -2624,6 +2649,56 @@ class ZkapiClient extends EventTarget {
             pathSource: plan.pathSource || null,
             ...(destinationWarning ? { destinationWarning } : {})
         };
+    }
+
+    /**
+     * Hand a prepared cooperative close to the operator's relay and follow it
+     * (followCloseRelay): the receipt of the transaction that carried the
+     * vault's MutualClose of exactly this close, read through the wallet's
+     * provider, or null when the client must submit it itself (the relay gave
+     * it back, or has not landed it by valid_until minus the margin).
+     * `closeRelayTiming` ({ now, sleep, pollMs, marginSeconds }) is for tests.
+     */
+    async followRelayedClose(plan, destination, onStatus = () => {}) {
+        const vault = this.config.funding.contract_address;
+        const inputs = plan.public_inputs;
+        const nullifier = inputs.withdrawal_nullifier;
+        let fromBlock = '0x0';
+        try {
+            fromBlock = await this.ethereum.request({ method: 'eth_blockNumber' });
+        } catch {
+            // Search the vault's whole history instead.
+        }
+        try {
+            await browserWalletRuntime.submitCloseRelay(plan);
+            onStatus('The operator’s relay holds this close and lands it in a batch. If it has not landed in time, it is submitted from your wallet.');
+        } catch (error) {
+            onStatus(`The relay has not accepted this close yet (${error?.message || error}).`);
+        }
+        let landedHash = null;
+        const noteTopic = `0x${BigInt(inputs.note_id).toString(16).padStart(64, '0')}`;
+        const outcome = await followCloseRelay({
+            validUntil: inputs.valid_until,
+            status: () => browserWalletRuntime.closeRelayStatus(nullifier),
+            resubmit: () => browserWalletRuntime.submitCloseRelay(plan),
+            closeSeen: async () => {
+                const logs = await this.ethereum.request({
+                    method: 'eth_getLogs',
+                    params: [{ address: vault, fromBlock, toBlock: 'latest', topics: [MUTUAL_CLOSE_TOPIC, noteTopic] }]
+                });
+                const hit = (logs || []).find(log => mutualCloseLogMatches([log], {
+                    vault, noteId: inputs.note_id, nullifier, finalBalance: inputs.final_balance, destination
+                }));
+                if (!/^0x[0-9a-fA-F]{64}$/.test(String(hit?.transactionHash || ''))) return false;
+                landedHash = hit.transactionHash;
+                return true;
+            },
+            selfSubmit: async () => {},
+            ...(this.closeRelayTiming || {})
+        });
+        if (outcome !== 'relayed' || !landedHash) return null;
+        onStatus(`The relay landed this close in ${this.compact(landedHash)} · waiting for confirmation…`);
+        return this.waitForReceipt(landedHash);
     }
 
     async recoverFailedWithdrawalSubmission({
@@ -2771,7 +2846,11 @@ class ZkapiClient extends EventTarget {
     // With `fees: 'payout'` a withdrawal proof names a transit account S =
     // CREATE2(factory, 0, creationCode ‖ (entryPoint, vault, paymaster, owner,
     // payee)) as its destination, where owner is the connected account and
-    // payee the payout address Y. The vault call runs inside an ERC-4337 user
+    // payee the payout address Y: one S per (connected account, payout
+    // address), which every later withdrawal of that account to Y reuses
+    // (initCode only while S has no code), so the client refuses a second
+    // sponsored escape from S while S's first one is open
+    // (assertNoOpenTransitEscape). The vault call runs inside an ERC-4337 user
     // operation sent from S and sponsored by the withdrawal paymaster P, which
     // keeps a measured charge out of the payout and pushes the rest to Y. The
     // connected account signs the operation's hash with personal_sign and never
@@ -2934,6 +3013,58 @@ class ZkapiClient extends EventTarget {
             payee: String(payout).toLowerCase(),
             creationCodeKeccak: pins.accountCreationCodeKeccak256
         };
+    }
+
+    /**
+     * The paymaster's open sponsored escape of S, read as its _openEscape
+     * reads it: escapeNotePlusOne(S) names a note that is pending, or closed
+     * while S still holds a balance (the payout waits for a forward). Null
+     * when S has none open (none recorded, the note active again after a
+     * defeat, or closed with S emptied).
+     */
+    async openTransitEscape(context) {
+        const S = context.transit.account;
+        const notePlusOne = decodeWord(await this.gaslessCall(context.reader, context.pins.paymaster, encodeEscapeNotePlusOne(S)), 'escapeNotePlusOne');
+        if (notePlusOne === 0n || notePlusOne > 1n << 32n) return null;
+        const noteId = Number(notePlusOne - 1n);
+        const status = await this.readBrowserWithdrawalStatus(noteId, null, { request: context.reader });
+        if (status.status === 'pending_withdrawal') return { noteId, status: 'pending' };
+        if (status.status === 'closed') {
+            const balance = toBigInt(await context.reader({ method: 'eth_getBalance', params: [S, 'latest'] }), 'balance');
+            if (balance !== 0n) return { noteId, status: 'payout_waiting', transitBalanceWei: balance.toString() };
+        }
+        return null;
+    }
+
+    /**
+     * One open sponsored escape per transit account (§3.2): the paymaster
+     * keeps one escape record per S, the evidence a FORWARD of that escape's
+     * payout needs, and refuses a second sponsored escape from S while the
+     * first is open (EscapeEvidencePending; within one bundle a transient
+     * per-S lock). S is one account per (connected account, payout address),
+     * so a second balance escaping to the same payout address meets it. It is
+     * refused here, before any proof binds S (`transit_escape_pending`): from
+     * this browser's records (an escape whose inclusion the read RPC may not
+     * show yet, or whose operation is in flight) and from the paymaster.
+     * Escapes of `noteId` itself (a resumed or re-proved escape of this
+     * balance) and closes are never refused this way: closes from one S use
+     * distinct nonce keys (the withdrawal nullifier) and the paymaster
+     * sponsors any number of them.
+     */
+    async assertNoOpenTransitEscape(context, { noteId }) {
+        const S = context.transit.account;
+        const records = await browserWalletRuntime.currentWithdrawals().catch(() => browserWalletRuntime.withdrawals || []);
+        const local = openSponsoredEscapeRecord(records, { account: S, noteId });
+        if (local) {
+            throw gaslessError('transit_escape_pending', { transitAccount: S, noteId: Number(local.noteId), recordId: local.recordId || null,
+                source: 'record', alternatives: ["withdraw('escape', onStatus, { fees: 'wallet' })", 'finalizeEscape', 'collectTransitBalance'] });
+        }
+        const open = await this.openTransitEscape(context);
+        if (open && open.noteId !== Number(noteId)) {
+            throw gaslessError('transit_escape_pending', { transitAccount: S, noteId: open.noteId, source: 'paymaster', status: open.status,
+                ...(open.transitBalanceWei ? { transitBalanceWei: open.transitBalanceWei } : {}),
+                alternatives: ["withdraw('escape', onStatus, { fees: 'wallet' })", 'finalizeEscape', 'collectTransitBalance'] });
+        }
     }
 
     /**
@@ -3176,6 +3307,7 @@ class ZkapiClient extends EventTarget {
         }
         if (!quote.attemptsLeft) throw gaslessError('gasless_attempts_exhausted');
         if (kind === KIND.escape && !quote.escapeOpen) {
+            if (state.policy.escapesEnabled) await this.assertNoOpenTransitEscape(context, { noteId });
             throw gaslessError(state.policy.escapesEnabled ? 'escape_already_sponsored' : 'escapes_disabled', { noteId },
                 state.policy.escapesEnabled ? 'An escape of this balance was already sponsored once, or this transit account still has an open sponsored escape.' : null);
         }
@@ -3934,6 +4066,7 @@ class ZkapiClient extends EventTarget {
         });
         if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
         context.state = preflight.state;
+        if (kind === KIND.escape) await this.assertNoOpenTransitEscape(context, { noteId });
 
         const withdrawal = { phase: 'prepared', mode, noteId, destination: S, payout, feePayer: 'payout', transit: context.transit };
         let plan;
@@ -3992,6 +4125,7 @@ class ZkapiClient extends EventTarget {
                     preflight = await this.gaslessPreflight(context, { kind, key: attemptsKey(KIND.escape, { noteId }) });
                     if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
                     context.state = preflight.state;
+                    await this.assertNoOpenTransitEscape(context, { noteId });
                 }
                 const knownHash = plan.transactionHash || null;
                 this.rememberWithdrawal({ ...withdrawal, phase: knownHash ? 'submitted' : 'prepared', transactionHash: knownHash,
@@ -8573,10 +8707,11 @@ class ZkapiClient extends EventTarget {
         } catch {
             concession = null;
         }
+        // Word 1 (activeRoot) is always zero: the vault keeps no escape's root, which only
+        // the escape's own calldata carries. It is not reported.
         return {
             status: 'pending_withdrawal',
             note_id: Number(noteId),
-            active_root: `0x${pendingWords[1]}`,
             withdrawal_nullifier: `0x${pendingWords[2]}`,
             final_balance: Number(BigInt(`0x${pendingWords[3]}`)),
             destination: `0x${pendingWords[4].slice(-40)}`,

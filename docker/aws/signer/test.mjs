@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { Interface, Transaction, Wallet, keccak256 } from 'ethers';
 import {
   ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_TX_FEE_CAP, ESCAPE_FINALIZED_TOPIC, GWEI, RpcError, UPSTREAM_TIMEOUT_MS,
-  createSigner, createUpstream, parseChainId, parseSignerConfig, vaultInterface,
+  batcherInterface, createSigner, createUpstream, parseChainId, parseSignerConfig, relayBatcherInterface, relayVaultInterface,
+  vaultInterface,
 } from './signer.mjs';
 import { createHttpServer } from './server.mjs';
 
@@ -151,6 +152,114 @@ test('signs the three concession-exit calls by their pinned selectors', async ()
   const padded = `${raise.slice(0, 10)}${'00'.repeat(32)}${raise.slice(10)}`;
   await assert.rejects(signer.handle('eth_sendTransaction', [{ ...validTx, data: padded }]), RpcError);
   assert.equal(calls.length, 0);
+});
+
+const BATCHER = '0x000000000000000000000000000000000000ba7c';
+// challengeBatch of distinct notes: a defeat (amount 0) and raises.
+const batchOf = (notes, { amounts = notes.map((_, index) => index), items = notes.map(() => inputs), proofs = `0x${'00'.repeat(256 * notes.length)}` } = {}) =>
+  batcherInterface.encodeFunctionData('challengeBatch', [notes, amounts, items, proofs]);
+const batchTx = (data = batchOf([1, 2, 3])) => ({ ...validTx, to: BATCHER, data });
+// The batcher answers vault() with `bound` and a simulated batch with `applied`.
+function batcherCall({ bound = vault, applied = 7n } = {}) {
+  return call => call.data === batcherInterface.encodeFunctionData('vault', [])
+    ? batcherInterface.encodeFunctionResult('vault', [bound])
+    : `0x${applied.toString(16).padStart(64, '0')}`;
+}
+
+test('signs a canonical challengeBatch for the configured batcher once its vault() is the vault', async () => {
+  // The selector of the batcher ABI's challengeBatch.
+  assert.equal(batcherInterface.getFunction('challengeBatch').selector, '0xab41c746');
+  const { signer, calls } = fixture({ eth_call: batcherCall() }, { exitBatcher: BATCHER });
+  assert.deepEqual([signer.policy.exit_batcher, signer.policy.batch_max_items], [BATCHER, 16]);
+  const data = batchOf([1, 2, 3]);
+  const hash = await signer.handle('eth_sendTransaction', [batchTx(data)]);
+  assert.deepEqual(calls.map(call => call.method), ['eth_chainId', 'eth_call', 'eth_call', 'eth_estimateGas', 'eth_getBlockByNumber', 'eth_getBalance', 'eth_sendRawTransaction']);
+  assert.deepEqual(calls[1].params, [{ to: BATCHER, data: batcherInterface.encodeFunctionData('vault', []) }, 'latest']);
+  assert.deepEqual(calls[2].params, [{ from: sender.toLowerCase(), to: BATCHER, data, value: '0x0' }, 'latest']);
+  const signed = Transaction.from(broadcasts(calls)[0].params[0]);
+  assert.deepEqual([signed.hash, signed.to.toLowerCase(), signed.data, signed.value, signed.nonce, signed.type], [hash, BATCHER, data, 0n, 4, 2]);
+  // vault() is read once; single vault calls still sign to the vault.
+  const before = calls.length;
+  await signer.handle('eth_sendTransaction', [{ ...batchTx(data), nonce: '0x5' }]);
+  assert.equal(calls.slice(before).filter(call => call.method === 'eth_call').length, 1);
+  await signer.handle('eth_sendTransaction', [{ ...validTx, nonce: '0x6' }]);
+  assert.equal(Transaction.from(broadcasts(calls).at(-1).params[0]).to.toLowerCase(), vault);
+  // A 64-item batch fits the calldata bound and the server's body limit.
+  const large = fixture({ eth_call: batcherCall({ applied: 1n }) }, { exitBatcher: BATCHER, batchMaxItems: 64n });
+  const notes = Array.from({ length: 64 }, (_, index) => index);
+  await large.signer.handle('eth_sendTransaction', [batchTx(batchOf(notes))]);
+  assert.equal(broadcasts(large.calls).length, 1);
+  const server = createHttpServer(large.signer).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendTransaction', params: [{ ...batchTx(batchOf(notes)), nonce: '0x5' }] });
+    assert.ok(body.length > 65_536);
+    const answer = await fetch(`http://127.0.0.1:${server.address().port}`, { method: 'POST', body }).then(r => r.json());
+    assert.match(answer.result, /^0x[0-9a-f]{64}$/);
+  } finally { server.close(); }
+});
+
+test('refuses batches outside the policy before any RPC, and without a configured batcher', async () => {
+  const otherDeployment = [2, CHAIN_ID, sender, ...inputs.slice(3)];
+  const batcherFunctions = new Interface(['function finalizeBatch(uint32[] noteIds)', 'function vault()']);
+  const refused = [
+    batchOf([1]),
+    batchOf(Array.from({ length: 17 }, (_, index) => index)),
+    batchOf([1, 2], { amounts: [0] }),
+    batchOf([1, 2], { items: [inputs] }),
+    batchOf([1, 2], { proofs: `0x${'00'.repeat(256)}` }),
+    batchOf([1, 2], { proofs: `0x${'00'.repeat(257 * 2)}` }),
+    batchOf([1, 1]),
+    batchOf([1, 2], { items: [inputs, otherDeployment] }),
+    batchOf([1, 2], { items: [[2, 1n, vault, ...inputs.slice(3)], inputs] }),
+    `${batchOf([1, 2]).slice(0, 10)}${'00'.repeat(32)}${batchOf([1, 2]).slice(10)}`,
+    `${batchOf([1, 2])}00`,
+    batcherFunctions.encodeFunctionData('finalizeBatch', [[1, 2]]),
+    batcherFunctions.encodeFunctionData('vault', []),
+    data,
+  ];
+  for (const call of refused) {
+    const { signer, calls } = fixture({ eth_call: batcherCall() }, { exitBatcher: BATCHER });
+    await assert.rejects(signer.handle('eth_sendTransaction', [batchTx(call)]), error => error instanceof RpcError && error.code === -32602, call.slice(0, 80));
+    assert.equal(calls.length, 0);
+  }
+  // A batch to a signer without a batcher, or to another address, is refused.
+  const none = fixture({ eth_call: batcherCall() });
+  await assert.rejects(none.signer.handle('eth_sendTransaction', [batchTx()]), { code: -32602, message: 'Destination is not authorized' });
+  const other = fixture({ eth_call: batcherCall() }, { exitBatcher: BATCHER });
+  await assert.rejects(other.signer.handle('eth_sendTransaction', [{ ...batchTx(), to: '0x000000000000000000000000000000000000ba7d' }]), { code: -32602, message: 'Destination is not authorized' });
+  // The batch size refusal names the limit.
+  await assert.rejects(other.signer.handle('eth_sendTransaction', [batchTx(refused[1])]),
+    { code: -32602, data: { reason: 'batch_size_out_of_bounds', batch_max_items: '0x10' } });
+  // The batcher is neither zero nor the vault.
+  for (const exitBatcher of ['0x0000000000000000000000000000000000000000', vault]) {
+    assert.throws(() => fixture({}, { exitBatcher }), { message: 'Exit batcher must be nonzero and not the vault' });
+  }
+  for (const batchMaxItems of [1n, 65n, 16]) {
+    assert.throws(() => fixture({}, { exitBatcher: BATCHER, batchMaxItems }), { message: 'Batch item limit is invalid' });
+  }
+});
+
+test('refuses a batcher bound to another vault, and a batch whose every item would be skipped', async () => {
+  const mismatch = fixture({ eth_call: batcherCall({ bound: sender }) }, { exitBatcher: BATCHER });
+  await assert.rejects(mismatch.signer.checkBatcher(), { code: -32003, data: { reason: 'batcher_vault_mismatch' } });
+  await assert.rejects(mismatch.signer.handle('eth_sendTransaction', [batchTx()]), { code: -32003, data: { reason: 'batcher_vault_mismatch' } });
+  assert.equal(broadcasts(mismatch.calls).length, 0);
+  // Without a batcher there is nothing to check.
+  await fixture().signer.checkBatcher();
+  // Every item resolved already: verification gas for nothing.
+  const nothing = fixture({ eth_call: batcherCall({ applied: 0n }) }, { exitBatcher: BATCHER });
+  await assert.rejects(nothing.signer.handle('eth_sendTransaction', [batchTx()]), { code: -32003, message: 'No item of the batch would apply', data: { reason: 'batch_applies_nothing' } });
+  assert.equal(broadcasts(nothing.calls).length, 0);
+  // Some items skipped (a fee replacement after others resolved them) signs.
+  const some = fixture({ eth_call: batcherCall({ applied: 2n }) }, { exitBatcher: BATCHER });
+  await some.signer.handle('eth_sendTransaction', [batchTx()]);
+  assert.equal(broadcasts(some.calls).length, 1);
+  // A reverting batch is a transient simulation failure; a garbled answer too.
+  const reverting = fixture({ eth_call: call => { if (call.data.startsWith('0xab41c746')) throw new RpcError(-32000, 'reverted', 'upstream_rejected'); return batcherCall()(call); } }, { exitBatcher: BATCHER });
+  await assert.rejects(reverting.signer.handle('eth_sendTransaction', [batchTx()]), { code: -32000, data: { reason: 'simulation_failed' } });
+  const garbled = fixture({ eth_call: call => (call.data.startsWith('0xab41c746') ? '0x' : batcherCall()(call)) }, { exitBatcher: BATCHER });
+  await assert.rejects(garbled.signer.handle('eth_sendTransaction', [batchTx()]), { code: -32000, data: { reason: 'simulation_failed' } });
 });
 
 // A leaf retirement of a note on a nonce (default the shared test nonce 4).
@@ -658,10 +767,11 @@ test('RPC method allowlist excludes generic signing, account management, fee ora
 test('signer status reports policy, base fee, balance coverage and warnings', async () => {
   const healthy = await fixture().signer.handle('zkapi_signerStatus', []);
   assert.deepEqual(healthy, {
-    chain_id: '0xaa36a7', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
+    chain_id: '0xaa36a7', role: 'challenger', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
     max_retirements_per_day: 2, retire_on_miss: true, retirement_lookback_blocks: 50400,
+    exit_batcher: null, batch_max_items: 16,
     retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
     block_number: '0x10', base_fee_per_gas: '0x3b9aca00', balance: ONE_ETH, warnings: [],
   });
@@ -754,10 +864,11 @@ test('HTTP errors suppress provider details, carry structured refusal reasons, a
   const post = value => fetch(base, { method: 'POST', body: JSON.stringify(value) }).then(r => r.json());
   const health = await fetch(`${base}/health`).then(r => r.json());
   assert.deepEqual(health, {
-    status: 'ok', chain_id: Number(CHAIN_ID), sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
+    status: 'ok', chain_id: Number(CHAIN_ID), role: 'challenger', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
     max_retirements_per_day: 2, retire_on_miss: true, retirement_lookback_blocks: 50400,
+    exit_batcher: null, batch_max_items: 16,
     retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
   });
   const failed = await post({ jsonrpc: '2.0', id: 8, method: 'eth_blockNumber', params: [] });
@@ -852,10 +963,21 @@ test('Mainnet refuses to start without an explicit fee cap; Sepolia uses a repor
     ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '2700000000000000000', ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '0',
   });
   assert.deepEqual(configured, {
-    chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '127.0.0.1', port: 65535, maxGas: 9_000_000n,
+    role: 'challenger', chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '127.0.0.1', port: 65535, maxGas: 9_000_000n,
     maxFeePerGas: 300n * GWEI, priorityFeePerGas: 2n * GWEI, maxPriorityFeePerGas: 20n * GWEI, feeCeiling: 1_000n * GWEI,
     txFeeCap: 2_700_000_000_000_000_000n, maxRetirementsPerDay: 0n, retireOnMiss: undefined, retirementLookbackBlocks: undefined,
+    exitBatcher: undefined, batchMaxItems: undefined,
   });
+  // The exit batcher is optional; a batch holds 2 to 64 items.
+  assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_EXIT_BATCHER: '' }).exitBatcher, undefined);
+  assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_EXIT_BATCHER: BATCHER }).exitBatcher, BATCHER);
+  assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_BATCH_MAX_ITEMS: '64' }).batchMaxItems, 64n);
+  for (const bad of ['1', '65']) {
+    assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_BATCH_MAX_ITEMS: bad }),
+      configError('ZKAPI_CHALLENGE_BATCH_MAX_ITEMS must be a decimal integer from 2 to 64'), bad);
+  }
+  assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_BATCH_MAX_ITEMS: '0x10' }),
+    configError('ZKAPI_CHALLENGE_BATCH_MAX_ITEMS must be a positive decimal integer'));
   assert.equal(parseSignerConfig(env).maxRetirementsPerDay, undefined);
   assert.deepEqual([parseSignerConfig(env).retireOnMiss, parseSignerConfig(env).retirementLookbackBlocks], [undefined, undefined]);
   assert.deepEqual([parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIRE_ON_MISS: '', ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS: '' }).retireOnMiss,
@@ -1025,12 +1147,12 @@ test('server process starts from strict configuration and prints its fee policy 
     child.on('exit', code => reject(new Error(`signer exited with ${code}: ${stderr}`)));
   });
   assert.deepEqual(line, {
-    status: 'listening', chain_id: 11155111, sender: sender.toLowerCase(), vault, fee_model: 'eip1559', fee_cap_source: 'explicit',
+    status: 'listening', role: 'challenger', chain_id: 11155111, sender: sender.toLowerCase(), vault, fee_model: 'eip1559', fee_cap_source: 'explicit',
     max_fee_per_gas_wei: '10000000000', priority_fee_per_gas_wei: '1000000000', max_priority_fee_per_gas_wei: '10000000000',
     // 0.1 ETH over 12M gas leaves 8.33 gwei per gas, below the 10 gwei fee cap.
     fee_ceiling_wei: '10000000000000', tx_fee_cap_wei: '100000000000000000', max_fee_per_gas_allowed_at_max_gas_wei: '8333333333',
     max_gas: '12000000', required_balance_wei: '120000000000000000', balance_wei: '1', max_retirements_per_day: 2,
-    retire_on_miss: true, retirement_lookback_blocks: 50400,
+    retire_on_miss: true, retirement_lookback_blocks: 50400, exit_batcher: null, batch_max_items: 16,
     base_fee_per_gas_wei: '9000000000', warnings: ['base_fee_near_cap', 'balance_below_required', 'tx_fee_cap_below_fee_cap'],
   });
   const health = await fetch(`http://127.0.0.1:${port}/health`).then(r => r.json());
@@ -1065,4 +1187,154 @@ test('refusals and signatures are logged once per transition without provider de
   assert.deepEqual(lost.logs, [{ event: 'challenge_refused', nonce: 4, code: -32000, reason: 'broadcast_ambiguous', message: 'Transaction broadcast outcome is unknown', transaction_hash: keccak256(broadcasts(lost.calls)[0].params[0]) }]);
   const text = JSON.stringify([...logs, ...lost.logs]);
   for (const secret of [key.slice(2), 'private-api-key', broadcasts(lost.calls)[0].params[0].slice(2, 66), data.slice(2, 10)]) assert.ok(!text.includes(secret));
+});
+
+test('server process refuses to start with an exit batcher bound to another vault', async t => {
+  const boundTo = { value: sender };
+  const upstream = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    const { id, method } = JSON.parse(body);
+    const results = {
+      eth_chainId: '0xaa36a7', eth_getBlockByNumber: { number: '0x10', baseFeePerGas: wei(GWEI) }, eth_getBalance: ONE_ETH,
+      eth_call: batcherInterface.encodeFunctionResult('vault', [boundTo.value]),
+    };
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ jsonrpc: '2.0', id, result: results[method] }));
+  }).listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  t.after(() => upstream.close());
+  const env = {
+    PATH: process.env.PATH, ZKAPI_CHALLENGE_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_PRIVATE_KEY: key, ZKAPI_CHALLENGE_VAULT: vault,
+    ZKAPI_CHALLENGE_RPC_URL: `http://127.0.0.1:${upstream.address().port}/private-api-key`, ZKAPI_CHALLENGE_PORT: '1',
+    ZKAPI_CHALLENGE_EXIT_BATCHER: BATCHER,
+  };
+  const run = () => new Promise(resolve => {
+    const child = spawn(process.execPath, ['server.mjs'], { cwd: here, stdio: ['ignore', 'pipe', 'pipe'], env });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('exit', code => resolve({ code, stderr }));
+  });
+  const refused = await run();
+  assert.equal(refused.code, 1);
+  assert.ok(refused.stderr.startsWith('Challenge signer startup failed: The exit batcher is bound to another vault (batcher_vault_mismatch)'), refused.stderr);
+  assert.ok(!refused.stderr.includes(key.slice(2)) && !refused.stderr.includes('private-api-key'));
+});
+
+// ---------------------------------------------------------------------------
+// The close-relay role: serverd's close relay signs through its own instance.
+// ---------------------------------------------------------------------------
+
+// A cooperative close (kind 1) of this deployment of note `note`, paying 0x11..11.
+const close = (note, overrides = {}) => {
+  const fields = {
+    protocolVersion: 2, chainId: CHAIN_ID, contractAddress: vault, activeRoot: 1, stateSigningKeyX: 2, stateSigningKeyY: 3,
+    clearanceSigningKeyX: 4, clearanceSigningKeyY: 5, noteId: note, finalBalance: 900_000, destination: `0x${'11'.repeat(20)}`,
+    withdrawalNullifier: 1000 + note, kind: 1, nextNullifier: 0, conceded: 0, validUntil: 2_000_000_000, ...overrides,
+  };
+  return [fields.protocolVersion, fields.chainId, fields.contractAddress, fields.activeRoot, fields.stateSigningKeyX,
+    fields.stateSigningKeyY, fields.clearanceSigningKeyX, fields.clearanceSigningKeyY, fields.noteId, fields.finalBalance,
+    fields.destination, fields.withdrawalNullifier, fields.kind, fields.nextNullifier, fields.conceded, fields.validUntil];
+};
+const closeBatch = (items, proofs = `0x${'00'.repeat(256 * items.length)}`) =>
+  relayBatcherInterface.encodeFunctionData('mutualCloseBatch', [items, proofs]);
+const singleClose = (item = close(1)) => relayVaultInterface.encodeFunctionData('mutualClose', [item, proof]);
+const relayFixture = (overrides = {}, options = {}) => fixture({ eth_call: batcherCall(), ...overrides }, { role: 'close-relay', exitBatcher: BATCHER, ...options });
+
+test('the close-relay role signs canonical closes of this deployment, single and batched', async () => {
+  assert.equal(relayBatcherInterface.getFunction('mutualCloseBatch').selector, '0x178cd980');
+  assert.equal(relayVaultInterface.getFunction('mutualClose').selector, '0x72cd2e44');
+  const { signer, calls, logs } = relayFixture();
+  assert.deepEqual([signer.policy.role, signer.policy.batch_max_items, signer.policy.retire_on_miss], ['close-relay', 64, false]);
+  const batch = closeBatch([close(1), close(2), close(3)]);
+  const hash = await signer.handle('eth_sendTransaction', [batchTx(batch)]);
+  assert.deepEqual(calls.map(call => call.method), ['eth_chainId', 'eth_call', 'eth_call', 'eth_estimateGas', 'eth_getBlockByNumber', 'eth_getBalance', 'eth_sendRawTransaction']);
+  assert.deepEqual(calls[1].params, [{ to: BATCHER, data: batcherInterface.encodeFunctionData('vault', []) }, 'latest']);
+  const signed = Transaction.from(broadcasts(calls)[0].params[0]);
+  assert.deepEqual([signed.hash, signed.to.toLowerCase(), signed.data, signed.value], [hash, BATCHER, batch, 0n]);
+  assert.equal(logs.at(-1).event, 'close_relay_signed');
+  // A batch of one, and a single mutualClose to the vault.
+  await signer.handle('eth_sendTransaction', [{ ...batchTx(closeBatch([close(4)])), nonce: '0x5' }]);
+  await signer.handle('eth_sendTransaction', [{ ...validTx, data: singleClose(), nonce: '0x6' }]);
+  assert.equal(Transaction.from(broadcasts(calls).at(-1).params[0]).to.toLowerCase(), vault);
+  // 64 closes fit the calldata bound and the server's body limit.
+  const items = Array.from({ length: 64 }, (_, index) => close(index));
+  const large = relayFixture();
+  await large.signer.handle('eth_sendTransaction', [batchTx(closeBatch(items))]);
+  assert.equal(broadcasts(large.calls).length, 1);
+  const server = createHttpServer(large.signer).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendTransaction', params: [{ ...batchTx(closeBatch(items)), nonce: '0x5' }] });
+    const answer = await fetch(`http://127.0.0.1:${server.address().port}`, { method: 'POST', body }).then(r => r.json());
+    assert.match(answer.result, /^0x[0-9a-f]{64}$/);
+  } finally { server.close(); }
+});
+
+test('the close-relay role refuses every other close, every challenger call and an empty simulation', async () => {
+  const refused = [
+    closeBatch([]),
+    closeBatch(Array.from({ length: 65 }, (_, index) => close(index))),
+    closeBatch([close(1), close(2, { withdrawalNullifier: 1001 })]),
+    closeBatch([close(1, { kind: 0, nextNullifier: 7 })]),
+    closeBatch([close(1, { kind: 2 })]),
+    closeBatch([close(1, { conceded: 1 })]),
+    closeBatch([close(1, { chainId: 1n })]),
+    closeBatch([close(1, { contractAddress: sender })]),
+    closeBatch([close(1, { protocolVersion: 3 })]),
+    closeBatch([close(1, { destination: '0x0000000000000000000000000000000000000000' })]),
+    closeBatch([close(1, { destination: vault })]),
+    closeBatch([close(1), close(2)], `0x${'00'.repeat(256)}`),
+    `${closeBatch([close(1)])}00`,
+    batchOf([1, 2, 3]),
+    batcherInterface.encodeFunctionData('vault', []),
+  ];
+  for (const call of refused) {
+    const { signer, calls } = relayFixture();
+    await assert.rejects(signer.handle('eth_sendTransaction', [batchTx(call)]), error => error instanceof RpcError && error.code === -32602, call.slice(0, 80));
+    assert.equal(calls.length, 0);
+  }
+  // To the vault: only a canonical mutualClose; every challenger call is refused.
+  for (const call of [
+    data,
+    vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 5]),
+    vaultInterface.encodeFunctionData('retireClosedLeaf', [1, Array(32).fill(0)]),
+    singleClose(close(1, { kind: 0, nextNullifier: 9 })),
+    relayVaultInterface.encodeFunctionData('mutualClose', [close(1), `0x${'00'.repeat(255)}`]),
+  ]) {
+    const { signer, calls } = relayFixture();
+    await assert.rejects(signer.handle('eth_sendTransaction', [{ ...validTx, data: call }]), { code: -32602 });
+    assert.equal(calls.length, 0);
+  }
+  // A batch that would close nothing (every note closed already) is refused.
+  const nothing = relayFixture({ eth_call: batcherCall({ applied: 0n }) });
+  await assert.rejects(nothing.signer.handle('eth_sendTransaction', [batchTx(closeBatch([close(1)]))]), error => error.code === -32003 && error.data?.reason === 'batch_applies_nothing');
+  assert.equal(broadcasts(nothing.calls).length, 0);
+  // A reverting close is a simulation failure, never signed.
+  const reverting = relayFixture({ eth_call: () => { throw new RpcError(-32000, 'reverted', 'upstream_rejected'); } });
+  await assert.rejects(reverting.signer.handle('eth_sendTransaction', [{ ...validTx, data: singleClose() }]), error => error.data?.reason === 'simulation_failed');
+  // The same gas, fee and balance policy as the challenger.
+  const poor = relayFixture({ eth_getBalance: '0x1' });
+  await assert.rejects(poor.signer.handle('eth_sendTransaction', [batchTx(closeBatch([close(1)]))]), error => error.data?.reason === 'insufficient_balance');
+  const tooMuchGas = relayFixture();
+  await assert.rejects(tooMuchGas.signer.handle('eth_sendTransaction', [{ ...batchTx(closeBatch([close(1)])), gas: '0x1000001' }]), error => error.data?.reason === 'gas_limit_exceeds_cap');
+  // The relay batches only through its batcher, which must be configured.
+  assert.throws(() => fixture({}, { role: 'close-relay' }), { message: 'The close-relay role requires ZKAPI_CHALLENGE_EXIT_BATCHER' });
+  assert.throws(() => fixture({}, { role: 'relay', exitBatcher: BATCHER }), { message: 'Signer role must be challenger or close-relay' });
+});
+
+test('the challenger role refuses every close-relay call', async () => {
+  for (const [to, call] of [[BATCHER, closeBatch([close(1), close(2)])], [vault, singleClose()]]) {
+    const { signer, calls } = fixture({ eth_call: batcherCall() }, { exitBatcher: BATCHER });
+    await assert.rejects(signer.handle('eth_sendTransaction', [{ ...validTx, to, data: call }]), { code: -32602 });
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('ZKAPI_SIGNER_ROLE selects the role, challenger by default', () => {
+  const base = { ZKAPI_CHALLENGE_CHAIN_ID: '11155111' };
+  assert.equal(parseSignerConfig(base).role, 'challenger');
+  assert.equal(parseSignerConfig({ ...base, ZKAPI_SIGNER_ROLE: '' }).role, 'challenger');
+  assert.equal(parseSignerConfig({ ...base, ZKAPI_SIGNER_ROLE: 'close-relay' }).role, 'close-relay');
+  assert.throws(() => parseSignerConfig({ ...base, ZKAPI_SIGNER_ROLE: 'relay' }), configError('ZKAPI_SIGNER_ROLE must be challenger or close-relay'));
 });

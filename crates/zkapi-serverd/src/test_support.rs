@@ -205,6 +205,36 @@ impl TestNote {
     }
 }
 
+impl TestNote {
+    /// A kind-1 cooperative close of the current state to `destination`,
+    /// valid until `valid_until` (the close relay's tests). The development
+    /// deployment signs the clearance it carries.
+    pub(crate) fn close_proof(
+        &self,
+        destination: [u8; 20],
+        valid_until: u64,
+    ) -> (
+        zkapi_types::WithdrawalPublicInputsV2C,
+        zkapi_types::wire::Groth16ProofWire,
+    ) {
+        let (public, witness) = self
+            .state
+            .withdrawal(
+                &self.deployment,
+                &self.tree,
+                &DevWithdrawal {
+                    kind: WithdrawalKind::MutualClose,
+                    destination,
+                    conceded: 0,
+                    valid_until,
+                },
+            )
+            .unwrap();
+        let proof = withdrawal_prover().prove(&public, witness).unwrap();
+        (public, proof)
+    }
+}
+
 /// A request a test wallet proved, with what installs its successor.
 #[derive(Clone)]
 pub(crate) struct PreparedTestRequest {

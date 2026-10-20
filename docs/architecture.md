@@ -52,7 +52,10 @@ and the [concession-vault migration](migration-concession-vault.md).
 
 A withdrawal can pay its network fee from the payout instead of a funded
 account: its proof names a transit account derived from the owner and the
-payout address, and a user operation from that account, sent through the
+payout address (one per owner and payout address: the browser SDK's owner is
+the connected account, zkapi-clientd derives its owner key per payout address
+from its payment key, so later exits to the same payout address reuse the
+account and skip its creation), and a user operation from that account, sent through the
 operator's ERC-4337 bundler, makes the vault call. The withdrawal paymaster
 re-runs the vault's checks in validation, sponsors the gas from its EntryPoint
 deposit, and in postOp keeps a measured charge and pushes the rest to the

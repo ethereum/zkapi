@@ -556,7 +556,12 @@ export function matchEscapePayout({ stateBalance, concededAtInit, boundAtState =
     };
 }
 
-// An escape's gas (§1.5: about 0.55–0.62M), for the G1 exit-cost warning.
+// An escape's gas, for the G1 exit-cost warning: one figure for both gas schedules the
+// SDK's networks run. An initiation and its finalization measure about 0.44M gas under
+// EIP-2929 storage pricing (mainnet; protocol/contracts/snapshots/concession-exit-gas.json)
+// and about 0.8M where EIP-8037 prices each fresh storage slot at about 110,000 (Sepolia:
+// the initiation writes four). 620,000 lies between them, about 40% over the first and 20%
+// under the second; the warning only informs and never blocks.
 export const ESCAPE_GAS_ESTIMATE = 620_000n;
 
 /** An escape's estimated network fee in ledger units at `gasPriceWei`, rounded up. */

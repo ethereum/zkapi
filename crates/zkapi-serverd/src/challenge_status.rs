@@ -37,6 +37,10 @@ pub const SCAN_LAG_CRITICAL_BLOCKS: u64 = 300;
 /// A recorded missed deadline stays a critical alarm this long, also when
 /// its escape was paid out and the obligation retired within one poll.
 pub const MISSED_ALARM_SECONDS: u64 = 3_600;
+/// A batching anomaly (an item the batch skipped or reverted for a reason
+/// other than a changed escape) stays a warning this long; the note itself
+/// goes on as single calls.
+pub const BATCH_ANOMALY_ALARM_SECONDS: u64 = 3_600;
 const DEFAULT_WARNING_REMAINING_SECONDS: u64 = 43_200;
 const DEFAULT_CRITICAL_REMAINING_SECONDS: u64 = 21_600;
 
@@ -281,6 +285,46 @@ pub struct ChallengeStatus {
     pub missed_raises_total: u64,
     pub last_missed: Option<MissedRecord>,
     pub config_warnings: Vec<String>,
+    /// Batched defeats and raises through the deployment's exit batcher.
+    #[serde(default)]
+    pub batching: BatchingStatus,
+}
+
+/// Defeats and raises sent together through `ZkApiExitBatcher.challengeBatch`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchingStatus {
+    /// Batches may be sent: the manifest names an exit batcher, batching is
+    /// on, and nothing turned it off since the daemon started.
+    pub enabled: bool,
+    /// The manifest's exit batcher; None when it names none.
+    pub exit_batcher: Option<String>,
+    /// Why batching is off although an exit batcher is configured.
+    pub disabled_reason: Option<String>,
+    pub max_items: u64,
+    pub max_age_seconds: u64,
+    pub deadline_margin_seconds: u64,
+    /// Due defeats and raises waiting for a batch to flush.
+    pub queued: u64,
+    /// Batch transactions sent (their first attempts), and the items they
+    /// carried.
+    pub batches_sent_total: u64,
+    pub batched_items_total: u64,
+    /// Items taken out of a batch and sent (or reconciled) as single calls:
+    /// skipped or reverting in the simulation, or anomalous after mining.
+    pub single_fallbacks_total: u64,
+    /// Items a batch skipped, or reverted on, for a reason other than a
+    /// changed escape. Each such note is never batched again.
+    pub anomalies_total: u64,
+    pub last_anomaly: Option<BatchAnomaly>,
+}
+
+/// The latest batching anomaly, kept in the checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchAnomaly {
+    pub note_id: u32,
+    pub nullifier: Felt252,
+    pub detail: String,
+    pub recorded_at: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +481,14 @@ pub struct ObligationStatus {
     pub submitted_block: Option<u64>,
     pub first_seen_at: Option<u64>,
     pub evaluated_at: Option<u64>,
+    /// The notes of the batch transaction on this obligation's nonce, in item
+    /// order (itself included); empty for a single call.
+    #[serde(default)]
+    pub batch_notes: Vec<u32>,
+    /// A batch skipped or reverted on this note for a reason other than a
+    /// changed escape: it goes as single calls only.
+    #[serde(default)]
+    pub batch_excluded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +543,7 @@ impl ChallengeStatus {
             missed_raises_total: 0,
             last_missed: None,
             config_warnings: Vec::new(),
+            batching: BatchingStatus::default(),
         }
     }
 }
@@ -632,6 +685,17 @@ pub fn evaluate(
             format!(
                 "missed challenge deadline of note {} ({})",
                 missed.note_id, missed.reason
+            ),
+        );
+    }
+    if let Some(anomaly) = s.batching.last_anomaly.as_ref().filter(|anomaly| {
+        wall_now.saturating_sub(anomaly.recorded_at) < BATCH_ANOMALY_ALARM_SECONDS
+    }) {
+        raise(
+            Severity::Warning,
+            format!(
+                "batched challenge anomaly of note {} ({}); the note goes as single calls",
+                anomaly.note_id, anomaly.detail
             ),
         );
     }
@@ -908,6 +972,8 @@ mod tests {
             submitted_block: None,
             first_seen_at: None,
             evaluated_at: Some(NOW),
+            batch_notes: Vec::new(),
+            batch_excluded: false,
         }
     }
 
@@ -1138,6 +1204,31 @@ mod tests {
         );
         s.last_missed.as_mut().unwrap().recorded_at = NOW - MISSED_ALARM_SECONDS;
         assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Ok);
+        // A batching anomaly warns for an hour; batch counters alone never.
+        let mut s = healthy_snapshot();
+        s.batching.batches_sent_total = 3;
+        s.batching.single_fallbacks_total = 2;
+        assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Ok);
+        s.batching.last_anomaly = Some(BatchAnomaly {
+            note_id: 6,
+            nullifier: Felt252::from_u64(9),
+            detail: "skipped with reason 0x".into(),
+            recorded_at: NOW - 10,
+        });
+        let current = evaluate(&s, &policy, NOW);
+        assert_eq!(current.status, Severity::Warning);
+        assert_eq!(
+            current.alarms,
+            ["warning: batched challenge anomaly of note 6 (skipped with reason 0x); the note goes as single calls"]
+        );
+        s.batching.last_anomaly.as_mut().unwrap().recorded_at = NOW - BATCH_ANOMALY_ALARM_SECONDS;
+        assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Ok);
+        // A snapshot of an earlier release, without the batching section,
+        // still reads.
+        let mut value = serde_json::to_value(healthy_snapshot()).unwrap();
+        value.as_object_mut().unwrap().remove("batching");
+        let earlier: ChallengeStatus = serde_json::from_value(value).unwrap();
+        assert_eq!(earlier.batching, BatchingStatus::default());
         let mut s = healthy_snapshot();
         s.indexer.pending_escapes = "unsupported".into();
         assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Warning);

@@ -5,8 +5,9 @@ import {Test, console} from "forge-std/Test.sol";
 import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "../src/adapters/Groth16ProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
+import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
 /// @dev The shared withdrawal golden vector (design §11 WP-F): a real kind-0 escape and a real
 ///      kind-1 close (vault-challenge.json's escape_a2_concede and close_b0) with their exact
@@ -47,10 +48,17 @@ contract WithdrawalGoldenTest is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
-        adapter = new Groth16ProofAdapter();
         (Types.WithdrawalPublicInputs memory escape,) = _withdrawal(ESCAPE);
+        // Folded for the vault DEPLOYER creates at nonce 0, the address the proofs bind.
+        adapter = new Groth16ProofAdapter(
+            vm.computeCreateAddress(DEPLOYER, 0),
+            escape.stateSigningKeyX,
+            escape.stateSigningKeyY,
+            escape.clearanceSigningKeyX,
+            escape.clearanceSigningKeyY
+        );
         vm.setNonce(DEPLOYER, 0);
         vm.prank(DEPLOYER);
         vault = new ZkApiVault(
@@ -64,7 +72,8 @@ contract WithdrawalGoldenTest is Test {
             escape.clearanceSigningKeyX,
             escape.clearanceSigningKeyY,
             OWNER,
-            MAX_PAUSE_DURATION
+            MAX_PAUSE_DURATION,
+            PoseidonRuntime.etch()
         );
         assertEq(address(vault), escape.contractAddress);
         vm.deal(USER, 10 * uint256(DEPOSIT) * 1 gwei);
@@ -142,7 +151,7 @@ contract WithdrawalGoldenTest is Test {
     function _leafOf(uint32 noteId) private view returns (uint256) {
         if (noteId >= vault.nextNoteId()) return 0;
         (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
-        return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiry);
+        return ReferenceHashes.leaf(noteId, commitment, amount, expiry);
     }
 
     /// Siblings of slot `index` (0 or 1) in a tree holding only notes 0 and 1.

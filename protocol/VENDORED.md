@@ -39,6 +39,21 @@ with their license. `Ownable2Step.sol`, added for the vault's two-step
 ownership transfer, is byte-for-byte the file of the recorded revision
 (v5.6.1). The included forge-std sources are its helpers and licenses.
 
+## Formal verification (`formal/`)
+
+`formal/` is this repository's own Lean 4 project (the proof that the vault's
+Poseidon runtime computes zkAPI's Poseidon). It vendors no third-party source:
+Mathlib and its dependencies are fetched by Lake at the revisions
+`formal/lake-manifest.json` pins (Mathlib `8accc04827c389e678c3ef83e623b402e7480394`,
+toolchain `leanprover/lean4:v4.35.0-rc3`, `formal/lean-toolchain`), and their
+build directory `.lake/` is ignored. Adapted, with attribution in the files
+(see `formal/README.md`, Attribution): the axiom-audit command, the `run`
+iteration lemmas, the field definition and the certificate method from
+msp-formal-curve (Apache-2.0, same author), and in `formal/scripts/generate.py`
+a port of arkworks `ark-crypto-primitives` `PoseidonGrainLFSR` (MIT/Apache-2.0).
+`contracts/test/reference/Bn254PoseidonReference.sol` is the vault's former
+generated library, kept as the tests' reference implementation.
+
 ## ERC-4337 EntryPoint v0.7.0 runtime fixtures (test only)
 
 The gasless withdrawal tests (`contracts/test/gasless/`) etch the canonical

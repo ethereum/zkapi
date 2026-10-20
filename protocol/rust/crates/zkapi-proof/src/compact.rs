@@ -16,7 +16,8 @@
 //!   `mpc-1` keys ([`check_setup_accepted`]).
 //! * Setup directories: [`write_setup_directory`] writes the four keys,
 //!   `manifest.json` ([`SetupManifest`]) and the generated Solidity
-//!   (`Bn254Poseidon.sol`, `Groth16ProofAdapter.sol`); [`setup`] generates the
+//!   (`Bn254PoseidonRuntime.sol` with its `poseidon-runtime.json`,
+//!   `Groth16ProofAdapter.sol`); [`setup`] generates the
 //!   development setup. Generating keys needs no feature: only accepting
 //!   development keys does.
 
@@ -116,7 +117,10 @@ pub const REQUEST_VERIFYING_KEY_FILE: &str = "request.vk";
 pub const WITHDRAWAL_PROVING_KEY_FILE: &str = "withdrawal.pk";
 pub const WITHDRAWAL_VERIFYING_KEY_FILE: &str = "withdrawal.vk";
 pub const SETUP_MANIFEST_FILE: &str = "manifest.json";
-pub const SOLIDITY_POSEIDON_FILE: &str = "Bn254Poseidon.sol";
+/// The vault's Poseidon contract ([`poseidon_runtime_solidity_source`]).
+pub const SOLIDITY_POSEIDON_FILE: &str = "Bn254PoseidonRuntime.sol";
+/// Its sidecar ([`poseidon_runtime_manifest`]).
+pub const POSEIDON_RUNTIME_MANIFEST_FILE: &str = "poseidon-runtime.json";
 pub const SOLIDITY_VERIFIER_FILE: &str = "Groth16ProofAdapter.sol";
 
 /// Seeds of the published development signing keys. Every fixture, example and
@@ -366,6 +370,12 @@ pub fn verifying_key_keccak256(vk_file: &[u8], kind: KeyKind) -> Result<[u8; 32]
     Ok(keccak256(payload))
 }
 
+/// keccak256 of a verifying key's arkworks compressed bytes: the adapter's
+/// `REQUEST_VK_HASH` or `WITHDRAWAL_VK_HASH` for that key.
+pub fn verifying_key_hash(key: &VerifyingKey<Bn254>) -> [u8; 32] {
+    vk_hash(key)
+}
+
 fn vk_hash(key: &VerifyingKey<Bn254>) -> [u8; 32] {
     let mut bytes = Vec::new();
     key.serialize_compressed(&mut bytes)
@@ -613,6 +623,18 @@ impl RequestVerifier {
         verify_raw(&self.key, KeyKind::Request, public_inputs, proof)
     }
 
+    /// The verifying key.
+    pub fn verifying_key(&self) -> &VerifyingKey<Bn254> {
+        &self.key
+    }
+
+    /// The adapter's batch verification of request statements under this key
+    /// ([`crate::batch::BatchVerifier`]).
+    pub fn batch(&self) -> crate::batch::BatchVerifier<'_> {
+        crate::batch::BatchVerifier::new(&self.key, KeyKind::Request)
+            .expect("the key's shape was checked when it was loaded")
+    }
+
     /// Verify a typed statement. A field at or above the scalar modulus, or
     /// a point off the curve, is an error rather than reduced.
     pub fn verify(&self, public: &RequestPublicInputsV2, proof: &Groth16ProofWire) -> Result<bool> {
@@ -706,6 +728,18 @@ impl WithdrawalVerifier {
         proof: &Groth16ProofWire,
     ) -> Result<bool> {
         verify_raw(&self.key, KeyKind::Withdrawal, public_inputs, proof)
+    }
+
+    /// The verifying key.
+    pub fn verifying_key(&self) -> &VerifyingKey<Bn254> {
+        &self.key
+    }
+
+    /// The adapter's batch verification of withdrawal statements under this
+    /// key ([`crate::batch::BatchVerifier`]).
+    pub fn batch(&self) -> crate::batch::BatchVerifier<'_> {
+        crate::batch::BatchVerifier::new(&self.key, KeyKind::Withdrawal)
+            .expect("the key's shape was checked when it was loaded")
     }
 
     /// Verify a proof of any kind. The caller checks `kind`, `valid_until` and
@@ -996,7 +1030,7 @@ pub struct PoseidonManifest {
     pub test_hash3: String,
     pub test_hash5: String,
     /// `merkle_node(1, 2)`: one permutation of `(DOMAIN_NODE, 1, 2)`, word 1 (the note tree's
-    /// node hash, `Bn254Poseidon.compress`).
+    /// node hash, `Bn254PoseidonRuntime`'s `compress`).
     #[serde(default)]
     pub test_node: String,
 }
@@ -1023,8 +1057,9 @@ pub fn setup(directory: impl AsRef<Path>) -> Result<()> {
 
 /// Write a setup directory: the four key files with
 /// `zkapi-v2-concession-v1/<setup_id>/<kind>` headers, `manifest.json`,
-/// `Bn254Poseidon.sol` and `Groth16ProofAdapter.sol` (with
-/// `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`). Used by
+/// `Bn254PoseidonRuntime.sol` with `poseidon-runtime.json`, and
+/// `Groth16ProofAdapter.sol` (with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and
+/// `WITHDRAWAL_VK_HASH`). Used by
 /// [`setup`] and by `examples/import_zkey.rs` for the ceremony keys.
 pub fn write_setup_directory(
     directory: impl AsRef<Path>,
@@ -1095,11 +1130,7 @@ pub fn write_setup_directory(
     manifest_json.push(b'\n');
     fs::write(directory.join(SETUP_MANIFEST_FILE), manifest_json)
         .context("write setup manifest")?;
-    fs::write(
-        directory.join(SOLIDITY_POSEIDON_FILE),
-        poseidon_solidity_source(),
-    )
-    .context("write Solidity Poseidon library")?;
+    write_poseidon_runtime(directory)?;
     fs::write(
         directory.join(SOLIDITY_VERIFIER_FILE),
         groth16_solidity_source(setup_id, &request_pk.vk, &withdrawal_pk.vk),
@@ -1573,25 +1604,191 @@ fn verifying_key_manifest(key: &VerifyingKey<Bn254>) -> VerifyingKeyManifest {
     }
 }
 
+/// A public input of a statement, in Groth16 order: its field in `Types`, its ABI bit width (256
+/// for a field element) and, for one that every proof of a vault shares, the Yul name of the
+/// constant the adapter's constructor folds into the first IC point.
+struct SolidityInput {
+    name: &'static str,
+    bits: u16,
+    folded: Option<&'static str>,
+}
+
+const fn input(name: &'static str, bits: u16, folded: Option<&'static str>) -> SolidityInput {
+    SolidityInput { name, bits, folded }
+}
+
+/// `Types.RequestPublicInputs`, in order.
+const REQUEST_SOLIDITY_INPUTS: [SolidityInput; 12] = [
+    input("protocolVersion", 16, Some("PROTOCOL_VERSION")),
+    input("chainId", 64, Some("chainId")),
+    input("contractAddress", 160, Some("vault")),
+    input("activeRoot", 256, None),
+    input("stateSigningKeyX", 256, Some("stateX")),
+    input("stateSigningKeyY", 256, Some("stateY")),
+    input("requestTime", 64, None),
+    input("solvencyBound", 128, None),
+    input("requestNullifier", 256, None),
+    input("authorizationTag", 256, None),
+    input("anonymousCommitmentX", 256, None),
+    input("anonymousCommitmentY", 256, None),
+];
+
+/// `Types.WithdrawalPublicInputs`, in order.
+const WITHDRAWAL_SOLIDITY_INPUTS: [SolidityInput; 16] = [
+    input("protocolVersion", 16, Some("PROTOCOL_VERSION")),
+    input("chainId", 64, Some("chainId")),
+    input("contractAddress", 160, Some("vault")),
+    input("activeRoot", 256, None),
+    input("stateSigningKeyX", 256, Some("stateX")),
+    input("stateSigningKeyY", 256, Some("stateY")),
+    input("clearanceSigningKeyX", 256, Some("clearanceX")),
+    input("clearanceSigningKeyY", 256, Some("clearanceY")),
+    input("noteId", 32, None),
+    input("finalBalance", 128, None),
+    input("destination", 160, None),
+    input("withdrawalNullifier", 256, None),
+    input("kind", 8, None),
+    input("nextNullifier", 256, None),
+    input("conceded", 128, None),
+    input("validUntil", 64, None),
+];
+
+/// The ABI bit width of every public input of a statement kind, in Groth16 order (256 for a
+/// field element): the table the adapter's narrow-field checks are generated from, which the
+/// reference batch verifier ([`crate::batch`]) applies the same way.
+pub fn statement_input_bits(kind: KeyKind) -> Vec<u16> {
+    let table: &[SolidityInput] = match kind {
+        KeyKind::Request => &REQUEST_SOLIDITY_INPUTS,
+        KeyKind::Withdrawal => &WITHDRAWAL_SOLIDITY_INPUTS,
+    };
+    table.iter().map(|input| input.bits).collect()
+}
+
+/// The bytes of `Types.WithdrawalPublicInputs` in calldata: one word per input.
+const WITHDRAWAL_INPUT_BYTES: usize = 32 * WITHDRAWAL_SOLIDITY_INPUTS.len();
+
+/// The bytes of `Types.RequestPublicInputs` in calldata: one word per input.
+const REQUEST_INPUT_BYTES: usize = 32 * REQUEST_SOLIDITY_INPUTS.len();
+
+/// The domain tag of the batch verifier's Fiat-Shamir transcript: its first word is
+/// `keccak256(BATCH_DOMAIN_TAG)` ([`batch_domain`]).
+pub const BATCH_DOMAIN_TAG: &str = "zkapi.groth16.batch.v1";
+
+/// The tag of the adapter's request records: their slot preimage starts with
+/// `keccak256(REQUEST_RECORD_TAG)` ([`request_record`]).
+pub const REQUEST_RECORD_TAG: &str = "zkapi.groth16.request-record.v1";
+
+/// `keccak256(BATCH_DOMAIN_TAG)`, the adapter's `BATCH_DOMAIN`.
+pub fn batch_domain() -> [u8; 32] {
+    keccak256(BATCH_DOMAIN_TAG.as_bytes())
+}
+
+/// `keccak256(REQUEST_RECORD_TAG)`, the adapter's `REQUEST_RECORD`. A withdrawal record's slot
+/// preimage starts with its destination, an address below 2^160, so the request namespace is
+/// disjoint from it only if this word is at or above 2^160: asserted here, at generation.
+pub fn request_record() -> [u8; 32] {
+    let word = keccak256(REQUEST_RECORD_TAG.as_bytes());
+    assert!(
+        word[..12].iter().any(|byte| *byte != 0),
+        "REQUEST_RECORD must be at or above 2^160"
+    );
+    word
+}
+
+/// The proof the adapter reads: A, B and C, eight words.
+const GROTH16_PROOF_BYTES: usize = 0x100;
+
+/// The position of `destination` among the withdrawal inputs: the verify-once record is kept at
+/// keccak256(destination ‖ h), storage ERC-7562 associates with the operation's sender.
+fn withdrawal_destination_index() -> usize {
+    WITHDRAWAL_SOLIDITY_INPUTS
+        .iter()
+        .position(|input| input.name == "destination" && input.bits == 160)
+        .expect("Types.WithdrawalPublicInputs has an address destination")
+}
+
+/// The Yul functions every assembly block of the adapter uses.
+const SOLIDITY_YUL_HELPERS: &str = r#"            // Reverts InvalidProof().
+            function fail() {
+                mstore(0x00, shl(224, 0x09bde339))
+                revert(0x00, 0x04)
+            }
+            // Adds s · (x, y) to the G1 point at l, with the four words after it as scratch. A
+            // scalar at or above the field order is refused. 0 · P is the identity, the neutral
+            // element of the sum: skipped. 1 · P and 2 · P need no scalar multiplication (6,000
+            // gas) either: the point itself, and one addition. The protocol version (2), a
+            // close's kind (1), an escape's kind (0) and an exit's zero nextNullifier and conceded
+            // take these paths.
+            function addTerm(l, x, y, s) {
+                if iszero(lt(s, SCALAR_MODULUS)) { fail() }
+                if s {
+                    let t := add(l, 0x40)
+                    mstore(t, x)
+                    mstore(add(t, 0x20), y)
+                    switch s
+                    case 1 {}
+                    case 2 {
+                        mstore(add(t, 0x40), x)
+                        mstore(add(t, 0x60), y)
+                        if iszero(staticcall(gas(), 0x06, t, 0x80, t, 0x40)) { fail() }
+                    }
+                    default {
+                        mstore(add(t, 0x40), s)
+                        if iszero(staticcall(gas(), 0x07, t, 0x60, t, 0x40)) { fail() }
+                    }
+                    if iszero(staticcall(gas(), 0x06, l, 0x80, l, 0x40)) { fail() }
+                }
+            }
+"#;
+
 /// The generated `Groth16ProofAdapter.sol` for a pair of verifying keys.
 pub fn groth16_solidity_source(
     setup_id: &str,
     request_key: &VerifyingKey<Bn254>,
     withdrawal_key: &VerifyingKey<Bn254>,
 ) -> String {
-    let mut source = r#"// SPDX-License-Identifier: MIT
+    assert_eq!(
+        request_key.gamma_abc_g1.len(),
+        REQUEST_SOLIDITY_INPUTS.len() + 1,
+        "request key shape"
+    );
+    assert_eq!(
+        withdrawal_key.gamma_abc_g1.len(),
+        WITHDRAWAL_SOLIDITY_INPUTS.len() + 1,
+        "withdrawal key shape"
+    );
+    let source = r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {IZkApiBatchProofAdapter} from "../interfaces/IZkApiBatchProofAdapter.sol";
 import {IZkApiProofAdapter} from "../interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../libraries/Types.sol";
-import {Errors} from "../libraries/Errors.sol";
 
 /// @title Groth16ProofAdapter
 /// @notice zkAPI verifier for circuit __CIRCUIT_ID__, setup __SETUP_ID__, generated from its
 ///         verifying keys. Verification is standard Groth16 over the 12 request and 16 withdrawal
 ///         public inputs, in the order of Types.RequestPublicInputs and Types.WithdrawalPublicInputs;
 ///         inputs of 0, 1 and 2 skip the scalar multiplication.
-contract Groth16ProofAdapter is IZkApiProofAdapter {
+///         A deployment serves one vault: the constructor folds the inputs every proof of that
+///         vault shares (protocol version 2, the chain ID, the vault's address and its signing
+///         keys) into the first IC point, and a statement whose words equal them all skips their
+///         scalar multiplications. Any other statement is verified over every input, so the
+///         adapter accepts exactly the proofs of these keys, whatever it was folded for; a wrong
+///         fold only costs gas.
+///         verifyWithdrawalOnce, the gasless paymaster's verification in validation, records the
+///         statement and proof it verified for the rest of the transaction (EIP-1153), and
+///         assertValidWithdrawal of the same bytes, the vault's in the execution phase, then
+///         returns without verifying them again.
+///         The batch entry points (IZkApiBatchProofAdapter) verify n statements of one kind at
+///         once, all or nothing, with one random linear combination of their equations: n + 3
+///         pairings and one shared multi-scalar multiplication instead of 4n pairings and n. The
+///         Once variants then write, for every item, the record a single verification would have
+///         left (withdrawals: the record of verifyWithdrawalOnce; requests: a record under
+///         REQUEST_RECORD that assertValidRequest consults), for ZkApiExitBatcher's vault calls.
+/// @dev Every word is read from calldata as Solidity's ABI decoder reads it: the narrow fields
+///      must be clean (an empty revert otherwise), the proof is 256 bytes and every input and
+///      proof word must be canonical; any other failure reverts InvalidProof().
+contract Groth16ProofAdapter is IZkApiProofAdapter, IZkApiBatchProofAdapter {
     /// @notice keccak256("__CIRCUIT_ID__"): the statement this adapter verifies.
     bytes32 public constant CIRCUIT_ID_HASH = __CIRCUIT_ID_HASH__;
     /// @notice keccak256 of the request verifying key (arkworks compressed bytes of request.vk
@@ -1604,208 +1801,787 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint256 private constant BASE_MODULUS =
         21888242871839275222246405745257275088696311157297823662689037894645226208583;
+    /// @dev The protocol version every statement carries.
+    uint256 private constant PROTOCOL_VERSION = 2;
+    /// @dev keccak256("__BATCH_DOMAIN_TAG__"): the first word of a batch's Fiat-Shamir transcript.
+    uint256 private constant BATCH_DOMAIN = __BATCH_DOMAIN__;
+    /// @dev keccak256("__REQUEST_RECORD_TAG__"), at or above 2^160: the first word of a request
+    ///      record's slot preimage, where a withdrawal record has its destination (below 2^160), so
+    ///      that no record of one kind can be read as one of the other.
+    uint256 private constant REQUEST_RECORD = __REQUEST_RECORD__;
 
-    struct G1Point { uint256 x; uint256 y; }
-    // Coordinates use arkworks order: c0 (real), then c1 (imaginary).
-    struct G2Point { uint256[2] x; uint256[2] y; }
-    struct Proof { G1Point a; G2Point b; G1Point c; }
+    /// @notice The chain ID the fold binds: block.chainid at construction.
+    uint256 public immutable foldedChainId;
+    /// @notice The vault address the fold binds (the statements' contractAddress).
+    address public immutable foldedVault;
+    /// @notice The state signing key the fold binds.
+    uint256 public immutable foldedStateSigningKeyX;
+    uint256 public immutable foldedStateSigningKeyY;
+    /// @notice The clearance signing key the withdrawal fold binds.
+    uint256 public immutable foldedClearanceSigningKeyX;
+    uint256 public immutable foldedClearanceSigningKeyY;
+    /// @notice IC0 + 2 · IC1 + chainId · IC2 + vault · IC3 + stateX · IC5 + stateY · IC6 of the
+    ///         request key, with the constants above.
+    uint256 public immutable foldedRequestIc0X;
+    uint256 public immutable foldedRequestIc0Y;
+    /// @notice The same for the withdrawal key, plus clearanceX · IC7 + clearanceY · IC8.
+    uint256 public immutable foldedWithdrawalIc0X;
+    uint256 public immutable foldedWithdrawalIc0Y;
+
+    // The verifying keys. G2 coordinates are named by their arkworks coefficients: c0 (real)
+    // and c1 (imaginary), which EIP-197 takes first.
+__VK_CONSTANTS__
+    /// @param vault The vault whose proofs take the folded path: its address, predicted before it
+    ///        exists (the deployer's CREATE nonce, or CREATE2).
+    /// @param stateSigningKeyX The vault's state and clearance signing keys. A coordinate at or
+    ///        above the scalar field order reverts InvalidProof(): no proof can carry it.
+    constructor(
+        address vault,
+        uint256 stateSigningKeyX,
+        uint256 stateSigningKeyY,
+        uint256 clearanceSigningKeyX,
+        uint256 clearanceSigningKeyY
+    ) {
+        foldedChainId = block.chainid;
+        foldedVault = vault;
+        foldedStateSigningKeyX = stateSigningKeyX;
+        foldedStateSigningKeyY = stateSigningKeyY;
+        foldedClearanceSigningKeyX = clearanceSigningKeyX;
+        foldedClearanceSigningKeyY = clearanceSigningKeyY;
+        (foldedRequestIc0X, foldedRequestIc0Y, foldedWithdrawalIc0X, foldedWithdrawalIc0Y) = _fold(
+            block.chainid,
+            uint256(uint160(vault)),
+            stateSigningKeyX,
+            stateSigningKeyY,
+            clearanceSigningKeyX,
+            clearanceSigningKeyY
+        );
+    }
 
     function assertValidRequest(Types.RequestPublicInputs calldata inputs, bytes calldata proof)
-        external view override
+        external
+        view
+        override
     {
-        uint256[12] memory values = [
-            uint256(inputs.protocolVersion),
-            uint256(inputs.chainId),
-            uint256(uint160(inputs.contractAddress)),
-            inputs.activeRoot,
-            inputs.stateSigningKeyX,
-            inputs.stateSigningKeyY,
-            uint256(inputs.requestTime),
-            uint256(inputs.solvencyBound),
-            inputs.requestNullifier,
-            inputs.authorizationTag,
-            inputs.anonymousCommitmentX,
-            inputs.anonymousCommitmentY
-        ];
-        (Proof memory parsed, bool validEncoding) = _decodeProof(proof);
-        if (!validEncoding || !_verifyRequest(values, parsed)) revert Errors.InvalidProof();
+        if (_requestVerifiedEarlier(inputs, proof)) return;
+        _verifyRequest(inputs, proof);
     }
 
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
-        external view override
+        external
+        view
+        override
     {
-        uint256[16] memory values = [
-            uint256(inputs.protocolVersion),
-            uint256(inputs.chainId),
-            uint256(uint160(inputs.contractAddress)),
-            inputs.activeRoot,
-            inputs.stateSigningKeyX,
-            inputs.stateSigningKeyY,
-            inputs.clearanceSigningKeyX,
-            inputs.clearanceSigningKeyY,
-            uint256(inputs.noteId),
-            uint256(inputs.finalBalance),
-            uint256(uint160(inputs.destination)),
-            inputs.withdrawalNullifier,
-            uint256(inputs.kind),
-            inputs.nextNullifier,
-            uint256(inputs.conceded),
-            uint256(inputs.validUntil)
-        ];
-        (Proof memory parsed, bool validEncoding) = _decodeProof(proof);
-        if (!validEncoding || !_verifyWithdrawal(values, parsed)) revert Errors.InvalidProof();
+        if (_verifiedEarlier(inputs, proof)) return;
+        _verifyWithdrawal(inputs, proof);
     }
 
-    function _verifyRequest(uint256[12] memory values, Proof memory proof) private view returns (bool) {
-        G1Point memory accumulator = _requestIc(0);
-        for (uint256 i = 0; i < 12; ++i) {
-            uint256 value = values[i];
-            if (value >= SCALAR_MODULUS) return false;
-            // 0 · IC is the point at infinity, the neutral element of the sum: skipped. 1 · IC and
-            // 2 · IC need no scalar multiplication (6,000 gas) either: the point itself, and one
-            // addition. The protocol version (2), a close's kind (1), an escape's kind (0) and an
-            // exit's zero nextNullifier and conceded take these paths.
-            if (value == 0) continue;
-            G1Point memory point = _requestIc(i + 1);
-            G1Point memory term = point;
-            bool ok;
-            if (value == 2) {
-                (term, ok) = _add(point, point);
-                if (!ok) return false;
-            } else if (value != 1) {
-                (term, ok) = _scalarMul(point, value);
-                if (!ok) return false;
-            }
-            (accumulator, ok) = _add(accumulator, term);
-            if (!ok) return false;
-        }
-        return _pairing(
-            _negate(proof.a), proof.b,
-            _requestAlpha(), _requestBeta(),
-            accumulator, _requestGamma(),
-            proof.c, _requestDelta()
-        );
-    }
-
-    function _verifyWithdrawal(uint256[16] memory values, Proof memory proof) private view returns (bool) {
-        G1Point memory accumulator = _withdrawalIc(0);
-        for (uint256 i = 0; i < 16; ++i) {
-            uint256 value = values[i];
-            if (value >= SCALAR_MODULUS) return false;
-            // 0 · IC is the point at infinity, the neutral element of the sum: skipped. 1 · IC and
-            // 2 · IC need no scalar multiplication (6,000 gas) either: the point itself, and one
-            // addition. The protocol version (2), a close's kind (1), an escape's kind (0) and an
-            // exit's zero nextNullifier and conceded take these paths.
-            if (value == 0) continue;
-            G1Point memory point = _withdrawalIc(i + 1);
-            G1Point memory term = point;
-            bool ok;
-            if (value == 2) {
-                (term, ok) = _add(point, point);
-                if (!ok) return false;
-            } else if (value != 1) {
-                (term, ok) = _scalarMul(point, value);
-                if (!ok) return false;
-            }
-            (accumulator, ok) = _add(accumulator, term);
-            if (!ok) return false;
-        }
-        return _pairing(
-            _negate(proof.a), proof.b,
-            _withdrawalAlpha(), _withdrawalBeta(),
-            accumulator, _withdrawalGamma(),
-            proof.c, _withdrawalDelta()
-        );
-    }
-
-    function _decodeProof(bytes calldata encoded) private pure returns (Proof memory proof, bool valid) {
-        if (encoded.length != 256) return (proof, false);
-        uint256[8] memory words;
+    function verifyWithdrawalOnce(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
+        external
+        override
+    {
+        _verifyWithdrawal(inputs, proof);
+        bytes32 slot = _verifiedSlot(inputs, proof);
         assembly ("memory-safe") {
-            let start := encoded.offset
-            mstore(words, calldataload(start))
-            mstore(add(words, 0x20), calldataload(add(start, 0x20)))
-            mstore(add(words, 0x40), calldataload(add(start, 0x40)))
-            mstore(add(words, 0x60), calldataload(add(start, 0x60)))
-            mstore(add(words, 0x80), calldataload(add(start, 0x80)))
-            mstore(add(words, 0xa0), calldataload(add(start, 0xa0)))
-            mstore(add(words, 0xc0), calldataload(add(start, 0xc0)))
-            mstore(add(words, 0xe0), calldataload(add(start, 0xe0)))
+            tstore(slot, 1)
         }
-        for (uint256 i = 0; i < 8; ++i) if (words[i] >= BASE_MODULUS) return (proof, false);
-        proof.a = G1Point(words[0], words[1]);
-        proof.b = G2Point([words[2], words[3]], [words[4], words[5]]);
-        proof.c = G1Point(words[6], words[7]);
-        return (proof, true);
     }
 
-    function _negate(G1Point memory point) private pure returns (G1Point memory) {
-        if (point.x == 0 && point.y == 0) return G1Point(0, 0);
-        return G1Point(point.x, BASE_MODULUS - (point.y % BASE_MODULUS));
-    }
-
-    function _add(G1Point memory a, G1Point memory b) private view returns (G1Point memory result, bool ok) {
-        uint256[4] memory input = [a.x, a.y, b.x, b.y];
-        assembly ("memory-safe") { ok := staticcall(gas(), 6, input, 0x80, result, 0x40) }
-    }
-
-    function _scalarMul(G1Point memory point, uint256 scalar)
-        private view returns (G1Point memory result, bool ok)
+    function verifyWithdrawalBatch(Types.WithdrawalPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        view
+        override
     {
-        uint256[3] memory input = [point.x, point.y, scalar];
-        assembly ("memory-safe") { ok := staticcall(gas(), 7, input, 0x60, result, 0x40) }
+        _verifyWithdrawalBatch(inputs, proofs);
     }
 
-    function _pairing(
-        G1Point memory a1, G2Point memory a2,
-        G1Point memory b1, G2Point memory b2,
-        G1Point memory c1, G2Point memory c2,
-        G1Point memory d1, G2Point memory d2
-    ) private view returns (bool) {
-        uint256[24] memory input;
-        _writePair(input, 0, a1, a2);
-        _writePair(input, 6, b1, b2);
-        _writePair(input, 12, c1, c2);
-        _writePair(input, 18, d1, d2);
-        uint256[1] memory output;
-        bool ok;
-        assembly ("memory-safe") { ok := staticcall(gas(), 8, input, 0x300, output, 0x20) }
-        return ok && output[0] == 1;
-    }
-
-    function _writePair(uint256[24] memory input, uint256 offset, G1Point memory g1, G2Point memory g2)
-        private pure
+    function verifyRequestBatch(Types.RequestPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        view
+        override
     {
-        input[offset] = g1.x;
-        input[offset + 1] = g1.y;
-        // EIP-197 expects the imaginary coefficient before the real coefficient.
-        input[offset + 2] = g2.x[1];
-        input[offset + 3] = g2.x[0];
-        input[offset + 4] = g2.y[1];
-        input[offset + 5] = g2.y[0];
+        _verifyRequestBatch(inputs, proofs);
     }
 
-__REQUEST_VK__
+    /// @dev The batch verification, then every item's record exactly as verifyWithdrawalOnce writes
+    ///      it (_verifiedSlot).
+    function verifyWithdrawalBatchOnce(Types.WithdrawalPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        override
+    {
+        _verifyWithdrawalBatch(inputs, proofs);
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            for { let i := 0 } lt(i, inputs.length) { i := add(i, 1) } {
+                let w := add(inputs.offset, mul(i, __RECORD_INPUT_BYTES__))
+                calldatacopy(m, w, __RECORD_INPUT_BYTES__)
+                calldatacopy(add(m, __RECORD_INPUT_BYTES__), add(proofs.offset, mul(i, 0x100)), 0x100)
+                mstore(0x00, __BATCH_RECORD_DESTINATION__)
+                mstore(0x20, keccak256(m, __RECORD_BYTES__))
+                tstore(keccak256(0x00, 0x40), 1)
+            }
+        }
+    }
 
-__WITHDRAWAL_VK__
+    /// @dev The batch verification, then every item's request record (_requestVerifiedEarlier).
+    function verifyRequestBatchOnce(Types.RequestPublicInputs[] calldata inputs, bytes calldata proofs)
+        external
+        override
+    {
+        _verifyRequestBatch(inputs, proofs);
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            for { let i := 0 } lt(i, inputs.length) { i := add(i, 1) } {
+                calldatacopy(m, add(inputs.offset, mul(i, __REQUEST_INPUT_BYTES__)), __REQUEST_INPUT_BYTES__)
+                calldatacopy(add(m, __REQUEST_INPUT_BYTES__), add(proofs.offset, mul(i, 0x100)), 0x100)
+                mstore(0x00, REQUEST_RECORD)
+                mstore(0x20, keccak256(m, __REQUEST_RECORD_BYTES__))
+                tstore(keccak256(0x00, 0x40), 1)
+            }
+        }
+    }
+
+    function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
+        return interfaceId == type(IZkApiProofAdapter).interfaceId
+            || interfaceId == type(IZkApiBatchProofAdapter).interfaceId || interfaceId == 0x01ffc9a7;
+    }
+
+    /// @dev Whether verifyWithdrawalOnce verified exactly these inputs and proof earlier in this
+    ///      transaction. Only a full verification writes a record and none is ever erased, so a
+    ///      record means these bytes verified; a proof that is not 256 bytes never does.
+    function _verifiedEarlier(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
+        private
+        view
+        returns (bool verified)
+    {
+        if (proof.length != 0x100) return false;
+        bytes32 slot = _verifiedSlot(inputs, proof);
+        assembly ("memory-safe") {
+            verified := iszero(iszero(tload(slot)))
+        }
+    }
+
+    /// @dev The transient slot of a verified withdrawal: keccak256(destination ‖ h), h the
+    ///      keccak256 of the 16 input words and the 256 proof bytes as the call carries them. Only
+    ///      these exact bytes name it, and it is associated with the destination in the ERC-7562
+    ///      sense (STO-021): the paymaster records it in validation for an operation whose sender
+    ///      is the destination.
+    function _verifiedSlot(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
+        private
+        pure
+        returns (bytes32 slot)
+    {
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            calldatacopy(m, inputs, __RECORD_INPUT_BYTES__)
+            calldatacopy(add(m, __RECORD_INPUT_BYTES__), proof.offset, 0x100)
+            mstore(0x00, __RECORD_DESTINATION__)
+            mstore(0x20, keccak256(m, __RECORD_BYTES__))
+            slot := keccak256(0x00, 0x40)
+        }
+    }
+
+    /// @dev Whether verifyRequestBatchOnce verified exactly these inputs and proof earlier in this
+    ///      transaction: keccak256(REQUEST_RECORD ‖ h), h the keccak256 of the 12 input words and the
+    ///      256 proof bytes as the call carries them. Only a full batch verification writes a record
+    ///      and none is ever erased; a proof that is not 256 bytes never has one.
+    function _requestVerifiedEarlier(Types.RequestPublicInputs calldata inputs, bytes calldata proof)
+        private
+        view
+        returns (bool verified)
+    {
+        if (proof.length != 0x100) return false;
+        assembly ("memory-safe") {
+            let m := mload(0x40)
+            calldatacopy(m, inputs, __REQUEST_INPUT_BYTES__)
+            calldatacopy(add(m, __REQUEST_INPUT_BYTES__), proof.offset, 0x100)
+            mstore(0x00, REQUEST_RECORD)
+            mstore(0x20, keccak256(m, __REQUEST_RECORD_BYTES__))
+            verified := iszero(iszero(tload(keccak256(0x00, 0x40))))
+        }
+    }
+
+__VERIFY_REQUEST__
+
+__VERIFY_WITHDRAWAL__
+
+__VERIFY_REQUEST_BATCH__
+
+__VERIFY_WITHDRAWAL_BATCH__
+
+__FOLD__
 }
-"#
-    .to_string();
-    source = source
+"#;
+    source
+        .replace(
+            "__VK_CONSTANTS__",
+            &format!(
+                "{}\n{}",
+                solidity_vk_constants("REQUEST", request_key),
+                solidity_vk_constants("WITHDRAWAL", withdrawal_key)
+            ),
+        )
+        .replace(
+            "__VERIFY_REQUEST__",
+            &solidity_verify_function("request", &REQUEST_SOLIDITY_INPUTS),
+        )
+        .replace(
+            "__VERIFY_WITHDRAWAL__",
+            &solidity_verify_function("withdrawal", &WITHDRAWAL_SOLIDITY_INPUTS),
+        )
+        .replace(
+            "__VERIFY_REQUEST_BATCH__",
+            &solidity_batch_function("request", &REQUEST_SOLIDITY_INPUTS),
+        )
+        .replace(
+            "__VERIFY_WITHDRAWAL_BATCH__",
+            &solidity_batch_function("withdrawal", &WITHDRAWAL_SOLIDITY_INPUTS),
+        )
+        .replace("__FOLD__", &solidity_fold_function())
+        .replace(
+            "__RECORD_INPUT_BYTES__",
+            &format!("{:#x}", WITHDRAWAL_INPUT_BYTES),
+        )
+        .replace(
+            "__RECORD_DESTINATION__",
+            &yul_input_word(withdrawal_destination_index()),
+        )
+        .replace(
+            "__BATCH_RECORD_DESTINATION__",
+            &yul_word_at("w", withdrawal_destination_index()),
+        )
+        .replace(
+            "__RECORD_BYTES__",
+            &format!("{:#x}", WITHDRAWAL_INPUT_BYTES + GROTH16_PROOF_BYTES),
+        )
+        .replace(
+            "__REQUEST_INPUT_BYTES__",
+            &format!("{:#x}", REQUEST_INPUT_BYTES),
+        )
+        .replace(
+            "__REQUEST_RECORD_BYTES__",
+            &format!("{:#x}", REQUEST_INPUT_BYTES + GROTH16_PROOF_BYTES),
+        )
+        .replace("__BATCH_DOMAIN_TAG__", BATCH_DOMAIN_TAG)
+        .replace("__BATCH_DOMAIN__", &hex32(&batch_domain()))
+        .replace("__REQUEST_RECORD_TAG__", REQUEST_RECORD_TAG)
+        .replace("__REQUEST_RECORD__", &hex32(&request_record()))
         .replace("__CIRCUIT_ID_HASH__", &hex32(&CIRCUIT_ID_HASH))
         .replace("__CIRCUIT_ID__", CIRCUIT_ID)
         .replace("__SETUP_ID__", setup_id)
         .replace("__REQUEST_VK_HASH__", &hex32(&vk_hash(request_key)))
-        .replace("__WITHDRAWAL_VK_HASH__", &hex32(&vk_hash(withdrawal_key)));
-    source = source.replace(
-        "__REQUEST_VK__",
-        &solidity_vk_functions("request", request_key),
+        .replace("__WITHDRAWAL_VK_HASH__", &hex32(&vk_hash(withdrawal_key)))
+}
+
+/// The Yul word of input `index` of the struct at `inputs`.
+fn yul_input_word(index: usize) -> String {
+    yul_word_at("inputs", index)
+}
+
+/// The Yul word `index` of the calldata words at `base`.
+fn yul_word_at(base: &str, index: usize) -> String {
+    if index == 0 {
+        format!("calldataload({base})")
+    } else {
+        format!("calldataload(add({base}, {:#x}))", 32 * index)
+    }
+}
+
+/// `terms` combined pairwise by the Yul builtin `op`, as a balanced tree.
+fn yul_tree(op: &str, terms: &[String]) -> String {
+    match terms {
+        [] => unreachable!("no terms"),
+        [one] => one.clone(),
+        _ => {
+            let (left, right) = terms.split_at(terms.len().div_ceil(2));
+            format!("{op}({}, {})", yul_tree(op, left), yul_tree(op, right))
+        }
+    }
+}
+
+/// `_verifyRequest` or `_verifyWithdrawal`: the whole Groth16 check of one statement in one
+/// assembly block. The pairing input (24 words) is built in place at the free memory pointer m:
+/// the multi-scalar multiplication accumulates at its third G1 point (m + 0x180) and uses the
+/// four words after it, which the gamma point overwrites afterwards, as scratch.
+fn solidity_verify_function(kind: &str, inputs: &[SolidityInput]) -> String {
+    let prefix = kind.to_uppercase();
+    let title = format!("{}{}", kind[..1].to_uppercase(), &kind[1..]);
+    let narrow: Vec<&SolidityInput> = inputs.iter().filter(|input| input.bits < 256).collect();
+    // The comment naming them, wrapped at 100 columns.
+    let mut narrow_names = String::new();
+    let mut line = "            // The narrow fields, as Solidity's ABI decoder checks them (an empty revert):"
+        .to_string();
+    for (position, input) in narrow.iter().enumerate() {
+        let separator = if position + 1 == narrow.len() {
+            "."
+        } else {
+            ","
+        };
+        let item = format!(" {} ({}){separator}", input.name, input.bits);
+        if line.len() + item.len() > 100 {
+            narrow_names.push_str(&line);
+            narrow_names.push('\n');
+            line = "            //".to_string();
+        }
+        line.push_str(&item);
+    }
+    narrow_names.push_str(&line);
+    let narrow_check = yul_tree(
+        "or",
+        &inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.bits < 256)
+            .map(|(index, input)| format!("shr({}, {})", input.bits, yul_input_word(index)))
+            .collect::<Vec<_>>(),
     );
-    source = source.replace(
-        "__WITHDRAWAL_VK__",
-        &solidity_vk_functions("withdrawal", withdrawal_key),
+    let proof_words = yul_tree(
+        "and",
+        &(0..8)
+            .map(|word| {
+                let load = if word == 0 {
+                    "calldataload(o)".to_string()
+                } else {
+                    format!("calldataload(add(o, {:#x}))", 32 * word)
+                };
+                format!("lt({load}, BASE_MODULUS)")
+            })
+            .collect::<Vec<_>>(),
     );
-    source
+    let folded_match = yul_tree(
+        "and",
+        &inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, input)| {
+                input
+                    .folded
+                    .map(|constant| format!("eq({}, {constant})", yul_input_word(index)))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let term = |index: usize| {
+        format!(
+            "addTerm(l, {prefix}_IC{point}_X, {prefix}_IC{point}_Y, {word})",
+            point = index + 1,
+            word = yul_input_word(index)
+        )
+    };
+    let mut generic = String::new();
+    let mut shared = String::new();
+    for (index, input) in inputs.iter().enumerate() {
+        if input.folded.is_some() {
+            generic.push_str(&format!("                {}\n", term(index)));
+        } else {
+            shared.push_str(&format!("            {}\n", term(index)));
+        }
+    }
+    let mut locals = format!(
+        "        uint256 foldedX = folded{title}Ic0X;\n        uint256 foldedY = folded{title}Ic0Y;\n"
+    );
+    for (local, immutable) in [
+        ("chainId", "foldedChainId"),
+        ("vault", "uint256(uint160(foldedVault))"),
+        ("stateX", "foldedStateSigningKeyX"),
+        ("stateY", "foldedStateSigningKeyY"),
+        ("clearanceX", "foldedClearanceSigningKeyX"),
+        ("clearanceY", "foldedClearanceSigningKeyY"),
+    ] {
+        if inputs.iter().any(|input| input.folded == Some(local)) {
+            locals.push_str(&format!("        uint256 {local} = {immutable};\n"));
+        }
+    }
+    let struct_name = format!("{title}PublicInputs");
+    format!(
+        r#"    /// @dev The Groth16 verification of a {kind} statement; reverts unless it holds. The
+    ///      checks run in the order of the ABI decoder and the plain verifier: the narrow fields,
+    ///      the proof's length and words, then each input as it enters the multi-scalar
+    ///      multiplication. The pairing input (24 words) is built in place at the free memory
+    ///      pointer m: the multiplication accumulates at its third G1 point (m + 0x180), with the
+    ///      four words gamma takes afterwards as scratch.
+    function _verify{title}(Types.{struct_name} calldata inputs, bytes calldata proof) private view {{
+{locals}        assembly ("memory-safe") {{
+{helpers}{narrow_names}
+            if {narrow_check} {{ revert(0x00, 0x00) }}
+            // The proof: 256 bytes, every word a canonical base-field element.
+            if iszero(eq(proof.length, 0x100)) {{ fail() }}
+            let o := proof.offset
+            if iszero({proof_words}) {{ fail() }}
+            let m := mload(0x40)
+            let l := add(m, 0x180)
+            switch {folded_match}
+            case 0 {{
+                // Another vault, chain, key or version: IC0 and every input.
+                mstore(l, {prefix}_IC0_X)
+                mstore(add(l, 0x20), {prefix}_IC0_Y)
+{generic}            }}
+            default {{
+                // The folded constants: their sum is the constructor's.
+                mstore(l, foldedX)
+                mstore(add(l, 0x20), foldedY)
+            }}
+{shared}{pairing}        }}
+    }}"#,
+        helpers = SOLIDITY_YUL_HELPERS,
+        pairing = solidity_pairing(&prefix),
+    )
+}
+
+/// The pairing e(-A, B) · e(alpha, beta) · e(L, gamma) · e(C, delta) == 1 over the input at m,
+/// whose L the multi-scalar multiplication left at m + 0x180. The proof's words are A.x, A.y,
+/// B.x.c0, B.x.c1, B.y.c0, B.y.c1, C.x, C.y; EIP-197 takes each G2 coefficient c1 first.
+fn solidity_pairing(prefix: &str) -> String {
+    let mut lines = vec![
+        "mstore(m, calldataload(o))".to_string(),
+        "mstore(add(m, 0x20), mod(sub(BASE_MODULUS, calldataload(add(o, 0x20))), BASE_MODULUS))"
+            .to_string(),
+        "mstore(add(m, 0x40), calldataload(add(o, 0x60)))".to_string(),
+        "mstore(add(m, 0x60), calldataload(add(o, 0x40)))".to_string(),
+        "mstore(add(m, 0x80), calldataload(add(o, 0xa0)))".to_string(),
+        "mstore(add(m, 0xa0), calldataload(add(o, 0x80)))".to_string(),
+    ];
+    let g2 = |point: &str| {
+        ["X_C1", "X_C0", "Y_C1", "Y_C0"].map(|coordinate| format!("{prefix}_{point}_{coordinate}"))
+    };
+    let mut constants = vec![
+        (0xc0, format!("{prefix}_ALPHA_X")),
+        (0xe0, format!("{prefix}_ALPHA_Y")),
+    ];
+    for (point, at) in [("BETA", 0x100), ("GAMMA", 0x1c0), ("DELTA", 0x280)] {
+        for (word, name) in g2(point).into_iter().enumerate() {
+            constants.push((at + 0x20 * word, name));
+        }
+    }
+    for (at, name) in constants {
+        if at == 0x280 {
+            lines.push("calldatacopy(add(m, 0x240), add(o, 0xc0), 0x40)".to_string());
+        }
+        lines.push(format!("mstore(add(m, {at:#x}), {name})"));
+    }
+    lines.push("let ok := staticcall(gas(), 0x08, m, 0x300, 0x00, 0x20)".to_string());
+    lines.push("if iszero(and(ok, eq(mload(0x00), 1))) { fail() }".to_string());
+    let mut out =
+        "            // The pairing: (-A, B), (alpha, beta), (L, gamma), (C, delta).\n".to_string();
+    for line in lines {
+        out.push_str(&format!("            {line}\n"));
+    }
+    out
+}
+
+/// The Yul function the batch verification adds to [`SOLIDITY_YUL_HELPERS`].
+const SOLIDITY_YUL_BATCH_HELPERS: &str = r#"            // Adds r · x to the scalar at p, modulo the field order. An input at or above it is
+            // refused, as the single verification's addTerm refuses it, so no statement verifies
+            // in a non-canonical form (x + r).
+            function accumulate(p, x, r) {
+                if iszero(lt(x, SCALAR_MODULUS)) { fail() }
+                if x { mstore(p, addmod(mload(p), mulmod(r, x, SCALAR_MODULUS), SCALAR_MODULUS)) }
+            }
+"#;
+
+/// `// <head> <item>, <item>, …, <item>.` wrapped at 100 columns, continuation lines `// `.
+fn wrapped_yul_comment(indent: &str, head: &str, items: &[String]) -> String {
+    let mut out = String::new();
+    let mut line = format!("{indent}// {head}");
+    for (position, item) in items.iter().enumerate() {
+        let separator = if position + 1 == items.len() {
+            "."
+        } else {
+            ","
+        };
+        let piece = format!(" {item}{separator}");
+        if line.len() + piece.len() > 100 {
+            out.push_str(&line);
+            out.push('\n');
+            line = format!("{indent}//");
+        }
+        line.push_str(&piece);
+    }
+    out.push_str(&line);
+    out
+}
+
+/// `_verifyRequestBatch` or `_verifyWithdrawalBatch`: the random-linear-combination (RLC) batch
+/// verification of n ≥ 1 statements of one kind in one assembly block, generated from the same
+/// input table as the single verification ([`solidity_verify_function`]): its per-input
+/// narrow-field masks, its folded constants and its generic fallback. With challenges r_0 = 1 and
+/// r_i = keccak256(seed ‖ i) >> 128 for i ≥ 1, where seed = keccak256(BATCH_DOMAIN ‖ VK hash ‖ n ‖
+/// every input word ‖ every proof word), the batch holds iff
+/// Π e(-r_i A_i, B_i) · e((Σ r_i) alpha, beta) · e(Σ r_i L_i, gamma) · e(Σ r_i C_i, delta) == 1,
+/// n + 3 pairs, where Σ r_i L_i = (Σ_folded r_i) IC0' + (Σ_other r_i) IC0 + Σ_j (Σ_i r_i x_ij) IC_j
+/// is one shared multi-scalar multiplication. [`crate::batch`] is the reference implementation of
+/// exactly this transcript and these checks.
+fn solidity_batch_function(kind: &str, inputs: &[SolidityInput]) -> String {
+    let prefix = kind.to_uppercase();
+    let title = format!("{}{}", kind[..1].to_uppercase(), &kind[1..]);
+    let stride = 32 * inputs.len();
+    // The scalars s: Σ r over the folded items, Σ r over the others, then Σ r x_j per input.
+    let scalar_bytes = 32 * (2 + inputs.len());
+    let narrow_names = wrapped_yul_comment(
+        "                ",
+        "The narrow fields, as Solidity's ABI decoder checks them (an empty revert):",
+        &inputs
+            .iter()
+            .filter(|input| input.bits < 256)
+            .map(|input| format!("{} ({})", input.name, input.bits))
+            .collect::<Vec<_>>(),
+    );
+    let narrow_check = yul_tree(
+        "or",
+        &inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.bits < 256)
+            .map(|(index, input)| format!("shr({}, {})", input.bits, yul_word_at("w", index)))
+            .collect::<Vec<_>>(),
+    );
+    let proof_words = yul_tree(
+        "and",
+        &(0..8)
+            .map(|word| format!("lt({}, BASE_MODULUS)", yul_word_at("o", word)))
+            .collect::<Vec<_>>(),
+    );
+    let folded_match = yul_tree(
+        "and",
+        &inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, input)| {
+                input
+                    .folded
+                    .map(|constant| format!("eq({}, {constant})", yul_word_at("w", index)))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let accumulate = |index: usize, indent: &str| {
+        format!(
+            "{indent}accumulate(add(s, {at:#x}), {word}, r)\n",
+            at = 0x40 + 32 * index,
+            word = yul_word_at("w", index)
+        )
+    };
+    let mut generic = String::new();
+    let mut shared = String::new();
+    for (index, input) in inputs.iter().enumerate() {
+        if input.folded.is_some() {
+            generic.push_str(&accumulate(index, "                    "));
+        } else {
+            shared.push_str(&accumulate(index, "                "));
+        }
+    }
+    let msm = (0..inputs.len())
+        .map(|index| {
+            format!(
+                "            addTerm(l, {prefix}_IC{point}_X, {prefix}_IC{point}_Y, mload(add(s, {at:#x})))\n",
+                point = index + 1,
+                at = 0x40 + 32 * index
+            )
+        })
+        .collect::<String>();
+    let mut locals = format!(
+        "        uint256 foldedX = folded{title}Ic0X;\n        uint256 foldedY = folded{title}Ic0Y;\n"
+    );
+    for (local, immutable) in [
+        ("chainId", "foldedChainId"),
+        ("vault", "uint256(uint160(foldedVault))"),
+        ("stateX", "foldedStateSigningKeyX"),
+        ("stateY", "foldedStateSigningKeyY"),
+        ("clearanceX", "foldedClearanceSigningKeyX"),
+        ("clearanceY", "foldedClearanceSigningKeyY"),
+    ] {
+        if inputs.iter().any(|input| input.folded == Some(local)) {
+            locals.push_str(&format!("        uint256 {local} = {immutable};\n"));
+        }
+    }
+    let struct_name = format!("{title}PublicInputs");
+    format!(
+        r#"    /// @dev The batch Groth16 verification of n ≥ 1 {kind} statements, all or nothing: reverts
+    ///      unless every one holds. Each item gets the single verification's checks in its order
+    ///      (narrow fields: an empty revert; proof words, then inputs, canonical: InvalidProof()),
+    ///      and the equations are combined with r_0 = 1 and 128-bit Fiat-Shamir challenges r_i =
+    ///      keccak256(seed ‖ i) >> 128 (i ≥ 1), seed = keccak256(BATCH_DOMAIN ‖ {prefix}_VK_HASH ‖ n ‖
+    ///      every input word ‖ every proof word), the bytes the loop reads: Π e(-r_i A_i, B_i) ·
+    ///      e(Σ r_i alpha, beta) · e(Σ r_i L_i, gamma) · e(Σ r_i C_i, delta) == 1, n + 3 pairs, where
+    ///      Σ r_i L_i = (Σ_folded r_i) IC0' + (Σ_other r_i) IC0 + Σ_j (Σ_i r_i x_ij) IC_j is one
+    ///      shared multi-scalar multiplication over the folded and generic items alike. An empty
+    ///      batch and a proofs length other than 256 · n revert InvalidProof(). Memory from the free
+    ///      pointer m: first the transcript (n ≥ 2), then the pairing input ((n + 3) · 0xc0 bytes),
+    ///      the scalars s ({scalar_words} words), Σ r L with its four scratch words, and Σ r C with its.
+    function _verify{title}Batch(Types.{struct_name}[] calldata inputs, bytes calldata proofs) private view {{
+{locals}        assembly ("memory-safe") {{
+{helpers}{batch_helpers}            let n := inputs.length
+            if iszero(n) {{ fail() }}
+            if iszero(eq(proofs.length, mul(n, 0x100))) {{ fail() }}
+            let m := mload(0x40)
+            // The Fiat-Shamir seed over every byte the loop reads. One statement needs none: r_0 = 1.
+            let seed := 0
+            if gt(n, 1) {{
+                mstore(m, BATCH_DOMAIN)
+                mstore(add(m, 0x20), {prefix}_VK_HASH)
+                mstore(add(m, 0x40), n)
+                calldatacopy(add(m, 0x60), inputs.offset, mul(n, {stride:#x}))
+                calldatacopy(add(m, add(0x60, mul(n, {stride:#x}))), proofs.offset, mul(n, 0x100))
+                seed := keccak256(m, add(0x60, mul(n, {transcript_item:#x})))
+            }}
+            let s := add(m, mul(add(n, 3), 0xc0))
+            let l := add(s, {scalar_bytes:#x})
+            let c := add(l, 0xc0)
+            for {{ let k := 0 }} lt(k, {scalar_bytes:#x}) {{ k := add(k, 0x20) }} {{ mstore(add(s, k), 0) }}
+            for {{ let i := 0 }} lt(i, n) {{ i := add(i, 1) }} {{
+                let w := add(inputs.offset, mul(i, {stride:#x}))
+                let o := add(proofs.offset, mul(i, 0x100))
+{narrow_names}
+                if {narrow_check} {{ revert(0x00, 0x00) }}
+                // The proof: every word a canonical base-field element.
+                if iszero({proof_words}) {{ fail() }}
+                // The challenge: 1 for the first statement, the top 128 bits of keccak256(seed ‖ i)
+                // after it.
+                let r := 1
+                if i {{
+                    mstore(0x00, seed)
+                    mstore(0x20, i)
+                    r := shr(128, keccak256(0x00, 0x40))
+                }}
+                switch {folded_match}
+                case 0 {{
+                    // Another vault, chain, key or version: IC0 and every input.
+                    mstore(add(s, 0x20), addmod(mload(add(s, 0x20)), r, SCALAR_MODULUS))
+{generic}                }}
+                default {{
+                    // The folded constants: IC0'.
+                    mstore(s, addmod(mload(s), r, SCALAR_MODULUS))
+                }}
+{shared}                // Pair i: (-r A, B), A negated in place, then scaled; and r C into the sum at c.
+                let q := add(m, mul(i, 0xc0))
+                mstore(q, calldataload(o))
+                mstore(add(q, 0x20), mod(sub(BASE_MODULUS, calldataload(add(o, 0x20))), BASE_MODULUS))
+                switch i
+                case 0 {{ calldatacopy(c, add(o, 0xc0), 0x40) }}
+                default {{
+                    mstore(add(q, 0x40), r)
+                    if iszero(staticcall(gas(), 0x07, q, 0x60, q, 0x40)) {{ fail() }}
+                    calldatacopy(add(c, 0x40), add(o, 0xc0), 0x40)
+                    mstore(add(c, 0x80), r)
+                    if iszero(staticcall(gas(), 0x07, add(c, 0x40), 0x60, add(c, 0x40), 0x40)) {{ fail() }}
+                    if iszero(staticcall(gas(), 0x06, c, 0x80, c, 0x40)) {{ fail() }}
+                }}
+                mstore(add(q, 0x40), calldataload(add(o, 0x60)))
+                mstore(add(q, 0x60), calldataload(add(o, 0x40)))
+                mstore(add(q, 0x80), calldataload(add(o, 0xa0)))
+                mstore(add(q, 0xa0), calldataload(add(o, 0x80)))
+            }}
+            // Σ r_i L_i: the shared multi-scalar multiplication, from the identity.
+            mstore(l, 0)
+            mstore(add(l, 0x20), 0)
+            addTerm(l, foldedX, foldedY, mload(s))
+            addTerm(l, {prefix}_IC0_X, {prefix}_IC0_Y, mload(add(s, 0x20)))
+{msm}            // The last three pairs: ((Σ r) alpha, beta), (Σ r L, gamma), (Σ r C, delta).
+            let q := add(m, mul(n, 0xc0))
+            let sum := addmod(mload(s), mload(add(s, 0x20)), SCALAR_MODULUS)
+            mstore(q, {prefix}_ALPHA_X)
+            mstore(add(q, 0x20), {prefix}_ALPHA_Y)
+            if iszero(eq(sum, 1)) {{
+                mstore(add(q, 0x40), sum)
+                if iszero(staticcall(gas(), 0x07, q, 0x60, q, 0x40)) {{ fail() }}
+            }}
+            mstore(add(q, 0x40), {prefix}_BETA_X_C1)
+            mstore(add(q, 0x60), {prefix}_BETA_X_C0)
+            mstore(add(q, 0x80), {prefix}_BETA_Y_C1)
+            mstore(add(q, 0xa0), {prefix}_BETA_Y_C0)
+            mstore(add(q, 0xc0), mload(l))
+            mstore(add(q, 0xe0), mload(add(l, 0x20)))
+            mstore(add(q, 0x100), {prefix}_GAMMA_X_C1)
+            mstore(add(q, 0x120), {prefix}_GAMMA_X_C0)
+            mstore(add(q, 0x140), {prefix}_GAMMA_Y_C1)
+            mstore(add(q, 0x160), {prefix}_GAMMA_Y_C0)
+            mstore(add(q, 0x180), mload(c))
+            mstore(add(q, 0x1a0), mload(add(c, 0x20)))
+            mstore(add(q, 0x1c0), {prefix}_DELTA_X_C1)
+            mstore(add(q, 0x1e0), {prefix}_DELTA_X_C0)
+            mstore(add(q, 0x200), {prefix}_DELTA_Y_C1)
+            mstore(add(q, 0x220), {prefix}_DELTA_Y_C0)
+            let ok := staticcall(gas(), 0x08, m, mul(add(n, 3), 0xc0), 0x00, 0x20)
+            if iszero(and(ok, eq(mload(0x00), 1))) {{ fail() }}
+        }}
+    }}"#,
+        helpers = SOLIDITY_YUL_HELPERS,
+        batch_helpers = SOLIDITY_YUL_BATCH_HELPERS,
+        scalar_words = 2 + inputs.len(),
+        transcript_item = stride + GROTH16_PROOF_BYTES,
+    )
+}
+
+/// `_fold`: the constructor's sum of IC0 and the folded inputs' terms, for both keys, by the
+/// routine the verification uses.
+fn solidity_fold_function() -> String {
+    let fold = |prefix: &str, inputs: &[SolidityInput], x: &str, y: &str| {
+        let mut out = format!(
+            "            mstore(l, {prefix}_IC0_X)\n            mstore(add(l, 0x20), {prefix}_IC0_Y)\n"
+        );
+        for (index, input) in inputs.iter().enumerate() {
+            if let Some(constant) = input.folded {
+                out.push_str(&format!(
+                    "            addTerm(l, {prefix}_IC{point}_X, {prefix}_IC{point}_Y, {constant})\n",
+                    point = index + 1
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "            {x} := mload(l)\n            {y} := mload(add(l, 0x20))\n"
+        ));
+        out
+    };
+    format!(
+        r#"    /// @dev IC0 + Σ c · IC over the constants every proof of the vault carries, for both keys,
+    ///      by the routine the verification uses: a constant at or above the scalar field order
+    ///      reverts InvalidProof().
+    function _fold(
+        uint256 chainId,
+        uint256 vault,
+        uint256 stateX,
+        uint256 stateY,
+        uint256 clearanceX,
+        uint256 clearanceY
+    ) private view returns (uint256 requestX, uint256 requestY, uint256 withdrawalX, uint256 withdrawalY) {{
+        assembly ("memory-safe") {{
+{helpers}            let l := mload(0x40)
+{request}{withdrawal}        }}
+    }}"#,
+        helpers = SOLIDITY_YUL_HELPERS,
+        request = fold("REQUEST", &REQUEST_SOLIDITY_INPUTS, "requestX", "requestY"),
+        withdrawal = fold(
+            "WITHDRAWAL",
+            &WITHDRAWAL_SOLIDITY_INPUTS,
+            "withdrawalX",
+            "withdrawalY"
+        ),
+    )
+}
+
+/// A verifying key as Solidity constants: `<PREFIX>_ALPHA_X/Y`, `_BETA_`, `_GAMMA_` and
+/// `_DELTA_X_C0/X_C1/Y_C0/Y_C1`, and `_IC<i>_X/Y`. scripts/expected-codehashes.mjs reads the IC
+/// points by these names from the artifact's AST to recompute the fold.
+fn solidity_vk_constants(prefix: &str, key: &VerifyingKey<Bn254>) -> String {
+    let mut out = String::new();
+    let mut constant = |name: String, value: String| {
+        out.push_str(&format!("    uint256 private constant {name} = {value};\n"));
+    };
+    constant(format!("{prefix}_ALPHA_X"), field_hex(&key.alpha_g1.x));
+    constant(format!("{prefix}_ALPHA_Y"), field_hex(&key.alpha_g1.y));
+    for (name, point) in [
+        ("BETA", &key.beta_g2),
+        ("GAMMA", &key.gamma_g2),
+        ("DELTA", &key.delta_g2),
+    ] {
+        constant(format!("{prefix}_{name}_X_C0"), field_hex(&point.x.c0));
+        constant(format!("{prefix}_{name}_X_C1"), field_hex(&point.x.c1));
+        constant(format!("{prefix}_{name}_Y_C0"), field_hex(&point.y.c0));
+        constant(format!("{prefix}_{name}_Y_C1"), field_hex(&point.y.c1));
+    }
+    for (index, point) in key.gamma_abc_g1.iter().enumerate() {
+        constant(format!("{prefix}_IC{index}_X"), field_hex(&point.x));
+        constant(format!("{prefix}_IC{index}_Y"), field_hex(&point.y));
+    }
+    out
 }
 
 fn poseidon_manifest() -> PoseidonManifest {
@@ -1835,8 +2611,9 @@ fn poseidon_manifest() -> PoseidonManifest {
     }
 }
 
-/// The optimized Poseidon constants of the Solidity library (the form of the Poseidon reference
-/// implementation): 372 words, in the layout `Bn254Poseidon.CONSTANTS` documents. Partial rounds
+/// The optimized (sparse) Poseidon constants (the form of the Poseidon reference
+/// implementation): 372 words, in the layout of the former library's `CONSTANTS`
+/// (`protocol/contracts/test/reference/Bn254PoseidonReference.sol`). Partial rounds
 /// add one constant (the constants of the two words that skip the S-box move through the linear
 /// layer into the next round's) and multiply by a sparse matrix: the round's matrix `L` is
 /// factored as `L = M' M''` with `M'' = [[l00, l01, l02], [w1, 1, 0], [w2, 0, 1]]` and
@@ -1844,7 +2621,8 @@ fn poseidon_manifest() -> PoseidonManifest {
 /// round's constant and S-box (they touch word 0 only), folds into the next round's matrix
 /// `M · M'`. The last partial round keeps its dense matrix: the full round after it mixes every
 /// word. [`optimized_poseidon_permutation`] is the permutation these constants describe; the
-/// tests check it against the plain one.
+/// tests check it against the plain one. [`crate::poseidon_runtime::scaled_schedule`] derives the
+/// runtime's scaled constants from them.
 pub(crate) fn optimized_poseidon_constants() -> Vec<Fr> {
     const RF_HALF: usize = 4;
     const RP: usize = 57;
@@ -1909,7 +2687,7 @@ pub(crate) fn optimized_poseidon_constants() -> Vec<Fr> {
     words
 }
 
-/// The permutation [`optimized_poseidon_constants`] describes, as the Solidity library runs it.
+/// The permutation [`optimized_poseidon_constants`] describes, as the former library runs it.
 #[cfg(test)]
 pub(crate) fn optimized_poseidon_permutation(words: &[Fr], mut s: [Fr; 3]) -> [Fr; 3] {
     let config = crate::groth16::poseidon_config();
@@ -1965,7 +2743,8 @@ pub(crate) fn optimized_poseidon_permutation(words: &[Fr], mut s: [Fr; 3]) -> [F
 }
 
 /// Rewrites the generated sources of an existing setup directory from its keys: the Solidity
-/// adapter and Poseidon library, and the manifest's `poseidon` section. For a change to the
+/// adapter, the Poseidon contract and its `poseidon-runtime.json`, and the manifest's `poseidon`
+/// section. For a change to the
 /// generators that leaves the keys alone (the import and the round-trip test regenerate them the
 /// same way).
 pub fn refresh_setup_sources(directory: impl AsRef<Path>) -> Result<()> {
@@ -1989,11 +2768,7 @@ pub fn refresh_setup_sources(directory: impl AsRef<Path>) -> Result<()> {
     let mut manifest_json = serde_json::to_vec_pretty(&manifest).context("encode manifest")?;
     manifest_json.push(b'\n');
     fs::write(&manifest_path, manifest_json).context("write setup manifest")?;
-    fs::write(
-        directory.join(SOLIDITY_POSEIDON_FILE),
-        poseidon_solidity_source(),
-    )
-    .context("write Solidity Poseidon library")?;
+    write_poseidon_runtime(directory)?;
     fs::write(
         directory.join(SOLIDITY_VERIFIER_FILE),
         groth16_solidity_source(&setup_id, &request_vk, &withdrawal_vk),
@@ -2002,411 +2777,47 @@ pub fn refresh_setup_sources(directory: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-fn poseidon_solidity_source() -> String {
+/// The vault's Poseidon contract, `Bn254PoseidonRuntime.sol` ([`crate::poseidon_runtime`]): the
+/// permutation of [`optimized_poseidon_constants`] in the scaled sparse form, fully unrolled with
+/// lazy reduction, behind the four entry points of the `Bn254Poseidon` library it replaces.
+pub fn poseidon_runtime_solidity_source() -> String {
+    crate::poseidon_runtime::runtime_source(&scaled_poseidon_schedule())
+}
+
+/// `poseidon-runtime.json`, the sidecar of [`poseidon_runtime_solidity_source`]: the compiler
+/// settings, the source's SHA-256, the pinned runtime codehash, the entry points, the scaled
+/// constants and the lane bounds after every round.
+pub fn poseidon_runtime_manifest() -> crate::poseidon_runtime::RuntimeManifest {
+    crate::poseidon_runtime::runtime_manifest(&scaled_poseidon_schedule(), SOLIDITY_POSEIDON_FILE)
+}
+
+/// `poseidon-runtime.json` as written: pretty JSON with a final newline.
+pub fn poseidon_runtime_manifest_json() -> Result<Vec<u8>> {
+    let mut json = serde_json::to_vec_pretty(&poseidon_runtime_manifest())
+        .context("encode poseidon-runtime.json")?;
+    json.push(b'\n');
+    Ok(json)
+}
+
+pub(crate) fn scaled_poseidon_schedule() -> crate::poseidon_runtime::ScaledSchedule {
     let config = crate::groth16::poseidon_config();
-    let constants = optimized_poseidon_constants()
-        .iter()
-        .map(|value| hex::encode(prime_field_bytes(value)))
-        .collect::<String>();
-    let mds = config
-        .mds
-        .iter()
-        .flatten()
-        .map(field_hex)
-        .collect::<Vec<_>>();
-    let mut source = r#"// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
-
-/// @title Bn254Poseidon
-/// @notice Poseidon over the BN254 scalar field, generated from zkAPI v2's arkworks parameters:
-///         width 3, rate 2, x^5 S-box, 8 full rounds and 57 partial rounds. compress is the note
-///         tree's node hash (one permutation, the domain in the capacity lane); hash5 is the sponge
-///         (zkapi_core::v2::hash_fields) over five inputs, the note leaf.
-/// @dev The permutation is in the optimized form of the Poseidon reference implementation: every
-///      partial round adds one constant (the constants of the two words that skip the S-box are
-///      moved through the linear layer into the next round) and multiplies by a sparse matrix (the
-///      MDS matrix factored per round, the dense factor folded into the next round's matrix); the
-///      hash function is unchanged. The rounds are Yul with the state in three locals and the round
-///      constants read from memory, where each entry point copies them once.
-library Bn254Poseidon {
-    uint256 internal constant FIELD_MODULUS =
-        21888242871839275222246405745257275088548364400416034343698204186575808495617;
-
-    /// @dev 372 words: the first 4 full rounds (3 constants each), 56 partial rounds (the
-    ///      constant, the sparse matrix's first row and its first column below the diagonal), the
-    ///      last partial round (3 constants and its dense matrix), the last 4 full rounds.
-    bytes internal constant CONSTANTS =
-        hex"__CONSTANTS__";
-
-    /// @notice One permutation of the state (capacity, left, right), its first rate lane: the
-    ///         two-to-one compression of the note tree, zkapi_core::v2::compress_fields.
-    function compress(uint256 capacity, uint256 left, uint256 right) public pure returns (uint256 result) {
-        uint256 freeMemoryPointer;
-        assembly ("memory-safe") {
-            freeMemoryPointer := mload(0x40)
-        }
-        (, result,) = _permute(capacity, left, right, _constants());
-        assembly ("memory-safe") {
-            mstore(0x40, freeMemoryPointer)
-        }
-    }
-
-    /// @notice The sponge over five inputs: zkapi_core::v2::hash_fields, the note leaf's hash.
-    function hash5(uint256 a, uint256 b, uint256 c, uint256 d, uint256 e) public pure returns (uint256 result) {
-        uint256 freeMemoryPointer;
-        assembly ("memory-safe") {
-            freeMemoryPointer := mload(0x40)
-        }
-        uint256 constants = _constants();
-        (uint256 s0, uint256 s1, uint256 s2) = _permute(0, a, b, constants);
-        (s0, s1, s2) = _permute(s0, addmod(s1, c, FIELD_MODULUS), addmod(s2, d, FIELD_MODULUS), constants);
-        (, result,) = _permute(s0, addmod(s1, e, FIELD_MODULUS), s2, constants);
-        assembly ("memory-safe") {
-            mstore(0x40, freeMemoryPointer)
-        }
-    }
-
-    /// @notice The roots of the depth-32 tree with oldLeaf and with newLeaf at index, from the
-    ///         leaf's siblings (bottom up), and the new path's node at nodeLevel (the leaf at 0,
-    ///         the root at 32): 64 compressions with capacity as the node domain.
-    function compressPairPath32(
-        uint256 capacity,
-        uint32 index,
-        uint256 oldLeaf,
-        uint256 newLeaf,
-        uint256[32] calldata siblings,
-        uint256 nodeLevel
-    ) public pure returns (uint256 oldRoot, uint256 newRoot, uint256 newNode) {
-        uint256 freeMemoryPointer;
-        assembly ("memory-safe") {
-            freeMemoryPointer := mload(0x40)
-        }
-        uint256 constants = _constants();
-        oldRoot = oldLeaf;
-        newRoot = newLeaf;
-        newNode = newLeaf;
-        for (uint256 level = 0; level < 32;) {
-            if (level == nodeLevel) newNode = newRoot;
-            uint256 sibling = siblings[level];
-            if (((index >> level) & 1) == 0) {
-                (, oldRoot,) = _permute(capacity, oldRoot, sibling, constants);
-                (, newRoot,) = _permute(capacity, newRoot, sibling, constants);
-            } else {
-                (, oldRoot,) = _permute(capacity, sibling, oldRoot, constants);
-                (, newRoot,) = _permute(capacity, sibling, newRoot, constants);
-            }
-            unchecked {
-                ++level;
-            }
-        }
-        if (nodeLevel >= 32) newNode = newRoot;
-        assembly ("memory-safe") {
-            mstore(0x40, freeMemoryPointer)
-        }
-    }
-
-    /// @notice The root of the depth-32 tree with leaf at index, from the leaf's siblings (bottom
-    ///         up), and the node the insertion completes: the path's node at the level of the
-    ///         lowest zero bit of index (the leaf itself when index is even; the root when every
-    ///         bit is set). An append-only tree stores that node as the left sibling of the
-    ///         insertions that follow.
-    function insertPath32(uint256 capacity, uint32 index, uint256 leaf, uint256[32] memory siblings)
-        public
-        pure
-        returns (uint256 root, uint256 completed)
-    {
-        uint256 freeMemoryPointer;
-        assembly ("memory-safe") {
-            freeMemoryPointer := mload(0x40)
-        }
-        uint256 constants = _constants();
-        root = leaf;
-        completed = leaf;
-        bool completing = true;
-        for (uint256 level = 0; level < 32;) {
-            uint256 sibling = siblings[level];
-            if (((index >> level) & 1) == 0) {
-                if (completing) {
-                    completed = root;
-                    completing = false;
-                }
-                (, root,) = _permute(capacity, root, sibling, constants);
-            } else {
-                (, root,) = _permute(capacity, sibling, root, constants);
-            }
-            unchecked {
-                ++level;
-            }
-        }
-        if (completing) completed = root;
-        assembly ("memory-safe") {
-            mstore(0x40, freeMemoryPointer)
-        }
-    }
-
-    /// @dev The round constants copied to memory; returns the offset of their first word.
-    function _constants() private pure returns (uint256 offset) {
-        bytes memory constants = CONSTANTS;
-        assembly ("memory-safe") {
-            offset := add(constants, 0x20)
-        }
-    }
-
-    /// @dev One Poseidon permutation: 4 full rounds, 57 partial rounds, 4 full rounds. The round
-    ///      groups are separate functions so that the stack pressure of a full round (three S-box
-    ///      outputs and a dense matrix) does not make the compiler keep the partial rounds' values
-    ///      in memory.
-    function _permute(uint256 s0, uint256 s1, uint256 s2, uint256 constants)
-        private
-        pure
-        returns (uint256, uint256, uint256)
-    {
-        (s0, s1, s2) = _fullRounds(s0, s1, s2, constants);
-        (s0, s1, s2) = _partialRounds(s0, s1, s2, constants + 384);
-        (s0, s1, s2) = _lastPartialRound(s0, s1, s2, constants + 11136);
-        (s0, s1, s2) = _fullRounds(s0, s1, s2, constants + 11520);
-        return (s0, s1, s2);
-    }
-
-    /// @dev Four full rounds whose constants start at off.
-    function _fullRounds(uint256 s0, uint256 s1, uint256 s2, uint256 off)
-        private
-        pure
-        returns (uint256, uint256, uint256)
-    {
-        assembly ("memory-safe") {
-            for { let end := add(off, 384) } lt(off, end) { off := add(off, 96) } {
-                let x := addmod(s0, mload(off), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                let y :=
-                    addmod(s1, mload(add(off, 32)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                let z :=
-                    addmod(s2, mload(add(off, 64)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                {
-                    let q := mulmod(x, x, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                    x := mulmod(
-                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                        x,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    )
-                }
-                {
-                    let q := mulmod(y, y, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                    y := mulmod(
-                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                        y,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    )
-                }
-                {
-                    let q := mulmod(z, z, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                    z := mulmod(
-                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                        z,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    )
-                }
-                s0 := addmod(
-                    addmod(
-                        mulmod(
-                            x,
-                            __M0__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        mulmod(
-                            y,
-                            __M1__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    mulmod(
-                        z,
-                        __M2__,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                )
-                s1 := addmod(
-                    addmod(
-                        mulmod(
-                            x,
-                            __M3__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        mulmod(
-                            y,
-                            __M4__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    mulmod(
-                        z,
-                        __M5__,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                )
-                s2 := addmod(
-                    addmod(
-                        mulmod(
-                            x,
-                            __M6__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        mulmod(
-                            y,
-                            __M7__,
-                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                        ),
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    mulmod(
-                        z,
-                        __M8__,
-                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                    ),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                )
-            }
-        }
-        return (s0, s1, s2);
-    }
-
-    /// @dev The 56 partial rounds with a sparse matrix, constants at off (6 words each): the new
-    ///      first word is a full row, the other two gain a multiple of the S-box output.
-    function _partialRounds(uint256 s0, uint256 s1, uint256 s2, uint256 off)
-        private
-        pure
-        returns (uint256, uint256, uint256)
-    {
-        assembly ("memory-safe") {
-            let P := 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-            // Never taken (calldata is far smaller). The modulus must reach the rounds as one stack
-            // value: left a single literal, the optimizer inlines it into every use and the code
-            // transform then places each through codecopy and scratch memory, at a multiple of the
-            // gas. A second, runtime-opaque definition prevents that.
-            if gt(calldatasize(), 0xffffffffffff) { P := 1 }
-            for { let end := add(off, 10752) } lt(off, end) { off := add(off, 192) } {
-                let x := addmod(s0, mload(off), P)
-                {
-                    let q := mulmod(x, x, P)
-                    x := mulmod(mulmod(q, q, P), x, P)
-                }
-                s0 := addmod(
-                    addmod(mulmod(x, mload(add(off, 32)), P), mulmod(s1, mload(add(off, 64)), P), P),
-                    mulmod(s2, mload(add(off, 96)), P),
-                    P
-                )
-                s1 := addmod(s1, mulmod(x, mload(add(off, 128)), P), P)
-                s2 := addmod(s2, mulmod(x, mload(add(off, 160)), P), P)
-            }
-        }
-        return (s0, s1, s2);
-    }
-
-    /// @dev The last partial round, with its dense matrix: constants at off (3 words), the matrix
-    ///      after them (9 words, row-major).
-    function _lastPartialRound(uint256 s0, uint256 s1, uint256 s2, uint256 off)
-        private
-        pure
-        returns (uint256, uint256, uint256)
-    {
-        assembly ("memory-safe") {
-            let x := addmod(s0, mload(off), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-            let y := addmod(s1, mload(add(off, 32)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-            let z := addmod(s2, mload(add(off, 64)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-            {
-                let q := mulmod(x, x, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
-                x := mulmod(
-                    mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    x,
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                )
-            }
-            s0 := addmod(
-                addmod(
-                    mulmod(x, mload(add(off, 96)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    mulmod(y, mload(add(off, 128)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                ),
-                mulmod(z, mload(add(off, 160)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-            )
-            s1 := addmod(
-                addmod(
-                    mulmod(x, mload(add(off, 192)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    mulmod(y, mload(add(off, 224)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                ),
-                mulmod(z, mload(add(off, 256)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-            )
-            s2 := addmod(
-                addmod(
-                    mulmod(x, mload(add(off, 288)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    mulmod(y, mload(add(off, 320)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-                ),
-                mulmod(z, mload(add(off, 352)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
-                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-            )
-        }
-        return (s0, s1, s2);
-    }
-}
-"#
-    .replace("__CONSTANTS__", &constants);
-    for (index, value) in mds.iter().enumerate() {
-        source = source.replace(&format!("__M{index}__"), value);
-    }
-    source
+    let mds: [[Fr; 3]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| config.mds[i][j]));
+    crate::poseidon_runtime::scaled_schedule(&optimized_poseidon_constants(), mds)
 }
 
-fn solidity_vk_functions(prefix: &str, key: &VerifyingKey<Bn254>) -> String {
-    let g1 =
-        |point: &G1Affine| format!("G1Point({}, {})", field_hex(&point.x), field_hex(&point.y));
-    let g2 = |point: &G2Affine| {
-        format!(
-            "G2Point([{}, {}], [{}, {}])",
-            field_hex(&point.x.c0),
-            field_hex(&point.x.c1),
-            field_hex(&point.y.c0),
-            field_hex(&point.y.c1)
-        )
-    };
-    let mut ic_cases = String::new();
-    for (index, point) in key.gamma_abc_g1.iter().enumerate() {
-        ic_cases.push_str(&format!(
-            "        if (index == {index}) return {};\n",
-            g1(point)
-        ));
-    }
-    format!(
-        r#"    function _{prefix}Alpha() private pure returns (G1Point memory) {{
-        return {alpha};
-    }}
-
-    function _{prefix}Beta() private pure returns (G2Point memory) {{
-        return {beta};
-    }}
-
-    function _{prefix}Gamma() private pure returns (G2Point memory) {{
-        return {gamma};
-    }}
-
-    function _{prefix}Delta() private pure returns (G2Point memory) {{
-        return {delta};
-    }}
-
-    function _{prefix}Ic(uint256 index) private pure returns (G1Point memory) {{
-{ic_cases}        revert Errors.InvalidProof();
-    }}"#,
-        alpha = g1(&key.alpha_g1),
-        beta = g2(&key.beta_g2),
-        gamma = g2(&key.gamma_g2),
-        delta = g2(&key.delta_g2),
+/// Writes the generated Poseidon contract and its sidecar into a setup directory.
+fn write_poseidon_runtime(directory: &Path) -> Result<()> {
+    fs::write(
+        directory.join(SOLIDITY_POSEIDON_FILE),
+        poseidon_runtime_solidity_source(),
     )
+    .context("write Solidity Poseidon runtime")?;
+    fs::write(
+        directory.join(POSEIDON_RUNTIME_MANIFEST_FILE),
+        poseidon_runtime_manifest_json()?,
+    )
+    .context("write poseidon-runtime.json")?;
+    Ok(())
 }
 
 fn g1_manifest(point: &G1Affine) -> [String; 2] {
@@ -2436,6 +2847,158 @@ mod tests {
             delta_g2: G2Affine::generator(),
             gamma_abc_g1: vec![G1Affine::generator(); REQUEST_PUBLIC_INPUTS + 1],
         }
+    }
+
+    /// The generated adapter multiplies every public input once on its generic path, and its
+    /// constructor folds exactly the inputs every proof of a vault shares; each narrow input is
+    /// checked at its width.
+    #[test]
+    fn solidity_adapter_folds_only_the_deployment_constants() {
+        let mut withdrawal_vk = test_vk();
+        withdrawal_vk.gamma_abc_g1 = vec![G1Affine::generator(); WITHDRAWAL_PUBLIC_INPUTS + 1];
+        let source = groth16_solidity_source(DEV_SETUP_ID, &test_vk(), &withdrawal_vk);
+        for (prefix, inputs) in [
+            ("REQUEST", &REQUEST_SOLIDITY_INPUTS[..]),
+            ("WITHDRAWAL", &WITHDRAWAL_SOLIDITY_INPUTS[..]),
+        ] {
+            for (index, input) in inputs.iter().enumerate() {
+                // the single verification's term (and the fold's for a folded input), and the
+                // batch verification's shared multi-scalar multiplication
+                let term = format!("addTerm(l, {prefix}_IC{point}_X", point = index + 1);
+                let expected = if input.folded.is_some() { 3 } else { 2 };
+                assert_eq!(
+                    source.matches(&term).count(),
+                    expected,
+                    "{prefix} {}",
+                    input.name
+                );
+                if input.bits < 256 {
+                    let word = yul_input_word(index);
+                    assert!(source.contains(&format!("shr({}, {word})", input.bits)));
+                    let batch_word = yul_word_at("w", index);
+                    assert!(source.contains(&format!("shr({}, {batch_word})", input.bits)));
+                }
+            }
+            assert!(!source.contains(&format!("{prefix}_IC{}_X", inputs.len() + 1)));
+        }
+        let folded: Vec<&str> = WITHDRAWAL_SOLIDITY_INPUTS
+            .iter()
+            .filter(|input| input.folded.is_some())
+            .map(|input| input.name)
+            .collect();
+        assert_eq!(
+            folded,
+            [
+                "protocolVersion",
+                "chainId",
+                "contractAddress",
+                "stateSigningKeyX",
+                "stateSigningKeyY",
+                "clearanceSigningKeyX",
+                "clearanceSigningKeyY"
+            ]
+        );
+        assert!(REQUEST_SOLIDITY_INPUTS
+            .iter()
+            .filter(|input| input.folded.is_some())
+            .map(|input| input.name)
+            .eq(folded[..5].iter().copied()));
+    }
+
+    /// The verify-once record covers the 16 input words and the 256 proof bytes, and its slot is
+    /// keyed by the destination word, so that it stays storage ERC-7562 associates with the
+    /// paymaster's sender (destination = sender) if the input order ever changes.
+    #[test]
+    fn solidity_adapter_records_under_the_destination() {
+        let mut withdrawal_vk = test_vk();
+        withdrawal_vk.gamma_abc_g1 = vec![G1Affine::generator(); WITHDRAWAL_PUBLIC_INPUTS + 1];
+        let source = groth16_solidity_source(DEV_SETUP_ID, &test_vk(), &withdrawal_vk);
+        assert_eq!(withdrawal_destination_index(), 10);
+        assert_eq!(WITHDRAWAL_INPUT_BYTES, 32 * WITHDRAWAL_PUBLIC_INPUTS);
+        for line in [
+            "calldatacopy(m, inputs, 0x200)",
+            "calldatacopy(add(m, 0x200), proof.offset, 0x100)",
+            "mstore(0x00, calldataload(add(inputs, 0x140)))",
+            // verifyWithdrawalBatchOnce writes the same record per item
+            "calldatacopy(m, w, 0x200)",
+            "calldatacopy(add(m, 0x200), add(proofs.offset, mul(i, 0x100)), 0x100)",
+            "mstore(0x00, calldataload(add(w, 0x140)))",
+        ] {
+            assert_eq!(source.matches(line).count(), 1, "{line}");
+        }
+        assert_eq!(
+            source.matches("mstore(0x20, keccak256(m, 0x300))").count(),
+            2
+        );
+        // request records: 12 words and the proof, under REQUEST_RECORD, written by
+        // verifyRequestBatchOnce and read by assertValidRequest
+        assert_eq!(
+            source.matches("mstore(0x20, keccak256(m, 0x280))").count(),
+            2
+        );
+        assert_eq!(source.matches("mstore(0x00, REQUEST_RECORD)").count(), 2);
+        assert!(source.contains("if (_requestVerifiedEarlier(inputs, proof)) return;"));
+        assert!(!source.contains("__RECORD_"));
+        assert!(!source.contains("__REQUEST_"));
+        assert!(!source.contains("__BATCH_"));
+    }
+
+    /// REQUEST_RECORD is at or above 2^160, so no withdrawal record (whose slot preimage starts with
+    /// an address) can be read as a request record; the batch domain is another word.
+    #[test]
+    fn request_records_live_outside_every_destination() {
+        let record = request_record();
+        assert!(record[..12].iter().any(|byte| *byte != 0));
+        assert_ne!(record, batch_domain());
+        assert_eq!(
+            hex32(&batch_domain()),
+            hex32(&keccak256(b"zkapi.groth16.batch.v1"))
+        );
+    }
+
+    /// The batch verification is generated from the same input table as the single one: a changed
+    /// width or meaning of an input (design C turns input 3 into the note's leaf and input 8 into
+    /// noteFields, up to 224 bits) changes only the table. Every narrow input is checked at its
+    /// width, every folded input joins IC0' on the folded path and is accumulated on the generic
+    /// one, and every other input is accumulated on both.
+    #[test]
+    fn batch_verification_follows_the_input_table() {
+        let mut table: Vec<SolidityInput> = WITHDRAWAL_SOLIDITY_INPUTS
+            .iter()
+            .map(|input| SolidityInput {
+                name: input.name,
+                bits: input.bits,
+                folded: input.folded,
+            })
+            .collect();
+        table[3] = input("noteLeaf", 256, None);
+        table[8] = input("noteFields", 224, None);
+        let source = solidity_batch_function("withdrawal", &table);
+        assert!(source.contains("shr(224, calldataload(add(w, 0x100)))"));
+        assert!(!source.contains("shr(32, calldataload(add(w, 0x100)))"));
+        assert!(source.contains("noteFields (224)"));
+        for (index, input) in table.iter().enumerate() {
+            let accumulate = format!(
+                "accumulate(add(s, {:#x}), {}, r)",
+                0x40 + 32 * index,
+                yul_word_at("w", index)
+            );
+            assert_eq!(source.matches(&accumulate).count(), 1, "{}", input.name);
+            if let Some(constant) = input.folded {
+                assert!(source.contains(&format!("eq({}, {constant})", yul_word_at("w", index))));
+            }
+        }
+        assert!(source.contains(&format!("lt(k, {:#x})", 32 * (2 + table.len()))));
+        assert!(source.contains(&format!("mul(n, {:#x})", 32 * table.len())));
+        assert!(source.contains(&format!("mul(n, {:#x})", 32 * table.len() + 0x100)));
+        // and the request kind, with its own table
+        let request = solidity_batch_function("request", &REQUEST_SOLIDITY_INPUTS);
+        assert!(request.contains("mstore(add(m, 0x20), REQUEST_VK_HASH)"));
+        assert!(request.contains("mul(n, 0x180)"));
+        assert_eq!(
+            request.matches("accumulate(add(s, ").count(),
+            REQUEST_PUBLIC_INPUTS
+        );
     }
 
     #[test]
@@ -2648,6 +3211,113 @@ mod tests {
             let s = permute([s[0], s[1] + c, s[2] + d]);
             let s = permute([s[0], s[1] + e, s[2]]);
             assert_eq!(s[1], core::hash_fields(&[a, b, c, d, e]));
+        }
+    }
+
+    /// The runtime's scaled schedule (lane 0 divided by λ_j in partial round j) is the same
+    /// permutation: every lane against the sparse form (checked above against zkapi-core), the
+    /// node compression with its domain in the capacity lane and the five-input sponge against
+    /// zkapi-core's arkworks sponge, including inputs that are not reduced field elements.
+    #[test]
+    fn scaled_poseidon_schedule_describes_the_same_permutation() {
+        let schedule = scaled_poseidon_schedule();
+        let words = optimized_poseidon_constants();
+        let scaled = |s: [Fr; 3]| crate::poseidon_runtime::scaled_permutation(&schedule, s);
+        assert_eq!(schedule.lambdas.len(), 57);
+        assert_eq!(schedule.lambdas[0], Fr::one());
+        let domain = Fr::from_be_bytes_mod_order(b"zkapi.v2.node");
+        let mut rng = ark_std::test_rng();
+        for seed in 0u64..8 {
+            let state = [Fr::rand(&mut rng), Fr::rand(&mut rng), Fr::rand(&mut rng)];
+            assert_eq!(scaled(state), optimized_poseidon_permutation(&words, state));
+            let (a, b, c, d, e) = (
+                Fr::from(seed * 7 + 1),
+                Fr::rand(&mut rng),
+                Fr::from(seed * 13 + 3),
+                -Fr::from(seed + 1),
+                Fr::rand(&mut rng),
+            );
+            assert_eq!(
+                scaled([domain, a, b])[1],
+                core::compress_fields(domain, a, b)
+            );
+            assert_eq!(
+                scaled([state[0], a, b])[1],
+                core::compress_fields(state[0], a, b)
+            );
+            let s = scaled([Fr::zero(), a, b]);
+            let s = scaled([s[0], s[1] + c, s[2] + d]);
+            let s = scaled([s[0], s[1] + e, s[2]]);
+            assert_eq!(s[1], core::hash_fields(&[a, b, c, d, e]));
+        }
+        assert_eq!(
+            scaled([domain, Fr::from(1u64), Fr::from(2u64)])[1],
+            crate::groth16::merkle_node(Fr::from(1u64), Fr::from(2u64))
+        );
+    }
+
+    /// The generated runtime: the library's four selectors, one unrolled `permute` of 65 round
+    /// blocks after the modulus binding and the never-taken branch, a plain ADD only where the
+    /// operands' bounds total at most 5 (5p < 2^256), canonical outputs, and a sidecar that
+    /// describes this source.
+    #[test]
+    fn poseidon_runtime_source_has_the_verified_shape() {
+        use crate::poseidon_runtime::{permute_body, word_hex};
+        let schedule = scaled_poseidon_schedule();
+        let (body, bounds) = permute_body(&schedule);
+        assert_eq!(bounds.len(), 65);
+        assert!(bounds.iter().flatten().all(|&m| (1..=5).contains(&m)));
+        assert_eq!(bounds[64], [1, 1, 1], "the last round reduces every lane");
+        let rounds = body
+            .lines()
+            .filter(|line| line == &"                {")
+            .count();
+        assert_eq!(rounds, 65);
+        assert!(body.starts_with(
+            "                let P := 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001\n"
+        ));
+        assert!(body.ends_with("                }\n"));
+        for line in body.lines() {
+            assert!(!line.ends_with(' ') && !line.contains('\t'), "{line:?}");
+        }
+        let source = poseidon_runtime_solidity_source();
+        assert_eq!(
+            source
+                .matches("function permute(s0, s1, s2) -> r0, r1, r2 {")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches(&body).count(), 1);
+        for selector in ["0x2d0c7694", "0xc98aeff5", "0x21d2c645", "0xf6073d4e"] {
+            assert_eq!(source.matches(&format!("case {selector} {{")).count(), 1);
+        }
+        assert!(!source.contains('\r') && source.ends_with("}\n"));
+        let manifest = poseidon_runtime_manifest();
+        assert_eq!(
+            manifest.source_sha256,
+            hex::encode(sha256(source.as_bytes()))
+        );
+        assert_eq!(manifest.lane_bounds, bounds);
+        assert_eq!(manifest.scaled_constants.lambdas[0], word_hex(&Fr::one()));
+        assert_eq!(manifest.scaled_constants.partial_rounds.len(), 56);
+        assert_eq!(
+            manifest
+                .entry_points
+                .iter()
+                .map(|e| e.selector.as_str())
+                .collect::<Vec<_>>(),
+            ["0x2d0c7694", "0xc98aeff5", "0x21d2c645", "0xf6073d4e"]
+        );
+        // Every literal of the body is a canonical constant (or the modulus itself, in the
+        // binding), written as 0x and 64 hex digits.
+        for token in body
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.starts_with("0x"))
+        {
+            if token == "0xffffffffffff" {
+                continue;
+            }
+            assert_eq!(token.len(), 66, "{token}");
         }
     }
 

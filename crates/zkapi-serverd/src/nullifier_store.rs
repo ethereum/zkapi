@@ -26,7 +26,7 @@ use zkapi_proof::compact::RequestVerifier;
 use zkapi_types::wire::{ApiRequestV2, CurvePointWire};
 use zkapi_types::{
     canonical_payload_hash, canonical_request_context, Felt252, RequestPublicInputsV2,
-    SchnorrSignature,
+    SchnorrSignature, WithdrawalPublicInputsV2C,
 };
 
 use crate::error::ServerError;
@@ -774,6 +774,9 @@ impl NullifierStore {
         migrate_settlement_review_log(&conn)?;
         conn.execute_batch(REQUEST_EVIDENCE_SCHEMA).map_err(|e| {
             ServerError::Database(format!("failed to create request_evidence: {e}"))
+        })?;
+        conn.execute_batch(CLOSE_RELAY_SCHEMA).map_err(|e| {
+            ServerError::Database(format!("failed to create the close relay tables: {e}"))
         })?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS nullifiers_settled_unsigned
@@ -2522,8 +2525,8 @@ impl NullifierStore {
             if !reviewed("binding_corrupt")? {
                 return Err(ReopenRefusal::NotBindingCorrupt);
             }
-        } else if !restoring_pending
-            && !(options.zero_charge && pending && reviewed("binding_reopened")?)
+        } else if !(restoring_pending
+            || (options.zero_charge && pending && reviewed("binding_reopened")?))
         {
             // Another undecodable column keeps a pending row with a readable
             // saved request from every scan too: name it instead.
@@ -4367,6 +4370,926 @@ fn current_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// Close relay (`crate::close_relay`): paid fee tickets, relayed closes and the
+// relay's transactions.
+// ---------------------------------------------------------------------------
+
+/// The close relay's tables. A ticket is written with its fee request's
+/// reservation, evidence and settled charge in one transaction
+/// (`reserve_relay_fee`); a relayed close is written with its ticket's
+/// redemption (`enqueue_close_relay`); a batch is written, with its items
+/// marked `in_flight`, before its transaction is sent (`open_relay_batch`).
+pub(crate) const CLOSE_RELAY_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS close_relay_tickets (
+        ticket_hash TEXT PRIMARY KEY,
+        request_nullifier TEXT NOT NULL UNIQUE,
+        client_request_id TEXT NOT NULL,
+        api_request_json TEXT NOT NULL,
+        fee_units INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        redeemed_by TEXT UNIQUE,
+        redeemed_at INTEGER);
+    CREATE TABLE IF NOT EXISTS close_relays (
+        withdrawal_nullifier TEXT PRIMARY KEY,
+        note_id INTEGER NOT NULL,
+        ticket_hash TEXT NOT NULL UNIQUE,
+        submission_digest TEXT NOT NULL,
+        inputs_json TEXT NOT NULL,
+        proof_blob BLOB NOT NULL CHECK (length(proof_blob) = 256),
+        valid_until INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN
+            ('queued', 'in_flight', 'landed', 'closed', 'failed', 'expired')),
+        batch_id INTEGER,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        transaction_hash TEXT,
+        block_number INTEGER,
+        detail TEXT,
+        queued_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS close_relays_status ON close_relays(status, queued_at);
+    CREATE TABLE IF NOT EXISTS close_relay_batches (
+        batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nonce INTEGER NOT NULL,
+        target TEXT NOT NULL,
+        calldata BLOB NOT NULL,
+        items_json TEXT NOT NULL,
+        gas_limit INTEGER NOT NULL,
+        max_fee_per_gas TEXT NOT NULL,
+        max_priority_fee_per_gas TEXT NOT NULL,
+        tx_hashes_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL CHECK (status IN ('pending', 'resolved')),
+        created_at INTEGER NOT NULL,
+        last_sent_at INTEGER,
+        resolved_at INTEGER,
+        outcome TEXT);
+    CREATE UNIQUE INDEX IF NOT EXISTS close_relay_batches_one_pending
+        ON close_relay_batches(status) WHERE status = 'pending';";
+
+/// A paid close-relay fee (`close_relay_tickets`): the fee request at state
+/// `k`, and the relayed close (at `N_{k+1}`, normally) that redeemed it.
+#[derive(Debug, Clone)]
+pub struct RelayFeeTicket {
+    pub ticket_hash: String,
+    pub request_nullifier: Felt252,
+    pub client_request_id: String,
+    /// The fee request exactly as admitted, for the signing sweep.
+    pub api_request: ApiRequestV2,
+    pub fee_units: u128,
+    pub created_at: u64,
+    /// The withdrawal nullifier of the close this ticket paid for.
+    pub redeemed_by: Option<Felt252>,
+    pub redeemed_at: Option<u64>,
+}
+
+/// Where a relayed close stands (`close_relays.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CloseRelayStatus {
+    /// Accepted and waiting for a batch.
+    Queued,
+    /// In the pending batch: its transaction may be in flight.
+    InFlight,
+    /// The vault's MutualClose for it was emitted in a relay transaction.
+    Landed,
+    /// Its note was closed by another transaction.
+    Closed,
+    /// Never relayed again (refused by the vault, payout push failed, or an
+    /// outcome the relay cannot establish): the client submits it itself.
+    Failed,
+    /// Too near its `valid_until` to send.
+    Expired,
+}
+
+impl CloseRelayStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::InFlight => "in_flight",
+            Self::Landed => "landed",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
+        }
+    }
+
+    fn from_db(value: &str) -> Option<Self> {
+        Some(match value {
+            "queued" => Self::Queued,
+            "in_flight" => Self::InFlight,
+            "landed" => Self::Landed,
+            "closed" => Self::Closed,
+            "failed" => Self::Failed,
+            "expired" => Self::Expired,
+            _ => return None,
+        })
+    }
+
+    /// No transaction of the relay will ever carry it again.
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Queued | Self::InFlight)
+    }
+}
+
+/// One relayed close (`close_relays`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseRelayRecord {
+    pub withdrawal_nullifier: Felt252,
+    pub note_id: u32,
+    pub ticket_hash: String,
+    /// `close_relay::submission_digest` of the statement and proof: the same
+    /// close submitted again is recognized by it.
+    pub submission_digest: String,
+    pub public_inputs: WithdrawalPublicInputsV2C,
+    /// The 256-byte Groth16 proof.
+    pub proof: Vec<u8>,
+    pub valid_until: u64,
+    pub status: CloseRelayStatus,
+    pub batch_id: Option<i64>,
+    /// Batches whose transaction reverted as a whole with this close in it.
+    pub attempts: u32,
+    pub transaction_hash: Option<String>,
+    pub block_number: Option<u64>,
+    pub detail: Option<String>,
+    pub queued_at: u64,
+    pub updated_at: u64,
+}
+
+/// A close to enqueue (`enqueue_close_relay`).
+pub struct NewCloseRelay<'a> {
+    pub public_inputs: &'a WithdrawalPublicInputsV2C,
+    pub proof: &'a [u8],
+    pub ticket_hash: &'a str,
+    pub submission_digest: &'a str,
+    pub now: u64,
+}
+
+/// What `enqueue_close_relay` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseRelayEnqueued {
+    /// Queued now, and its ticket redeemed.
+    New(CloseRelayRecord),
+    /// The same close (same statement and proof) was submitted before.
+    Existing(CloseRelayRecord),
+}
+
+/// What happens to one close of a batch, or of the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayItemOutcome {
+    /// Back to the queue, for the next batch (a batch that reverted as a
+    /// whole, or a transient refusal such as a paused vault). `attempt`
+    /// counts it against the close's limit.
+    Requeue {
+        attempt: bool,
+        detail: Option<String>,
+    },
+    /// A terminal status.
+    Terminal {
+        status: CloseRelayStatus,
+        transaction_hash: Option<String>,
+        block_number: Option<u64>,
+        detail: Option<String>,
+    },
+}
+
+/// The relay's transaction for a set of closes (`close_relay_batches`): one
+/// nonce, fixed calldata, and every hash sent for it (fee bumps replace it at
+/// the same nonce).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayBatchRecord {
+    pub batch_id: i64,
+    pub nonce: u64,
+    /// The batcher, or the vault for a single `mutualClose`.
+    pub target: String,
+    pub calldata: Vec<u8>,
+    /// The closes' withdrawal nullifiers, in item order.
+    pub items: Vec<Felt252>,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub tx_hashes: Vec<String>,
+    pub created_at: u64,
+    pub last_sent_at: Option<u64>,
+}
+
+/// A batch to open (`open_relay_batch`).
+pub struct NewRelayBatch<'a> {
+    pub nonce: u64,
+    pub target: &'a str,
+    pub calldata: &'a [u8],
+    pub items: &'a [Felt252],
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub now: u64,
+}
+
+fn relay_refusal(code: &'static str, message: impl Into<String>) -> ServerError {
+    ServerError::CloseRelay {
+        code,
+        message: message.into(),
+    }
+}
+
+fn row_to_relay_ticket(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayFeeTicket> {
+    let undecodable = |index: usize, error: String| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
+    };
+    let request_json: String = row.get("api_request_json")?;
+    let nullifier: String = row.get("request_nullifier")?;
+    let redeemed_by: Option<String> = row.get("redeemed_by")?;
+    Ok(RelayFeeTicket {
+        ticket_hash: row.get("ticket_hash")?,
+        request_nullifier: Felt252::from_hex(&nullifier).map_err(|error| undecodable(1, error))?,
+        client_request_id: row.get("client_request_id")?,
+        api_request: serde_json::from_str(&request_json)
+            .map_err(|error| undecodable(3, error.to_string()))?,
+        fee_units: row.get::<_, i64>("fee_units")?.max(0) as u128,
+        created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
+        redeemed_by: redeemed_by
+            .map(|value| Felt252::from_hex(&value).map_err(|error| undecodable(6, error)))
+            .transpose()?,
+        redeemed_at: row
+            .get::<_, Option<i64>>("redeemed_at")?
+            .map(|value| value.max(0) as u64),
+    })
+}
+
+fn row_to_close_relay(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloseRelayRecord> {
+    let undecodable = |index: usize, error: String| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
+    };
+    let nullifier: String = row.get("withdrawal_nullifier")?;
+    let inputs: String = row.get("inputs_json")?;
+    let status: String = row.get("status")?;
+    Ok(CloseRelayRecord {
+        withdrawal_nullifier: Felt252::from_hex(&nullifier)
+            .map_err(|error| undecodable(0, error))?,
+        note_id: u32::try_from(row.get::<_, i64>("note_id")?)
+            .map_err(|error| undecodable(1, error.to_string()))?,
+        ticket_hash: row.get("ticket_hash")?,
+        submission_digest: row.get("submission_digest")?,
+        public_inputs: serde_json::from_str(&inputs)
+            .map_err(|error| undecodable(4, error.to_string()))?,
+        proof: row.get("proof_blob")?,
+        valid_until: row.get::<_, i64>("valid_until")?.max(0) as u64,
+        status: CloseRelayStatus::from_db(&status)
+            .ok_or_else(|| undecodable(7, format!("unknown close relay status {status}")))?,
+        batch_id: row.get("batch_id")?,
+        attempts: row.get::<_, i64>("attempts")?.clamp(0, u32::MAX as i64) as u32,
+        transaction_hash: row.get("transaction_hash")?,
+        block_number: row
+            .get::<_, Option<i64>>("block_number")?
+            .map(|value| value.max(0) as u64),
+        detail: row.get("detail")?,
+        queued_at: row.get::<_, i64>("queued_at")?.max(0) as u64,
+        updated_at: row.get::<_, i64>("updated_at")?.max(0) as u64,
+    })
+}
+
+fn row_to_relay_batch(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayBatchRecord> {
+    let undecodable = |index: usize, error: String| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
+    };
+    let items: String = row.get("items_json")?;
+    let items: Vec<String> =
+        serde_json::from_str(&items).map_err(|error| undecodable(4, error.to_string()))?;
+    let hashes: String = row.get("tx_hashes_json")?;
+    let decimal = |index: usize, value: String| {
+        value
+            .parse::<u128>()
+            .map_err(|error| undecodable(index, error.to_string()))
+    };
+    Ok(RelayBatchRecord {
+        batch_id: row.get("batch_id")?,
+        nonce: row.get::<_, i64>("nonce")?.max(0) as u64,
+        target: row.get("target")?,
+        calldata: row.get("calldata")?,
+        items: items
+            .iter()
+            .map(|item| Felt252::from_hex(item).map_err(|error| undecodable(4, error)))
+            .collect::<Result<_, _>>()?,
+        gas_limit: row.get::<_, i64>("gas_limit")?.max(0) as u64,
+        max_fee_per_gas: decimal(6, row.get("max_fee_per_gas")?)?,
+        max_priority_fee_per_gas: decimal(7, row.get("max_priority_fee_per_gas")?)?,
+        tx_hashes: serde_json::from_str(&hashes)
+            .map_err(|error| undecodable(8, error.to_string()))?,
+        created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
+        last_sent_at: row
+            .get::<_, Option<i64>>("last_sent_at")?
+            .map(|value| value.max(0) as u64),
+    })
+}
+
+impl NullifierStore {
+    /// Admit a close-relay fee request: reserve its nullifier, record its
+    /// proof as evidence, persist its charge (`settlement`, the fee) and
+    /// write its ticket, all in one transaction. A fee request is therefore
+    /// never reserved without its charge: like every request, it is enforced
+    /// by the challenger (a later escape from its state is raised by the
+    /// fee, one from an earlier state defeated with this evidence). A ticket
+    /// hash used before is refused (`relay_ticket_taken`), with nothing
+    /// written.
+    pub(crate) fn reserve_relay_fee(
+        &self,
+        request: &ApiRequestV2,
+        ticket_hash: &str,
+        settlement: &SettledCharge,
+    ) -> Result<(), ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("relay fee reservation failed: {error}"))
+        };
+        let binding = api_request_binding(request)?;
+        request_proof_bytes(request)?;
+        let request_json = serde_json::to_string(request).map_err(|error| {
+            ServerError::Internal(format!("relay fee encoding failed: {error}"))
+        })?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let taken: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM close_relay_tickets WHERE ticket_hash = ?1)",
+                params![ticket_hash],
+                |row| row.get(0),
+            )
+            .map_err(failed)?;
+        if taken {
+            return Err(relay_refusal(
+                "relay_ticket_taken",
+                "this ticket hash was paid for already; draw a fresh ticket secret",
+            ));
+        }
+        let nullifier = request.public_inputs.request_nullifier;
+        insert_reservation(
+            &transaction,
+            &nullifier,
+            &request.client_request_id,
+            &request.payload_hash,
+            "relay_fee",
+            Some(&binding),
+            settlement.settled_at,
+        )?;
+        insert_evidence(&transaction, request, "reserve", settlement.settled_at)?;
+        let rows = transaction
+            .execute(
+                "UPDATE nullifiers SET settled_charge = ?1, settled_basis = ?2, settled_at = ?3,
+                    response_code = ?4, response_payload = ?5
+                 WHERE nullifier = ?6 AND status = 'Reserved' AND settled_charge IS NULL",
+                params![
+                    sql_charge(settlement.charge)?,
+                    settlement.basis,
+                    sql_time(settlement.settled_at),
+                    settlement.response_code,
+                    settlement.response_payload,
+                    nullifier.to_hex(),
+                ],
+            )
+            .map_err(failed)?;
+        if rows != 1 {
+            return Err(ServerError::Internal(
+                "the relay fee reservation changed while settling".into(),
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO close_relay_tickets (
+                    ticket_hash, request_nullifier, client_request_id, api_request_json,
+                    fee_units, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    ticket_hash,
+                    nullifier.to_hex(),
+                    request.client_request_id,
+                    request_json,
+                    sql_charge(settlement.charge)?,
+                    sql_time(settlement.settled_at),
+                ],
+            )
+            .map_err(failed)?;
+        transaction.commit().map_err(failed)
+    }
+
+    /// The ticket paid by the fee request at `request_nullifier`.
+    pub(crate) fn relay_fee_ticket_of_request(
+        &self,
+        request_nullifier: &Felt252,
+    ) -> Result<Option<RelayFeeTicket>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        conn.query_row(
+            "SELECT * FROM close_relay_tickets WHERE request_nullifier = ?1",
+            params![request_nullifier.to_hex()],
+            row_to_relay_ticket,
+        )
+        .optional()
+        .map_err(|e| ServerError::Database(format!("relay ticket read failed: {e}")))
+    }
+
+    /// The ticket with this hash.
+    pub fn relay_fee_ticket(
+        &self,
+        ticket_hash: &str,
+    ) -> Result<Option<RelayFeeTicket>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        conn.query_row(
+            "SELECT * FROM close_relay_tickets WHERE ticket_hash = ?1",
+            params![ticket_hash],
+            row_to_relay_ticket,
+        )
+        .optional()
+        .map_err(|e| ServerError::Database(format!("relay ticket read failed: {e}")))
+    }
+
+    /// Queue a verified close for the relay and redeem its ticket, in one
+    /// transaction. The same close again (equal `submission_digest`) returns
+    /// its record (`Existing`); another close at its nullifier is refused
+    /// (`relay_conflict`), as is a ticket that is unknown, whose fee request
+    /// is not settled, or that paid for another close; and a nullifier this
+    /// server never cleared (`relay_clearance_unknown`).
+    pub(crate) fn enqueue_close_relay(
+        &self,
+        close: &NewCloseRelay<'_>,
+    ) -> Result<CloseRelayEnqueued, ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("close relay enqueue failed: {error}"))
+        };
+        if close.proof.len() != 256 {
+            return Err(ServerError::InvalidProof(
+                "a Groth16 proof has exactly 256 bytes".into(),
+            ));
+        }
+        let inputs = close.public_inputs;
+        let nullifier = inputs.withdrawal_nullifier.to_hex();
+        let inputs_json = serde_json::to_string(inputs)
+            .map_err(|error| ServerError::Internal(format!("close encoding failed: {error}")))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT * FROM close_relays WHERE withdrawal_nullifier = ?1",
+                params![nullifier],
+                row_to_close_relay,
+            )
+            .optional()
+            .map_err(failed)?
+        {
+            if existing.submission_digest == close.submission_digest
+                && existing.ticket_hash == close.ticket_hash
+            {
+                return Ok(CloseRelayEnqueued::Existing(existing));
+            }
+            return Err(relay_refusal(
+                "relay_conflict",
+                "another close was submitted for this nullifier; the relay keeps the first",
+            ));
+        }
+        let ticket = transaction
+            .query_row(
+                "SELECT * FROM close_relay_tickets WHERE ticket_hash = ?1",
+                params![close.ticket_hash],
+                row_to_relay_ticket,
+            )
+            .optional()
+            .map_err(failed)?
+            .ok_or_else(|| {
+                relay_refusal(
+                    "relay_ticket_unknown",
+                    "no relay fee was paid for this ticket; pay the fee request first",
+                )
+            })?;
+        if let Some(redeemed_by) = ticket.redeemed_by {
+            if redeemed_by != inputs.withdrawal_nullifier {
+                return Err(relay_refusal(
+                    "relay_ticket_redeemed",
+                    "this ticket already paid for another close",
+                ));
+            }
+        }
+        let fee_settled: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM nullifiers WHERE nullifier = ?1
+                    AND reservation_kind = 'relay_fee' AND settled_charge IS NOT NULL)",
+                params![ticket.request_nullifier.to_hex()],
+                |row| row.get(0),
+            )
+            .map_err(failed)?;
+        if !fee_settled {
+            return Err(relay_refusal(
+                "relay_ticket_unknown",
+                "this ticket's fee request is not settled",
+            ));
+        }
+        let cleared = transaction
+            .query_row(
+                "SELECT status FROM nullifiers WHERE nullifier = ?1",
+                params![nullifier],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(failed)?;
+        if cleared.as_deref() != Some(status_to_str(NullifierStatus::ClearanceReserved)) {
+            return Err(relay_refusal(
+                "relay_clearance_unknown",
+                "this server issued no clearance for this withdrawal nullifier",
+            ));
+        }
+        let now = sql_time(close.now);
+        transaction
+            .execute(
+                "INSERT INTO close_relays (
+                    withdrawal_nullifier, note_id, ticket_hash, submission_digest, inputs_json,
+                    proof_blob, valid_until, status, queued_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, ?8)",
+                params![
+                    nullifier,
+                    i64::from(inputs.note_id),
+                    close.ticket_hash,
+                    close.submission_digest,
+                    inputs_json,
+                    close.proof,
+                    sql_time(inputs.valid_until),
+                    now,
+                ],
+            )
+            .map_err(failed)?;
+        let rows = transaction
+            .execute(
+                "UPDATE close_relay_tickets SET redeemed_by = ?1, redeemed_at = ?2
+                 WHERE ticket_hash = ?3 AND (redeemed_by IS NULL OR redeemed_by = ?1)",
+                params![nullifier, now, close.ticket_hash],
+            )
+            .map_err(failed)?;
+        if rows != 1 {
+            return Err(relay_refusal(
+                "relay_ticket_redeemed",
+                "this ticket already paid for another close",
+            ));
+        }
+        let record = transaction
+            .query_row(
+                "SELECT * FROM close_relays WHERE withdrawal_nullifier = ?1",
+                params![nullifier],
+                row_to_close_relay,
+            )
+            .map_err(failed)?;
+        transaction.commit().map_err(failed)?;
+        Ok(CloseRelayEnqueued::New(record))
+    }
+
+    /// The relayed close at `withdrawal_nullifier`.
+    pub fn close_relay(
+        &self,
+        withdrawal_nullifier: &Felt252,
+    ) -> Result<Option<CloseRelayRecord>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        conn.query_row(
+            "SELECT * FROM close_relays WHERE withdrawal_nullifier = ?1",
+            params![withdrawal_nullifier.to_hex()],
+            row_to_close_relay,
+        )
+        .optional()
+        .map_err(|e| ServerError::Database(format!("close relay read failed: {e}")))
+    }
+
+    /// The queued closes, oldest first, at most `limit`.
+    pub(crate) fn queued_close_relays(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<CloseRelayRecord>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT * FROM close_relays WHERE status = 'queued'
+                 ORDER BY queued_at ASC, withdrawal_nullifier ASC LIMIT ?1",
+            )
+            .map_err(|e| ServerError::Database(format!("close relay scan failed: {e}")))?;
+        let rows = statement
+            .query_map(params![limit as i64], row_to_close_relay)
+            .map_err(|e| ServerError::Database(format!("close relay scan failed: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ServerError::Database(format!("close relay scan failed: {e}")))
+    }
+
+    /// The relay's one pending batch, if any.
+    pub(crate) fn pending_relay_batch(&self) -> Result<Option<RelayBatchRecord>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        conn.query_row(
+            "SELECT * FROM close_relay_batches WHERE status = 'pending'",
+            [],
+            row_to_relay_batch,
+        )
+        .optional()
+        .map_err(|e| ServerError::Database(format!("relay batch read failed: {e}")))
+    }
+
+    /// Open the relay's batch at `batch.nonce` for queued closes, before its
+    /// transaction is sent: the batch row and its items' `in_flight` status
+    /// in one transaction. Refused while another batch is pending (one nonce
+    /// lane) or when an item is no longer queued.
+    pub(crate) fn open_relay_batch(&self, batch: &NewRelayBatch<'_>) -> Result<i64, ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("relay batch open failed: {error}"))
+        };
+        if batch.items.is_empty() {
+            return Err(ServerError::Internal("a relay batch needs a close".into()));
+        }
+        let items: Vec<String> = batch.items.iter().map(Felt252::to_hex).collect();
+        let items_json = serde_json::to_string(&items)
+            .map_err(|error| ServerError::Internal(format!("batch encoding failed: {error}")))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let pending: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM close_relay_batches WHERE status = 'pending')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(failed)?;
+        if pending {
+            return Err(ServerError::Internal(
+                "a relay batch is already pending".into(),
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO close_relay_batches (
+                    nonce, target, calldata, items_json, gas_limit, max_fee_per_gas,
+                    max_priority_fee_per_gas, status, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+                params![
+                    sql_time(batch.nonce),
+                    batch.target,
+                    batch.calldata,
+                    items_json,
+                    sql_time(batch.gas_limit),
+                    batch.max_fee_per_gas.to_string(),
+                    batch.max_priority_fee_per_gas.to_string(),
+                    sql_time(batch.now),
+                ],
+            )
+            .map_err(failed)?;
+        let batch_id = transaction.last_insert_rowid();
+        for item in &items {
+            let rows = transaction
+                .execute(
+                    "UPDATE close_relays SET status = 'in_flight', batch_id = ?1, updated_at = ?2
+                     WHERE withdrawal_nullifier = ?3 AND status = 'queued'",
+                    params![batch_id, sql_time(batch.now), item],
+                )
+                .map_err(failed)?;
+            if rows != 1 {
+                return Err(ServerError::Internal(format!(
+                    "close {item} is no longer queued"
+                )));
+            }
+        }
+        transaction.commit().map_err(failed)?;
+        Ok(batch_id)
+    }
+
+    /// Record a transaction sent for the pending batch: its hash (kept with
+    /// every earlier one, since any of them may be mined) and its fees.
+    pub(crate) fn record_relay_send(
+        &self,
+        batch_id: i64,
+        tx_hash: &str,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+        now: u64,
+    ) -> Result<(), ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("relay send record failed: {error}"))
+        };
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let hashes: String = transaction
+            .query_row(
+                "SELECT tx_hashes_json FROM close_relay_batches
+                 WHERE batch_id = ?1 AND status = 'pending'",
+                params![batch_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(failed)?
+            .ok_or_else(|| ServerError::Internal("the relay batch is not pending".into()))?;
+        let mut hashes: Vec<String> = serde_json::from_str(&hashes)
+            .map_err(|error| ServerError::Database(format!("relay batch hashes: {error}")))?;
+        let tx_hash = tx_hash.to_ascii_lowercase();
+        if !hashes.contains(&tx_hash) {
+            hashes.push(tx_hash);
+        }
+        let hashes = serde_json::to_string(&hashes)
+            .map_err(|error| ServerError::Internal(format!("batch encoding failed: {error}")))?;
+        transaction
+            .execute(
+                "UPDATE close_relay_batches SET tx_hashes_json = ?1, max_fee_per_gas = ?2,
+                    max_priority_fee_per_gas = ?3, last_sent_at = ?4
+                 WHERE batch_id = ?5",
+                params![
+                    hashes,
+                    max_fee_per_gas.to_string(),
+                    max_priority_fee_per_gas.to_string(),
+                    sql_time(now),
+                    batch_id
+                ],
+            )
+            .map_err(failed)?;
+        transaction.commit().map_err(failed)
+    }
+
+    /// Resolve the pending batch: apply each close's outcome and mark the
+    /// batch resolved, in one transaction. A close of the batch without an
+    /// outcome goes back to the queue.
+    pub(crate) fn resolve_relay_batch(
+        &self,
+        batch_id: i64,
+        outcomes: &[(Felt252, RelayItemOutcome)],
+        summary: &str,
+        now: u64,
+    ) -> Result<(), ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("relay batch resolution failed: {error}"))
+        };
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let rows = transaction
+            .execute(
+                "UPDATE close_relay_batches SET status = 'resolved', resolved_at = ?1, outcome = ?2
+                 WHERE batch_id = ?3 AND status = 'pending'",
+                params![sql_time(now), truncate_detail(summary), batch_id],
+            )
+            .map_err(failed)?;
+        if rows != 1 {
+            return Err(ServerError::Internal(
+                "the relay batch is not pending".into(),
+            ));
+        }
+        for (nullifier, outcome) in outcomes {
+            apply_relay_outcome(&transaction, nullifier, Some(batch_id), outcome, now)?;
+        }
+        transaction
+            .execute(
+                "UPDATE close_relays SET status = 'queued', batch_id = NULL, updated_at = ?1
+                 WHERE batch_id = ?2 AND status = 'in_flight'",
+                params![sql_time(now), batch_id],
+            )
+            .map_err(failed)?;
+        transaction.commit().map_err(failed)
+    }
+
+    /// Apply outcomes to queued closes outside a batch: those a simulation
+    /// found the vault would refuse, and those past the relay's cutoff.
+    pub(crate) fn settle_queued_relays(
+        &self,
+        outcomes: &[(Felt252, RelayItemOutcome)],
+        now: u64,
+    ) -> Result<(), ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("close relay update failed: {error}"))
+        };
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        for (nullifier, outcome) in outcomes {
+            apply_relay_outcome(&transaction, nullifier, None, outcome, now)?;
+        }
+        transaction.commit().map_err(failed)
+    }
+
+    /// Counts of relayed closes by status, for operator status.
+    pub fn close_relay_counts(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, u64>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let mut statement = conn
+            .prepare("SELECT status, COUNT(*) FROM close_relays GROUP BY status")
+            .map_err(|e| ServerError::Database(format!("close relay count failed: {e}")))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })
+            .map_err(|e| ServerError::Database(format!("close relay count failed: {e}")))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| ServerError::Database(format!("close relay count failed: {e}")))
+    }
+}
+
+/// Apply `outcome` to the close at `nullifier`, which must be queued
+/// (`batch_id` None) or in flight in `batch_id`. A terminal status is never
+/// changed again.
+fn apply_relay_outcome(
+    conn: &Connection,
+    nullifier: &Felt252,
+    batch_id: Option<i64>,
+    outcome: &RelayItemOutcome,
+    now: u64,
+) -> Result<(), ServerError> {
+    let failed = |error: rusqlite::Error| {
+        ServerError::Database(format!("close relay update failed: {error}"))
+    };
+    let (from, batch) = match batch_id {
+        Some(batch_id) => ("in_flight", Some(batch_id)),
+        None => ("queued", None),
+    };
+    match outcome {
+        RelayItemOutcome::Requeue { attempt, detail } => conn
+            .execute(
+                "UPDATE close_relays SET status = 'queued', batch_id = NULL,
+                    attempts = attempts + ?1, detail = COALESCE(?2, detail), updated_at = ?3
+                 WHERE withdrawal_nullifier = ?4 AND status = ?5
+                   AND (?6 IS NULL OR batch_id = ?6)",
+                params![
+                    i64::from(*attempt),
+                    detail.as_deref().map(truncate_detail),
+                    sql_time(now),
+                    nullifier.to_hex(),
+                    from,
+                    batch,
+                ],
+            )
+            .map_err(failed)?,
+        RelayItemOutcome::Terminal {
+            status,
+            transaction_hash,
+            block_number,
+            detail,
+        } => {
+            if !status.is_terminal() {
+                return Err(ServerError::Internal(format!(
+                    "{} is not a terminal close relay status",
+                    status.as_str()
+                )));
+            }
+            conn.execute(
+                "UPDATE close_relays SET status = ?1, transaction_hash = ?2, block_number = ?3,
+                    detail = ?4, updated_at = ?5
+                 WHERE withdrawal_nullifier = ?6 AND status = ?7
+                   AND (?8 IS NULL OR batch_id = ?8)",
+                params![
+                    status.as_str(),
+                    transaction_hash,
+                    block_number.map(sql_time),
+                    detail.as_deref().map(truncate_detail),
+                    sql_time(now),
+                    nullifier.to_hex(),
+                    from,
+                    batch,
+                ],
+            )
+            .map_err(failed)?
+        }
+    };
+    Ok(())
 }
 
 #[cfg(test)]

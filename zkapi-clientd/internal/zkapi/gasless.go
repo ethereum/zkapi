@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/hkdf"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -507,6 +510,100 @@ func transitAccountAddress(factory common.Address, creationCode []byte, entryPoi
 func transitInitCode(factory, owner, payee common.Address) []byte {
 	data, _ := hex.DecodeString(selectorCreateAccount + addressABIWord(strings.ToLower(owner.Hex())) + addressABIWord(strings.ToLower(payee.Hex())))
 	return append(append([]byte{}, factory.Bytes()...), data...)
+}
+
+// ------------------------------------------------------------- the owner key
+
+// The owner key of a transit account is derived, not drawn: one key per
+// payout address and deployment, from the wallet's own secret, so that every
+// gasless exit of this wallet to one payout address uses one transit account
+// S. The first exit's operation creates S through its initCode; every later
+// one finds S's code and carries none, which saves S's creation (about 89,000
+// gas on mainnet, and a state-creation charge of about 535,000 under
+// EIP-8037). The derivation (shared byte for byte with the SDK's
+// deriveTransitOwnerKey; testdata/transit-owner-vectors.json is the table
+// both assert):
+//
+//	PRK      = HKDF-Extract(SHA-256, salt = "zkapi/transit-owner/v1", IKM = seed)
+//	info(c)  = uint256(chainId) ‖ entryPoint ‖ vault ‖ factory ‖ paymaster ‖
+//	           keccak256(accountCreationCode) ‖ payee ‖ uint32(c)
+//	           (big-endian; addresses 20 bytes; 32+5×20+32+20+4 = 168 bytes)
+//	k(c)     = HKDF-Expand(SHA-256, PRK, info(c), 32 bytes), big-endian
+//	owner    = k(c) for the first c = 0, 1, … with 1 ≤ k(c) ≤ n − 1
+//	           (secp256k1's order n; c > 0 happens with probability ~2^-128)
+//
+// Everything S's address commits to besides the owner (the chain, the
+// EntryPoint, the vault, the factory and the creation code it deploys, the
+// paymaster, the payee) is in info, so another deployment, paymaster or
+// payout address gets an unrelated key, and the owner addresses of two
+// payout addresses (public in S's creation) cannot be linked to each other or
+// to the seed. Rejection with a counter rather than a reduction mod n keeps
+// every accepted key exactly uniform. zkapi-clientd's seed is its local
+// payment key (address-funding.json's private_key), which already holds the
+// wallet's funds and is backed up with the payment journal: the owner key can
+// always be derived again from it, and is still journaled with each record
+// (transit.owner_key) so that a record stays readable by earlier builds.
+const transitOwnerDerivationV1 = "hkdf-sha256/zkapi-transit-owner-v1"
+
+// transitOwnerSalt is the HKDF salt of the owner derivation: its domain tag.
+var transitOwnerSalt = []byte("zkapi/transit-owner/v1")
+
+// transitOwnerMaxCounter bounds the resampling; reaching it is a 2^-(128×256)
+// event and an error rather than a loop.
+const transitOwnerMaxCounter = 256
+
+// transitOwnerScope is what a transit account's address commits to besides
+// its owner: the info of the owner derivation.
+type transitOwnerScope struct {
+	ChainID                               uint64
+	EntryPoint, Vault, Factory, Paymaster common.Address
+	CreationCodeHash                      common.Hash
+	Payee                                 common.Address
+}
+
+// info is the HKDF info of counter c: 168 bytes.
+func (s transitOwnerScope) info(counter uint32) []byte {
+	info := common.LeftPadBytes(new(big.Int).SetUint64(s.ChainID).Bytes(), 32)
+	for _, address := range []common.Address{s.EntryPoint, s.Vault, s.Factory, s.Paymaster} {
+		info = append(info, address.Bytes()...)
+	}
+	info = append(info, s.CreationCodeHash.Bytes()...)
+	info = append(info, s.Payee.Bytes()...)
+	return binary.BigEndian.AppendUint32(info, counter)
+}
+
+// transitOwnerExpand is HKDF-Expand(SHA-256, prk, info, 32).
+func transitOwnerExpand(prk, info []byte) ([]byte, error) {
+	return hkdf.Expand(sha256.New, prk, string(info), 32)
+}
+
+// deriveTransitOwnerKey derives the owner key of the transit account that
+// scope and the derived owner determine, and the counter that produced it.
+func deriveTransitOwnerKey(seed []byte, scope transitOwnerScope) (*ecdsa.PrivateKey, uint32, error) {
+	return deriveTransitOwnerKeyWith(seed, scope, transitOwnerExpand)
+}
+
+// deriveTransitOwnerKeyWith is deriveTransitOwnerKey with the expansion
+// given, so that a test reaches the resampling.
+func deriveTransitOwnerKeyWith(seed []byte, scope transitOwnerScope, expand func(prk, info []byte) ([]byte, error)) (*ecdsa.PrivateKey, uint32, error) {
+	if len(seed) < 32 {
+		return nil, 0, errors.New("the transit owner derivation needs a seed of at least 32 bytes")
+	}
+	prk, err := hkdf.Extract(sha256.New, seed, transitOwnerSalt)
+	if err != nil {
+		return nil, 0, errors.New("cannot derive the transit account's owner key")
+	}
+	for counter := uint32(0); counter < transitOwnerMaxCounter; counter++ {
+		okm, err := expand(prk, scope.info(counter))
+		if err != nil || len(okm) != 32 {
+			return nil, 0, errors.New("cannot derive the transit account's owner key")
+		}
+		// ToECDSA refuses 0 and every value ≥ n.
+		if key, err := crypto.ToECDSA(okm); err == nil {
+			return key, counter, nil
+		}
+	}
+	return nil, 0, errors.New("cannot derive the transit account's owner key")
 }
 
 // transitCallData is S.withdraw(vaultCall): the selector, the offset word,

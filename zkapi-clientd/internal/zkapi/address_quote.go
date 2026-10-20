@@ -89,6 +89,11 @@ type AddressPaymentQuote struct {
 	// deducts it, so it is the floor whether the push succeeds or not.
 	PayeeHasCode       bool   `json:"payee_has_code,omitempty"`
 	CreditSurchargeWei string `json:"credit_surcharge_wei,omitempty"`
+	// A relay quote (FeePolicy "relay"): the operator's relay fee in native
+	// units, taken from the private balance by one metered request; Amount
+	// is the payout after it. The quote's fee figures are those of the
+	// wallet-paid close its approval pre-authorizes as the fallback.
+	RelayFeeUnits string `json:"relay_fee_units,omitempty"`
 }
 
 // quoteID is a fresh 32-byte approval ID.

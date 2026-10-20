@@ -215,7 +215,7 @@ All commands run from `protocol/rust` at the frozen circuit revision
    | `request.pk`, `request.vk`, `withdrawal.pk`, `withdrawal.vk` | arkworks keys with headers `zkapi-v2-concession-v1/mpc-1/<kind>\0` |
    | `manifest.json` | See below |
    | `Groth16ProofAdapter.sol` | the regenerated adapter with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH`, `WITHDRAWAL_VK_HASH` (then `forge fmt` into `protocol/contracts/src/adapters`) |
-   | `Bn254Poseidon.sol` | the Poseidon library |
+   | `Bn254PoseidonRuntime.sol`, `poseidon-runtime.json` | the vault's Poseidon contract and its pins (source hash, runtime codehash); identical to the development setup's |
 
    `manifest.json` records:
    - `setup_id: "mpc-1"` and `reduction: "circom"`;

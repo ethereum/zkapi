@@ -226,6 +226,79 @@ clearance. This circuit has no proof-less clearance:
 `--allow-legacy-clearance` refuses startup, and `/health` always reports
 `clearance_ownership_proof_required: true`.
 
+## Relay a cooperative close
+
+An operator can land cooperative closes for its clients through the
+deployment's exit batcher (`mutualCloseBatch`), from its own account. The
+relay is optional and off by default: serverd enables it only when started
+with the `--relay-*` flags and when the deployment manifest names the exit
+batcher. A client never depends on it, because a close the relay does not
+land is one the client can still submit itself.
+
+| Method and path | Purpose |
+|---|---|
+| `GET /v2/withdraw/relay/terms` | The relay's terms: `{"enabled": false}`, or `enabled: true` with `fee_units`, `min_validity_seconds`, `batch_target`, `flush_age_seconds`, `urgent_margin_seconds`, `cutoff_seconds` and `exit_batcher` |
+| `POST /v2/withdraw/relay/fee` | Pay the fee: one `ApiRequestV2` at the note's current state, answered with its signed successor (`RequestResponseV2`) |
+| `POST /v2/withdraw/relay` | Queue a finished kind-1 close: `CloseRelaySubmissionV2C { public_inputs, proof, ticket_secret }`. `202` when it is queued, `200` when the same close is sent again |
+| `GET /v2/withdraw/relay/{withdrawal_nullifier}` | The close's `CloseRelayStatusResponse`, or `404 {"status":"not_found"}` |
+
+The fee is a request like any other, so it needs no circuit change. Its
+payload must be exactly
+`{"mode":"close_relay_fee","version":1,"fee_units":"<fee>","ticket_hash":"0x<64 hex>"}`.
+`fee_units` is the current fee from the terms, and `ticket_hash` is
+`keccak256("zkapi:v2c:close-relay-ticket\0" || secret)` of a fresh 32-byte
+secret. The server admits it with every check of a request, with a solvency
+bound of at least the fee. It settles the request at once at exactly the fee
+and signs the successor: `charge_applied` is the fee, and the response payload
+is `{"status":"relay_fee_paid",...}`. The client installs that successor, asks
+for clearance there, and proves the close at it. The close therefore pays the
+treasury the fee within `deposit - finalBalance`.
+
+The submission carries the close's statement and proof exactly as
+`mutualClose` takes them, together with the ticket's secret. Only the holder of
+the secret can redeem a paid fee, and it redeems one close. The server checks
+the following:
+
+- The close is for this deployment and its keys.
+- It is kind 1, with no successor nullifier and nothing conceded.
+- Its destination is neither zero nor the vault.
+- `valid_until` is at least `min_validity_seconds` ahead.
+- The proof is valid.
+- The nullifier is unused on chain, and the server issued the clearance at
+  it.
+
+The relay sends a batch once `batch_target` closes are queued, once the oldest
+has waited `flush_age_seconds`, or once a close comes within
+`urgent_margin_seconds` of its `valid_until`. It simulates every batch first
+and drops any close the vault would refuse. A close that is in no transaction
+within `cutoff_seconds` of `valid_until` is given back to its client.
+
+`status` is one of the following:
+
+- `queued`
+- `submitted`: in a relay transaction that is not confirmed yet.
+- `landed`: the vault's `MutualClose` for the close was emitted in the relay's
+  transaction, given in `transaction_hash`.
+- `closed`: another transaction closed the note.
+- `failed`: the relay never sends the close again. For example, the payout
+  push failed.
+- `expired`: the close is too near its `valid_until`.
+
+`self_submit` is true for `failed` and `expired`. The client then sends
+`mutualClose` itself, from its wallet. In every case the client confirms the
+payout from the vault's `MutualClose` event, not from this status.
+
+Relay errors are `404 relay_disabled` and the following:
+
+- `400 relay_ticket_invalid`, `relay_ticket_unknown`,
+  `relay_clearance_unknown` and `relay_validity_too_short`.
+- `409 relay_fee_changed`, `relay_ticket_taken`, `relay_ticket_redeemed`,
+  `relay_conflict` and `relay_already_closed`.
+- The request and proof errors listed above.
+
+The fee policy, the relayer's signer, and the operator's flags are described
+in [Close relay](https://github.com/ethereum/zkapi/blob/main/docs/native-eth-billing.md#close-relay).
+
 ## Operations and errors
 
 | Method and path | Purpose |

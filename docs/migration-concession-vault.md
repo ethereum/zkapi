@@ -472,11 +472,14 @@ ignore its Phases 1 to 4, which this runbook replaces.
    rebuild the WebAssembly with `bash scripts/build-browser-client.sh --setup mpc-1`,
    which also copies the keys into `sdk/assets/proofs/` and rewrites
    `sdk/assets/manifest.json`. Commit
-   `protocol/setup/v2-concession/manifest.json`: `Deploy.s.sol` checks an
-   `mpc-1` deployment against it. Then `npm run verify:wasm` must reproduce
-   the WebAssembly byte for byte.
+   `protocol/setup/v2-concession/manifest.json` together with the
+   `Bn254PoseidonRuntime.sol` and `poseidon-runtime.json` that `import_zkey`
+   writes next to it: `Deploy.s.sol` checks an `mpc-1` deployment against the
+   manifest, and refuses to run without a `poseidon-runtime.json` next to
+   `SETUP_MANIFEST` (its `runtime_codehash` pins the Poseidon runtime). Then
+   `npm run verify:wasm` must reproduce the WebAssembly byte for byte.
 5. **Expected codehashes.** Publish the expected runtime code hashes of the
-   vault, adapter and library for each deployment's constructor arguments,
+   vault, adapter and Poseidon runtime for each deployment's constructor arguments,
    computed from source by `node scripts/expected-codehashes.mjs` (it takes
    the arguments as flags, or reads a deployment manifest with
    `--deployment`). Anyone can rebuild the Forge artifacts with the pinned
@@ -495,6 +498,13 @@ The drill vault tests the adversarial cases with short timings. It uses the
    profile only). Deploy the gasless-withdrawal paymaster with it as in
    [B2, step 2](#b2-production-sepolia), with `PAYMASTER_ESCAPES=1`: the
    drill sponsors escape initiations, which no published profile does.
+   Sepolia prices state creation under EIP-8037, where the paymaster's gas
+   policy does not hold, so `Deploy.s.sol` refuses `GASLESS=1` there
+   ([gas schedule](deployment.md#gas-schedule)). Until a paymaster with a
+   policy derived under EIP-8037 exists, deploy the Sepolia vaults with
+   `GASLESS=0`, and run the gasless drills and the
+   [gasless release gates](#gasless-release-gates) on a drill vault of a
+   testnet without state-gas pricing (Hoodi) or on Anvil.
    Finalize the manifest as in [B2, step 3](#b2-production-sepolia).
 2. Build drill binaries that load the `dev` keys, the server with the
    adversary modes, into their own target directory, as
@@ -604,7 +614,10 @@ the challenge period.
 
 Gasless withdrawals have release gates. Pass them on the drill vault before
 B2, step 5 generates any profile with `--bundler-url` (a published
-`gasless.bundler_url`), and again before mainnet (Phase C, step 1). Until
+`gasless.bundler_url`), and again before mainnet (Phase C, step 1). While
+Sepolia refuses the paymaster ([B1, step 1](#b1-drill-vault)), "the drill
+vault" here is one on a testnet without state-gas pricing, and the gates
+must also pass again under the gas schedule mainnet runs at Phase C. Until
 they pass, generate the profiles without `--bundler-url` (`bundler_url` is
 then `null`, and no client sponsors anything by default), and regenerate and
 republish them once the gates pass.
@@ -618,14 +631,22 @@ republish them once the gates pass.
    storage and account accesses of the checks). The gap changes no outcome,
    because a bundler's simulations and the inclusion all run cold. The
    committed measurements are in `protocol/contracts/snapshots/gasless-gas.json`.
+   `RealAdapterWorstCaseTest` pins `PM_VERIFICATION_FLOOR` from the dearest
+   inputs (an `S` with a settled sponsored-escape record, and the scalar
+   multiplication the golden proof's `noteId` 0 skips).
 2. **A real bundler's tracer.** Run a v0.7 bundler with full ERC-7562
    validation (the reference bundler's `debug_bundler_*` mode or Rundler in
    debug mode) against the Anvil harness with the etched EntryPoint, send it
    the acceptance's sponsored close, escape, finalization and forward, and
-   record zero rule violations with the bundler's version. The acceptance's
-   mini bundler does not trace, and the Forge opcode audit
-   (`test_opcodeAudit_*`) is not a bundler's.
-3. **A public bundler on Sepolia.** On the drill vault, with a public v0.7
+   record zero rule violations with the bundler's version. Among the
+   accesses it must accept is the adapter's transient record: the paymaster's
+   validation calls `verifyWithdrawalOnce`, which writes one `TSTORE` in the
+   adapter's frame at `keccak256(sender ‖ h)` (STO-021). Send a close and an
+   escape both from an existing `S` and with initCode, where the rule
+   relies on the staked factory. The acceptance's mini bundler does not
+   trace, and the Forge opcode audit (`test_opcodeAudit_*`) is not a
+   bundler's.
+3. **A public bundler on a public testnet.** On the drill vault, with a public v0.7
    bundler, `eth_sendUserOperation` is accepted and included and `Settled`
    is observed. Then force a `success == false` that the operator controls:
    build a sponsored close as the acceptance harness does (scenario 27),
@@ -656,16 +677,22 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    multisig, ideally behind a timelock), `TREASURY`, the four key
    coordinates, the Sepolia production parameters,
    `SETUP_MANIFEST=../../protocol/setup/v2-concession/manifest.json`,
-   optionally `POSEIDON_ADDRESS` (an existing library with the compiled
-   codehash) and `CHAIN_ID=11155111`; see [the contract notes](deployment.md#contracts).
-   The script checks the keys, links the library, deploys the adapter and
-   the vault with 11 constructor arguments, checks the adapter's
+   optionally `POSEIDON_ADDRESS` (an already deployed `Bn254PoseidonRuntime`
+   whose runtime code hash is the `runtime_codehash` of the
+   `poseidon-runtime.json` next to `SETUP_MANIFEST`) and `CHAIN_ID=11155111`;
+   see [the contract notes](deployment.md#contracts). The script checks the
+   keys, deploys (or reuses) the Poseidon runtime after checking its code hash
+   against that pin, deploys the adapter and the vault with 12 constructor
+   arguments (the Poseidon runtime's address last), checks the adapter's
    `CIRCUIT_ID_HASH()` and verifying-key hashes against the setup manifest,
    and writes only the provisional manifest `$OUTPUT_PATH.pending`.
 
    In the same broadcast it deploys the gasless-withdrawal paymaster
    (`GASLESS=1`, the default; see
-   [the contract notes](deployment.md#gasless-withdrawals)). Set
+   [the contract notes](deployment.md#gasless-withdrawals)). On Sepolia the
+   script refuses it for now, so pass `GASLESS=0` there
+   ([B1, step 1](#b1-drill-vault)); the paymaster settings below are for a
+   chain whose gas schedule the paymaster's policy was measured under. Set
    `PAYMASTER_OWNER` (the multisig; when it is not the deployer it must call
    `acceptOwnership()` on the paymaster), `PAYMASTER_STAKE_WEI` and
    `FACTORY_STAKE_WEI` (0.1 ETH on Sepolia, 1 ETH on mainnet),
@@ -809,7 +836,7 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    binding before they migrate anything, and refuse a database bound to
    another deployment, including the legacy vault's, and one whose binding
    cannot be read. Each daemon refuses a placeholder or provisional
-   manifest, and checks the vault, the adapter and the library against it.
+   manifest, and checks the vault, the adapter and the Poseidon runtime against it.
    **The challenger must be healthy, with its alerting armed, before the
    first deposit.**
 8. **Acceptance.** Run the Docker guide's acceptance checks: `/health` and
@@ -1357,34 +1384,40 @@ addresses for new proofs.
 
 **Escape exposure.** Sponsored escape initiations stay disabled in every
 published profile. Each defeated sponsored escape costs the float the
-initiation (about 1.25M gas) on top of the operator's challenge (about 435k
-gas), against the attacker's deposit gas (about 0.3M, recovered later):
-about 5:1 against the operator. Enable them only on the Sepolia drill, and
-decide for mainnet from the `EscapeInitiationOwed` and `owedPaid` data.
+initiation (about 643,000 gas, `handleOpsRealEscape` in
+`protocol/contracts/snapshots/gasless-gas.json`) on top of the operator's
+challenge (about 284,000 gas, `challengeEscapeWithdrawal` in
+`snapshots/concession-exit-gas.json`), against the attacker's deposit gas
+(about 0.58M per transaction, recovered later): roughly 1.6:1 against the
+operator, since the Poseidon runtime made deposits about 40% cheaper
+([deployment notes](deployment.md#operating-gasless-withdrawals)). Enable them only on the drill
+vault, and decide for mainnet from the `EscapeInitiationOwed` and
+`owedPaid` data.
 Without them, escapes are sponsored at finalization only.
 
 **Uneconomic floor per network.** Clients refuse a sponsored withdrawal whose
 `maxCost + flatFee` exceeds 25% of the payout (`gasless_uneconomic`, unless
-the host passes `allowExpensiveGas`). `maxCost` is about 1.7M gas of limits
+the host passes `allowExpensiveGas`). `maxCost` is about 1.41M gas of limits
+(the default fields of `gasFields` for a first use; up to 1.5M at `pvgCap`)
 times `maxFeePerGas`. Both clients take `maxFeePerGas = min(2 × base fee +
 tip, maxFeeCeiling)` and refuse (`gas_above_paymaster_ceiling`) only when
 `base fee + tip` exceeds `maxFeeCeiling`, so a ceiling of `c` sponsors base
 fees up to `c − tip`, and from a base fee of `(c − tip) / 2` on every
 operation is priced at `c` ([Fee ceilings](deployment.md#operating-gasless-withdrawals)).
 The smallest payout sponsored by default is about
-`4 × 1.7M × maxFeePerGas`, at most `4 × 1.7M × maxFeeCeiling`:
+`4 × 1.41M × maxFeePerGas`, at most `4 × 1.41M × maxFeeCeiling`:
 
 | `maxFeePerGas` | Smallest payout | `maxSponsoredCost` needed |
 | --- | --- | --- |
-| 5 gwei | about 0.034 ETH | the default 0.05 ETH |
-| 28 gwei | about 0.19 ETH | the default 0.05 ETH |
-| 62 gwei (a 30 gwei base fee) | about 0.42 ETH | at least about 0.11 ETH |
+| 5 gwei | about 0.028 ETH | the default 0.05 ETH |
+| 35 gwei | about 0.20 ETH | the default 0.05 ETH |
+| 62 gwei (a 30 gwei base fee) | about 0.35 ETH | at least about 0.09 ETH |
 
 The policy's `maxSponsoredCost` refuses anything above it first
 (`max_cost_above_policy`): at the default 0.05 ETH, nothing is sponsored
-above about 28 gwei, whatever the payout. The 62 gwei row applies only with
+above about 35 gwei, whatever the payout. The 62 gwei row applies only with
 a raised policy, and the hard cap of 0.25 ETH stops sponsorship above about
-139 gwei. Publish the floor with the network's typical fees and the live
+177 gwei (167 gwei at `pvgCap`). Publish the floor with the network's typical fees and the live
 policy. Smaller balances keep the wallet path.
 
 ### Fee spikes
@@ -1450,7 +1483,7 @@ refuses them everywhere.
   day, counted per nonce. Anyone who forces root races by front-running
   deposits can spend it and delay a retirement after a missed defeat; the
   miss itself is already critical.
-- **Strategic under-conceding.** A raise costs about 335,000 gas, more than
+- **Strategic under-conceding.** A raise costs about 272,000 gas, more than
   small request tiers; a modified client may bet that the operator does not
   raise. `ZKAPI_CHALLENGE_RAISE_MIN_UNITS` sets the smallest raise worth it.
 - **Forced early exits conceding the bound** forfeit the bound minus the

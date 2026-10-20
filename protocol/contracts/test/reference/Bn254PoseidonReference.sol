@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-/// @title Bn254Poseidon
-/// @notice Poseidon over the BN254 scalar field, generated from zkAPI v2's arkworks parameters:
+/// @title Bn254PoseidonReference
+/// @notice Test oracle: the Bn254Poseidon library the vault linked (and DELEGATECALLed) before
+///         src/poseidon/Bn254PoseidonRuntime.sol replaced it, kept unchanged apart from its name.
+///         Poseidon over the BN254 scalar field, generated from zkAPI v2's arkworks parameters:
 ///         width 3, rate 2, x^5 S-box, 8 full rounds and 57 partial rounds. compress is the note
 ///         tree's node hash (one permutation, the domain in the capacity lane); hash5 is the sponge
 ///         (zkapi_core::v2::hash_fields) over five inputs, the note leaf.
-/// @dev The permutation is in the optimized form of the Poseidon reference implementation: every
+/// @dev An independent implementation of the same functions: looped, strictly reduced, compiled
+///      with via-IR, and in the sparse form, not the runtime's scaled one. Its 372 constants are
+///      checked against zkAPI's parameters by protocol/formal (Zkapi.Poseidon.Sparse, with
+///      deployed_constants), and Bn254PoseidonRuntimeTest runs the runtime against it.
+///      The permutation is in the optimized form of the Poseidon reference implementation: every
 ///      partial round adds one constant (the constants of the two words that skip the S-box are
 ///      moved through the linear layer into the next round) and multiplies by a sparse matrix (the
 ///      MDS matrix factored per round, the dense factor folded into the next round's matrix); the
 ///      hash function is unchanged. The rounds are Yul with the state in three locals and the round
 ///      constants read from memory, where each entry point copies them once.
-library Bn254Poseidon {
+library Bn254PoseidonReference {
     uint256 internal constant FIELD_MODULUS =
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
 

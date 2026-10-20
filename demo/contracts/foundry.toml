@@ -1,11 +1,11 @@
-# script/Deploy.s.sol links Bn254Poseidon into the vault's creation code itself
-# (forge never links it), so no remapping workaround is needed. Create the output
-# directory first (fs_permissions does not admit a missing directory):
+# The vault links no library: script/Deploy.s.sol deploys the Poseidon runtime from its
+# artifact and passes its address to the vault. Create the output directory first
+# (fs_permissions does not admit a missing directory):
 #   mkdir -p ../../.demo
 #   OUTPUT_PATH="$PWD/../../.demo/deployment.json" ... forge script script/Deploy.s.sol
-# The compiler settings equal protocol/contracts/foundry.toml's, so the deployed
-# runtime code is the code the protocol suites test and
-# scripts/expected-codehashes.mjs reproduces.
+# The compiler settings equal protocol/contracts/foundry.toml's (the Poseidon runtime with
+# the legacy pipeline there and here), so the deployed runtime code is the code the
+# protocol suites test and scripts/expected-codehashes.mjs reproduces.
 [profile.default]
 src = "src"
 script = "script"
@@ -23,4 +23,11 @@ fs_permissions = [
     { access = "read", path = "./" },
     { access = "read", path = "../../protocol/setup" },
     { access = "read-write", path = "../../.demo" },
+]
+# Bn254PoseidonRuntime is compiled with the legacy pipeline, as in protocol/contracts;
+# script/PoseidonRuntimeArtifact.sol imports it (and so joins the profile) to get it into out/.
+additional_compiler_profiles = [{ name = "legacy", via_ir = false }]
+compilation_restrictions = [
+    { paths = "../../protocol/contracts/src/poseidon/Bn254PoseidonRuntime.sol", via_ir = false },
+    { paths = "script/PoseidonRuntimeArtifact.sol", via_ir = false },
 ]

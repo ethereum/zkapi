@@ -28,6 +28,9 @@
 // (shortens the submission loop's waits, as the SDK's own tests do). The
 // wallet answers `personal_sign` with the Anvil account (recorded in
 // `signatures`), so a sponsored operation is signed and never sent by it.
+//
+// The operator's close relay (`fees: 'relay'`): `withdraw` passes it through;
+// `close_relay_timing` shortens the relay's status and log polls.
 import path from 'node:path';
 import readline from 'node:readline';
 import { readFile } from 'node:fs/promises';
@@ -262,6 +265,10 @@ async function handle(command) {
         case 'gasless_timing':
             client.gaslessTimingOverrides = { ...(command.timing || {}) };
             return { timing: client.gaslessTiming };
+        case 'close_relay_timing':
+            // The relayed close's status and log polls (`fees: 'relay'`).
+            client.closeRelayTiming = { ...(command.timing || {}) };
+            return { timing: client.closeRelayTiming };
         case 'claim': {
             const statuses = [];
             const result = await client.claimEscapePayout(command.recordId, message => statuses.push(message));

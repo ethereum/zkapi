@@ -6,8 +6,10 @@ use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use zkapi_serverd::{
     challenge_service::{
-        ChallengeService, ChallengeServiceConfig, ChallengeTiming, DeploymentCheckError, FeePolicy,
-        DEFAULT_DEFEAT_GAS_LIMIT, DEFAULT_RAISE_GAS_LIMIT, DEFAULT_RAISE_LEAD_SECONDS,
+        BatchPolicy, ChallengeService, ChallengeServiceConfig, ChallengeTiming,
+        DeploymentCheckError, FeePolicy, DEFAULT_BATCH_DEADLINE_MARGIN_SECONDS,
+        DEFAULT_BATCH_MAX_AGE_SECONDS, DEFAULT_BATCH_MAX_ITEMS, DEFAULT_DEFEAT_GAS_LIMIT,
+        DEFAULT_RAISE_GAS_LIMIT, DEFAULT_RAISE_LEAD_SECONDS,
     },
     challenge_status::{self, AlarmPolicy},
     deployment::DeploymentManifest,
@@ -141,6 +143,23 @@ struct Args {
     /// The API server's settlement poll interval.
     #[arg(long, default_value_t = 2)]
     settlement_poll_seconds: u64,
+    /// Batch defeats and raises through the deployment manifest's exit
+    /// batcher (exit_batcher_address). Without one in the manifest, or with
+    /// false, every defeat and raise is a single vault call.
+    #[arg(long, env = "ZKAPI_CHALLENGE_BATCHING", default_value_t = true, action = clap::ArgAction::Set)]
+    batching: bool,
+    /// A batch flushes once it holds this many items (2 to the batcher's
+    /// MAX_ITEMS()).
+    #[arg(long, env = "ZKAPI_CHALLENGE_BATCH_MAX_ITEMS", default_value_t = DEFAULT_BATCH_MAX_ITEMS)]
+    batch_max_items: usize,
+    /// A batch flushes once its oldest item has waited this long.
+    #[arg(long, env = "ZKAPI_CHALLENGE_BATCH_MAX_AGE_SECONDS", default_value_t = DEFAULT_BATCH_MAX_AGE_SECONDS)]
+    batch_max_age_seconds: u64,
+    /// A batch flushes at once when any item's deadline is within the
+    /// critical threshold plus this; within the critical threshold every
+    /// defeat and raise is a single call.
+    #[arg(long, env = "ZKAPI_CHALLENGE_BATCH_DEADLINE_MARGIN_SECONDS", default_value_t = DEFAULT_BATCH_DEADLINE_MARGIN_SECONDS)]
+    batch_deadline_margin_seconds: u64,
 }
 
 #[tokio::main]
@@ -188,6 +207,26 @@ async fn main() -> anyhow::Result<()> {
             "the deployment manifest has no settlement_window_seconds; pass --settlement-window-seconds"
         ),
     };
+    let batch = BatchPolicy {
+        batcher: manifest
+            .exit_batcher_address
+            .clone()
+            .filter(|_| args.batching),
+        max_items: args.batch_max_items,
+        max_age_seconds: args.batch_max_age_seconds,
+        deadline_margin_seconds: args.batch_deadline_margin_seconds,
+    };
+    match (&batch.batcher, &manifest.exit_batcher_address) {
+        (Some(batcher), _) => {
+            tracing::info!(exit_batcher = %batcher, max_items = batch.max_items, "defeats and raises are batched through the deployment's exit batcher")
+        }
+        (None, Some(_)) => tracing::info!(
+            "batching is off (--batching false): defeats and raises go as single calls"
+        ),
+        (None, None) => tracing::info!(
+            "the deployment manifest names no exit batcher: defeats and raises go as single calls"
+        ),
+    }
     let timing = ChallengeTiming {
         settlement_window_seconds,
         settlement_poll_seconds: args.settlement_poll_seconds,
@@ -248,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
         retire_on_miss: args.retire_on_miss,
         defeat_gas_limit: args.defeat_gas_limit,
         raise_gas_limit: args.raise_gas_limit,
+        batch,
     };
     let mut service = ChallengeService::new(config, store)?;
     let listener = tokio::net::TcpListener::bind(args.status_listen)

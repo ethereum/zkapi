@@ -237,7 +237,7 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `currentRoot()` | `0xfdab463d` | The live root |
 | `rootRetiredAt(uint256)` | `0x7600ff88` | When the root was last replaced; informational |
 | `notes(uint32)` | `0x9f18e4ed` | `commitment, depositAmount, expiryTs, status` (0 none, 1 active, 2 pending withdrawal, 3 closed) |
-| `pendingWithdrawals(uint32)` | `0xa2f9f1ce` | `exists, activeRoot, withdrawalNullifier, finalBalance, destination, challengeDeadline`; `finalBalance` is the current payout |
+| `pendingWithdrawals(uint32)` | `0xa2f9f1ce` | `exists, activeRoot, withdrawalNullifier, finalBalance, destination, challengeDeadline`; `finalBalance` is the current payout, and `activeRoot` is always zero (the escape's calldata carries the proof's root) |
 | `pendingConcessions(uint32)` | `0xf8ffe6e0` | `nextNullifier, stateBalance, conceded` |
 | `usedNullifiers(uint256)` | `0xaad24061` | Whether a nullifier is consumed; `false` again after a defeat |
 | `challengedNullifiers(uint256)` | `0x6cda756a` | Whether an escape from that state was defeated by successor evidence |

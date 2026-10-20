@@ -92,6 +92,10 @@ pub fn build_router_with_token(service: Arc<AuthService>, token: Option<String>)
         .route("/oa/v1/withdraw/prepare", post(oa_prepare_withdrawal))
         .route("/oa/v1/withdraw/confirm", post(oa_confirm_withdrawal))
         .route("/oa/v1/withdraw/release", post(oa_release_withdrawal))
+        .route("/oa/v1/withdraw/relay/terms", get(oa_close_relay_terms))
+        .route("/oa/v1/withdraw/relay/fee", post(oa_close_relay_fee))
+        .route("/oa/v1/withdraw/relay/submit", post(oa_close_relay_submit))
+        .route("/oa/v1/withdraw/relay/status", get(oa_close_relay_status))
         .route("/oa/v1/withdraw/escape/prepare", post(oa_escape_prepare))
         .route("/oa/v1/withdraw/escape/submit", post(oa_escape_submit))
         .route("/oa/v1/withdraw/escape/status", get(oa_escape_status))
@@ -244,6 +248,39 @@ async fn oa_prepare_withdrawal(
         .oa_prepare_withdrawal(destination, body.accept_unsettled_request_risk)
         .await
     {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+/// GET /oa/v1/withdraw/relay/terms -- the protocol server's relay terms.
+async fn oa_close_relay_terms(State(service): State<Arc<AuthService>>) -> Response {
+    match service.close_relay_terms().await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+/// POST /oa/v1/withdraw/relay/fee -- pay the close relay's fee (one metered
+/// request at the current state) before the withdrawal is prepared.
+async fn oa_close_relay_fee(State(service): State<Arc<AuthService>>) -> Response {
+    match service.close_relay_fee().await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+/// POST /oa/v1/withdraw/relay/submit -- queue the reserved close at the relay.
+async fn oa_close_relay_submit(State(service): State<Arc<AuthService>>) -> Response {
+    match service.close_relay_submit().await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+/// GET /oa/v1/withdraw/relay/status -- the relay's status of the close.
+async fn oa_close_relay_status(State(service): State<Arc<AuthService>>) -> Response {
+    match service.close_relay_status().await {
         Ok(value) => Json(value).into_response(),
         Err(error) => generic_error(error),
     }
@@ -1057,6 +1094,10 @@ mod tests {
             "/oa/v1/withdraw/prepare",
             "/oa/v1/withdraw/confirm",
             "/oa/v1/withdraw/release",
+            "/oa/v1/withdraw/relay/terms",
+            "/oa/v1/withdraw/relay/fee",
+            "/oa/v1/withdraw/relay/submit",
+            "/oa/v1/withdraw/relay/status",
             "/funding",
             "/wallet/reset",
             "/health",

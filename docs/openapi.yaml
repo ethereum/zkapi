@@ -245,6 +245,141 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
+  /v2/withdraw/relay/terms:
+    get:
+      summary: The operator's close relay terms
+      responses:
+        "200":
+          description: >-
+            {"enabled": false} when the server does not relay closes;
+            otherwise the fee and the batching policy.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CloseRelayTermsResponse"}
+  /v2/withdraw/relay/fee:
+    post:
+      summary: Pay the close relay fee as one metered request at the note's current state
+      description: >-
+        The payload is exactly {"mode":"close_relay_fee","version":1,
+        "fee_units":"<fee>","ticket_hash":"0x<64 hex>"}, ticket_hash being
+        keccak256("zkapi:v2c:close-relay-ticket\0" || secret) of a fresh
+        32-byte secret. Admitted like any request with solvency_bound at
+        least the fee, settled at exactly the fee, answered with the signed
+        successor. Prove the cooperative close at that successor.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ApiRequestV2"}
+      responses:
+        "200":
+          description: The signed successor; charge_applied is the fee. An exact retry returns it again.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RequestResponseV2"}
+        "400":
+          description: invalid_request, invalid_proof or protocol_mismatch
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "404":
+          description: relay_disabled
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "409":
+          description: >-
+            relay_fee_changed (read the terms again), relay_ticket_taken (draw
+            a new secret), stale_root, replay or nullifier_used
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "500":
+          description: internal_error (retriable; resend the same request)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "503": {$ref: "#/components/responses/ChainReadUnavailable"}
+  /v2/withdraw/relay:
+    post:
+      summary: Queue a finished cooperative close for the operator's relay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CloseRelaySubmissionV2C"}
+      responses:
+        "200":
+          description: The same close was submitted before; its current status
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CloseRelayStatusResponse"}
+        "202":
+          description: Queued now; the ticket is redeemed
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CloseRelayStatusResponse"}
+        "400":
+          description: >-
+            invalid_request, invalid_proof, protocol_mismatch,
+            relay_ticket_invalid, relay_ticket_unknown,
+            relay_clearance_unknown or relay_validity_too_short
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "404":
+          description: relay_disabled
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "409":
+          description: relay_conflict, relay_ticket_redeemed or relay_already_closed
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "500":
+          description: internal_error (retriable)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "503":
+          description: chain_read_unavailable or capacity_exhausted (retriable)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+  /v2/withdraw/relay/{withdrawal_nullifier}:
+    get:
+      summary: A relayed close's status
+      parameters:
+        - in: path
+          name: withdrawal_nullifier
+          required: true
+          schema: {$ref: "#/components/schemas/Felt"}
+      responses:
+        "200":
+          description: The relay's status of the close
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CloseRelayStatusResponse"}
+        "400":
+          description: invalid_request for a malformed nullifier
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "404":
+          description: >-
+            {"status":"not_found"} when the relay holds no such close, or the
+            error relay_disabled
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [status]
+                    properties:
+                      status: {const: not_found}
+                  - {$ref: "#/components/schemas/ErrorResponse"}
+        "500": {$ref: "#/components/responses/DatabaseError"}
   /v2/requests/{client_request_id}:
     get:
       summary: Recover a request transcript by client request ID
@@ -516,6 +651,48 @@ components:
       properties:
         withdrawal_nullifier: {$ref: "#/components/schemas/Felt"}
         ownership_proof: {$ref: "#/components/schemas/ClearanceOwnershipProofV2C"}
+    CloseRelayTermsResponse:
+      type: object
+      required: [enabled]
+      properties:
+        enabled: {type: boolean}
+        fee_units: {type: string, pattern: "^[1-9][0-9]*$", description: "The fee in gwei"}
+        min_validity_seconds: {type: integer, minimum: 0}
+        batch_target: {type: integer, minimum: 1}
+        flush_age_seconds: {type: integer, minimum: 1}
+        urgent_margin_seconds: {type: integer, minimum: 1}
+        cutoff_seconds: {type: integer, minimum: 1}
+        exit_batcher: {type: string, pattern: "^0x[0-9a-f]{40}$"}
+    CloseRelaySubmissionV2C:
+      type: object
+      additionalProperties: false
+      required: [public_inputs, proof, ticket_secret]
+      properties:
+        public_inputs:
+          allOf:
+            - {$ref: "#/components/schemas/WithdrawalPublicInputsV2C"}
+            - type: object
+              properties:
+                kind: {const: 1}
+                conceded: {const: 0}
+        proof: {$ref: "#/components/schemas/Groth16Proof"}
+        ticket_secret: {type: string, pattern: "^0x[0-9a-fA-F]{64}$"}
+    CloseRelayStatusResponse:
+      type: object
+      required: [status, withdrawal_nullifier, note_id, valid_until, queued_at, updated_at, self_submit]
+      properties:
+        status: {type: string, enum: [queued, submitted, landed, closed, failed, expired]}
+        withdrawal_nullifier: {$ref: "#/components/schemas/Felt"}
+        note_id: {type: integer, minimum: 0, maximum: 4294967295}
+        valid_until: {type: integer, minimum: 0}
+        queued_at: {type: integer, minimum: 0}
+        updated_at: {type: integer, minimum: 0}
+        transaction_hash: {type: string, pattern: "^0x[0-9a-f]{64}$"}
+        block_number: {type: integer, minimum: 0}
+        detail: {type: string}
+        self_submit:
+          type: boolean
+          description: True for failed and expired; the client submits the close itself
     RequestEvidence:
       type: object
       required: [public_inputs, proof]

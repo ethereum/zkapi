@@ -257,6 +257,149 @@ startup. A nullifier with any request row is refused (`nullifier_used`); a
 granted clearance reserves it for good, and asking again signs again. See the
 [API reference](../docs-site/content/docs/api-reference/serverd.mdx).
 
+## Close relay
+
+The operator may relay cooperative closes: clients hand a finished close to
+serverd, which submits closes in batches through the deployment's
+permissionless `ZkApiExitBatcher` (`mutualCloseBatch`), about 4x cheaper per
+close than a sponsored gasless close and less than half a single
+`mutualClose` at 16 closes per batch. It is off unless configured, and it
+needs the deployment manifest's `exit_batcher_address` (startup runs
+`probe_exit_batcher`: codehash, vault, adapter and item gas caps). Relay mode
+is opt-in for clients; the wallet-paid and gasless paths are unchanged. The
+API is in [api-spec.md](api-spec.md#close-relay).
+
+### Fee
+
+The fee is one metered request, with no circuit change. Before preparing the
+withdrawal, the client makes one request at its current state `k` with the
+payload `{"mode":"close_relay_fee","version":1,"fee_units":"<fee>","ticket_hash":...}`
+(`POST /v2/withdraw/relay/fee`). serverd admits it like any request
+(solvency bound at least the fee), settles it at once at exactly the fee, and
+signs the successor `k+1` with the fee deducted. The client then asks for
+clearance at `N_{k+1}` and proves its close there, so the fee is part of the
+close's treasury share `deposit - finalBalance`. The request's reservation,
+evidence, settled charge and ticket are written in one transaction. The close
+names the ticket's secret; the server redeems the ticket for exactly one close
+(the fee row is then keyed by `N_{k+1}`). The ticket links the close to the
+fee request, which reveals only that this note paid a relay fee.
+
+### Why both sides are safe
+
+- **Operator.** The fee request is an ordinary metered request. Its proof is
+  in `request_evidence` and its charge is final before anything is signed. The
+  challenger enforces it like any request: an escape from state `k` is raised
+  by the fee, and one from an earlier state is defeated with the evidence at
+  its successor. A fee is paid once per ticket and redeemed once.
+- **User.** The close's proof binds its destination and final balance, so the
+  relay can only submit the close or not. It cannot redirect the payout, and
+  the batcher holds no ETH. The client keeps the proof. It submits the close
+  itself if the relay gives it back (`failed`, `expired`) or has not landed it
+  by `valid_until` minus a margin (20 minutes by default, see below). It
+  keeps the withdrawal pending until it sees the vault's `MutualClose` event
+  for the close.
+
+### Batching
+
+The relay worker flushes the queue through the batcher in three cases: once
+`--relay-batch-target` closes are queued (16 by default), once the oldest
+has waited `--relay-flush-age-seconds` (T, 900 by default), or at once when
+a close comes within `--relay-urgent-margin-seconds` of its `valid_until`
+(1800 by default).
+
+Before sending, the worker `eth_call`s the exact batch. Every proof is
+verified first, so one bad proof reverts the whole batch; the worker then
+bisects it. A lone close is sent to `vault.mutualClose` directly, since a
+batch of one costs about 16.5k more. The gas limit is `batcher.gasBound(kinds)`
+plus 21,000 and the calldata gas (or the EIP-7623 floor), and never below
+`eth_estimateGas`. Fees are `min(2 x baseFee + tip, --relay-max-fee-per-gas)`.
+While the base fee is above that cap the queue waits.
+
+Each skipped close is classified from the vault's refusal:
+
+- **Done (`closed`).** The note was closed by another transaction, usually
+  the client's own.
+- **`failed`, never relayed again.** The payout push failed
+  (`NativeTransferFailed`), or the close ran out of its gas cap, for example
+  a destination that burns the gas. The client submits it itself.
+- **Back to the queue.** The vault is paused.
+
+A batch that reverts as a whole puts its closes back, counting an attempt. A
+close fails after `--relay-max-attempts`.
+
+One relay transaction is in flight at a time, on one nonce. Its calldata,
+nonce and every hash it was sent under are persisted before and after each
+send, so a restart resumes where the relay left off:
+
+- A receipt with `--relay-confirmations` confirmations decides each close,
+  from the vault's `MutualClose` and the batcher's `ItemSkipped` logs.
+- A nonce consumed without a receipt the relay holds is resolved from each
+  note's status on chain. The relay never sends those closes again.
+- A nonce the node never saw returns its closes to the queue.
+- A transaction still pending after `--relay-bump-after-seconds` is replaced
+  at the same nonce with 25% higher fees.
+
+No close is sent within `--relay-cutoff-seconds` (300) of its `valid_until`;
+it becomes `expired`. Clients self-submit at 1,200 s before `valid_until`:
+after the relay's urgent flush (1,800 s), before its cutoff (300 s). A
+submission must be valid for at least `--relay-min-validity-seconds` (3,600;
+wallets prove closes for 3 hours).
+
+### Pricing the fee
+
+Price the fee for a realistic batch size B and the worst-case item cap. The
+relay pays at most `--relay-max-fee-per-gas`, so price the fee against that
+value:
+
+```text
+per-close gas(B) ~= (verification bound(B) + B x itemGas(close) x 64/63 + overhead) / B
+                    + calldata per close (about 768 bytes, about 12k gas)
+fee_units        ~= per-close gas(B) x max_fee_per_gas (gwei) x (1 + margin)
+```
+
+With the measured verification cost (1,004,340 gas for 16 proofs, about
+62.8k each) and the mainnet close cap of 150,000:
+
+- **Worst case at B = 16.** The bound is about 62.8k + 152.4k + 12k, roughly
+  230k gas per close.
+- **Typical at B = 16.** A real batch costs 129,477 gas per close (measured).
+- **Single close.** A lone `mutualClose` is about 307.5k gas.
+
+At a 5 gwei cap and a 20% margin, the worst case at B = 16 is 230,000 x 5 x
+1.2 = 1,380,000 units (0.00138 ETH). A fee priced for B = 16 does not cover a
+lone close flushed at age T. Either raise T so that batches fill, or price
+for the batch size the queue actually reaches. Read `itemGas(0)` and
+`gasBound` from the chain: caps are chain-specific (larger under EIP-8037).
+
+### Configuration
+
+| Flag (environment) | Default | Meaning |
+| --- | --- | --- |
+| `--relay-fee-units` (`ZKAPI_RELAY_FEE_UNITS`) | off | The fee in gwei; setting it turns the relay on |
+| `--relay-rpc-url` (`ZKAPI_RELAY_RPC_URL`) | required | The relayer's signing RPC (`eth_sendTransaction` for the sender, plus reads); must serve `--chain-id` |
+| `--relay-sender` (`ZKAPI_RELAY_SENDER`) | required | The dedicated relayer account; fund it with ETH for gas |
+| `--relay-read-rpc-url` (`ZKAPI_RELAY_READ_RPC_URL`) | `--native-billing-rpc-url` | Simulations, estimates, blocks and receipts (a signer sidecar returns no revert data) |
+| `--relay-max-fee-per-gas` (`ZKAPI_RELAY_MAX_FEE_PER_GAS`) | required | Cap in wei; also the price the fee is set against |
+| `--relay-batcher` (`ZKAPI_RELAY_BATCHER`) | manifest | Must equal the manifest's exit batcher |
+| `--relay-priority-fee-per-gas` | 1 gwei | Tip |
+| `--relay-batch-target` / `--relay-max-batch` | 16 / 32 | Flush size / most closes per batch (at most `MAX_ITEMS()`) |
+| `--relay-flush-age-seconds` | 900 | T |
+| `--relay-urgent-margin-seconds` / `--relay-cutoff-seconds` | 1800 / 300 | Deadline handling |
+| `--relay-min-validity-seconds` | 3600 | Minimum `valid_until` lead of a submission |
+| `--relay-poll-seconds` / `--relay-confirmations` / `--relay-bump-after-seconds` | 5 / 2 / 120 | Worker timing |
+| `--relay-max-gas` | 12,000,000 | Largest relay transaction (the signer sidecar's default gas cap); bigger batches are halved |
+| `--relay-max-attempts` | 3 | Whole-batch reverts a close may take part in before it fails |
+
+The relayer is a dedicated account behind a signing RPC, never the
+challenger's. With the AWS deployment, run the signer image in its close-relay
+role (`ZKAPI_SIGNER_ROLE=close-relay`, Compose service `relay-signer`; see
+[docker/aws/README.md](../docker/aws/README.md)) with its own key: it signs
+only `mutualCloseBatch` (`0x178cd980`) to the batcher and `mutualClose`
+(`0x72cd2e44`) to the vault, for cooperative closes of this deployment, and
+refuses every challenger call. The relay's state lives in the server database,
+in the tables `close_relay_tickets`, `close_relays` and
+`close_relay_batches`.
+
 ## Deployment
 
 The deploy script creates a native-only vault and accepts `REQUEST_CHARGE_CAP`

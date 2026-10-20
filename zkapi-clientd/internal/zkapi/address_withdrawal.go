@@ -86,6 +86,10 @@ type AddressWithdrawalStatus struct {
 	// fail and the payout be credited).
 	PayeeHasCode    bool   `json:"payee_has_code,omitempty"`
 	GaslessAdvisory string `json:"gasless_advisory,omitempty"`
+	// A relayed withdrawal (--fees relay, FeePayer "relay"): the operator's
+	// relay fee in native units, and the relay's last reported status.
+	RelayFeeUnits string `json:"relay_fee_units,omitempty"`
+	RelayStatus   string `json:"relay_status,omitempty"`
 }
 
 type addressWithdrawalRecord struct {
@@ -156,6 +160,8 @@ type addressWithdrawalRecord struct {
 	// PayeeHasCode records that the payout address had code when the
 	// withdrawal was prepared (design 3.1's advisory).
 	PayeeHasCode bool `json:"payee_has_code,omitempty"`
+	// Relay is a relayed close (FeePayer "relay", close_relay.go).
+	Relay *addressRelayRecord `json:"relay,omitempty"`
 }
 
 // proofDestination is the address the proof and the vault's logs name: the
@@ -509,6 +515,7 @@ func (h *FundingHandler) withdrawalSnapshotFor(ctx context.Context, exit bool) (
 		}
 		setEscapePayoutCredit(&status, withdrawal, config)
 		setGaslessStatus(&status, withdrawal)
+		setCloseRelayStatus(&status, withdrawal)
 		if *wallet.HasNote && wallet.Note.NoteID != withdrawal.NoteID {
 			status.Phase = "recovery_required"
 		}
@@ -596,6 +603,9 @@ func setWithdrawalMessage(status *AddressWithdrawalStatus) {
 		return
 	}
 	if setGaslessMessage(status) {
+		return
+	}
+	if status.FeePayer == "relay" && setCloseRelayMessage(status) {
 		return
 	}
 	if status.Phase == "complete" && status.PayoutCredited {
@@ -727,6 +737,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		}
 		setEscapePayoutCredit(&status, record.Withdrawal, config)
 		setGaslessStatus(&status, record.Withdrawal)
+		setCloseRelayStatus(&status, record.Withdrawal)
 		if record.Withdrawal != nil && record.Pending == nil {
 			for _, entry := range record.History {
 				if strings.EqualFold(entry.Hash, record.Withdrawal.TransactionHash) {
@@ -778,18 +789,22 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		// account, so the gasless pre-flight (the pins, the bundler, the
 		// paymaster's policy and the fee against the current balance) runs
 		// before anything is reserved; a refusal leaves nothing saved.
+		// A relayed close (--fees relay) needs a server that relays: refused
+		// before anything is reserved.
+		if options.Fees == "relay" {
+			terms, err := h.client.CloseRelayTerms(ctx)
+			if err != nil {
+				return status, err
+			}
+			if _, err := terms.fee(); err != nil {
+				return status, err
+			}
+		}
 		var transit *addressTransit
 		proofDestination := ""
 		payeeHasCode := false
 		if options.Fees == "payout" {
-			if payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindClose, wallet.Note.Balance, destination); err != nil {
-				return status, err
-			}
-			profile, _, err := h.gaslessProfile()
-			if err != nil {
-				return status, err
-			}
-			if transit, err = h.newTransit(ctx, config, profile, destination); err != nil {
+			if transit, payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindClose, wallet.Note.Balance, destination, record); err != nil {
 				return status, err
 			}
 			proofDestination = transit.Account
@@ -801,6 +816,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			record.Pending = nil
 		}
 		record.Withdrawal = &addressWithdrawalRecord{NoteID: wallet.Note.NoteID, Destination: destination, Phase: "quoted"}
+		if options.Fees == "relay" {
+			record.Withdrawal.FeePayer = "relay"
+		}
 		if transit != nil {
 			record.Withdrawal.FeePayer, record.Withdrawal.ProofDestination, record.Withdrawal.Transit = "payout", proofDestination, transit
 			record.Withdrawal.PayeeHasCode = payeeHasCode
@@ -812,6 +830,10 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		}
 	}
 	w := record.Withdrawal
+	// A relayed close (close_relay.go): its quote, approval and following.
+	if handled, next, err := h.closeRelayStep(ctx, config, record, wallet, options, update); handled {
+		return next, err
+	}
 	// The fee mode of a saved gasless withdrawal: --fees wallet falls back to
 	// a wallet-paid call bound to the transit account (then --sweep delivers
 	// the payout) while no operation is in flight; --fees payout cannot be
@@ -1405,7 +1427,18 @@ func (h *FundingHandler) archiveWithdrawnDeposit(config fundingConfig, record *a
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
 		return errors.New("deposit recovery file is not private; preserve it")
 	}
-	archive := h.statePath + ".withdrawn-" + strings.TrimPrefix(record.Pending.Hash, "0x")
+	// Named after the signed close, or for a relayed close (no signed
+	// transaction of its own) after the relay's settling transaction.
+	settled := ""
+	if record.Pending != nil {
+		settled = record.Pending.Hash
+	} else if record.Withdrawal != nil {
+		settled = record.Withdrawal.SettlementHash
+	}
+	if !isHex(settled, 32) {
+		return errors.New("withdrawal has no settling transaction to archive its deposit under; preserve recovery files")
+	}
+	archive := h.statePath + ".withdrawn-" + strings.TrimPrefix(settled, "0x")
 	if _, err := os.Lstat(archive); err == nil || !errors.Is(err, os.ErrNotExist) {
 		return errors.New("withdrawn deposit archive already exists; preserve recovery files")
 	}

@@ -312,6 +312,26 @@ test('withdrawal root synchronization waits for the indexer and fails closed', a
     );
 });
 
+test('a request path waits for the indexer to hold a note installed from its receipt', async () => {
+    const roots = await import(pathToFileURL(path.join(__dirname, 'services/zkapiWithdrawalRoot.mjs')));
+    const noSleep = { delayMs: 0, sleep: async () => {} };
+    // The deposit of note 3 is installed; the indexer has applied notes 0-2 only, then catches up.
+    let reads = 0;
+    const snapshot = await roots.waitForIndexedNote(async () => ({ next_note_id: ++reads < 3 ? 3 : 4 }), 3, { attempts: 5, ...noSleep });
+    assert.equal(snapshot.next_note_id, 4);
+    assert.equal(reads, 3);
+    // An indexer that never catches up fails closed with the lag's code.
+    await assert.rejects(roots.waitForIndexedNote(async () => ({ next_note_id: 3 }), 3, { attempts: 2, ...noSleep }),
+        error => error.code === 'indexer_root_lag');
+    // A deposit's empty slot and a malformed snapshot are not waited for.
+    reads = 0;
+    await roots.waitForIndexedNote(async () => { reads += 1; return { next_note_id: 0 }; }, null, noSleep);
+    await roots.waitForIndexedNote(async () => { reads += 1; return {}; }, 3, noSleep);
+    assert.equal(reads, 2);
+    const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
+    assert.match(sourceMethodAt(runtime, 'async treePath('), /waitForIndexedNote\([\s\S]*requireExisting \? noteId : null/);
+});
+
 test('only a never-submitted prepared deposit can be replaced after cancellation', () => {
     const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
     assert.match(runtime, /pending\.phase !== 'prepared' \|\| pending\.submissionId[\s\S]*pending\.transactionHash \|\| pending\.transactionHashes\?\.length/);

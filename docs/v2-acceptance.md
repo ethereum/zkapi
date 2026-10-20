@@ -156,6 +156,7 @@ Before the scenarios, serverd must refuse to start with:
 | 3 | Codehash-mismatch profile refuses deposits | SDK | `deposit` fails `deployment_mismatch` on `vault_runtime_codehash`, read through the wallet and the pinned RPC. Nothing is signed. |
 | 4 | Indexer down, exit with the deposit-time path | SDK | Deposit (deployment checks pass), request, settle. Another deposit moves the root, the indexer stops, and the SDK escapes (`E2.escape`, `c = 0`, path source `deposit`) at the note's deposit root, not the current one. The indexer restarts from its checkpoint. |
 | 5 | Honest close (the Phase C smoke test) | SDK | Deposit, request, settle, then `withdraw('mutual')`: the SDK's own exit lock, ownership proof, clearance and close proof. `MutualClose` pays `D − 400` to the destination and 400 to the treasury, the clearance nullifier reads `usedNullifiers` and `clearance_reserved`, the record is `closed`, and the SDK holds no note and no exit lock. |
+| 5a | Relayed cooperative close (`relay-close`) | wallet core and SDK | Serverd restarts with the close relay (fee 20,000 gwei, batch target 2), sending through a second signer sidecar in its `close-relay` role, from the last Anvil account. The wallet core pays the fee as one request (`POST /v2/withdraw/relay/fee`, charge exactly the fee, ticket hash of a fresh secret), installs the successor, clears and proves the close there, and queues it (`202`, then `200` for the same close). A secret that paid no fee is refused `relay_ticket_unknown`, nothing is sent below the batch target, and the relay signer refuses a call that is not a close. The SDK then closes with `fees: 'relay'` (its fee request proved in the worker) and sends nothing from its wallet. Both closes land in one `mutualCloseBatch` transaction from the relayer to the exit batcher. Each pays `D − 20,000` to its destination, the treasury receives 20,000 per close, the relayer pays exactly the batch's gas, both relay statuses are `landed`, and the SDK record is `closed`. Serverd then restarts without the relay (`enabled: false`). |
 | 6 | Under-concession, raise, finalize, deferred credit, claim | wallet core | The escape concedes 100 while a request is in flight. The server settles 400, signs nothing (`exit_deferred`), and the challenger raises to 400. Finalization to a destination that needs more than 100,000 gas credits the payout (`EscapePayoutDeferred`); `claimEscapePayout`, sent by a third party, pays it. |
 | 7 | Forced early exit with `c = 0`, raise to the real charge, client state closed | companion | Serverd switches to the OA org key source; the companion's OA bridge lease is verified. The operator is unreachable: `early_exit: concede_nothing` prepares `c = 0` from the deposit path (`path_source` `deposit`). The key lapses, the server settles 400, the challenger raises to 400. After finalization (9) the companion records `complete` (payout `D − 400`, `conceded_final` 400) and `has_note` is false. |
 | 8 | Stale-device pre-check; honest close | companion | A copy of the companion's wallet taken at the genesis state is the stale device; the newest device spends the genesis state and its successor. A second `zkapi-walletd` on the copy refuses the escape with `device_not_newest` and holds no exit lock and no escape record: nothing left it. The newest device then closes through its mutual route (kind 2, clearance, kind 1); the close pays `D − 800`, and `/oa/v1/withdraw/confirm` records it. |
@@ -178,10 +179,16 @@ withdrawal proof names a transit account `S` derived from (owner, payee). A
 user operation from `S` makes the vault call, the paymaster sponsors it, and
 the payout less the measured charge reaches the payee, which holds no ETH.
 The SDK's connected account owns its transit accounts. For zkapi-clientd the
-harness generates an ephemeral owner key per withdrawal, and the companion
-proves the escape. The harness then builds, signs and sends clientd-shaped
-operations: the ephemeral owner key, the profile's default gas limits and an
-EIP-191 signature over the operation hash. Its preVerificationGas (21,000 +
+harness derives the owner key per payout address as zkapi-clientd does
+(HKDF-SHA256 over the chain, the gasless contracts and the payee, from a
+random seed standing for clientd's payment key; `zkapi-clientd/internal/zkapi/testdata/transit-owner-vectors.json`),
+so later exits to one payout address reuse one transit account, and the
+companion proves the escape. The harness then builds, signs and sends
+clientd-shaped operations: the derived owner key, the profile's default gas
+limits and an EIP-191 signature over the operation hash. "Two closes to one
+payout address as zkapi-clientd" (`--stop-after gasless-reuse`) checks the
+reuse: the first close creates `S` through its initCode, the second reuses it
+without one, and both settle to the payee. Its preVerificationGas (21,000 +
 16 per byte + 10,000, clamped) and its tip (`eth_maxPriorityFeePerGas`, capped
 at `priorityFeeCeiling`) are simplified, so the bytes differ from what
 zkapi-clientd would sign (it takes the largest of three preVerificationGas
@@ -251,7 +258,7 @@ It also carries the committed Forge snapshot (`protocol/contracts/snapshots/conc
 | Companion | Actual `zkapi-walletd` routes as `zkapi-clientd` calls them; the harness plays clientd and signs its transactions |
 | Gasless contracts | The canonical EntryPoint v0.7.0 and SenderCreator runtimes, etched and codehash-checked. The paymaster, its factory and the account logic come from the same `Deploy.s.sol` broadcast, finalized and codehash-checked |
 | Bundler | In-process mini bundler (`scripts/acceptance/mini-bundler.mjs`). It checks each operation's shape and hash (local and the EntryPoint's `getUserOpHash`), dry-runs `handleOps` with `eth_call` and returns its `FailedOp` as the JSON-RPC error, then bundles with `handleOps` from an Anvil account. Drill knobs: hold, drop, defer, two-operation bundles, forgotten receipts |
-| zkapi-clientd's gasless path | The harness plays it: an ephemeral owner key, the profile's pinned gas fields, an EIP-191 signature and the bundler's JSON-RPC. The companion proves |
+| zkapi-clientd's gasless path | The harness plays it: the owner key derived per payout address, the profile's pinned gas fields, an EIP-191 signature and the bundler's JSON-RPC. The companion proves |
 | Provider, OA org, price feed | Loopback mocks |
 
 The run does not establish:

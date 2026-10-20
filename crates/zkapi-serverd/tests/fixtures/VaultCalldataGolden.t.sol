@@ -8,13 +8,18 @@ pragma solidity ^0.8.28;
 // check-calldata-golden.sh runs it with forge and compares (CI), or rewrites
 // the JSON with --update. zkapi-serverd's watcher and native_billing tests and
 // zkapi-indexerd's poller tests pin their encoders, selectors and decoders
-// against the JSON.
+// against the JSON. Its `batcher` section is the same for the periphery
+// ZkApiExitBatcher (src/periphery): every method selector from its compiled
+// ABI, its errors, its ItemSkipped log and the calldata of its batch calls,
+// which zkapi-challenged's batch encoder and the signer pin.
 
 import {Test, Vm, console} from "forge-std/Test.sol";
 import {ZkApiVault} from "zkapi/ZkApiVault.sol";
 import {Types} from "zkapi/libraries/Types.sol";
 import {Events} from "zkapi/libraries/Events.sol";
 import {IZkApiProofAdapter} from "zkapi/interfaces/IZkApiProofAdapter.sol";
+import {Errors} from "zkapi/libraries/Errors.sol";
+import {ZkApiExitBatcher} from "zkapi/periphery/ZkApiExitBatcher.sol";
 
 /// Emits the vault's own event declarations, so their topics and data
 /// layouts are the compiler's.
@@ -80,6 +85,14 @@ contract GoldenTest is Test {
         w.validUntil = type(uint64).max;
     }
 
+    /// The 256 proof bytes in descending order: a second item's proof.
+    function reversedProof() internal pure returns (bytes memory out) {
+        out = new bytes(256);
+        for (uint256 i = 0; i < 256; i++) {
+            out[i] = bytes1(uint8(256 - i));
+        }
+    }
+
     function line(string memory key, bytes memory value) internal pure {
         console.log(string.concat(key, "=", vm.toString(value)));
     }
@@ -114,9 +127,11 @@ contract GoldenTest is Test {
 
         // Every vault and adapter function the server, challenger, indexer,
         // signer and clients call or decode. Public getters have selectors
-        // only on an instance, so a vault is deployed.
+        // only on an instance, so a vault is deployed (with the real Poseidon
+        // runtime, which its constructor checks).
+        address poseidon = deployCode("out/Bn254PoseidonRuntime.sol/Bn254PoseidonRuntime.json");
         ZkApiVault vault = new ZkApiVault(
-            address(0xbeef), 30 days, 1 days, 100_000, address(0xada), 11, 12, 13, 14, address(this), 2 days
+            address(0xbeef), 30 days, 1 days, 100_000, address(0xada), 11, 12, 13, 14, address(this), 2 days, poseidon
         );
         IZkApiProofAdapter adapter = IZkApiProofAdapter(address(0xada));
         selector("challengeEscapeWithdrawal", vault.challengeEscapeWithdrawal.selector);
@@ -185,5 +200,79 @@ contract GoldenTest is Test {
             line(string.concat("event.", names[i], ".topics"), abi.encodePacked(logs[i].topics));
             line(string.concat("event.", names[i], ".data"), logs[i].data);
         }
+        batcherVectors();
+    }
+
+    /// The exit batcher's vectors, printed as `batcher.<kind>.<name>`.
+    function batcherVectors() internal {
+        // Every method of the compiled batcher, by name (its ABI has no
+        // overloads), so getters of immutables are included.
+        string memory artifact = vm.readFile("out/ZkApiExitBatcher.sol/ZkApiExitBatcher.json");
+        string[] memory signatures = vm.parseJsonKeys(artifact, ".methodIdentifiers");
+        for (uint256 i = 0; i < signatures.length; i++) {
+            bytes memory signature = bytes(signatures[i]);
+            uint256 open = 0;
+            while (signature[open] != "(") open++;
+            bytes memory name = new bytes(open);
+            for (uint256 j = 0; j < open; j++) {
+                name[j] = signature[j];
+            }
+            string memory id = vm.parseJsonString(
+                artifact, string.concat(".methodIdentifiers['", signatures[i], "']")
+            );
+            console.log(string.concat("batcher.selector.", string(name), "=0x", id));
+        }
+        line("batcher.error.BatchOutOfGas", abi.encodePacked(ZkApiExitBatcher.BatchOutOfGas.selector));
+        line("batcher.error.EmptyBatch", abi.encodePacked(ZkApiExitBatcher.EmptyBatch.selector));
+        line("batcher.error.BatchTooLarge", abi.encodePacked(ZkApiExitBatcher.BatchTooLarge.selector));
+        line("batcher.error.LengthMismatch", abi.encodePacked(ZkApiExitBatcher.LengthMismatch.selector));
+        // The vault errors whose skip means the escape changed under an item.
+        line("batcher.vault_error.NotPendingWithdrawal", abi.encodePacked(Errors.NotPendingWithdrawal.selector));
+        line("batcher.vault_error.ReplayedNullifier", abi.encodePacked(Errors.ReplayedNullifier.selector));
+        line("batcher.vault_error.NotARaise", abi.encodePacked(Errors.NotARaise.selector));
+        line("batcher.vault_error.ChallengeExpired", abi.encodePacked(Errors.ChallengeExpired.selector));
+
+        // A defeat (amount 0) of note 2^32-1 and a raise of note 7.
+        uint32[] memory noteIds = new uint32[](2);
+        noteIds[0] = type(uint32).max;
+        noteIds[1] = 7;
+        uint128[] memory amounts = new uint128[](2);
+        amounts[1] = 123456789012345678901234567890;
+        Types.RequestPublicInputs[] memory requests = new Types.RequestPublicInputs[](2);
+        requests[0] = request();
+        requests[1] = request();
+        bytes memory proofs = bytes.concat(proof(), reversedProof());
+        line(
+            "batcher.calldata.challengeBatch",
+            abi.encodeCall(ZkApiExitBatcher.challengeBatch, (noteIds, amounts, requests, proofs))
+        );
+        uint8[] memory kinds = new uint8[](2);
+        kinds[0] = 2;
+        kinds[1] = 3;
+        line("batcher.calldata.gasBound", abi.encodeCall(ZkApiExitBatcher.gasBound, (kinds)));
+        Types.WithdrawalPublicInputs[] memory closes = new Types.WithdrawalPublicInputs[](2);
+        closes[0] = withdrawal(1);
+        closes[1] = withdrawal(1);
+        closes[1].noteId = 7;
+        line("batcher.calldata.mutualCloseBatch", abi.encodeCall(ZkApiExitBatcher.mutualCloseBatch, (closes, proofs)));
+        Types.WithdrawalPublicInputs[] memory escapes = new Types.WithdrawalPublicInputs[](2);
+        escapes[0] = withdrawal(0);
+        escapes[1] = withdrawal(0);
+        escapes[1].noteId = 7;
+        line(
+            "batcher.calldata.initiateEscapeBatch",
+            abi.encodeCall(ZkApiExitBatcher.initiateEscapeBatch, (escapes, proofs))
+        );
+        line("batcher.calldata.finalizeBatch", abi.encodeCall(ZkApiExitBatcher.finalizeBatch, (noteIds)));
+
+        // ItemSkipped of item 3, a defeat (kind 2) of note 7 whose escape
+        // was no longer pending, as the batcher's declaration emits it.
+        vm.recordLogs();
+        emit ZkApiExitBatcher.ItemSkipped(3, 2, 7, abi.encodeWithSelector(Errors.NotPendingWithdrawal.selector));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        require(logs.length == 1, "one ItemSkipped log");
+        line("batcher.event.ItemSkipped.topic0", abi.encodePacked(logs[0].topics[0]));
+        line("batcher.event.ItemSkipped.topics", abi.encodePacked(logs[0].topics));
+        line("batcher.event.ItemSkipped.data", logs[0].data);
     }
 }

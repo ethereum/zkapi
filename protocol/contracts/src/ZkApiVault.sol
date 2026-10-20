@@ -11,6 +11,7 @@ import {MerkleUpdateLib} from "./libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "./libraries/NoteLeafLib.sol";
 import {ReentrancyGuardTransient} from "./libraries/ReentrancyGuardTransient.sol";
 import {IZkApiProofAdapter} from "./interfaces/IZkApiProofAdapter.sol";
+import {IBn254Poseidon} from "./interfaces/IBn254Poseidon.sol";
 
 /// @title ZkApiVault
 /// @notice Native ETH settlement in whole gwei with in-protocol BN254 Groth16 verification, for
@@ -26,6 +27,9 @@ import {IZkApiProofAdapter} from "./interfaces/IZkApiProofAdapter.sol";
 ///      transferOwnership only nominates pendingOwner, and the current owner keeps every power
 ///      (including unpause and replacing the nomination) until the nominee calls acceptOwnership.
 ///      A mistyped or unusable nominee therefore cannot leave a paused vault without an owner.
+///      The note tree's hashing (deposit's leaf and insertion, retireClosedLeaf's two paths) is done
+///      by `poseidon`, a Bn254PoseidonRuntime deployed separately and called with STATICCALL, so it
+///      can never change the vault's state.
 contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     uint16 public constant PROTOCOL_VERSION = 2;
     /// @notice Capability marker of the concession exit (vault revision 3).
@@ -60,6 +64,10 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     /// @dev Withdrawal kinds. Kind 2 (ownership proof, for the server's clearance) is never accepted.
     uint8 private constant KIND_ESCAPE = 0;
     uint8 private constant KIND_CLOSE = 1;
+    /// @dev _nullifierWords: the two flags, and the shift of a pending escape's value above them.
+    uint256 private constant USED = 1;
+    uint256 private constant CHALLENGED = 2;
+    uint256 private constant PAYLOAD_SHIFT = 2;
 
     /// Native asset sentinel retained for deployment and client compatibility.
     address public constant billingToken = address(0);
@@ -79,6 +87,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     /// @notice Longest time a pause blocks initiateEscapeWithdrawal and mutualClose; at least
     ///         2 * challengePeriod.
     uint64 public immutable maxPauseDuration;
+    /// @notice The Poseidon contract (src/poseidon/Bn254PoseidonRuntime.sol) that hashes the note
+    ///         tree: leaves (hash5) and Merkle paths (insertPath32, compressPairPath32).
+    IBn254Poseidon public immutable poseidon;
 
     address public treasury;
     bool public paused;
@@ -100,11 +111,14 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     mapping(uint32 => Types.Note) public notes;
     /// @dev The pending escapes; read through pendingWithdrawals and pendingConcessions.
     mapping(uint32 => Types.Escape) private _escapes;
-    mapping(uint256 => bool) public usedNullifiers;
-    /// @notice States an escape from which was defeated by successor evidence (a request proof at
-    ///         the state's successor nullifier); they can never escape again, and the state just
-    ///         below one reverts SupersededState. mutualClose does not consult it.
-    mapping(uint256 => bool) public challengedNullifiers;
+    /// @dev One word per nullifier, read through usedNullifiers (bit 0, USED) and
+    ///      challengedNullifiers (bit 1, CHALLENGED). An escape writes the rest of its record above
+    ///      the flags of the two words it consumes (PAYLOAD_SHIFT): N_{k+1} in N_k's word and the
+    ///      destination in N_{k+1}'s, so that a pending escape costs four fresh slots in all. A
+    ///      defeat clears both words except N_k's CHALLENGED; a finalization leaves them, as only
+    ///      _escapes says whether an escape is pending. A word without USED therefore holds no
+    ///      value: it is 0 or CHALLENGED.
+    mapping(uint256 => uint256) private _nullifierWords;
     /// @dev Expiry on the active (unpaused) clock. Zero means notes[noteId].expiryTs.
     mapping(uint32 => uint64) private _activeExpiry;
     /// @notice Escape payouts (gwei units) whose push to their destination failed, by destination;
@@ -137,7 +151,8 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         uint256 clearanceSigningKeyX_,
         uint256 clearanceSigningKeyY_,
         address owner_,
-        uint64 maxPauseDuration_
+        uint64 maxPauseDuration_,
+        address poseidon_
     ) Ownable(owner_) {
         if (
             treasury_ == address(0) || proofAdapter_ == address(0) || challengePeriod_ == 0
@@ -152,6 +167,13 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         if (
             (stateSigningKeyX_ == 0 && stateSigningKeyY_ == 0)
                 || (clearanceSigningKeyX_ == 0 && clearanceSigningKeyY_ == 0)
+        ) revert Errors.InvalidDeploymentBinding();
+        // The hasher must be a contract that answers compress(DOMAIN_NODE, 0, 0) with the tree's
+        // first zero hash: a guard against a wrong address (an account without code, or another
+        // contract of the deployment). Its identity is pinned by its runtime codehash off chain.
+        if (
+            poseidon_.code.length == 0
+                || MerkleUpdateLib.poseidonNodeHash(IBn254Poseidon(poseidon_), 0, 0) != MerkleUpdateLib.zeroHash(1)
         ) revert Errors.InvalidDeploymentBinding();
 
         if (requestChargeCap_ == 0 || requestChargeCap_ > MAX_NATIVE_UNITS) {
@@ -170,6 +192,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         clearanceSigningKeyX = clearanceSigningKeyX_;
         clearanceSigningKeyY = clearanceSigningKeyY_;
         maxPauseDuration = maxPauseDuration_;
+        poseidon = IBn254Poseidon(poseidon_);
         currentRoot = MerkleUpdateLib.EMPTY_ROOT;
         knownRoots[MerkleUpdateLib.EMPTY_ROOT] = true;
     }
@@ -189,8 +212,8 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         uint256 bucketedExpiry = ((rawExpiry + EXPIRY_BUCKET - 1) / EXPIRY_BUCKET) * EXPIRY_BUCKET;
         if (bucketedExpiry > type(uint64).max) revert Errors.InvalidFelt();
         uint64 expiryTs = uint64(bucketedExpiry);
-        uint256 newLeaf = NoteLeafLib.computeLeaf(noteId, commitment, amount, expiryTs);
-        uint256 newRoot = MerkleUpdateLib.insert(_filledSubtrees, noteId, newLeaf);
+        uint256 newLeaf = NoteLeafLib.computeLeaf(poseidon, noteId, commitment, amount, expiryTs);
+        uint256 newRoot = MerkleUpdateLib.insert(poseidon, _filledSubtrees, noteId, newLeaf);
 
         _setCurrentRoot(newRoot);
         notes[noteId] = Types.Note(commitment, amount, expiryTs, Types.NoteStatus.Active);
@@ -234,10 +257,12 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         uint256 nullifier = inputs.withdrawalNullifier;
         uint256 nextNullifier = inputs.nextNullifier;
         if (nextNullifier == 0 || nextNullifier == nullifier) revert Errors.InvalidDeploymentBinding();
+        uint256 word = _nullifierWords[nullifier];
+        uint256 nextWord = _nullifierWords[nextNullifier];
         // A defeated escape stays defeated: its calldata is public, so anyone could replay it.
-        if (challengedNullifiers[nullifier]) revert Errors.ChallengedNullifier();
+        if (word & CHALLENGED != 0) revert Errors.ChallengedNullifier();
         // The successor of this state was spent (it defeated an escape), so this state is stale.
-        if (challengedNullifiers[nextNullifier]) revert Errors.SupersededState();
+        if (nextWord & CHALLENGED != 0) revert Errors.SupersededState();
         if (!isKnownRoot(inputs.activeRoot)) revert Errors.UnknownRoot();
         proofAdapter.assertValidWithdrawal(inputs, proof);
 
@@ -248,19 +273,24 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         // casting to 'uint128' is safe because total is at most the uint128 depositAmount
         // forge-lint: disable-next-line(unsafe-typecast)
         uint128 stateBalance = uint128(total);
-        _consumeNullifier(nullifier);
-        _consumeNullifier(nextNullifier);
+        _requireUnused(nullifier, word);
+        _requireUnused(nextNullifier, nextWord);
 
         uint64 deadline = uint64(block.timestamp) + challengePeriod;
         note.status = Types.NoteStatus.PendingWithdrawal;
+        // Neither word has a flag (checked above), so both are zero: these writes consume both
+        // nullifiers and record N_{k+1} in N_k's word and the destination in N_{k+1}'s. N_{k+1} is
+        // below the field modulus (_requireUnused), so it fits above the flags.
+        _nullifierWords[nullifier] = (nextNullifier << PAYLOAD_SHIFT) | USED;
+        _nullifierWords[nextNullifier] = (uint256(uint160(inputs.destination)) << PAYLOAD_SHIFT) | USED;
+        // casting to 'uint96' is safe because both amounts are at most total, which the check above
+        // bounds by depositAmount, at most MAX_NATIVE_UNITS (< 2^53) since deposit
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint96 finalBalance = uint96(inputs.finalBalance);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint96 conceded = uint96(inputs.conceded);
         _escapes[inputs.noteId] = Types.Escape({
-            withdrawalNullifier: nullifier,
-            nextNullifier: nextNullifier,
-            activeRoot: inputs.activeRoot,
-            destination: inputs.destination,
-            challengeDeadline: deadline,
-            finalBalance: inputs.finalBalance,
-            conceded: inputs.conceded
+            withdrawalNullifier: nullifier, challengeDeadline: deadline, finalBalance: finalBalance, conceded: conceded
         });
         emit EscapeWithdrawalInitiated(
             inputs.noteId, nullifier, inputs.finalBalance, inputs.destination, deadline, currentRoot
@@ -279,17 +309,17 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     {
         (Types.Note storage note, Types.Escape storage escape) = _pendingEscape(noteId);
         _validateRequestBinding(inputs);
-        uint256 nextNullifier = escape.nextNullifier;
+        uint256 nullifier = escape.withdrawalNullifier;
+        uint256 nextNullifier = _nextNullifierOf(nullifier);
         // A request at the escaped nullifier never defeats; it can only raise the concession.
         if (inputs.requestNullifier != nextNullifier) revert Errors.NotSuccessorEvidence();
         proofAdapter.assertValidRequest(inputs, proof);
 
-        uint256 nullifier = escape.withdrawalNullifier;
         note.status = Types.NoteStatus.Active;
         delete _escapes[noteId];
-        delete usedNullifiers[nullifier];
-        delete usedNullifiers[nextNullifier];
-        challengedNullifiers[nullifier] = true;
+        // Releases both nullifiers and the escape's values in their words; N_k stays CHALLENGED.
+        _nullifierWords[nullifier] = CHALLENGED;
+        delete _nullifierWords[nextNullifier];
         _grantChallengeGrace(noteId, note);
         emit EscapeWithdrawalChallenged(noteId, nullifier, currentRoot);
     }
@@ -316,8 +346,12 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         proofAdapter.assertValidRequest(inputs, proof);
 
         uint128 finalBalance = stateBalance - raised;
-        escape.conceded = raised;
-        escape.finalBalance = finalBalance;
+        // casting to 'uint96' is safe because raised and finalBalance are at most stateBalance, the
+        // sum of the escape's two uint96 amounts, itself at most MAX_NATIVE_UNITS (< 2^53)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        escape.conceded = uint96(raised);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        escape.finalBalance = uint96(finalBalance);
         emit EscapeConcessionRaised(noteId, nullifier, raised, finalBalance);
     }
 
@@ -328,16 +362,18 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     function finalizeEscapeWithdrawal(uint32 noteId) external nonReentrant {
         Types.Note storage note = notes[noteId];
         Types.Escape storage escape = _escapes[noteId];
-        address destination = escape.destination;
-        if (note.status != Types.NoteStatus.PendingWithdrawal || destination == address(0)) {
+        uint64 deadline = escape.challengeDeadline;
+        if (note.status != Types.NoteStatus.PendingWithdrawal || deadline == 0) {
             revert Errors.NotPendingWithdrawal();
         }
-        if (block.timestamp < escape.challengeDeadline) revert Errors.ChallengeNotExpired();
+        if (block.timestamp < deadline) revert Errors.ChallengeNotExpired();
 
         uint256 nullifier = escape.withdrawalNullifier;
         uint128 finalBalance = escape.finalBalance;
+        address destination = _destinationOf(_nextNullifierOf(nullifier));
         uint128 operatorShare = note.depositAmount - finalBalance;
         note.status = Types.NoteStatus.Closed;
+        // Both nullifiers stay consumed; their words keep the values nothing reads any more.
         delete _escapes[noteId];
         if (finalBalance != 0 && !_push(destination, finalBalance, ESCAPE_PAYOUT_GAS)) {
             escapePayoutCredits[destination] += finalBalance;
@@ -377,8 +413,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     function retireClosedLeaf(uint32 noteId, uint256[32] calldata siblings) external nonReentrant {
         Types.Note storage note = notes[noteId];
         if (note.status != Types.NoteStatus.Closed) revert Errors.NoteNotClosed();
-        uint256 newRoot =
-            MerkleUpdateLib.retire(_filledSubtrees, nextNoteId, currentRoot, noteId, _leaf(noteId, note), siblings);
+        uint256 newRoot = MerkleUpdateLib.retire(
+            poseidon, _filledSubtrees, nextNoteId, currentRoot, noteId, _leaf(noteId, note), siblings
+        );
         _setCurrentRoot(newRoot);
         emit ClosedLeafRetired(noteId, newRoot);
     }
@@ -462,9 +499,23 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         return knownRoots[root];
     }
 
-    /// @notice A pending escape as revision 2 exposed it (6 words): exists, the escape proof's
-    ///         activeRoot, withdrawalNullifier, the current payout finalBalance, destination and
-    ///         challengeDeadline. All zero for a note without a pending escape.
+    /// @notice Whether `nullifier` is consumed by an exit: a mutual close or a pending or finalized
+    ///         escape (which consumes both its nullifiers). A defeat releases both.
+    function usedNullifiers(uint256 nullifier) external view returns (bool) {
+        return _nullifierWords[nullifier] & USED != 0;
+    }
+
+    /// @notice States an escape from which was defeated by successor evidence (a request proof at
+    ///         the state's successor nullifier); they can never escape again, and the state just
+    ///         below one reverts SupersededState. mutualClose does not consult it.
+    function challengedNullifiers(uint256 nullifier) external view returns (bool) {
+        return _nullifierWords[nullifier] & CHALLENGED != 0;
+    }
+
+    /// @notice A pending escape in revision 2's 6 words: exists, a zero word (revision 2's escape
+    ///         proof activeRoot, which is not stored), withdrawalNullifier, the current payout
+    ///         finalBalance, destination and challengeDeadline. All zero for a note without a
+    ///         pending escape.
     function pendingWithdrawals(uint32 noteId)
         external
         view
@@ -478,12 +529,12 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         )
     {
         Types.Escape storage escape = _escapes[noteId];
-        destination = escape.destination;
-        exists = destination != address(0);
-        activeRoot = escape.activeRoot;
+        challengeDeadline = escape.challengeDeadline;
+        if (challengeDeadline == 0) return (false, 0, 0, 0, address(0), 0);
+        exists = true;
         withdrawalNullifier = escape.withdrawalNullifier;
         finalBalance = escape.finalBalance;
-        challengeDeadline = escape.challengeDeadline;
+        destination = _destinationOf(_nextNullifierOf(withdrawalNullifier));
     }
 
     /// @notice The concession side of a pending escape (3 words): nextNullifier N_{k+1}, the state
@@ -494,7 +545,8 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         returns (uint256 nextNullifier, uint128 stateBalance, uint128 conceded)
     {
         Types.Escape storage escape = _escapes[noteId];
-        nextNullifier = escape.nextNullifier;
+        if (escape.challengeDeadline == 0) return (0, 0, 0);
+        nextNullifier = _nextNullifierOf(escape.withdrawalNullifier);
         conceded = escape.conceded;
         stateBalance = escape.finalBalance + conceded;
     }
@@ -553,15 +605,36 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
         if (destination == address(0) || destination == address(this)) revert Errors.InvalidDestination();
     }
 
-    /// @dev Only canonical field elements are consumed, whatever the adapter accepts: usedNullifiers,
-    ///      challengedNullifiers and the escape records are keyed on the raw word, so N + r (the same
-    ///      scalar to a verifier that reduced it) would otherwise slip past ChallengedNullifier,
-    ///      SupersededState and ReplayedNullifier, or name a successor no defeat can match. Every
-    ///      nullifier those mappings hold was consumed here first.
+    /// @dev mutualClose's consumption of N, which keeps a CHALLENGED flag (G2: a close does not
+    ///      consult it).
     function _consumeNullifier(uint256 nullifier) private {
-        _requireField(nullifier);
-        if (usedNullifiers[nullifier]) revert Errors.ReplayedNullifier();
-        usedNullifiers[nullifier] = true;
+        uint256 word = _nullifierWords[nullifier];
+        _requireUnused(nullifier, word);
+        _nullifierWords[nullifier] = word | USED;
+    }
+
+    /// @dev Only canonical field elements are consumed, whatever the adapter accepts: the nullifier
+    ///      words and the escape records are keyed on the raw word, so N + r (the same scalar to a
+    ///      verifier that reduced it) would otherwise slip past ChallengedNullifier, SupersededState
+    ///      and ReplayedNullifier, or name a successor no defeat can match. Every nullifier with a
+    ///      nonzero word passed this check first. `word` is _nullifierWords[nullifier].
+    function _requireUnused(uint256 nullifier, uint256 word) private pure {
+        if (nullifier >= MerkleUpdateLib.FIELD_MODULUS) revert Errors.InvalidFelt();
+        if (word & USED != 0) revert Errors.ReplayedNullifier();
+    }
+
+    /// @dev N_{k+1} of the pending escape from N_k = `nullifier`, from N_k's word.
+    function _nextNullifierOf(uint256 nullifier) private view returns (uint256) {
+        return _nullifierWords[nullifier] >> PAYLOAD_SHIFT;
+    }
+
+    /// @dev The destination of the pending escape whose successor nullifier is `nextNullifier`,
+    ///      from N_{k+1}'s word.
+    function _destinationOf(uint256 nextNullifier) private view returns (address) {
+        // casting to 'uint160' is safe because the word holds the destination, and nothing else,
+        // above its flags
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return address(uint160(_nullifierWords[nextNullifier] >> PAYLOAD_SHIFT));
     }
 
     function _setCurrentRoot(uint256 newRoot) private {
@@ -573,10 +646,9 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     function _pendingEscape(uint32 noteId) private view returns (Types.Note storage note, Types.Escape storage escape) {
         note = notes[noteId];
         escape = _escapes[noteId];
-        if (note.status != Types.NoteStatus.PendingWithdrawal || escape.destination == address(0)) {
-            revert Errors.NotPendingWithdrawal();
-        }
-        if (block.timestamp >= escape.challengeDeadline) revert Errors.ChallengeExpired();
+        uint64 deadline = escape.challengeDeadline;
+        if (note.status != Types.NoteStatus.PendingWithdrawal || deadline == 0) revert Errors.NotPendingWithdrawal();
+        if (block.timestamp >= deadline) revert Errors.ChallengeExpired();
     }
 
     /// @dev Delays, but does not prevent, an expiry sweep right after a defeat: the note keeps
@@ -632,7 +704,7 @@ contract ZkApiVault is ReentrancyGuardTransient, Ownable2Step, Events {
     }
 
     function _leaf(uint32 noteId, Types.Note storage note) private view returns (uint256) {
-        return NoteLeafLib.computeLeaf(noteId, note.commitment, note.depositAmount, note.expiryTs);
+        return NoteLeafLib.computeLeaf(poseidon, noteId, note.commitment, note.depositAmount, note.expiryTs);
     }
 
     function _requireField(uint256 value) private pure {

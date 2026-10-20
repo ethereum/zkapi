@@ -20,6 +20,7 @@ type configureOptions struct {
 	network, listen, relay, binary, proofs    string
 	exitRPC                                   string
 	bundlerURL, withdrawalFees                string
+	transitAccounts                           string
 	usd                                       string
 	keyReuseWindowSeconds                     int
 	webSearch                                 bool
@@ -38,7 +39,8 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.StringVar(&o.proofs, "proof-setup-dir", "", "path to the installed proving assets")
 	f.StringVar(&o.exitRPC, "exit-rpc-url", "", "your own Ethereum RPC for exits: deployment checks also use it and exit transactions are sent through it (HTTPS, or http:// to this machine; 'none' clears it)")
 	f.StringVar(&o.bundlerURL, "bundler-url", "", "your own ERC-4337 bundler for gasless withdrawals (--fees payout): HTTPS, or http:// to this machine; 'none' clears it and the deployment's published bundler is used")
-	f.StringVar(&o.withdrawalFees, "withdrawal-fees", "", "how withdrawals pay the network fee by default: wallet (the local signing address) or payout (a sponsored operation paid from the payout, no ETH needed)")
+	f.StringVar(&o.withdrawalFees, "withdrawal-fees", "", "how withdrawals pay the network fee by default: wallet (the local signing address), payout (a sponsored operation paid from the payout, no ETH needed) or relay (the operator's close relay, paid by its fee from the private balance)")
+	f.StringVar(&o.transitAccounts, "transit-accounts", "", "how gasless withdrawals (--fees payout) choose their transit account: per-payee (the default: one reused account per payout address, which links your exits to that address) or fresh (a new account for every withdrawal, paying its creation each time)")
 	f.StringVar(&o.usd, "usd", "", "skip the new-deposit USD amount prompt (prompt default: 20; network fees are extra)")
 	f.BoolVar(&o.status, "status", false, "show saved configuration status without setup")
 	f.BoolVar(&o.apiKey, "api-key", false, "print the local inference API key explicitly")
@@ -80,8 +82,11 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	if o.fields["key-reuse-window-seconds"] && (o.keyReuseWindowSeconds < 0 || o.keyReuseWindowSeconds > config.MaxKeyReuseWindowSeconds) {
 		return o, errors.New("key-reuse-window-seconds must be between 0 and 300")
 	}
-	if o.fields["withdrawal-fees"] && o.withdrawalFees != "wallet" && o.withdrawalFees != "payout" {
-		return o, errors.New("withdrawal-fees must be wallet or payout")
+	if o.fields["withdrawal-fees"] && o.withdrawalFees != "wallet" && o.withdrawalFees != "payout" && o.withdrawalFees != "relay" {
+		return o, errors.New("withdrawal-fees must be wallet, payout or relay")
+	}
+	if o.fields["transit-accounts"] && o.transitAccounts != "per-payee" && o.transitAccounts != "fresh" {
+		return o, errors.New("transit-accounts must be per-payee or fresh")
 	}
 	if o.fields["bundler-url"] && o.bundlerURL != "none" {
 		if err := zkapi.ValidateBundlerURL(o.bundlerURL); err != nil {
@@ -294,6 +299,12 @@ func applyConfigureOptions(c config.Config, o configureOptions) config.Config {
 			c.ZKAPI.WithdrawalFees = ""
 		}
 	}
+	if o.fields["transit-accounts"] {
+		c.ZKAPI.TransitAccounts = o.transitAccounts
+		if o.transitAccounts == "per-payee" {
+			c.ZKAPI.TransitAccounts = ""
+		}
+	}
 	return c
 }
 
@@ -315,6 +326,12 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 	}
 	if c.ZKAPI.WithdrawalFees == "payout" {
 		ui.Printf("Withdrawal fees: paid from the payout by default (--fees payout)\n")
+	}
+	if c.ZKAPI.WithdrawalFees == "relay" {
+		ui.Printf("Withdrawal fees: cooperative closes go through the operator's close relay by default (--fees relay)\n")
+	}
+	if c.ZKAPI.TransitAccounts == "fresh" {
+		ui.Printf("Transit accounts: a fresh one for every gasless withdrawal (not linked through a shared account; its creation is paid each time)\n")
 	}
 	showClientConnection(c, ui)
 	if c.WebSearch {
