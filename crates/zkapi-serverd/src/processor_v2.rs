@@ -832,6 +832,15 @@ impl RequestProcessor {
             .vault_roots
             .lock()
             .map_err(|_| ServerError::Internal("root state lock poisoned".into()))?;
+        self.admissible_root_locked(&roots, root, now)
+    }
+
+    fn admissible_root_locked(
+        &self,
+        roots: &VaultRoots,
+        root: &Felt252,
+        now: u64,
+    ) -> Result<(), ServerError> {
         let max = self.config.root_max_staleness_seconds;
         let latest = match roots.latest() {
             Some(latest) if roots.is_fresh(now, max) => latest.root,
@@ -3108,6 +3117,19 @@ impl RequestProcessor {
         request: &ApiRequestV2,
         issuance: Option<&IssuanceLease<'_>>,
     ) -> Result<Option<RequestResponseV2>, ServerError> {
+        self.validate_and_reserve_verifying(request, issuance, || {
+            self.verifier
+                .verify(&request.public_inputs, &request.proof)
+                .map_err(|error| ServerError::InvalidProof(error.to_string()))
+        })
+    }
+
+    fn validate_and_reserve_verifying(
+        &self,
+        request: &ApiRequestV2,
+        issuance: Option<&IssuanceLease<'_>>,
+        verify: impl FnOnce() -> Result<bool, ServerError>,
+    ) -> Result<Option<RequestResponseV2>, ServerError> {
         let public = &request.public_inputs;
         let payload_hash = canonical_payload_hash(request.payload.as_bytes());
         if payload_hash != request.payload_hash {
@@ -3180,11 +3202,7 @@ impl RequestProcessor {
                 "proof authorization tag does not bind this request id and payload".to_string(),
             ));
         }
-        if !self
-            .verifier
-            .verify(public, &request.proof)
-            .map_err(|error| ServerError::InvalidProof(error.to_string()))?
-        {
+        if !verify()? {
             return Err(ServerError::InvalidProof(
                 "Groth16 verification returned false".to_string(),
             ));
@@ -3194,10 +3212,19 @@ impl RequestProcessor {
         // actual reservation boundary, while issue_openrouter_lease retains
         // its serialization lock. A matching existing reservation returned
         // above and keeps its original quote even after expiration.
-        self.native_oracle
-            .assert_fresh(&self.lease_authorization(request)?.1, current_timestamp())?;
+        let quote = self.lease_authorization(request)?.1;
         let lease = issuance
             .map(|issuance| self.issuance_lease_row(request, issuance, current_timestamp()));
+        // A retirement can land while Groth16 verification runs. Recheck and
+        // hold the same lock the root poller uses through the synchronous DB
+        // transaction: invalidated roots cannot become resumable reservations.
+        let roots = self
+            .vault_roots
+            .lock()
+            .map_err(|_| ServerError::Internal("root state lock poisoned".into()))?;
+        let now = current_timestamp();
+        self.admissible_root_locked(&roots, &public.active_root, now)?;
+        self.native_oracle.assert_fresh(&quote, now)?;
         self.store
             .reserve_openrouter_lease_with(request, lease.as_ref())?;
         Ok(None)
@@ -7185,6 +7212,67 @@ mod tests {
             .verifier
             .verify(&evidence[0].public_inputs, &request.proof)
             .unwrap());
+    }
+
+    /// Root observation and reservation are atomic even when verification
+    /// overlaps a removal, reorg or loss of freshness. Additions retain grace.
+    #[test]
+    fn a_root_invalidated_during_verification_cannot_be_reserved() {
+        for change in ["retirement_or_reorg", "unavailable", "addition"] {
+            let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+            let mut request = unverified_lease_request(&processor);
+            let context =
+                canonical_request_context(&request.client_request_id, &request.payload_hash);
+            request.public_inputs.authorization_tag =
+                core::authorization_tag(&request.public_inputs.request_nullifier, &context);
+            processor.update_root(request.public_inputs.active_root);
+            let lease_config = processor.config.openrouter_leases.clone().unwrap();
+            let issuance = IssuanceLease {
+                lease_config: &lease_config,
+                spending_limit_usd: 3.0,
+                oa_request_id: Some("root-race-issuance"),
+            };
+            let result =
+                processor.validate_and_reserve_verifying(&request, Some(&issuance), || {
+                    match change {
+                        "unavailable" => processor.vault_roots.lock().unwrap().last_read_at = None,
+                        _ => processor.record_vault_root(
+                            Felt252::from_u64(0xabc),
+                            None,
+                            current_timestamp(),
+                            change != "addition",
+                        ),
+                    }
+                    Ok(true)
+                });
+            let nullifier = &request.public_inputs.request_nullifier;
+            if change == "addition" {
+                assert!(result.unwrap().is_none());
+                assert!(processor.store.lookup_by_nullifier(nullifier).is_some());
+                assert!(processor
+                    .store
+                    .lookup_openrouter_lease(&request.client_request_id)
+                    .is_some());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ServerError::StaleRoot { .. }) | Err(ServerError::RootUnavailable(_))
+                    ),
+                    "{change}: {result:?}"
+                );
+                assert!(processor.store.lookup_by_nullifier(nullifier).is_none());
+                assert!(processor
+                    .store
+                    .lookup_openrouter_lease(&request.client_request_id)
+                    .is_none());
+                assert!(processor
+                    .store
+                    .request_evidence(nullifier)
+                    .unwrap()
+                    .is_empty());
+            }
+        }
     }
 
     // ---- Admission: the request root (O5') and the lease ceiling (§5.2) ----
