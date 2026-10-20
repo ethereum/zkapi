@@ -76,6 +76,18 @@ Folded into 0.2.0's notes at release.
   - The vault and the paymaster use a transient reentrancy guard
     (`ReentrancyGuardTransient`, EIP-1153), same error selector.
 
+### Fixed
+
+- **The browser SDK's wallet status no longer exposes the note's anchor and
+  commitment.** `walletStatus()` passed the WebAssembly status through
+  unchanged, so `current_anchor`, `current_commitment_x/y` and
+  `bound_at_state` reached `client.snapshot().wallet`, every `subscribe()`
+  listener and the window-wide `zkapi-state-changed` event. The server issued
+  that anchor, so a host that logged or reported its state could link the
+  account to the note's private request chain. The status now carries an
+  explicit allowlist: `has_note`, `pending_request` and the note's `note_id`,
+  `deposit_amount`, `current_balance`, `expiry_ts` and `is_genesis`.
+
 ### Breaking
 - **`deposit(bytes32 commitment, uint128 amount)`** (selector `0x56d2e1ea`)
   replaces `deposit(bytes32,uint128,uint256[32])`: the siblings argument is
@@ -90,6 +102,10 @@ Folded into 0.2.0's notes at release.
 - **`rootRetiredAt(uint256)` is removed** from the vault (informational, never
   read on chain; `NoteDeposited` and `ClosedLeafRetired` carry every root
   change).
+- **`snapshot().wallet.note` drops `current_anchor`,
+  `current_commitment_x/y` and `bound_at_state`** (see Fixed). A host that
+  read them gets `undefined`; the exit view keeps its bound under
+  `snapshot().config.exit`.
 
 - None: the change is additive. Profiles without `gasless` (or with
   `gasless: null`) keep working with the wallet-pays path.
