@@ -2,7 +2,7 @@ import { browserSdkOptions, beginBrowserSdkInitialization, browserSdkTransport }
 import { assertNativeVault, exitRpcUrl, pinnedRpcRequest, urlRpcRequest, validateNativeFunding, validateNativeQuote, validateProofBoundQuote, readNativeQuote, readVaultWord, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote } from './zkapiNativeEth.mjs';
 import { CHAT_SPENDING_TIER_USD } from './zkapiRequestCompat.mjs';
 import { TestnetPasswordAuth, testnetPasswordRequired } from './testnetPasswordAuth.mjs';
-import { sameFelt, waitForExpectedActiveRoot } from './zkapiWithdrawalRoot.mjs';
+import { sameFelt, waitForExpectedActiveRoot, waitForIndexedNote } from './zkapiWithdrawalRoot.mjs';
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import {
     INVALID_SUCCESSOR_DISPOSITION,
@@ -1699,10 +1699,15 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     async treePath(noteId, requireExisting = true, expectedActiveRoot = null, signal = null) {
+        const sleep = milliseconds => delay(milliseconds, signal);
         return waitForExpectedActiveRoot(async () => {
-            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`, { signal });
+            // A note installed from its deposit's receipt may not be in the
+            // indexer's tree yet: wait for the indexer rather than refuse.
+            const snapshot = await waitForIndexedNote(
+                () => this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`, { signal }),
+                requireExisting ? noteId : null, { sleep });
             return this.worker.call('treePath', { snapshot, noteId, requireExisting });
-        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds, signal) });
+        }, expectedActiveRoot, { sleep });
     }
 
     async nextDepositPath(expectedActiveRoot = null) {
