@@ -216,6 +216,10 @@ export async function verifyGaslessDeployment({ request, trusted, chainId, sourc
         equals(pins.accountCreationCodeKeccak256, actual => actual === pins.accountCreationCodeKeccak256));
     await call('paymaster.gasPolicy', pins.paymaster, GASLESS_ABI.gasPolicy, decodeGasPolicy,
         equals('the profile’s gas_policy', actual => sameGasPolicy(actual, pins.gasPolicy)));
+    if (pins.gasSchedule != null) {
+        await call('paymaster.gasSchedule', pins.paymaster, GASLESS_ABI.gasSchedule, decodeWord,
+            equals(pins.gasSchedule.toString(), actual => actual === pins.gasSchedule));
+    }
     const sample = transitAccountAddress({
         factory: pins.factory, creationCodeHex: pins.accountCreationCode, entryPoint: pins.entryPoint, vault: trusted.contract_address,
         paymaster: pins.paymaster, owner: GASLESS_SAMPLE_OWNER, payee: GASLESS_SAMPLE_PAYEE

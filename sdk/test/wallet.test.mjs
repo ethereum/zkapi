@@ -653,6 +653,7 @@ test("every gasless selector and event topic is the keccak of its signature", ()
     credits: "credits(address)",
     quote: "quote(uint8,address,uint32,uint256,uint256,uint256)",
     gasPolicy: "gasPolicy()",
+    gasSchedule: "gasSchedule()",
     chargeFor: "chargeFor(uint8,uint256,uint256,uint256,uint256,bool,bool,uint256)",
     keyFor: "keyFor(uint8,uint256,uint32,address)",
     transitAccount: "transitAccount(address,address)",

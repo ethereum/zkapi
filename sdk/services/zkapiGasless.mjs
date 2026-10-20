@@ -294,6 +294,7 @@ export function gaslessPins(trusted) {
         accountCreationCodeKeccak256: lower(gasless.account_creation_code_keccak256),
         bundlerUrl: gasless.bundler_url == null ? null : String(gasless.bundler_url),
         gasPolicy: normalizeGasPolicy(gasless.gas_policy),
+        gasSchedule: gasless.gas_schedule == null ? null : toBigInt(gasless.gas_schedule, 'gas_schedule'),
         policy: {
             maxSponsoredCostWei: toBigInt(gasless.policy?.max_sponsored_cost_wei ?? 0, 'policy.max_sponsored_cost_wei'),
             flatFeeWei: toBigInt(gasless.policy?.flat_fee_wei ?? 0, 'policy.flat_fee_wei'),
@@ -307,6 +308,9 @@ export function gaslessPins(trusted) {
         uneconomicFractionPercent: gasless.uneconomic_fraction_percent == null
             ? UNECONOMIC_FRACTION_PERCENT : toBigInt(gasless.uneconomic_fraction_percent, 'uneconomic_fraction_percent')
     };
+    if (pins.gasSchedule != null && pins.gasSchedule !== 0n && pins.gasSchedule !== 1n) {
+        throw gaslessError('gasless_profile_invalid', { field: 'gas_schedule' }, 'The profile names an unsupported gas schedule.');
+    }
     for (const field of ['entryPointCodehash', 'senderCreatorCodehash', 'paymasterCodehash', 'factoryCodehash', 'accountCreationCodeKeccak256']) {
         if (!WORD.test(pins[field])) throw gaslessError('gasless_profile_invalid', { field }, `The profile's gasless ${field} is not a 32-byte hash.`);
     }

@@ -62,9 +62,9 @@ test('the transit account is the CREATE2 of the pinned creation code and the fiv
     assert.equal(transitAccountAddress(args), low(V.transit_account));
     assert.equal(create2TransitAccount({ ...args, creationCode: V.account_creation_code }), low(V.transit_account), 'the independent CREATE2');
     assert.equal(codehash(V.account_creation_code), low(V.account_creation_code_keccak256));
-    // The proxy's runtime is the creation code after its 13-byte stub, then the arguments.
-    assert.equal(`0x${V.account_creation_code.slice(2 + 26)}${[V.entry_point, V.vault, V.paymaster, V.owner, V.payee]
-        .map(address => BigInt(address).toString(16).padStart(64, '0')).join('')}`, low(V.transit_runtime_code));
+    // The compact proxy stores only the owner and payee after its 53-byte runtime.
+    assert.equal(`0x${V.account_creation_code.slice(2 + 24 * 2)}${V.owner.slice(2)}${V.payee.slice(2)}`.toLowerCase(), low(V.transit_runtime_code));
+    assert.equal((V.transit_runtime_code.length - 2) / 2, 93);
     // Another payee or owner is another account; a bad argument is refused.
     assert.notEqual(transitAccountAddress({ ...args, payee: V.owner }), low(V.transit_account));
     assert.notEqual(transitAccountAddress({ ...args, owner: V.payee }), low(V.transit_account));
@@ -180,7 +180,7 @@ test('the gas policy normalizes from both spellings, compares with the contractâ
     const vectors = normalizeGasPolicy(V.gas_policy);
     const profile = normalizeGasPolicy(gaslessProfileFromVectors({ spelling: 'profile' }).gas_policy);
     assert.ok(sameGasPolicy(vectors, profile), 'postop_* / call_cap and post_op_* / call_hard_cap pin the same constants');
-    assert.deepEqual(profile.defaults.callDefault.map(String), ['395000', '395000', '250000', '60000']);
+    assert.deepEqual(profile.defaults.callDefault.map(String), ['402500', '395000', '250000', '60000']);
     assert.equal(profile.defaults.postOpDefault, 270_000n);
     assert.equal(vectors.finalizeReserveGas, vectors.pvgFloor + vectors.verificationFloor + vectors.callFloor[2] + vectors.pmVerificationFloor + vectors.postOpFloor);
     assert.equal(vectors.finalizeReserveGas.toString(), V.gas_policy.finalize_reserve_gas);
@@ -227,7 +227,7 @@ test('the profile pins are read, validated and absent when the deployment has no
 test('gas fields come from the pinned policy within every floor and cap, never from an estimate', () => {
     const fields = gasFields({ gasPolicy, kind: KIND.close, withInitCode: true, calldataBytes: 1_764 });
     assert.deepEqual(fields, {
-        callGasLimit: 395_000n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
+        callGasLimit: 402_500n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
         paymasterVerificationGasLimit: 370_000n, paymasterPostOpGasLimit: 275_000n
     });
     assert.equal(gasFields({ gasPolicy, kind: KIND.close, withInitCode: false, calldataBytes: 0 }).verificationGasLimit, 80_000n);

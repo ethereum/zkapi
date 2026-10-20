@@ -260,6 +260,20 @@ test('the gasless pins and the deployment check of the EntryPoint, SenderCreator
     }
     const ok = await verifyGaslessDeployment({ request: gaslessChain().request, trusted: profile, chainId: 1, source: 'read_rpc' });
     assert.deepEqual(ok, { ok: true, source: 'read_rpc', mismatches: [] });
+    // Older profiles need no schedule getter; a published immutable schedule
+    // must match on chain, and unknown schedule IDs are refused before reads.
+    for (const schedule of [0, 1]) {
+        const scheduled = { ...profile, gasless: { ...gasless, gas_schedule: schedule } };
+        const getter = `${low(VECTORS.paymaster)}:${GASLESS_ABI.gasSchedule}`;
+        assert.equal((await verifyGaslessDeployment({ request: gaslessChain({ getters: { [getter]: word(BigInt(schedule)) } }).request,
+            trusted: scheduled, chainId: 1 })).ok, true);
+        const mismatch = await verifyGaslessDeployment({ request: gaslessChain({ getters: { [getter]: word(BigInt(1 - schedule)) } }).request,
+            trusted: scheduled, chainId: 1 });
+        assert.deepEqual(mismatch.mismatches.map(entry => entry.field), ['paymaster.gasSchedule']);
+        const absent = await verifyGaslessDeployment({ request: gaslessChain().request, trusted: scheduled, chainId: 1 });
+        assert.deepEqual(absent.mismatches.map(entry => entry.field), ['paymaster.gasSchedule']);
+    }
+    assert.throws(() => gaslessPins({ ...profile, gasless: { ...gasless, gas_schedule: 2 } }), { code: 'gasless_profile_invalid' });
     // The vendored canonical runtimes hash to the pins (identical on every chain).
     assert.equal(codehash(ENTRY_POINT_RUNTIME), VECTORS.entry_point_codehash);
     assert.equal(codehash(SENDER_CREATOR_RUNTIME), VECTORS.sender_creator_codehash);

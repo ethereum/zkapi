@@ -142,6 +142,7 @@ const GASLESS_ABI = Object.freeze({
   quote: "e948303d",
   // gasPolicy(): 30 words (two uint256[4] then 22 scalars)
   gasPolicy: "3a5dbdc2",
+  gasSchedule: "61ed0660", // gasSchedule()
   // chargeFor(uint8,uint256,uint256,uint256,uint256,bool,bool,uint256)
   chargeFor: "64452fce",
   // keyFor(uint8,uint256,uint32,address)
