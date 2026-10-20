@@ -142,7 +142,8 @@ SQLite transaction, the server cannot read the binding read-only and runs the
 RPC check again. The challenger refuses to start until this row exists.
 
 Allow these calls on `ZKAPI_NATIVE_BILLING_RPC_URL`. It must also support the
-`finalized` block tag, `eth_call` at a block hash (EIP-1898 `{"blockHash": ...}`),
+`finalized` block tag, `eth_call` at a canonical block hash (EIP-1898
+`{"blockHash": ..., "requireCanonical": true}`),
 and an `eth_call` gas cap of at least 0.6M gas: `currentRoot()` is a computed
 view of up to about 0.5M gas, which the server calls at a block hash about once
 per root poll interval (1 second), so a provider with a lower cap (or without
@@ -156,7 +157,7 @@ EIP-1898) leaves the server without a vault root and every request is refused
 | `eth_call` `0x15fa2a9a`, `0x230e2a24` | vault | `latest` | `stateSigningKeyX()`, `stateSigningKeyY()` |
 | `eth_call` `0xdc41d636`, `0x112cd6bc` | vault | `latest` | `clearanceSigningKeyX()`, `clearanceSigningKeyY()` |
 | `eth_call` `0xf3f480d9` | vault | `latest` | `challengePeriod()` |
-| `eth_call` `0xfdab463d`, `0x7a2043a3` | vault | block hash | `currentRoot()` (about 0.5M gas) and `nextNoteId()`: the request-root poll, and the comparison with the indexer's root at the indexer's block hash |
+| `eth_call` `0xfdab463d`, `0x7a2043a3`, `0xe442740e` | vault | same canonical block hash | `currentRoot()` (about 0.5M gas), `nextNoteId()`, and `retirementEpoch()`: the request-root poll; the indexer comparison reads the root at the indexer's block hash |
 | `eth_call` `0xd154f5bf` | vault | `latest` | `noteRecord(uint32)`: one fresh read per clearance, after the ownership proof verifies |
 | `eth_call` `0x5e00b426`, `0xc0baafb1`, `0x41b3d185`, `0xefc91e58` | vault | `latest` | Startup probes: `CONCESSION_ESCAPE_VERSION()`, `LEAF_BOUND_EXIT_VERSION()`, `minDeposit()`, `proofAdapter()` |
 | `eth_call` `0xda0e8385`, `0xfe351488`, `0x7fcd0926` | adapter | `latest` | Startup probes: `CIRCUIT_ID_HASH()`, `REQUEST_VK_HASH()`, `WITHDRAWAL_VK_HASH()` |
@@ -173,13 +174,20 @@ Request admission accepts only roots the server itself read from the vault's
 `currentRoot()` at a block hash it fetched: the latest one, or an earlier one
 until `ZKAPI_REQUEST_ROOT_GRACE_SECONDS` (in `deployment.env`; default 60, 0 to
 600, 0 accepting only the latest) after the vault replaced it. Any other root
-is refused `stale_root` with the latest root. Deposits and leaf retirements
-change the root, so the grace lets requests whose path was fetched just before
-such a change through, however often the root changes. Indexer roots never
-enter the window. When a recorded block hash is no longer canonical at its
-height, the server keeps only the latest root. Requests are refused
-`root_unavailable` (retriable) only while the server has had no successful
-vault read for `ZKAPI_ROOT_MAX_STALENESS_SECONDS` (default 60). The indexer's
+is refused `stale_root` with the latest root. Grace applies only across
+deposits: a changed `retirementEpoch()` or an observed reorganization discards
+all earlier roots. The epoch and root are read at the same canonical block
+hash, so requests cannot reuse a pre-retirement root after the server observes
+the retirement. This boundary takes effect on the next successful root poll;
+it does not eliminate the delay between a chain update and the poll. Indexer
+roots never enter the window.
+
+Requests are refused `root_unavailable` (retriable) if either the last
+successful vault read or its chain block timestamp is older than
+`ZKAPI_ROOT_MAX_STALENESS_SECONDS` (default 60). A regressing RPC head also
+invalidates admission until the provider catches up; a successful read of a
+stale block does not extend freshness. Admission rechecks root validity and
+freshness after proof verification, while reserving the request. The indexer's
 root is compared with `currentRoot()` at the indexer's block hash as a health
 signal only: a disagreement is logged as a warning, counted in the
 `zkapi_indexer_root_disagreement` metric and reported as degraded health, and
