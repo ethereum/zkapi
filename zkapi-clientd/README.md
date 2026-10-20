@@ -27,6 +27,13 @@ zkapi-clientd serve
 
 Leave that terminal running. In Open WebUI or another OpenAI-compatible client, set the base URL to **`http://127.0.0.1:8787/v1`** and leave the API key empty (use `local` if the app requires a value). Select a model and chat. The endpoint accepts local connections only.
 
+Web search is on by default for all chat completions through OpenRouter's web
+plugin. Search charges apply, including for background title and follow-up
+requests from your UI. To turn the default off, stop `serve`, run
+`zkapi-clientd config --web-search=false`, then restart `serve`.
+Use `zkapi-clientd config --web-search=true` or `config --edit` to turn it back on.
+See [web search](docs/CLI_ZKAPI.md#web-search) for configuration details.
+
 The default reuses an OpenRouter key for a fixed window of up to 60 seconds.
 Compatible requests from different chats, local clients, and Open WebUI's title
 and follow-up requests can share a key and its spending cap; the provider can

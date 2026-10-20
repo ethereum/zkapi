@@ -22,6 +22,7 @@ type configureOptions struct {
 	bundlerURL, withdrawalFees                string
 	usd                                       string
 	keyReuseWindowSeconds                     int
+	webSearch                                 bool
 	status, apiKey, edit, menu, requireAPIKey bool
 	fields                                    map[string]bool
 }
@@ -43,7 +44,8 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.BoolVar(&o.apiKey, "api-key", false, "print the local inference API key explicitly")
 	f.IntVar(&o.keyReuseWindowSeconds, "key-reuse-window-seconds", config.DefaultKeyReuseWindowSeconds, "fixed ephemeral key reuse window (default 60 seconds; 1-300 shares keys across chats and local clients; 0 uses a fresh key per inference request)")
 	f.BoolVar(&o.requireAPIKey, "require-api-key", false, "require a local API key for inference (default: no key required)")
-	f.BoolVar(&o.edit, "edit", false, "edit network, listener, and transport interactively")
+	f.BoolVar(&o.webSearch, "web-search", true, "automatically enable OpenRouter web search for chat completions; use --web-search=false to disable (search charges apply)")
+	f.BoolVar(&o.edit, "edit", false, "edit network, listener, transport, and web search interactively")
 	f.BoolVar(&o.menu, "menu", false, "open configuration and wallet management actions")
 	if err := f.Parse(args); err != nil {
 		return o, err
@@ -258,6 +260,9 @@ func applyConfigureOptions(c config.Config, o configureOptions) config.Config {
 	if o.fields["require-api-key"] {
 		c.RequireAPIKey = o.requireAPIKey
 	}
+	if o.fields["web-search"] {
+		c.WebSearch = o.webSearch
+	}
 	if o.fields["listen"] {
 		c.Listen = o.listen
 	}
@@ -309,6 +314,11 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 		ui.Printf("Withdrawal fees: paid from the payout by default (--fees payout)\n")
 	}
 	showClientConnection(c, ui)
+	if c.WebSearch {
+		ui.Printf("Web search: on by default (OpenRouter; search charges apply).\n")
+	} else {
+		ui.Printf("Web search: off by default.\n")
+	}
 	if c.KeyReuseWindowSeconds == 0 {
 		ui.Printf("Ephemeral key reuse: disabled; fresh key per inference request. New keys may wait for earlier settlement.\n")
 	} else {
@@ -388,6 +398,15 @@ func promptConfigure(ctx context.Context, c config.Config, ui setupPrompter, edi
 		c = candidate
 		break
 	}
+	searchDefault := "off"
+	if c.WebSearch {
+		searchDefault = "on"
+	}
+	search, err := configureChoice(ctx, ui, "Web search by default (OpenRouter search charges apply): on or off", searchDefault, "on", "off")
+	if err != nil {
+		return c, err
+	}
+	c.WebSearch = search == "on"
 	return c, nil
 }
 

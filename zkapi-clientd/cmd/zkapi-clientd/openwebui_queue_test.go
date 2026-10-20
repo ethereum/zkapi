@@ -86,6 +86,13 @@ func testOpenWebUIBurst(t *testing.T, reuseWindow time.Duration, automatic bool)
 		case "/chat/pinned-models":
 			body = `{"disabled_models":[]}`
 		case "/api/v1/chat/completions":
+			var request map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("invalid provider request: %v", err)
+			}
+			if string(request["plugins"]) != `[{"id":"web"}]` || string(request["model"]) != `"test/model"` || request["user"] != nil {
+				t.Error("provider request lost default web search, changed the model, or forwarded caller identity")
+			}
 			n := providerCalls.Add(1)
 			wantKey := "Bearer fresh-key-1"
 			if n == 2 && reuseWindow == 0 {

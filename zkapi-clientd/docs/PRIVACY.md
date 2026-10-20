@@ -7,6 +7,13 @@ The wallet/prover helper receives neither prompts nor responses nor model IDs.
 The provider sees the inference content. Client applications may store their
 own transcripts; the daemon cannot hide content already given to that UI.
 
+Web search is enabled by default through OpenRouter's web plugin. OpenRouter
+or its search provider processes search queries derived from the inference
+content, and search charges apply to every completion, including background UI
+requests. Stop `serve`, run `zkapi-clientd config --web-search=false`, then
+restart `serve` to disable automatic search. Explicit `:online` model requests
+still enable search. The saved preference is preserved across updates.
+
 Direct HTTPS is the default. It exposes the source IP to destination services
 and uses local DNS, so network timing/IP can correlate activity even though
 credential issuance is unlinkable. Optional Wisp carries destination TLS with
