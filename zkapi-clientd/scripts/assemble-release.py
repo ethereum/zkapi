@@ -2,6 +2,7 @@
 """Render installable manifests from actual release artifacts, never placeholder hashes."""
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import re
 import shutil
@@ -13,11 +14,34 @@ import tempfile
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("version", help="MAJOR.MINOR.PATCH")
 parser.add_argument("artifacts", type=Path, help="Directory containing all four native archives")
+parser.add_argument("--fixture", action="store_true",
+                    help="test fixtures only: skip the published point-release gate")
 args = parser.parse_args()
 if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
     parser.error("version must be MAJOR.MINOR.PATCH")
 
 repo = Path(__file__).resolve().parents[2]
+
+# Design §10.7 D: this release's warnings send owners of the earlier vault's
+# notes to that vault's point release (LegacyRelease in deployments.go), which
+# withdraws them. It is assembled only once that release is published, with
+# its checksum record checked in, so the release it names can be installed.
+legacy = re.search(r'LegacyRelease = "zkapi-clientd ([0-9]+\.[0-9]+\.[0-9]+) ',
+                   (repo / "zkapi-clientd/internal/zkapi/deployments.go").read_text())
+if not legacy:
+    parser.error("internal/zkapi/deployments.go names no LegacyRelease version")
+if not args.fixture and args.version != legacy.group(1):
+    record = repo / f"zkapi-clientd/packaging/releases/clientd-{legacy.group(1)}.json"
+    published = False
+    if record.is_file():
+        try:
+            published = json.loads(record.read_text()).get("tag") == f"clientd-v{legacy.group(1)}"
+        except ValueError:
+            published = False
+    if not published:
+        parser.error(f"publish the earlier vault's point release clientd-v{legacy.group(1)} first and "
+                     f"check in packaging/releases/clientd-{legacy.group(1)}.json (design §10.7 D): "
+                     "this release's warnings send owners of that vault's notes there")
 artifacts = args.artifacts.resolve()
 values = {
     "VERSION": args.version,

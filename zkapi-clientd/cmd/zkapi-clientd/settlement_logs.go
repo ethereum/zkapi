@@ -17,7 +17,7 @@ type settlementRunner interface {
 // fixed result fields enter these logs; wallet receipts report the actual cost.
 func runAutomaticSettlement(ctx context.Context, logger *log.Logger, runner settlementRunner) {
 	ctx = activity.WithReporter(ctx, func(event activity.Event) {
-		if logger == nil {
+		if logger == nil || activity.DiagnosticLevel(ctx) == activity.SemiVerbose {
 			return
 		}
 		switch event.Kind {

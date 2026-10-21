@@ -1,12 +1,14 @@
 package zkapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"math/big"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -29,7 +31,7 @@ func TestNativeFundingExactPayableDepositAndMinedRecovery(t *testing.T) {
 	tx := f.accepted[deposit.TransactionHash]
 	expected := new(big.Int).Mul(big.NewInt(amount), big.NewInt(1_000_000_000))
 	simulated, _ := new(big.Int).SetString(strings.TrimPrefix(f.estimateValue, "0x"), 16)
-	if tx.Nonce() != 0 || !strings.EqualFold(tx.To().Hex(), addressTestVault) || tx.Value().Cmp(expected) != 0 || simulated == nil || simulated.Cmp(expected) != 0 || len(tx.Data()) != 4+34*32 || hex.EncodeToString(tx.Data()[:4]) != "c588341c" {
+	if tx.Nonce() != 0 || !strings.EqualFold(tx.To().Hex(), addressTestVault) || tx.Value().Cmp(expected) != 0 || simulated == nil || simulated.Cmp(expected) != 0 || !isDepositCalldata(tx.Data()) {
 		t.Fatal("native signed value, calldata, or simulated value is incorrect")
 	}
 	if tx.Type() != types.DynamicFeeTxType || f.overrideReads != 2 {
@@ -147,7 +149,7 @@ func TestNativeFundingDoesNotSilentlyRebindLegacySignerOrDeposit(t *testing.T) {
 }
 
 func TestNativeFundingConfigurationMustMatchPackagedDeploymentAndGwei(t *testing.T) {
-	for _, mutation := range []string{"deployment_id", "contract_address", "billing_unit", "native_asset_wei_per_unit", "token"} {
+	for _, mutation := range []string{"deployment_id", "contract_address", "billing_unit", "native_asset_wei_per_unit", "token", "demo_rpc_url", "indexer_url", "protocol_server_url"} {
 		t.Run(mutation, func(t *testing.T) {
 			f := newAddressFixture(t, true)
 			upstream := f.h.client.local.Transport
@@ -172,6 +174,8 @@ func TestNativeFundingConfigurationMustMatchPackagedDeploymentAndGwei(t *testing
 					body[mutation] = "1"
 				case "token":
 					body["demo_billing_token_address"] = addressTestToken
+				case "demo_rpc_url", "indexer_url", "protocol_server_url":
+					body[mutation] = "https://ethereum-rpc.publicnode.com.evil"
 				}
 				return withdrawalJSONResponse(r, 200, body), nil
 			})
@@ -191,12 +195,69 @@ func TestNativeManualConfirmationAcceptsMinedReceiptWithoutSignerJournal(t *test
 		t.Fatal(err)
 	}
 	hash := "0x" + strings.Repeat("a", 64)
+	receipt := sampleReceipt(depositRecord{Contract: addressTestVault, Commitment: "0x1234", Amount: 100000})
 	f.receipts[hash] = map[string]any{
 		"transactionHash": hash, "status": "0x1", "blockNumber": "0x10", "blockHash": addressTestBlock,
-		"to": addressTestVault, "logs": sampleReceipt(depositRecord{Contract: addressTestVault, Commitment: "0x1234", Amount: 100000}).Logs,
+		"to": addressTestVault, "logs": receipt.Logs,
 	}
+	// The receipt is corroborated by the vault state and the indexer.
+	expiry, _ := new(big.Int).SetString(receipt.Logs[0].Data[66:130], 16)
+	f.mu.Lock()
+	f.registerDeposit(addressTestFirstNote, "0x1234", 100000, expiry.Uint64())
+	f.mu.Unlock()
 	f.finalized = "0x1"
 	if _, err := f.h.confirm(context.Background(), hash); err != nil || f.activated != 1 {
 		t.Fatalf("canonical mined native receipt rejected: %v", err)
+	}
+}
+
+// Design §10.5: this release keeps its payment state per deployment ID. The
+// earlier release kept its payment address, key and pending deposit per
+// network, for another vault; those files neither block funding here nor
+// are read or rewritten, and a startup warning names them.
+func TestFundingStateIsPerDeploymentAndLeavesTheLegacyFilesAlone(t *testing.T) {
+	f := newAddressFixture(t, true)
+	root := t.TempDir()
+	legacyDir := filepath.Join(root, "mainnet")
+	if err := os.MkdirAll(legacyDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, _ := json.Marshal(addressFundingRecord{Version: 2, ChainID: 1, Contract: "0x4386000000000000000000000000000000000001", Address: crypto.PubkeyToAddress(key.PublicKey).Hex(), PrivateKey: hex.EncodeToString(crypto.FromECDSA(key)), Phase: "active", DeploymentID: "zkapi-native-eth-mainnet-note-bound-v1-fresh-20260930", BillingAsset: "native_eth", BillingUnit: "gwei", WeiPerUnit: "1000000000"})
+	files := map[string][]byte{"address-funding.json": legacy, "pending-deposit.json": []byte(`{"chain_id":1}`)}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(legacyDir, name), content, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if warning := LegacyFundingWarning(root, "mainnet"); !strings.Contains(warning, legacyDir) {
+		t.Fatalf("no legacy funding warning: %q", warning)
+	}
+	if LegacyFundingWarning(t.TempDir(), "mainnet") != "" {
+		t.Fatal("a warning without legacy files")
+	}
+	h, err := NewFundingHandler(f.h.client, "http://127.0.0.1:8787", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := h.Address(context.Background())
+	if err != nil || strings.EqualFold(status.Address, crypto.PubkeyToAddress(key.PublicKey).Hex()) {
+		t.Fatalf("funding was blocked by, or adopted, the legacy payment address: %+v %v", status, err)
+	}
+	deployment, _, err := pinnedDeployment("mainnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.addressStatePath() != filepath.Join(root, "mainnet", deployment.ID, "address-funding.json") {
+		t.Fatalf("payment state at %s", h.addressStatePath())
+	}
+	for name, content := range files {
+		saved, err := os.ReadFile(filepath.Join(legacyDir, name))
+		if err != nil || !bytes.Equal(saved, content) {
+			t.Fatalf("the legacy %s was changed", name)
+		}
 	}
 }

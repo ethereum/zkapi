@@ -35,9 +35,10 @@ Usage: ./scripts/install-source.sh [--prefix ABSOLUTE_DIR]
           [--version MAJOR.MINOR.PATCH] [--setup [--network mainnet|sepolia]]
 
 The source build uses version 0.0.0 by default and records the exact checkout,
-source state, wallet companion commits, patch hashes and build toolchains.
-It prepares and builds the pinned Rust companion in a temporary directory;
-the build does not modify operator services or wallet data.
+source state, the pinned wallet companion commit and build toolchains.
+It prepares and builds the pinned Rust companion (crates/zkapi-companion at
+ZKAPI_SOURCE_COMMIT) in a temporary directory; the build does not modify
+operator services or wallet data.
 Installation defaults to ~/.local. Stop an existing daemon before updating,
 then restart it after installation. Prior installation bundles are retained.
 

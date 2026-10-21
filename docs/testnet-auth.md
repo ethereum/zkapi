@@ -47,7 +47,9 @@ forward `X-ZKAPI-Testnet-Password`, `Origin`, `Access-Control-Request-Method`,
 and `Access-Control-Request-Headers`, allow OPTIONS/GET/POST, and preserve CORS
 and no-store response headers. Do not add password headers to access logs or
 enable request-header debug dumps. The bundled gateway already forwards `/v2/`
-and the request headers to the server. Only the server container receives
+and the request headers to the server. Its per-source `POST` limits run before
+the password check, so a throttled request receives
+`429 gateway_rate_limited`, not `401`. Only the server container receives
 `server.env`.
 
 Rotate the password by replacing this one environment value and recreating the

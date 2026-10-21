@@ -1,9 +1,11 @@
 //! Live dashboard feed for the zkAPI server.
 //!
-//! Events expose lease authorizations, proof bindings, aggregate upstream cost,
-//! whole-gwei settlement, and signed state transitions. Inference prompts stay
-//! between the client and its leased upstream key. This bounded feed is
-//! observability only and does not affect protocol state.
+//! Events expose lease authorizations, proof bindings, aggregate upstream cost
+//! and whole-gwei settlement, recorded when a request settles. Inference
+//! prompts stay between the client and its leased upstream key, and the
+//! unauthenticated feed carries nothing of the successor state: no commitment,
+//! anchor or server blinding. This bounded feed is observability only and does
+//! not affect protocol state.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -47,11 +49,6 @@ pub struct DashboardEvent {
     pub charge_applied: u128,
     pub charge_usd: f64,
 
-    // --- next state the server signed ---
-    pub next_commitment: CurvePointWire,
-    pub next_anchor: Felt252,
-    pub blind_delta_srv: Felt252,
-
     // --- timing ---
     pub upstream_ms: u64,
     pub total_ms: u64,
@@ -63,6 +60,79 @@ pub struct DashboardTotals {
     pub request_count: u64,
     pub total_gwei_charged: u128,
     pub total_cost_usd: f64,
+}
+
+/// Durable lease-settlement health, counted with raw SQL so that rows the
+/// settler cannot decode are included. Operator-only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SettlementCounts {
+    /// Leases still to be settled.
+    pub pending: u64,
+    /// Settled leases whose successor is not signed because an exit consumed
+    /// the request's nullifier (O7), awaiting the exit's defeat.
+    pub exit_deferred: u64,
+    /// Settled leases whose successor is never signed (ExitedUnsigned).
+    pub exited_unsigned: u64,
+    /// Non-terminal leases with at least one failed settlement attempt.
+    pub retrying: u64,
+    pub provisioning: u64,
+    /// Corrupt bindings cancelled without a signature.
+    pub cancelled: u64,
+    /// Rows whose status no settler recognizes.
+    pub unknown_status: u64,
+    /// Settlement reviews not yet acknowledged.
+    pub open_reviews: u64,
+    /// Provider keys of terminal leases still queued for deletion.
+    pub pending_key_cleanups: u64,
+    /// Seconds until the nearest pending settlement deadline (0 if past).
+    pub next_deadline_in_seconds: Option<u64>,
+}
+
+/// One non-terminal lease on the operator settlement page.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingLeaseView {
+    pub client_request_id: String,
+    pub request_nullifier: Felt252,
+    pub key_source: String,
+    pub status: String,
+    pub delivered: Option<bool>,
+    /// Set before finalization only on a lease committed to a zero charge:
+    /// "unissued" (never delivered) or "operator_conceded" (reopened with a
+    /// concession).
+    pub charge_basis: Option<String>,
+    pub expires_at: u64,
+    pub settle_after: u64,
+    pub settlement_deadline: Option<u64>,
+    pub seconds_until_deadline: Option<u64>,
+    pub attempts: u64,
+    pub first_error_at: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+/// A settlement review; gwei and micro-USD amounts are decimal strings.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettlementReviewView {
+    pub client_request_id: String,
+    pub request_nullifier: Felt252,
+    pub key_source: String,
+    pub reason: String,
+    pub charge_basis: Option<String>,
+    pub detail: String,
+    pub reported_usage_micro_usd: Option<String>,
+    pub charge_applied: Option<String>,
+    pub solvency_bound: String,
+    pub created_at: u64,
+    pub acknowledged_at: Option<u64>,
+}
+
+/// GET /v1/dashboard/settlement.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettlementOverview {
+    pub generated_at: u64,
+    pub settlement_deadline_seconds: Option<u64>,
+    pub counts: SettlementCounts,
+    pub pending: Vec<PendingLeaseView>,
+    pub reviews: Vec<SettlementReviewView>,
 }
 
 /// Bounded in-memory feed + broadcast hub.
@@ -191,6 +261,20 @@ mod tests {
         assert_eq!(hub.recent().len(), 2);
     }
 
+    /// §5.1: the unauthenticated feed carries nothing of the successor.
+    #[test]
+    fn events_carry_no_successor_state() {
+        let event = serde_json::to_value(sample_event(1, 1)).unwrap();
+        for field in [
+            "next_anchor",
+            "blind_delta_srv",
+            "next_commitment",
+            "next_state_signature",
+        ] {
+            assert!(event.get(field).is_none(), "{field}");
+        }
+    }
+
     fn sample_event(seq: u64, charge: u128) -> DashboardEvent {
         DashboardEvent {
             seq,
@@ -215,12 +299,6 @@ mod tests {
             usage: None,
             charge_applied: charge,
             charge_usd: 0.000001 * charge as f64,
-            next_commitment: CurvePointWire {
-                x: Felt252::ZERO,
-                y: Felt252::ZERO,
-            },
-            next_anchor: Felt252::ZERO,
-            blind_delta_srv: Felt252::ZERO,
             upstream_ms: 0,
             total_ms: 0,
         }

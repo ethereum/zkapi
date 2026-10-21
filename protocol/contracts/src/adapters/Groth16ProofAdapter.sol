@@ -6,8 +6,19 @@ import {Types} from "../libraries/Types.sol";
 import {Errors} from "../libraries/Errors.sol";
 
 /// @title Groth16ProofAdapter
-/// @notice Circuit-specific zkAPI v2 verifier generated from the selected setup.
+/// @notice zkAPI verifier for circuit zkapi-v2-concession-v1, setup dev, generated from its
+///         verifying keys. Verification is standard Groth16 over the 12 request and 16 withdrawal
+///         public inputs, in the order of Types.RequestPublicInputs and Types.WithdrawalPublicInputs;
+///         inputs of 0, 1 and 2 skip the scalar multiplication.
 contract Groth16ProofAdapter is IZkApiProofAdapter {
+    /// @notice keccak256("zkapi-v2-concession-v1"): the statement this adapter verifies.
+    bytes32 public constant CIRCUIT_ID_HASH = 0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687;
+    /// @notice keccak256 of the request verifying key (arkworks compressed bytes of request.vk
+    ///         without its header). Identifies the setup.
+    bytes32 public constant REQUEST_VK_HASH = 0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790;
+    /// @notice keccak256 of the withdrawal verifying key (withdrawal.vk without its header).
+    bytes32 public constant WITHDRAWAL_VK_HASH = 0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1;
+
     uint256 private constant SCALAR_MODULUS =
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint256 private constant BASE_MODULUS =
@@ -58,7 +69,7 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
         view
         override
     {
-        uint256[14] memory values = [
+        uint256[16] memory values = [
             uint256(inputs.protocolVersion),
             uint256(inputs.chainId),
             uint256(uint160(inputs.contractAddress)),
@@ -71,8 +82,10 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
             uint256(inputs.finalBalance),
             uint256(uint160(inputs.destination)),
             inputs.withdrawalNullifier,
-            inputs.hasClearance ? uint256(1) : uint256(0),
-            inputs.withdrawalTag
+            uint256(inputs.kind),
+            inputs.nextNullifier,
+            uint256(inputs.conceded),
+            uint256(inputs.validUntil)
         ];
         (Proof memory parsed, bool validEncoding) = _decodeProof(proof);
         if (!validEncoding || !_verifyWithdrawal(values, parsed)) revert Errors.InvalidProof();
@@ -81,12 +94,25 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _verifyRequest(uint256[12] memory values, Proof memory proof) private view returns (bool) {
         G1Point memory accumulator = _requestIc(0);
         for (uint256 i = 0; i < 12; ++i) {
-            if (values[i] >= SCALAR_MODULUS) return false;
-            (G1Point memory term, bool mulOk) = _scalarMul(_requestIc(i + 1), values[i]);
-            if (!mulOk) return false;
-            bool addOk;
-            (accumulator, addOk) = _add(accumulator, term);
-            if (!addOk) return false;
+            uint256 value = values[i];
+            if (value >= SCALAR_MODULUS) return false;
+            // 0 · IC is the point at infinity, the neutral element of the sum: skipped. 1 · IC and
+            // 2 · IC need no scalar multiplication (6,000 gas) either: the point itself, and one
+            // addition. The protocol version (2), a close's kind (1), an escape's kind (0) and an
+            // exit's zero nextNullifier and conceded take these paths.
+            if (value == 0) continue;
+            G1Point memory point = _requestIc(i + 1);
+            G1Point memory term = point;
+            bool ok;
+            if (value == 2) {
+                (term, ok) = _add(point, point);
+                if (!ok) return false;
+            } else if (value != 1) {
+                (term, ok) = _scalarMul(point, value);
+                if (!ok) return false;
+            }
+            (accumulator, ok) = _add(accumulator, term);
+            if (!ok) return false;
         }
         return _pairing(
             _negate(proof.a),
@@ -100,15 +126,28 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
         );
     }
 
-    function _verifyWithdrawal(uint256[14] memory values, Proof memory proof) private view returns (bool) {
+    function _verifyWithdrawal(uint256[16] memory values, Proof memory proof) private view returns (bool) {
         G1Point memory accumulator = _withdrawalIc(0);
-        for (uint256 i = 0; i < 14; ++i) {
-            if (values[i] >= SCALAR_MODULUS) return false;
-            (G1Point memory term, bool mulOk) = _scalarMul(_withdrawalIc(i + 1), values[i]);
-            if (!mulOk) return false;
-            bool addOk;
-            (accumulator, addOk) = _add(accumulator, term);
-            if (!addOk) return false;
+        for (uint256 i = 0; i < 16; ++i) {
+            uint256 value = values[i];
+            if (value >= SCALAR_MODULUS) return false;
+            // 0 · IC is the point at infinity, the neutral element of the sum: skipped. 1 · IC and
+            // 2 · IC need no scalar multiplication (6,000 gas) either: the point itself, and one
+            // addition. The protocol version (2), a close's kind (1), an escape's kind (0) and an
+            // exit's zero nextNullifier and conceded take these paths.
+            if (value == 0) continue;
+            G1Point memory point = _withdrawalIc(i + 1);
+            G1Point memory term = point;
+            bool ok;
+            if (value == 2) {
+                (term, ok) = _add(point, point);
+                if (!ok) return false;
+            } else if (value != 1) {
+                (term, ok) = _scalarMul(point, value);
+                if (!ok) return false;
+            }
+            (accumulator, ok) = _add(accumulator, term);
+            if (!ok) return false;
         }
         return _pairing(
             _negate(proof.a),
@@ -193,20 +232,20 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
 
     function _requestAlpha() private pure returns (G1Point memory) {
         return G1Point(
-            0x10ba3e5ba8596ba51db06e46d7da8e8979772e7e6d3cf4bf317643e0dddb0620,
-            0x123da26d22d43331e967ff8e114fb59f189899e8cb9ceddc4da353d5999aa271
+            0x0e41d816cbcc39b947acbbec578a240d71f6f0d84baa1b4055db06b0005c3793,
+            0x2cd0915dbb7599f0393714c1c388deb83f43bb5d2f610777ee30a9c47da131b5
         );
     }
 
     function _requestBeta() private pure returns (G2Point memory) {
         return G2Point(
             [
-                0x1528aeec4a0d86a0f1872a82d6a1561f7fa141c3876db6ba3b0fefd9b31b919e,
-                0x018b3ac8da743666eac86ed526d014109edb3c8d28bc881db744ca3ec4d2aa1d
+                0x123603df7a4dcdbfc69e74856a3b4c9cd4b4798df54f4fd34a68635bfebab38e,
+                0x0e67a3f707f1e7cd3ca0587602f5ecfb487a4150aaed074b8d17b9e1917713e2
             ],
             [
-                0x093d1c4cbe931e02fed65443c168b1e9dbf52dc7585c662b65662f83145e65c0,
-                0x110036c8d501478c54d8b2e29a9179f5fd8d02aa75ac2c3ae354350a5fb1f17a
+                0x14c71c77cf6f6d4e55e8a957830f4ee88d19cd21ec897db31b0aad4ba6fa6f43,
+                0x1eb225694e7bdf9e06a4afe8825787b8203289fdc512a18c89530f5398bb19db
             ]
         );
     }
@@ -214,12 +253,12 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _requestGamma() private pure returns (G2Point memory) {
         return G2Point(
             [
-                0x03a58bd945e92b664b8910fd16d46a5774df2281bd4fb02f69de93709eff1282,
-                0x1d2e2b5507dceb20c1627ca160f0991ec59e97bbcce6b415c15faa567a69c46c
+                0x243c8ae4b6d9020f398be9a4c6e7d861e9d6be0eedd09664dee2670cac521085,
+                0x1026ecf1c3b7c5131bb928553af0dcd45f3e37e23ae971f2ff862540bd7f7126
             ],
             [
-                0x1c8314036c37a5238a26b2128f7b36b7820f388ca3f4b446442e410e12c0dda8,
-                0x29f52c12bd0e399248d80cd27f4d316b2f85832efb74e3d668d61fef82ed14f6
+                0x1594c00bdef3d8c7bf8301e896a7bfae32d2c15dd72cc5f5554b9e6e57e7e4ec,
+                0x0c9bdd6c7adea26d6d70793f9fdc2a9d16ece6365ff8434eac63c681dd920fc1
             ]
         );
     }
@@ -227,12 +266,12 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _requestDelta() private pure returns (G2Point memory) {
         return G2Point(
             [
-                0x2edc223d533aa01cd4fbd64b973070fa5d09a4c4a5219690efe7d1ebcc6f6696,
-                0x15de832e84f776aa038a07f6282e1c94129c4ba0a207b79d25db8d833b5fd4f2
+                0x23885d6c3f54f3117c570ae2d1abcbbc1d5393089490edfd2d740b9c97c07e7e,
+                0x0a352eb74c0c3f7dfb312b5f220e6055b0eaecd101cec6e592578419a2540970
             ],
             [
-                0x11039fadaf696374e6d1f5a5a78c40a3b3f73ed2cf9ae764047479fe6797d33f,
-                0x290a4105af46eeecbe32fc842d8bc9b5a6c6499c88aff6c79cf2ea2f6eb45ff4
+                0x19ed0aa007774000f64282f29f33ee10cc6490e13f3bd46cf7cbec49b538cc36,
+                0x21a121ac7037f98ae762c17ca81422e8d5866b38dd113e2a57a8cee63e94c736
             ]
         );
     }
@@ -240,80 +279,80 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _requestIc(uint256 index) private pure returns (G1Point memory) {
         if (index == 0) {
             return G1Point(
-                0x174aee0b310184c85f0cc09a7797573c8121914ba0d1cdcc07ec8bc3126a46bc,
-                0x2d361922636dcbde6c1eb17d0d7f8338b14605fedf1276f2ce809cea6a53ac57
+                0x29dc866da7e243c657d0de1583ef137c2d83404a5e6d764c1c129e1d0b81ae51,
+                0x13faa0669073c6aaefb44d0d09733e979f2608815c3af7c914050c23e7f114f3
             );
         }
         if (index == 1) {
             return G1Point(
-                0x14b762f8fb4c93344ab0fc0e0c72df252646dc0f2a6ca4c9807d406637fb0623,
-                0x226ad0a46ea2024e71e24e87b6f4e5b839c530431440d76cb856dd8cad064ba3
+                0x022adf9c9a3d89a4b5a3343699aa144e3ac9dce9c69f405a716ca9c410ae3995,
+                0x29a1c4d8d8d0586bd5e61fe41b3baf494ee1f1de531c1d0dddbb81aaa7930672
             );
         }
         if (index == 2) {
             return G1Point(
-                0x15375b2c3434be5e3146bbcd35a24a53a16c9cd7c11a21cdcd6adef5864f32dc,
-                0x1d4788d03f950fe789b64cdba7e9cbceea70cb6a03f04e312bdd0b508e11311a
+                0x1f0362d0d3eee2d8c8d22631870473db15fa7f5e6dfc589c268ed96fc1a79263,
+                0x15c569522a31fa817bed8d71a87a1d8da079a4f4ce986235f77d64b1c8bf172f
             );
         }
         if (index == 3) {
             return G1Point(
-                0x04c4222205a81c127d0ac2cc4dd958a9b410f4e04d45ee54f50843d70d218da7,
-                0x27085ed594c715cb9bbc96a6754eb116cbaa4c1a3da28eba81d196953d40621a
+                0x18ce1bc5a9a174cc79b506bc9f6f1f2a0330d9f9f51e7998e6a51b666b9e7cca,
+                0x0e317817e9d2acddf74671564e07a4648ba607fe88827f423196128c7ad06b16
             );
         }
         if (index == 4) {
             return G1Point(
-                0x2544865c8d55cf2fcad8c1dbf05e7b4d43dea4de9ed68de0b809975f62df3c02,
-                0x1ec27bf0d2572be8fc969cc21591f19647968fef95e5e263535f2be6c9bed4f6
+                0x0d1a49f5e4c81cfb0f0d247633f484f88af77fd06db5791139a85affd48c0755,
+                0x2d564d3ea7a8a4ebfb7f0445fe5ff38ffe1b45280c31f9dda40a9116a93f88d8
             );
         }
         if (index == 5) {
             return G1Point(
-                0x2376bf76dc45478e9f47b4e2151e479eda388155bae81bf7d1feb138b1a7d474,
-                0x13f2853847210b7500e92e9bef2150fcac8d380d4ddb7e509eb989d7b4b69f51
+                0x05f880e80c12c1e3b012a391b0d70e74d948bd9fbcca126185eb9b5ad70648df,
+                0x0cec3847f4aecb37b1cbc76ec29518b39c0085edcbaf2e4a58461c017ac7ceb4
             );
         }
         if (index == 6) {
             return G1Point(
-                0x2d6e51a3adb76cd1735b0ad411c42e447e90a6be4a33f99dadcf13a4d9eeaf31,
-                0x255f507d0b179b8fe0316ff75784da578af0ac7844d32ab9ea5ba420c66ffc15
+                0x27867bc2d456b2ee366b63178e06e854afb34c2c4199f184cac66570e205f97e,
+                0x1788a58831198d51f512afb565b974bd2727dd6a24116a8dc72bfa27d138e6c9
             );
         }
         if (index == 7) {
             return G1Point(
-                0x245a76ef7b13667e7693c8dcbf0e91a1d958c66e0bf24ebc10c519d469eb9274,
-                0x083b088bfedc67f72b53dd54b48fe1acedfc6b5d25fb0dabf0fd1de9ae9a64c3
+                0x105643c3617ee640173bfc9dcc8bb31a5f841208fd5558ce916a34e97898ba98,
+                0x0ba033fda0d9d3667eafec10f8b2d68c895d711f80e1380e3f8c67239bda206b
             );
         }
         if (index == 8) {
             return G1Point(
-                0x042ec83ce0538c0f56f3eb1f534acbaab56f44fc040fb22f03129244f47a4c8e,
-                0x16c767075f65958a08c481fd53d54b40c95a914e0444f8377486526fbbc51c37
+                0x302ea3ae838cc65fcf32badd1663e6a8d3a217ac7a60c56b39da231c7927bb6f,
+                0x06b38b47dc9b092877faba06e2092e6492645fc34d5934681b15bb7bbdc65371
             );
         }
         if (index == 9) {
             return G1Point(
-                0x2a247dcc1c285b0f4e31e96c622566fcd34bf23444dee957d0827773cfc458c4,
-                0x2ced1e1bf83caa086cb74a30601bc0cc9fa675d45189d62e107f30d394fdec84
+                0x2d1867a697640bf25b0afd7d5713f904ce4a4c81ba438f937a1abb1e38d0ad77,
+                0x13169463799390d1b98a933b5968026e926ce668a132224e825caeec4d557749
             );
         }
         if (index == 10) {
             return G1Point(
-                0x090219e32321331209f5b2cf6e74f41b254e3655f8d63b8e101472443cd83e48,
-                0x044ad923155f1c8d283efdab696ebc309da12340c1eb47011fca17aa4b803d5b
+                0x083c8ee4ccbdaddc98e1b62d62a44253bd660155e548ba64c061e7c74a7fef5d,
+                0x0090449d3855502cebdb187662d8ef7864c3c8dc52a8432a45a7e1ea559ebbe8
             );
         }
         if (index == 11) {
             return G1Point(
-                0x037968a077509d5db62d0d15ec78531e4581519b4085dc9d1120f1c491f85007,
-                0x09b1608c468e6d3759e4ccca0abc8a361332605116dc52a3e050dde479746696
+                0x2ddd41710cda2c8e86f936094a98a4ed8da149b0006c41e30cbb2514fe6e1698,
+                0x106857485c6108b9c2612bd85f3b6b8c841ead5981033ec02cd4648bf0cbcc4a
             );
         }
         if (index == 12) {
             return G1Point(
-                0x21ace17e82c5c9e36243f5aa05f705ce0c811942ca9c85ebc8a4da875decf52b,
-                0x13fcd96f7d5eb7a3fb68a7bf34390fc393af1e8642a32ddb7b36eac1159f3dcc
+                0x0d6d874d429871f52ecc07d253c69d43ce59f191496025735267b772ab9af505,
+                0x10f7e6181cd8620740ba6137212a7c7cb0241dd4344c706d8d581d76fe70e16c
             );
         }
         revert Errors.InvalidProof();
@@ -321,20 +360,20 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
 
     function _withdrawalAlpha() private pure returns (G1Point memory) {
         return G1Point(
-            0x1b68f243a5120511f84c88daaf020016c4ccc552efac97db30e202964a0f97c6,
-            0x1c6c644b440b3d672f121fe14e191cd61aeee4336fa9000557ae3cd0a5b6a3b4
+            0x2166ed9bdbd9c61a47a6f602c0ac5cfbef17ca98b350205323f9f94608a6db18,
+            0x277a08955c058c4fb5fd53c08e7a094d1a336221446b14724f1f31e3f1a8f476
         );
     }
 
     function _withdrawalBeta() private pure returns (G2Point memory) {
         return G2Point(
             [
-                0x14e880b05dab34ab9d8e2859eac18465303588648542266dbccf4d12fe613f80,
-                0x28e6870b066b8d6787b6a58dd65fe24b8740880589ff227934cc58fe666f3cef
+                0x1416fa0b9fdf0482bf1b96163bb664573a7859c6613ee2485d5e4272f776e23d,
+                0x088a2dc33a5cb675d136ea487f615651da57178ff9bfa29346fb8d536e1646ab
             ],
             [
-                0x1390d942e685b7f9ab55a8dcdf0d102693c2250697dfa65bef54491173aa2b16,
-                0x22358fd10742e5486a1eea3c0201142616a6e28dfa8ceb27f47481f866e9cb7a
+                0x0849883a5afb3e2ef3c7271d372c3732c12fb3e578a542b6f086e5bb52297ece,
+                0x0d8c1091ed12401dc07e373bb67de5e856321d24ee4948262c3b424ac6c4ce1e
             ]
         );
     }
@@ -342,12 +381,12 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _withdrawalGamma() private pure returns (G2Point memory) {
         return G2Point(
             [
-                0x0fb1b8fb2f8546e4f051ee63d95077529f6a38d5309f09fd77294c7f51d991de,
-                0x11d1e24c5678701cd8a0307fb43b76f74f8f32d5c57189106387594c19f9426a
+                0x2e7ff8f53da4536307c816b4c40d1decd534ac06aacc95de2109a4a6c5457d07,
+                0x1b5f2d8441eefd7a9e62d380a18a5631a5f711aa1e1441d691325fb5a1af59c9
             ],
             [
-                0x0f29505fb8c56780294020ce185649986d7319a52fecf9f9b8ae37da7824e17b,
-                0x27e9a4ed2f4ef4efeb6a41a0bc077b0c815678a914ae4e5b52c0779823c5fc3c
+                0x22fc60802258f0cab10fffbe417e717a7838b2634385b79e6cb63440f5882ab7,
+                0x02b447f81d2e5a532d15703f8d17ef25ecb51fb0a75d26e22a0ebd2c94f462fd
             ]
         );
     }
@@ -355,12 +394,12 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _withdrawalDelta() private pure returns (G2Point memory) {
         return G2Point(
             [
-                0x000dcd58940f740d08041c957d4ed647ac1bcd47aa79413078a3c8c67c2bf97a,
-                0x2ae3d495d8a41db13d7b6cfdb779e736281fc9cf82aff7b2148dd31622b64408
+                0x1ed8e7b749cd67d171bf587bcf59fc867596c452ef776ad72c11fea946c41914,
+                0x1cd6a44736e1a1b9246c6716674af675ce70afb8a0719e17a1fa95fc80dde590
             ],
             [
-                0x1f2d271fa1cdef48f60395b6c34ff202aca2e4bfe9a830ee13462fa1ed7741c0,
-                0x0610c280e78c787de109eebe744b678d15fe4b2983e81fea3c259904cb08a19d
+                0x27a63e18cba604245976b2f10bd1b3a447f206086c71c1872b2839b715056586,
+                0x2875c65bd2df8477b746c7b3bf8e1115c03a304e447a8a80ff7dee11c10e93bc
             ]
         );
     }
@@ -368,92 +407,104 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _withdrawalIc(uint256 index) private pure returns (G1Point memory) {
         if (index == 0) {
             return G1Point(
-                0x23bcf00d9cb8869b3c4049e0d31fe1c01166635ae33eadf2dcf0664a3b6a5f7a,
-                0x085a22accb9ddaa7de10dbb6db5a1dcaa5aa43bd6868024b096875b4fc4f97fb
+                0x01ec9065d8749e451c78a4bddb0e87ef97640c665609bbba06350412ba759dae,
+                0x1f2389ff9e07f10296766db544d47d1852bbb00d800b2c5488c948cb6ab1aea4
             );
         }
         if (index == 1) {
             return G1Point(
-                0x0cf771a769ac19b9d94e52bd219efb1c7d857ae38331ae91b04502bcc1351441,
-                0x1e13f96a68e67625d29042e5a56dba939241e4ffbb2c644f4f31e9211de12578
+                0x2f65d6796ce1e6547fb96295af051d0c4a31dc2a2f83f9d1c8b3ccb50504faac,
+                0x1cea1a47577772cc688918a353feef0d6bb7677bebe77e23b76d0f07a542247b
             );
         }
         if (index == 2) {
             return G1Point(
-                0x2f7bf4395880097fad5e558726c149ac96bfc8c80d556996716601ca42fe2eee,
-                0x072033d3eb57ec50403d57c7dcf372e75461af3864db17781b7dd3e13bd22f20
+                0x1a4d60a242e61bf0fb8aad7a1679095b5402f6b429f3f380162180e05672e7a2,
+                0x13af3c5a6e34d7c633f484d251a803d11de9be3eccde2860d87378aae31bf20d
             );
         }
         if (index == 3) {
             return G1Point(
-                0x119f446f1e059715aa3726db63094b54af436c4ebb853bde084ae4aa6da5d1ec,
-                0x1f46255071e48a87e8921fe55face923de4d179eaf16bcc1d78a1feafe42c3de
+                0x1912aed3bcd481ca13c200fd68526a4e5b6bfa817d854dd5dd80f302e7ceb4d3,
+                0x200fc8c19651b067d3ef51686231aa30c383871322726c30c4028776a2021a58
             );
         }
         if (index == 4) {
             return G1Point(
-                0x0cf355372151e0226f2aae2f73ca849c4506f5794a551353a9be997abe9f18bf,
-                0x02653477629494a85df2289b64e70cd39cf6e6b61ca7f71fbe49e4f266e64a51
+                0x209837ed55b2f0b1a214d96bda695a3512cb62113d3a47d22b7507282d37bdfd,
+                0x0c7bf70fd82347f7febd5790a01623228ea01bc1d57e23dae9d56a5d10954a2a
             );
         }
         if (index == 5) {
             return G1Point(
-                0x10d7380431997375db7343bb63d19aa2fdc7a074e70c604a2a14bd8c13c5a01f,
-                0x228c44eda5c853b54ccb56fb27f5fc08675d07924372e3703d09c909d525919a
+                0x24c0111c44fa9790bbd28f7c9e1e425f2ff19b0b7109e47c63414679e44aaaa6,
+                0x0deabc62c530c11773096d9278f7f0170094db78dbf65b09b08fda90d7d6e271
             );
         }
         if (index == 6) {
             return G1Point(
-                0x20481997027f5a3f1aa5f701770ddc85d72a04f6ff71f24e9ede9f3c44a7b063,
-                0x0b4aeb8e2110985c4369aa819d4f1a90bf981c618b82aa3311a7dced86656fea
+                0x097d1c378f329568048ff32f8b4606d6a519e1f3039195f483ce320ff9165f1d,
+                0x048fcefd36e381acdf4b30c7578837e1f8364980cfe0d980c3f9c3e77ef0c7f0
             );
         }
         if (index == 7) {
             return G1Point(
-                0x09626f2649c660c659d9c033d2040b9dd48d6a163bd55f72e9156104509e13a1,
-                0x19d311f67aeeb9cce576064e6b3aac9b284edf19665cdc10409f5bbec888cd42
+                0x2debd0053005c26c54bb11f2ad71c140377c501e1064dfa512e1208d10d84b97,
+                0x2612b6f613b96fa0439207ff674ccfb292cf04fc795b4c38e628a2fde3580df8
             );
         }
         if (index == 8) {
             return G1Point(
-                0x1841f89c356bd239098b64939203b61f50c126649589b6f7b4eb02bb966504a1,
-                0x0f384c41b3c6cf49adb6ea32d6d5eb7423aa6464d5be566ee337b9747077143b
+                0x2c560d9a316a2236832e3eb1058dcdc9747d3f6809a749369924e94540313511,
+                0x13665025be7dbcd2425ec777a3cc7045c53bdbd7436c8342355e23d7826070fa
             );
         }
         if (index == 9) {
             return G1Point(
-                0x0691e96a90fe638eec94cf392f09e42a210dfb9a4051cb8a998c795739c721c2,
-                0x15491bfec0a280a816393ffc8abd685dd7a4453cbcb07cb2faacc97f1f829f08
+                0x2431a5a30f78dfbbcb11c74eba15e4c972b85eec0f168311c6f6a051d54d061b,
+                0x1ab3e0357014c15112d7702505ec50a83fbed56536e0fbcbffb22e067703c079
             );
         }
         if (index == 10) {
             return G1Point(
-                0x1118135f7bd7642a3f4a97cc65a753de1a3edcb8ce038b349eb0002d8765a527,
-                0x17bc505eed6159b0441af30157f9f2a0f44dfebe281012bda0f6ddb5b6f3d8f6
+                0x1f8142c40f9b09b2541186da50bfb5968645ab171e93356f440bf9629ee0cb90,
+                0x0ec00bf558849de8cc8444456c231ec73892975780786d3d9e86192f99b83068
             );
         }
         if (index == 11) {
             return G1Point(
-                0x178b8641c7d4c8878d2ea2e1112a6e6431aa297f8600c492022706d70e8592a8,
-                0x2ffad292edae7bf627d7fbeb963821cb2a27a16f186dd2b7ec6c23d5781acc80
+                0x0e1ba5b47631a18c9523f0cf0a4ebe45196455dc3028090883197400240c6606,
+                0x02fe5e8016e77949b4a1f075c33849206460cc218ebefd0d9f8f82f3d07471a4
             );
         }
         if (index == 12) {
             return G1Point(
-                0x29f9884b6578bfe504209a3d06d7ed895b6a566a53ad63a8c4f6f7e110f4ced6,
-                0x0dbd57c26240585cac2765e563d26dded5f7cad6b2afad23c164bc59d6977e5a
+                0x0f03e68245000a851f410ab4aadd0d1fbd9add7691818f881ddc4e84b7f4ede6,
+                0x2376f78eb5abddf5460be7594b09f737780c335113cf9e2fedcd60be3962d146
             );
         }
         if (index == 13) {
             return G1Point(
-                0x03516852c6b425644ae6878e532c12d2ede06086a1533c6d2e696f7e0fb0a1f0,
-                0x0fbf07f2e7af142fb38ec1c65269abff2015d6862769ef367cecf7dd481387a6
+                0x29a4616c6a8f099cd56dff3df9c44f52d8c679ddfba79ab204d8695c6115d14b,
+                0x0ee4013d135b902d0fa7ab4c71000dc4e8dc3e568de9dfb5fb474a1ff025aa04
             );
         }
         if (index == 14) {
             return G1Point(
-                0x049e373bc04913bef644e77d51b6e92ed0cb1970dfa08d5679fcea088d6e7229,
-                0x04fef570797d750fec4d65d20c6ec5af25f726fadf54ce261e4d3e6c6c4e08bb
+                0x100816372bf2241443e779c9ab6ba4804bc008bb988899e5719c4feb24b11d0c,
+                0x02a6815d85e3d6fa76238823da04cd26fe54475a6eabce200000bb2a2d7af1bd
+            );
+        }
+        if (index == 15) {
+            return G1Point(
+                0x0db9c30a3a638f825fe883a6e717447b3014c7a26954c6a356d0f246aa93f7d0,
+                0x15cc2bb91e77add5eb87ecdd3041b42c1497713cae8fbf57ec8e8e4c6f927948
+            );
+        }
+        if (index == 16) {
+            return G1Point(
+                0x09754e506956548f40dcc9511c046745d99563fb0e857828653d49a3669c2733,
+                0x24a803af39ef324b406b5bbd43d51a06c06471dac27d3caf6e2e314b56c7872b
             );
         }
         revert Errors.InvalidProof();

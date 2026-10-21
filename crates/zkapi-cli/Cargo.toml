@@ -21,3 +21,13 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[features]
+# Drill and acceptance builds only: `zkapi --adversary <mode> serverd`. A
+# release build has no such flag (tests/release_rejects_adversary.rs).
+adversary = ["zkapi-serverd/adversary"]
+
+[dev-dependencies]
+# Tests load the development setup (protocol/setup/v2-concession-dev); a
+# release build never accepts it.
+zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof", features = ["dev-setup"] }

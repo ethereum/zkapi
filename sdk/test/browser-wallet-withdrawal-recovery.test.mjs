@@ -233,6 +233,10 @@ function baseRuntime(overrides = {}) {
         state: stateOverride === null ? null : {
             note_id: 7,
             current_balance: 1_000_000,
+            current_anchor: '0x1234',
+            expiry_ts: 2_000_000_000,
+            // The deposit-time path: exits need no indexer (Amendment A1).
+            deposit_path: { active_root: '0x1', siblings: Array(32).fill('0x0') },
             ...(stateOverride || {})
         }
     };
@@ -896,7 +900,15 @@ test('browser withdrawal recovery invariants', async t => {
         browserWalletRuntime.settleActiveLease = async () => null;
         browserWalletRuntime.recoverPending = async () => false;
         browserWalletRuntime.treePath = async () => ({ active_root: '0x1', siblings: [] });
-        browserWalletRuntime.remoteJson = async () => ({ signature: 'server-clearance' });
+        browserWalletRuntime.remoteJson = async (url, init = {}) => {
+            assert.match(url, /\/v2\/withdraw\/clearance$/);
+            assert.equal(init.method, 'POST');
+            return { signature: 'server-clearance', withdrawal_nullifier: '0x777' };
+        };
+        // A kind-2 ownership proof (its checks run in the clearance tests).
+        browserWalletRuntime.generateOwnershipProof = async () => ({
+            public_inputs: { kind: 2, valid_until: Math.floor(Date.now() / 1_000) + 3_600 }, proof: { proof: 'ownership' }
+        });
         browserWalletRuntime.worker = {
             async call(operation, payload) {
                 if (operation === 'withdrawalNullifier') return '0x777';
@@ -908,7 +920,10 @@ test('browser withdrawal recovery invariants', async t => {
                         active_root: payload.args.active_root,
                         note_id: 7,
                         final_balance: 1_000_000,
-                        withdrawal_nullifier: '0x777'
+                        withdrawal_nullifier: '0x777',
+                        kind: { escape: 0, mutual: 1, ownership: 2 }[payload.args.mode],
+                        conceded: payload.args.conceded ?? 0,
+                        valid_until: payload.args.valid_until
                     }
                 };
             }
@@ -990,16 +1005,23 @@ test('browser withdrawal recovery invariants', async t => {
         }
     });
 
-    await t.test('canceling an unsubmitted escape removes every selected-note withdrawal lock', async () => {
+    await t.test('canceling an unsubmitted escape clears its plan but keeps the exit lock until the proof expires', async () => {
         localStorage.clear();
         const durable = durableState(baseRuntime());
         attachDurableRuntime(browserWalletRuntime, durable);
         browserWalletRuntime.settleActiveLease = async () => null;
         browserWalletRuntime.recoverPending = async () => false;
-        browserWalletRuntime.treePath = async () => ({ active_root: '0x1', siblings: [] });
+        browserWalletRuntime.treePath = async () => assert.fail('an escape uses the saved deposit path');
+        // The stale-device pre-check finds no evidence at N⁺.
+        browserWalletRuntime.remoteJson = async url => {
+            assert.match(url, /\/v2\/nullifiers\/0x5777\/evidence$/);
+            throw Object.assign(new Error('Not found'), { status: 404, code: 'not_found' });
+        };
+        browserWalletRuntime.vaultWord = async () => 0n;
         browserWalletRuntime.worker = {
             async call(operation, payload) {
                 if (operation === 'withdrawalNullifier') return '0x777';
+                if (operation === 'successorNullifier') return '0x5777';
                 assert.equal(operation, 'prepareWithdrawal');
                 return {
                     mode: payload.args.mode,
@@ -1008,7 +1030,10 @@ test('browser withdrawal recovery invariants', async t => {
                         active_root: payload.args.active_root,
                         note_id: 7,
                         final_balance: 1_000_000,
-                        withdrawal_nullifier: '0x777'
+                        withdrawal_nullifier: '0x777',
+                        kind: { escape: 0, mutual: 1, ownership: 2 }[payload.args.mode],
+                        conceded: payload.args.conceded ?? 0,
+                        valid_until: payload.args.valid_until
                     }
                 };
             }
@@ -1039,6 +1064,7 @@ test('browser withdrawal recovery invariants', async t => {
             refresh: async () => {
                 const snapshot = browserWalletRuntime.snapshot();
                 zkapiClient.config.prepared_withdrawal = snapshot.config.prepared_withdrawal;
+                zkapiClient.config.exit = snapshot.config.exit;
                 zkapiClient.wallet = snapshot.wallet;
                 return snapshot;
             }
@@ -1054,14 +1080,20 @@ test('browser withdrawal recovery invariants', async t => {
                 }
             );
             assert.match(rejection.shortMessage, /no funds moved/i);
+            assert.match(rejection.shortMessage, /until that proof expires/i);
             assert.equal(durable.value.preparedWithdrawal, null);
             assert.equal(zkapiClient.withdrawal, null);
             assert.equal(zkapiClient.config.prepared_withdrawal, null);
-            assert.equal(zkapiClient.withdrawalBlocksChat, false);
+            // E6: the escape proof reached the wallet, so the exit lock keeps
+            // the balance frozen until that proof is dead.
+            assert.equal(durable.value.exitLock.mode, 'escape');
+            assert.deepEqual(durable.value.exitLock.released.map(entry => entry.kind), [0]);
+            assert.equal(zkapiClient.withdrawalBlocksChat, true);
 
             const reloadedRuntime = attachDurableRuntime(new BrowserWalletRuntime(), durable);
             await reloadedRuntime.reload();
             assert.equal(reloadedRuntime.snapshot().config.prepared_withdrawal, null);
+            assert.equal(reloadedRuntime.snapshot().config.exit.lock.exit_proofs_released, 1);
         } finally {
             restoreClient();
         }

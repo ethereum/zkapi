@@ -1,5 +1,5 @@
 // Package relay provides direct HTTPS or destination TLS through a Wisp v1
-// relay or a loopback SOCKS5 proxy. A configured route forwards encrypted bytes
+// relay, a loopback SOCKS5 proxy, or conversation-isolated Tor SOCKS. A configured route forwards encrypted bytes
 // without terminating TLS and never falls back to direct access.
 package relay
 
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
 )
 
 // DefaultURL is the same public, shared relay credential as chat/config.js.
@@ -55,15 +56,33 @@ func destinationDialer(relayURL string) (func(context.Context, string, string) (
 	}
 	u, err := url.Parse(relayURL)
 	if err != nil || u.User != nil || u.Fragment != "" || u.Hostname() == "" {
-		return nil, errors.New("transport must use wss or a loopback SOCKS5 proxy")
+		return nil, errors.New("transport must use wss, socks5:// or tor:// with a loopback proxy")
 	}
-	if u.Scheme == "socks5" {
+	if u.Scheme == "socks5" || u.Scheme == "tor" {
 		ip := net.ParseIP(u.Hostname())
 		port, portErr := strconv.ParseUint(u.Port(), 10, 16)
 		if ip == nil || !ip.IsLoopback() || portErr != nil || port == 0 || u.Path != "" || u.RawQuery != "" || u.Opaque != "" {
-			return nil, errors.New("SOCKS5 proxy must be a numeric loopback address and port without credentials or path")
+			return nil, errors.New("SOCKS5/Tor proxy must be a numeric loopback address and port without credentials or path")
 		}
 		return func(ctx context.Context, network, address string) (net.Conn, error) {
+			if u.Scheme == "tor" {
+				identity, _ := ctx.Value(torIdentityKey{}).(string)
+				if identity == "" {
+					// Background/payment traffic gets a separate identity per
+					// connection, never the inference conversation's identity.
+					var err error
+					identity, err = NewTorIdentity()
+					if err != nil {
+						return nil, err
+					}
+				}
+				started := time.Now()
+				conn, err := dialSOCKS5Auth(ctx, u.Host, network, address, identity)
+				if err != nil {
+					activity.Diagnostic(ctx, "Tor connection failed elapsed=%.3fs (SOCKS connection; remote details withheld)", time.Since(started).Seconds())
+				}
+				return conn, err
+			}
 			return dialSOCKS5(ctx, u.Host, network, address)
 		}, nil
 	}

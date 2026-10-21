@@ -1,8 +1,11 @@
 //! Wire format types for HTTP APIs.
 //!
 //! Field elements use 0x-prefixed lowercase hex strings; curve points have
-//! x and y fields. Proofs contain base64-encoded canonical Groth16 bytes.
-//! Integer fields retain the existing v2 serde representation.
+//! x and y fields. Proofs contain base64-encoded Groth16 proofs as eight
+//! 32-byte big-endian coordinates. Integer fields retain the existing v2 serde
+//! representation. Request types are unchanged from circuit
+//! `zkapi-v2-note-bound-v1`; the withdrawal and clearance types are the V2C
+//! (`zkapi-v2-concession-v1`) statements.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +24,8 @@ pub enum ProofBackendWire {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Groth16ProofWire {
     pub backend: ProofBackendWire,
-    /// Arkworks canonical compressed proof bytes, base64 encoded.
+    /// Base64 of 256 bytes: `A.x, A.y, B.x.c0, B.x.c1, B.y.c0, B.y.c1, C.x, C.y`,
+    /// each a canonical 32-byte big-endian BN254 base-field coordinate.
     pub proof: String,
 }
 
@@ -74,6 +78,8 @@ pub struct OpenRouterLeaseResponse {
 /// contains the plaintext OpenRouter runtime key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenRouterLeaseStatusResponse {
+    /// provisioning, active, retiring, disabled, revoking, finalized, or
+    /// cancelled (a corrupt server record that was never signed).
     pub status: String,
     pub client_request_id: String,
     pub issued_at: u64,
@@ -86,6 +92,14 @@ pub struct OpenRouterLeaseStatusResponse {
     pub charge_applied: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// How a finalized charge was determined: "measured", "clamped",
+    /// "worst_case" or "unissued".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge_basis: Option<String>,
+    /// UNIX time by which a pending lease is finalized, at worst at the
+    /// request's solvency bound. Absent once the lease is terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_deadline: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +134,10 @@ pub struct RecoveryResponseV2 {
     pub nullifier_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_response: Option<RequestResponseV2>,
+    /// For a reserved lease request: the UNIX time by which the server
+    /// finalizes it. Wait for that response rather than escaping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_deadline: Option<u64>,
 }
 
 /// A curve point serialized as {x, y} hex fields.
@@ -147,15 +165,90 @@ pub struct ErrorResponse {
     pub retry_after_seconds: Option<u64>,
 }
 
-/// Clearance request for mutual close.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClearanceRequest {
+/// Clearance request for a mutual close on a `zkapi-v2-concession-v1`
+/// deployment. The ownership proof is required.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClearanceRequestV2C {
     pub withdrawal_nullifier: Felt252,
+    pub ownership_proof: ClearanceOwnershipProofV2C,
+}
+
+/// A kind-2 (ownership) withdrawal proof for the nullifier being cleared:
+/// `kind == 2`, `next_nullifier == 0`, `conceded == 0`, `destination == 0`,
+/// `withdrawal_nullifier` equal to the cleared nullifier and a fresh
+/// `valid_until`. It publishes no successor nullifier and no destination and
+/// is rejected by every vault entry point.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClearanceOwnershipProofV2C {
+    pub public_inputs: crate::WithdrawalPublicInputsV2C,
+    pub proof: Groth16ProofWire,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ErrorResponse;
+    use super::{ClearanceRequestV2C, ErrorResponse};
+
+    #[test]
+    fn clearance_request_requires_an_exact_v2c_ownership_proof() {
+        let zero_destination = [0u8; 20];
+        let legacy_destination = [17u8; 20];
+        let inputs = serde_json::json!({
+            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "active_root":"0x2",
+            "state_signing_key_x":"0x3", "state_signing_key_y":"0x4",
+            "clearance_signing_key_x":"0x5", "clearance_signing_key_y":"0x6",
+            "note_id":7, "final_balance":1950000, "destination":zero_destination,
+            "withdrawal_nullifier":"0x7", "kind":2, "next_nullifier":"0x0", "conceded":0,
+            "valid_until":2000003600u64
+        });
+        let proof = serde_json::json!({"backend":"groth16_bn254","proof":"AA=="});
+        let body = serde_json::json!({"withdrawal_nullifier":"0x7",
+            "ownership_proof":{"public_inputs":inputs, "proof":proof}});
+        let parsed: ClearanceRequestV2C = serde_json::from_value(body.clone()).unwrap();
+        let ownership = &parsed.ownership_proof.public_inputs;
+        assert_eq!(ownership.final_balance, 1_950_000);
+        assert_eq!(ownership.kind, 2);
+        assert_eq!(ownership.valid_until, 2_000_003_600);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), body);
+
+        // The ownership proof is mandatory.
+        assert!(
+            serde_json::from_str::<ClearanceRequestV2C>(r#"{"withdrawal_nullifier":"0x7"}"#)
+                .is_err()
+        );
+        // Unknown fields are rejected at every level.
+        let mut extra = body.clone();
+        extra["prompt"] = "not allowed".into();
+        assert!(serde_json::from_value::<ClearanceRequestV2C>(extra).is_err());
+        let mut extra = body.clone();
+        extra["ownership_proof"]["prompt"] = "not allowed".into();
+        assert!(serde_json::from_value::<ClearanceRequestV2C>(extra).is_err());
+        let mut extra = body.clone();
+        extra["ownership_proof"]["public_inputs"]["has_clearance"] = false.into();
+        assert!(serde_json::from_value::<ClearanceRequestV2C>(extra).is_err());
+
+        // A legacy 14-field withdrawal statement and a request statement are rejected.
+        let legacy = serde_json::json!({
+            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "active_root":"0x2",
+            "state_signing_key_x":"0x3", "state_signing_key_y":"0x4",
+            "clearance_signing_key_x":"0x5", "clearance_signing_key_y":"0x6",
+            "note_id":7, "final_balance":1950000, "destination":legacy_destination,
+            "withdrawal_nullifier":"0x7", "has_clearance":false, "withdrawal_tag":"0x8"
+        });
+        let mut legacy_body = body.clone();
+        legacy_body["ownership_proof"]["public_inputs"] = legacy;
+        assert!(serde_json::from_value::<ClearanceRequestV2C>(legacy_body).is_err());
+        let request_statement = serde_json::json!({
+            "protocol_version":2, "chain_id":1, "contract_address":"0x1", "active_root":"0x2",
+            "state_signing_key_x":"0x3", "state_signing_key_y":"0x4", "request_time":5,
+            "solvency_bound":6, "request_nullifier":"0x7", "authorization_tag":"0x8",
+            "anonymous_commitment_x":"0x9", "anonymous_commitment_y":"0xa"
+        });
+        let mut request_proof = body;
+        request_proof["ownership_proof"]["public_inputs"] = request_statement;
+        assert!(serde_json::from_value::<ClearanceRequestV2C>(request_proof).is_err());
+    }
 
     #[test]
     fn legacy_error_response_without_retry_delay_remains_compatible() {

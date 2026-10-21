@@ -3,10 +3,24 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
+
+// LockHint describes the running daemon recorded in daemon.lock, so lock
+// errors name the holder and the file. The hint matters most when the holder
+// lives in another environment (a container or sandbox sharing this
+// filesystem) and its process is therefore invisible to the reader.
+func LockHint(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+		return ""
+	}
+	return ", currently held by " + strings.TrimSpace(string(data))
+}
 
 // Update changes settings without replacing credentials or touching the
 // wallet. The daemon's stable lock prevents changes to an active profile, and
@@ -39,7 +53,7 @@ func Update(dir string, previous, next Config) error {
 		return errors.New("daemon.lock must belong to the current user")
 	}
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return errors.New("this profile is in use; stop zkapi-clientd serve before editing its configuration")
+		return fmt.Errorf("this profile is in use; stop zkapi-clientd serve before editing its configuration (lock file: %s%s)", path, LockHint(path))
 	}
 	defer syscall.Flock(fd, syscall.LOCK_UN)
 	current, err := Load(dir)

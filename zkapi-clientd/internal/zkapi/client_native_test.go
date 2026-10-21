@@ -11,11 +11,15 @@ import (
 	"time"
 )
 
+// Bridge 5 (design §10.6): the companion must speak bridge 5, report the
+// concession exit and its escape routes, and prove with the pinned circuit
+// and setup; a bridge-4 (zkapi-v2-note-bound-v1) companion is refused.
 func TestCheckRequiresExactV3NativeDeploymentIdentity(t *testing.T) {
 	mutations := map[string]any{
 		"deployment_id": "old-deployment", "contract_address": "0x1111111111111111111111111111111111111111",
-		"chain_id": 42, "billing_asset": "erc20", "billing_unit": "micro_usd", "circuit_id": "zkapi-v2",
-		"bridge_version": 2, "require_oa_org_key_source": false, "mode": "proxy",
+		"chain_id": 42, "billing_asset": "erc20", "billing_unit": "micro_usd", "circuit_id": "zkapi-v2-note-bound-v1",
+		"bridge_version": 4, "require_oa_org_key_source": false, "mode": "proxy",
+		"exit_concession": 0, "setup_id": "mpc-1", "escape_routes_version": 0,
 	}
 	for _, network := range []string{"mainnet", "sepolia"} {
 		for field, replacement := range mutations {

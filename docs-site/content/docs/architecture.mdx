@@ -1,13 +1,15 @@
 ---
 title: Architecture
-description: Browser wallet, v2 proof and signing services, indexer, and native ETH settlement
+description: Browser wallet, v2 proof and signing services, indexer, challenger, and native ETH settlement
 ---
 
 The browser SDK generates note-bound Groth16 proofs locally. `serverd`
 verifies lease authorizations and signs balance updates, `indexerd` mirrors
-the active note tree, and the native ETH vault settles withdrawals.
-`zkapi-challenged` submits evidence against escape withdrawals from already-used
-states. The host application owns the user interface.
+the note tree, and the native ETH vault settles withdrawals.
+`zkapi-challenged` defeats escapes from states that were already spent and
+raises escapes that concede less than the operator is owed. The host
+application owns the user interface; `zkapi-clientd` and its wallet companion
+offer the same wallet on a desktop.
 
 ## Repository layout
 
@@ -15,63 +17,94 @@ states. The host application owns the user interface.
 protocol/                       # Tracked directly; no submodule checkout
   rust/crates/
     zkapi-types                 # v2 wire types, canonical fields and byte hashes
-    zkapi-core/src/v2.rs         # BN254 Poseidon, Merkle tree, binding tags
-    zkapi-proof/src/groth16.rs   # Request and withdrawal circuits
-    zkapi-proof/src/compact.rs   # Native prover, verifier, commitments, Schnorr
-    zkapi-client/src/wallet.rs  # Native wallet library and request journal
+    zkapi-core/src/v2.rs        # BN254 Poseidon, Merkle tree, nullifiers and anchors
+    zkapi-proof/src/groth16.rs  # Request and withdrawal circuits
+    zkapi-proof/src/compact.rs  # Prover, verifier, key headers and setup policy
+    zkapi-proof/src/ceremony.rs # Ceremony import checks (powers of tau, zkeys)
+    zkapi-client                # Native wallet, exit rules and request journal
     zkapi-browser               # WASM interface to the same v2 proof code
   contracts/                    # Native ETH ZkApiVault and Groth16ProofAdapter
-  setup/v2/                     # Note-bound development keys and verifier
+  setup/v2-concession/          # Ceremony keys (mpc-1), once G-SETUP has run
+  setup/v2-concession-dev/      # Development keys for tests and the drill vault
+  setup/v2/                     # Keys of the legacy circuit zkapi-v2-note-bound-v1
 crates/
-  zkapi-serverd                 # v2 verification, signing, leases and recovery
-  zkapi-indexerd                # Active note tree from on-chain events
-  zkapi-cli                     # Operator commands
+  zkapi-serverd                 # v2 verification, signing, leases, recovery, challenger
+  zkapi-indexerd                # Note tree from on-chain events
+  zkapi-cli                     # Operator commands (serverd, db init, settlement reopen)
+  zkapi-companion               # zkapi-walletd, the desktop wallet companion and exit kit
+  zkapi-auth                    # Credential-scheme abstraction the companion uses
 sdk/                            # Browser wallet, proving worker, storage and pins
+zkapi-clientd/                  # Desktop client (Go) that drives zkapi-walletd
 ```
 
 The protocol Rust workspace is separate from the application workspace.
-`zkapi-serverd` exports `processor_v2.rs` and `signer_v2.rs`. The native wallet
-library is available in `protocol/rust/crates/zkapi-client`.
+`zkapi-serverd` exports `processor_v2.rs` and `signer_v2.rs`, and builds the
+`zkapi-challenged` binary.
 
 ## Wallet and proof generation
 
 The browser SDK stores private note state and pending-operation journals in
 browser storage and runs the v2 prover through WASM. Its bundled setup assets
-must match the circuit revision and selected deployment.
+must match the circuit and the selected deployment's setup.
 
 The wallet creates the complete authorization and saves it before sending.
 The journal retains the original proof, public inputs, payload and request ID
-needed for exact recovery. After receiving a finalized settlement response, it
-checks the response hash, charge, Schnorr signature and note-bound commitment
-update before saving the next state.
+needed for exact recovery. Before the first request from a state it writes
+the state's `bound_at_state`, the one solvency bound every request from that
+state uses, in the same storage transaction as the journal. After receiving a
+finalized settlement response, it checks the response hash, the charge
+against that bound, that the next anchor is the successor of its own
+nullifier, the Schnorr signature and the note-bound commitment update before
+saving the next state.
+
+In the same storage transaction as the journal, the SDK appends the request to
+an archive of transmitted requests. A server error alone never discards a
+journal, and the archive classifies each request as resolved, unresolved or
+terminal. The exit decision reads it: a state with no unresolved request
+closes mutually; a state with one waits for its settlement, then escapes
+conceding `bound_at_state`. The wallet freezes the state when it starts to
+exit, so no request proof leaves the device from a state whose exit proof
+may still land. These exit rules are shared by the SDK, the Rust companion
+and `zkapi-clientd` through one set of test vectors. See `sdk/README.md` for
+the exact codes and configuration.
 
 ## Server and verification
 
-The server loads the request verifying key, initializes separate Schnorr
-state and clearance signers, opens its durable nullifier store, and polls the
-indexer for the active root. Startup requires native oracle configuration and
-a lease issuer. Its advertised signing keys must match the keys pinned in
-the client configuration and immutable vault.
+The server loads the request and withdrawal verifying keys, initializes
+separate Schnorr state and clearance signers, opens its durable nullifier
+store, and polls the indexer and the vault for the current root. Startup
+requires native oracle configuration, a lease issuer, both signing seeds and
+the deployment manifest; the published development keys are refused.
+`zkapi db init` creates the database and binds it to the manifest's
+deployment before any daemon starts. On its first start the server checks
+that the native billing RPC serves the configured chain and that the derived
+keys equal the vault's immutable keys, then runs its startup probes: the
+vault's concession version and root window, its proof adapter, the adapter's
+circuit and verifying-key hashes, and the runtime code hashes of the vault,
+adapter and Poseidon library against the manifest. Each fails closed.
 
 | Component | Responsibility |
 |---|---|
-| Groth16 request verifier | Membership, private signed-state validity, solvency, nullifier and authorization relation |
-| Request processor | Deployment/key checks, payload and quote binding, freshness, current root, caps and durable reservation |
-| Lease service | Issue a spending-limited runtime key and settle measured usage after retirement |
-| Schnorr signer | Sign the updated commitment and anchor; sign clearance separately |
-| Groth16ProofAdapter | Verify request challenge proofs and withdrawal proofs directly on-chain |
-| Challenge service | Read pending escapes, find original authorization evidence, and submit before the deadline |
+| Groth16 request verifier | Membership, private signed-state validity and anchor chain, solvency, nullifier and authorization relation |
+| Request processor | Deployment and key checks, payload and quote binding, freshness, the exact current root, caps, the lease ceiling, and the durable reservation with its append-only request evidence |
+| Lease service | Issue a spending-limited runtime key, settle measured usage after retirement, and fix every lease's charge by a write-once deadline |
+| Schnorr signer | Sign the updated commitment at the derived successor anchor, only while the request's nullifier is unspent on chain; sign clearance separately |
+| Groth16ProofAdapter | Verify request evidence and withdrawal proofs directly on-chain |
+| Challenge service | Read pending escapes and their concessions, defeat with a verified request proof at the successor nullifier, raise to what the escaped state owes, retire a closed note's leaf after a missed defeat, and report each obligation's status |
 
 ## Deposit flow
 
-1. The wallet samples a secret and computes the v2 registration commitment.
-2. It obtains the next note ID and an empty-slot path from the indexed tree.
+1. The wallet checks the deployment: the runtime code hashes of the vault,
+   adapter and Poseidon library and the vault's and adapter's getters,
+   through the wallet provider that will sign and the pinned RPC.
+2. It samples a secret, computes the v2 registration commitment, and obtains
+   the next note ID and an empty-slot path from the indexed tree.
 3. The user calls `deposit(commitment, amount, siblings)` on the pinned vault
    with exactly `amount × 1 gwei` in transaction value.
 4. The vault emits `NoteDeposited` with the registration commitment, amount,
    expiry and new root; the indexer updates its tree.
-5. The wallet confirms the note and initializes its random blinding and
-   commitment `C = D·G + r·H + L·J`.
+5. The wallet confirms the note, saves its Merkle path at the deposit's root,
+   and initializes its random blinding and commitment `C = D·G + r·H + L·J`.
 
 Only the registration commitment goes to the vault. The secret stays with the
 wallet, and the note-bound balance commitment is used for private state proofs.
@@ -90,16 +123,16 @@ sequenceDiagram
   I-->>B: Root and leaves
   B->>S: GET /v2/billing/quote
   S-->>B: Native ETH billing quote
-  B->>B: Verify quote, prove and journal authorization
+  B->>B: Verify quote, fix the state's bound, prove and journal authorization
   B->>S: POST /v2/openrouter/leases
-  S->>S: Verify proof and quote; reserve nullifier
+  S->>S: Verify proof and quote; reserve nullifier with its evidence
   S-->>B: Short-lived runtime key
   B->>O: Direct inference calls
   O-->>B: Inference responses
   B->>S: Retire lease with original authorization
-  S->>S: Complete retirement and usage settlement
+  S->>S: Settle usage; sign the successor while the nullifier is unspent
   B->>S: Recover signed settlement
-  S-->>B: Charge, next commitment, anchor, Schnorr signature
+  S-->>B: Charge, next commitment, derived anchor, Schnorr signature
   B->>B: Verify and save next private state
 ```
 
@@ -110,25 +143,50 @@ after retirement and settlement, rather than after each provider response.
 
 ## Withdrawal and challenges
 
-For mutual close, the wallet fetches a Schnorr clearance signature from
-`POST /v2/withdraw/clearance`, then proves the final balance, destination and
-clearance mode. The signature is a private proof witness. It submits
-`mutualClose(inputs, proof, siblings)` against the current root, and the vault
-verifies, removes the leaf and pays out native ETH.
+For a mutual close, the wallet sends a kind-2 ownership proof of its current
+state to `POST /v2/withdraw/clearance` for a Schnorr clearance signature, then
+proves a kind-1 close with the signature as a private witness and submits
+`mutualClose(inputs, proof)`. The vault accepts a proof at any root it ever
+held, consumes the nullifier and pays out native ETH.
 
-An escape uses a withdrawal proof without clearance. The challenge service
-uses the archived request proof and its original historical root to show that
-the withdrawal nullifier already authorized usage. It obtains a fresh zero-slot
-path to restore the note in the current tree. Other deposits and closes do not
-require rewriting the old proof's root. See [Protocol](/docs/protocol#withdrawal)
-and the [vault API](/docs/api-reference/vault).
+An escape (kind 0) names the nullifier of the state it leaves and the
+nullifier of that state's successor, concedes an amount up to the state's
+`bound_at_state`, and pays the rest after the challenge period. The wallet
+takes its Merkle path from the deposit, the indexer or a rebuild from the
+vault's logs, and needs no operator call. The challenge service defeats such
+an escape only with a verified request proof at the successor nullifier,
+which only a newer device of the owner can have made, and otherwise raises
+its concession to the charge the escaped state's request owes, at most that
+request's solvency bound. It reads its evidence from the server's append-only
+`request_evidence` table and needs neither the indexer nor the live root for
+either transaction. A defeat returns the note to active and blocks every
+later escape from that state; the owner exits from the newer state. An
+unchallenged escape is finalized after its deadline; if the destination
+rejects the payout or needs more than 100,000 gas to receive it, the vault
+credits it to that destination for a later `claimEscapePayout`. See
+[Protocol](/docs/protocol#withdrawal) and the
+[vault API](/docs/api-reference/vault).
+
+The challenge service serves `/livez`, `/health` and `/status` on a private
+listener, raises each obligation's severity as its deadline approaches, and
+signs through a restricted EIP-1559 signer that accepts only its defeat, raise
+and leaf-retirement calls to the configured vault. See the
+[challenge service operation](https://github.com/ethereum/zkapi/blob/main/docs/challenge-service.md)
+guide.
 
 ## Deployment identity
 
-A deployment fixes the chain, vault, proof adapter, state signing key and
-clearance signing key. Clients must pin the circuit revision, matching proof
-assets and deployment identity; fetching a manifest is not enough to establish
-trust in its contents. Mainnet and Sepolia have independent pins and wallet
-state. See
+A deployment fixes the chain, vault, proof adapter, Poseidon library, state
+signing key and clearance signing key. Clients pin the circuit and setup,
+matching proof assets, the runtime code hashes of the three contracts, the
+adapter's verifying-key hashes and the vault's parameters, and check them on
+chain; fetching a manifest is not enough to establish trust in its contents.
+Mainnet and Sepolia have independent pins and wallet state. A profile
+declares `vault_revision: 3`, `exit_concession: 1`,
+`clearance_ownership_proof: "required"` and the settlement window the wallet
+waits for. Until a revision-3 vault is deployed on a network, its packaged
+profile is a `not_deployed` placeholder that builds and clients refuse. See
 [setup and compatibility](/docs/cryptography#setup-and-compatibility) for the
-setup trust assumptions and artifact compatibility requirements.
+setup trust assumptions and artifact compatibility requirements, and
+[owner and operator powers](/docs/protocol#owner-and-operator-powers) for what
+the vault owner and the operator can do.

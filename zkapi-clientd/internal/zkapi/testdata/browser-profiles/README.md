@@ -1,12 +1,13 @@
 # Browser deployment profile fixtures
 
-These public profiles match the reviewed OA Chat deployment configurations.
-Mainnet includes the October 1 production verifier update from OA Chat commit
-`0be21ed`; Sepolia retains its existing configuration. The SDK's separately
-packaged browser profiles may lag this CLI update. Their public endpoints are
-`zkapi-mainnet.openanonymity.ai` and `zkapi-sepolia.openanonymity.ai`.
+These mirror the SDK's build profiles (`sdk/assets/config/{mainnet,sepolia}.json`)
+for the concession-exit vault (revision 3, circuit `zkapi-v2-concession-v1`).
+Until that vault is deployed on a network, both the SDK profile and the
+packaged clientd deployment are `deployment_status: "not_deployed"`
+placeholders that pin only the circuit, setup, proving-key hashes and the
+vault parameters. `deployments_test.go` checks that the packaged clientd
+deployments pin the same values as these profiles.
 
-The fixtures independently check the client's embedded deployment identity,
-public signing keys, origins and proof hashes. They contain no credentials or
-user wallet state. The network manifests pin the current vaults and deployment
-configuration; SHA-256 checks enforce exact approved manifest bytes.
+`testdata/deployed/deployments/*.json` are invented, deployed concession
+profiles (fake addresses and code hashes) that the package tests run
+against in place of the placeholders.

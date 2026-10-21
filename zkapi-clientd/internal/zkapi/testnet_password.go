@@ -16,7 +16,7 @@ func CheckTestnetPassword(ctx context.Context, network, password string, client 
 	if network != "sepolia" {
 		return nil
 	}
-	_, raw, err := pinnedDeployment(network)
+	_, raw, err := deployedDeployment(network)
 	if err != nil {
 		return err
 	}

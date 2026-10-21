@@ -17,12 +17,15 @@ cargo test --release --workspace --locked
 cargo test --release --manifest-path protocol/rust/Cargo.toml --workspace --locked
 npm ci
 npm run test:sdk
-npm run build:browser
-npm run build:mainnet
 npm run verify:assets
+npm run verify:builds
 ```
 
 Run `forge test` from `protocol/contracts/` for vault and verifier tests.
+`npm run verify:builds` checks that a `not_deployed` placeholder profile
+refuses to build and that a deployed one builds; `npm run build:browser` and
+`npm run build:mainnet` refuse the packaged placeholders until a revision-3
+vault is deployed and pinned.
 Committed proof assets are already included; consuming the SDK does not
 require generating new setup keys. The protocol source and Solidity
 dependencies are tracked under `protocol/`; no submodule initialization is
@@ -47,8 +50,8 @@ import { configureBrowserSdk } from '@openanonymity/zkapi-browser-sdk';
 import client from '@openanonymity/zkapi-browser-sdk/client';
 
 configureBrowserSdk({
-  configUrl: '/zkapi/browser-config.json',
-  workerUrl: '/zkapi/assets/zkapiWasmWorker.js',
+  configUrl: '/zkapi/v2c/browser-config.json',
+  workerUrl: '/zkapi/v2c/assets/zkapiWasmWorker.js',
 });
 
 await client.init();
@@ -61,41 +64,70 @@ and settlement. Build the static worker, WASM, keys, and configuration with
 `buildBrowserSdkAssets` from the package's `/build` export.
 
 Use the repository's `sdk/README.md` for the complete integration contract,
-including external wallet providers, durable manual signing, and recovery.
-The trusted configuration pins the network, native vault, server signing keys,
+including external wallet providers, durable manual signing, recovery, the
+exit rules, the exit kit and the user's exit RPC. The trusted configuration
+pins the network, native vault, contract code hashes, server signing keys,
 proof asset hashes, and deployment manifest. Protocol amounts are whole gwei.
+Until a revision-3 vault is deployed on a network, its packaged profile is a
+placeholder and the build refuses it (`deployment_not_deployed`). During the
+migration a host serves this build at `/zkapi/v2c/` beside the legacy build;
+see `examples/sample-host`.
 
 ## Runtime services
 
 The root workspace builds the server and indexer runtime libraries,
 `zkapi-indexerd`, `zkapi-challenged`, and the `zkapi` operator CLI. Start the
-server with `zkapi serverd`; use `--help` for current configuration flags. The server and browser must use the same deployment,
-keys, and `zkapi-v2-note-bound-v1` circuit revision.
+indexer, then create the database with `zkapi db init`, then start the
+challenger and finally `zkapi serverd`; use `--help` for current
+configuration flags. The server and browser must use the same deployment,
+keys, setup and `zkapi-v2-concession-v1` circuit.
+
+`ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` are required, with no defaults, even
+on a local chain. Generate each one independently, for example with
+`printf '0x%s\n' "$(openssl rand -hex 31)"`. `zkapi signing-keys` derives the
+public keys to pass to the vault constructor; it and the server refuse zero
+or guessable seeds, one key for both roles, and the published development
+keys in either role. `zkapi serverd` then refuses to start unless its native
+billing RPC serves `--chain-id` and the derived keys equal the vault's
+immutable keys. See the
+[deployment](https://github.com/ethereum/zkapi/blob/main/docs/deployment.md),
+[challenge service](https://github.com/ethereum/zkapi/blob/main/docs/challenge-service.md)
+and [concession-vault migration](https://github.com/ethereum/zkapi/blob/main/docs/migration-concession-vault.md)
+guides for operation.
 
 ## Select the matching setup
 
-The checked-in `protocol/setup/v2` keys belong to the
-`zkapi-v2-note-bound-v1` circuit. Keep the proving keys, verifying keys,
-Solidity adapter, and browser WASM from the same release together.
+Three setup directories are checked in:
 
-Use the configured deployment's pinned artifacts. Check
-`proof_setup.circuit_id`, key and WASM hashes, chain ID, vault address, and
+- `protocol/setup/v2-concession`: the production setup `mpc-1` of circuit
+  `zkapi-v2-concession-v1`, from a multi-party ceremony. It holds no keys
+  until that ceremony has run, and release builds load no other keys.
+- `protocol/setup/v2-concession-dev`: the development setup `dev`, generated
+  by one party, for tests, CI, the Sepolia drill vault and any vault
+  deliberately deployed on it with `ALLOW_DEV_SETUP=1`. Only builds with the
+  `dev-setup` feature load it.
+- `protocol/setup/v2`: the keys of the legacy circuit `zkapi-v2-note-bound-v1`,
+  for the release line `release/v2-note-bound`.
+
+Keep the proving keys, verifying keys, Solidity adapter, and browser WASM from
+the same release and setup together. Check `proof_setup.circuit_id`, the setup
+ID, key and WASM hashes, chain ID, vault address, contract code hashes and
 state/clearance signing keys against independently trusted deployment values.
-The key-file circuit header catches accidental mismatches; it does not prove
-setup provenance or replace hash pinning.
+Each key file's header names its circuit, setup and kind and catches
+accidental mismatches; it does not prove setup provenance or replace hash
+pinning.
 
-Only when intentionally creating a **new** deployment, generate a separate
-setup directory:
+Only when intentionally creating a **new** development deployment, generate a
+separate setup directory:
 
 ```bash
 ./target/release/zkapi setup --output-dir protocol/setup/new-deployment
 ```
 
-This creates new incompatible keys and a matching verifier. The checked-in
-setup is single-party; no multiparty ceremony has been conducted.
-Production use requires independent review of the design and setup assumptions.
+This creates new incompatible development keys and a matching verifier, which
+release builds refuse. Production keys come only from the ceremony described
+in `protocol/setup/v2-concession/README.md`, and production use also requires
+the independent review of the design and setup.
 
 The vault's verifier and signing keys are immutable. The server, frontend and
 manifest must match those deployed values before a wallet is funded.
-
-See `protocol/setup/v2/README.md` for setup provenance and compatibility.

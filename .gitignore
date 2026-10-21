@@ -19,3 +19,18 @@
 /zkapi-clientd/zkapi-clientd
 /zkapi-clientd/build/
 /zkapi-clientd/dist/
+# Local executables and installed proving assets are not source releases.
+/zkapi-clientd/bin/
+/zkapi-clientd/share/
+
+# Python caches from local tools.
+__pycache__/
+*.py[cod]
+
+# Wallet/config home and local build staging — never commit private keys
+.config/
+staged/
+out*.txt
+resp-*.json
+*-body.json
+models.json

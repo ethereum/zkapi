@@ -1,0 +1,385 @@
+--- a/zkapi-clientd/cmd/zkapi-clientd/configured_runtime.go
++++ b/zkapi-clientd/cmd/zkapi-clientd/configured_runtime.go
+@@ -33,6 +33,7 @@
+ // Serve opens a missing note through the authenticated funding flow, then stays running.
+ // A reserved withdrawal or uncertain transaction is never replaced.
+ func runConfiguredServe(ctx context.Context, dir string, c, expected config.Config, out io.Writer) error {
++	ctx = context.WithValue(ctx, coverServeKey{}, true)
+ 	ui := &noninteractiveSetup{out: out}
+ 	runtime := configuredRuntime(expected)
+ 	runtime.testnet = checkSepoliaAccess
+--- a/zkapi-clientd/cmd/zkapi-clientd/main.go
++++ b/zkapi-clientd/cmd/zkapi-clientd/main.go
+@@ -65,8 +65,8 @@
+ 		help()
+ 		return nil
+ 	}
+-	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "set-model" {
+-		return errors.New("unknown command; use zkapi-clientd config, serve, withdraw, list-models, or set-model (--help for usage)")
++	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" {
++		return errors.New("unknown command; use config, serve, withdraw or list-models; saved settings belong under config in the primary entry point")
+ 	}
+ 	if dir == "" {
+ 		dir, err = config.DefaultDir()
+@@ -79,6 +79,9 @@
+ 		return err
+ 	}
+ 	if args[0] == "config" {
++		if len(args) == 1 {
++			return printSavedConfig(dir, os.Stdout)
++		}
+ 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+ 		defer cancel()
+ 		ui := &terminalSetupPrompter{out: os.Stdout}
+@@ -93,8 +96,8 @@
+ 		fmt.Println("Usage: zkapi-clientd withdraw [--public]\nWithdraw private balance, then return leftover public ETH to the same destination with a separate fee approval. Includes saved transaction recovery. Use --public for a standalone public return. Requires a terminal for destination and approval. Starts a temporary daemon if needed; never stops an existing daemon.")
+ 		return nil
+ 	}
+-	if (args[0] == "list-models" || args[0] == "set-model") && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+-		fmt.Println("Usage: zkapi-clientd list-models\n       zkapi-clientd set-model [MODEL | --clear]\nList public model IDs/caps, or show/save/clear the default model. No payments. Stop serve before changing the saved default.")
++	if args[0] == "list-models" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
++		fmt.Println("Usage: zkapi-clientd list-models; set defaults with config --model MODEL in the primary entry point.")
+ 		return nil
+ 	}
+ 	c, err := config.Load(dir)
+@@ -103,7 +106,7 @@
+ 	}
+ 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+ 	defer cancel()
+-	if args[0] == "list-models" || args[0] == "set-model" {
++	if args[0] == "list-models" {
+ 		return runModels(ctx, dir, c, args[0], args[1:], os.Stdout)
+ 	}
+ 	if args[0] == "withdraw" {
+@@ -160,7 +163,6 @@
+   serve [--model MODEL]  Open a missing note when funded, then serve inference
+   withdraw [--public]    Withdraw private balance or return public funding ETH
+   list-models            List supported model IDs and per-query caps
+-  set-model [MODEL]      Show or save the default model (--clear removes it)
+ 
+ Run zkapi-clientd config --help for configuration options.
+ Run zkapi-clientd --version to show the installed version.
+@@ -221,13 +223,14 @@
+ }
+ 
+ func zkConfig(c config.Config, client *http.Client) zkapi.Config {
+-	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL)}
++	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL), TorEndpoint: c.RelayURL, Rewriter: c.Rewriter}
+ }
+ 
+ type zkInference struct{ *zkapi.Client }
+ 
+ func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.Response, error) {
+ 	response, err := z.Client.Complete(ctx, body)
++	err = accessPreparationError(ctx, err)
+ 	var remote *zkapi.Error
+ 	if errors.As(err, &remote) {
+ 		switch remote.Code {
+@@ -360,7 +363,12 @@
+ 		return err
+ 	}
+ 	api.DefaultModel = c.DefaultModel
++	api.RewriterNotice = c.Rewriter.Notice
++	if c.Rewriter.Enabled() {
++		fmt.Fprintln(out, "WARNING: rewriter enabled: uncached user text goes DIRECTLY to the configured rewriter, outside Tor/zkAPI. Target history replays saved rewrites; cache misses rewrite historical user turns. Style rewriting does not guarantee anonymity.")
++	}
+ 	api.RequireAPIKey = c.RequireAPIKey
++	api.WebSearch = c.WebSearch
+ 	api.Status = server.ServiceStatus{Backend: c.Backend}
+ 	api.Status.Network = c.ZKAPI.Network
+ 	api.Status.RequestBudgetPolicy = "model"
+@@ -370,6 +378,11 @@
+ 		api.ManagementToken = c.ManagementToken
+ 		api.Admin = http.HandlerFunc(funding.ServeAdminHTTP)
+ 	}
++	stopCover, err := startServeCover(life, c, logger)
++	if err != nil {
++		return err
++	}
++	defer stopCover()
+ 	httpServer := &http.Server{Handler: server.LogRequests(api, logger), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 32 << 10, ErrorLog: log.New(io.Discard, "", 0), BaseContext: func(net.Listener) context.Context { return life }}
+ 	serverDone := make(chan error, 1)
+ 	go func() { serverDone <- httpServer.Serve(listener) }()
+@@ -383,6 +396,11 @@
+ 	}
+ 	logger.Printf("zkAPI client %s listening at http://%s/v1 (%s); %s", version, c.Listen, c.Backend, transport)
+ 	logger.Printf("zkAPI network: %s", c.ZKAPI.Network)
++	if c.WebSearch {
++		logger.Print("Web search: on by default (OpenRouter; search charges apply)")
++	} else {
++		logger.Print("Web search: off by default")
++	}
+ 	if c.RequireAPIKey {
+ 		logger.Print("Use zkapi-clientd config --api-key to configure your client; Ctrl+C stops the service")
+ 	} else {
+--- a/zkapi-clientd/cmd/zkapi-clientd/configure.go
++++ b/zkapi-clientd/cmd/zkapi-clientd/configure.go
+@@ -19,6 +19,7 @@
+ 	network, listen, relay, binary, proofs    string
+ 	usd                                       string
+ 	keyReuseWindowSeconds                     int
++	webSearch                                 bool
+ 	status, apiKey, edit, menu, requireAPIKey bool
+ 	fields                                    map[string]bool
+ }
+@@ -37,15 +38,17 @@
+ 	f.BoolVar(&o.apiKey, "api-key", false, "print the local inference API key explicitly")
+ 	f.IntVar(&o.keyReuseWindowSeconds, "key-reuse-window-seconds", config.DefaultKeyReuseWindowSeconds, "fixed ephemeral key reuse window (default 60 seconds; 1-300 shares keys across chats and local clients; 0 uses a fresh key per inference request)")
+ 	f.BoolVar(&o.requireAPIKey, "require-api-key", false, "require a local API key for inference (default: no key required)")
+-	f.BoolVar(&o.edit, "edit", false, "edit network, listener, and transport interactively")
++	f.BoolVar(&o.webSearch, "web-search", true, "automatically enable OpenRouter web search for chat completions; use --web-search=false to disable (search charges apply)")
++	f.BoolVar(&o.edit, "edit", false, "edit network, listener, transport, and web search interactively")
+ 	f.BoolVar(&o.menu, "menu", false, "open configuration and wallet management actions")
++	f.Bool("setup", false, "explicit wallet setup")
+ 	if err := f.Parse(args); err != nil {
+ 		return o, err
+ 	}
+ 	o.fields = make(map[string]bool)
+ 	invalid := false
+ 	f.Visit(func(field *flag.Flag) {
+-		if field.Name == "status" || field.Name == "api-key" || field.Name == "edit" || field.Name == "menu" {
++		if field.Name == "setup" || field.Name == "status" || field.Name == "api-key" || field.Name == "edit" || field.Name == "menu" {
+ 			return
+ 		}
+ 		if field.Name != "usd" {
+@@ -243,6 +246,9 @@
+ 	if o.fields["require-api-key"] {
+ 		c.RequireAPIKey = o.requireAPIKey
+ 	}
++	if o.fields["web-search"] {
++		c.WebSearch = o.webSearch
++	}
+ 	if o.fields["listen"] {
+ 		c.Listen = o.listen
+ 	}
+@@ -269,9 +275,14 @@
+ 	}
+ 	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", c.ZKAPI.Network, transport)
+ 	showClientConnection(c, ui)
++	if c.WebSearch {
++		ui.Printf("Web search: on by default (OpenRouter; search charges apply).\n")
++	} else {
++		ui.Printf("Web search: off by default.\n")
++	}
+ 	if c.KeyReuseWindowSeconds == 0 {
+ 		ui.Printf("Ephemeral key reuse: disabled; fresh key per inference request. New keys may wait for earlier settlement.\n")
+-	} else if strings.HasPrefix(c.RelayURL, "tor://") {
++	} else if strings.HasPrefix(c.RelayURL, "tor://") || c.Rewriter.Enabled() {
+ 		ui.Printf("Ephemeral key reuse: up to %d seconds within prefix-continuing conversations only; fresh key on each conversation change.\n", c.KeyReuseWindowSeconds)
+ 	} else {
+ 		ui.Printf("Ephemeral key reuse: fixed window up to %d seconds; different chats and local clients can share a key and its spending cap. The provider can link those requests.\n", c.KeyReuseWindowSeconds)
+@@ -350,6 +361,15 @@
+ 		c = candidate
+ 		break
+ 	}
++	searchDefault := "off"
++	if c.WebSearch {
++		searchDefault = "on"
++	}
++	search, err := configureChoice(ctx, ui, "Web search by default (OpenRouter search charges apply): on or off", searchDefault, "on", "off")
++	if err != nil {
++		return c, err
++	}
++	c.WebSearch = search == "on"
+ 	return c, nil
+ }
+ 
+--- a/zkapi-clientd/internal/config/config.go
++++ b/zkapi-clientd/internal/config/config.go
+@@ -14,7 +14,9 @@
+ 	"strconv"
+ 	"strings"
+ 
++	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
+ 	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
++	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+ )
+ 
+ // Compatible requests share a provider credential within this fixed window,
+@@ -66,6 +68,8 @@
+ }
+ 
+ type Config struct {
++	Cover    cover.Config    `json:"cover,omitzero"`
++	Rewriter rewriter.Config `json:"rewriter,omitzero"`
+ 	// ManagementToken is a separate owner-only credential. It must never be
+ 	// published with config.json or shared with inference API clients.
+ 	ManagementToken       string `json:"-"`
+@@ -73,6 +77,7 @@
+ 	Listen                string `json:"listen"`
+ 	APIKey                string `json:"api_key"`
+ 	KeyReuseWindowSeconds int    `json:"key_reuse_window_seconds"`
++	WebSearch             bool   `json:"web_search"`
+ 	RequireAPIKey         bool   `json:"require_api_key"`   // opt in to bearer authentication for loopback inference
+ 	Backend               string `json:"backend"`           // fixed to zkapi; retained for existing profile compatibility
+ 	OrgURL                string `json:"org_url,omitempty"` // legacy profile field; unused
+@@ -157,10 +162,16 @@
+ 		return Config{}, err
+ 	}
+ 	bridge, err := Secret()
+-	return Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, Listen: "127.0.0.1:8787", APIKey: key, Backend: "zkapi", VerifierURL: DefaultVerifierURL("mainnet"), Concurrency: 4, ZKAPI: ZKAPI{ClientURL: "http://127.0.0.1:8790", BridgeToken: bridge, Network: "mainnet"}}, err
++	return Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, WebSearch: true, Listen: "127.0.0.1:8787", APIKey: key, Backend: "zkapi", VerifierURL: DefaultVerifierURL("mainnet"), Concurrency: 4, ZKAPI: ZKAPI{ClientURL: "http://127.0.0.1:8790", BridgeToken: bridge, Network: "mainnet"}}, err
+ }
+ 
+ func Validate(c Config) error {
++	if err := c.Cover.Validate(c.RelayURL); err != nil {
++		return err
++	}
++	if err := c.Rewriter.Validate(); err != nil {
++		return err
++	}
+ 	if c.DefaultModel != "" && !ValidModelID(c.DefaultModel) {
+ 		return errors.New("invalid default model ID")
+ 	}
+@@ -290,12 +301,13 @@
+ 		return Config{}, err
+ 	}
+ 	defer f.Close()
+-	// Missing fields in older profiles adopt the default window. Preserve
+-	// explicitly saved reuse windows, including zero for strict per-request keys.
+-	c := Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds}
++	// Missing fields in older profiles adopt the defaults. Preserve explicit
++	// opt-outs, including zero for strict per-request keys and web_search=false.
++	c := Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, WebSearch: true}
+ 	decoded := struct {
+ 		*Config
+ 		ReuseWindow json.RawMessage `json:"key_reuse_window_seconds"`
++		WebSearch   json.RawMessage `json:"web_search"`
+ 	}{Config: &c}
+ 	d := json.NewDecoder(io.LimitReader(f, 1<<20))
+ 	d.DisallowUnknownFields()
+@@ -309,6 +321,13 @@
+ 		}
+ 		c.KeyReuseWindowSeconds = *seconds
+ 	}
++	if len(decoded.WebSearch) > 0 {
++		var enabled *bool
++		if json.Unmarshal(decoded.WebSearch, &enabled) != nil || enabled == nil {
++			return Config{}, errors.New("web_search must be a boolean")
++		}
++		c.WebSearch = *enabled
++	}
+ 	var trailing any
+ 	if d.Decode(&trailing) != io.EOF {
+ 		return Config{}, errors.New("config.json must contain one JSON object")
+--- a/zkapi-clientd/internal/zkapi/client.go
++++ b/zkapi-clientd/internal/zkapi/client.go
+@@ -10,6 +10,7 @@
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+ 	"io"
+ 	"net"
+ 	"net/http"
+@@ -33,29 +34,32 @@
+ // Config is the Go-side bridge configuration. A companion must be built with
+ // companion.patch; unpatched or unauthenticated daemons are rejected.
+ type Config struct {
+-	ClientURL        string        `json:"client_url"`
+-	BridgeToken      string        `json:"bridge_token"`
+-	Network          string        `json:"network"` // empty means mainnet; Sepolia is explicit
+-	InferenceBaseURL string        `json:"inference_base_url"`
+-	HTTPClient       *http.Client  `json:"-"` // remote HTTPS, direct or over Wisp as configured
+-	KeyReuseWindow   time.Duration `json:"-"` // fixed, in-memory window; zero disables reuse
+-	TorMode          bool          `json:"-"` // HTTPClient must use relay's tor:// transport
++	Rewriter         rewriter.Config `json:"-"`
++	TorEndpoint      string          `json:"-"`
++	ClientURL        string          `json:"client_url"`
++	BridgeToken      string          `json:"bridge_token"`
++	Network          string          `json:"network"` // empty means mainnet; Sepolia is explicit
++	InferenceBaseURL string          `json:"inference_base_url"`
++	HTTPClient       *http.Client    `json:"-"` // remote HTTPS, direct or over Wisp as configured
++	KeyReuseWindow   time.Duration   `json:"-"` // fixed, in-memory window; zero disables reuse
++	TorMode          bool            `json:"-"` // HTTPClient must use relay's tor:// transport
+ }
+ 
+ type Client struct {
+-	leaseMu        sync.Mutex
+-	usedLeases     map[[32]byte]uint64
+-	requestSlot    chan struct{}
+-	settlementPoll time.Duration
+-	settlementWake chan struct{}
+-	leaseGroup     *leaseGroup // accessed only while owning requestSlot
+-	now            func() time.Time
+-	cachedLease    *reusableLease // accessed only while owning requestSlot
+-	conversation   conversation   // accessed only while owning requestSlot
+-	keySerial      uint64         // process-local display number; contains no key material
+-	config         Config
+-	local          *http.Client
+-	inference      *http.Client
++	rewriteTranscript rewriter.Transcript // serialized by requestSlot
++	leaseMu           sync.Mutex
++	usedLeases        map[[32]byte]uint64
++	requestSlot       chan struct{}
++	settlementPoll    time.Duration
++	settlementWake    chan struct{}
++	leaseGroup        *leaseGroup // accessed only while owning requestSlot
++	now               func() time.Time
++	cachedLease       *reusableLease // accessed only while owning requestSlot
++	conversation      conversation   // accessed only while owning requestSlot
++	keySerial         uint64         // process-local display number; contains no key material
++	config            Config
++	local             *http.Client
++	inference         *http.Client
+ }
+ 
+ // Error is safe to return to API consumers: raw companion/provider messages
+@@ -82,6 +86,12 @@
+ }
+ 
+ func New(config Config) (*Client, error) {
++	if err := config.Rewriter.Validate(); err != nil {
++		return nil, err
++	}
++	if config.Rewriter.Enabled() && config.TorMode && !relay.IsTor(config.TorEndpoint) {
++		return nil, errors.New("rewriter Tor preparation requires a Tor endpoint")
++	}
+ 	if config.KeyReuseWindow < 0 || config.KeyReuseWindow > 5*time.Minute {
+ 		return nil, errors.New("zkAPI key reuse window must be between zero and five minutes")
+ 	}
+@@ -272,7 +282,7 @@
+ 		return nil, err
+ 	}
+ 	var identity string
+-	if c.config.TorMode {
++	if c.config.TorMode || c.config.Rewriter.Enabled() {
+ 		var err error
+ 		previous := c.conversation.serial
+ 		identity, err = c.selectConversation(body)
+@@ -280,6 +290,15 @@
+ 			return nil, err
+ 		}
+ 		c.reportConversation(ctx, previous)
++	}
++	// Conversation classification uses the original incoming history, never the
++	// nondeterministic rewrite. Target history replays saved normalized turns.
++	if c.config.Rewriter.Enabled() {
++		var err error
++		body, err = c.rewritePrompt(ctx, body, identity)
++		if err != nil {
++			return nil, err
++		}
+ 	}
+ 	lease, err := c.waitForLease(ctx, body)
+ 	if err != nil {
+--- a/zkapi-clientd/cmd/zkapi-clientd/configure_test.go
++++ b/zkapi-clientd/cmd/zkapi-clientd/configure_test.go
+@@ -139,7 +139,7 @@
+ 	if err := config.Update(dir, prior, original); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	ui := &startTestUI{answers: []string{"sepolia", "127.0.0.1:9876", "direct"}}
++	ui := &startTestUI{answers: []string{"sepolia", "127.0.0.1:9876", "direct", ""}}
+ 	called := false
+ 	err = configure(context.Background(), dir, []string{"--edit"}, ui, io.Discard, func(_ context.Context, _ string, c config.Config, action string, _ setupPrompter, _ io.Writer) error {
+ 		called = true
+@@ -208,7 +208,7 @@
+ 					ui := &startTestUI{}
+ 					if interactive {
+ 						args = []string{"--edit"}
+-						ui.answers = []string{to, c.Listen, "direct"}
++						ui.answers = []string{to, c.Listen, "direct", ""}
+ 					}
+ 					want := c
+ 					want.ZKAPI.Network = to

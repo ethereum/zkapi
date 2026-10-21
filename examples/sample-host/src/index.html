@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>zkAPI sample host</title>
+</head>
+<body>
+  <main>
+    <h1>zkAPI sample host</h1>
+    <p id="zkapi-status">Loading the wallet…</p>
+    <p id="zkapi-legacy" hidden>
+      An earlier withdrawal is still open on the previous vault.
+      <button id="zkapi-finish-legacy" type="button">Open the previous wallet to finish it</button>
+    </p>
+  </main>
+  <script type="module">
+    import { startZkapi } from './app/app.js';
+    const status = document.getElementById('zkapi-status');
+    async function start(options) {
+      const loaded = await startZkapi(options);
+      await loaded.sdk.zkapiClient.init();
+      status.textContent = `${loaded.deployment.circuitId} wallet for ${loaded.deployment.deploymentId} (${loaded.reason}).`;
+      document.getElementById('zkapi-legacy').hidden = loaded.build === 'legacy' || loaded.legacyOpen.length === 0;
+    }
+    // One SDK per page: switching builds reloads the page.
+    const prefer = new URLSearchParams(location.search).get('build');
+    document.getElementById('zkapi-finish-legacy').addEventListener('click', () => { location.search = '?build=legacy'; });
+    start({ prefer: prefer === 'legacy' ? 'legacy' : null }).catch(error => { status.textContent = error.message; });
+  </script>
+</body>
+</html>

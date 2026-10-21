@@ -1,0 +1,10 @@
+:root { color-scheme: light dark; font: 17px/1.6 system-ui, sans-serif; background: light-dark(#f7f8fa, #16191e); color: light-dark(#18212f, #edf0f4); }
+body { margin: 0; padding: 32px 20px; }
+main { max-width: 680px; margin: 7vh auto; }
+h1 { font-size: clamp(1.8rem, 5vw, 2.6rem); line-height: 1.15; letter-spacing: -.025em; }
+h2 { margin-top: 40px; font-size: 1.15rem; }
+a { color: light-dark(#1258ca, #9cc0ff); text-underline-offset: 3px; }
+nav { display: flex; flex-wrap: wrap; gap: 12px 24px; padding: 20px 0; }
+code { font-size: .85em; overflow-wrap: anywhere; }
+.eyebrow { font-weight: 650; }
+.note { opacity: .7; font-size: .9rem; }

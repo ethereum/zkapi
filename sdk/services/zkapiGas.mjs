@@ -19,3 +19,8 @@ export function bufferedGasLimit(estimate) {
     }
     return `0x${buffered.toString(16)}`;
 }
+
+// The gas limit an exit is submitted with when the wallet provider's
+// simulation refuses it (design §6.4 E4.5: that simulation is advisory). An
+// escape costs about 0.55–0.62M gas and a mutual close about 0.40–0.45M.
+export const EXIT_FALLBACK_GAS_LIMIT = 1_000_000n;

@@ -1,5 +1,104 @@
 /* @ts-self-types="./zkapi_browser.d.ts" */
 
+/**
+ * The note tree rebuilt from vault logs (§6.6): `apply` one event, in log
+ * order, and compare the returned root with the event's.
+ */
+export class BrowserNoteTree {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        BrowserNoteTreeFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_browsernotetree_free(ptr, 0);
+    }
+    /**
+     * Apply one `TreeEvent` (JSON) and return the new root (JSON felt).
+     * @param {string} event_json
+     * @returns {string}
+     */
+    apply(event_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passStringToWasm0(event_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.browsernotetree_apply(this.__wbg_ptr, ptr0, len0);
+            var ptr2 = ret[0];
+            var len2 = ret[1];
+            if (ret[3]) {
+                ptr2 = 0; len2 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    constructor() {
+        const ret = wasm.browsernotetree_new();
+        this.__wbg_ptr = ret >>> 0;
+        BrowserNoteTreeFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @returns {number}
+     */
+    next_note_id() {
+        const ret = wasm.browsernotetree_next_note_id(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @param {number} note_id
+     * @returns {string}
+     */
+    path(note_id) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.browsernotetree_path(this.__wbg_ptr, note_id);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    root() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.browsernotetree_root(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) BrowserNoteTree.prototype[Symbol.dispose] = BrowserNoteTree.prototype.free;
+
 export class BrowserRequestProver {
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
@@ -57,6 +156,39 @@ export class BrowserRequestProver {
     }
 }
 if (Symbol.dispose) BrowserRequestProver.prototype[Symbol.dispose] = BrowserRequestProver.prototype.free;
+
+/**
+ * S1, S2, S4 and S6 of a response whose journal is lost; returns
+ * `{charge_applied, next_anchor}` (JSON).
+ * @param {string} config_json
+ * @param {string} state_json
+ * @param {string} response_json
+ * @returns {string}
+ */
+export function browser_check_unrecoverable_response(config_json, state_json, response_json) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(config_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(response_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.browser_check_unrecoverable_response(ptr0, len0, ptr1, len1, ptr2, len2);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
+}
 
 /**
  * @returns {string}
@@ -153,6 +285,24 @@ export function browser_generate_deposit() {
 }
 
 /**
+ * Whether `{active_root, siblings}` (JSON) is a path of the state's note.
+ * @param {string} state_json
+ * @param {string} path_json
+ * @returns {boolean}
+ */
+export function browser_note_path_matches(state_json, path_json) {
+    const ptr0 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(path_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.browser_note_path_matches(ptr0, len0, ptr1, len1);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0] !== 0;
+}
+
+/**
  * @param {string} config_json
  * @param {string} state_json
  * @param {string} args_json
@@ -221,6 +371,48 @@ export function browser_prepare_withdrawal(config_json, state_json, args_json, p
 }
 
 /**
+ * The setup this bundle loads keys of: "dev" or "mpc-1".
+ * @returns {string}
+ */
+export function browser_setup_id() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.browser_setup_id();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * @param {string} state_json
+ * @returns {string}
+ */
+export function browser_successor_nullifier(state_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.browser_successor_nullifier(ptr0, len0);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
  * @param {string} snapshot_json
  * @param {number} note_id
  * @param {boolean} require_existing
@@ -245,6 +437,54 @@ export function browser_tree_path(snapshot_json, note_id, require_existing) {
     } finally {
         wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
     }
+}
+
+/**
+ * @param {string} leaves_json
+ * @param {number} note_id
+ * @returns {string}
+ */
+export function browser_tree_path_from_leaves(leaves_json, note_id) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(leaves_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.browser_tree_path_from_leaves(ptr0, len0, note_id);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * `true` iff the proof verifies for the statement under the request
+ * verifying key file `verifying_key`; an error for malformed input.
+ * @param {string} public_json
+ * @param {string} proof_base64
+ * @param {Uint8Array} verifying_key
+ * @returns {boolean}
+ */
+export function browser_verify_request(public_json, proof_base64, verifying_key) {
+    const ptr0 = passStringToWasm0(public_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(proof_base64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArray8ToWasm0(verifying_key, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.browser_verify_request(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0] !== 0;
 }
 
 /**
@@ -440,6 +680,9 @@ function __wbg_get_imports() {
     };
 }
 
+const BrowserNoteTreeFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_browsernotetree_free(ptr >>> 0, 1));
 const BrowserRequestProverFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_browserrequestprover_free(ptr >>> 0, 1));

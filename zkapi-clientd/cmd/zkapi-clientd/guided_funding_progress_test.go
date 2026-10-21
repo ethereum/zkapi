@@ -52,6 +52,9 @@ func TestGuidedDepositRefreshesPaymentInPlaceAndClearsCancelledWait(t *testing.T
 		q := initial
 		// Network fees change while the receiving account remains unfunded.
 		increase := big.NewInt(int64(call * 1000))
+		if call == 2 {
+			increase.SetInt64(20_000_000_000_000)
+		}
 		for _, field := range []*string{&q.RequiredFeeWei, &q.RequiredTotalWei, &q.ShortfallWei, &q.FeeReserveWei, &q.RecommendedTotalWei, &q.RecommendedTopUpWei} {
 			value, _ := new(big.Int).SetString(*field, 10)
 			*field = value.Add(value, increase).String()
@@ -63,8 +66,11 @@ func TestGuidedDepositRefreshesPaymentInPlaceAndClearsCancelledWait(t *testing.T
 	waits := 0
 	err := waitAndDeposit(ctx, f, initial, u, func(ctx context.Context) error {
 		waits++
-		if !strings.Contains(u.active, "Waiting for ETH:") {
-			t.Fatal("polling has no visible funding status")
+		if u.active != "" || !strings.Contains(u.payments[len(u.payments)-1], "Send at least:") {
+			t.Fatal("polling must show the payment card without redundant status")
+		}
+		if waits == 1 && len(u.payments) != 1 {
+			t.Fatal("unchanged rounded amount refreshed payment")
 		}
 		if waits == 2 {
 			cancel()
@@ -74,10 +80,10 @@ func TestGuidedDepositRefreshesPaymentInPlaceAndClearsCancelledWait(t *testing.T
 	if !errors.Is(err, context.Canceled) || u.active != "" || f.approveCalls != 0 || u.continues != 0 {
 		t.Fatalf("cancelled funding wait did not stop cleanly: %v, %+v", err, u)
 	}
-	if len(u.payments) != 3 || strings.Contains(u.String(), "Scan with") || strings.Contains(u.String(), "Payment information updated") || strings.Contains(u.String(), "Waiting for ETH:") {
+	if len(u.payments) != 2 || strings.Contains(u.String(), "Scan with") || strings.Contains(u.String(), "Payment information updated") || strings.Contains(u.String(), "Waiting for ETH:") {
 		t.Fatal("polling appended payment cards or status to the permanent transcript")
 	}
-	if !strings.Contains(u.payments[2], "Payment information updated") || !strings.Contains(u.payments[2], "Payment URI:") {
+	if !strings.Contains(u.payments[1], "Payment information updated") || !strings.Contains(u.payments[1], "Send at least: 0.00078 ETH") || !strings.Contains(u.payments[1], "Payment URI:") {
 		t.Fatal("refreshed payment lost its usable transfer instructions")
 	}
 }
@@ -104,7 +110,7 @@ func TestGuidedDepositRestoresFundingStatusAfterQuoteRetry(t *testing.T) {
 	err := waitAndDeposit(context.Background(), f, initial, u, func(context.Context) error {
 		waits++
 		if waits == 2 {
-			if !strings.Contains(u.active, "Waiting for ETH:") {
+			if u.active != "" {
 				t.Fatal("the recovered quote left a stale retry message visible")
 			}
 			return context.Canceled
@@ -163,8 +169,8 @@ func TestGuidedDepositRestoresWaitAfterFundingFallsBelowApprovedAmount(t *testin
 		return quote, nil
 	}
 	err := waitAndDeposit(context.Background(), f, initial, u, func(context.Context) error {
-		if !strings.Contains(u.active, "Waiting for ETH:") {
-			t.Fatal("the balance-loss warning left the funding wait blank")
+		if u.active != "" || !strings.Contains(u.payments[len(u.payments)-1], "Send at least:") {
+			t.Fatal("balance loss must retain payment instructions without redundant status")
 		}
 		return context.Canceled
 	})

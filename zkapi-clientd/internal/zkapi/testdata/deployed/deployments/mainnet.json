@@ -1,0 +1,141 @@
+{
+  "deployment_status": "deployed",
+  "deployment_id": "zkapi-native-eth-mainnet-concession-v1-test",
+  "network": "mainnet",
+  "chain_id": 1,
+  "rpc_url": "https://ethereum-rpc.publicnode.com",
+  "protocol_version": 2,
+  "contract_address": "0xC0C0000000000000000000000000000000000001",
+  "billing_asset": "native_eth",
+  "billing_unit": "gwei",
+  "billing_token_address": null,
+  "native_asset_wei_per_unit": "1000000000",
+  "native_price_feed_address": "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419",
+  "native_price_feed_decimals": 8,
+  "native_price_max_age_seconds": 4500,
+  "demo_mint_enabled": false,
+  "proof_adapter_address": "0xADA0000000000000000000000000000000000001",
+  "poseidon_library_address": "0x9055000000000000000000000000000000000001",
+  "deploy_block": 100,
+  "protocol_server_url": "https://zkapi-mainnet.openanonymity.ai",
+  "indexer_url": "https://zkapi-mainnet.openanonymity.ai",
+  "config_url": "https://zkapi-mainnet.openanonymity.ai/config.json",
+  "request_charge_cap": 50000,
+  "note_ttl_seconds": 2592000,
+  "challenge_period_seconds": 172800,
+  "max_pause_duration_seconds": 3888000,
+  "settlement_window_seconds": 21905,
+  "vault_revision": 3,
+  "exit_concession": 1,
+  "clearance_ownership_proof": "required",
+  "auth_scheme": "state-anchor",
+  "provider": "native_leases",
+  "upstreams": [
+    "openrouter"
+  ],
+  "proof_backend": "groth16_bn254",
+  "proof_setup": {
+    "repository_path": "protocol/setup/v2-concession",
+    "circuit_id": "zkapi-v2-concession-v1",
+    "setup_id": "dev",
+    "request_proving_key_sha256": "7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba",
+    "request_verifying_key_sha256": "11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf",
+    "withdrawal_proving_key_sha256": "43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1",
+    "withdrawal_verifying_key_sha256": "d816b9937021361381c52e17d554d975b8ecedeee7edbcecf1bb3393e0f0edb9",
+    "request_vk_keccak256": "0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790",
+    "withdrawal_vk_keccak256": "0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1"
+  },
+  "clearance_signing_key": {
+    "x": "0x12d2b4547d9de0a359fc26abcf5e66cd359be83b53167850c9070540a8045cec",
+    "y": "0x11cc3f621d6d39b557b4bb64826ebaaeda04f98910f116e307d6650177dead82"
+  },
+  "state_signing_key": {
+    "x": "0x2094c5f9e183a8aef5be682556a17aa4dbafdb03fd6e6a97d75a03efed2fe5a4",
+    "y": "0x11c7bbbeb288a09378e6721bd06ed5cc95b87046ff8cf6733e46ced0af1300d7"
+  },
+  "privacy_mode": {
+    "ephemeral_key_source": "oa_org",
+    "issuer_url": "https://org-live.openanonymity.ai",
+    "verifier_url": "https://verifier-production-20260917.openanonymity.ai",
+    "openrouter_inference_base": "https://openrouter.ai/api/v1",
+    "lease_ttl_seconds": 300
+  },
+  "deployment_evidence": {
+    "vault_runtime_keccak256": "0x7910917e8f05b0afca92d132a4ab778c1bedc944d0edd499f287f7e607aaa20d",
+    "adapter_runtime_keccak256": "0x5fc732f90325986524ddccd5b8276da840cb1c9c0bc9a3b62ecb97656f2b7a87",
+    "poseidon_runtime_keccak256": "0x253e8b1722376a150140d98c81a747f309be5d39d78031c2b562724f59f9f87a",
+    "entry_point_runtime_keccak256": "0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58",
+    "sender_creator_runtime_keccak256": "0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689",
+    "paymaster_runtime_keccak256": "0x6df2edb0bf978e91127079182cd7063fceaeb4cede191dca48e7d1418830063a",
+    "factory_runtime_keccak256": "0x3b631ddb1be7b5edecd5fcca1dc36dafb95cf242b840d1482e1630a9c1e68049",
+    "account_implementation_runtime_keccak256": "0x11a558625a379ae5178eb3106859de37a0bb36239b0dd915661059bf9aa0a61d"
+  },
+  "gasless": {
+    "entry_point_address": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+    "entry_point_runtime_codehash": "0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58",
+    "sender_creator_address": "0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C",
+    "sender_creator_runtime_codehash": "0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689",
+    "withdrawal_paymaster_address": "0xd4022d308CD9d3E35437f86E059749c46c41Fd72",
+    "withdrawal_paymaster_runtime_codehash": "0x6df2edb0bf978e91127079182cd7063fceaeb4cede191dca48e7d1418830063a",
+    "withdrawal_account_factory_address": "0xbFE3BaDC37F216a782D75CbA4B66BA9f699D64b1",
+    "withdrawal_account_factory_runtime_codehash": "0x3b631ddb1be7b5edecd5fcca1dc36dafb95cf242b840d1482e1630a9c1e68049",
+    "withdrawal_account_implementation_address": "0xdE9EA737A17442966C486E6627728e743E536971",
+    "withdrawal_account_implementation_runtime_codehash": "0x11a558625a379ae5178eb3106859de37a0bb36239b0dd915661059bf9aa0a61d",
+    "account_creation_code": "0x600d80380380916000396000f336600060003760a0603d36396000600060a03601600073de9ea737a17442966c486e6627728e743e5369715af43d600060003e3d600082603b57fd5bf3",
+    "account_creation_code_keccak256": "0x4a6378352b0162013eabb74f6f1a8c7286483b4aa096af41ea2db7821d99af9e",
+    "bundler_url": null,
+    "gas_policy": {
+      "account_call_overhead_escape_gas": "28900",
+      "account_call_overhead_gas": "55500",
+      "call_floor": [
+        "600000",
+        "650000",
+        "260000",
+        "80000"
+      ],
+      "call_cap": [
+        "950000",
+        "1100000",
+        "400000",
+        "150000"
+      ],
+      "credit_gas": "46000",
+      "eoa_push_gas": "9100",
+      "finalize_reserve_gas": "1020000",
+      "margin_gas": "15000",
+      "max_attempts": "3",
+      "new_account_gas": "25000",
+      "payout_push_gas": "100000",
+      "pm_verification_cap": "496000",
+      "pm_verification_floor": "420000",
+      "postop_base_gas": "17000",
+      "postop_cap": "350000",
+      "postop_escape_forward_gas": "30000",
+      "postop_escape_gas": "71200",
+      "postop_finalize_extra_gas": "5000",
+      "postop_floor": "250000",
+      "pvg_cap": "150000",
+      "pvg_floor": "40000",
+      "verification_cap": "400000",
+      "verification_floor": "50000",
+      "verification_floor_init": "140000"
+    },
+    "policy": {
+      "max_sponsored_cost_wei": "250000000000000000",
+      "flat_fee_wei": "10000000000000",
+      "min_escape_net_wei": "100000000000000",
+      "escapes_enabled": true
+    },
+    "fee_ceilings": {
+      "max_fee_wei": "100000000000",
+      "priority_fee_wei": "5000000000"
+    },
+    "uneconomic_fraction_percent": 25
+  },
+  "models": [],
+  "limitations": [
+    "Test fixture: a deployed concession-exit profile with invented addresses; its code pins are keccak256 of the fixture code 0x600160015b (vault), 0x600260025b (adapter) and 0x600360035b (Poseidon).",
+    "Test fixture: the gasless object pins the transit vectors' paymaster and factory addresses with the fixture codes 0x600460045b (paymaster) and 0x600560055b (factory), and the canonical EntryPoint v0.7.0 runtime served from protocol/contracts/test/fixtures."
+  ],
+  "treasury_address": "0x7EA5000000000000000000000000000000000001"
+}

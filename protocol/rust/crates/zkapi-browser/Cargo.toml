@@ -8,6 +8,14 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Build the bundle for the development setup (`dev`): the WebAssembly then
+# loads only `dev` keys and `browser_setup_id()` returns "dev". Without it the
+# bundle is for the ceremony setup (`mpc-1`, pinned in zkapi-proof) and loads
+# only those keys. `scripts/build-browser-client.sh --setup dev` turns it on;
+# the SDK build refuses to pair a bundle with a profile of another setup.
+dev-setup = ["zkapi-proof/dev-setup"]
+
 [dependencies]
 zkapi-types = { workspace = true }
 zkapi-core = { workspace = true }
@@ -19,5 +27,11 @@ getrandom = { version = "0.2", features = ["js"] }
 rand = { version = "0.8", features = ["getrandom"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
+# Pinned to the wasm-bindgen-cli that scripts/build-browser-client.sh runs:
+# the CLI refuses a module built against another schema version.
+wasm-bindgen = "=0.2.117"
 console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+# The tests prove with the committed development setup and its fixtures.
+zkapi-proof = { workspace = true, features = ["dev-setup", "dev-fixtures"] }

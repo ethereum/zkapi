@@ -8,9 +8,10 @@ API usage with proofs generated in the browser. Each authorization consumes a
 state nullifier; after usage settles, the server signs the next private balance
 and anchor.
 
-These docs describe **protocol v2**, circuit revision
-`zkapi-v2-note-bound-v1`: Groth16 over BN254, Poseidon hashes, and Baby-JubJub
-commitments with Schnorr signatures.
+These docs describe **protocol v2**, circuit `zkapi-v2-concession-v1` (vault
+revision 3): Groth16 over BN254, Poseidon hashes, and Baby-JubJub commitments
+with Schnorr signatures. Its concession exit lets a user leave without any
+cooperation from the operator.
 
 ## What you get
 
@@ -51,9 +52,9 @@ It issues short-lived OpenRouter keys against proof-bound native ETH billing
 quotes and settles their measured usage. Prompts and responses pass directly
 between the client and OpenRouter.
 
-**The vault, indexer, and challenge service** maintain the active note tree,
-verify withdrawals on-chain, and challenge escape withdrawals from states
-that already authorized usage.
+**The vault, indexer, and challenge service** maintain the note tree, verify
+withdrawals on-chain, defeat escapes from states the user already spent, and
+raise escapes that concede less than the user's last request owes.
 
 ## Privacy and deployment assumptions
 
@@ -61,11 +62,20 @@ Request proofs hide the note ID, deposit, exact balance, expiry, anchor, and
 state signature. They do not hide information outside the proof: deposits and
 withdrawals are public, network and timing metadata remain observable, and
 the upstream provider sees prompts. Direct leases keep prompts out of the
-billing authorization.
+billing authorization. A mutual close shows the server the note ID and balance
+when it requests clearance. An escape from a state that served a request
+links that last request to the note at exit.
+
+The vault owner can pause deposits indefinitely, but new exits for at most
+the vault's `maxPauseDuration`, and can schedule time-locked treasury changes.
+A pause cannot move user funds or make notes expire. The operator signs every
+balance update and clearance, but cannot block an exit. See
+[owner and operator powers](/docs/protocol#owner-and-operator-powers).
 
 The current Groth16 and Baby-JubJub construction is not post-quantum. The
-checked-in proving keys use a single-party setup with no multiparty ceremony;
-artifact hashes establish identity, not setup security. See
+checked-in proving keys are a single-party development setup; production keys
+come from a multi-party ceremony that has not run yet, and no revision-3 vault
+is deployed. Artifact hashes establish identity, not setup security. See
 [Cryptography](/docs/cryptography) for setup trust and compatibility requirements.
 
 ## Next steps

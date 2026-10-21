@@ -1,13 +1,27 @@
 name: zkAPI client daemon tests
 on:
+  # Besides its own tree, clientd's tests read shared fixtures (transit-vectors.json,
+  # the EntryPoint and SenderCreator runtimes, the withdrawal and calldata golden
+  # vectors, the exit rules and the dev setup) and mirror the gasless contracts' constants: a PR that
+  # changes only those must still run them (scripts/v2-acceptance.test.mjs checks the list).
   pull_request:
     paths:
       - 'zkapi-clientd/**'
       - '.github/workflows/zkapi-clientd-test.yml'
+      - 'protocol/contracts/test/fixtures/**'
+      - 'protocol/contracts/src/gasless/**'
+      - 'protocol/rust/crates/zkapi-client/tests/vectors/**'
+      - 'protocol/setup/v2-concession-dev/**'
+      - 'crates/zkapi-serverd/tests/fixtures/**'
   push:
     paths:
       - 'zkapi-clientd/**'
       - '.github/workflows/zkapi-clientd-test.yml'
+      - 'protocol/contracts/test/fixtures/**'
+      - 'protocol/contracts/src/gasless/**'
+      - 'protocol/rust/crates/zkapi-client/tests/vectors/**'
+      - 'protocol/setup/v2-concession-dev/**'
+      - 'crates/zkapi-serverd/tests/fixtures/**'
 permissions:
   contents: read
 jobs:
@@ -29,3 +43,26 @@ jobs:
       - name: Vet client
         working-directory: zkapi-clientd
         run: go vet ./...
+  companion:
+    # The native companion is the pinned upstream source plus this repository's
+    # companion.patch and protocol-transport.patch. Apply both to the pinned
+    # commits and run the tests of every crate either patch changes, including
+    # the patched protocol crates that the companion workspace excludes, as the
+    # release workflow does, so a change that breaks either patch fails here
+    # instead of at release time.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev cmake
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+      - name: Test source preparation
+        run: python3 zkapi-clientd/scripts/test-prepare-zkapi.py
+      - name: Prepare pinned native wallet source
+        run: zkapi-clientd/scripts/prepare-zkapi.sh "$RUNNER_TEMP/zkapi-walletd-source"
+      - name: Test the patched companion and protocol crates
+        shell: bash
+        run: zkapi-clientd/scripts/test-companion.sh "$RUNNER_TEMP/zkapi-walletd-source"

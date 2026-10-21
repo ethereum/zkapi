@@ -1,0 +1,16 @@
+[package]
+name = "zkapi-auth"
+description = "Swappable credential-scheme abstraction for zkAPI: state-anchor (reference) and blind-signature auth methods"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
+zkapi-core = { path = "../../protocol/rust/crates/zkapi-core" }
+zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof" }
+num-bigint = "0.4"
+rand = { workspace = true }
+sha3 = { workspace = true }
+starknet-types-core = "0.2"
+thiserror = { workspace = true }

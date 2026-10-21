@@ -177,7 +177,7 @@ func TestSelectNetworkPreservesCustomVerifier(t *testing.T) {
 }
 
 func TestLoadPreservesRelaySelection(t *testing.T) {
-	for _, relayURL := range []string{"", "wss://relay.example/", "ws://127.0.0.1:8765/"} {
+	for _, relayURL := range []string{"", "wss://relay.example/", "ws://127.0.0.1:8765/", "socks5://127.0.0.1:9050", "tor://127.0.0.1:9050"} {
 		t.Run(relayURL, func(t *testing.T) {
 			c, err := Default()
 			if err != nil {
@@ -349,5 +349,35 @@ func TestRejectUnsafeRouting(t *testing.T) {
 		if Validate(c) == nil {
 			t.Fatal("unsafe config accepted")
 		}
+	}
+}
+
+// The gasless withdrawal settings: the bundler follows the exit RPC's URL
+// rules and the default fee mode is wallet or payout.
+func TestGaslessSettingsAreValidated(t *testing.T) {
+	for _, mutate := range []func(*Config){
+		func(c *Config) { c.ZKAPI.BundlerURL = "http://bundler.example" },
+		func(c *Config) { c.ZKAPI.BundlerURL = "https://user:pw@bundler.example" },
+		func(c *Config) { c.ZKAPI.BundlerURL = "https://bundler.example/?key=1" },
+		func(c *Config) { c.ZKAPI.WithdrawalFees = "sponsor" },
+	} {
+		c, _ := Default()
+		mutate(&c)
+		if Validate(c) == nil {
+			t.Fatal("unsafe gasless setting accepted")
+		}
+	}
+	c, _ := Default()
+	c.ZKAPI.BundlerURL, c.ZKAPI.WithdrawalFees = "http://127.0.0.1:4337", "payout"
+	if err := Validate(c); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "profile")
+	if err := Init(dir, c); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil || loaded.ZKAPI.BundlerURL != "http://127.0.0.1:4337" || loaded.ZKAPI.WithdrawalFees != "payout" {
+		t.Fatalf("gasless settings not saved: %+v %v", loaded.ZKAPI, err)
 	}
 }

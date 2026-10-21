@@ -67,12 +67,12 @@ function recoveryHarness(t, kind = 'deposit') {
         zero_path: Array(32).fill('0x0'), submissionFrom: FROM, submissionNonce: 5 };
     const plan = { operationId: 'op', submissionId: 'submission', noteId: 7,
         mode: 'mutual', destination: FROM, submissionFrom: FROM, submissionNonce: 5,
-        siblings: Array(32).fill('0x0'), proof: { backend: 'groth16_bn254', proof: Buffer.alloc(256).toString('base64') },
+        proof: { backend: 'groth16_bn254', proof: Buffer.alloc(256).toString('base64') },
         public_inputs: { protocol_version: 2, chain_id: 1, contract_address: VAULT,
             active_root: '0x1', state_signing_key_x: '0x1', state_signing_key_y: '0x1',
             clearance_signing_key_x: '0x1', clearance_signing_key_y: '0x1', note_id: 7,
             final_balance: 1500000, destination: FROM, withdrawal_nullifier: '0x7',
-            has_clearance: true, withdrawal_tag: '0x8' } };
+            kind: 1, next_nullifier: '0x0', conceded: 0, valid_until: 4_000_000_000 } };
     const record = { recordId: 'record', noteId: 7, destination: FROM, mode: 'mutual',
         startOperationId: 'op', startSubmissionId: 'submission', startSubmissionFrom: FROM,
         startSubmissionNonce: 5, preparedWithdrawal: plan,
@@ -172,7 +172,8 @@ for (const mode of ['mutual', 'escape']) {
         h.plan.mode = mode;
         h.plan.destination = destination;
         h.plan.public_inputs.destination = destination;
-        h.plan.public_inputs.has_clearance = mode === 'mutual';
+        h.plan.public_inputs.kind = mode === 'mutual' ? 1 : 0;
+        h.plan.public_inputs.next_nullifier = mode === 'mutual' ? '0x0' : '0x9';
         t.mock.method(h.c, 'assertBalanceNotClaimed', async () => {});
         t.mock.method(h.c, 'settleActiveLease', async () => {});
         t.mock.method(h.c, 'connectWallet', async () => FROM);

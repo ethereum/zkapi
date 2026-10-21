@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
 )
 
 // ConnectProxy gives the Rust prover the same direct, Wisp, or SOCKS5 route as Go while
@@ -74,7 +76,7 @@ func connectHandler(life context.Context, authorization string, dialer func(cont
 			http.Error(w, "Public destination required", 403)
 			return
 		}
-		upstream, err := dialer(r.Context(), r.Host)
+		upstream, err := dialer(activity.InheritDiagnostics(r.Context(), life), r.Host)
 		if err != nil {
 			http.Error(w, "Upstream connection unavailable", 502)
 			return

@@ -1,3 +1,10 @@
+//! Native proving benchmark for the `zkapi-v2-concession-v1` circuits with
+//! the shipping `CircomReduction` prover:
+//!
+//! ```text
+//! cargo run --release -p zkapi-proof --example proof_bench -- \
+//!   ../setup/v2-concession-dev withdrawal_state_escape 5 1
+//! ```
 use std::env;
 use std::fs;
 use std::hint::black_box;
@@ -6,23 +13,16 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use ark_bn254::Fr;
-use ark_ed_on_bn254::{EdwardsAffine, Fr as EdwardsScalarField};
-use ark_ff::PrimeField;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use base64::Engine;
 use serde::Serialize;
-use zkapi_core::v2 as core;
 use zkapi_proof::compact::{
-    balance_commitment, rerandomize, CompactSigner, RequestProver, RequestVerifier,
-    RequestWitnessData, WithdrawalProver, WithdrawalVerifier, WithdrawalWitnessData,
+    request_circuit, withdrawal_circuit, RequestProver, RequestVerifier, RequestWitnessData,
+    WithdrawalProver, WithdrawalVerifier, WithdrawalWitnessData,
 };
-use zkapi_proof::groth16::{
-    RequestCircuit, RequestPublic, RequestWitness, StateSignature, WithdrawalCircuit,
-    WithdrawalPublic, WithdrawalWitness,
-};
-use zkapi_types::{
-    Felt252, RequestPublicInputsV2, SchnorrSignature, WithdrawalPublicInputsV2, MERKLE_DEPTH,
-};
+use zkapi_proof::dev::{tree_with, DevDeployment, DevNote, DevRequest, DevState, DevWithdrawal};
+use zkapi_proof::groth16::{RequestCircuit, WithdrawalCircuit};
+use zkapi_types::{Felt252, RequestPublicInputsV2, WithdrawalKind, WithdrawalPublicInputsV2C};
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +33,7 @@ enum BenchCase {
     WithdrawalGenesisMutual,
     WithdrawalStateEscape,
     WithdrawalStateMutual,
+    WithdrawalStateOwnership,
 }
 
 impl BenchCase {
@@ -44,10 +45,12 @@ impl BenchCase {
             "withdrawal_genesis_mutual" => Ok(Self::WithdrawalGenesisMutual),
             "withdrawal_state_escape" => Ok(Self::WithdrawalStateEscape),
             "withdrawal_state_mutual" => Ok(Self::WithdrawalStateMutual),
+            "withdrawal_state_ownership" => Ok(Self::WithdrawalStateOwnership),
             _ => bail!(
                 "unknown case {value:?}; expected request_genesis, request_state, \
                  withdrawal_genesis_escape, withdrawal_genesis_mutual, \
-                 withdrawal_state_escape, or withdrawal_state_mutual"
+                 withdrawal_state_escape, withdrawal_state_mutual, or \
+                 withdrawal_state_ownership"
             ),
         }
     }
@@ -72,7 +75,7 @@ impl Distribution {
         let mut sorted = samples_ms.clone();
         sorted.sort_by(f64::total_cmp);
         let len = sorted.len();
-        let median_ms = if len % 2 == 0 {
+        let median_ms = if len.is_multiple_of(2) {
             (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
         } else {
             sorted[len / 2]
@@ -119,7 +122,7 @@ struct RequestFixture {
 
 #[derive(Clone)]
 struct WithdrawalFixture {
-    public: WithdrawalPublicInputsV2,
+    public: WithdrawalPublicInputsV2C,
     witness: WithdrawalWitnessData,
     circuit: WithdrawalCircuit,
 }
@@ -234,11 +237,14 @@ fn bench_withdrawal(
         case,
         BenchCase::WithdrawalGenesisEscape | BenchCase::WithdrawalGenesisMutual
     );
-    let mutual = matches!(
-        case,
-        BenchCase::WithdrawalGenesisMutual | BenchCase::WithdrawalStateMutual
-    );
-    let fixture = withdrawal_fixture(genesis, mutual)?;
+    let kind = match case {
+        BenchCase::WithdrawalGenesisMutual | BenchCase::WithdrawalStateMutual => {
+            WithdrawalKind::MutualClose
+        }
+        BenchCase::WithdrawalStateOwnership => WithdrawalKind::Ownership,
+        _ => WithdrawalKind::Escape,
+    };
+    let fixture = withdrawal_fixture(genesis, kind)?;
     let (constraints, instance_variables, witness_variables) = constraint_counts(fixture.circuit)?;
 
     let (prover, prover_load) = timed_load(load_iterations, || WithdrawalProver::load(setup))?;
@@ -316,70 +322,50 @@ fn constraint_counts<C: ConstraintSynthesizer<Fr>>(circuit: C) -> Result<(usize,
     ))
 }
 
-fn request_fixture(genesis: bool) -> Result<RequestFixture> {
-    let common = CommonFixture::new(genesis)?;
-    let request_context = Felt252::from_u64(99);
-    let rerandomization = Felt252::from_u64(9);
-    let anonymous = rerandomize(&common.commitment, &rerandomization)?;
-    let public = RequestPublicInputsV2 {
-        protocol_version: common.protocol_version,
-        chain_id: common.chain_id,
-        contract_address: common.contract_address,
-        active_root: common.root,
-        state_signing_key_x: common.state_key.x,
-        state_signing_key_y: common.state_key.y,
+struct Common {
+    deployment: DevDeployment,
+    tree: zkapi_core::MerkleTree,
+    state: DevState,
+    request: DevRequest,
+}
+
+/// Genesis, or the signed successor of a genesis request (charge 100,000).
+fn common(genesis: bool) -> Result<Common> {
+    let deployment = DevDeployment::new(31_337, Felt252::from_u64(0x1234));
+    let note = DevNote {
+        secret: Felt252::from_u64(42),
+        note_id: 0,
+        deposit_amount: 1_000_000,
+        expiry: 4_000_000_000,
+    };
+    let tree = tree_with(&[&note]);
+    let request = DevRequest {
         request_time: 2_000_000_000,
         solvency_bound: 500_000,
-        request_nullifier: common.nullifier,
-        authorization_tag: core::authorization_tag(&common.nullifier, &request_context),
-        anonymous_commitment_x: anonymous.x,
-        anonymous_commitment_y: anonymous.y,
+        request_context: Felt252::from_u64(99),
+        rerandomization: Felt252::from_u64(9),
     };
-    let witness = RequestWitnessData {
-        secret: common.secret,
-        request_context,
-        note_id: common.note_id,
-        deposit_amount: common.deposit_amount,
-        expiry: common.expiry,
-        merkle_siblings: common.siblings,
-        current_balance: common.balance,
-        current_blinding: common.blinding,
-        rerandomization,
-        current_anchor: common.anchor,
-        is_genesis: genesis,
-        state_signature: common.state_signature,
+    let genesis_state = note.genesis(Felt252::from_u64(7));
+    let state = if genesis {
+        genesis_state
+    } else {
+        genesis_state.successor(&deployment, &request, 100_000, &Felt252::from_u64(17))?
     };
-    let circuit = RequestCircuit {
-        public: RequestPublic {
-            protocol_version: public.protocol_version,
-            chain_id: public.chain_id,
-            contract_address: field(public.contract_address),
-            active_root: field(public.active_root),
-            state_signing_key: point(public.state_signing_key_x, public.state_signing_key_y),
-            request_time: public.request_time,
-            solvency_bound: public.solvency_bound,
-            request_nullifier: field(public.request_nullifier),
-            authorization_tag: field(public.authorization_tag),
-            anonymous_commitment: point(
-                public.anonymous_commitment_x,
-                public.anonymous_commitment_y,
-            ),
-        },
-        witness: RequestWitness {
-            secret: field(witness.secret),
-            request_context: field(witness.request_context),
-            note_id: witness.note_id,
-            deposit_amount: witness.deposit_amount,
-            expiry: witness.expiry,
-            merkle_siblings: witness.merkle_siblings.map(field),
-            current_balance: witness.current_balance,
-            current_blinding: scalar(witness.current_blinding),
-            rerandomization: scalar(witness.rerandomization),
-            current_anchor: field(witness.current_anchor),
-            is_genesis: witness.is_genesis,
-            state_signature: signature(witness.state_signature),
-        },
-    };
+    Ok(Common {
+        deployment,
+        tree,
+        state,
+        request,
+    })
+}
+
+fn request_fixture(genesis: bool) -> Result<RequestFixture> {
+    let common = common(genesis)?;
+    let (public, witness) =
+        common
+            .state
+            .request(&common.deployment, &common.tree, &common.request)?;
+    let circuit = request_circuit(&public, &witness)?;
     Ok(RequestFixture {
         public,
         witness,
@@ -387,200 +373,29 @@ fn request_fixture(genesis: bool) -> Result<RequestFixture> {
     })
 }
 
-fn withdrawal_fixture(genesis: bool, mutual: bool) -> Result<WithdrawalFixture> {
-    let common = CommonFixture::new(genesis)?;
-    let destination = [0x11u8; 20];
-    let destination_felt = Felt252::try_from_bytes_be({
-        let mut bytes = [0u8; 32];
-        bytes[12..].copy_from_slice(&destination);
-        bytes
-    })
-    .map_err(anyhow::Error::msg)?;
-    let clearance_signature = if mutual {
-        let message = core::clearance_message(
-            common.protocol_version,
-            common.chain_id,
-            &common.contract_address,
-            &common.nullifier,
-        );
-        Some(common.clearance_signer.sign(&message))
-    } else {
-        None
+fn withdrawal_fixture(genesis: bool, kind: WithdrawalKind) -> Result<WithdrawalFixture> {
+    let common = common(genesis)?;
+    let (destination, conceded) = match kind {
+        WithdrawalKind::Escape => ([0x11; 20], 50_000),
+        WithdrawalKind::MutualClose => ([0x11; 20], 0),
+        WithdrawalKind::Ownership => ([0; 20], 0),
     };
-    let public = WithdrawalPublicInputsV2 {
-        protocol_version: common.protocol_version,
-        chain_id: common.chain_id,
-        contract_address: common.contract_address,
-        active_root: common.root,
-        state_signing_key_x: common.state_key.x,
-        state_signing_key_y: common.state_key.y,
-        clearance_signing_key_x: common.clearance_key.x,
-        clearance_signing_key_y: common.clearance_key.y,
-        note_id: common.note_id,
-        final_balance: common.balance,
-        destination,
-        withdrawal_nullifier: common.nullifier,
-        has_clearance: mutual,
-        withdrawal_tag: core::withdrawal_tag(
-            &common.nullifier,
-            &destination_felt,
-            common.balance,
-            mutual,
-        ),
-    };
-    let witness = WithdrawalWitnessData {
-        secret: common.secret,
-        deposit_amount: common.deposit_amount,
-        expiry: common.expiry,
-        merkle_siblings: common.siblings,
-        final_blinding: common.blinding,
-        current_anchor: common.anchor,
-        is_genesis: genesis,
-        state_signature: common.state_signature,
-        clearance_signature,
-    };
-    let circuit = WithdrawalCircuit {
-        public: WithdrawalPublic {
-            protocol_version: public.protocol_version,
-            chain_id: public.chain_id,
-            contract_address: field(public.contract_address),
-            active_root: field(public.active_root),
-            state_signing_key: point(public.state_signing_key_x, public.state_signing_key_y),
-            clearance_signing_key: point(
-                public.clearance_signing_key_x,
-                public.clearance_signing_key_y,
-            ),
-            note_id: public.note_id,
-            final_balance: public.final_balance,
-            destination: field(destination_felt),
-            withdrawal_nullifier: field(public.withdrawal_nullifier),
-            has_clearance: public.has_clearance,
-            withdrawal_tag: field(public.withdrawal_tag),
+    let (public, witness) = common.state.withdrawal(
+        &common.deployment,
+        &common.tree,
+        &DevWithdrawal {
+            kind,
+            destination,
+            conceded,
+            valid_until: 2_000_010_800,
         },
-        witness: WithdrawalWitness {
-            secret: field(witness.secret),
-            deposit_amount: witness.deposit_amount,
-            expiry: witness.expiry,
-            merkle_siblings: witness.merkle_siblings.map(field),
-            final_blinding: scalar(witness.final_blinding),
-            current_anchor: field(witness.current_anchor),
-            is_genesis: witness.is_genesis,
-            state_signature: signature(witness.state_signature),
-            clearance_signature: signature(witness.clearance_signature),
-        },
-    };
+    )?;
+    let circuit = withdrawal_circuit(&public, &witness)?;
     Ok(WithdrawalFixture {
         public,
         witness,
         circuit,
     })
-}
-
-struct CommonFixture {
-    protocol_version: u16,
-    chain_id: u64,
-    contract_address: Felt252,
-    secret: Felt252,
-    note_id: u32,
-    deposit_amount: u128,
-    expiry: u64,
-    siblings: [Felt252; MERKLE_DEPTH],
-    root: Felt252,
-    balance: u128,
-    blinding: Felt252,
-    commitment: zkapi_types::wire::CurvePointWire,
-    anchor: Felt252,
-    nullifier: Felt252,
-    state_key: zkapi_types::wire::CurvePointWire,
-    clearance_key: zkapi_types::wire::CurvePointWire,
-    state_signature: Option<SchnorrSignature>,
-    clearance_signer: CompactSigner,
-}
-
-impl CommonFixture {
-    fn new(genesis: bool) -> Result<Self> {
-        let protocol_version = 2;
-        let chain_id = 31_337;
-        let contract_address = Felt252::from_u64(0x1234);
-        let secret = Felt252::from_u64(42);
-        let note_id = 0;
-        let deposit_amount = 1_000_000;
-        let expiry = 4_000_000_000;
-        let siblings: [Felt252; MERKLE_DEPTH] = core::zero_hashes()[..MERKLE_DEPTH]
-            .try_into()
-            .expect("fixed Merkle depth");
-        let registration = core::registration_commitment(&secret);
-        let leaf = core::note_leaf(note_id, &registration, deposit_amount, expiry);
-        let root = core::merkle_root(note_id, &leaf, &siblings);
-        let balance = if genesis { deposit_amount } else { 900_000 };
-        let blinding = Felt252::from_u64(7);
-        let commitment = balance_commitment(balance, &blinding, &leaf);
-        let anchor = if genesis {
-            Felt252::ONE
-        } else {
-            Felt252::from_u64(12_345)
-        };
-        let nullifier = core::nullifier(&secret, &anchor);
-        let state_signer = CompactSigner::from_seed(&Felt252::from_u64(1));
-        let clearance_signer = CompactSigner::from_seed(&Felt252::from_u64(2));
-        let state_key = state_signer.public_key();
-        let clearance_key = clearance_signer.public_key();
-        let state_signature = if genesis {
-            None
-        } else {
-            let message = core::state_message(
-                protocol_version,
-                chain_id,
-                &contract_address,
-                &commitment.x,
-                &commitment.y,
-                &anchor,
-            );
-            Some(state_signer.sign(&message))
-        };
-        Ok(Self {
-            protocol_version,
-            chain_id,
-            contract_address,
-            secret,
-            note_id,
-            deposit_amount,
-            expiry,
-            siblings,
-            root,
-            balance,
-            blinding,
-            commitment,
-            anchor,
-            nullifier,
-            state_key,
-            clearance_key,
-            state_signature,
-            clearance_signer,
-        })
-    }
-}
-
-fn field(value: Felt252) -> Fr {
-    core::felt_to_field(&value)
-}
-
-fn scalar(value: Felt252) -> EdwardsScalarField {
-    EdwardsScalarField::from_be_bytes_mod_order(value.as_bytes())
-}
-
-fn point(x: Felt252, y: Felt252) -> EdwardsAffine {
-    let point = EdwardsAffine::new_unchecked(field(x), field(y));
-    debug_assert!(point.is_on_curve());
-    point
-}
-
-fn signature(value: Option<SchnorrSignature>) -> StateSignature {
-    let value = value.unwrap_or(SchnorrSignature::IDENTITY);
-    StateSignature {
-        r: point(value.r_x, value.r_y),
-        s: scalar(value.s),
-    }
 }
 
 fn decoded_proof_len(encoded: &str) -> Result<usize> {

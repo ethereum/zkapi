@@ -47,6 +47,57 @@ type AddressPaymentQuote struct {
 	Binding    string `json:"binding,omitempty"`
 	Nonce      uint64 `json:"nonce"`
 	RetryHash  string `json:"retry_hash,omitempty"`
+	// Warnings are advisory findings the owner sees before approving, such
+	// as an escape whose simulation failed (design §6.4 E4 step 5).
+	Warnings []string `json:"warnings,omitempty"`
+	// A payout quote (FeePolicy "payout", design 3.3): the network fee is
+	// paid from the payout by a sponsored user operation. FeeCapWei is the
+	// most the payout can lose to this operation (its maximum cost plus the
+	// paymaster's flat fee), MinimumReceivedWei what the payout address
+	// receives at least (absent for an escape initiation, whose
+	// finalization is a later operation at its own fees: FinalizeEstimateWei
+	// is that finalization at the client's limits and today's fee, and
+	// EstimatedReceivedWei the payout after both, estimates only), OwedWei
+	// what the transit account owes from an earlier sponsored escape,
+	// FinalizeReserveWei the reserve the paymaster requires an escape
+	// initiation to leave. FeeBumpCapWei is the most the fee may take after
+	// the operation is re-signed with higher fees because the bundler
+	// dropped it (the --fee-cap-gwei the quote was made with, FeeCapGwei,
+	// else FeeCapWei: without a cap it is never re-signed above the
+	// approved maximum); AllowExpensiveGas records that flag. UserOpGas and
+	// the fee fields are the operation's; all of them are bound at approval.
+	UserOpKind           string           `json:"user_op_kind,omitempty"`
+	UserOpNonce          string           `json:"user_op_nonce,omitempty"`
+	TransitAccount       string           `json:"transit_account,omitempty"`
+	BundlerURL           string           `json:"bundler_url,omitempty"`
+	FeeCapWei            string           `json:"fee_cap_wei,omitempty"`
+	FlatFeeWei           string           `json:"flat_fee_wei,omitempty"`
+	PayoutWei            string           `json:"payout_wei,omitempty"`
+	MinimumReceivedWei   string           `json:"minimum_received_wei,omitempty"`
+	OwedWei              string           `json:"owed_wei,omitempty"`
+	FinalizeReserveWei   string           `json:"finalize_reserve_wei,omitempty"`
+	FinalizeEstimateWei  string           `json:"finalize_estimate_wei,omitempty"`
+	EstimatedReceivedWei string           `json:"estimated_received_wei,omitempty"`
+	FeeBumpCapWei        string           `json:"fee_bump_cap_wei,omitempty"`
+	FeeCapGwei           uint64           `json:"fee_cap_gwei,omitempty"`
+	AllowExpensiveGas    bool             `json:"allow_expensive_gas,omitempty"`
+	UserOpGas            *GaslessQuoteGas `json:"user_op_gas,omitempty"`
+	// PayeeHasCode: the payout address is a contract (design 3.1's
+	// advisory is in Warnings). The paymaster pushes it the payout with
+	// 100,000 gas and credits it when the push fails, charging
+	// CreditSurchargeWei beyond the cap; MinimumReceivedWei already
+	// deducts it, so it is the floor whether the push succeeds or not.
+	PayeeHasCode       bool   `json:"payee_has_code,omitempty"`
+	CreditSurchargeWei string `json:"credit_surcharge_wei,omitempty"`
+}
+
+// quoteID is a fresh 32-byte approval ID.
+func quoteID() (string, error) {
+	nonceBytes := make([]byte, 32)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(nonceBytes), nil
 }
 
 type addressQuoteContextKey struct{}
@@ -54,6 +105,10 @@ type addressQuoteMode struct {
 	Capture   *AddressPaymentQuote
 	Approval  *AddressPaymentQuote
 	RetryHash string
+	// AcceptUnsettledRequestRisk carries the owner's acknowledgement for an
+	// expired note whose current state has an unsettled request: the
+	// companion may then send the ownership proof the server requires.
+	AcceptUnsettledRequestRisk bool
 }
 
 func quoteMode(ctx context.Context) *addressQuoteMode {
@@ -108,6 +163,9 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	if record.Phase == "active" || record.Phase == "legacy_recovery" || (record.Withdrawal != nil && record.Withdrawal.Phase != "complete") {
 		return quote, errors.New("recover the saved transaction or close the private note before quoting a deposit")
 	}
+	if record.Withdrawal.waitingPayout() {
+		return quote, errWithdrawalPayoutWaiting
+	}
 	retryHash := ""
 	if record.Pending != nil {
 		if record.Pending.Kind != "deposit" || record.Phase != "reverted" || record.Amount != amount {
@@ -120,6 +178,14 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 		if !final || receipt.Status != "0x0" {
 			return quote, errors.New("the saved deposit must have a finalized revert before requoting")
 		}
+		// The RPC's revert alone never authorizes reusing the note secret.
+		deposit, err := h.readAddressDeposit(config)
+		if err != nil {
+			return quote, err
+		}
+		if err := h.checkDepositRevert(ctx, config, record, deposit, receipt); err != nil {
+			return quote, err
+		}
 		retryHash = record.Pending.Hash
 	}
 	if _, err = h.prepare(ctx, amount); err != nil {
@@ -128,6 +194,26 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	deposit, err := h.readAddressDeposit(config)
 	if err != nil || deposit == nil || deposit.Amount != amount || deposit.Active || deposit.TransactionHash != "" {
 		return quote, errors.New("the prepared deposit cannot be quoted; preserve its recovery data")
+	}
+	if retryHash == "" {
+		// An earlier deposit of this note, already retired, may have landed
+		// since. Approval searches the tree it signs from again; a retry that
+		// would be refused is not quoted for funding. A quote saves phase
+		// waiting_funds, so a saved conflict is only cleared by a search that
+		// completes.
+		search := h.advisePriorDeposits
+		if record.Phase == "verification_conflict" {
+			search = h.checkPriorDeposits
+		}
+		if err := search(ctx, config, record, deposit); err != nil {
+			if errors.Is(err, errDepositVerificationConflict) && record.Phase != "verification_conflict" {
+				record.Phase = "verification_conflict"
+				if saveErr := h.saveAddress(record); saveErr != nil {
+					return quote, saveErr
+				}
+			}
+			return quote, err
+		}
 	}
 	record.Amount, record.Commitment, record.Phase = amount, deposit.Commitment, "waiting_funds"
 	if retryHash != "" {
@@ -138,7 +224,7 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	if microUSD != 0 {
 		record.DepositUSDUnits = amount
 	}
-	record.Withdrawal = nil
+	retireWithdrawal(record)
 	if err = h.saveAddress(record); err != nil {
 		return quote, err
 	}
@@ -167,9 +253,14 @@ func (h *FundingHandler) ApproveAddressDeposit(ctx context.Context, id string) (
 	}
 	return h.fundAddressLocked(context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Approval: quote}), quote.Amount)
 }
-func (h *FundingHandler) QuoteAddressWithdrawal(ctx context.Context, destination string, noteID uint64, retryHash string) (AddressPaymentQuote, error) {
+
+// QuoteAddressWithdrawal reserves the note and returns a fee quote.
+// acceptUnsettledRequestRisk is the owner's explicit acknowledgement for an
+// expired note at a state with an unsettled request (see the companion's
+// unsettled_request_state); it is only forwarded when given.
+func (h *FundingHandler) QuoteAddressWithdrawal(ctx context.Context, destination string, noteID uint64, retryHash string, acceptUnsettledRequestRisk bool) (AddressPaymentQuote, error) {
 	var quote AddressPaymentQuote
-	mode := &addressQuoteMode{Capture: &quote, RetryHash: retryHash}
+	mode := &addressQuoteMode{Capture: &quote, RetryHash: retryHash, AcceptUnsettledRequestRisk: acceptUnsettledRequestRisk}
 	status, err := h.WithdrawAddress(context.WithValue(ctx, addressQuoteContextKey{}, mode), destination, noteID, retryHash)
 	if err == nil && quote.ID == "" {
 		err = fmt.Errorf("withdrawal cannot be quoted while its status is %s; resume the saved operation", status.Phase)
@@ -188,14 +279,29 @@ func (h *FundingHandler) ApproveAddressWithdrawal(ctx context.Context, id string
 		h.mu.Unlock()
 		return AddressWithdrawalStatus{}, err
 	}
-	quote, err := checkedAddressQuote(record, id, "withdrawal")
+	kind := "withdrawal"
+	if record.Quote != nil && transitKinds[record.Quote.Kind] {
+		kind = record.Quote.Kind
+	}
+	quote, err := checkedAddressQuote(record, id, kind)
 	h.mu.Unlock()
 	if err != nil {
 		return AddressWithdrawalStatus{}, err
 	}
 	// WithdrawAddress takes the same lock again and the signer rechecks this
 	// exact saved ID/binding before any signing; a competing quote fails closed.
-	return h.WithdrawAddress(context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Approval: quote}), quote.Destination, quote.NoteID, quote.RetryHash)
+	ctx = context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Approval: quote})
+	options := withdrawalOptions(ctx)
+	switch kind {
+	case "transit_create", "transit_sweep":
+		options.Sweep = true
+	case "gasless_claim":
+		options.ClaimCredit = true
+	}
+	if quote.FeePolicy == "payout" && quote.UserOpKind == "forward" {
+		options.Collect = true
+	}
+	return h.WithdrawAddress(WithWithdrawalOptions(ctx, options), quote.Destination, quote.NoteID, quote.RetryHash)
 }
 func checkedAddressQuote(record *addressFundingRecord, id, kind string) (*AddressPaymentQuote, error) {
 	q := record.Quote
@@ -217,12 +323,13 @@ func (h *FundingHandler) refreshAddressDeposit(ctx context.Context, deposit *dep
 	if json.Unmarshal(raw, &refreshed) != nil || len(refreshed.ZeroPath) != 32 {
 		return "", errors.New("invalid refreshed deposit path")
 	}
-	data := "0xc588341c" + addressABIWord(deposit.Commitment) + fmt.Sprintf("%064x", deposit.Amount)
+	// deposit(bytes32,uint128): the vault appends the leaf itself (revision 3). The path stays
+	// with the record, for the note's exit proof.
+	data := depositCalldata(deposit.Commitment, deposit.Amount)
 	for _, sibling := range refreshed.ZeroPath {
 		if !isField(sibling) {
 			return "", errors.New("invalid refreshed deposit path")
 		}
-		data += addressABIWord(sibling)
 	}
 	deposit.ZeroPath = refreshed.ZeroPath
 	if err = h.save(*deposit); err != nil {
@@ -237,9 +344,9 @@ func positiveDifference(left, right *big.Int) *big.Int {
 	}
 	return n
 }
-func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to string, value, balance, estimate *big.Int, gas, nonce uint64, fees addressFees, retryHash string) (AddressPaymentQuote, error) {
-	nonceBytes := make([]byte, 32)
-	if _, err := rand.Read(nonceBytes); err != nil {
+func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to string, value, balance, estimate *big.Int, gas, nonce uint64, fees addressFees, retryHash string, warnings ...string) (AddressPaymentQuote, error) {
+	id, err := quoteID()
+	if err != nil {
 		return AddressPaymentQuote{}, err
 	}
 	gasInt := new(big.Int).SetUint64(gas)
@@ -250,11 +357,12 @@ func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to
 	if recommended.BitLen() > 256 {
 		return AddressPaymentQuote{}, errAddressFeeData
 	}
-	q := AddressPaymentQuote{ID: hex.EncodeToString(nonceBytes), Kind: kind, Address: record.Address, ChainID: record.ChainID, Contract: record.Contract, DeploymentID: record.DeploymentID, Amount: record.Amount, PrincipalWei: value.String(), BalanceWei: balance.String(), ExpectedFeeWei: new(big.Int).Mul(estimate, fees.Expected).String(), RequiredFeeWei: required.String(), FeeReserveWei: reserve.String(), FeeBufferWei: new(big.Int).Sub(reserve, required).String(), RequiredTotalWei: total.String(), RecommendedTotalWei: recommended.String(), ShortfallWei: positiveDifference(total, balance).String(), RecommendedTopUpWei: positiveDifference(recommended, balance).String(), EstimatedGas: estimate.Uint64(), GasLimit: gas, MaxFeePerGas: fees.Max.String(), MaxPriorityFeePerGas: fees.Tip.String(), FeePolicy: "low", ExpiresAt: time.Now().Add(30 * time.Second).UnixMilli(), Commitment: record.Commitment, Nonce: nonce, RetryHash: retryHash}
+	q := AddressPaymentQuote{ID: id, Kind: kind, Address: record.Address, ChainID: record.ChainID, Contract: record.Contract, DeploymentID: record.DeploymentID, Amount: record.Amount, PrincipalWei: value.String(), BalanceWei: balance.String(), ExpectedFeeWei: new(big.Int).Mul(estimate, fees.Expected).String(), RequiredFeeWei: required.String(), FeeReserveWei: reserve.String(), FeeBufferWei: new(big.Int).Sub(reserve, required).String(), RequiredTotalWei: total.String(), RecommendedTotalWei: recommended.String(), ShortfallWei: positiveDifference(total, balance).String(), RecommendedTopUpWei: positiveDifference(recommended, balance).String(), EstimatedGas: estimate.Uint64(), GasLimit: gas, MaxFeePerGas: fees.Max.String(), MaxPriorityFeePerGas: fees.Tip.String(), FeePolicy: "low", ExpiresAt: time.Now().Add(30 * time.Second).UnixMilli(), Commitment: record.Commitment, Nonce: nonce, RetryHash: retryHash}
 	if kind == "deposit" {
 		q.InputMicroUSD = record.DepositMicroUSD
 	}
-	if kind == "withdrawal" && record.Withdrawal != nil {
+	q.Warnings = warnings
+	if (kind == "withdrawal" || escapeKinds[kind] || transitKinds[kind]) && record.Withdrawal != nil {
 		q.NoteID = record.Withdrawal.NoteID
 		q.Amount = record.Withdrawal.Amount
 		q.Destination = record.Withdrawal.Destination
@@ -285,7 +393,38 @@ func validatePaymentApproval(record *addressFundingRecord, q *AddressPaymentQuot
 	if kind == "return" && !strings.EqualFold(q.Destination, to) {
 		return errAddressQuoteChanged
 	}
+	if escapeKinds[kind] && (record.Withdrawal == nil || record.Withdrawal.Mode != "escape" || q.NoteID != record.Withdrawal.NoteID || q.Amount != record.Withdrawal.Amount || q.Binding != record.Withdrawal.Binding || !strings.EqualFold(q.Destination, record.Withdrawal.Destination) || !strings.EqualFold(to, record.Contract)) {
+		return errAddressQuoteChanged
+	}
+	if transitKinds[kind] {
+		w := record.Withdrawal
+		if w == nil || w.Transit == nil || q.NoteID != w.NoteID || !strings.EqualFold(q.Destination, w.Destination) {
+			return errAddressQuoteChanged
+		}
+		if expected, _ := transitTransactionData(kind, w); !strings.EqualFold(to, expected) {
+			return errAddressQuoteChanged
+		}
+	}
 	return nil
+}
+
+// SavedEscapeQuote is the saved quote of an escape transaction, if any.
+func (h *FundingHandler) SavedEscapeQuote(ctx context.Context) (*AddressPaymentQuote, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	config, err := h.config(ctx)
+	if err != nil {
+		return nil, err
+	}
+	record, err := h.loadAddress(config)
+	if err != nil {
+		return nil, err
+	}
+	if record.Quote == nil || !escapeKinds[record.Quote.Kind] {
+		return nil, nil
+	}
+	copy := *record.Quote
+	return &copy, nil
 }
 
 // SavedAddressQuote is read-only; an expired quote remains inspectable but can

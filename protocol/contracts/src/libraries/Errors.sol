@@ -8,11 +8,20 @@ library Errors {
     /// @notice The supplied proof did not verify.
     error InvalidProof();
 
-    /// @notice The Merkle root provided is not the current active root.
+    /// @notice The Merkle siblings do not reproduce the current root.
     error StaleRoot();
+
+    /// @notice A withdrawal proof's activeRoot is neither current nor retired within ROOT_HISTORY_WINDOW.
+    error UnknownRoot();
 
     /// @notice The nullifier has already been consumed.
     error ReplayedNullifier();
+
+    /// @notice An escape at this nullifier was defeated by a challenge; exit from the successor state.
+    error ChallengedNullifier();
+
+    /// @notice The withdrawal destination is the zero address or the vault itself.
+    error InvalidDestination();
 
     /// @notice The note is not in Active status.
     error NoteNotActive();
@@ -56,9 +65,44 @@ library Errors {
     /// @notice The contract is paused.
     error Paused();
 
+    /// @notice The contract is not paused.
+    error NotPaused();
+
+    /// @notice No treasury change is scheduled.
+    error NoPendingTreasuryChange();
+
+    /// @notice The scheduled treasury change is still inside its timelock.
+    error TreasuryChangeNotReady();
+
     /// @notice The caller is not authorized for this operation.
     error Unauthorized();
 
     /// @notice A field value is outside the BN254 scalar field.
     error InvalidFelt();
+
+    /// @notice The withdrawal proof's kind is not the one this entry point accepts: escapes take
+    ///         kind 0, mutual closes kind 1, and no entry point accepts an ownership proof (kind 2).
+    error WrongWithdrawalKind();
+
+    /// @notice An escape from the state just below a defeated escape: its successor nullifier
+    ///         belongs to a state that was spent, so successor evidence exists.
+    error SupersededState();
+
+    /// @notice A defeat must carry a request proof at the escape's successor nullifier.
+    error NotSuccessorEvidence();
+
+    /// @notice A raise must carry a request proof at the escaped state's nullifier.
+    error NotStateEvidence();
+
+    /// @notice The raise would not increase the escape's concession.
+    error NotARaise();
+
+    /// @notice The withdrawal proof's validUntil has passed.
+    error ProofExpired();
+
+    /// @notice A pause within PAUSE_COOLDOWN of the latest unpause.
+    error PauseCooldown();
+
+    /// @notice retireClosedLeaf on a note that is not Closed.
+    error NoteNotClosed();
 }

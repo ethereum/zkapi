@@ -1,30 +1,40 @@
 ---
 title: Protocol
-description: Note-bound private balances, request authorization, and settlement
+description: Note-bound private balances, request authorization, settlement and the concession exit
 ---
 
 zkAPI v2 uses a **state-anchor chain**: each accepted authorization consumes
 the user's current private spend state and leads to a fresh state signed by
-the server. The current circuit revision is `zkapi-v2-note-bound-v1`, using
-Groth16 proofs on BN254 and Schnorr signatures on Baby-JubJub.
+the server. The current circuit is `zkapi-v2-concession-v1`, used by vault
+revision 3, with Groth16 proofs on BN254 and Schnorr signatures on
+Baby-JubJub. Its exit, the **concession exit**, lets an owner leave without
+any cooperation from the operator.
 
 ## Primitives
 
 | Symbol | Meaning |
 |---|---|
 | `s` | User secret |
+| `n` | Note ID, the note's leaf index in the vault's tree |
 | `R` | Registration commitment `Poseidon("zkapi.v2.reg", s, 0)` |
 | `D` | Native ETH deposit in integer gwei |
-| `L` | Active note leaf `Poseidon("zkapi.v2.leaf", note_id, R, D, expiry)` |
+| `L` | Note leaf `Poseidon("zkapi.v2.leaf", n, R, D, expiry)` |
 | `B` | Current private available balance |
 | `C(B, r, L)` | Note-bound commitment `B·G + r·H + L·J` |
-| `τ` | Current state anchor |
-| `σ_state` | Server Schnorr signature binding the deployment, commitment, and anchor |
-| `x` | State nullifier `Poseidon("zkapi.v2.null", s, τ)` |
-| `σ_clear` | Separate server Schnorr signature authorizing withdrawal of that nullifier |
+| `τ` | Current state anchor; `τ = 1` at genesis |
+| `N(τ)` | State nullifier `Poseidon("zkapi.v2c.null", s, n, τ)` |
+| `succ(N)` | Successor anchor `Poseidon("zkapi.v2c.anchor", N)` |
+| `σ_state` | Server Schnorr signature binding the deployment, commitment and anchor |
+| `σ_clear` | Separate server Schnorr signature authorizing a mutual close at a nullifier |
+| `b` | `bound_at_state`: the one solvency bound every request from a state uses |
 
 The strings in these formulas denote domain tags encoded as field elements.
 See [Cryptography](/docs/cryptography) for the exact primitives and public inputs.
+
+The states of a note form a chain: `τ_0 = 1`, `N_i = N(τ_i)` and
+`τ_{i+1} = succ(N_i)`. Anyone can compute the next anchor from a nullifier;
+only the holder of `s` can compute the next nullifier. The nullifier includes
+the note ID, so two notes with the same secret never share a nullifier.
 
 ## Registration
 
@@ -33,10 +43,16 @@ See [Cryptography](/docs/cryptography) for the exact primitives and public input
 3. The vault records the deposit and expiry, and inserts the full note leaf `L`
    into its depth-32 Poseidon tree.
 4. The wallet initializes `B = D`, `τ = 1`, and a random blinding `r`. Genesis
-   requires no server signature; the circuit enforces the initial balance and anchor.
+   requires no server signature; the circuit enforces the initial balance and
+   anchor. The wallet also keeps the deposit's Merkle path: the vault accepts
+   proofs at that root for good.
 
 Deposits use integer gwei and require exactly `D × 1 gwei` in transaction
-value. The current SDK and vault support native ETH only.
+value. The current SDK and vault support native ETH only. Before every
+deposit, clients check the vault's, adapter's and Poseidon library's runtime
+code hashes and the vault's getters against their build-pinned profile,
+through the wallet provider that signs and the pinned RPC; a mismatch refuses
+the deposit.
 
 ## Why the commitment includes the note
 
@@ -57,32 +73,48 @@ The wallet generates a fresh rerandomization `ε`, yielding
 `C_anon = C(B, r, L) + ε·H`. Its Groth16 request proof establishes:
 
 - membership of the note in the supplied active root;
-- a valid genesis state or server-signed current state for that same note;
-- `B ≥ solvency_bound` and an expiry at least public `request_time`;
-- correct derivation of `x` from the secret and current anchor;
+- a genesis state (`τ = 1` and `B = D`), or a server-signed state for that
+  note whose anchor is the successor of the previous state's nullifier,
+  `τ = succ(N(τ_prev))`; a signed state at anchor 1 is unprovable;
+- `D ≥ B ≥ solvency_bound`, and an expiry at least the public `request_time`;
+- the nullifier `N(τ)`;
 - correct rerandomization of the note-bound commitment;
-- an authorization tag binding `x` to the request ID and payload hash.
+- an authorization tag binding `N(τ)` to the request ID and payload hash.
+
+Every request the wallet sends from one state carries the same solvency
+bound, written to durable storage as `bound_at_state` before any proof leaves
+the device.
 
 The server recomputes the hash of the exact payload bytes and the request
 context, verifies the authorization tag, deployment, signing key, root,
-freshness, solvency bound, and proof, then reserves the nullifier. Since `x`
-does not depend on the payload, changing the request cannot create another
-spendable nullifier for the same state. Exact retries use the durable request
-record for recovery.
+freshness, solvency bound and proof, then reserves the nullifier. It admits a
+request only at the vault's current root, refreshed within 60 seconds and
+equal to its indexer's root, and, when configured, only within a per-request
+ceiling on the lease budget. The reservation and an append-only copy of the
+request proof are written in one transaction; that copy is the challenger's
+evidence. Since `N(τ)` does not depend on the payload, changing the request
+cannot create another spendable nullifier for the same state. Exact retries
+use the durable request record for recovery.
 
-When usage is finalized, the server applies the charge `Δ` within the
-applicable cap and returns a fresh Schnorr-signed state:
+When usage is settled, the server fixes the charge `Δ` within the applicable
+cap, then signs a fresh state:
 
 ```text
 C_new = C_anon − Δ·G + blind_delta·H
 B_new = B − Δ
 r_new = r + ε + blind_delta
-τ_new = Poseidon("zkapi.v2.anchor", server_randomness, x, C_new.x, C_new.y)
+τ_new = succ(N(τ))
 ```
 
-The signature covers the protocol version, chain, vault address, `C_new`, and
-`τ_new`. The wallet verifies the response hash, charge, signature, and commitment
-update before saving its next private state and clearing the pending journal.
+The signature covers the protocol version, chain, vault address, `C_new` and
+`τ_new`. The server signs only while the request's nullifier is unspent on
+chain: if an exit consumed it, the signature waits, and is made only if that
+exit is defeated; otherwise the request ends unsigned (`exited_unsigned`) one
+challenge period plus an hour after the server first found it consumed. The wallet checks the response hash, the
+charge against `bound_at_state`, that `τ_new` is the successor of its own
+nullifier, the commitment update and the signature before saving its next
+private state and clearing the pending journal. A successor that fails these
+checks is treated like a withheld one.
 
 The browser sends a prompt-free lease authorization to
 `POST /v2/openrouter/leases`, uses the leased key directly with OpenRouter, and
@@ -91,56 +123,230 @@ accepted native ETH price quote is part of the proof-bound authorization and
 stays fixed through recovery and settlement. The billing server does not proxy
 inference requests.
 
+Settlement always fixes a charge by a write-once deadline. A lease whose key
+never reached the wallet settles at zero. A delivered lease is charged its
+measured usage, clamped to the proven `solvency_bound` before conversion. If
+its usage cannot be settled at all, or is still unavailable when the deadline
+passes, the lease settles at `solvency_bound`. The server refuses to start
+unless the lease lifetime plus that deadline fit within half the vault's
+challenge period, and the challenger refuses to start unless a raise it
+decides after that settlement still lands within the challenge period.
+
 ## Refunds
 
 No funds move on-chain per request. Only the actual charge reduces the private
-balance; unused capacity under the solvency bound stays available. On close,
-the vault settles native ETH:
+balance; unused capacity under the solvency bound stays available. When a note
+closes, the vault settles native ETH:
 
 ```text
-payout_to_destination = B_final
-payout_to_treasury    = D − B_final
+payout_to_destination = final_balance
+payout_to_treasury    = D − final_balance
 ```
 
-These ledger amounts are multiplied by one gwei to obtain wei.
-The withdrawal destination is proof-bound and may differ from the funding
-address.
+These ledger amounts are multiplied by one gwei to obtain wei. The withdrawal
+destination is proof-bound and may differ from the funding address.
 
 ## Withdrawal
 
-**Mutual close.** The wallet requests clearance for its current nullifier from
-`POST /v2/withdraw/clearance`. The server reserves the nullifier and returns a
-Schnorr signature under its separate clearance key. The wallet includes that
-signature as a private witness to the withdrawal proof, then submits
-`mutualClose(inputs, proof, siblings)`. The vault checks its immutable deployment
-keys, the current root, and the Groth16 proof, removes the leaf, and pays out.
+A withdrawal proof has a **kind**: 0 is an escape, 1 a mutual close, and 2 an
+ownership proof, which goes only to the server and which every vault entry
+point refuses. Every withdrawal proof carries a `valid_until` time; the vault
+refuses an escape or close proof after it, and the server refuses an
+ownership proof that expires more than an hour ahead. Withdrawals do no Merkle
+work: the vault accepts a proof at any root it ever held, and the note's leaf
+stays in the tree.
 
-**Escape hatch.** Without clearance, the wallet submits
-`initiateEscapeWithdrawal(inputs, proof, siblings)`. The vault removes the leaf
-immediately and records a pending withdrawal. The challenge window is the
-vault's configured `challengePeriod`; the default is 24 hours.
+**Mutual close.** The wallet proves note ownership with a kind-2 proof for its
+current nullifier: its destination and conceded amount are zero, and it names
+no successor. It sends it to `POST /v2/withdraw/clearance`. The server checks
+the proof, its deployment and keys, its freshness and its root, then reserves
+the nullifier and returns a Schnorr signature under its separate clearance
+key. The wallet includes that signature as a private witness to a kind-1
+proof and submits `mutualClose(inputs, proof)`. The vault checks its immutable
+deployment keys and the proof, consumes the nullifier, closes the note and
+pays out at once. The ownership proof shows the server the note ID, balance
+and nullifier before the close publishes them; it cannot start an escape.
 
-An operator must run the challenge service. If the escaped state already
-authorized usage, a challenger supplies the original request proof with the
-same nullifier. That proof retains its historical active root even if other
-deposits or closes have since changed the tree. A current zero-slot path lets
-the vault restore the note to the current tree. A successful challenge cancels
-the pending payout and makes the note active again; it does not impose a
-separate monetary penalty. Otherwise, `finalizeEscapeWithdrawal(noteId)` pays
-the recorded amounts after the deadline.
+**Escape.** Without clearance, the wallet submits
+`initiateEscapeWithdrawal(inputs, proof)` with a kind-0 proof from its newest
+state `S_k`. The escape publishes:
 
-An active note that expires without close-out can be claimed for the treasury
-with `claimExpired(noteId, siblings)`. The SDK preserves deposit and withdrawal
-journals for transaction recovery.
+- `N_k`, the nullifier of the state it leaves;
+- `next_nullifier = N_{k+1}`, the nullifier of that state's successor,
+  computed in the circuit;
+- `conceded = c`, an amount the owner gives up, with `c ≤ B_k`;
+- the destination and `valid_until`.
+
+The vault consumes both nullifiers, records the escape with
+`challengeDeadline = now + challengePeriod`, and will pay `B_k − c`. While the
+escape is pending, anyone may:
+
+- **Defeat** it with `challengeEscapeWithdrawal(noteId, inputs, proof)`: a
+  valid request proof at `N_{k+1}`. That shows the owner held and spent the
+  successor state, so `S_k` was stale. The vault returns the note to active,
+  releases both nullifiers, marks `N_k` in `challengedNullifiers` for good,
+  and keeps at least one challenge period of unpaused time before the note
+  can be claimed as expired. An escape from `S_k` then reverts
+  `ChallengedNullifier()`, and one from the state just below
+  `SupersededState()`. A request proof at `N_k` never defeats an escape.
+- **Raise** its concession with `raiseEscapeConcession(noteId, inputs, proof, amount)`:
+  a valid request proof at `N_k` raises `c`, in place, to
+  `min(amount, solvency_bound, B_k)`. The deadline does not move, and a
+  defeat stays possible.
+
+After the deadline, `finalizeEscapeWithdrawal(noteId)` pays the current
+`B_k − c`. If the destination rejects ETH or needs more than 100,000 gas, the
+amount is credited instead (`EscapePayoutDeferred`), and anyone can deliver
+it later with `claimEscapePayout(destination)`; the treasury share is paid
+either way. A mutual close forwards all gas, so a close to a destination that
+rejects ETH reverts, and the wallet proves it again to another destination.
+
+The operator runs a challenge service. It defeats an escape when it holds a
+verified request proof at the escape's successor nullifier, and otherwise
+raises the concession to what the request at the escaped state owes: its
+settled charge, or its solvency bound if it may have been delivered and is
+still unsettled near the deadline. An honest owner escaping from its newest
+state is never defeated, because only the owner can make a request proof at
+`N_{k+1}`, and the wallet makes none once it starts to exit.
+
+### How a wallet chooses an exit
+
+The wallet freezes the state when it starts an exit: from then on it makes no
+request proof there, only the exit's own proofs. Every operator call made
+during an exit has a 20-second limit, and none can delay the exit past
+`must_initiate_by`, 12 hours before the note's expiry. Then:
+
+- **Fresh state** (no unresolved request): a mutual close. If the server
+  refuses the clearance or cannot be reached, an escape with `c = 0`.
+- **A request is unresolved**: the wallet waits until `T`, at most the
+  request's settlement time plus 15 minutes, then escapes with
+  `c = bound_at_state`. An honest operator delivers the successor before `T`;
+  a dishonest one could raise to that bound anyway. The owner may escape
+  earlier with `c = 0`, and the operator then raises it to the actual charge.
+- **A lost response** (the server finalized a request whose successor passes
+  the wallet's identity, hash, anchor and signature checks but cannot be
+  installed, for example after the wallet lost its blinding): an escape with
+  `c = min(charge, bound_at_state)`. A successor at the wrong anchor counts
+  as withheld.
+
+Merkle paths come from the deposit-time path, the indexer, or a rebuild from
+the vault's logs, read through the user's own exit RPC when one is set. Just
+before proving, the wallet asks the server for a request proof at
+`N_{k+1}`; one that verifies means another device holds a newer state, and
+the wallet refuses (`device_not_newest`). The browser SDK can also export an
+encrypted exit kit, from which the companion CLI escapes without the host.
+
+**Guarantee.** An honest wallet obtains at least `B_k − b_k`, where `S_k` is
+its newest installed state and `b_k` its `bound_at_state`, whatever the
+operator and owner do. This holds as long as the chain includes one
+transaction before `must_initiate_by`, the setup is sound, and the wallet's
+storage is durable. The payout is gross of the escape's gas, about 575,000.
+
+An active note that is not withdrawn can be claimed for the treasury with
+`claimExpired(noteId)` once its effective expiry has passed, while the vault
+is not paused. `effectiveExpiry(noteId)` is the deposit's expiry extended by
+all time the vault spent paused since the deposit and by any post-challenge
+grace, and is never earlier than `unpauseClaimGrace` after the latest unpause.
+Requests still end at the note's original expiry, which the request proof
+checks. A pending escape is never swept.
 
 ## Compatibility and trust
 
-Use matching note-bound circuits, proving/verifying keys, browser WASM, and
-deployed verifiers. The vault's proof adapter and signing keys are immutable;
-client configuration must pin their deployed values. The SDK supports native
-ETH balances and rejects incompatible wallet formats without converting them.
+Use matching circuits, proving and verifying keys, browser WASM and deployed
+verifiers. The vault's proof adapter and signing keys are immutable; clients
+pin them, the runtime code hashes of the vault, adapter and Poseidon library,
+and the adapter's verifying-key hashes, and check them on chain before every
+deposit. The SDK supports native ETH balances and rejects incompatible wallet
+formats without converting them.
 
-The current elliptic-curve construction is **not post-quantum**. The checked-in
-setup is single-party; no multiparty ceremony has been conducted.
-Read the [setup and compatibility requirements](/docs/cryptography#setup-and-compatibility)
+The current elliptic-curve construction is **not post-quantum**. The
+checked-in keys are a single-party development setup; production keys come
+from a multi-party ceremony that has not run yet, and release builds load no
+other keys. Read the [setup and compatibility requirements](/docs/cryptography#setup-and-compatibility)
 before choosing deployment artifacts.
+
+The vault rules on this page are those of vault revision 3. No revision-3
+vault is deployed yet: the packaged SDK and `zkapi-clientd` profiles are
+placeholders that refuse to fund a note. The deployed vaults run an earlier
+revision of circuit `zkapi-v2-note-bound-v1`, served by the release line
+`release/v2-note-bound`. They keep their original rules: an escape names only
+its own nullifier, any request proof at it defeats the escape and consumes
+the nullifier, withdrawals need Merkle siblings at the current root, a pause
+has no time limit, `claimExpired` and a one-step `setTreasury` remain
+available while paused, and `transferOwnership` takes effect at once. See the
+[migration runbook](https://github.com/ethereum/zkapi/blob/main/docs/migration-concession-vault.md).
+
+### Owner and operator powers
+
+One owner address controls the vault's pause switch and treasury. The proof
+adapter, signing keys, challenge period, note lifetime and maximum pause are
+immutable, and the vault has no upgrade path. The deployment script requires
+an explicit `OWNER` outside local chains; use a multisig or timelock.
+
+- **Pause.** `pause()` stops deposits, `claimExpired`, scheduling or accepting
+  a treasury change, `withdrawTreasuryArrears` and `renounceOwnership`. It
+  stops `initiateEscapeWithdrawal` and `mutualClose` for at most
+  `maxPauseDuration`, at least twice the challenge period (45 days on the
+  planned mainnet deployment): from `pausedAt + maxPauseDuration` they reopen
+  while the vault is still paused. Defeats, raises,
+  `finalizeEscapeWithdrawal`, `claimEscapePayout` and `retireClosedLeaf` stay
+  open, so pending escapes still resolve. A new pause needs one day since the
+  latest unpause (`PauseCooldown()`). Paused time extends every note's claim
+  deadline, and after any `unpause()` no note can be claimed as expired for
+  `unpauseClaimGrace = max(challengePeriod, 1 day)`. Pause and unpause emit
+  `Paused(address)` and `Unpaused(address)`; redundant calls revert. No vault
+  function lets the owner take user funds.
+- **Treasury.** `setTreasury(address)` only schedules a change.
+  `acceptTreasury()` applies it after
+  `treasuryChangeDelay = max(challengePeriod, 2 days)` of unpaused time, and
+  `cancelTreasuryChange()` withdraws it at any time, including while paused.
+  The treasury receives closed notes' spent balances, concessions and expired
+  deposits. A treasury that rejects a payment, or needs more than 100,000 gas
+  to accept it, cannot block a user payout: its share accrues in
+  `treasuryArrears`, which anyone can pay to the current treasury with
+  `withdrawTreasuryArrears()`.
+- **Ownership.** Transfers are two-step. `transferOwnership(newOwner)` only
+  records `pendingOwner()` and emits `OwnershipTransferStarted`; the transfer
+  completes when that address calls `acceptOwnership()`. Both work while
+  paused, for key rotation. Until the nominee accepts, the current owner keeps
+  every power and can replace the nomination or cancel it with
+  `transferOwnership(address(0))`. A rotation away from a key that may be
+  compromised must submit the nomination and the acceptance together,
+  consecutively in one private bundle that is included atomically, never as
+  separate transactions through the public mempool; a Safe nominee's
+  acceptance is a pre-signed `execTransaction` calling `acceptOwnership()`
+  (see the [owner key rotation runbook](https://github.com/ethereum/zkapi/blob/main/docs/migration-concession-vault.md#owner-key-rotation)).
+  `renounceOwnership` reverts while paused and clears any nomination.
+
+The operator runs the API server, indexer and challenge service. It signs
+every successor state and every clearance, so it can refuse service or a
+mutual close, but it cannot block an exit: an escape needs no operator call,
+and its Merkle path comes from the deposit or from the vault's own logs. The
+operator must keep its challenger running through every challenge window to
+be paid for service an escaping owner used. The server refuses to start unless
+its signing seeds derive the vault's immutable keys and are not the published
+development keys, and unless the vault, adapter and library match its
+deployment manifest.
+
+### What remains
+
+- **Challenger liveness.** If the challenger misses a defeat, the stale escape
+  pays out; the challenger then retires the closed note's leaf
+  (`retireClosedLeaf`), so the server refuses later requests built on it.
+- **Exit-time linkage.** An escape from a state that served a request links
+  that last request to the note and destination for the server and gateway,
+  and a raise publishes its public inputs on chain. Waiting for settlement
+  and a mutual close link nothing new.
+- **Owner pause.** Up to `maxPauseDuration` per pause.
+- **Setup trust.** Soundness rests on the multi-party setup: an honest public
+  phase 1 that the ceremony used, and at least one honest phase-2
+  contributor.
+- **Leaked keys.** A leaked state-signing key can forge states, each capped at
+  its note's deposit; a leaked clearance key lets a dishonest owner close at
+  a spent state.
+- **Clearance reservations** are permanent and clearance signatures do not
+  expire; a wallet never sends a request from a state after sending its
+  ownership proof.
+- **Legacy vaults** keep the withholding gap until they are drained: an
+  operator that finalizes a request but withholds its signed successor can
+  defeat every escape the owner can build there.

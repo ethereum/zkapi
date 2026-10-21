@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/lecore"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 )
 
 type Backend interface {
@@ -43,7 +44,12 @@ type API struct {
 	LeCoreContextRecall bool
 	// RequireAPIKey opts into bearer authentication for inference routes. Local
 	// management always requires its credentials, regardless of this setting.
-	RequireAPIKey bool
+	RewriterNotice string
+	DefaultModel   string
+	RequireAPIKey  bool
+	// WebSearch adds OpenRouter's web plugin to every chat completion. Explicit
+	// :online model selections still request search when this default is off.
+	WebSearch bool
 	// Admin is optional local wallet management. All of its routes require the
 	// private CLI credential; an inference API key cannot authorize wallet use.
 	Admin           http.Handler
@@ -66,7 +72,7 @@ func New(backend Backend, key string, concurrency int) (*API, error) {
 	if concurrency < 1 || concurrency > 64 {
 		return nil, errors.New("concurrency must be between 1 and 64")
 	}
-	return &API{backend: backend, key: sha256.Sum256([]byte(key)), slots: make(chan struct{}, concurrency), pending: make(chan struct{}, concurrency+64)}, nil
+	return &API{backend: backend, key: sha256.Sum256([]byte(key)), slots: make(chan struct{}, concurrency), pending: make(chan struct{}, concurrency+64), WebSearch: true}, nil
 }
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +129,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/v1/models" && r.Method == http.MethodGet:
-		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
 		defer cancel()
 		data, err := a.backend.Models(ctx)
 		if err != nil {
@@ -184,7 +190,20 @@ var fields = map[string]bool{
 	"modalities": true, "audio": true, "prediction": true,
 }
 
-func sanitize(body []byte) (json.RawMessage, bool, error) {
+func sanitizeWithDefault(body []byte, model string, webSearch bool) (json.RawMessage, bool, error) {
+	if model != "" {
+		var values map[string]json.RawMessage
+		if json.Unmarshal(body, &values) == nil && values != nil {
+			if _, exists := values["model"]; !exists {
+				values["model"], _ = json.Marshal(model)
+				body, _ = json.Marshal(values)
+			}
+		}
+	}
+	return sanitize(body, webSearch)
+}
+
+func sanitize(body []byte, webSearch bool) (json.RawMessage, bool, error) {
 	var values map[string]json.RawMessage
 	if err := json.Unmarshal(body, &values); err != nil || values == nil {
 		return nil, false, errors.New("body must be a JSON object")
@@ -219,6 +238,21 @@ func sanitize(body []byte) (json.RawMessage, bool, error) {
 			delete(values, key)
 		}
 	}
+	if stream {
+		options := map[string]json.RawMessage{}
+		if raw, ok := values["stream_options"]; ok && string(raw) != "null" {
+			if err := json.Unmarshal(raw, &options); err != nil {
+				return nil, false, errors.New("stream_options must be an object")
+			}
+		}
+		options["include_usage"] = json.RawMessage("true")
+		values["stream_options"], _ = json.Marshal(options)
+	}
+	// Only this locally configured plugin crosses the boundary. Keep caller
+	// plugins filtered and preserve the model ID, tools, and generation options.
+	if webSearch {
+		values["plugins"] = json.RawMessage(`[{"id":"web"}]`)
+	}
 	clean, err := json.Marshal(values)
 	return clean, stream, err
 }
@@ -250,7 +284,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 413, "invalid_body", "Request body is too large or unreadable (16 MiB maximum).")
 		return
 	}
-	clean, streaming, err := sanitize(body)
+	clean, streaming, err := sanitizeWithDefault(body, a.DefaultModel, a.WebSearch)
 	if err != nil {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return
@@ -271,24 +305,35 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 	if a.LeCoreContextRecall {
 		clean, _ = lecore.Optimize(clean)
 	}
+	promptDiagnostic(ctx, clean)
+	var selected struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(clean, &selected)
+	notice := &completionNotice{streaming: streaming, mode: a.RewriterNotice, model: selected.Model}
+	ctx = notice.context(ctx, w)
 	response, err := a.backend.Complete(ctx, clean)
 	if err != nil {
+		if errors.Is(err, rewriter.ErrFailed) {
+			notice.writeError(w, 502, "rewrite_failed", rewriter.ErrFailed.Error())
+			return
+		}
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			writeError(w, 408, "request_cancelled", "The request was canceled or timed out while waiting for inference.")
+			notice.writeError(w, 408, "request_cancelled", "The request was canceled or timed out while waiting for inference.")
 			return
 		}
 		// Transport/issuer errors may include secrets, submitted JSON or URLs.
 		// Do not expose them to either HTTP clients or service logs.
 		var safe *BackendError
 		if errors.As(err, &safe) && safe.Status >= 400 && safe.Status <= 599 {
-			writeError(w, safe.Status, safe.Code, safe.Message)
+			notice.writeError(w, safe.Status, safe.Code, safe.Message)
 			return
 		}
-		writeError(w, 502, "anonymous_access_failed", "Anonymous access could not be prepared. Check funding with zkapi-clientd config; relay and verifier availability are also required.")
+		notice.writeError(w, 502, "anonymous_access_failed", "Anonymous access could not be prepared. Check funding with zkapi-clientd config; relay and verifier availability are also required.")
 		return
 	}
 	if response == nil || response.Body == nil {
-		writeError(w, 502, "invalid_upstream_response", "The inference provider returned an invalid response.")
+		notice.writeError(w, 502, "invalid_upstream_response", "The inference provider returned an invalid response.")
 		return
 	}
 	defer response.Body.Close()
@@ -312,30 +357,45 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		if retry := response.Header.Get("Retry-After"); retry != "" {
 			w.Header().Set("Retry-After", retry)
 		}
-		writeError(w, status, "upstream_error", "The inference provider rejected the request.")
+		notice.writeError(w, status, "upstream_error", "The inference provider rejected the request.")
 		return
 	}
 	contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if streaming && contentType != "text/event-stream" {
-		writeError(w, 502, "stream_unavailable", "The inference provider did not return an event stream.")
+		notice.writeError(w, 502, "stream_unavailable", "The inference provider did not return an event stream.")
 		return
 	}
 	if !streaming && contentType != "application/json" {
-		writeError(w, 502, "invalid_upstream_response", "The inference provider did not return JSON.")
+		notice.writeError(w, 502, "invalid_upstream_response", "The inference provider did not return JSON.")
 		return
 	}
-	w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(response.StatusCode)
+	if !streaming && notice.notice != nil {
+		body, err := notice.annotateJSON(response.Body)
+		if err != nil {
+			notice.writeError(w, 502, "invalid_upstream_response", "The inference provider did not return valid JSON.")
+			return
+		}
+		writeJSON(w, response.StatusCode, body)
+		return
+	}
+	if !notice.started {
+		w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(response.StatusCode)
+	}
 	if streaming {
 		if err := control.Flush(); err != nil {
 			return
 		}
 	}
+	diagnostic := newResponseDiagnostic(ctx, streaming)
+	responseComplete := false
+	defer func() { diagnostic.finish(responseComplete) }()
 	buffer := make([]byte, 16*1024)
 	for {
 		n, readErr := response.Body.Read(buffer)
 		if n > 0 {
+			diagnostic.add(buffer[:n])
 			_ = control.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := w.Write(buffer[:n]); err != nil {
 				return
@@ -349,6 +409,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if readErr != nil {
+			responseComplete = readErr == io.EOF
 			if readErr != io.EOF {
 				panic(http.ErrAbortHandler)
 			}

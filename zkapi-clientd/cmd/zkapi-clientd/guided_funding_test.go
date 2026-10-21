@@ -19,11 +19,14 @@ type fundingWizardUI struct {
 	confirmations             []bool
 	asks, confirms, continues int
 	beforeContinue            func()
+	// questions records what was asked, in order.
+	questions []string
 }
 
 func (u *fundingWizardUI) Printf(format string, args ...any) { fmt.Fprintf(&u.Buffer, format, args...) }
-func (u *fundingWizardUI) Ask(context.Context, string, string) (string, error) {
+func (u *fundingWizardUI) Ask(_ context.Context, question, _ string) (string, error) {
 	u.asks++
+	u.questions = append(u.questions, question)
 	if len(u.answers) == 0 {
 		return "", errors.New("unexpected input request")
 	}
@@ -63,6 +66,7 @@ type wizardFundingFixture struct {
 	approve                                               func(string) (zkapi.AddressFundingStatus, error)
 	resume                                                func(uint64) (zkapi.AddressFundingStatus, error)
 	withdrawal                                            string
+	withdrawalStatus                                      func() zkapi.AddressWithdrawalStatus
 }
 
 func wizardState(phase string) zkapi.AddressFundingStatus {
@@ -97,6 +101,9 @@ func (f *wizardFundingFixture) Address(context.Context) (zkapi.AddressFundingSta
 	return s, nil
 }
 func (f *wizardFundingFixture) Withdrawal(context.Context) (zkapi.AddressWithdrawalStatus, error) {
+	if f.withdrawalStatus != nil {
+		return f.withdrawalStatus(), nil
+	}
 	phase := f.withdrawal
 	if phase == "" {
 		phase = "no_note"
@@ -164,9 +171,42 @@ func TestGuidedFundingWaitsForMoneyThenApprovesFreshFixedQuote(t *testing.T) {
 	if f.approveCalls != 1 || f.resumeCalls != 1 || f.quoteCalls != 5 || polls != 3 || u.confirms != 0 || u.continues != 1 || u.asks != 1 {
 		t.Fatalf("unexpected flow: %+v polls=%d UI=%+v", f, polls, u)
 	}
-	for _, want := range []string{"Funding address:", "Waiting for ETH:", "Funds available.", "Deposit confirmed.", "Private balance:"} {
+	for _, want := range []string{"To:", "Send at least:", "Funds available.", "Deposit confirmed.", "Private balance:"} {
 		if !strings.Contains(u.String(), want) {
 			t.Fatalf("missing %q", want)
+		}
+	}
+}
+
+// Before a new deposit replaces a credited escape's withdrawal record, and
+// while earlier credited payouts stay unclaimed, the guided setup names them
+// with their claim call. A paid withdrawal adds nothing.
+func TestGuidedFundingNamesUnclaimedEscapePayoutsBeforeANewDeposit(t *testing.T) {
+	for _, credited := range []bool{true, false} {
+		f := newWizardFixture()
+		current := "An escape of this note finalized and closed it, but the vault could not deliver the payout; call claimEscapePayout(0xdest) on the vault"
+		earlier := "An earlier escape (note 9) closed its note; call claimEscapePayout(0xother) on the vault"
+		f.withdrawalStatus = func() zkapi.AddressWithdrawalStatus {
+			return zkapi.AddressWithdrawalStatus{Phase: "complete", PayoutCredited: credited, Message: current}
+		}
+		f.address = func() zkapi.AddressFundingStatus {
+			s := wizardState("ready")
+			s.Amount, s.TransactionHash = 0, ""
+			if credited {
+				s.EscapePayoutCredits = []zkapi.EscapePayoutCredit{{Destination: "0xother", Message: earlier}}
+			}
+			return s
+		}
+		u := &fundingWizardUI{answers: []string{"20"}, confirmations: []bool{true}}
+		if err := guidedFunding(context.Background(), f, "", u, immediateWizardPoll); err != nil {
+			t.Fatal(err)
+		}
+		output := u.String()
+		for _, message := range []string{current, earlier} {
+			shown := strings.Index(output, "Unclaimed escape payout: "+message)
+			if (shown >= 0) != credited || (credited && shown > strings.Index(output, "Ready to deposit")) {
+				t.Fatalf("credited=%v: the reminder %q is missing or follows the deposit: %s", credited, message, output)
+			}
 		}
 	}
 }
@@ -552,9 +592,9 @@ func TestGuidedFundingPartialPaymentsAndFeesUpdateWithoutPrompting(t *testing.T)
 		t.Fatal("waiting did not poll automatically", err)
 	}
 	for _, want := range []string{
-		"Waiting for ETH: receiving account balance 0.000000000000000000 ETH; still needed 0.000750001000025000 ETH.",
-		"Waiting for ETH: receiving account balance 0.000100000000000000 ETH; still needed 0.000650001000025000 ETH.",
-		"?value=650001000030000", "?value=650001000031000",
+		"Send at least: 0.00076 ETH",
+		"Send at least: 0.00066 ETH (account already has 0.00010 ETH)",
+		"?value=650001000030000",
 	} {
 		if !strings.Contains(u.String(), want) {
 			t.Fatalf("missing updated payment information %q", want)
@@ -635,7 +675,7 @@ func TestGuidedFundingRefreshFailurePreservesVisibleBalanceWithoutApproval(t *te
 	}
 	err := guidedFunding(context.Background(), f, "20", u, func(context.Context) error { return context.Canceled })
 	if !errors.Is(err, context.Canceled) || f.approveCalls+u.continues+u.confirms != 0 ||
-		!strings.Contains(u.String(), "receiving account balance 0.000100000000000000 ETH") ||
+		!strings.Contains(u.String(), "account already has 0.00010 ETH") ||
 		!strings.Contains(u.String(), "Could not refresh the funding quote") {
 		t.Fatal("refresh failure hid the last balance or authorized a transaction", err)
 	}

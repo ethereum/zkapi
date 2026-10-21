@@ -6,12 +6,16 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -30,17 +34,31 @@ type withdrawalFixture struct {
 	*addressFixture
 	prepareCalls, confirmCalls int
 	pending                    bool
-	confirmFailure             bool
-	capability                 bool
-	planMutation               func(map[string]any)
-	reservedDestination        string
-	completedHash              string
-	walletBalance              uint64
-	planBalance                uint64
-	reservedBalance            uint64
-	noteID                     uint64
-	reservedNoteID             uint64
-	reservedNullifier          string
+	// unsettled makes prepare answer as the companion does at a note state
+	// with an unsettled request on a legacy vault.
+	unsettled bool
+	// unsettledCode replaces unsettled_request_state when set.
+	unsettledCode string
+	// overrideVersion is the companion's unsettled_request_override_version.
+	overrideVersion int
+	// prepareBodies records every withdrawal prepare request body.
+	prepareBodies  []map[string]any
+	confirmFailure bool
+	// companionCredited makes the companion report escape_payout_credited.
+	companionCredited     bool
+	capability            bool
+	planMutation          func(map[string]any)
+	reservedDestination   string
+	completedHash         string
+	walletBalance         uint64
+	planBalance           uint64
+	reservedBalance       uint64
+	noteID                uint64
+	reservedNoteID        uint64
+	reservedNullifier     string
+	ownershipProofVersion int
+	// The companion's escape routes (escape_withdrawal_test.go).
+	escape *escapeCompanion
 }
 
 func withdrawalJSONResponse(r *http.Request, status int, value any) *http.Response {
@@ -73,7 +91,8 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 	if err != nil || active.Phase != "active" {
 		t.Fatalf("fixture deposit did not activate: %+v %v", active, err)
 	}
-	w := &withdrawalFixture{addressFixture: f, capability: true, walletBalance: 99999, planBalance: 99999, noteID: 12}
+	// A bridge-5 companion always reports clearance ownership proofs.
+	w := &withdrawalFixture{addressFixture: f, capability: true, walletBalance: 99999, planBalance: 99999, noteID: 12, ownershipProofVersion: 1}
 	upstream := f.h.client.local.Transport
 	f.h.client.local.Transport = withdrawalRoundTripper(func(r *http.Request) (*http.Response, error) {
 		if r.Header.Get("Authorization") != "Bearer "+testBridgeToken {
@@ -87,6 +106,12 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 			}
 			policy := testPolicy("mainnet")
 			policy["withdrawal_bridge_version"] = version
+			if w.ownershipProofVersion != 0 {
+				policy["clearance_ownership_proof_version"] = w.ownershipProofVersion
+			}
+			if w.overrideVersion != 0 {
+				policy["unsettled_request_override_version"] = w.overrideVersion
+			}
 			return withdrawalJSONResponse(r, 200, policy), nil
 		case "/wallet/status":
 			return withdrawalJSONResponse(r, 200, map[string]any{"has_note": f.active, "pending_request": w.pending, "note": map[string]any{"note_id": w.noteID, "deposit_amount": 100000, "current_balance": w.walletBalance, "expiry_ts": 2000000000, "current_anchor": "0x55", "current_commitment_x": "0x66", "current_commitment_y": "0x77"}}), nil
@@ -116,9 +141,28 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 			return withdrawalJSONResponse(r, 200, map[string]any{}), nil
 		case "/oa/v1/withdraw/status":
 			return withdrawalJSONResponse(r, 200, w.bridgeStatus()), nil
+		case "/oa/v1/withdraw/escape/prepare", "/oa/v1/withdraw/escape/submit", "/oa/v1/withdraw/escape/status", "/oa/v1/withdraw/escape/finalize", "/oa/v1/withdraw/escape/cancel":
+			if w.escape == nil {
+				return withdrawalJSONResponse(r, 404, map[string]any{}), nil
+			}
+			return w.escape.serve(t, r, w), nil
 		case "/oa/v1/withdraw/prepare":
+			raw, _ := io.ReadAll(r.Body)
+			var recorded map[string]any
+			if json.Unmarshal(raw, &recorded) != nil {
+				t.Error("invalid withdrawal prepare request")
+			}
+			w.prepareBodies = append(w.prepareBodies, recorded)
+			r.Body = io.NopCloser(bytes.NewReader(raw))
 			if w.pending {
 				return withdrawalJSONResponse(r, 409, map[string]any{"error": map[string]string{"code": "pending_settlement", "message": "private companion diagnostics"}}), nil
+			}
+			if w.unsettled {
+				code := "unsettled_request_state"
+				if w.unsettledCode != "" {
+					code = w.unsettledCode
+				}
+				return withdrawalJSONResponse(r, 409, map[string]any{"error": map[string]string{"code": code, "message": "private companion diagnostics", "nullifier": "0x1234ab"}}), nil
 			}
 			w.prepareCalls++
 			var body struct {
@@ -175,6 +219,9 @@ func (f *withdrawalFixture) bridgeStatus() map[string]any {
 	status := map[string]any{"phase": "reserved", "note_id": f.reservedNoteID, "destination": f.reservedDestination, "final_balance": fmt.Sprint(f.reservedBalance), "withdrawal_nullifier": f.reservedNullifier}
 	if f.completedHash != "" {
 		status["phase"], status["transaction_hash"] = "complete", f.completedHash
+		if f.companionCredited {
+			status["escape_payout_credited"] = true
+		}
 	}
 	return status
 }
@@ -196,7 +243,8 @@ func withdrawalTestPlan(destination string) map[string]any {
 			"active_root": "0x9", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
 			"clearance_signing_key_x": "0x3", "clearance_signing_key_y": "0x4",
 			"note_id": 12, "final_balance": 99999, "destination": address,
-			"withdrawal_nullifier": "0x123", "has_clearance": true, "withdrawal_tag": "0x456",
+			"withdrawal_nullifier": "0x123", "kind": 1, "next_nullifier": "0x0", "conceded": 0,
+			"valid_until": time.Now().Unix() + exitProofValidity,
 		},
 		"siblings": siblings,
 		"proof":    map[string]any{"backend": "groth16_bn254", "proof": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 256))},
@@ -223,7 +271,7 @@ func (f *withdrawalFixture) withdraw(t *testing.T, retryHash ...string) string {
 		if len(retryHash) > 0 {
 			retry = retryHash[0]
 		}
-		quote, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, retry)
+		quote, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, retry, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -255,6 +303,10 @@ func (f *withdrawalFixture) mineWithdrawal(t *testing.T, hash string, destinatio
 	logs := []map[string]any{{"address": addressTestVault, "topics": []string{crypto.Keccak256Hash([]byte("MutualClose(uint32,uint256,uint128,address)")).Hex(), fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord(f.reservedNullifier) + fmt.Sprintf("%064x", f.reservedBalance) + addressABIWord(destination)}}
 	f.receipts[hash] = map[string]any{"transactionHash": hash, "status": status, "blockNumber": "0x10", "blockHash": addressTestBlock, "to": addressTestVault, "logs": logs}
 	f.nonce = fmt.Sprintf("0x%x", tx.Nonce()+1)
+	if !reverted {
+		// The vault and the indexer both observe the close.
+		f.closeNote(uint32(f.reservedNoteID))
+	}
 }
 
 func TestAddressWithdrawalSignsExactBoundCallAndPreservesDepositHistory(t *testing.T) {
@@ -264,18 +316,83 @@ func TestAddressWithdrawalSignsExactBoundCallAndPreservesDepositHistory(t *testi
 	if tx.Nonce() != 2 || tx.Value().Sign() != 0 || !strings.EqualFold(tx.To().Hex(), addressTestVault) {
 		t.Fatal("withdrawal escaped local signer nonce, zero value, or configured vault")
 	}
-	signature := "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,bool,uint256),bytes,uint256[32])"
+	// mutualClose((16-field tuple),bytes): 16 words, the bytes offset 17*32,
+	// the length 256 and the proof, 836 bytes. Selector 0x72cd2e44.
+	signature := "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)"
 	expected := hex.EncodeToString(crypto.Keccak256([]byte(signature))[:4])
-	for _, value := range []string{"0x2", "0x1", addressTestVault, "0x9", "0x1", "0x2", "0x3", "0x4", "0xc", "0x1869f", withdrawalTestDestination, "0x123", "0x1", "0x456", "0x5e0"} {
+	if expected != "72cd2e44" {
+		t.Fatalf("the mutualClose selector is %s", expected)
+	}
+	validUntil := new(big.Int).SetBytes(tx.Data()[4+15*32 : 4+16*32]).Uint64()
+	for _, value := range []string{"0x2", "0x1", addressTestVault, "0x9", "0x1", "0x2", "0x3", "0x4", "0xc", "0x1869f", withdrawalTestDestination, "0x123", "0x1", "0x0", "0x0", fmt.Sprintf("0x%x", validUntil), "0x220", "0x100"} {
 		expected += addressABIWord(value)
 	}
-	expected += strings.Repeat(addressABIWord("0xa"), 32) + addressABIWord("0x100") + strings.Repeat("5a", 256)
-	if got := hex.EncodeToString(tx.Data()); got != expected {
+	expected += strings.Repeat("5a", 256)
+	if got := hex.EncodeToString(tx.Data()); got != expected || len(tx.Data()) != 836 {
 		t.Fatalf("withdrawal calldata differs from the pinned contract ABI: got %d bytes, want %d", len(tx.Data()), len(expected)/2)
 	}
+	if now := uint64(time.Now().Unix()); validUntil < now || validUntil > now+exitProofValidity+exitProofClockAllowance {
+		t.Fatalf("valid_until %d outside the signing window", validUntil)
+	}
+	checkSignedCloseWords(t, tx.Data(), f.journal(t).Withdrawal)
 	record := f.journal(t)
 	if len(record.History) != 2 || record.History[1].Kind != "deposit" {
 		t.Fatal("activating withdrawal discarded or replaced the deposit nonce history")
+	}
+}
+
+// checkSignedCloseWords checks validateSignedWithdrawal on signed mutualClose
+// calldata (design §6.7): 836 bytes; the fixed words; kind 1 with no
+// successor nullifier or concession even under a binding of the changed
+// words; the bytes offset and length; valid_until in [now, now + 10,800 +
+// 300]; and the binding over words[:16] with the root and valid_until
+// blanked, so a re-proof at another root still matches.
+func checkSignedCloseWords(t *testing.T, data []byte, saved *addressWithdrawalRecord) {
+	t.Helper()
+	config := fundingConfig{ChainID: 1, Contract: addressTestVault}
+	now := time.Now()
+	if err := validateSignedWithdrawal(data, config, saved, now); err != nil {
+		t.Fatal(err)
+	}
+	words := func(raw []byte) []string {
+		out := make([]string, 18)
+		for i := range out {
+			out[i] = hex.EncodeToString(raw[4+i*32 : 4+(i+1)*32])
+		}
+		return out
+	}
+	tamper := func(index int) []byte {
+		tampered := append([]byte(nil), data...)
+		tampered[4+index*32+31] ^= 1
+		return tampered
+	}
+	for _, index := range []int{0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17} {
+		if validateSignedWithdrawal(tamper(index), config, saved, now) == nil {
+			t.Errorf("close word %d tampering accepted", index)
+		}
+	}
+	// An escape's kind, a successor nullifier or a concession is refused even
+	// when the saved binding covers it.
+	for _, index := range []int{12, 13, 14} {
+		tampered := tamper(index)
+		rebound := *saved
+		rebound.Binding = withdrawalBinding(words(tampered))
+		if validateSignedWithdrawal(tampered, config, &rebound, now) == nil {
+			t.Errorf("close word %d accepted under its own binding", index)
+		}
+	}
+	if validateSignedWithdrawal(tamper(3), config, saved, now) != nil {
+		t.Error("a re-proof at another root refused")
+	}
+	for name, validUntil := range map[string]int64{"expired": now.Unix() - 1, "too late": now.Unix() + exitProofValidity + exitProofClockAllowance + 1} {
+		changed := append([]byte(nil), data...)
+		copy(changed[4+15*32:4+16*32], common.LeftPadBytes(big.NewInt(validUntil).Bytes(), 32))
+		if validateSignedWithdrawal(changed, config, saved, now) == nil {
+			t.Errorf("%s valid_until accepted", name)
+		}
+	}
+	if validateSignedWithdrawal(append(append([]byte(nil), data...), 0), config, saved, now) == nil || validateSignedWithdrawal(data[:len(data)-1], config, saved, now) == nil {
+		t.Error("calldata of another length accepted")
 	}
 }
 
@@ -339,7 +456,7 @@ func TestAddressWithdrawalChecksummedDestinationSurvivesSignedJournalRestart(t *
 }
 
 func TestAddressWithdrawalRejectsUnsafePlanBeforeSigning(t *testing.T) {
-	for _, mutation := range []string{"chain", "contract", "version", "note", "balance", "destination", "clearance", "siblings", "proof_backend", "proof_length", "field_overflow"} {
+	for _, mutation := range []string{"chain", "contract", "version", "note", "balance", "destination", "escape_kind", "ownership_kind", "next_nullifier", "conceded", "expired", "far_future", "proof_backend", "proof_length", "field_overflow"} {
 		t.Run(mutation, func(t *testing.T) {
 			f := newWithdrawalFixture(t)
 			f.planMutation = func(plan map[string]any) {
@@ -357,10 +474,18 @@ func TestAddressWithdrawalRejectsUnsafePlanBeforeSigning(t *testing.T) {
 					pi["final_balance"] = 100000
 				case "destination":
 					pi["destination"] = make([]int, 20)
-				case "clearance":
-					pi["has_clearance"] = false
-				case "siblings":
-					plan["siblings"] = []string{"0xa"}
+				case "escape_kind":
+					pi["kind"] = 0
+				case "ownership_kind":
+					pi["kind"] = 2
+				case "next_nullifier":
+					pi["next_nullifier"] = "0x77"
+				case "conceded":
+					pi["conceded"] = 5
+				case "expired":
+					pi["valid_until"] = time.Now().Unix() - 1
+				case "far_future":
+					pi["valid_until"] = time.Now().Unix() + exitProofValidity + exitProofClockAllowance + 60
 				case "proof_backend":
 					plan["proof"].(map[string]any)["backend"] = "stwo_cairo"
 				case "proof_length":
@@ -493,7 +618,7 @@ func TestAddressWithdrawalRefreshesOnlyAfterExplicitFinalizedRevertRetry(t *test
 }
 
 func TestAddressWithdrawalSavedProofBindingRejectsChangeDuringGasWait(t *testing.T) {
-	for _, field := range []string{"state_signing_key_x", "clearance_signing_key_y", "withdrawal_nullifier", "withdrawal_tag"} {
+	for _, field := range []string{"state_signing_key_x", "clearance_signing_key_y", "withdrawal_nullifier"} {
 		t.Run(field, func(t *testing.T) {
 			f := newWithdrawalFixture(t)
 			f.eth = "0x0"
@@ -526,7 +651,10 @@ func (f *withdrawalFixture) competingClose(t *testing.T, original, other string)
 		t.Fatal(err)
 	}
 	receipt["status"], receipt["transactionHash"] = "0x1", other
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.receipts[other] = receipt
+	f.closeNote(uint32(f.reservedNoteID)) // The competing payout closed the note.
 }
 
 func TestAddressWithdrawalConfirmsCompetingPayoutThenRefillsWithoutSigningAgain(t *testing.T) {
@@ -754,10 +882,13 @@ func TestAddressWithdrawalAllowsSecondWithdrawalAfterLegacyRefill(t *testing.T) 
 		t.Fatal(err)
 	}
 	legacyHash := "0x" + strings.Repeat("e", 64)
-	receipt := sampleReceipt(deposit)
+	expiry := uint64(time.Now().Unix()) + 3600
+	receipt := depositEventReceipt(addressTestVault, 13, deposit.Commitment, deposit.Amount, expiry)
 	receipt.TransactionHash = legacyHash
-	receipt.Logs[0].Topics[1] = fmt.Sprintf("0x%064x", 13)
-	receipt.Logs[0].Topics[2] = "0x" + addressABIWord(deposit.Commitment)
+	// Activation needs the vault and the indexer to show the refill too.
+	f.mu.Lock()
+	f.registerDeposit(13, deposit.Commitment, deposit.Amount, expiry)
+	f.mu.Unlock()
 	receiptRaw, _ := json.Marshal(receipt)
 	var storedReceipt map[string]any
 	if err := json.Unmarshal(receiptRaw, &storedReceipt); err != nil {
@@ -871,6 +1002,41 @@ func TestAddressWithdrawalPreconditionsRejectBeforeProofOrBroadcast(t *testing.T
 	}
 }
 
+// The vault cannot receive its own payout: a vault with vault_revision 2
+// reverts InvalidDestination, and a legacy vault cannot receive ETH. A
+// withdrawal to it used to save the destination and have the companion
+// reserve the note and its permanent clearance for it, so every close
+// reverted and the note could only expire. It is now refused before
+// anything is saved or reserved, in any spelling, for both billing assets.
+func TestAddressWithdrawalRefusesTheVaultAsDestination(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		f := newWithdrawalFixture(t, native)
+		config, err := f.h.config(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, destination := range []string{strings.ToLower(config.Contract), common.HexToAddress(config.Contract).Hex()} {
+			var err error
+			if native {
+				_, err = f.h.QuoteAddressWithdrawal(context.Background(), destination, f.noteID, "", false)
+			} else {
+				_, err = f.h.WithdrawAddress(context.Background(), destination, f.noteID)
+			}
+			if !errors.Is(err, errWithdrawalToVault) {
+				t.Fatalf("native=%v %s: %v", native, destination, err)
+			}
+		}
+		if f.prepareCalls != 0 || f.reservedDestination != "" || f.journal(t).Withdrawal != nil {
+			t.Fatalf("native=%v: a withdrawal to the vault was saved or reserved", native)
+		}
+		// Any other destination still withdraws.
+		f.withdraw(t)
+		if !strings.EqualFold(f.reservedDestination, withdrawalTestDestination) {
+			t.Fatalf("native=%v: reserved %q", native, f.reservedDestination)
+		}
+	}
+}
+
 func TestAddressWithdrawalWaitsForOutstandingInferenceSettlement(t *testing.T) {
 	f := newWithdrawalFixture(t)
 	f.pending = true
@@ -885,6 +1051,99 @@ func TestAddressWithdrawalWaitsForOutstandingInferenceSettlement(t *testing.T) {
 	f.withdraw(t)
 	if f.prepareCalls != 1 || len(f.accepted) != 3 {
 		t.Fatal("settled inference could not resume saved withdrawal")
+	}
+}
+
+// The owner's acknowledgement for an expired note at an unsettled state
+// reaches the companion only with the quote that carries it, and only a
+// companion that understands it receives it. Its refusal code crosses the
+// management boundary, so the guided withdrawal can act on it.
+func TestUnsettledRequestAcknowledgementIsForwardedOnlyWhenGiven(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.unsettled = true
+	_, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, "", false)
+	var refused *Error
+	if !errors.As(err, &refused) || refused.Code != "unsettled_request_state" {
+		t.Fatalf("refusal: %v", err)
+	}
+	if len(f.prepareBodies) != 1 || f.prepareBodies[0]["accept_unsettled_request_risk"] != nil {
+		t.Fatalf("an unrequested acknowledgement was sent: %+v", f.prepareBodies)
+	}
+	r := httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal/quote", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d}`, withdrawalTestDestination, f.noteID)))
+	r.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	f.h.ServeAdminHTTP(recorder, r)
+	var failure struct{ Error, Code string }
+	if json.Unmarshal(recorder.Body.Bytes(), &failure) != nil || failure.Code != "unsettled_request_state" || !strings.Contains(failure.Error, "After the note expires") || strings.Contains(failure.Error, "private companion") {
+		t.Fatalf("management refusal: %d %s", recorder.Code, recorder.Body.String())
+	}
+	f.unsettledCode = "unsettled_clearance_reserved"
+	r = httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal/quote", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d}`, withdrawalTestDestination, f.noteID)))
+	r.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	f.h.ServeAdminHTTP(recorder, r)
+	if json.Unmarshal(recorder.Body.Bytes(), &failure) != nil || failure.Code != "unsettled_clearance_reserved" || strings.Contains(failure.Error, "private companion") {
+		t.Fatalf("clearance-reserved management refusal: %d %s", recorder.Code, recorder.Body.String())
+	}
+	f.unsettledCode = "receipt_journal_missing"
+	r = httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal/quote", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d}`, withdrawalTestDestination, f.noteID)))
+	r.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	f.h.ServeAdminHTTP(recorder, r)
+	if json.Unmarshal(recorder.Body.Bytes(), &failure) != nil || failure.Code != "receipt_journal_missing" || !strings.Contains(failure.Error, "0x1234ab") || strings.Contains(failure.Error, "private companion") {
+		t.Fatalf("missing receipt journal management refusal: %d %s", recorder.Code, recorder.Body.String())
+	}
+	f.unsettledCode = ""
+
+	// A companion that cannot take the acknowledgement never receives it.
+	before := len(f.prepareBodies)
+	if _, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, "", true); err == nil || !strings.Contains(err.Error(), "update the native bundle") {
+		t.Fatalf("old companion: %v", err)
+	}
+	if len(f.prepareBodies) != before {
+		t.Fatal("the acknowledgement reached a companion without the capability")
+	}
+	f.overrideVersion, f.unsettled = 1, false
+	if _, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if last := f.prepareBodies[len(f.prepareBodies)-1]; last["accept_unsettled_request_risk"] != true || last["destination"] == nil {
+		t.Fatalf("acknowledged prepare: %+v", last)
+	}
+	// Approval and the plain withdrawal route never carry it.
+	r = httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d,"accept_unsettled_request_risk":true}`, withdrawalTestDestination, f.noteID)))
+	r.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	before = len(f.prepareBodies)
+	f.h.ServeAdminHTTP(recorder, r)
+	if recorder.Code != http.StatusBadGateway || len(f.prepareBodies) != before {
+		t.Fatalf("plain withdrawal took the acknowledgement: %d %s", recorder.Code, recorder.Body.String())
+	}
+	status, err := f.h.AddressWithdrawal(context.Background())
+	if err != nil || status.NoteExpiry != 2000000000 {
+		t.Fatalf("note expiry: %+v %v", status, err)
+	}
+}
+
+// At a note state with an unsettled request on a legacy vault the companion
+// refuses to prepare (closure:journal-discard #1). The saved intent stays
+// resumable, nothing is signed, and the user is told how to settle the state.
+func TestAddressWithdrawalAtAnUnsettledNoteStateSignsNothingAndResumes(t *testing.T) {
+	f := newWithdrawalFixture(t)
+	f.unsettled = true
+	_, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+	var refused *Error
+	if !errors.As(err, &refused) || refused.Code != "unsettled_request_state" || !strings.Contains(err.Error(), "send one chat request") || strings.Contains(err.Error(), "private companion") {
+		t.Fatalf("the unsettled-state refusal was hidden or leaked: %v", err)
+	}
+	record := f.journal(t)
+	if record.Pending != nil || record.Withdrawal == nil || record.Withdrawal.Binding != "" || len(f.accepted) != 2 {
+		t.Fatalf("a refused preparation bound or signed a withdrawal: %+v", record.Withdrawal)
+	}
+	f.unsettled = false
+	f.withdraw(t)
+	if len(f.accepted) != 3 {
+		t.Fatal("the withdrawal did not resume once the note state settled")
 	}
 }
 
@@ -942,7 +1201,10 @@ func TestNativeWithdrawalKeepsGweiAmountAndZeroTransactionValue(t *testing.T) {
 	if tx == nil || tx.Value().Sign() != 0 || tx.Nonce() != 1 || len(f.accepted) != 2 {
 		t.Fatal("native withdrawal signed value or unexpected extra approval")
 	}
-	if err := validateSignedWithdrawal(tx.Data(), fundingConfig{ChainID: 1, Contract: addressTestVault}, f.journal(t).Withdrawal); err != nil {
+	if len(tx.Data()) != 836 {
+		t.Fatalf("the mutualClose calldata is %d bytes, not 836", len(tx.Data()))
+	}
+	if err := validateSignedWithdrawal(tx.Data(), fundingConfig{ChainID: 1, Contract: addressTestVault}, f.journal(t).Withdrawal, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	f.mineWithdrawal(t, hash, withdrawalTestDestination, false)

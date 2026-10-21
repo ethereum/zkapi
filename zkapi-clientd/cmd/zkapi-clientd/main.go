@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/server"
@@ -39,6 +40,7 @@ func run(args []string) error {
 	var err error
 	global := flag.NewFlagSet("zkapi-clientd", flag.ContinueOnError)
 	global.StringVar(&dir, "config-dir", dir, "private configuration and wallet directory")
+	protocolFlag := global.String("vault-protocol", os.Getenv("ZKAPI_VAULT_PROTOCOL"), "override saved vault stack: concession or legacy")
 	showVersion := global.Bool("version", false, "print version")
 	global.Usage = help
 	if err := global.Parse(args); err != nil {
@@ -47,6 +49,16 @@ func run(args []string) error {
 		}
 		return err
 	}
+	protocol, err := vaultProtocol(*protocolFlag)
+	if err != nil {
+		return err
+	}
+	explicitDir := false
+	global.Visit(func(f *flag.Flag) {
+		if f.Name == "config-dir" && dir != "" {
+			explicitDir = true
+		}
+	})
 	if *showVersion {
 		fmt.Println("zkapi-clientd", version)
 		return nil
@@ -64,8 +76,8 @@ func run(args []string) error {
 		help()
 		return nil
 	}
-	if args[0] != "config" && args[0] != "serve" {
-		return errors.New("unknown command; use zkapi-clientd config or zkapi-clientd serve (--help for usage)")
+	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" {
+		return errors.New("unknown command; use config, serve, withdraw or list-models (--help for usage); saved settings belong under config")
 	}
 	if dir == "" {
 		dir, err = config.DefaultDir()
@@ -78,6 +90,26 @@ func run(args []string) error {
 		return err
 	}
 	if args[0] == "config" {
+		if handled, err := runConfigSettings(dir, args[1:], os.Stdout); handled || err != nil {
+			return err
+		}
+	}
+	savedProtocol, err := config.LoadVaultProtocol(dir)
+	if err != nil {
+		return err
+	}
+	if *protocolFlag == "" {
+		protocol, err = vaultProtocol(savedProtocol)
+		if err != nil {
+			return err
+		}
+	}
+	if protocol == "legacy" {
+		// A saved legacy choice explicitly binds the resolved profile; no need
+		// to repeat --config-dir on every command for the default profile.
+		return dispatchLegacy(dir, explicitDir || savedProtocol == "legacy", args)
+	}
+	if args[0] == "config" {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 		ui := &terminalSetupPrompter{out: os.Stdout}
@@ -85,7 +117,16 @@ func run(args []string) error {
 		return runConfigure(ctx, dir, args[1:], ui, os.Stdout)
 	}
 	if args[0] == "serve" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-		fmt.Println("Usage: zkapi-clientd serve\nRun the saved configuration. Run zkapi-clientd config to configure missing prerequisites.")
+		fmt.Println("Usage: zkapi-clientd serve [--model MODEL] [--semi-verbose | --verbose]\nOpens a missing private note automatically when the funding address has enough ETH. Verbose modes log private prompt/response content. Run the saved configuration. Run zkapi-clientd config to configure missing prerequisites.")
+		return nil
+	}
+	if args[0] == "withdraw" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+		fmt.Println("Usage: zkapi-clientd withdraw [--public | OPTIONS]\nWithout options: guided private withdrawal, then public ETH return with separate approval. --public: standalone public return. Explicit options below use the protocol's quote/approval and recovery flow without an automatic public sweep.")
+		_ = runWithdrawal(context.Background(), config.Config{}, []string{"--help"}, os.Stdout)
+		return nil
+	}
+	if args[0] == "list-models" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+		fmt.Println("Usage: zkapi-clientd list-models\nList public model IDs/caps. Set the default with config --model MODEL. No payments.")
 		return nil
 	}
 	c, err := config.Load(dir)
@@ -94,26 +135,73 @@ func run(args []string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if args[0] == "list-models" {
+		return runModels(ctx, dir, c, args[0], args[1:], os.Stdout)
+	}
+	if args[0] == "withdraw" {
+		action := "withdraw"
+		if len(args) == 2 && args[1] == "--public" {
+			action = "return"
+		} else if len(args) != 1 {
+			return runConfiguredWithdrawal(ctx, dir, c, args[1:], os.Stdout)
+		}
+		ui := &terminalSetupPrompter{out: os.Stdout}
+		defer ui.Close()
+		if err := runConfigAction(ctx, dir, c, action, ui, os.Stdout); err != nil {
+			return err
+		}
+		return nil
+	}
 	expected := c
 	c, err = serveConfig(c, args[1:])
 	if err != nil {
 		return err
 	}
+	level, err := serveLogLevel(args[1:])
+	if err != nil {
+		return err
+	}
+	if level != activity.Normal {
+		logger := log.New(os.Stdout, "zkapi-clientd ", log.LstdFlags)
+		logger.Print("WARNING: diagnostic mode logs private prompt/response content; terminal output may be retained by your service manager")
+		ctx = activity.WithDiagnostics(ctx, level, logger)
+	}
+	modelFlags := flag.NewFlagSet("serve", flag.ContinueOnError)
+	model := modelFlags.String("model", "", "")
+	modelFlags.Bool("verbose", false, "")
+	modelFlags.Bool("semi-verbose", false, "")
+	if err := modelFlags.Parse(args[1:]); err != nil {
+		return err
+	}
+	fundingModel := *model
+	if fundingModel == "" {
+		fundingModel = c.DefaultModel
+	}
+	if fundingModel != "" && !config.ValidModelID(fundingModel) {
+		return errors.New("invalid model ID")
+	}
+	ctx = context.WithValue(ctx, serveModelKey{}, fundingModel)
 	return runConfiguredServe(ctx, dir, c, expected, os.Stdout)
 
 }
 
 func help() {
-	fmt.Fprintln(os.Stderr, `Usage: zkapi-clientd [--config-dir DIR] COMMAND
+	fmt.Fprintln(os.Stderr, `Usage: zkapi-clientd [--config-dir DIR] [--vault-protocol concession|legacy] COMMAND
 
-  config                 Show status, configure or edit settings, and prepare the wallet
-  serve                  Run inference using the saved configuration
+  config                 Print saved config as JSON; --help for settings
+                         --setup: prepare wallet; --menu: wallet actions
+  serve [--model MODEL]  Open a missing note when funded, then serve inference
+  withdraw [OPTIONS]     Guided withdrawal; --escape / --fees payout / --public
+  list-models            List supported model IDs and per-query caps
 
 Run zkapi-clientd config --help for configuration options.
 Run zkapi-clientd --version to show the installed version.
+Vault: flag > ZKAPI_VAULT_PROTOCOL > saved config --vault-protocol > concession.
+Legacy selects the pinned old executable, requires a saved legacy choice or explicit --config-dir,
+and preserves native rewriter/cover settings. No automatic fallback or note conversion.
 Config: ZKAPI_CLIENTD_CONFIG_DIR or the OS user config directory / zkapi-clientd.
 Mainnet is the default; Sepolia keeps a separate wallet.
-The network proxy is off by default. No prompts or responses are stored.`)
+The network proxy is off by default. Verbose modes log private message content.`)
 }
 
 func initialize(dir string, args []string) error {
@@ -124,7 +212,7 @@ func initialize(dir string, args []string) error {
 	f := flag.NewFlagSet("init", flag.ContinueOnError)
 	f.StringVar(&c.ZKAPI.Network, "network", c.ZKAPI.Network, "mainnet or sepolia")
 	f.StringVar(&c.VerifierURL, "verifier-url", c.VerifierURL, "verifier HTTPS origin")
-	f.StringVar(&c.RelayURL, "relay-url", c.RelayURL, "Wisp relay URL or loopback SOCKS5 proxy (default: direct HTTPS)")
+	f.StringVar(&c.RelayURL, "relay-url", c.RelayURL, "Wisp, socks5://IP:PORT, or conversation-isolated tor://IP:PORT (default: direct HTTPS)")
 	f.StringVar(&c.Listen, "listen", c.Listen, "loopback IP:port")
 	f.StringVar(&c.ZKAPI.Binary, "zkapi-binary", "", "path to zkapi-walletd wallet/prover")
 	f.StringVar(&c.ZKAPI.ProofSetupDir, "proof-setup-dir", "", "verified deployed circuit proving assets")
@@ -149,6 +237,12 @@ func initialize(dir string, args []string) error {
 // Serving uses the saved network without rewriting wallet state.
 func serveConfig(c config.Config, args []string) (config.Config, error) {
 	f := flag.NewFlagSet("serve", flag.ContinueOnError)
+	f.String("model", "", "model for opening-balance recommendation")
+	f.Bool("verbose", false, "log messages and detailed operations (private content)")
+	f.Bool("semi-verbose", false, "one-line operations and message previews (private content)")
+	if _, err := serveLogLevel(args); err != nil {
+		return config.Config{}, err
+	}
 	if err := f.Parse(args); err != nil {
 		return config.Config{}, err
 	}
@@ -162,20 +256,32 @@ func serveConfig(c config.Config, args []string) (config.Config, error) {
 }
 
 func zkConfig(c config.Config, client *http.Client) zkapi.Config {
-	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second}
+	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL), TorEndpoint: c.RelayURL, Rewriter: c.Rewriter, ExitRPCURL: c.ZKAPI.ExitRPCURL, BundlerURL: c.ZKAPI.BundlerURL}
 }
 
 type zkInference struct{ *zkapi.Client }
 
 func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.Response, error) {
 	response, err := z.Client.Complete(ctx, body)
+	err = accessPreparationError(ctx, err)
 	var remote *zkapi.Error
 	if errors.As(err, &remote) {
 		switch remote.Code {
+		case "receipt_journal_missing":
+			// The message names the nullifier the operator needs.
+			return nil, &server.BackendError{Status: 409, Code: "receipt_journal_missing", Message: err.Error()}
+		case "ownership_proof_sent":
+			// The note stays withdrawal-only; waiting or retrying cannot help.
+			return nil, &server.BackendError{Status: 409, Code: "ownership_proof_sent", Message: "A withdrawal sent, or may have sent, the ownership proof of the note's current state, so no chat request is made from it. Run zkapi-clientd config --menu and choose withdraw to finish the withdrawal."}
+		case "clearance_reserved_state":
+			// No chat can settle this state; waiting or retrying cannot help.
+			return nil, &server.BackendError{Status: 409, Code: "clearance_reserved_state", Message: "The note's current state is reserved for withdrawal on the zkAPI server (for example because the operator released it), so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance."}
 		case "testnet_password_required":
 			return nil, &server.BackendError{Status: 401, Code: "testnet_password_required", Message: remote.Error()}
 		case "invalid_model":
 			return nil, &server.BackendError{Status: 400, Code: "invalid_model", Message: "Select a model from /v1/models."}
+		case "model_not_found":
+			return nil, &server.BackendError{Status: 400, Code: "model_not_found", Message: "Model not found. Use a full provider/model ID from /v1/models."}
 		case "model_budget_unavailable":
 			return nil, &server.BackendError{Status: 400, Code: "model_budget_unavailable", Message: "The model is unavailable or has no reviewed request budget. Select a model from /v1/models."}
 		case "model_policy_unavailable":
@@ -201,15 +307,21 @@ func serve(ctx context.Context, dir string, c config.Config, out io.Writer) erro
 func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, out io.Writer) error {
 	logger := log.New(out, "zkapi-clientd ", log.LstdFlags)
 	logger.Print("Starting local API service")
-	lock, err := os.OpenFile(filepath.Join(dir, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	lockPath := filepath.Join(dir, "daemon.lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return errors.New("a zkAPI client daemon is already using this config directory")
+		return fmt.Errorf("a zkAPI client daemon is already using this config directory (lock file: %s%s)", lockPath, config.LockHint(lockPath))
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	// Record the holder so a lock error elsewhere (for example a shell in a
+	// different environment sharing this filesystem) can name this process.
+	host, _ := os.Hostname()
+	_ = lock.Truncate(0)
+	_, _ = lock.WriteAt([]byte(fmt.Sprintf("pid=%d host=%s exe=zkapi-clientd-serve", os.Getpid(), host)), 0)
 	// Configuration may have been edited after command dispatch but before
 	// acquiring the service lock. Never start with that stale snapshot.
 	saved, err := config.Load(dir)
@@ -258,7 +370,13 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 			return err
 		}
 		defer proxy.Close()
-		cmd, err := zkapi.CompanionCommand(life, zc, zkapi.CompanionConfig{Binary: c.ZKAPI.Binary, SetupDir: c.ZKAPI.ProofSetupDir, StateDir: filepath.Join(dir, "zkapi"), VerifierURL: c.VerifierURL, ProxyURL: proxy.URL, TestnetPassword: password})
+		if warning := zkapi.LegacyWalletWarning(filepath.Join(dir, "zkapi"), c.ZKAPI.Network); warning != "" {
+			logger.Print(warning)
+		}
+		if warning := zkapi.LegacyFundingWarning(filepath.Join(dir, "funding"), c.ZKAPI.Network); warning != "" {
+			logger.Print(warning)
+		}
+		cmd, err := zkapi.CompanionCommand(life, zc, zkapi.CompanionConfig{Binary: c.ZKAPI.Binary, SetupDir: c.ZKAPI.ProofSetupDir, StateDir: filepath.Join(dir, "zkapi"), VerifierURL: c.VerifierURL, ProxyURL: proxy.URL, TestnetPassword: password, ExitRPCURL: c.ZKAPI.ExitRPCURL})
 		if err != nil {
 			return err
 		}
@@ -288,12 +406,27 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	if err != nil {
 		return err
 	}
+	// Design §6.7: check the deployment on chain at startup (deposits check
+	// again before signing). A mismatch refuses deposits; exits stay open.
+	go func() {
+		checkCtx, cancel := context.WithTimeout(life, 2*time.Minute)
+		defer cancel()
+		if err := wallet.CheckDeployment(checkCtx); err != nil {
+			logger.Printf("zkAPI deployment check: %v", err)
+		}
+	}()
 	api, err := server.New(backend, c.APIKey, c.Concurrency)
 	if err != nil {
 		return err
 	}
+	api.DefaultModel = c.DefaultModel
+	api.RewriterNotice = c.Rewriter.Notice
+	if c.Rewriter.Enabled() {
+		fmt.Fprintln(out, "WARNING: rewriter enabled: uncached user text goes DIRECTLY to the configured rewriter, outside Tor/zkAPI. Target history replays saved rewrites; cache misses rewrite historical user turns. Style rewriting does not guarantee anonymity.")
+	}
 	api.RequireAPIKey = c.RequireAPIKey
 	api.LeCoreContextRecall = c.LeCoreContextRecall
+	api.WebSearch = c.WebSearch
 	api.Status = server.ServiceStatus{Backend: c.Backend}
 	api.Status.Network = c.ZKAPI.Network
 	api.Status.RequestBudgetPolicy = "model"
@@ -303,11 +436,18 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 		api.ManagementToken = c.ManagementToken
 		api.Admin = http.HandlerFunc(funding.ServeAdminHTTP)
 	}
+	stopCover, err := startServeCover(life, c, logger)
+	if err != nil {
+		return err
+	}
+	defer stopCover()
 	httpServer := &http.Server{Handler: server.LogRequests(api, logger), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 32 << 10, ErrorLog: log.New(io.Discard, "", 0), BaseContext: func(net.Listener) context.Context { return life }}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- httpServer.Serve(listener) }()
 	transport := "direct HTTPS (network proxy off)"
-	if strings.HasPrefix(c.RelayURL, "socks5://") {
+	if relay.IsTor(c.RelayURL) {
+		transport = "Tor required (conversation isolation; IsolateSOCKSAuth required on Tor)"
+	} else if strings.HasPrefix(c.RelayURL, "socks5://") {
 		transport = "SOCKS5 proxy required"
 	} else if c.RelayURL != "" {
 		transport = "encrypted relay required"
@@ -317,12 +457,19 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	if c.LeCoreContextRecall {
 		logger.Print("OpenZoo leCore context recall enabled for long text requests")
 	}
+	if c.WebSearch {
+		logger.Print("Web search: on by default (OpenRouter; search charges apply)")
+	} else {
+		logger.Print("Web search: off by default")
+	}
 	if c.RequireAPIKey {
 		logger.Print("Use zkapi-clientd config --api-key to configure your client; Ctrl+C stops the service")
 	} else {
 		logger.Print("Localhost inference needs no API key; Ctrl+C stops the service")
 	}
-	if c.KeyReuseWindowSeconds > 0 {
+	if c.KeyReuseWindowSeconds > 0 && relay.IsTor(c.RelayURL) {
+		logger.Printf("Tor key reuse: up to %d seconds within prefix-continuing conversations only; new conversations always acquire fresh keys", c.KeyReuseWindowSeconds)
+	} else if c.KeyReuseWindowSeconds > 0 {
 		logger.Printf("Ephemeral key reuse enabled for up to %d seconds: different chats and local clients can share a key and spending cap. Run zkapi-clientd config --key-reuse-window-seconds 0 to isolate every request", c.KeyReuseWindowSeconds)
 	} else {
 		logger.Print("Ephemeral key isolation: fresh OpenRouter key for every completion, including background UI requests")

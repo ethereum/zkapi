@@ -10,9 +10,19 @@ use std::path::Path;
 use crate::error::ServerError;
 
 pub(crate) struct ServerWriterLock {
-    // Closing the file releases the advisory lock. Never unlink the sidecar:
-    // another process could otherwise lock a different inode at the same path.
-    _file: File,
+    // Dropping releases the advisory lock. Never unlink the sidecar: another
+    // process could otherwise lock a different inode at the same path.
+    file: File,
+}
+
+impl Drop for ServerWriterLock {
+    fn drop(&mut self) {
+        // Unlock explicitly instead of relying on the close alone. A child
+        // process spawned concurrently holds a duplicate of this descriptor
+        // until its exec closes it, and the lock belongs to the shared open
+        // file description: a close would leave it held until then.
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 impl ServerWriterLock {
@@ -64,7 +74,7 @@ impl ServerWriterLock {
                 "cannot acquire exclusive server database writer lock; another server may be running: {error}"
             ))
         })?;
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
 }
 

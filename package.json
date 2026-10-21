@@ -13,7 +13,9 @@
     "test": "npm run test:sdk",
     "test:sdk": "node --test sdk/test/*.test.mjs",
     "test:e2e:v2": "bash scripts/run-v2-acceptance.sh",
-    "verify:assets": "node scripts/sync-sdk-assets.mjs --check"
+    "verify:assets": "node scripts/sync-sdk-assets.mjs --check",
+    "verify:wasm": "bash scripts/build-browser-client.sh --check",
+    "verify:builds": "node scripts/check-sdk-builds.mjs"
   },
   "devDependencies": {
     "esbuild": "0.27.2"
@@ -33,7 +35,10 @@
     "./withdrawal-recovery": "./sdk/services/zkapiWithdrawalRecovery.mjs",
     "./expiry-history": "./sdk/services/zkapiExpiryHistory.mjs",
     "./withdrawal-root": "./sdk/services/zkapiWithdrawalRoot.mjs",
+    "./request-archive": "./sdk/services/zkapiRequestArchive.mjs",
+    "./exit-kit": "./sdk/services/zkapiExitKit.mjs",
     "./gas": "./sdk/services/zkapiGas.mjs",
+    "./gasless": "./sdk/services/zkapiGasless.mjs",
     "./contract-error": "./sdk/services/zkapiContractError.mjs",
     "./wallet-error": "./sdk/services/zkapiWalletError.mjs",
     "./package.json": "./package.json"

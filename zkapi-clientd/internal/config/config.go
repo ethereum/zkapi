@@ -14,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 )
 
 // Compatible requests share a provider credential within this fixed window,
@@ -63,23 +65,51 @@ type ZKAPI struct {
 	// Retained only to load older configurations. Each new request chooses its
 	// budget from the selected model; a saved fixed limit has no effect.
 	RequestLimitMicroUSD uint64 `json:"request_limit_micro_usd,omitempty"`
+	// ExitRPCURL is the owner's own Ethereum RPC for exits (--exit-rpc-url):
+	// deployment checks also run through it, the companion reads expiry,
+	// roots and logs through it, and exit transactions are sent through it.
+	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
+	// WithdrawalFees is how a withdrawal pays its network fee by default:
+	// "wallet" (the local signing address; the default) or "payout" (a
+	// sponsored operation paid from the payout, --fees payout).
+	WithdrawalFees string `json:"withdrawal_fees,omitempty"`
+	// BundlerURL is the owner's ERC-4337 bundler for gasless withdrawals
+	// (--bundler-url); empty uses the deployment's published bundler.
+	BundlerURL string `json:"bundler_url,omitempty"`
 }
 
 type Config struct {
+	Cover    cover.Config    `json:"cover,omitzero"`
+	Rewriter rewriter.Config `json:"rewriter,omitzero"`
 	// ManagementToken is a separate owner-only credential. It must never be
 	// published with config.json or shared with inference API clients.
 	ManagementToken       string `json:"-"`
+	DefaultModel          string `json:"default_model,omitempty"`
 	Listen                string `json:"listen"`
 	APIKey                string `json:"api_key"`
 	KeyReuseWindowSeconds int    `json:"key_reuse_window_seconds"`
 	LeCoreContextRecall   bool   `json:"lecore_context_recall"` // opt in to local context retrieval before paid inference
+	WebSearch             bool   `json:"web_search"`            // automatically enable OpenRouter web search for chat completions
 	RequireAPIKey         bool   `json:"require_api_key"`       // opt in to bearer authentication for loopback inference
 	Backend               string `json:"backend"`               // fixed to zkapi; retained for existing profile compatibility
 	OrgURL                string `json:"org_url,omitempty"`     // legacy profile field; unused
 	VerifierURL           string `json:"verifier_url"`
-	RelayURL              string `json:"relay_url"` // empty uses direct HTTPS; nonempty selects Wisp or loopback SOCKS5
+	RelayURL              string `json:"relay_url"` // empty: direct; wss: Wisp; socks5: proxy; tor: conversation isolation
 	Concurrency           int    `json:"concurrency"`
 	ZKAPI                 ZKAPI  `json:"zkapi"`
+}
+
+// ValidModelID excludes whitespace and terminal control characters.
+func ValidModelID(id string) bool {
+	if len(id) == 0 || len(id) > 256 {
+		return false
+	}
+	for _, r := range id {
+		if r <= 32 || r >= 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func DefaultDir() (string, error) {
@@ -144,10 +174,19 @@ func Default() (Config, error) {
 		return Config{}, err
 	}
 	bridge, err := Secret()
-	return Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, Listen: "127.0.0.1:8787", APIKey: key, Backend: "zkapi", VerifierURL: DefaultVerifierURL("mainnet"), Concurrency: 4, ZKAPI: ZKAPI{ClientURL: "http://127.0.0.1:8790", BridgeToken: bridge, Network: "mainnet"}}, err
+	return Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, WebSearch: true, Listen: "127.0.0.1:8787", APIKey: key, Backend: "zkapi", VerifierURL: DefaultVerifierURL("mainnet"), Concurrency: 4, ZKAPI: ZKAPI{ClientURL: "http://127.0.0.1:8790", BridgeToken: bridge, Network: "mainnet"}}, err
 }
 
 func Validate(c Config) error {
+	if err := c.Cover.Validate(c.RelayURL); err != nil {
+		return err
+	}
+	if err := c.Rewriter.Validate(); err != nil {
+		return err
+	}
+	if c.DefaultModel != "" && !ValidModelID(c.DefaultModel) {
+		return errors.New("invalid default model ID")
+	}
 	if c.KeyReuseWindowSeconds < 0 || c.KeyReuseWindowSeconds > MaxKeyReuseWindowSeconds {
 		return errors.New("key_reuse_window_seconds must be between 0 and 300 (0 disables reuse)")
 	}
@@ -180,6 +219,9 @@ func Validate(c Config) error {
 	if _, err := relay.NewClient(c.RelayURL); err != nil {
 		return err
 	}
+	if relay.IsTor(c.RelayURL) && c.ZKAPI.ExternalCompanion {
+		return errors.New("Tor mode requires the managed companion so payment traffic uses the configured Tor bridge")
+	}
 	if c.ZKAPI.Network != "mainnet" && c.ZKAPI.Network != "sepolia" {
 		return errors.New("ZKAPI network must be mainnet or sepolia")
 	}
@@ -193,7 +235,36 @@ func Validate(c Config) error {
 	if ip := net.ParseIP(u.Hostname()); ip == nil || !ip.IsLoopback() {
 		return errors.New("ZKAPI client_url must use a numeric loopback IP")
 	}
+	if c.ZKAPI.ExitRPCURL != "" && !validExitRPC(c.ZKAPI.ExitRPCURL) {
+		return errors.New("ZKAPI exit_rpc_url must be an HTTPS URL, or plain HTTP to a node on this machine, without credentials, query or fragment")
+	}
+	if c.ZKAPI.BundlerURL != "" && !validExitRPC(c.ZKAPI.BundlerURL) {
+		return errors.New("ZKAPI bundler_url must be an HTTPS URL, or plain HTTP to a bundler on this machine, without credentials, query or fragment")
+	}
+	if c.ZKAPI.WithdrawalFees != "" && c.ZKAPI.WithdrawalFees != "wallet" && c.ZKAPI.WithdrawalFees != "payout" {
+		return errors.New("ZKAPI withdrawal_fees must be wallet or payout")
+	}
 	return nil
+}
+
+// validExitRPC mirrors zkapi.ValidateExitRPCURL: the owner's own Ethereum RPC
+// for exits, over HTTPS or plain HTTP to this machine.
+func validExitRPC(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	if u.Scheme != "http" {
+		return false
+	}
+	if u.Hostname() == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && ip.IsLoopback()
 }
 
 func Init(dir string, c Config) error {
@@ -271,12 +342,13 @@ func readConfig(dir string) (Config, error) {
 		return Config{}, err
 	}
 	defer f.Close()
-	// Missing fields in older profiles adopt the default window. Preserve
-	// explicitly saved reuse windows, including zero for strict per-request keys.
-	c := Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds}
+	// Missing fields in older profiles adopt the defaults. Preserve explicit
+	// opt-outs, including zero for strict per-request keys and web_search=false.
+	c := Config{KeyReuseWindowSeconds: DefaultKeyReuseWindowSeconds, WebSearch: true}
 	decoded := struct {
 		*Config
 		ReuseWindow json.RawMessage `json:"key_reuse_window_seconds"`
+		WebSearch   json.RawMessage `json:"web_search"`
 	}{Config: &c}
 	d := json.NewDecoder(io.LimitReader(f, 1<<20))
 	d.DisallowUnknownFields()
@@ -289,6 +361,13 @@ func readConfig(dir string) (Config, error) {
 			return Config{}, errors.New("key_reuse_window_seconds must be an integer between 0 and 300")
 		}
 		c.KeyReuseWindowSeconds = *seconds
+	}
+	if len(decoded.WebSearch) > 0 {
+		var enabled *bool
+		if json.Unmarshal(decoded.WebSearch, &enabled) != nil || enabled == nil {
+			return Config{}, errors.New("web_search must be a boolean")
+		}
+		c.WebSearch = *enabled
 	}
 	var trailing any
 	if d.Decode(&trailing) != io.EOF {

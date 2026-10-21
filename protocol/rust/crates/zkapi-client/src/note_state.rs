@@ -6,7 +6,6 @@
 //! wallet can always recover to a consistent point after a crash.
 
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -31,8 +30,38 @@ pub struct NoteState {
     pub current_commitment_x: Felt252,
     pub current_commitment_y: Felt252,
     pub current_anchor: Felt252,
+    /// The anchor of the state whose request produced this one. The request
+    /// circuit checks `current_anchor == next_anchor(nullifier(s, n, prev))`
+    /// for every signed state, so a signed state without it cannot prove a
+    /// request (`ClientError::PrevAnchorMissing`). Exits never need it.
+    /// `None` at genesis and in state files written before it existed.
+    #[serde(default)]
+    pub prev_anchor: Option<Felt252>,
     pub is_genesis: bool,
     pub state_signature: Option<SchnorrSignature>,
+    /// C2 (design §6.2): the one `solvency_bound` every request proof at
+    /// this state carries. 0 until the first request proof at the state is
+    /// prepared, and reset to 0 by every install. A raise of an escape from
+    /// this state can never take more than it.
+    #[serde(default)]
+    pub bound_at_state: u128,
+    /// Installs since the deposit (0 at genesis); an exit kit records the
+    /// state it was exported at.
+    #[serde(default)]
+    pub state_seq: u64,
+    /// Amendment A1: the note's Merkle path at the root its own deposit set.
+    /// The vault accepts any root it ever held, and the tree is append-only
+    /// for every note that is not closed, so this path proves membership for
+    /// every exit, with no indexer and no log rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposit_path: Option<DepositPath>,
+}
+
+/// A note's Merkle path at the root of its deposit (Amendment A1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepositPath {
+    pub root: Felt252,
+    pub siblings: Vec<Felt252>,
 }
 
 impl NoteState {
@@ -66,8 +95,12 @@ impl NoteState {
             current_commitment_x: commitment_x,
             current_commitment_y: commitment_y,
             current_anchor: Felt252::ONE, // genesis anchor
+            prev_anchor: None,
             is_genesis: true,
             state_signature: None,
+            bound_at_state: 0,
+            state_seq: 0,
+            deposit_path: None,
         }
     }
 
@@ -84,10 +117,12 @@ impl NoteState {
         }
     }
 
-    /// Persist the state atomically by writing to a temporary file and then
-    /// renaming it into the target path. This guarantees that a crash at any
-    /// point leaves either the old state or the new state on disk, never a
-    /// partial write.
+    /// Persist the state atomically and durably: it is written and synced
+    /// under a temporary name, renamed into the target path, and the rename
+    /// is synced before this returns. A crash at any point, including a power
+    /// loss, leaves either the old state or the complete new state on disk,
+    /// so a request journal cleared afterwards never outlives the state it
+    /// was installed into.
     pub fn save(&self, path: &Path) -> Result<(), ClientError> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| ClientError::Serialization(e.to_string()))?;
@@ -97,11 +132,7 @@ impl NoteState {
             fs::create_dir_all(parent)?;
         }
 
-        // Write to a sibling temp file, then atomically rename.
-        let tmp_path = path.with_extension("tmp");
-        write_private_file(&tmp_path, json.as_bytes())?;
-        fs::rename(&tmp_path, path)?;
-        Ok(())
+        crate::journal::replace_file_durably(path, json.as_bytes())
     }
 
     /// Load state from a JSON file on disk.
@@ -117,6 +148,9 @@ impl NoteState {
         let parent = path.parent().unwrap_or(Path::new("."));
         let archive_dir = parent.join("archive");
         fs::create_dir_all(&archive_dir)?;
+        // The archive directory's entry is durable before the active file
+        // can be removed.
+        crate::journal::sync_parent(&archive_dir)?;
 
         let filename = format!("note_{}_closed.json", self.note_id);
         let archive_path = archive_dir.join(filename);
@@ -125,27 +159,10 @@ impl NoteState {
         self.save(&archive_path)?;
         if path.exists() {
             fs::remove_file(path)?;
+            crate::journal::sync_parent(path)?;
         }
         Ok(())
     }
-}
-
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
-    let mut options = fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(bytes)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -177,7 +194,64 @@ mod tests {
         assert!(state.is_genesis);
         assert_eq!(state.current_balance, 1000);
         assert_eq!(state.current_anchor, Felt252::ONE);
+        assert!(state.prev_anchor.is_none());
         assert!(state.state_signature.is_none());
+    }
+
+    /// A state file written before `bound_at_state`, `state_seq` and
+    /// `deposit_path` existed loads with no bound, sequence 0 and no saved
+    /// path.
+    #[test]
+    fn a_state_file_without_the_concession_fields_loads_with_defaults() {
+        let dir = test_dir("no_concession_fields");
+        let path = dir.join("note_state.json");
+        let state = NoteState::new_from_deposit(
+            2,
+            1,
+            Felt252::from_u64(0xdead),
+            7,
+            Felt252::from_u64(42),
+            5000,
+            1700000000,
+            "0xff".to_string(),
+            Felt252::from_u64(10),
+            Felt252::from_u64(20),
+        );
+        let mut value = serde_json::to_value(&state).unwrap();
+        for field in ["bound_at_state", "state_seq", "deposit_path"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = NoteState::load(&path).unwrap();
+        assert_eq!(loaded.bound_at_state, 0);
+        assert_eq!(loaded.state_seq, 0);
+        assert!(loaded.deposit_path.is_none());
+    }
+
+    /// A state file written before `prev_anchor` existed still loads; its
+    /// predecessor anchor is unknown.
+    #[test]
+    fn a_state_file_without_prev_anchor_loads_with_none() {
+        let dir = test_dir("no_prev_anchor");
+        let path = dir.join("note_state.json");
+        let state = NoteState::new_from_deposit(
+            2,
+            1,
+            Felt252::from_u64(0xdead),
+            7,
+            Felt252::from_u64(42),
+            5000,
+            1700000000,
+            "0xff".to_string(),
+            Felt252::from_u64(10),
+            Felt252::from_u64(20),
+        );
+        let mut value = serde_json::to_value(&state).unwrap();
+        value.as_object_mut().unwrap().remove("prev_anchor");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = NoteState::load(&path).unwrap();
+        assert!(loaded.prev_anchor.is_none());
+        assert_eq!(loaded.note_id, 7);
     }
 
     #[test]
@@ -243,6 +317,44 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// The state's contents and its new name are synced before `save`
+    /// returns: a power loss could otherwise leave an empty state file, or
+    /// the old state beside a journal already cleared for the new one.
+    #[test]
+    fn saved_state_is_durable_before_save_returns() {
+        let dir = test_dir("durable");
+        let path = dir.join("note_state.json");
+        let state = NoteState::new_from_deposit(
+            1,
+            1,
+            Felt252::ZERO,
+            4,
+            Felt252::from_u64(1),
+            100,
+            0,
+            "0x0".into(),
+            Felt252::ZERO,
+            Felt252::ZERO,
+        );
+        crate::journal::durability::take();
+        state.save(&path).unwrap();
+        assert_eq!(
+            crate::journal::durability::take(),
+            [("file", dir.join("note_state.tmp")), ("dir", dir.clone())]
+        );
+        state.archive(&path).unwrap();
+        let archive = dir.join("archive");
+        assert_eq!(
+            crate::journal::durability::take(),
+            [
+                ("dir", dir.clone()),
+                ("file", archive.join("note_4_closed.tmp")),
+                ("dir", archive.clone()),
+                ("dir", dir.clone())
+            ]
+        );
     }
 
     #[test]

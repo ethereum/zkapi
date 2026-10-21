@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,9 +20,13 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-const addressTestVault = "0x4386fdbda35d995beb3bf8625118ec5982ec81fe"
+const addressTestVault = "0xc0c0000000000000000000000000000000000001"
 const addressTestToken = "0x2222222222222222222222222222222222222222"
-const addressTestBlock = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// addressTestBlock is the hash of the fixture's canonical block 0x20, whose
+// header the RPC serves by hash with the time this test binary started.
+var addressTestHeader = fixtureHeader(0x20, time.Now().Unix())
+var addressTestBlock = addressTestHeader.Hash().Hex()
 
 type addressFixture struct {
 	native                                                         bool
@@ -38,15 +43,157 @@ type addressFixture struct {
 	active                                                         bool
 	prepared, activated, paths                                     int
 	rpcCalls                                                       []string
+	// Independent corroboration sources. The RPC answers vault notes() from
+	// vaultNotes; the separate indexer server serves leaves. mine registers
+	// a deposit in both, and tests make them disagree deliberately.
+	vaultNotes                 map[uint32]fixtureNote
+	vaultReadsAt               []string
+	leaves                     []*big.Int
+	indexer                    *httptest.Server
+	indexerBlock               uint64
+	indexerHash                string
+	indexerStatus              int // >0: HTTP error, <0: inconsistent snapshot
+	indexerWithoutBlock        bool
+	snapshotReads, rootReads   int
+	cachedRoot                 *big.Int
+	cachedPath                 []*big.Int
+	cachedVersion, leafVersion int
+	mined                      map[string]uint32
+	minedExpiry                map[uint32]uint64
+	// minedRoot is NoteDeposited.newRoot of each mined deposit, by hash.
+	minedRoot map[string]*big.Int
+	// Block headers served by eth_getBlockByHash, by lowercase hash.
+	headers map[string]*types.Header
+	// Companion wallet state for activation and rebind.
+	walletNote      map[string]any
+	walletPending   bool
+	withdrawalPhase map[string]any
+	confirmBodies   []map[string]any
+	resetCalls      int
+	// Withdrawal release: a non-empty releaseRefusal answers 409 with that
+	// code; companionSteps orders release and reset calls.
+	releaseBodies  []map[string]any
+	releaseRefusal string
+	companionSteps []string
+	// escapeCredits answers the vault's escapePayoutCredits(address), by
+	// lowercase destination address; a missing destination reads zero.
+	escapeCredits map[string]string
+	creditReads   int
+	// codeTamper makes the RPC serve other runtime code at the vault.
+	codeTamper bool
+	// pinnedDown makes the pinned RPC refuse every call; exitRPC serves the
+	// same chain as the owner's exit RPC (--exit-rpc-url), and exitCalls
+	// lists the methods it answered.
+	pinnedDown bool
+	exitRPC    string
+	exitCalls  []string
+	// refuseSimulation makes the RPCs refuse the eth_call simulation and the
+	// gas estimate of a signed vault call.
+	refuseSimulation bool
+	// pinnedNonce, when set, is the nonce the pinned RPC alone answers (a
+	// lying pinned RPC). pendingNonce and finalizedNonce, when set, answer
+	// eth_getTransactionCount at the "pending" and "finalized" tags (a
+	// mempool transaction, a nonce taken by another transaction).
+	pinnedNonce, pendingNonce, finalizedNonce string
+	// latestTime, when set, is the timestamp of every block served.
+	latestTime int64
+	// hideReceipts makes this many receipt reads answer null first.
+	hideReceipts int
+	// logs are the vault logs eth_getLogs serves, filtered by topics.
+	logs []map[string]any
+	// gasless, when enabled (enableGasless), serves the gasless contracts
+	// and the bundler of a sponsored withdrawal.
+	gasless *gaslessFixture
+}
+
+// addressTestFirstNote is the first fixture deposit's note: the indexer
+// starts with this many unrelated leaves.
+const addressTestFirstNote = 12
+
+func (f *addressFixture) setLeaf(id uint32, leaf *big.Int) {
+	for uint32(len(f.leaves)) <= id {
+		f.leaves = append(f.leaves, new(big.Int))
+	}
+	f.leaves[id] = leaf
+	f.leafVersion++
+}
+
+func (f *addressFixture) registerDeposit(id uint32, commitment string, amount, expiry uint64) {
+	f.vaultNotes[id] = fixtureNote{commitment: "0x" + addressABIWord(commitment), amount: amount, expiry: expiry, status: noteActive}
+	f.setLeaf(id, noteLeaf(id, fieldValue(commitment), amount, expiry))
+}
+
+func (f *addressFixture) closeNote(id uint32) {
+	note := f.vaultNotes[id]
+	note.status = noteClosed
+	f.vaultNotes[id] = note
+	f.setLeaf(id, new(big.Int))
+}
+
+// tree returns the root and the empty-slot path at next_note_id, cached
+// until a leaf changes. Callers hold f.mu.
+func (f *addressFixture) tree() (*big.Int, []*big.Int) {
+	if f.cachedRoot == nil || f.cachedVersion != f.leafVersion {
+		f.cachedRoot, f.cachedPath = testTree(f.leaves, uint32(len(f.leaves)))
+		f.cachedVersion = f.leafVersion
+	}
+	return f.cachedRoot, f.cachedPath
 }
 
 func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 	t.Helper()
 	f := &addressFixture{chain: "0x1", decimals: "0x6", gas: "0x10000", gasPrice: "0x3b9aca00", balance: "0xf4240", eth: "0xde0b6b3a7640000", allowance: "0x0", nonce: "0x0", finalized: "0x20", canonical: addressTestBlock, accepted: map[string]*types.Transaction{}, receipts: map[string]map[string]any{}}
 	f.native = len(native) > 0 && native[0]
-	rpc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	f.vaultNotes, f.mined, f.minedExpiry = map[uint32]fixtureNote{}, map[string]uint32{}, map[uint32]uint64{}
+	f.headers = map[string]*types.Header{strings.ToLower(addressTestBlock): addressTestHeader}
+	for i := range addressTestFirstNote {
+		f.setLeaf(uint32(i), big.NewInt(int64(0x1000+i)))
+	}
+	f.indexerBlock, f.indexerHash = 0x20, addressTestBlock
+	f.walletNote = map[string]any{"note_id": addressTestFirstNote, "current_balance": 99999}
+	f.indexer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+			t.Error("identity reached the indexer")
+		}
+		if r.Method != http.MethodGet || (r.URL.Path != "/v1/tree/snapshot" && r.URL.Path != "/v1/tree/root") {
+			t.Errorf("unexpected indexer request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		snapshot := r.URL.Path == "/v1/tree/snapshot"
+		if snapshot {
+			f.snapshotReads++
+		} else {
+			f.rootReads++
+		}
+		if f.indexerStatus > 0 {
+			w.WriteHeader(f.indexerStatus)
+			_, _ = io.WriteString(w, `{"status":"unavailable","error_code":"indexer_unavailable"}`)
+			return
+		}
+		root, _ := f.tree()
+		body := map[string]any{"root": fmt.Sprintf("0x%x", root), "next_note_id": len(f.leaves)}
+		if snapshot {
+			body["leaves"] = fieldHexes(f.leaves)
+		}
+		if f.indexerStatus < 0 && snapshot { // An internally inconsistent snapshot.
+			body["next_note_id"] = len(f.leaves) + 1
+		}
+		if !f.indexerWithoutBlock {
+			body["block_number"], body["block_hash"] = f.indexerBlock, f.indexerHash
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	t.Cleanup(f.indexer.Close)
+	chainRPC := func(w http.ResponseWriter, r *http.Request, exit bool) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if !exit && f.pinnedDown {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
 			t.Error("identity reached payment RPC")
 		}
@@ -62,15 +209,52 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			t.Error("invalid RPC request")
 			return
 		}
-		f.rpcCalls = append(f.rpcCalls, request.Method)
+		if exit {
+			f.exitCalls = append(f.exitCalls, request.Method)
+		} else {
+			f.rpcCalls = append(f.rpcCalls, request.Method)
+		}
 		var result any
+		// The gasless fixture (gasless_fixture_test.go) answers the gasless
+		// contracts' reads and the dry run of a sponsored operation.
+		if f.gasless != nil {
+			if result, refused, handled := f.gasless.answer(t, request.Method, request.Params); handled {
+				if refused != nil {
+					_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": refused})
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+				}
+				return
+			}
+		}
+		// The deployment checks before a deposit read the fixture vault's
+		// code and getters.
+		if answer, ok := deploymentCheckAnswer("mainnet", request.Method, request.Params); ok {
+			if f.codeTamper && request.Method == "eth_getCode" && answer == fixtureCode["vault"] {
+				answer = "0x60016001"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": answer})
+			return
+		}
 		switch request.Method {
 		case "eth_chainId":
 			result = f.chain
 		case "eth_getBalance":
 			result = f.eth
 		case "eth_getTransactionCount":
+			var tag string
+			if len(request.Params) == 2 {
+				_ = json.Unmarshal(request.Params[1], &tag)
+			}
 			result = f.nonce
+			switch {
+			case !exit && f.pinnedNonce != "":
+				result = f.pinnedNonce
+			case tag == "pending" && f.pendingNonce != "":
+				result = f.pendingNonce
+			case tag == "finalized" && f.finalizedNonce != "":
+				result = f.finalizedNonce
+			}
 		case "eth_getCode":
 			result = "0x"
 		case "eth_feeHistory":
@@ -86,6 +270,10 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			}
 			result = map[string]any{"oldestBlock": "0xd", "baseFeePerGas": bases, "reward": rewards, "gasUsedRatio": ratios}
 		case "eth_estimateGas":
+			if f.refuseSimulation {
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": 3, "message": "execution reverted"}})
+				return
+			}
 			if len(request.Params) == 3 {
 				f.overrideReads++
 			}
@@ -95,6 +283,26 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			result = f.gas
 		case "eth_gasPrice":
 			result = f.gasPrice
+		case "eth_blockNumber":
+			result = "0x20"
+		case "eth_getLogs":
+			var filter struct {
+				Address string   `json:"address"`
+				Topics  []string `json:"topics"`
+			}
+			_ = json.Unmarshal(request.Params[0], &filter)
+			found := []map[string]any{}
+			for _, log := range f.logs {
+				topics, _ := log["topics"].([]string)
+				matches := strings.EqualFold(fmt.Sprint(log["address"]), filter.Address)
+				for i, topic := range filter.Topics {
+					matches = matches && i < len(topics) && strings.EqualFold(topics[i], topic)
+				}
+				if matches {
+					found = append(found, log)
+				}
+			}
+			result = found
 		case "eth_call":
 			var call struct {
 				From string `json:"from"`
@@ -102,11 +310,41 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				Data string `json:"data"`
 			}
 			_ = json.Unmarshal(request.Params[0], &call)
+			if call.From != "" && f.refuseSimulation && strings.EqualFold(call.To, addressTestVault) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": 3, "message": "execution reverted"}})
+				return
+			}
 			if call.From != "" {
 				result = "0x"
 				if len(request.Params) == 3 {
 					f.overrideReads++
 				}
+				break
+			}
+			if strings.EqualFold(call.To, addressTestVault) && strings.HasPrefix(call.Data, "0x"+escapePayoutCreditsSelector) && len(call.Data) == 74 {
+				f.creditReads++
+				result = "0x0"
+				if credit, ok := f.escapeCredits["0x"+strings.ToLower(call.Data[34:])]; ok {
+					result = credit
+				}
+				break
+			}
+			if strings.EqualFold(call.To, addressTestVault) && strings.HasPrefix(call.Data, notesSelector) {
+				var block struct {
+					BlockHash        string `json:"blockHash"`
+					RequireCanonical bool   `json:"requireCanonical"`
+				}
+				if len(request.Params) == 2 && json.Unmarshal(request.Params[1], &block) == nil {
+					f.vaultReadsAt = append(f.vaultReadsAt, block.BlockHash)
+					if !block.RequireCanonical || !strings.EqualFold(block.BlockHash, f.canonical) {
+						_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32000, "message": "header not found"}})
+						return
+					}
+				} else {
+					f.vaultReadsAt = append(f.vaultReadsAt, string(request.Params[1]))
+				}
+				id, _ := new(big.Int).SetString(call.Data[10:], 16)
+				result = encodeVaultNote(f.vaultNotes[uint32(id.Uint64())])
 				break
 			}
 			if !strings.EqualFold(call.To, addressTestToken) {
@@ -125,8 +363,11 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		case "eth_getTransactionReceipt":
 			var hash string
 			_ = json.Unmarshal(request.Params[0], &hash)
-			if found, ok := f.receipts[hash]; ok {
+			if found, ok := f.receipts[hash]; ok && f.hideReceipts == 0 {
 				result = found
+			}
+			if f.hideReceipts > 0 {
+				f.hideReceipts--
 			}
 		case "eth_getBlockByNumber":
 			var number string
@@ -137,7 +378,17 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			if number == "latest" {
 				number = "0x20"
 			}
-			result = map[string]string{"number": number, "hash": f.canonical, "timestamp": fmt.Sprintf("0x%x", time.Now().Unix()), "baseFeePerGas": f.gasPrice}
+			timestamp := time.Now().Unix()
+			if f.latestTime != 0 {
+				timestamp = f.latestTime
+			}
+			result = map[string]string{"number": number, "hash": f.canonical, "timestamp": fmt.Sprintf("0x%x", timestamp), "baseFeePerGas": f.gasPrice}
+		case "eth_getBlockByHash":
+			var hash string
+			_ = json.Unmarshal(request.Params[0], &hash)
+			if header, ok := f.headers[strings.ToLower(hash)]; ok {
+				result = header
+			}
 		case "eth_sendRawTransaction":
 			var raw string
 			_ = json.Unmarshal(request.Params[0], &raw)
@@ -179,14 +430,18 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			t.Errorf("unexpected RPC %s", request.Method)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
-	}))
+	}
+	rpc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { chainRPC(w, r, false) }))
 	t.Cleanup(rpc.Close)
+	exitRPC := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { chainRPC(w, r, true) }))
+	t.Cleanup(exitRPC.Close)
+	f.exitRPC = exitRPC.URL
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		switch r.URL.Path {
 		case "/funding/config":
-			config := map[string]any{"chain_id": 1, "contract_address": addressTestVault, "demo_billing_token_address": addressTestToken, "demo_rpc_url": rpc.URL}
+			config := map[string]any{"chain_id": 1, "contract_address": addressTestVault, "demo_billing_token_address": addressTestToken, "demo_rpc_url": rpc.URL, "indexer_url": f.indexer.URL, "protocol_server_url": testProtocolServerURL(t, "mainnet")}
 			if f.native {
 				config["demo_billing_token_address"] = nil
 				deployment, _, err := pinnedDeployment("mainnet")
@@ -200,7 +455,7 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			}
 			_ = json.NewEncoder(w).Encode(config)
 		case "/wallet/status":
-			_ = json.NewEncoder(w).Encode(map[string]any{"has_note": f.active, "note": map[string]any{"note_id": 12, "current_balance": 99999}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"has_note": f.active, "pending_request": f.walletPending, "note": f.walletNote})
 		case "/funding/api/deposit/prepare":
 			f.prepared++
 			var input struct {
@@ -214,19 +469,48 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			_ = json.NewEncoder(w).Encode(map[string]any{"amount": input.Amount, "secret": "0xabcdef", "commitment": "0x1234", "zero_path": path})
 		case "/oa/v1/deposit/path":
 			f.paths++
-			path := make([]string, 32)
-			for i := range path {
-				path[i] = "0xa"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"zero_path": path})
+			_, path := f.tree()
+			_ = json.NewEncoder(w).Encode(map[string]any{"zero_path": fieldHexes(path)})
 		case "/funding/api/deposit/confirm":
+			var body map[string]any
+			if json.NewDecoder(r.Body).Decode(&body) != nil {
+				t.Error("invalid deposit confirmation")
+			}
+			f.confirmBodies = append(f.confirmBodies, body)
 			f.activated++
 			f.active = true
+			f.walletNote = map[string]any{"note_id": body["note_id"], "deposit_amount": body["amount"], "current_balance": body["amount"], "expiry_ts": body["expiry_ts"], "is_genesis": true}
 			_, _ = io.WriteString(w, `{}`)
+		case "/wallet/reset":
+			f.resetCalls++
+			f.companionSteps = append(f.companionSteps, "reset")
+			f.active = false
+			_ = json.NewEncoder(w).Encode(map[string]any{"has_note": false, "pending_request": false})
+		case "/oa/v1/withdraw/release":
+			var body map[string]any
+			if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&body) != nil {
+				t.Error("invalid withdrawal release")
+			}
+			f.releaseBodies = append(f.releaseBodies, body)
+			f.companionSteps = append(f.companionSteps, "release")
+			if f.releaseRefusal != "" {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": f.releaseRefusal, "message": "private reservation detail"}})
+				return
+			}
+			f.withdrawalPhase = nil
+			_ = json.NewEncoder(w).Encode(map[string]any{"phase": "none"})
+		case "/oa/v1/withdraw/status":
+			phase := f.withdrawalPhase
+			if phase == nil {
+				phase = map[string]any{"phase": "none"}
+			}
+			_ = json.NewEncoder(w).Encode(phase)
 		default:
 			t.Errorf("unexpected companion path %s", r.URL.Path)
 		}
 	}, rpc)
+	client.endpoints.Indexer = f.indexer.URL
 	var err error
 	f.h, err = NewFundingHandler(client, "http://127.0.0.1:8787", t.TempDir())
 	if err != nil {
@@ -235,6 +519,21 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 	return f
 }
 
+// setChainTime makes the fixture chain's block 0x20, which the indexer's
+// view and the RPC's canonical reads name, carry block time at. Call it
+// before anything is mined.
+func (f *addressFixture) setChainTime(at int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	header := fixtureHeader(0x20, at)
+	hash := header.Hash().Hex()
+	f.headers[strings.ToLower(hash)] = header
+	f.canonical, f.indexerHash = hash, hash
+}
+
+// mine includes a broadcast transaction. A successful deposit lands at the
+// indexer's next slot, in both the vault state and the indexer snapshot; a
+// re-inclusion of the same transaction keeps its note and expiry.
 func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 	t.Helper()
 	f.mu.Lock()
@@ -247,16 +546,26 @@ func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 	if reverted {
 		status = "0x0"
 	}
-	receipt := map[string]any{"transactionHash": hash, "status": status, "blockNumber": "0x10", "blockHash": addressTestBlock, "to": tx.To().Hex()}
+	receipt := map[string]any{"transactionHash": hash, "status": status, "blockNumber": "0x10", "blockHash": f.canonical, "to": tx.To().Hex()}
 	if !reverted {
 		data := hex.EncodeToString(tx.Data())
 		if strings.HasPrefix(data, "095ea7b3") {
 			value, _ := new(big.Int).SetString(data[72:], 16)
 			f.allowance = "0x" + value.Text(16)
 		} else {
+			commitment := "0x" + data[8:72]
 			amount, _ := new(big.Int).SetString(data[72:136], 16)
-			record := depositRecord{Contract: addressTestVault, Commitment: "0x1234", Amount: amount.Uint64()}
-			receipt["logs"] = sampleReceipt(record).Logs
+			id, ok := f.mined[hash]
+			if !ok {
+				id = uint32(len(f.leaves))
+				f.mined[hash], f.minedExpiry[id] = id, uint64(time.Now().Unix())+3600
+				f.registerDeposit(id, commitment, amount.Uint64(), f.minedExpiry[id])
+				if f.minedRoot == nil {
+					f.minedRoot = map[string]*big.Int{}
+				}
+				f.minedRoot[hash], _ = f.tree()
+			}
+			receipt["logs"] = depositEventReceiptAt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id], f.minedRoot[hash]).Logs
 			f.allowance = "0x0"
 		}
 	}
@@ -403,9 +712,20 @@ func TestAddressFundingApprovesExactAmountRefreshesPathAndDepositsOnce(t *testin
 	if tx == nil || tx.Nonce() != 1 || !strings.EqualFold(tx.To().Hex(), addressTestVault) {
 		t.Fatal("invalid deposit transaction")
 	}
-	data := hex.EncodeToString(tx.Data())
-	if len(data) != 8+64*34 || !strings.HasSuffix(data, strings.Repeat(addressABIWord("0xa"), 32)) {
+	// The prepared "0x0" path was replaced by the refreshed empty-slot path,
+	// bound to the indexer slot the deposit targets; the calldata carries
+	// only the commitment and the amount (vault revision 3).
+	f.mu.Lock()
+	_, path := f.tree()
+	f.mu.Unlock()
+	if data := hex.EncodeToString(tx.Data()); len(data) != 8+64*2 || !strings.HasPrefix(data, depositSelector) {
+		t.Fatal("deposit calldata is not deposit(bytes32,uint128)")
+	}
+	if refreshed := f.savedDeposit(t).ZeroPath; !slices.Equal(refreshed, fieldHexes(path)) || slices.Equal(refreshed, slices.Repeat([]string{"0x0"}, 32)) {
 		t.Fatal("deposit witness was not refreshed")
+	}
+	if saved, err := f.h.readAddressDeposit(fundingConfig{ChainID: 1, Contract: addressTestVault, Token: addressTestToken}); err != nil || saved.Slot == nil || saved.Slot.NoteID != addressTestFirstNote {
+		t.Fatalf("deposit slot was not recorded before signing: %+v %v", saved, err)
 	}
 	f.mine(t, deposit.TransactionHash, false)
 	before := len(f.submitted)

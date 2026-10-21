@@ -423,7 +423,8 @@ class PackageTests(unittest.TestCase):
         self.version = "1.2.3"
         for target in TARGETS:
             self.archive(target)
-        command([sys.executable, REPO / "zkapi-clientd/scripts/assemble-release.py", self.version, self.artifacts])
+        command([sys.executable, REPO / "zkapi-clientd/scripts/assemble-release.py", self.version, self.artifacts,
+                 "--fixture"])
 
     def archive(self, target, missing=()):
         files = {"zkapi-clientd": b"#!/bin/sh\nprintf 'zkapi-clientd 1.2.3\\n'\n",

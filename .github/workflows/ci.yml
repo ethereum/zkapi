@@ -24,12 +24,27 @@ jobs:
       - name: Install SDK test dependencies
         run: npm ci
 
+      # VERSION is the single release version (docs/versioning.md).
+      - name: Check that every file carries the release version
+        run: node scripts/version.mjs check
+
+      # The gateway test runs the shipped nginx.conf against a live nginx;
+      # ZKAPI_REQUIRE_NGINX=1 fails it instead of skipping it without one.
+      - name: Install nginx for the gateway test
+        run: command -v nginx || { sudo apt-get update && sudo apt-get install -y nginx; }
+
       - name: Test SDK and package both network asset sets
         run: |
           npm test
-          node --test docker/aws/run-daemon.test.mjs
-          npm run build:browser
-          npm run build:mainnet
+          ZKAPI_REQUIRE_NGINX=1 node --test docker/aws/*.test.mjs
+          # build:browser and build:mainnet: a network whose profile is still
+          # a not_deployed placeholder must refuse; a deployed one must build.
+          npm run verify:builds
+
+      - name: Test challenge signer
+        run: |
+          npm ci --prefix docker/aws/signer --ignore-scripts --no-audit --no-fund
+          npm test --prefix docker/aws/signer
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,7 +53,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # The challenger's defeat, raise and retirement encoders, the escape
+      # and close layouts, and every getter selector and event layout the
+      # server, challenger, indexer, SDK and clientd read are pinned against
+      # these vectors, which Forge takes from the real protocol/contracts.
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Golden vault calldata, selectors and events match the real contracts
+        run: bash crates/zkapi-serverd/tests/fixtures/check-calldata-golden.sh
 
       - name: Build app crates
         run: cargo build --release --workspace
@@ -50,10 +75,31 @@ jobs:
         run: cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof --example wasm_roundtrip -- "$PWD/scripts/prove-browser-fixture.mjs" "$PWD/sdk"
 
       - name: Clippy app crates
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The adversary modes (withhold, born-spent, reuse-anchor, random-anchor,
+      # overcharge, lie-expired, hang) exist only in drill builds. Check the
+      # release binary built above first: the feature build below replaces it.
+      - name: Release binaries reject the adversary flag
+        run: |
+          for args in "--adversary hang serverd" "serverd --adversary withhold"; do
+            set +e
+            output=$(./target/release/zkapi $args 2>&1)
+            status=$?
+            set -e
+            case "$status:$output" in
+              "2:"*"unexpected argument '--adversary'"*) ;;
+              *) echo "release zkapi accepted '$args' (exit $status): $output" >&2; exit 1 ;;
+            esac
+          done
+
+      - name: Test and lint the drill-only adversary feature
+        run: |
+          cargo clippy -p zkapi-serverd -p zkapi-cli --all-targets --features zkapi-cli/adversary -- -D warnings
+          cargo test --release -p zkapi-serverd -p zkapi-cli --features zkapi-cli/adversary
 
       - name: Validate operator scripts
-        run: bash -n scripts/build-browser-client.sh docker/tee/attestation-hook.sh && sh -n docker/aws/run-daemon.sh
+        run: bash -n scripts/build-browser-client.sh scripts/run-v2-acceptance.sh docker/tee/attestation-hook.sh && sh -n docker/aws/run-daemon.sh
 
   protocol-rust:
     runs-on: ubuntu-latest
@@ -74,23 +120,346 @@ jobs:
       - name: Test protocol Rust workspace
         run: cargo test --release --manifest-path protocol/rust/Cargo.toml --workspace -- --test-threads=1
 
-  contracts:
+  # Its own job, so that a failing step elsewhere never skips it. The binary
+  # is built on its own, so no dev-dependency turns on `dev-setup`: the
+  # library as production binaries see it must refuse development keys. It
+  # also resolves (without compiling) the features of the production builds
+  # in docker/Dockerfile and scripts/build-browser-client.sh, and checks the
+  # committed ceremony setup against the pins in compact.rs.
+  release-key-policy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: protocol/rust
+
+      - name: Release builds refuse development keys
+        run: cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof --bin release_policy_check
+
+  contracts:
+    runs-on: ubuntu-latest
+    env:
+      # The setup whose generated adapter src/adapters/Groth16ProofAdapter.sol must be.
+      # protocol/setup/v2-concession once the ceremony keys land (G-SETUP). Absolute, so it
+      # means the same here as in the Forge tests and zkapi-proof's tests, which take it
+      # absolute or relative to protocol/rust (ZKAPI_SETUP_DIR=../setup/v2-concession).
+      ZKAPI_SETUP_DIR: ${{ github.workspace }}/protocol/setup/v2-concession-dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Pinned: the gas snapshot and the expected codehashes are exact.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
 
-      - name: Forge build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Fails if a contract exceeds the EIP-170 runtime or EIP-3860 initcode limit.
+      - name: Forge build and contract sizes
         working-directory: protocol/contracts
-        run: forge build
+        run: forge build --sizes
 
+      - name: Forge format
+        working-directory: protocol/contracts
+        run: forge fmt --check src test
+
+      # The verifier is never hand-edited: it is the generator's output for the
+      # committed setup, after forge fmt. Its constants are checked against the
+      # setup's manifest.json by Groth16ProofAdapterTest.
+      - name: The adapter is the formatted generator output
+        working-directory: protocol/contracts
+        run: |
+          cp "$ZKAPI_SETUP_DIR/Groth16ProofAdapter.sol" "$RUNNER_TEMP/Groth16ProofAdapter.sol"
+          forge fmt "$RUNNER_TEMP/Groth16ProofAdapter.sol"
+          diff -u "$RUNNER_TEMP/Groth16ProofAdapter.sol" src/adapters/Groth16ProofAdapter.sol
+
+      # FORGE_SNAPSHOT_CHECK compares the gas snapshot of the exit entry points
+      # (snapshots/) with the committed one; regenerate it with forge test.
       - name: Forge test
         working-directory: protocol/contracts
+        env:
+          FORGE_SNAPSHOT_CHECK: "true"
         run: forge test -vvv
+
+      # The script's signing-key checks (Forge) and the exact manifest parsing of
+      # expected-codehashes.mjs (node; its codehash case reads protocol/contracts/out).
+      - name: Build and test the demo deployment script
+        working-directory: demo/contracts
+        run: |
+          forge build
+          forge test -vvv
+          node --test test/*.test.mjs
+
+      # No RPC: dry runs with the public Anvil development key. The script
+      # checks the signing keys and the setup policy, links Bn254Poseidon
+      # itself and checks the adapter against the setup manifest and the
+      # vault's getters against its inputs, and writes the provisional
+      # manifest OUTPUT_PATH.pending ("simulated", deployBlockLowerBound, no
+      # deployBlock); the expected codehashes are then recomputed from both
+      # projects' artifacts (the compiler settings match, so they agree). On
+      # chain 31337 the first run pins the development keys (seeds 0x1 and
+      # 0x2, allowed only on local chains), the second keys with a coordinate
+      # between 2^63 and 2^64, which the manifest must carry as a decimal
+      # string, and the third keys off the curve, which it must refuse. On
+      # Sepolia's and mainnet's chain IDs the single-party dev setup needs
+      # ALLOW_DEV_SETUP=1 and deploys with it, and an mpc-1 label is refused
+      # until protocol/setup/v2-concession pins the ceremony keys (and then
+      # needs their verifying keys).
+      # A dry run without an RPC starts from an empty state, which has no
+      # EntryPoint v0.7.0 runtime, so these runs pass GASLESS=0 (the manifest
+      # then carries withdrawalPaymaster: null); the gasless block is refused
+      # without it, and is simulated against an Anvil at the end of the step.
+      - name: Simulate the demo deployment script and check its codehashes
+        working-directory: demo/contracts
+        run: |
+          mkdir -p ../../.demo
+          simulate() {
+            GASLESS="${GASLESS:-0}" \
+              PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+              OUTPUT_PATH="$PWD/../../.demo/$1" \
+              SETUP_MANIFEST="${SETUP_MANIFEST:-$ZKAPI_SETUP_DIR/manifest.json}" \
+              STATE_SIGNING_KEY_X="$3" STATE_SIGNING_KEY_Y="$4" CLEARANCE_SIGNING_KEY_X="$5" CLEARANCE_SIGNING_KEY_Y="$6" \
+              forge script script/Deploy.s.sol --chain-id "$2"
+          }
+          check() {
+            node -e 'const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const [chain, allowDev, ...want] = process.argv.slice(2); const keys = [m.stateSigningKeyX, m.stateSigningKeyY, m.clearanceSigningKeyX, m.clearanceSigningKeyY]; if (m.deploymentStatus !== "simulated" || "deployBlock" in m || !Number.isSafeInteger(m.deployBlockLowerBound) || m.chainId !== Number(chain) || m.allowDevSetup !== (allowDev === "1") || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || !/^0x[0-9a-fA-F]{40}$/.test(m.poseidonLibrary) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400 || m.maxPauseDuration !== 604800 || m.concessionEscapeVersion !== 1 || m.vaultRevision !== 3 || m.circuitId !== "zkapi-v2-concession-v1" || m.setupId !== "dev" || !/^0x[0-9a-f]{64}$/.test(m.vaultRuntimeCodehash) || !("withdrawalPaymaster" in m) || m.withdrawalPaymaster !== null || "withdrawalAccountFactory" in m || "paymasterGasPolicy" in m || keys.some(k => typeof k !== "string" || !/^[0-9]+$/.test(k)) || keys.join() !== want.map(k => BigInt(k).toString()).join()) { console.error(m); process.exit(1); }' "$PWD/../../.demo/$1.pending" "$2" "$3" "$4" "$5" "$6" "$7"
+            node ../../scripts/expected-codehashes.mjs --artifacts out --deployment "../../.demo/$1.pending" --check
+            node ../../scripts/expected-codehashes.mjs --artifacts ../../protocol/contracts/out --deployment "../../.demo/$1.pending" --check
+          }
+          refuses() {
+            if "${@:2}" > "$RUNNER_TEMP/refused.log" 2>&1; then
+              echo "Deploy.s.sol accepted: ${*:2}"; exit 1
+            fi
+            grep -qE "$1" "$RUNNER_TEMP/refused.log" || { cat "$RUNNER_TEMP/refused.log"; exit 1; }
+          }
+          DEV_KEYS="0x2b8cfd91b905cae31d41e7dedf4a927ee3bc429aad7e344d59d2810d82876c32 0x2aaa6c24a758209e90aced1f10277b762a7c1115dbc0e16ac276fc2c671a861f 0x1812b84c2101217b0939a2f542535075eeaa81d07dab701a899a55db26e85be4 0x0be80d0f61a801533a94a03b12683474f86ca012941db1c568c53dc877b16fd6"
+          WIDE_KEYS="0x05503c73ffee28fcacc324d533595173a637420b99492265bf57c2c286f59cd7 9223372036854775867 9223372036854775849 0x2f46a27130a593f9edcbdaf446ca1029bb5c18d0c9a12ac3c7e9be74b61444f1"
+          simulate deployment.json 31337 $DEV_KEYS
+          check deployment.json 31337 0 $DEV_KEYS
+          simulate deployment-wide-keys.json 31337 $WIDE_KEYS
+          check deployment-wide-keys.json 31337 0 $WIDE_KEYS
+          refuses "STATE_SIGNING_KEY_X/Y is not a Baby-JubJub point" simulate deployment-bad-keys.json 31337 11 12 13 14
+          # Without GASLESS=0 the gasless block runs, and an empty state has no EntryPoint v0.7.0 runtime.
+          GASLESS=1 refuses "ENTRY_POINT is not EntryPoint v0.7.0" simulate deployment-no-entrypoint.json 31337 $DEV_KEYS
+          (
+            export OWNER=0x000000000000000000000000000000000000dEaD TREASURY=0x000000000000000000000000000000000000bEEF MAX_PAUSE_DURATION_SECONDS=604800
+            for chain in 11155111 1; do
+              refuses "setup dev is single-party: off local chains it deploys only with ALLOW_DEV_SETUP=1" \
+                simulate deployment-single-party.json "$chain" $WIDE_KEYS
+              ALLOW_DEV_SETUP=1 simulate "deployment-single-party-$chain.json" "$chain" $WIDE_KEYS
+              check "deployment-single-party-$chain.json" "$chain" 1 $WIDE_KEYS
+            done
+            # Off local chains the paymaster's stake and deposit amounts have no defaults, and are
+            # required before the chain is looked at.
+            GASLESS=1 ALLOW_DEV_SETUP=1 refuses "PAYMASTER_STAKE_WEI" simulate deployment-sepolia-no-stake.json 11155111 $WIDE_KEYS
+            sed 's/"setup_id": "dev"/"setup_id": "mpc-1"/' "$ZKAPI_SETUP_DIR/manifest.json" > ../../.demo/relabelled-mpc-1.json
+            for chain in 11155111 1; do
+              SETUP_MANIFEST="$PWD/../../.demo/relabelled-mpc-1.json" \
+                refuses "mpc-1 is not pinned yet|mpc-1 verifying keys are not the ceremony's" \
+                simulate deployment-relabelled.json "$chain" $WIDE_KEYS
+            done
+          )
+          # The gasless block, simulated (no --broadcast) against an Anvil that carries the canonical
+          # EntryPoint v0.7.0 and SenderCreator runtimes, etched from the fixtures the Forge tests
+          # etch (a public chain has them deployed). PAYMASTER_OWNER is not the deployer, as with a
+          # multisig: the script deploys the paymaster with the deployer as owner, stakes it and
+          # its factory, funds the deposit and nominates the owner (paymasterOwnershipTransferPending).
+          # The manifest's eight runtime codehashes are recomputed from both projects' artifacts
+          # only: a dry run deploys nothing, so none of its addresses has code to compare with
+          # (--check --rpc would report every one as empty); the chain's two etched runtimes are
+          # proven with cast, and the broadcast step audits a finalized manifest against its chain.
+          RPC=http://127.0.0.1:8545
+          anvil --port 8545 --silent &
+          trap 'kill $!' EXIT
+          for _ in $(seq 100); do cast block-number --rpc-url "$RPC" > /dev/null 2>&1 && break; sleep 0.1; done
+          etch() { cast rpc anvil_setCode "$1" "$(cat "../../protocol/contracts/test/fixtures/$2")" --rpc-url "$RPC" > /dev/null; }
+          etch 0x0000000071727De22E5E9d8BAf0edAc6f37da032 entrypoint-v0.7.0.runtime.hex
+          etch 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C sender-creator-v0.7.0.runtime.hex
+          test "$(cast keccak "$(cast code 0x0000000071727De22E5E9d8BAf0edAc6f37da032 --rpc-url "$RPC")")" = 0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58
+          test "$(cast keccak "$(cast code 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C --rpc-url "$RPC")")" = 0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689
+          PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+            OUTPUT_PATH="$PWD/../../.demo/deployment-gasless.json" \
+            SETUP_MANIFEST="$ZKAPI_SETUP_DIR/manifest.json" \
+            PAYMASTER_OWNER=0x000000000000000000000000000000000000dEaD PAYMASTER_FEE_KEEPER=0x000000000000000000000000000000000000Fee1 \
+            STATE_SIGNING_KEY_X=0x2b8cfd91b905cae31d41e7dedf4a927ee3bc429aad7e344d59d2810d82876c32 \
+            STATE_SIGNING_KEY_Y=0x2aaa6c24a758209e90aced1f10277b762a7c1115dbc0e16ac276fc2c671a861f \
+            CLEARANCE_SIGNING_KEY_X=0x1812b84c2101217b0939a2f542535075eeaa81d07dab701a899a55db26e85be4 \
+            CLEARANCE_SIGNING_KEY_Y=0x0be80d0f61a801533a94a03b12683474f86ca012941db1c568c53dc877b16fd6 \
+            forge script script/Deploy.s.sol --rpc-url "$RPC"
+          node -e 'const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const addr = /^0x[0-9a-fA-F]{40}$/; const hash = /^0x[0-9a-f]{64}$/; const wei = /^(0|[1-9][0-9]*)$/; const gp = m.paymasterGasPolicy ?? {}; if (m.deploymentStatus !== "simulated" || m.entryPoint.toLowerCase() !== "0x0000000071727de22e5e9d8baf0edac6f37da032" || m.entryPointRuntimeCodehash !== "0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58" || m.senderCreator.toLowerCase() !== "0xefc2c1444ebcc4db75e7613d20c6a62ff67a167c" || m.senderCreatorRuntimeCodehash !== "0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689" || ![m.withdrawalPaymaster, m.withdrawalAccountFactory, m.withdrawalAccountImplementation].every(a => addr.test(a)) || ![m.paymasterRuntimeCodehash, m.factoryRuntimeCodehash, m.accountImplementationRuntimeCodehash, m.accountCreationCodeKeccak256].every(h => hash.test(h)) || !/^0x[0-9a-f]{148}$/.test(m.accountCreationCode) || m.paymasterOwner.toLowerCase() !== "0x000000000000000000000000000000000000dead" || m.paymasterOwnershipTransferPending !== true || m.paymasterFeeKeeper.toLowerCase() !== "0x000000000000000000000000000000000000fee1" || m.paymasterStakeWei !== "100000000000000000" || m.factoryStakeWei !== "100000000000000000" || m.paymasterUnstakeDelaySeconds !== 86400 || m.paymasterInitialDepositWei !== "1000000000000000000" || m.paymasterPolicy.maxSponsoredCostWei !== "50000000000000000" || m.paymasterPolicy.flatFeeWei !== "0" || m.paymasterPolicy.minEscapeNetWei !== "10000000000000000" || m.paymasterPolicy.escapesEnabled !== false || m.paymasterFeeCeilings.maxFeeWei !== "100000000000" || m.paymasterFeeCeilings.priorityFeeWei !== "3000000000" || Object.keys(gp).length !== 24 || gp.callFloor.length !== 4 || gp.callCap.length !== 4 || !Object.values(gp).flat().every(Number.isSafeInteger) || gp.maxAttempts !== 3 || ![m.paymasterStakeWei, m.paymasterInitialDepositWei].every(w => wei.test(w))) { console.error(m); process.exit(1); }' ../../.demo/deployment-gasless.json.pending
+          node ../../scripts/expected-codehashes.mjs --artifacts out --deployment ../../.demo/deployment-gasless.json.pending --check > /dev/null
+          node ../../scripts/expected-codehashes.mjs --artifacts ../../protocol/contracts/out --deployment ../../.demo/deployment-gasless.json.pending --check
+
+      # Broadcast to a local Anvil (after 5 empty blocks) and finalize. The
+      # Anvil first gets the canonical EntryPoint v0.7.0 and SenderCreator
+      # runtimes (anvil_setCode from the fixtures), as a public chain has them,
+      # so the broadcast carries the gasless paymaster, its stakes and its
+      # deposit (GASLESS defaults to 1). The provisional manifest is "pending"
+      # with deployBlockLowerBound 5, the simulated head; finalize checks the
+      # creation receipts (the paymaster's included), the eight runtime
+      # codehashes, owner and treasury, and the paymaster's deposit, stakes,
+      # policy, gas policy and owner on chain, and only then writes the
+      # manifest with deployBlock, the block whose state first holds the vault's
+      # code. The profiles then carry the gasless object, and
+      # paymaster-status.mjs reads the float and stakes back. A provisional
+      # manifest the chain contradicts, and a dry run's, are refused, and
+      # nothing is written. A second broadcast with GASLESS=0 finalizes on the
+      # vault's checks alone, with withdrawalPaymaster null.
+      - name: Broadcast the demo deployment to Anvil and finalize its manifest
+        working-directory: demo/contracts
+        run: |
+          RPC=http://127.0.0.1:8546
+          anvil --port 8546 --silent &
+          trap 'kill $!' EXIT
+          for _ in $(seq 100); do cast block-number --rpc-url "$RPC" > /dev/null 2>&1 && break; sleep 0.1; done
+          etch() { cast rpc anvil_setCode "$1" "$(cat "../../protocol/contracts/test/fixtures/$2")" --rpc-url "$RPC" > /dev/null; }
+          etch 0x0000000071727De22E5E9d8BAf0edAc6f37da032 entrypoint-v0.7.0.runtime.hex
+          etch 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C sender-creator-v0.7.0.runtime.hex
+          test "$(cast keccak "$(cast code 0x0000000071727De22E5E9d8BAf0edAc6f37da032 --rpc-url "$RPC")")" = 0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58
+          test "$(cast keccak "$(cast code 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C --rpc-url "$RPC")")" = 0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689
+          cast rpc anvil_mine 5 --rpc-url "$RPC" > /dev/null
+          deploy() {
+            PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+              OUTPUT_PATH="$PWD/../../.demo/$1" \
+              SETUP_MANIFEST="$ZKAPI_SETUP_DIR/manifest.json" \
+              STATE_SIGNING_KEY_X=0x2b8cfd91b905cae31d41e7dedf4a927ee3bc429aad7e344d59d2810d82876c32 \
+              STATE_SIGNING_KEY_Y=0x2aaa6c24a758209e90aced1f10277b762a7c1115dbc0e16ac276fc2c671a861f \
+              CLEARANCE_SIGNING_KEY_X=0x1812b84c2101217b0939a2f542535075eeaa81d07dab701a899a55db26e85be4 \
+              CLEARANCE_SIGNING_KEY_Y=0x0be80d0f61a801533a94a03b12683474f86ca012941db1c568c53dc877b16fd6 \
+              forge script script/Deploy.s.sol --rpc-url "$RPC" --broadcast
+          }
+          deploy anvil.json
+          test ! -e ../../.demo/anvil.json
+          node -e 'const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); if (m.deploymentStatus !== "pending" || m.deployBlockLowerBound !== 5 || "deployBlock" in m || !/^0x[0-9a-fA-F]{40}$/.test(m.withdrawalPaymaster) || m.paymasterOwnershipTransferPending !== false) { console.error(m); process.exit(1); }' ../../.demo/anvil.json.pending
+          node ../../scripts/expected-codehashes.mjs --deployment ../../.demo/anvil.json.pending --rpc "$RPC" --finalize ../../.demo/anvil.json
+          VAULT=$(node -p 'require("../../.demo/anvil.json").vault')
+          BLOCK=$(node -p 'const m = require("../../.demo/anvil.json"); if (m.deploymentStatus !== "deployed" || !(m.deployBlock > 5)) process.exit(1); m.deployBlock')
+          test "$(cast code "$VAULT" --block $((BLOCK - 1)) --rpc-url "$RPC")" = 0x
+          test "$(cast code "$VAULT" --block "$BLOCK" --rpc-url "$RPC")" != 0x
+          # The finalize step saw the paymaster (its creation transaction) and the factory and
+          # account logic its constructor created (their code is on chain and pins the paymaster).
+          PAYMASTER=$(node -p 'const m = require("../../.demo/anvil.json"); if (!/^0x[0-9a-f]{64}$/.test(m.deployTransactions.withdrawalPaymaster)) process.exit(1); m.withdrawalPaymaster')
+          FACTORY=$(node -p 'require("../../.demo/anvil.json").withdrawalAccountFactory')
+          test "$(cast code "$PAYMASTER" --rpc-url "$RPC")" != 0x
+          test "$(cast code "$FACTORY" --rpc-url "$RPC")" != 0x
+          test "$(cast call "$FACTORY" 'paymaster()(address)' --rpc-url "$RPC")" = "$(cast to-check-sum-address "$PAYMASTER")"
+          test "$(cast call "$PAYMASTER" 'factory()(address)' --rpc-url "$RPC")" = "$(cast to-check-sum-address "$FACTORY")"
+          node ../../scripts/expected-codehashes.mjs --deployment ../../.demo/anvil.json --check --rpc "$RPC" > /dev/null
+          node ../../scripts/paymaster-status.mjs --deployment ../../.demo/anvil.json --rpc "$RPC" > ../../.demo/paymaster-status.json
+          node -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); if (s.deposit_wei !== "1000000000000000000" || !s.paymaster_stake.staked || s.paymaster_stake.stake_wei !== "100000000000000000" || !s.factory_stake.staked || s.owner !== "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266" || s.policy.escapes_enabled !== false || s.lost_wei !== "0" || s.open_owed_total_wei !== "0" || s.stranded_open.length !== 0 || s.user_operations.total !== 0) { console.error(s); process.exit(1); }' ../../.demo/paymaster-status.json
+          # The trusted profile from the finalized manifest carries the gasless object. The clientd
+          # profile is not produced here (its placeholders are Sepolia's and Mainnet's, and this
+          # manifest is chain 31337): scripts/v2-acceptance.test.mjs builds it from a Sepolia-chain
+          # manifest with the paymaster and asserts its gasless object and deployment evidence.
+          node ../../scripts/deployment-profile.mjs --finalized ../../.demo/anvil.json --deployment-id ci-anvil-concession-v1 \
+            --protocol-server-url https://api.example --indexer-url https://indexer.example --rpc-url "$RPC" \
+            --verifier-url https://verifier.example --price-feed 0x0000000000000000000000000000000000001234 \
+            --settlement-window-seconds 14705 --bundler-url https://bundler.example/rpc --out ../../.demo/anvil-profile.json
+          node -e 'const g = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).trusted_deployment.gasless; const m = require("../../.demo/anvil.json"); const want = ["entry_point_address", "entry_point_runtime_codehash", "sender_creator_address", "sender_creator_runtime_codehash", "withdrawal_paymaster_address", "withdrawal_paymaster_runtime_codehash", "withdrawal_account_factory_address", "withdrawal_account_factory_runtime_codehash", "withdrawal_account_implementation_address", "withdrawal_account_implementation_runtime_codehash", "account_creation_code", "account_creation_code_keccak256", "bundler_url", "gas_policy", "policy", "fee_ceilings", "uneconomic_fraction_percent"]; if (JSON.stringify(Object.keys(g)) !== JSON.stringify(want) || g.withdrawal_paymaster_address !== m.withdrawalPaymaster.toLowerCase() || g.bundler_url !== "https://bundler.example/rpc" || g.gas_policy.call_default.some((d, k) => d < g.gas_policy.call_floor[k] || d > g.gas_policy.call_cap[k]) || g.gas_policy.max_attempts !== 3 || g.policy.max_sponsored_cost_wei !== "50000000000000000" || g.uneconomic_fraction_percent !== 25) { console.error(g); process.exit(1); }' ../../.demo/anvil-profile.json
+          node -e 'const fs = require("fs"); const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); m.treasury = "0x000000000000000000000000000000000000bEEF"; fs.writeFileSync(process.argv[2], JSON.stringify(m));' ../../.demo/anvil.json.pending ../../.demo/tampered.json.pending
+          node -e 'const fs = require("fs"); const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); m.paymasterInitialDepositWei = "2000000000000000000"; fs.writeFileSync(process.argv[2], JSON.stringify(m));' ../../.demo/anvil.json.pending ../../.demo/tampered-deposit.json.pending
+          for pending in tampered tampered-deposit deployment; do
+            if node ../../scripts/expected-codehashes.mjs --deployment "../../.demo/$pending.json.pending" --rpc "$RPC" --finalize "../../.demo/$pending-final.json"; then
+              echo "finalized $pending.json.pending"; exit 1
+            fi
+            test ! -e "../../.demo/$pending-final.json"
+          done
+          # Without the paymaster (GASLESS=0): the manifest carries withdrawalPaymaster null and
+          # nothing else gasless, finalize checks the vault alone, and the profiles say gasless null.
+          GASLESS=0 deploy anvil-plain.json
+          node ../../scripts/expected-codehashes.mjs --deployment ../../.demo/anvil-plain.json.pending --rpc "$RPC" --finalize ../../.demo/anvil-plain.json > ../../.demo/anvil-plain-finalize.json
+          node -e 'const m = require("../../.demo/anvil-plain.json"); const r = require("../../.demo/anvil-plain-finalize.json"); if (m.deploymentStatus !== "deployed" || m.withdrawalPaymaster !== null || "withdrawalAccountFactory" in m || "withdrawalPaymaster" in m.deployTransactions || "paymaster_runtime_codehash" in r || r.mismatches.length) { console.error(m, r); process.exit(1); }'
+          node ../../scripts/deployment-profile.mjs --finalized ../../.demo/anvil-plain.json --deployment-id ci-anvil-plain-concession-v1 \
+            --protocol-server-url https://api.example --indexer-url https://indexer.example --rpc-url "$RPC" \
+            --verifier-url https://verifier.example --price-feed 0x0000000000000000000000000000000000001234 \
+            --settlement-window-seconds 14705 | node -e 'let s = ""; process.stdin.on("data", d => s += d).on("end", () => { if (JSON.parse(s).trusted_deployment.gasless !== null) process.exit(1); })'
+
+      - name: Test challenge signer against Anvil
+        run: |
+          npm ci --prefix docker/aws/signer --ignore-scripts --no-audit --no-fund
+          ZKAPI_REQUIRE_ANVIL=1 npm run test:anvil --prefix docker/aws/signer
+
+  # The shared withdrawal golden vector (design §11 WP-F): a real kind-0
+  # escape and kind-1 close, encoded by the Rust (zkapi-serverd,
+  # zkapi-companion), JS (sdk/wallet.js) and Go (zkapi-clientd) encoders, each
+  # byte-equal to Forge's abi.encodeCall and each submitted to a vault on Anvil.
+  withdrawal-golden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: zkapi-clientd/go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Every encoder's golden escape and close lands on an Anvil vault
+        run: node scripts/check-withdrawal-golden.mjs
+
+  # The end-to-end acceptance of circuit zkapi-v2-concession-v1 and the
+  # §10.7 Phase B drill scenarios that run on a local chain
+  # (docs/v2-acceptance.md): contracts deployed by Deploy.s.sol and finalized
+  # on chain, real proofs, the drill build of serverd (--adversary),
+  # indexerd, challengerd behind the signer sidecar, the browser SDK with its
+  # WebAssembly in Node and the clientd companion, on Anvil with mock
+  # provider, OA org and price feed. Writes the run's gas.json.
+  lifecycle-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The version the contracts job pins.
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Run the concession-exit acceptance and drills
+        run: bash scripts/run-v2-acceptance.sh
+
+      - name: Keep acceptance evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-acceptance-evidence
+          path: .zkapi/acceptance/
+          retention-days: 7
 
   docker:
     runs-on: ubuntu-latest
@@ -101,3 +470,14 @@ jobs:
 
       - name: Build Docker image
         run: docker build -f docker/Dockerfile -t ethereum/zkapi:ci .
+
+      - name: The image's zkapi rejects the adversary flag
+        run: |
+          set +e
+          output=$(docker run --rm --entrypoint zkapi ethereum/zkapi:ci --adversary hang serverd 2>&1)
+          status=$?
+          set -e
+          case "$status:$output" in
+            "2:"*"unexpected argument '--adversary'"*) ;;
+            *) echo "the image's zkapi accepted --adversary (exit $status): $output" >&2; exit 1 ;;
+          esac

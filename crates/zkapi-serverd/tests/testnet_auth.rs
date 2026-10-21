@@ -16,8 +16,8 @@ use zkapi_types::Felt252;
 
 const PASSWORD: &str = "testnet-integration-password";
 
-fn router(protected: bool) -> axum::Router {
-    let config = ServerConfig {
+fn config(protected: bool) -> ServerConfig {
+    ServerConfig {
         chain_id: if protected { SEPOLIA_CHAIN_ID } else { 1 },
         contract_address: Felt252::from_u64(123),
         testnet_password: protected.then(|| TestnetPassword::new(PASSWORD).unwrap()),
@@ -29,6 +29,7 @@ fn router(protected: bool) -> axum::Router {
             ttl_seconds: 300,
             settlement_grace_seconds: 5,
             settlement_poll_seconds: 5,
+            settlement_deadline_seconds: zkapi_serverd::config::DEFAULT_SETTLEMENT_DEADLINE_SECONDS,
         }),
         native_billing: Some(NativeBillingConfig {
             rpc_url: "http://127.0.0.1:9".into(),
@@ -36,18 +37,50 @@ fn router(protected: bool) -> axum::Router {
             decimals: 8,
             max_age_seconds: 4500,
         }),
-        proof_setup_dir: format!("{}/../../protocol/setup/v2", env!("CARGO_MANIFEST_DIR")),
+        proof_setup_dir: format!(
+            "{}/../../protocol/setup/v2-concession-dev",
+            env!("CARGO_MANIFEST_DIR")
+        ),
         ..Default::default()
-    };
+    }
+}
+
+fn router(protected: bool) -> axum::Router {
     create_router(Arc::new(
         RequestProcessor::try_new(
-            config,
+            config(protected),
             Arc::new(NullifierStore::in_memory().unwrap()),
-            Arc::new(ServerSigner::new(&Felt252::ONE, &Felt252::from_u64(2))),
+            // Fixture seeds: serving processors refuse the published 0x1/0x2 keys.
+            Arc::new(ServerSigner::new(
+                &Felt252::from_u64(7),
+                &Felt252::from_u64(8),
+            )),
             Felt252::ZERO,
         )
         .unwrap(),
     ))
+}
+
+#[test]
+fn serving_processors_refuse_the_published_development_keys() {
+    for (state, clearance) in [(1, 2), (2, 1), (7, 7)] {
+        let error = RequestProcessor::try_new(
+            config(false),
+            Arc::new(NullifierStore::in_memory().unwrap()),
+            Arc::new(ServerSigner::new(
+                &Felt252::from_u64(state),
+                &Felt252::from_u64(clearance),
+            )),
+            Felt252::ZERO,
+        )
+        .err()
+        .expect("a serving processor accepted a published or reused key")
+        .to_string();
+        assert!(
+            error.contains("refusing to serve"),
+            "seeds {state:#x}/{clearance:#x}: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -67,6 +100,7 @@ async fn all_service_routes_reject_missing_or_wrong_password_before_body_parsing
         ("GET", "/v1/dashboard/summary"),
         ("GET", "/v1/dashboard/recent"),
         ("GET", "/v1/dashboard/events"),
+        ("GET", "/v1/dashboard/settlement"),
         ("POST", "/health"),
         ("GET", "/unknown-future-service"),
     ] {

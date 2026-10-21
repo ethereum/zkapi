@@ -35,8 +35,51 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	confirmationText := flags.String("confirm", "", "confirm an independently submitted matching withdrawal after a finalized local revert")
 	approval := flags.String("approve", "", "approve the displayed withdrawal quote ID")
 	resume := flags.Bool("resume", false, "recover a saved signed withdrawal without authorizing a new transaction")
+	escape := flags.Bool("escape", false, "withdraw by escape, without the operator: shows the decision, then --conceded quotes it")
+	concededText := flags.String("conceded", "", "with --escape: the concession the escape decision showed, confirming it")
+	earlyExitText := flags.String("early-exit", "", "with --escape: exit before a sent request can settle, conceding nothing or the state's bound (nothing|bound)")
+	claim := flags.Bool("claim", false, "deliver an escape payout the vault credited to --to")
+	cancel := flags.Bool("cancel", false, "with --escape: cancel an escape that released no exit proof, so chats resume")
+	feesText := flags.String("fees", "", "how the network fee is paid: wallet (the local signing address; the default, or zkapi.withdrawal_fees) or payout (a sponsored operation paid from the payout; the payout address needs no ETH)")
+	feeCapGwei := flags.Uint64("fee-cap-gwei", 0, "with --fees payout: the most the payout may lose to the network fee and the paymaster's flat fee (for a contract destination, plus the credit surcharge of a failed push), in gwei")
+	bundlerText := flags.String("bundler-url", "", "with --fees payout: your own ERC-4337 bundler (HTTPS, or http:// to this machine); overrides zkapi.bundler_url and the deployment's bundler")
+	allowExpensiveGas := flags.Bool("allow-expensive-gas", false, "with --fees payout: accept a sponsored fee above the deployment's uneconomic fraction of the payout")
+	collect := flags.Bool("collect", false, "with --to: forward a payout waiting in the transit account with a sponsored operation (its fee is taken from the payout)")
+	sweep := flags.Bool("sweep", false, "with --to: deliver a payout waiting in the transit account with a wallet-paid sweep (the account is created first when it has no code)")
+	claimCredit := flags.Bool("claim-credit", false, "with --to: deliver a payout the paymaster credited (wallet-paid claimCredit)")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	options, err := resolveGaslessOptions(c, *feesText, *feeCapGwei, *bundlerText, *allowExpensiveGas, *collect, *sweep, *claimCredit)
+	if err != nil {
+		return err
+	}
+	if *cancel {
+		if !*escape || *claim || *approval != "" || *resume || *confirmationText != "" || *concededText != "" || *earlyExitText != "" || *destinationText != "" || flags.NArg() != 0 {
+			return errors.New("use --escape --cancel alone")
+		}
+		return runEscapeCancel(ctx, c, out)
+	}
+	if *escape || *claim || *concededText != "" || *earlyExitText != "" {
+		if *approval != "" || *resume || *confirmationText != "" || flags.NArg() != 0 || *destinationText == "" || (*escape && *claim) || (!*escape && (*concededText != "" || *earlyExitText != "")) || options.transitAction() {
+			return errors.New("use --escape --to ADDRESS [--conceded AMOUNT] [--early-exit nothing|bound], or --claim --to ADDRESS (--collect, --sweep and --claim-credit go with --to alone)")
+		}
+		destination, err := zkapi.NormalizeWithdrawalDestination(*destinationText)
+		if err != nil {
+			return err
+		}
+		escapeFlow := escapeOptions{destination: destination, claim: *claim, gasless: options}
+		if escapeFlow.earlyExit, err = parseEarlyExit(*earlyExitText); err != nil {
+			return err
+		}
+		if *concededText != "" {
+			conceded, err := strconv.ParseUint(*concededText, 10, 64)
+			if err != nil {
+				return errors.New("--conceded must be the concession in gwei that the escape decision showed")
+			}
+			escapeFlow.conceded = &conceded
+		}
+		return runEscape(ctx, c, escapeFlow, out)
 	}
 	emptyApproval := false
 	flags.Visit(func(f *flag.Flag) {
@@ -49,6 +92,12 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	}
 	if flags.NArg() != 0 || (*approval != "" && (*destinationText != "" || *confirmationText != "" || *resume)) || (*resume && (*destinationText != "" || *confirmationText != "")) {
 		return errors.New("use --to ADDRESS, --approve QUOTE_ID, or --resume separately")
+	}
+	if options.transitAction() && (*destinationText == "" || *confirmationText != "" || *approval != "" || *resume) {
+		return errors.New("use --collect, --sweep or --claim-credit with --to ADDRESS alone")
+	}
+	if (*collect && *sweep) || (*collect && *claimCredit) || (*sweep && *claimCredit) {
+		return errors.New("use one of --collect, --sweep and --claim-credit")
 	}
 	destinationSet, confirmationSet := false, false
 	flags.Visit(func(f *flag.Flag) {
@@ -63,7 +112,6 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 		return errors.New("--confirm requires --to and a valid 32-byte transaction hash")
 	}
 	destination := ""
-	var err error
 	if destinationSet {
 		destination, err = zkapi.NormalizeWithdrawalDestination(*destinationText)
 		if err != nil {
@@ -77,6 +125,14 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	if err != nil {
 		return err
 	}
+	if *approval != "" {
+		// An escape quote (initiation, finalization or claim) is approved
+		// through the escape route.
+		if handled, err := approveEscapeQuote(ctx, c, *approval, out); handled || err != nil {
+			submitted = handled
+			return err
+		}
+	}
 	state, err := requestWithdrawal(ctx, c, http.MethodGet, nil)
 	if err != nil {
 		return err
@@ -86,6 +142,21 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	printWithdrawalProgress(out, state, "ETH")
 	if !destinationSet && *approval == "" && !*resume {
 		withdrawalResumeInstructions(out, state)
+		return nil
+	}
+	if options.transitAction() {
+		// A payout waiting in the transit account or the paymaster: quote
+		// the operation or the wallet-paid transaction that delivers it.
+		if state.Destination != "" && !strings.EqualFold(destination, state.Destination) {
+			return errors.New("the saved withdrawal has another destination; use the saved destination")
+		}
+		body := map[string]any{"destination": destination, "note_id": noteID}
+		options.apply(body, savedWithdrawal(state))
+		quote, err := requestPaymentQuote(ctx, c, http.MethodPost, "/admin/withdrawal/quote", "", body)
+		if err != nil {
+			return err
+		}
+		printPaymentQuote(out, quote, "zkapi-clientd withdraw")
 		return nil
 	}
 	if confirmationSet {
@@ -110,14 +181,14 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 		return errors.New("withdrawal requires recovery; preserve the local funding and companion files")
 	}
 	if *resume {
-		if (state.Phase != "withdrawal_pending" && state.Phase != "confirming") || state.Destination == "" || state.TransactionHash == "" {
+		if (state.Phase != "withdrawal_pending" && state.Phase != "confirming" && !zkapi.GaslessPendingPhase(state.Phase)) || state.Destination == "" || (state.TransactionHash == "" && state.UserOpHash == "") {
 			return errors.New("no signed withdrawal to resume; use --to to prepare and approve a quote")
 		}
 		destination = state.Destination
 	}
 	expectedAmount := state.Amount
 	if *approval != "" {
-		quote, err := requestPaymentQuote(ctx, c, http.MethodGet, "/admin/withdrawal/quote", "withdrawal", nil)
+		quote, err := requestPaymentQuote(ctx, c, http.MethodGet, "/admin/withdrawal/quote", "", nil)
 		if err != nil {
 			return err
 		}
@@ -147,7 +218,7 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 			if err != nil {
 				return err
 			}
-		} else if state.Phase == "withdrawal_pending" || state.Phase == "confirming" {
+		} else if state.Phase == "withdrawal_pending" || state.Phase == "confirming" || zkapi.GaslessPendingPhase(state.Phase) {
 			submitted = true
 			state, err = requestWithdrawal(ctx, c, http.MethodPost, map[string]any{"destination": destination, "note_id": noteID})
 			if err != nil {
@@ -155,7 +226,7 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 			}
 		} else {
 			switch state.Phase {
-			case "ready", "quoted", "waiting_settlement", "waiting_funds", "reverted":
+			case "ready", "quoted", "waiting_settlement", "waiting_funds", "reverted", "gasless_refused", "op_reverted":
 			default:
 				return errors.New("unknown withdrawal status; no request was submitted")
 			}
@@ -166,6 +237,14 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 				}
 				body["retry_transaction_hash"] = state.TransactionHash
 			}
+			if state.Phase == "op_reverted" {
+				// A reverted operation is proved again only with its hash.
+				if !validWithdrawalTransactionHash(state.UserOpHash) {
+					return errors.New("the reverted operation has no valid saved hash")
+				}
+				body["retry_transaction_hash"] = state.UserOpHash
+			}
+			options.apply(body, savedWithdrawal(state))
 			quote, err := requestPaymentQuote(ctx, c, http.MethodPost, "/admin/withdrawal/quote", "withdrawal", body)
 			if err != nil {
 				return err
@@ -190,7 +269,11 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 		switch state.Phase {
 		case "complete":
 			return nil
-		case "withdrawal_pending", "confirming":
+		case "withdrawal_pending", "confirming", "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
+		case "op_reverted":
+			return errors.New("the sponsored operation reverted; follow the status message (withdraw --collect or --sweep when the payout waits in the transit account, or rerun --to to prove again)")
+		case "gasless_refused":
+			return errors.New("the gasless path stopped: " + state.GaslessRefusal + "; rerun --to to try again, or --to with --fees wallet to pay the fee from the local signing address")
 		case "waiting_settlement":
 			return errors.New("withdrawal is waiting for the inference lease to settle; rerun --to to prepare a fresh quote afterward")
 		case "waiting_funds":
@@ -218,13 +301,30 @@ func printWithdrawalProgress(out io.Writer, state zkapi.AddressWithdrawalStatus,
 	if state.Destination != "" && state.Phase != "ready" {
 		fmt.Fprintf(out, "Saved withdrawal: %s %s to %s\n", fundingUnits(strconv.FormatUint(state.Amount, 10), decimals), token, state.Destination)
 	}
-	fmt.Fprintf(out, "%s: %s\n", state.Phase, state.Message)
+	phase := state.Phase
+	if state.PayoutCredited {
+		phase = "payout credited, not delivered"
+	}
+	fmt.Fprintf(out, "%s: %s\n", phase, state.Message)
 	if state.TransactionHash != "" {
 		fmt.Fprintln(out, "Transaction:", state.TransactionHash)
+	}
+	if state.UserOpHash != "" {
+		fmt.Fprintln(out, "Operation:", state.UserOpHash)
+	}
+	if state.TransitAccount != "" {
+		fmt.Fprintf(out, "Fee: %s; transit account: %s\n", state.FeePayer, state.TransitAccount)
+	}
+	if state.GaslessAdvisory != "" {
+		fmt.Fprintln(out, "Note:", state.GaslessAdvisory)
+	}
+	if state.ReceivedWei != "" {
+		fmt.Fprintf(out, "Received by the payout address: %s ETH (sponsored fee %s ETH, earlier debt paid %s ETH)\n", fundingUnits(state.ReceivedWei, 18), fundingUnits(zeroIfEmpty(state.ChargedWei), 18), fundingUnits(zeroIfEmpty(state.OwedPaidWei), 18))
 	}
 	if state.ActualFeeWei != "" {
 		fmt.Fprintf(out, "Actual network fee: %s ETH\n", fundingUnits(state.ActualFeeWei, 18))
 	}
+	printEscapePayoutCredits(out, state.EscapePayoutCredits)
 }
 
 func withdrawalResumeInstructions(out io.Writer, state zkapi.AddressWithdrawalStatus) {
@@ -233,7 +333,7 @@ func withdrawalResumeInstructions(out io.Writer, state zkapi.AddressWithdrawalSt
 		return
 	}
 	if state.Destination != "" && state.Phase != "ready" {
-		if state.Phase == "withdrawal_pending" || state.Phase == "confirming" {
+		if state.Phase == "withdrawal_pending" || state.Phase == "confirming" || zkapi.GaslessPendingPhase(state.Phase) {
 			fmt.Fprintln(out, "To recover this signed withdrawal, run zkapi-clientd withdraw --resume (keep the same --config-dir if used).")
 		} else {
 			fmt.Fprintf(out, "To quote this saved withdrawal again, run zkapi-clientd withdraw --to %s (keep the same --config-dir if used).\n", state.Destination)
@@ -304,13 +404,100 @@ func requestWithdrawalPath(ctx context.Context, c config.Config, method, path st
 		if _, err := zkapi.NormalizeWithdrawalDestination(state.Destination); err != nil {
 			return state, errors.New("invalid saved withdrawal destination")
 		}
-	} else if state.Phase == "withdrawal_pending" || state.Phase == "confirming" || state.Phase == "complete" || state.Phase == "reverted" {
+	} else if state.Phase == "withdrawal_pending" || state.Phase == "confirming" || state.Phase == "complete" || state.Phase == "reverted" || zkapi.GaslessPhase(state.Phase) {
 		return state, errors.New("saved withdrawal destination is missing")
 	}
 	if state.TransactionHash != "" && !validWithdrawalTransactionHash(state.TransactionHash) {
 		return state, errors.New("invalid saved withdrawal transaction")
 	}
+	if (state.UserOpHash != "" && !validWithdrawalTransactionHash(state.UserOpHash)) || (state.TransitAccount != "" && !fundingAddress(state.TransitAccount)) || (state.ReceivedWei != "" && !fundingBalance(state.ReceivedWei)) {
+		return state, errors.New("invalid saved withdrawal operation")
+	}
 	return state, nil
+}
+
+func zeroIfEmpty(value string) string {
+	if value == "" {
+		return "0"
+	}
+	return value
+}
+
+// gaslessOptions are the gasless flags of a withdrawal command (design
+// 3.3), resolved from the flags, then the configuration. feesNamed records
+// that --fees was given on the command line: a named mode is always sent to
+// the daemon (a named "wallet" falls a saved sponsored withdrawal back to
+// the wallet-paid path, a named "payout" takes it back), while the
+// configured default is sent only for a new withdrawal (a plain rerun keeps
+// a saved withdrawal's fee mode, whatever zkapi.withdrawal_fees says).
+type gaslessOptions struct {
+	fees              string
+	feesNamed         bool
+	feeCapGwei        uint64
+	bundlerURL        string
+	allowExpensiveGas bool
+	collect           bool
+	sweep             bool
+	claimCredit       bool
+}
+
+func resolveGaslessOptions(c config.Config, fees string, feeCapGwei uint64, bundlerURL string, allowExpensiveGas, collect, sweep, claimCredit bool) (gaslessOptions, error) {
+	feesNamed := fees != ""
+	if fees == "" {
+		fees = c.ZKAPI.WithdrawalFees
+	}
+	if fees == "" {
+		fees = "wallet"
+	}
+	if fees != "wallet" && fees != "payout" {
+		return gaslessOptions{}, errors.New("--fees must be wallet or payout")
+	}
+	if bundlerURL == "" {
+		bundlerURL = c.ZKAPI.BundlerURL
+	}
+	if bundlerURL != "" {
+		if err := zkapi.ValidateBundlerURL(bundlerURL); err != nil {
+			return gaslessOptions{}, err
+		}
+	}
+	return gaslessOptions{fees: fees, feesNamed: feesNamed, feeCapGwei: feeCapGwei, bundlerURL: bundlerURL, allowExpensiveGas: allowExpensiveGas, collect: collect, sweep: sweep, claimCredit: claimCredit}, nil
+}
+
+func (o gaslessOptions) transitAction() bool { return o.collect || o.sweep || o.claimCredit }
+
+// apply adds the options a quote request carries. The fee mode is sent
+// when --fees was named, or, for a configured payout default, only when no
+// withdrawal is saved (saved): a plain rerun keeps the saved withdrawal's
+// mode, so a record the owner moved to the wallet is not switched back to
+// the sponsored path. The wallet default adds nothing.
+func (o gaslessOptions) apply(body map[string]any, saved bool) {
+	if o.feesNamed || (o.fees == "payout" && !saved) {
+		body["fees"] = o.fees
+	}
+	if o.bundlerURL != "" {
+		body["bundler_url"] = o.bundlerURL
+	}
+	if o.feeCapGwei != 0 {
+		body["fee_cap_gwei"] = o.feeCapGwei
+	}
+	if o.allowExpensiveGas {
+		body["allow_expensive_gas"] = true
+	}
+	if o.collect {
+		body["collect"] = true
+	}
+	if o.sweep {
+		body["sweep"] = true
+	}
+	if o.claimCredit {
+		body["claim_credit"] = true
+	}
+}
+
+// savedWithdrawal reports a status with a saved withdrawal or escape (a
+// reservation for its destination), whose fee mode a plain rerun keeps.
+func savedWithdrawal(state zkapi.AddressWithdrawalStatus) bool {
+	return state.Destination != "" && state.Phase != "ready" && state.Phase != "no_note"
 }
 
 func validWithdrawalTransactionHash(value string) bool {

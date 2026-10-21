@@ -34,7 +34,7 @@ func TestInitializeNetworkProxySelection(t *testing.T) {
 
 func TestOnlyConfigAndServeCommandsAreAvailable(t *testing.T) {
 	t.Setenv("ZKAPI_CLIENTD_CONFIG_DIR", filepath.Join(t.TempDir(), "profile"))
-	for _, command := range []string{"tickets", "init", "start", "fund", "withdraw", "status", "api-key"} {
+	for _, command := range []string{"tickets", "init", "start", "fund", "withdraw", "status", "api-key", "set-model", "set-rewriter", "set-cover", "set-vault-protocol"} {
 		if err := run([]string{command}); err == nil {
 			t.Fatalf("accepted removed command %s", command)
 		}
@@ -49,16 +49,24 @@ func TestExplicitConfigurationDirectoryOverridesLegacySelection(t *testing.T) {
 	unused := filepath.Join(t.TempDir(), "unused")
 	t.Setenv("ZKAPI_CLIENTD_CONFIG_DIR", unused)
 	dir := filepath.Join(t.TempDir(), "selected")
-	if err := run([]string{"--config-dir", dir, "config", "--status"}); err != nil {
+	c, err := config.Default()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatal("explicit profile not selected", err)
+	if err := config.Init(dir, c); err != nil {
+		t.Fatal(err)
+	}
+	c, err = config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"--config-dir", dir, "config"}); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := os.Stat(unused); !os.IsNotExist(err) {
 		t.Fatal("default override was used despite explicit directory")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "config.json")); !os.IsNotExist(err) {
-		t.Fatal("status created a wallet")
+	if after, err := config.Load(dir); err != nil || after != c {
+		t.Fatal("display changed configuration", err)
 	}
 }

@@ -1,6 +1,10 @@
 // Host integration is explicit: importing the SDK does not create a worker,
 // connect a wallet, fetch configuration, or enable an application proxy.
-let options = Object.freeze({ transport: null, configUrl: null, workerUrl: null, mode: 'browser', requestTestnetPassword: null });
+// provingKeysBaseUrlOverride lets exits fetch the withdrawal key from another
+// origin (design §6.4 E7) when the host is gone or hostile; the build-pinned
+// SHA-256 still applies.
+let options = Object.freeze({ transport: null, configUrl: null, workerUrl: null, mode: 'browser', requestTestnetPassword: null,
+    provingKeysBaseUrlOverride: null });
 let initializing = false;
 
 function absoluteUrl(value, label) {
@@ -20,7 +24,8 @@ export function configureBrowserSdk(next = {}) {
     if (!next || typeof next !== 'object' || Array.isArray(next)) {
         throw new TypeError('zkAPI browser SDK configuration must be an object.');
     }
-    const unknown = Object.keys(next).filter(key => !['transport', 'configUrl', 'workerUrl', 'mode', 'requestTestnetPassword'].includes(key));
+    const unknown = Object.keys(next).filter(key => !['transport', 'configUrl', 'workerUrl', 'mode', 'requestTestnetPassword',
+        'provingKeysBaseUrlOverride'].includes(key));
     if (unknown.length) throw new TypeError(`Unknown zkAPI browser SDK option: ${unknown.join(', ')}.`);
     const merged = { ...options, ...next };
     if (merged.transport !== null && typeof merged.transport !== 'function') {
@@ -34,6 +39,10 @@ export function configureBrowserSdk(next = {}) {
     }
     merged.configUrl = absoluteUrl(merged.configUrl, 'configUrl');
     merged.workerUrl = absoluteUrl(merged.workerUrl, 'workerUrl');
+    merged.provingKeysBaseUrlOverride = absoluteUrl(merged.provingKeysBaseUrlOverride, 'provingKeysBaseUrlOverride');
+    if (merged.provingKeysBaseUrlOverride && !merged.provingKeysBaseUrlOverride.endsWith('/')) {
+        throw new TypeError('provingKeysBaseUrlOverride must end with a slash.');
+    }
     options = Object.freeze(merged);
     return options;
 }

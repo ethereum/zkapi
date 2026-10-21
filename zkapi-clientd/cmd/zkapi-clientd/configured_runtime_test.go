@@ -183,9 +183,24 @@ func TestConfigPaymentRequiresConsentAndRejectsReplacedQuote(t *testing.T) {
 						}
 						return
 					}
+					if kind == "withdrawal" && r.URL.Path == "/admin/return" {
+						state := returnTestStatus("ready")
+						state["eth_balance"] = "0"
+						_ = json.NewEncoder(w).Encode(state)
+						return
+					}
+					if r.URL.Path == prefix+"/gasless" {
+						_ = json.NewEncoder(w).Encode(map[string]any{"available": false, "reason": "gasless_unavailable"})
+						return
+					}
 					if r.URL.Path == prefix {
 						if kind == "withdrawal" {
 							state := withdrawalTestStatus("ready")
+							if approvals > 0 {
+								state["phase"] = "complete"
+								state["destination"] = withdrawalTestDestination
+								state["transaction_hash"] = "0x" + strings.Repeat("b", 64)
+							}
 							state["deployment_id"] = paymentTestQuote(kind).DeploymentID
 							_ = json.NewEncoder(w).Encode(state)
 						} else {

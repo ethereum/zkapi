@@ -1,142 +1,146 @@
+//! Real-proof fixtures for the Solidity adapter tests, proved with the
+//! shipping `CircomReduction` prover:
+//!
+//! ```text
+//! cargo run --release -p zkapi-proof --example solidity_fixture -- ../setup/v2-concession-dev
+//! ```
+//!
+//! Prints JSON: for each statement its `public_inputs` (serde), `inputs_abi`
+//! (the static Solidity tuple: one 32-byte word per public input, in order)
+//! and `proof_hex` (256 bytes). Statements: a genesis and a signed request,
+//! an escape with `c = 0` and with `c > 0`, a genesis escape with `c > 0`, a
+//! mutual close, an ownership proof and an escape to a full 160-bit
+//! destination.
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::Serialize;
 use zkapi_core::v2 as core;
 use zkapi_proof::compact::{
-    balance_commitment, rerandomize, CompactSigner, RequestProver, RequestVerifier,
-    RequestWitnessData, WithdrawalProver, WithdrawalVerifier, WithdrawalWitnessData,
+    RequestProver, RequestVerifier, WithdrawalProver, WithdrawalVerifier, CIRCUIT_ID,
 };
-use zkapi_types::{Felt252, RequestPublicInputsV2, WithdrawalPublicInputsV2, MERKLE_DEPTH};
+use zkapi_proof::dev::{tree_with, DevDeployment, DevNote, DevRequest, DevWithdrawal};
+use zkapi_types::wire::Groth16ProofWire;
+use zkapi_types::{Felt252, RequestPublicInputsV2, WithdrawalKind, WithdrawalPublicInputsV2C};
+
+const TIMESTAMP: u64 = 2_000_000_000;
+const VALID_UNTIL: u64 = TIMESTAMP + 10_800;
 
 #[derive(Serialize)]
 struct Fixture<T> {
     public_inputs: T,
+    inputs_abi: String,
     proof_hex: String,
 }
 
 #[derive(Serialize)]
 struct Fixtures {
+    circuit_id: &'static str,
+    setup_id: String,
     request: Fixture<RequestPublicInputsV2>,
-    withdrawal: Fixture<WithdrawalPublicInputsV2>,
+    request_signed: Fixture<RequestPublicInputsV2>,
+    withdrawal: Fixture<WithdrawalPublicInputsV2C>,
+    escape_c0: Fixture<WithdrawalPublicInputsV2C>,
+    escape_genesis_concession: Fixture<WithdrawalPublicInputsV2C>,
+    close: Fixture<WithdrawalPublicInputsV2C>,
+    ownership: Fixture<WithdrawalPublicInputsV2C>,
+    escape_full_destination: Fixture<WithdrawalPublicInputsV2C>,
+}
+
+fn encode(inputs: &[Felt252], proof: &Groth16ProofWire) -> Result<(String, String)> {
+    let words = inputs
+        .iter()
+        .flat_map(|field| field.as_bytes().iter().copied())
+        .collect::<Vec<_>>();
+    let proof = base64::engine::general_purpose::STANDARD
+        .decode(&proof.proof)
+        .context("decode proof")?;
+    Ok((
+        format!("0x{}", hex::encode(words)),
+        format!("0x{}", hex::encode(proof)),
+    ))
 }
 
 fn main() -> Result<()> {
     let setup = std::env::args()
         .nth(1)
         .context("usage: solidity_fixture SETUP_DIRECTORY")?;
-    let secret = Felt252::from_u64(42);
-    let deposit_amount = 1_000_000u128;
-    let expiry = 4_000_000_000u64;
-    let note_id = 0u32;
-    let zero_hashes = core::zero_hashes();
-    let siblings: [Felt252; MERKLE_DEPTH] = zero_hashes[..MERKLE_DEPTH].try_into().unwrap();
-    let registration = core::registration_commitment(&secret);
-    let leaf = core::note_leaf(note_id, &registration, deposit_amount, expiry);
-    let root = core::merkle_root(note_id, &leaf, &siblings);
-    let state_signer = CompactSigner::from_seed(&Felt252::from_u64(1));
-    let clearance_signer = CompactSigner::from_seed(&Felt252::from_u64(2));
-    let state_key = state_signer.public_key();
-    let clearance_key = clearance_signer.public_key();
-    let contract_address = Felt252::from_u64(0x1234);
-    let current_anchor = Felt252::ONE;
-    let blinding = Felt252::from_u64(7);
-    let rerandomization = Felt252::from_u64(9);
-    let anonymous = rerandomize(
-        &balance_commitment(deposit_amount, &blinding, &leaf),
-        &rerandomization,
-    )?;
-    let nullifier = core::nullifier(&secret, &current_anchor);
-    let request_context = Felt252::from_u64(99);
-    let request_public = RequestPublicInputsV2 {
-        protocol_version: 2,
-        chain_id: 31_337,
-        contract_address,
-        active_root: root,
-        state_signing_key_x: state_key.x,
-        state_signing_key_y: state_key.y,
-        request_time: 2_000_000_000,
+    let requests = RequestProver::load(&setup)?;
+    let request_verifier = RequestVerifier::load(&setup)?;
+    let withdrawals = WithdrawalProver::load(&setup)?;
+    let withdrawal_verifier = WithdrawalVerifier::load(&setup)?;
+
+    let deployment = DevDeployment::new(31_337, Felt252::from_u64(0x1234));
+    let note = DevNote {
+        secret: Felt252::from_u64(42),
+        note_id: 0,
+        deposit_amount: 1_000_000,
+        expiry: 4_000_000_000,
+    };
+    let tree = tree_with(&[&note]);
+    let s0 = note.genesis(Felt252::from_u64(7));
+    let r0 = DevRequest {
+        request_time: TIMESTAMP,
         solvency_bound: 500_000,
-        request_nullifier: nullifier,
-        authorization_tag: core::authorization_tag(&nullifier, &request_context),
-        anonymous_commitment_x: anonymous.x,
-        anonymous_commitment_y: anonymous.y,
+        request_context: Felt252::from_u64(99),
+        rerandomization: Felt252::from_u64(9),
     };
-    let request_proof = RequestProver::load(&setup)?.prove(
-        &request_public,
-        RequestWitnessData {
-            secret,
-            request_context,
-            note_id,
-            deposit_amount,
-            expiry,
-            merkle_siblings: siblings,
-            current_balance: deposit_amount,
-            current_blinding: blinding,
-            rerandomization,
-            current_anchor,
-            is_genesis: true,
-            state_signature: None,
-        },
-    )?;
-    assert!(RequestVerifier::load(&setup)?.verify(&request_public, &request_proof)?);
+    let s1 = s0.successor(&deployment, &r0, 120_000, &Felt252::from_u64(17))?;
+    let r1 = DevRequest {
+        solvency_bound: 300_000,
+        request_context: Felt252::from_u64(100),
+        rerandomization: Felt252::from_u64(11),
+        ..r0.clone()
+    };
+    assert_eq!(s1.anchor, core::next_anchor(&s0.nullifier()));
 
-    let destination = [0x11u8; 20];
-    let destination_felt = Felt252::try_from_bytes_be({
-        let mut bytes = [0u8; 32];
-        bytes[12..].copy_from_slice(&destination);
-        bytes
-    })
-    .map_err(anyhow::Error::msg)?;
-    let withdrawal_public = WithdrawalPublicInputsV2 {
-        protocol_version: 2,
-        chain_id: 31_337,
-        contract_address,
-        active_root: root,
-        state_signing_key_x: state_key.x,
-        state_signing_key_y: state_key.y,
-        clearance_signing_key_x: clearance_key.x,
-        clearance_signing_key_y: clearance_key.y,
-        note_id,
-        final_balance: deposit_amount,
-        destination,
-        withdrawal_nullifier: nullifier,
-        has_clearance: false,
-        withdrawal_tag: core::withdrawal_tag(&nullifier, &destination_felt, deposit_amount, false),
+    let request = |state: &zkapi_proof::dev::DevState, r: &DevRequest| -> Result<Fixture<_>> {
+        let (public, witness) = state.request(&deployment, &tree, r)?;
+        let proof = requests.prove(&public, witness)?;
+        anyhow::ensure!(request_verifier.verify(&public, &proof)?);
+        let (inputs_abi, proof_hex) = encode(&public.to_field_elements(), &proof)?;
+        Ok(Fixture {
+            public_inputs: public,
+            inputs_abi,
+            proof_hex,
+        })
     };
-    let withdrawal_proof = WithdrawalProver::load(&setup)?.prove(
-        &withdrawal_public,
-        WithdrawalWitnessData {
-            secret,
-            deposit_amount,
-            expiry,
-            merkle_siblings: siblings,
-            final_blinding: blinding,
-            current_anchor,
-            is_genesis: true,
-            state_signature: None,
-            clearance_signature: None,
-        },
-    )?;
-    assert!(WithdrawalVerifier::load(&setup)?.verify(&withdrawal_public, &withdrawal_proof)?);
+    let withdrawal = |state: &zkapi_proof::dev::DevState,
+                      kind: WithdrawalKind,
+                      destination: [u8; 20],
+                      conceded: u128|
+     -> Result<Fixture<_>> {
+        let (public, witness) = state.withdrawal(
+            &deployment,
+            &tree,
+            &DevWithdrawal {
+                kind,
+                destination,
+                conceded,
+                valid_until: VALID_UNTIL,
+            },
+        )?;
+        let proof = withdrawals.prove(&public, witness)?;
+        anyhow::ensure!(withdrawal_verifier.verify(&public, &proof)?);
+        let (inputs_abi, proof_hex) = encode(&public.to_field_elements(), &proof)?;
+        Ok(Fixture {
+            public_inputs: public,
+            inputs_abi,
+            proof_hex,
+        })
+    };
 
-    let proof_hex = |proof: &zkapi_types::wire::Groth16ProofWire| -> Result<String> {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&proof.proof)
-            .context("decode proof")?;
-        Ok(format!("0x{}", hex::encode(bytes)))
+    let fixtures = Fixtures {
+        circuit_id: CIRCUIT_ID,
+        setup_id: requests.setup_id().to_string(),
+        request: request(&s0, &r0)?,
+        request_signed: request(&s1, &r1)?,
+        withdrawal: withdrawal(&s1, WithdrawalKind::Escape, [0x11; 20], r1.solvency_bound)?,
+        escape_c0: withdrawal(&s1, WithdrawalKind::Escape, [0x11; 20], 0)?,
+        escape_genesis_concession: withdrawal(&s0, WithdrawalKind::Escape, [0x11; 20], 250_000)?,
+        close: withdrawal(&s1, WithdrawalKind::MutualClose, [0x11; 20], 0)?,
+        ownership: withdrawal(&s1, WithdrawalKind::Ownership, [0; 20], 0)?,
+        escape_full_destination: withdrawal(&s1, WithdrawalKind::Escape, [0xff; 20], 0)?,
     };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&Fixtures {
-            request: Fixture {
-                public_inputs: request_public,
-                proof_hex: proof_hex(&request_proof)?,
-            },
-            withdrawal: Fixture {
-                public_inputs: withdrawal_public,
-                proof_hex: proof_hex(&withdrawal_proof)?,
-            },
-        })?
-    );
+    println!("{}", serde_json::to_string_pretty(&fixtures)?);
     Ok(())
 }

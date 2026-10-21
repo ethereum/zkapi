@@ -1,10 +1,14 @@
 name: zkapi
 
 x-daemon: &daemon
-  image: zkapi/aws:${ZKAPI_IMAGE_TAG:-note-bound-v1}
+  image: zkapi/aws:${ZKAPI_IMAGE_TAG:-concession-v1}
   build:
     context: ../..
     dockerfile: docker/Dockerfile
+    # 1 builds a single-party image (README.md, "Single-party setup"); the
+    # gateway takes the same value.
+    args:
+      ALLOW_DEV_SETUP: ${ALLOW_DEV_SETUP:-}
   entrypoint: ["zkapi-run"]
   restart: unless-stopped
   read_only: true
@@ -28,11 +32,36 @@ services:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/indexer.env
     healthcheck:
+      # 200 only while a verified view is served. The start period covers a full
+      # replay from DEPLOY_BLOCK (first start of a new checkpoint, or a resync);
+      # health turns 200 as soon as the replay verifies against the vault.
       test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:3001/health"]
       interval: 10s
       timeout: 6s
       retries: 6
-      start_period: 60s
+      start_period: 900s
+
+  # Creates or migrates /data/server.db and binds it to the deployment
+  # manifest, before the challenger and the server start (order: indexer,
+  # db-init, challenger, server).
+  db-init:
+    <<: *daemon
+    command: ["db-init"]
+    restart: "no"
+    env_file:
+      - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
+    volumes:
+      - ${ZKAPI_DATA_DIR:-/var/lib/zkapi}:/data
+      - &manifest
+        type: bind
+        source: ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.json
+        target: /srv/zkapi/deployment.json
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      indexer:
+        condition: service_started
 
   server:
     <<: *daemon
@@ -40,15 +69,23 @@ services:
     env_file:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/server.env
+    volumes:
+      - ${ZKAPI_DATA_DIR:-/var/lib/zkapi}:/data
+      - *manifest
     depends_on:
+      # Not service_healthy: a stale, diverged or replaying indexer answers 503,
+      # which the server tolerates; it must not keep the API down.
       indexer:
-        condition: service_healthy
+        condition: service_started
+      db-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:3000/health"]
       interval: 10s
       timeout: 6s
       retries: 3
-      start_period: 30s
+      # Covers the startup vault signing-key check and its RPC retries.
+      start_period: 120s
 
   challenger:
     <<: *daemon
@@ -57,14 +94,28 @@ services:
     env_file:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/challenge.env
+    volumes:
+      - ${ZKAPI_DATA_DIR:-/var/lib/zkapi}:/data
+      - *manifest
     depends_on:
-      server:
-        condition: service_healthy
+      # The challenger opens the server database read-only: `zkapi db init`
+      # created it and its deployment binding. An unhealthy API or indexer
+      # must never keep it down.
+      db-init:
+        condition: service_completed_successfully
       signer:
         condition: service_healthy
+    healthcheck:
+      # Liveness of the poll loop only. /health returns 503 for alarms (a
+      # missed deadline, a diverged indexer) and is for alerting, not restarts.
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:3002/livez"]
+      interval: 10s
+      timeout: 6s
+      retries: 3
+      start_period: 60s
 
   signer:
-    image: zkapi/signer:${ZKAPI_IMAGE_TAG:-note-bound-v1}
+    image: zkapi/signer:${ZKAPI_IMAGE_TAG:-concession-v1}
     build:
       context: ./signer
     profiles: ["challenge"]
@@ -91,10 +142,12 @@ services:
         max-file: "5"
 
   gateway:
-    image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-note-bound-v1}
+    image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v1}
     build:
       context: ../..
       dockerfile: docker/aws/Dockerfile.gateway
+      args:
+        ALLOW_DEV_SETUP: ${ALLOW_DEV_SETUP:-}
     user: "101:101"
     entrypoint: ["nginx", "-g", "daemon off;"]
     restart: unless-stopped

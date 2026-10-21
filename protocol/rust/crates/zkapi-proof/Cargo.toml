@@ -11,6 +11,7 @@ zkapi-core   = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 hex          = { workspace = true }
+sha2         = { workspace = true }
 sha3         = { workspace = true }
 anyhow          = { workspace = true }
 ark-bn254 = { workspace = true }
@@ -19,6 +20,7 @@ ark-ec = { workspace = true }
 ark-ed-on-bn254 = { workspace = true }
 ark-ff = { workspace = true }
 ark-groth16 = { workspace = true }
+ark-poly = { workspace = true }
 ark-r1cs-std = { workspace = true }
 ark-relations = { workspace = true }
 ark-serialize = { workspace = true }
@@ -26,3 +28,39 @@ ark-snark = { workspace = true }
 ark-std = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
+
+# The ceremony import's powers-of-tau hash (`ceremony::Ptau::blake2b512`).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+blake2 = { workspace = true }
+
+[features]
+# Accept the single-party development and rehearsal setups (`dev`,
+# `rehearsal`) and unpinned `mpc-1` keys. Tests and CI enable it, and so do
+# the production builds of a single-party vault (deployed with Deploy.s.sol's
+# ALLOW_DEV_SETUP=1), on their command line only when asked: ALLOW_DEV_SETUP=1
+# for docker/Dockerfile and zkapi-clientd/scripts/build-native.sh, `--setup
+# dev` for scripts/build-browser-client.sh. Never enable it on a dependency of
+# a production binary: Cargo unifies features across the packages of one
+# build, so every build would accept development keys. Default release builds
+# leave it off and accept only the pinned `mpc-1` keys
+# (`compact::CEREMONY_VK_KECCAK256`). `cargo run -p zkapi-proof --bin
+# release_policy_check` checks this, and that those builds do not enable it
+# unless asked.
+dev-setup = []
+# The `dev` fixtures (published development signing keys, notes and state
+# chains). Changes no acceptance policy. Key generation (`compact::setup`)
+# needs no feature.
+dev-fixtures = []
+
+[dev-dependencies]
+# Turns on both features for this crate's own tests and examples.
+zkapi-proof = { path = ".", features = ["dev-setup", "dev-fixtures"] }
+
+# Independent implementations for the reduction cross-check, the R1CS
+# fidelity tests and the ceremony import (examples/import_zkey.rs). Never
+# linked into the library or the WebAssembly build.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+ark-circom = { version = "=0.5.0", default-features = false }
+# ark-circom 0.5.0 needs a wasmer engine feature to compile; it is unused here.
+wasmer = { version = "4.4.0", default-features = false, features = ["sys"] }
+wasmer-wasix = { version = "0.28.0", default-features = false, features = ["sys"] }

@@ -41,13 +41,13 @@ func TestPaymentQuoteRejectsInvalidAuthorizationBindings(t *testing.T) {
 	}
 }
 
-func TestPaymentQuoteShowsExactWeiShortfallAndUSDSelection(t *testing.T) {
+func TestPaymentQuoteShowsRoundedMinimumAndUSDSelection(t *testing.T) {
 	q := paymentTestQuote("deposit")
 	q.InputMicroUSD = 2_000_001
 	q.ShortfallWei, q.RecommendedTopUpWei = "1", "1000000001"
 	var out bytes.Buffer
 	printPaymentQuote(&out, q, "zkapi-clientd fund")
-	for _, want := range []string{"Selected USD value: $2.000001", "Required top-up: 0.000000000000000001 ETH", "Recommended top-up including buffer: 0.000000001000000001 ETH", "?value=1000000001", "--approve " + testQuoteID} {
+	for _, want := range []string{"Selected USD value: $2.000001", "Send at least: 0.0000000011 ETH", "?value=1000000001", "--approve " + testQuoteID} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("missing exact quote quantity %q: %s", want, out.String())
 		}

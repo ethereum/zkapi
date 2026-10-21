@@ -37,7 +37,10 @@ export function deriveExpiryRecords(deposits = [], withdrawals = [], nowMs = Dat
         const claim = confirmedClaim(deposit);
         if (!claim && (!Number.isFinite(nowMs) || deposit.expiryTs * 1000 > nowMs || withdrawals.some(record =>
             record.deploymentId === deposit.deploymentId && record.noteId === deposit.noteId
-            && ((record.payoutVerified === true && ['closed', 'closed_unconfirmed'].includes(record.phase))
+            // A credited escape closed the note too: the vault holds its
+            // payout for the destination, so expiry can no longer claim it.
+            && (((record.payoutVerified === true || record.payoutCredited === true)
+                && ['closed', 'closed_unconfirmed'].includes(record.phase))
                 || (record.mode === 'escape'
                 && record.chainStatus === 'pending_withdrawal' && integer(record.startBlockNumber)
                 && record.startBlockNumber > 0 && integer(record.finalizedBlockNumber)

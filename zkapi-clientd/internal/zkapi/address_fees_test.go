@@ -128,7 +128,7 @@ func TestFeeHistoryPinnedToFreshExactLatestHeader(t *testing.T) {
 		})
 	}
 }
-func TestPublicSweepRejectsContractButExactContractReturnSimulates(t *testing.T) {
+func TestPublicSweepAndExactContractReturnSimulate(t *testing.T) {
 	f := newAddressFixture(t, true)
 	_, _ = f.h.Address(context.Background())
 	upstream := f.h.client.inference.Transport
@@ -146,8 +146,8 @@ func TestPublicSweepRejectsContractButExactContractReturnSimulates(t *testing.T)
 		}
 		return upstream.RoundTrip(r)
 	})
-	if _, err := f.h.QuoteAddressReturn(context.Background(), withdrawalTestDestination, ""); err == nil || len(f.submitted) != 0 {
-		t.Fatal("contract sweep accepted")
+	if _, err := f.h.QuoteAddressReturn(context.Background(), withdrawalTestDestination, ""); err != nil || len(f.submitted) != 0 {
+		t.Fatal("contract sweep must simulate without submitting", err)
 	}
 	q, err := f.h.QuoteAddressReturn(context.Background(), withdrawalTestDestination, "123456789123456789")
 	if err != nil {

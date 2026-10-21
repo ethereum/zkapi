@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
 
@@ -23,6 +24,10 @@ type sessionLogCursor struct {
 }
 
 func (s *sessionLogCursor) report(logger *log.Logger, feed zkapi.SessionEvents) {
+	s.reportMode(logger, feed, false)
+}
+
+func (s *sessionLogCursor) reportMode(logger *log.Logger, feed zkapi.SessionEvents, diagnostic bool) {
 	if s.instance != feed.InstanceID {
 		s.instance, s.next = feed.InstanceID, 1
 		s.active = make(map[string]uint64)
@@ -47,6 +52,11 @@ func (s *sessionLogCursor) report(logger *log.Logger, feed zkapi.SessionEvents) 
 			logger.Printf("zkAPI OpenRouter key session %d started", s.serial)
 		case "settled":
 			cost, balance := fundingUnits(*event.ChargeUnits, 9), fundingUnits(*event.BalanceUnits, 9)
+			if diagnostic {
+				logger.Printf("payment settled: charge=%s ETH; private balance=%s ETH; refund/change: not separately reported by wallet (budget was an authorization, not a transfer)", cost, balance)
+				delete(s.active, event.SessionID)
+				continue
+			}
 			if serial, exists := s.active[event.SessionID]; exists {
 				logger.Printf("zkAPI OpenRouter key session %d ended (settled); cost: %s ETH; balance remaining: %s ETH", serial, cost, balance)
 			} else {
@@ -73,7 +83,7 @@ func monitorSessions(ctx context.Context, logger *log.Logger, reader sessionEven
 			return
 		}
 		if err == nil {
-			cursor.report(logger, feed)
+			cursor.reportMode(logger, feed, activity.DiagnosticLevel(ctx) != activity.Normal)
 			failures = 0
 		} else {
 			failures++

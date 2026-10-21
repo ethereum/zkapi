@@ -68,6 +68,29 @@ export function validateNativeQuote(quote, funding, { now = Math.floor(Date.now(
     return quote;
 }
 
+/**
+ * Validate a quote that is already bound into a proved request payload. Its
+ * own fields must be internally consistent and on this deployment's chain, but
+ * it is deliberately not compared with the current feed, decimals or maximum
+ * age pins: those may change after the proof was made, and re-validating a
+ * proof-bound value against mutable configuration would strand its receipt.
+ * Callers still require sameNativeQuote against the settlement payload.
+ */
+export function validateProofBoundQuote(quote, funding) {
+    if (!quote || quote.asset !== 'native_eth' || quote.units_per_eth !== Number(NATIVE_UNITS_PER_ETH)
+        || !Number.isSafeInteger(Number(funding?.chain_id)) || quote.chain_id !== Number(funding.chain_id)
+        || !ADDRESS.test(quote.feed_address || '') || ZERO.test(quote.feed_address)
+        || !Number.isSafeInteger(quote.decimals) || quote.decimals < 0 || quote.decimals > 36
+        || !unsigned(quote.round_id) || BigInt(quote.round_id) <= 0n || BigInt(quote.round_id) >= (1n << 80n)
+        || !unsigned(quote.answer) || BigInt(quote.answer) <= 0n || BigInt(quote.answer) > 1_000_000_000_000_000_000n
+        || !Number.isSafeInteger(quote.updated_at) || quote.updated_at <= 0
+        || !Number.isSafeInteger(quote.expires_at) || quote.expires_at <= quote.updated_at
+        || quote.expires_at - quote.updated_at > 86_400) {
+        throw new Error('The saved request carries an invalid ETH/USD quote.');
+    }
+    return quote;
+}
+
 export function nativeUnitsForUsd(usd, quote) {
     const micros = parseUnits(usd, 6);
     const numerator = micros * NATIVE_UNITS_PER_ETH * 10n ** BigInt(quote.decimals);
@@ -93,14 +116,41 @@ export function nativeDepositValue(amount, funding) {
     return units * NATIVE_WEI_PER_UNIT;
 }
 
+/**
+ * `promise`, or a rejection once `signal` aborts: an RPC call ends at its
+ * timeout even through a host transport that ignores the signal (E0).
+ */
+function untilAborted(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+    return new Promise((resolve, reject) => {
+        const aborted = () => reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+        signal.addEventListener('abort', aborted, { once: true });
+        promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+    });
+}
+
 async function rpc(funding, method, params, signal) {
-    const response = await browserSdkTransport(funding.demo_rpc_url || funding.rpc_url, {
+    const response = await untilAborted(browserSdkTransport(funding.demo_rpc_url || funding.rpc_url, {
         method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'omit',
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal, cache: 'no-store'
-    }, { preferProxy: true });
+    }, { preferProxy: true }), signal);
     if (!response.ok) throw new Error('The ETH price RPC is unavailable. Please check again.');
-    const body = await response.json();
-    if (body.error || body.result == null) throw new Error('The ETH price RPC could not return a verified quote.');
+    const body = await untilAborted(response.json(), signal);
+    if (body.error || body.result == null) {
+        const error = new Error('The ETH price RPC could not return a verified quote.');
+        // The call itself reverted (code 3 on anvil and current geth; older
+        // nodes say so only in the message): an answer about the contract,
+        // not an unavailable RPC.
+        if (body.error && (Number(body.error.code) === 3 || /revert/i.test(String(body.error.message || '')))) {
+            error.code = 'rpc_call_reverted';
+            // The revert data (a custom error, FailedOp of an EntryPoint dry
+            // run): what a sponsored withdrawal decodes.
+            if (body.error.data != null) error.data = body.error.data;
+            error.rpcMessage = body.error.message || null;
+        }
+        throw error;
+    }
     return body.result;
 }
 
@@ -111,6 +161,85 @@ async function assertNativeVaultAtBlock(funding, blockTag, signal) {
         || BigInt(scale) !== NATIVE_WEI_PER_UNIT || BigInt(token) !== 0n) {
         throw new Error('The pinned vault does not accept native ETH in the configured denomination.');
     }
+}
+
+/**
+ * Read one 32-byte word from the pinned vault through the trusted deployment
+ * RPC (never the injected wallet or a server-supplied URL), after checking the
+ * chain. Used as an independent chain witness for server claims.
+ */
+export async function readVaultWord(funding, data, {
+    blockTag = 'latest',
+    signal = AbortSignal.timeout(20_000)
+} = {}) {
+    validateNativeFunding(funding);
+    if (BigInt(await rpc(funding, 'eth_chainId', [], signal)) !== BigInt(funding.chain_id)) {
+        throw new Error('The vault RPC is on the wrong chain.');
+    }
+    const word = await rpc(funding, 'eth_call', [{ to: funding.contract_address, data }, blockTag], signal);
+    if (!/^0x[0-9a-f]{64}$/i.test(word || '')) {
+        throw Object.assign(new Error('The vault returned an invalid value.'), { code: 'vault_value_invalid' });
+    }
+    return BigInt(word);
+}
+
+/**
+ * An EIP-1193-style `request({ method, params })` over the build-pinned RPC,
+ * each call bounded by `timeoutMs`. Exit-mode reads (deployment pins, note
+ * status, finality, the tree rebuild) use it or the user's exit RPC.
+ */
+export function pinnedRpcRequest(funding, { timeoutMs = 20_000, signal = null } = {}) {
+    validateNativeFunding(funding);
+    return ({ method, params = [] }) => {
+        const timeout = AbortSignal.timeout(timeoutMs);
+        return rpc(funding, method, params, signal ? AbortSignal.any([signal, timeout]) : timeout);
+    };
+}
+
+/**
+ * The same over a user-configured exit RPC URL (design §6.4 E0, §6.6). It is
+ * the user's own endpoint, so it is called directly, never through the host's
+ * proxy, and without credentials.
+ */
+export function urlRpcRequest(url, { timeoutMs = 20_000, signal = null, fetchImpl = null } = {}) {
+    const target = exitRpcUrl(url);
+    return async ({ method, params = [] }) => {
+        const timeout = AbortSignal.timeout(timeoutMs);
+        const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        const response = await untilAborted((fetchImpl || globalThis.fetch)(target, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'omit', cache: 'no-store',
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+            signal: callSignal
+        }), callSignal);
+        if (!response.ok) throw new Error(`The exit RPC answered HTTP ${response.status}.`);
+        const body = await untilAborted(response.json(), callSignal);
+        if (body.error) {
+            throw Object.assign(new Error(body.error.message || 'The exit RPC returned an error.'), {
+                code: Number(body.error.code) === 3 || /revert/i.test(String(body.error.message || '')) ? 'rpc_call_reverted' : body.error.code,
+                // The revert data (a custom error, FailedOp of an EntryPoint
+                // dry run): what a sponsored withdrawal decodes.
+                ...(body.error.data != null ? { data: body.error.data } : {})
+            });
+        }
+        return body.result;
+    };
+}
+
+/** A validated exit RPC URL: HTTPS, or HTTP on loopback; no credentials. */
+export function exitRpcUrl(value) {
+    let url;
+    try {
+        url = new URL(String(value));
+    } catch {
+        throw Object.assign(new Error('The exit RPC URL is invalid.'), { code: 'exit_rpc_invalid' });
+    }
+    if (url.username || url.password || (url.protocol !== 'https:'
+        && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)))) {
+        throw Object.assign(new Error('The exit RPC must be an HTTPS (or loopback) URL without credentials.'), {
+            code: 'exit_rpc_invalid'
+        });
+    }
+    return url.href;
 }
 
 export async function assertNativeVault(funding, { signal = AbortSignal.timeout(20_000) } = {}) {

@@ -45,7 +45,7 @@ func testOpenWebUIBurst(t *testing.T, reuseWindow time.Duration, automatic bool)
 		}
 		switch r.URL.Path {
 		case "/oa/v1/status":
-			_ = json.NewEncoder(w).Encode(map[string]any{"bridge_version": 4, "chain_id": 1, "mode": "direct_openrouter", "require_oa_org_key_source": true, "deployment_id": "zkapi-native-eth-mainnet-note-bound-v1-fresh-20260930", "contract_address": "0x4386FDbdA35D995beB3BF8625118Ec5982ec81fe", "billing_asset": "native_eth", "billing_unit": "gwei", "circuit_id": "zkapi-v2-note-bound-v1"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"bridge_version": 5, "chain_id": 1, "mode": "direct_openrouter", "require_oa_org_key_source": true, "deployment_id": "zkapi-native-eth-mainnet-concession-v1-test", "contract_address": "0xC0C0000000000000000000000000000000000001", "billing_asset": "native_eth", "billing_unit": "gwei", "circuit_id": "zkapi-v2-concession-v1", "exit_concession": 1, "setup_id": "dev", "escape_routes_version": 2})
 		case "/oa/v1/lease":
 			body, _ := io.ReadAll(r.Body)
 			if string(body) != `{"request_limit_micro_usd":1000000}` {
@@ -86,6 +86,13 @@ func testOpenWebUIBurst(t *testing.T, reuseWindow time.Duration, automatic bool)
 		case "/chat/pinned-models":
 			body = `{"disabled_models":[]}`
 		case "/api/v1/chat/completions":
+			var request map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("invalid provider request: %v", err)
+			}
+			if string(request["plugins"]) != `[{"id":"web"}]` || string(request["model"]) != `"test/model"` || request["user"] != nil {
+				t.Error("provider request lost default web search, changed the model, or forwarded caller identity")
+			}
 			n := providerCalls.Add(1)
 			wantKey := "Bearer fresh-key-1"
 			if n == 2 && reuseWindow == 0 {

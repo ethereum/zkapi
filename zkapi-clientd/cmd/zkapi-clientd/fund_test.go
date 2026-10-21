@@ -66,7 +66,7 @@ const testQuoteID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 func paymentTestQuote(kind string) zkapi.AddressPaymentQuote {
 	q := zkapi.AddressPaymentQuote{ID: testQuoteID, Kind: kind, Address: "0x1111111111111111111111111111111111111111", ChainID: 1,
-		Contract: "0x4386FDbdA35D995beB3BF8625118Ec5982ec81fe", DeploymentID: "zkapi-native-eth-mainnet-note-bound-v1-fresh-20260930",
+		Contract: "0xC0C0000000000000000000000000000000000001", DeploymentID: "zkapi-native-eth-mainnet-concession-v1-test",
 		Amount: 750001, PrincipalWei: "750001000000000", BalanceWei: "1000000000000000", ExpectedFeeWei: "21000", RequiredFeeWei: "25000", FeeReserveWei: "30000", FeeBufferWei: "5000", RequiredTotalWei: "750001000025000", RecommendedTotalWei: "750001000030000", ShortfallWei: "0", RecommendedTopUpWei: "0",
 		EstimatedGas: 21000, GasLimit: 25000, MaxFeePerGas: "1", MaxPriorityFeePerGas: "1", FeePolicy: "low", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
 	if kind == "withdrawal" {

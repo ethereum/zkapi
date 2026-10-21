@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,7 +23,7 @@ func TestPreparePersistsSecretAndReturnsOnlyPublicFields(t *testing.T) {
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/funding/config":
-			_ = json.NewEncoder(w).Encode(map[string]any{"chain_id": 1, "contract_address": "0x1111111111111111111111111111111111111111", "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": upstream.URL, "demo_private_key": "must never leave companion"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"chain_id": 1, "contract_address": "0x1111111111111111111111111111111111111111", "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": upstream.URL, "indexer_url": upstream.URL, "protocol_server_url": testProtocolServerURL(t, "mainnet"), "demo_private_key": "must never leave companion"})
 		case "/wallet/status":
 			_, _ = io.WriteString(w, `{"has_note":false}`)
 		case "/funding/api/deposit/prepare":
@@ -92,6 +93,12 @@ func TestDemoMintEnabledOnlyForAdvertisedSepoliaDeployment(t *testing.T) {
 		{"wrong deployment chain rejected", "mainnet", 11155111, true, false, true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
+			// No test seam here: the companion must name the packaged
+			// endpoints, which config() checks before any network read.
+			pinned, _, err := pinnedDeployment(scenario.network)
+			if err != nil {
+				t.Fatal(err)
+			}
 			local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Authorization") != "Bearer "+testBridgeToken {
 					t.Error("missing companion authentication")
@@ -102,7 +109,7 @@ func TestDemoMintEnabledOnlyForAdvertisedSepoliaDeployment(t *testing.T) {
 				case "/oa/v1/status":
 					_ = json.NewEncoder(w).Encode(testPolicy(scenario.network))
 				case "/funding/config":
-					_ = json.NewEncoder(w).Encode(map[string]any{"chain_id": scenario.chain, "contract_address": "0x1111111111111111111111111111111111111111", "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": "https://rpc.example", "demo_mint_enabled": scenario.flag})
+					_ = json.NewEncoder(w).Encode(map[string]any{"chain_id": scenario.chain, "contract_address": "0x1111111111111111111111111111111111111111", "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": pinned.RPC, "indexer_url": pinned.IndexerURL, "protocol_server_url": pinned.ProtocolServerURL, "demo_mint_enabled": scenario.flag})
 				default:
 					t.Errorf("unexpected companion request: %s", r.URL.Path)
 				}
@@ -217,20 +224,67 @@ func TestWrappedDepositReceiptRetainsTransactionHashBinding(t *testing.T) {
 	}
 }
 
+// legacyChainServer serves a legacy token deployment's receipts by hash, plus
+// the vault notes() state and an indexer snapshot that both hold the deposit
+// in base (note 12). Receipt and corroboration data share no mutable state.
+func legacyChainServer(t *testing.T, record depositRecord, base ethReceipt, receipt func(hash string, base ethReceipt) any) *httptest.Server {
+	t.Helper()
+	expiry, _ := new(big.Int).SetString(base.Logs[0].Data[66:130], 16)
+	leaves := make([]*big.Int, 13)
+	for i := range leaves {
+		leaves[i] = big.NewInt(int64(0x1000 + i))
+	}
+	leaves[12] = noteLeaf(12, fieldValue(record.Commitment), record.Amount, expiry.Uint64())
+	note := encodeVaultNote(fixtureNote{commitment: record.Commitment, amount: record.Amount, expiry: expiry.Uint64(), status: noteActive})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/tree/snapshot" {
+			_ = json.NewEncoder(w).Encode(snapshotBody(leaves, 0x20, addressTestBlock))
+			return
+		}
+		var request struct {
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		var result any
+		switch request.Method {
+		case "eth_getTransactionReceipt":
+			var hash string
+			_ = json.Unmarshal(request.Params[0], &hash)
+			result = receipt(hash, base)
+		case "eth_chainId":
+			result = "0x1"
+		case "eth_call":
+			result = note
+		case "eth_getBlockByNumber":
+			var number string
+			_ = json.Unmarshal(request.Params[0], &number)
+			result = map[string]string{"number": number, "hash": addressTestBlock}
+		default:
+			t.Errorf("unexpected RPC %s", request.Method)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": result})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func legacyFundingConfig(record depositRecord, upstream *httptest.Server, t *testing.T) map[string]any {
+	return map[string]any{"chain_id": 1, "contract_address": record.Contract, "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": upstream.URL, "indexer_url": upstream.URL, "protocol_server_url": testProtocolServerURL(t, "mainnet")}
+}
+
 func TestFundingConfirmationRetryDoesNotReinitializeSpentNote(t *testing.T) {
 	record := depositRecord{ChainID: 1, Contract: "0x1111111111111111111111111111111111111111", Amount: 100000, Secret: "0x5678", Commitment: "0x1234"}
 	hash := "0x" + strings.Repeat("a", 64)
 	var confirmed atomic.Int32
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receipt := sampleReceipt(record)
-		receipt.TransactionHash = hash
-		_ = json.NewEncoder(w).Encode(map[string]any{"result": receipt})
-	}))
-	defer upstream.Close()
+	upstream := legacyChainServer(t, record, sampleReceipt(record), func(_ string, receipt ethReceipt) any {
+		receipt.TransactionHash, receipt.BlockNumber, receipt.BlockHash = hash, "0x10", addressTestBlock
+		return receipt
+	})
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/funding/config":
-			_ = json.NewEncoder(w).Encode(map[string]any{"chain_id": 1, "contract_address": record.Contract, "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": upstream.URL})
+			_ = json.NewEncoder(w).Encode(legacyFundingConfig(record, upstream, t))
 		case "/wallet/status":
 			_, _ = io.WriteString(w, `{"has_note":true,"note":{"note_id":12,"current_balance":1}}`)
 		case "/funding/api/deposit/confirm":
@@ -261,17 +315,12 @@ func TestWrongOrRevertedDepositHashCanBeCorrected(t *testing.T) {
 			record := depositRecord{ChainID: 1, Contract: "0x1111111111111111111111111111111111111111", Amount: 100000, Secret: "0x5678", Commitment: "0x1234"}
 			wrong := "0x" + strings.Repeat("b", 64)
 			correct := "0x" + strings.Repeat("c", 64)
-			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var request struct {
-					Params []string `json:"params"`
-				}
-				_ = json.NewDecoder(r.Body).Decode(&request)
-				receipt := sampleReceipt(record)
-				receipt.TransactionHash = request.Params[0]
-				if request.Params[0] == wrong {
+			upstream := legacyChainServer(t, record, sampleReceipt(record), func(hash string, receipt ethReceipt) any {
+				receipt.TransactionHash, receipt.BlockNumber, receipt.BlockHash = hash, "0x10", addressTestBlock
+				receipt.Logs = append(receipt.Logs[:0:0], receipt.Logs...)
+				if hash == wrong {
 					if scenario == "unknown" {
-						_, _ = io.WriteString(w, `{"result":null}`)
-						return
+						return nil
 					}
 					if scenario == "reverted" {
 						receipt.Status = "0x0"
@@ -280,14 +329,13 @@ func TestWrongOrRevertedDepositHashCanBeCorrected(t *testing.T) {
 						receipt.Logs[0].Address = receipt.To
 					}
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"result": receipt})
-			}))
-			defer upstream.Close()
+				return receipt
+			})
 			var confirmed atomic.Int32
 			client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/funding/config":
-					_ = json.NewEncoder(w).Encode(map[string]any{"chain_id": 1, "contract_address": record.Contract, "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": upstream.URL})
+					_ = json.NewEncoder(w).Encode(legacyFundingConfig(record, upstream, t))
 				case "/wallet/status":
 					_, _ = io.WriteString(w, `{"has_note":false}`)
 				case "/funding/api/deposit/confirm":
@@ -327,7 +375,7 @@ func TestCompletedDepositIsArchivedBeforeNewNote(t *testing.T) {
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/funding/config":
-			_ = json.NewEncoder(w).Encode(map[string]any{"chain_id": 1, "contract_address": "0x1111111111111111111111111111111111111111", "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": upstream.URL})
+			_ = json.NewEncoder(w).Encode(map[string]any{"chain_id": 1, "contract_address": "0x1111111111111111111111111111111111111111", "demo_billing_token_address": "0x2222222222222222222222222222222222222222", "demo_rpc_url": upstream.URL, "indexer_url": upstream.URL, "protocol_server_url": testProtocolServerURL(t, "mainnet")})
 		case "/wallet/status":
 			_, _ = io.WriteString(w, `{"has_note":false}`)
 		case "/funding/api/deposit/prepare":

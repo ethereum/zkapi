@@ -185,7 +185,7 @@ func TestNativeUSDIntentSurvivesRefreshWithoutRepricing(t *testing.T) {
 }
 func TestNativeWithdrawalQuoteDoesNotSignAndBindsDestination(t *testing.T) {
 	f := newWithdrawalFixture(t, true)
-	q, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, 12, "")
+	q, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, 12, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestNativeWithdrawalQuoteDoesNotSignAndBindsDestination(t *testing.T) {
 		t.Fatalf("withdrawal approval failed: %+v %v", status, err)
 	}
 	before := len(f.submitted)
-	if _, err = f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, 12, ""); err == nil || len(f.submitted) != before {
+	if _, err = f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, 12, "", false); err == nil || len(f.submitted) != before {
 		t.Fatal("readonly withdrawal quote replayed pending signed bytes")
 	}
 }
@@ -280,6 +280,9 @@ func TestPaymentQuoteGetterNeverSigns(t *testing.T) {
 	}
 }
 func ioReadAndRestore(r *http.Request) ([]byte, error) {
+	if r.Body == nil { // Indexer snapshot reads share the transport.
+		return nil, nil
+	}
 	raw, err := io.ReadAll(r.Body)
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	return raw, err
@@ -415,7 +418,7 @@ func TestNativeWithdrawalQuoteReservesSyntheticBalanceForSelfPayout(t *testing.T
 		return upstream.RoundTrip(r)
 	})
 	before := len(f.submitted)
-	quote, err := f.h.QuoteAddressWithdrawal(context.Background(), address.Address, f.noteID, "")
+	quote, err := f.h.QuoteAddressWithdrawal(context.Background(), address.Address, f.noteID, "", false)
 	if err != nil || quote.Destination != address.Address || quote.Amount != f.walletBalance || quotedCalls != 2 || len(f.submitted) != before {
 		t.Fatalf("self-withdrawal quote failed or signed: %+v %v", quote, err)
 	}

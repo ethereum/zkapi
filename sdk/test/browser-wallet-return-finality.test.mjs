@@ -133,7 +133,9 @@ async function scenario({ finalitySupported = true, selected = false, parked = f
             noteId: state.note_id,
             operationId: 'retained-close-authorization',
             clearanceReserved: true,
-            ...(parked ? { submissionOutcome: 'rejected_before_broadcast' } : { transactionHash: TX_HASH }),
+            // Only a close the server granted can be set aside.
+            ...(parked ? { submissionOutcome: 'rejected_before_broadcast', withdrawalNullifier: '0x777',
+                clearance: { withdrawal_nullifier: '0x777', signature: { r: '0x1', s: '0x2' } } } : { transactionHash: TX_HASH }),
             destination: returned.destination,
             public_inputs: { note_id: state.note_id, final_balance: state.current_balance }
         }

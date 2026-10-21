@@ -35,26 +35,43 @@ func runFunding(ctx context.Context, c config.Config, args []string, out io.Writ
 	usdText := flags.String("usd", "", "USD amount converted once to a fixed ETH principal; prepare a quote")
 	approval := flags.String("approve", "", "approve the displayed quote ID")
 	resume := flags.Bool("resume", false, "recover the saved signed deposit without authorizing a new transaction")
+	rebind := flags.Bool("rebind", false, "re-derive the saved deposit's note from finalized vault state and the zkAPI indexer")
+	noteText := flags.String("note-id", "", "with --rebind: the vault note ID that holds the saved deposit")
+	replaceText := flags.String("replace-note-id", "", "with --rebind: the unspent companion note ID to replace")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	emptyValue := false
 	flags.Visit(func(f *flag.Flag) {
-		if (f.Name == "amount" || f.Name == "usd" || f.Name == "approve") && f.Value.String() == "" {
+		if (f.Name == "amount" || f.Name == "usd" || f.Name == "approve" || f.Name == "note-id" || f.Name == "replace-note-id") && f.Value.String() == "" {
 			emptyValue = true
 		}
 	})
 	if emptyValue {
-		return errors.New("amount, USD value, and approval ID cannot be empty")
+		return errors.New("amount, USD value, approval ID, and note IDs cannot be empty")
 	}
 	selected := 0
-	for _, v := range []bool{*amountText != "", *usdText != "", *approval != "", *resume} {
+	for _, v := range []bool{*amountText != "", *usdText != "", *approval != "", *resume, *rebind} {
 		if v {
 			selected++
 		}
 	}
 	if flags.NArg() != 0 || selected > 1 {
-		return errors.New("choose --amount, --usd, --approve, or --resume separately")
+		return errors.New("choose --amount, --usd, --approve, --resume, or --rebind separately")
+	}
+	if !*rebind && (*noteText != "" || *replaceText != "") {
+		return errors.New("--note-id and --replace-note-id are only valid with --rebind")
+	}
+	rebindBody := map[string]uint64{}
+	for name, text := range map[string]string{"note_id": *noteText, "replace_note_id": *replaceText} {
+		if text == "" {
+			continue
+		}
+		id, err := parseNoteID(text)
+		if err != nil {
+			return err
+		}
+		rebindBody[name] = id
 	}
 	var amount, usd uint64
 	var err error
@@ -88,6 +105,20 @@ func runFunding(ctx context.Context, c config.Config, args []string, out io.Writ
 		printFundingProgress(out, state)
 		fmt.Fprintln(out, "Prepare a quote: zkapi-clientd fund --amount 0.00075 (ETH), or zkapi-clientd fund --usd 5.00.")
 		fmt.Fprintln(out, "Recover an already signed deposit: zkapi-clientd fund --resume. Keep the same --config-dir if used.")
+		return nil
+	}
+	if *rebind {
+		// The daemon verifies the binding itself; IDs only select a candidate
+		// or name the one companion note the user agrees to replace.
+		submitted = true
+		state, err = requestFunding(ctx, c, http.MethodPost, "/admin/funding/rebind", rebindBody)
+		if err != nil {
+			return err
+		}
+		printFundingProgress(out, state)
+		if state.Phase != "active" {
+			return errors.New("rebind did not activate the private balance; follow the status message")
+		}
 		return nil
 	}
 	if amount != 0 || usd != 0 {
@@ -174,6 +205,16 @@ func printFundingProgress(out io.Writer, state zkapi.AddressFundingStatus) {
 	if state.ActualFeeWei != "" {
 		fmt.Fprintf(out, "Actual network fee: %s ETH\n", fundingUnits(state.ActualFeeWei, 18))
 	}
+	printEscapePayoutCredits(out, state.EscapePayoutCredits)
+}
+
+// printEscapePayoutCredits reminds of earlier escapes' payouts that the vault
+// still holds for their destinations: a later deposit replaced their
+// withdrawal records, and nothing arrives until someone claims them.
+func printEscapePayoutCredits(out io.Writer, credits []zkapi.EscapePayoutCredit) {
+	for _, credit := range credits {
+		fmt.Fprintf(out, "Unclaimed escape payout: %s\n", credit.Message)
+	}
 }
 
 func waitFundingPoll(ctx context.Context) error {
@@ -185,6 +226,18 @@ func waitFundingPoll(ctx context.Context) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// parseNoteID accepts a decimal 32-bit vault note ID.
+func parseNoteID(value string) (uint64, error) {
+	if value == "" || strings.IndexFunc(value, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+		return 0, errors.New("note IDs must be decimal 32-bit vault note IDs")
+	}
+	id, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return 0, errors.New("note IDs must be decimal 32-bit vault note IDs")
+	}
+	return id, nil
 }
 
 func parseFundingAmount(value string) (uint64, error) {

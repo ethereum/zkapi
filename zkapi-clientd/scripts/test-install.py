@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
@@ -431,8 +432,18 @@ class InstallerTests(unittest.TestCase):
             for architecture in ("amd64", "arm64"):
                 self.fixture(operating_system=operating_system, architecture=architecture)
         directory = self.artifacts / "1.2.3"
-        result = subprocess.run([sys.executable, str(INSTALLER.parent / "scripts/assemble-release.py"),
-                                 "1.2.3", str(directory)], env=self.env, capture_output=True,
+        assemble = [sys.executable, str(INSTALLER.parent / "scripts/assemble-release.py"), "1.2.3", str(directory)]
+        # Design §10.7 D: not before the earlier vault's point release is
+        # published (its checksum record checked in).
+        legacy = re.search(r'LegacyRelease = "zkapi-clientd ([0-9.]+) ',
+                           (INSTALLER.parent / "internal/zkapi/deployments.go").read_text()).group(1)
+        if not (INSTALLER.parent / f"packaging/releases/clientd-{legacy}.json").exists():
+            result = subprocess.run(assemble, env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"clientd-v{legacy}", result.stderr)
+            self.assertIn("10.7 D", result.stderr)
+            self.assertFalse((directory / "install.sh").exists())
+        result = subprocess.run(assemble + ["--fixture"], env=self.env, capture_output=True,
                                 text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = directory / "install.sh"

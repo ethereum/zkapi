@@ -14,7 +14,7 @@ pub mod wire;
 pub use felt::Felt252;
 pub use inputs::{
     canonical_payload_hash, canonical_request_context, canonical_response_hash,
-    RequestPublicInputsV2, WithdrawalPublicInputsV2,
+    RequestPublicInputsV2, WithdrawalKind, WithdrawalPublicInputsV2C,
 };
 pub use note::NullifierStatus;
 pub use signature::SchnorrSignature;

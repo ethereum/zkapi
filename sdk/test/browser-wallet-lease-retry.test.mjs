@@ -1058,19 +1058,21 @@ test('concurrent same-chat requests with different budgets never share the wrong
 
 test('selected cap reaches proof inputs and insufficient funds never start proving', async () => {
     const runtime = runtimeForLeaseRequests();
+    runtime.manifest = { deployment_id: 'selected-cap-test' };
     runtime.config.wallet_core = { policy_charge_cap: 50_000 };
     runtime.config.policy_enabled = true;
     runtime.config.proving_keys = { request: {} };
-    runtime.runtime = { state: { note_id: 44, current_balance: 5_000_000 } };
+    runtime.runtime = { state: { note_id: 44, current_balance: 5_000_000, current_anchor: '0x2c', expiry_ts: 2_000_000_000 } };
     runtime.treePath = async () => ({ active_root: 'root', siblings: [] });
     runtime.commit = async next => { runtime.runtime = next; };
     const proofInputs = [];
     runtime.worker = { call: async (operation, payload) => {
         assert.equal(operation, 'prepareRequest');
         proofInputs.push(payload);
-        const request = { payload: payload.args.payload,
-            public_inputs: { solvency_bound: payload.config.request_charge_cap } };
-        return { journal: { prepared_request: request }, request };
+        const request = { client_request_id: payload.args.client_request_id, payload: payload.args.payload,
+            public_inputs: { request_nullifier: '0x44', solvency_bound: payload.config.request_charge_cap } };
+        return { journal: { client_request_id: request.client_request_id, nullifier: '0x44', prepared_request: request }, request,
+            state: { ...payload.state, bound_at_state: payload.config.request_charge_cap } };
     } };
     await assert.rejects(runtime.prepareLeaseRequest(undefined, null, 6), error => error.required_credits === 6_000_000);
     assert.equal(proofInputs.length, 0);

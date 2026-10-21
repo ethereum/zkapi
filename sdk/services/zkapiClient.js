@@ -1,16 +1,50 @@
 import walletCodec from '../wallet.js';
-import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, nativeDepositValue, parseUnits, formatUnits } from './zkapiNativeEth.mjs';
+import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, nativeDepositValue, parseUnits, formatUnits, NATIVE_WEI_PER_UNIT } from './zkapiNativeEth.mjs';
 import { beginBrowserSdkInitialization } from '../configure.js';
 import browserWalletRuntime from './browserWalletRuntime.js';
-import { contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
-import { bufferedGasLimit } from './zkapiGas.mjs';
+import { ENTRY_POINT_ERRORS, contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
+import { EXIT_FALLBACK_GAS_LIMIT, bufferedGasLimit } from './zkapiGas.mjs';
 import { normalizeWalletError, walletErrorMessage } from './zkapiWalletError.mjs';
 import { backgroundWithdrawalClaims, isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHistory.mjs';
 import { externalRecoveryContext, sameAddress, externalTransactionNonce, assertExternalTransaction,
     hasDurableTransactionHash } from './zkapiExternalTransactions.mjs';
+import { matchEscapePayout } from './zkapiExitPolicy.mjs';
+import { gaslessRecordFields, isGaslessWithdrawal } from './browserWalletStore.js';
+import { gaslessDeploymentError, verifyGaslessDeployment } from './zkapiDeploymentCheck.mjs';
+import {
+    GASLESS_MESSAGES, GASLESS_TIMING, KIND, attemptsKey, availabilityVerdict, buildUserOperation,
+    bumpFees, checkEstimate, decodeAddressWord, decodeBool, decodeGasPolicy, decodePolicy, decodeQuote, decodeWord, dryRunError,
+    encodeAttempts, encodeBalanceOf, encodeCallCap, encodeCredits, encodeEscapeNotePlusOne, encodeGetAddress,
+    encodeGetNonce, encodeGetUserOpHash, encodeHandleOps, encodeOwed, encodeQuote, encodeStranded, gasFields, gaslessAmounts,
+    gaslessError, gaslessPins as gaslessPinsOf, handleOpsCalldataBytes, journalValue, maxCostWei, nonceKeyFor, packNonce, weiString,
+    parseCollected, parseCreditClaimed, parsePayoutCredited, sameGasPolicy, selectFees, settlementOf, toBigInt, emittedUserOpHash,
+    transitAccountAddress, transitInitCode, unpackNonce, userOpHash, userOperationFromJson, userOperationJson,
+    userOperationReceiptTransactionHash
+} from './zkapiGasless.mjs';
 
 const WITHDRAWAL_STORAGE_KEY = 'zkapi-withdrawal-v2';
+// The sponsored path (design §3.2). The dry run of a user operation calls
+// handleOps with a beneficiary that holds no code: eth_call needs no balance.
+const GASLESS_DRY_RUN_BENEFICIARY = '0x000000000000000000000000000000000000dEaD';
+// The pre-flight refusals that come before the fee selection (§3.1 (2) and
+// the policy of (3)); a fee refusal outranks the float, the pause and the attempts.
+const GASLESS_PREFLIGHT_BEFORE_FEES = ['bundler_unavailable', 'bundler_wrong_chain', 'bundler_unsupported_entry_point', 'sponsorship_paused',
+    'escapes_disabled', 'gasless_policy_mismatch'];
+// Silent EntryPoint refusals a bundler may answer a send with are rebuilt at
+// most this many times (the dry run of `prepare` is bounded the same way).
+const GASLESS_BUNDLER_REBUILD_LIMIT = 2;
+// What the bundler learns (design: the operator-run bundler pre-discloses escapes unless the user names their own).
+const GASLESS_BUNDLER_NOTE = 'The bundler (the operator’s unless you set your own) sees the operation, with its note, transit account and payout address, together with this browser’s IP address and timing before it is included; for an escape it learns of the exit before the chain does. A bundler you choose keeps that from the operator.';
+const GASLESS_PRIVACY_NOTE = `The connected account becomes the on-chain owner of this withdrawal’s transit account (visible in the account’s creation data) and receives the payout. A fresh account, which needs no ETH, breaks the link to your funding history. ${GASLESS_BUNDLER_NOTE}`;
+const GASLESS_PRIVACY_NOTE_SEPARATE_PAYOUT = `The connected account becomes the on-chain owner of this withdrawal’s transit account (visible in the account’s creation data); the payout goes to the address you chose. A fresh owner account, which needs no ETH, breaks the link to your funding history. ${GASLESS_BUNDLER_NOTE}`;
+// The record phases claimWithdrawalFinalization accepts (browserWalletStore's claimBrowserWithdrawalFinalization).
+const FINALIZATION_CLAIMABLE_PHASES = new Set(['pending', 'finalizing', 'awaiting_wallet', 'ambiguous']);
+// The vault call a close or escape is priced with before its proof exists:
+// 836 nonzero bytes (16 gas each in preVerificationGas, where a zero byte
+// costs 4), so the quoted maxCost bounds the signed operation's.
+const WORST_CASE_EXIT_CALL = `0x${'ff'.repeat(836)}`;
+const GASLESS_PAYOUT_CONTRACT_WARNING = 'The payout address is a contract. It must accept ETH within 100,000 gas, or the paymaster only credits the payout for a later claim (claimGaslessCredit).';
 // Ethereum's `finalized` block tag is authoritative when the wallet RPC
 // supports it. A confirmation-depth fallback keeps recovery moving on older
 // providers without ever blocking the user from selecting a fresh note.
@@ -22,18 +56,117 @@ const walletProviders = new WeakMap();
 
 const {
     ABI,
+    ESCAPE_PAYOUT_GAS,
+    GASLESS_ABI,
     abiWord,
     addressWord,
     callData,
+    decodePendingConcessions,
+    decodeVaultEvent,
+    encodeClaimCredit,
+    encodeClaimEscapePayout,
+    encodeCreateAccount,
     encodeDeposit,
+    encodeEscapePayoutCredits,
     encodeFinalizeEscape,
+    encodeSweep,
+    encodeTransitWithdraw,
     encodeWithdrawal,
     escapePeriodBadge,
     escapePeriodLabel,
     escapePeriodPhrase,
+    parseEscapePayoutClaim,
     parseNoteDeposited,
     parseWithdrawalReceipt
 } = walletCodec;
+
+// The vault (revision 2 and later) closes an escape even when its push to
+// the destination fails (the destination rejects ETH or needs more than
+// ESCAPE_PAYOUT_GAS): the balance is then credited to
+// escapePayoutCredits(destination) and reaches it only through
+// claimEscapePayout(destination), which anyone may call.
+const ESCAPE_PAYOUT_CREDITED_MESSAGE = 'The escape closed, but the destination did not accept the payout. The vault holds it for that address until it is claimed; anyone can claim it for that address once it accepts ETH.';
+const ESCAPE_PAYOUT_STILL_REJECTED_MESSAGE = 'The destination still does not accept ETH, so the vault keeps its payout. Try the claim again once the address can receive ETH.';
+// A top-level call pays 21,000 intrinsic gas before its target runs, and the
+// vault's value-bearing push adds the 2,300 call stipend. This budget gives
+// the destination the same execution gas as the vault's push.
+const ESCAPE_DESTINATION_CHECK_GAS = 21_000 + ESCAPE_PAYOUT_GAS + 2_300;
+const ESCAPE_DESTINATION_CREDIT_WARNING = 'This address did not accept a plain ETH transfer within the vault’s 100,000-gas payout limit. An escape to it still closes, but the vault would only hold the payout for this address until someone claims it. An escape destination cannot be changed later, so prefer an ordinary account.';
+const DEVICE_NOT_NEWEST_MESSAGE = 'The escape was defeated: another device spent this balance’s next state, so this device is not the newest. Restore the newest backup or exit kit.';
+const CONCESSION_EXCEEDED_BOUND_MESSAGE = 'The escape paid less than this balance minus its last chat’s budget (concession_exceeded_bound). The vault’s accounting is final; report this to the operator.';
+
+// A failed eth_call whose provider reports an EVM failure (a revert, out of
+// gas or an invalid instruction), as opposed to an RPC, network or account error.
+// Geth words halts ("out of gas", "invalid jump destination"); anvil reports
+// them as "EVM error <HaltReason>" ("EVM error OutOfGas") with code -32603,
+// and uses that prefix only for halts. Account and validation failures
+// ("insufficient funds", "header not found") match neither.
+const EXECUTION_FAILURE = /revert|out\s*of\s*gas|gas required exceeds allowance|invalid\s*(?:fe\s*)?opcode|invalid\s*jump|stack\s*(?:under|over)flow|opcode\s*not\s*found|\bEVM error\b/i;
+
+function executionFailure(error) {
+    const queue = [error];
+    const seen = new Set();
+    while (queue.length) {
+        const value = queue.shift();
+        if (value == null) continue;
+        if (typeof value === 'string') {
+            if (EXECUTION_FAILURE.test(value)) return true;
+            continue;
+        }
+        if (typeof value !== 'object' || seen.has(value)) continue;
+        seen.add(value);
+        if (Number(value.code) === 3) return true;
+        for (const field of ['message', 'shortMessage', 'reason', 'error', 'cause', 'originalError', 'data']) {
+            queue.push(value[field]);
+        }
+    }
+    return false;
+}
+
+// The payout reading of a close that a reorganization removed.
+const REOPENED_PAYOUT_FIELDS = Object.freeze({
+    payoutVerified: false,
+    payoutCredited: false,
+    creditedAmount: null,
+    payoutCreditEvidence: null,
+    payoutClaimed: false,
+    payoutClaimEvidence: null,
+    payoutClaimTransactionHash: null,
+    payoutClaimBlockNumber: null,
+    payoutClaimedAmount: null
+});
+
+function rpcQuantity(value) {
+    return `0x${BigInt(value).toString(16)}`;
+}
+
+// The payout fields of a closed withdrawal record, from this pass's receipt
+// evidence (payoutVerified: a receipt proved the payout; payoutCredit: the
+// vault only credited it) and the record's earlier reading. Receipt and claim
+// evidence is kept: a pass that cannot read the receipt again never undoes a
+// proven payout, and a credited escape payout is never reported as paid
+// (payoutVerified) until a claim for its destination is proven. Only a credit
+// inferred from the vault's balance (evidence 'vault_credit') yields, to this
+// escape's own receipt proving that the push was paid. A payout the
+// paymaster credited (`paymasterCredited`, a sponsored operation whose payee
+// refused the push) is likewise never reported as paid until
+// claimGaslessCredit delivers it and clears the flag.
+function closedWithdrawalPayout(record, payoutVerified, payoutCredit) {
+    if (record.paymasterCredited === true && !record.creditClaimTransactionHash) return { payoutVerified: false };
+    const credited = record.payoutCredited === true;
+    if (!payoutCredit && credited && payoutVerified === true && record.payoutCreditEvidence === 'vault_credit') {
+        return { payoutVerified: true, payoutCredited: false, creditedAmount: null, payoutCreditEvidence: null };
+    }
+    if (!payoutCredit && !credited) return { payoutVerified: payoutVerified === true || record.payoutVerified === true };
+    const receiptCredit = payoutCredit?.evidence === 'receipt' ? payoutCredit : null;
+    return {
+        payoutCredited: true,
+        creditedAmount: receiptCredit ? receiptCredit.amount : (record.creditedAmount ?? null),
+        payoutCreditEvidence: receiptCredit ? 'receipt'
+            : (record.payoutCreditEvidence || payoutCredit?.evidence || 'receipt'),
+        payoutVerified: record.payoutClaimed === true
+    };
+}
 
 function readStoredWithdrawal() {
     if (typeof window === 'undefined' || typeof localStorage === 'undefined') return null;
@@ -46,6 +179,12 @@ function readStoredWithdrawal() {
         localStorage.removeItem(WITHDRAWAL_STORAGE_KEY);
         return null;
     }
+}
+
+/** The earliest of the given block numbers (null and undefined ignored), or null. */
+function earliestBlock(...blocks) {
+    const known = blocks.filter(block => block != null && Number.isFinite(Number(block))).map(Number);
+    return known.length ? Math.min(...known) : null;
 }
 
 function normalizeWithdrawalDestination(destination, funding) {
@@ -95,6 +234,43 @@ function isDefinitelyPreBroadcastSendFailure(error) {
     return /insufficient funds(?: for gas| to pay)|intrinsic gas too low|exceeds (?:the )?block gas limit|transaction gas limit too high|gas limit (?:is )?too high|sender account not recognized|unknown account/i.test(message);
 }
 
+// Actionable copy for wallet-gate refusals and vault reverts. error.data keeps
+// the machine-readable details (for example escape_at).
+const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
+    request_settlement_pending: 'A private chat payment for this balance may still settle. A mutual close waits for it; an escape is available now, and from the time shown it concedes at most that chat’s budget.',
+    device_not_newest: 'Another device spent this balance’s next state, so this device is not the newest. Restore the newest backup or exit kit before withdrawing.',
+    exit_locked: 'A withdrawal of this balance is in progress. Finish or cancel it before starting a private chat.',
+    exit_lock_mode: 'An escape proof for this balance may still land, so it can only exit by escape until that proof expires.',
+    exit_lock_state: 'An exit proof of another balance state may still land. Check its status first.',
+    exit_release_pending: 'An earlier exit proof of this balance has expired, and a newer balance state waits until the vault confirms that proof can no longer land. The vault could not be read yet: try again shortly, or set your own exit RPC. Close to the exit deadline the exit goes ahead from the earlier state.',
+    note_near_expiry: 'This balance is too close to its expiry for a new private chat. Withdraw it instead.',
+    invalid_successor: 'The server settled a private request with a successor that fails this wallet’s checks. Only withdrawing remains, conceding at most that request’s budget.',
+    deployment_mismatch: 'This vault does not match the deployment this app pins, so deposits are refused. Existing balances can still be withdrawn.',
+    deployment_unverifiable: 'This app cannot verify its vault deployment, so deposits are refused. Existing balances can still be withdrawn.',
+    canary_cap_exceeded: 'During its launch period this vault takes only limited deposits. Choose a smaller amount.',
+    canary_cap_unverified: 'The vault balance could not be read to check its launch-period limit. Try again.',
+    receipt_unrecoverable: 'The server reports a settled private request for this balance that this browser cannot apply. Only withdrawing remains, conceding at most that request’s budget.',
+    receipt_response_missing: 'The server reports a finalized private request for this balance but returned no receipt. Try again shortly.',
+    receipt_pending_install: 'A settled private request must be applied to this balance first. Select the balance and try again.',
+    request_archive_limit: 'Too many unsettled private requests are recorded for this balance, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw the balance.',
+    withdrawal_submission_pending: 'A withdrawal transaction for this balance is still unresolved. Check its status first.',
+    challenged_nullifier: 'The vault already defeated an escape at this balance state: another device spent its next state. Restore the newest backup or exit kit.',
+    superseded_state: 'The vault already defeated an escape from this balance’s next state: another device holds a newer state. Restore the newest backup or exit kit.',
+    proof_expired: 'The withdrawal proof expired before it was included. Prepare the withdrawal again.',
+    unknown_root: 'The vault does not know this withdrawal proof’s Merkle root. Prepare the withdrawal again.',
+    invalid_destination: 'The vault rejected the withdrawal address. Choose a valid nonzero address.',
+    vault_paused: 'The vault is paused by its owner. Withdrawals reopen at the latest when its pause limit ends.',
+    testnet_password_required: 'Enter the Sepolia password to check this balance’s private request status.',
+    // Sponsored withdrawals (design §3.2).
+    ...GASLESS_MESSAGES
+});
+
+function withdrawalErrorWithMessage(error) {
+    const message = WITHDRAWAL_ERROR_MESSAGES[error?.code];
+    if (message && error && typeof error === 'object') error.shortMessage = message;
+    return error;
+}
+
 function tagTransactionError(error, stage, broadcastPossible, transactionHash = null) {
     const tagged = normalizeWalletError(error);
     tagged.transactionStage = stage;
@@ -141,6 +317,33 @@ function walletNonceNumber(value, depth = 0) {
 
     if (quantity < 0n || quantity > BigInt(Number.MAX_SAFE_INTEGER)) return null;
     return Number(quantity);
+}
+
+/**
+ * The payout a withdrawal started with, as its start receipt states it. An
+ * escape's record follows raises (its finalBalance is the vault's current
+ * pendingWithdrawals amount), so its start is B − concededAtInit (E5); a
+ * record without B and c_init (or a close) started at its finalBalance.
+ */
+function startFinalBalance(record) {
+    if (record?.mode !== 'mutual' && record?.stateBalance != null && record?.concededAtInit != null) {
+        try {
+            const started = BigInt(record.stateBalance) - BigInt(record.concededAtInit);
+            if (started >= 0n) return started;
+        } catch {
+            // A malformed record falls back to its finalBalance.
+        }
+    }
+    return BigInt(record.finalBalance);
+}
+
+// Refusals of an exit that a new proof can cure: valid_until passed (E4.7) or
+// the vault does not know the proof's root (E4.1).
+const REPROVABLE_EXIT_ERRORS = Object.freeze(['proof_expired', 'unknown_root']);
+
+/** The G1 warning (design §2.3) as a status message; amounts are gwei ledger units. */
+function exitCostMessage({ floor, cost }) {
+    return `This balance can return as little as ${formatUnits(floor, 9)} ETH, less than three times the estimated network fee of an escape (${formatUnits(cost, 9)} ETH at the current gas price). Exiting by escape may cost more than it returns.`;
 }
 
 class ZkapiClient extends EventTarget {
@@ -203,6 +406,9 @@ class ZkapiClient extends EventTarget {
         })().catch((error) => {
             this.lastError = error;
             this.loading = false;
+            // A failed start is not kept: the next init() (an exit, for
+            // one) starts again rather than replaying this error.
+            this.initPromise = null;
             this.emitChange('error');
             throw error;
         });
@@ -620,6 +826,8 @@ class ZkapiClient extends EventTarget {
     }
 
     async quoteDepositUsd(usd, { signal } = {}) {
+        // A quote is for a new deposit, which a closed deployment refuses.
+        if (browserWalletRuntime.depositsClosed()) throw browserWalletRuntime.depositsClosedError();
         const price = await this.refreshEthUsdPrice({ signal });
         const amount = nativeUnitsForUsd(usd, price);
         return Object.freeze({ amount: String(amount), ethAmount: formatUnits(amount, 9),
@@ -637,6 +845,7 @@ class ZkapiClient extends EventTarget {
         if (typeof from !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(from) || /^0x0{40}$/i.test(from)) {
             throw new Error('Choose a valid funding address before estimating this deposit.');
         }
+        await this.assertDepositMayStart();
         const funding = this.config.funding;
         const amount = parseUnits(amountInput, 9);
         if (amount <= 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -842,8 +1051,10 @@ class ZkapiClient extends EventTarget {
     }
 
     get withdrawalBlocksChat() {
+        // C3: a held exit lock freezes requests until the exit ends (E6).
         return !!this.activeLateWithdrawal
             || !!this.config?.prepared_withdrawal
+            || !!this.config?.exit?.lock
             || ['prepared', 'submitted', 'pending'].includes(this.withdrawal?.phase);
     }
 
@@ -1110,7 +1321,7 @@ class ZkapiClient extends EventTarget {
     async resumeExternalTransaction({ transaction, hash, context }) {
 
         if (this.depositPromise || this.withdrawPromise || this.finalizePromise
-            || this.backgroundWithdrawalPromises?.size) {
+            || this.payoutClaimPromise || this.backgroundWithdrawalPromises?.size) {
             throw new Error('The original wallet action is still running. Return its transaction ID to that action.');
         }
         const funding = this.config?.funding;
@@ -1119,7 +1330,7 @@ class ZkapiClient extends EventTarget {
             || Number(context.chainId) !== Number(funding?.chain_id)
             || !sameAddress(context.contractAddress, funding?.contract_address)
             || !['deposit', 'withdrawal', 'background-withdrawal',
-                'background-replacement', 'finalization'].includes(context.kind)) {
+                'background-replacement', 'finalization', 'escape-payout-claim'].includes(context.kind)) {
             throw new Error('The saved external transaction belongs to a different payment deployment.');
         }
         await this.assertFundingChain();
@@ -1232,6 +1443,16 @@ class ZkapiClient extends EventTarget {
                     throw new Error('The external transaction no longer matches its saved finalization.');
                 }
                 await browserWalletRuntime.rememberWithdrawalFinalization(record.recordId, hash, reference, metadata);
+            } else if (context.kind === 'escape-payout-claim') {
+                // A claim moves no private state and anyone may send it; keep
+                // its hash so claimEscapePayout can prove the delivery.
+                const record = records.find(entry => entry.recordId === context.recordId);
+                if (!record || record.payoutCredited !== true
+                    || !sameAddress(context.destination, record.destination)
+                    || !sameData(encodeClaimEscapePayout(record.destination))) {
+                    throw new Error('The external transaction no longer matches its saved escape payout claim.');
+                }
+                if (record.payoutClaimed !== true) await this.rememberEscapePayoutClaim(record.recordId, hash);
             } else {
                 throw new Error('The external transaction has an unsupported recovery kind.');
             }
@@ -1249,7 +1470,8 @@ class ZkapiClient extends EventTarget {
         onPrepared = null,
         preparedNonce = null,
         externalRecovery = null,
-        value = 0n
+        value = 0n,
+        { exitEstimate = null } = {}
     ) {
         const normalizedPreparedNonce = preparedNonce == null
             ? null
@@ -1290,7 +1512,27 @@ class ZkapiClient extends EventTarget {
                 || error?.code === 'transaction_gas_limit_exceeded') {
                 throw tagTransactionError(error, 'estimate', false);
             }
-            throw tagTransactionError(contractEstimateError(error), 'estimate', false);
+            const estimateError = contractEstimateError(error);
+            if (!exitEstimate || exitEstimate.blocking?.(estimateError)) {
+                throw tagTransactionError(estimateError, 'estimate', false);
+            }
+            // E4.5: an exit's simulation is advisory. A lagging or lying
+            // wallet RPC cannot stop it: simulate through the user's exit RPC
+            // when one is set, else submit with a fixed, bounded gas limit, and
+            // warn; the wallet still asks the user to confirm.
+            let alternative = null;
+            try {
+                alternative = await exitEstimate.alternative?.({ from: transaction.from, to: transaction.to,
+                    data: transaction.data }) ?? null;
+            } catch {
+                alternative = null;
+            }
+            try {
+                transaction.gas = alternative != null ? bufferedGasLimit(alternative) : `0x${EXIT_FALLBACK_GAS_LIMIT.toString(16)}`;
+            } catch {
+                transaction.gas = `0x${EXIT_FALLBACK_GAS_LIMIT.toString(16)}`;
+            }
+            await exitEstimate.onAdvisory?.(estimateError, { gas: transaction.gas, exitRpcEstimate: alternative });
         }
         let hash;
         try {
@@ -1433,12 +1675,23 @@ class ZkapiClient extends EventTarget {
             commitment: plan.commitment,
             transactionHash: receipt.transactionHash,
             receiptMetadata,
-            expiry_ts: Number(deposited.expiryTs)
+            expiry_ts: Number(deposited.expiryTs),
+            // The root this deposit set: with its path, the note's exit path
+            // for life (Amendment A1). The plan's siblings come along for a
+            // note the background recovery committed first, whose pending
+            // deposit (and its zero_path) is gone by then.
+            deposit_root: `0x${deposited.newRoot.toString(16)}`,
+            zero_path: Array.isArray(plan.zero_path) ? plan.zero_path : null
         });
         const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
         onStatus(balanceRefreshPending
             ? 'Deposit confirmed and saved. The balance display will refresh when available.'
             : 'Private balance is ready.');
+        // G1: a balance smaller than three escape fees is worth less than
+        // its unilateral exit. The gas price read ends within E0's
+        // CALL_TIMEOUT, so a silent wallet cannot hold the confirmation.
+        const costWarning = await browserWalletRuntime.refreshExitCost({ request: request => this.ethereum.request(request) });
+        if (costWarning) onStatus(exitCostMessage(costWarning));
         return {
             status: 'confirmed',
             balanceRefreshPending,
@@ -1500,6 +1753,8 @@ class ZkapiClient extends EventTarget {
                     if (receiptMetadata) { confirmedReceipt = candidate; break; }
                 } catch { /* Vault recovery remains available when fee evidence is temporarily unavailable. */ }
             }
+            const recoveredDeposit = confirmedReceipt
+                ? parseNoteDeposited(confirmedReceipt, this.config.funding.contract_address) : null;
             await browserWalletRuntime.confirmDeposit({
                 operationId: plan.operationId,
                 secret: plan.secret,
@@ -1508,7 +1763,9 @@ class ZkapiClient extends EventTarget {
                 commitment: plan.commitment,
                 transactionHash: receiptMetadata?.transactionHash || null,
                 receiptMetadata,
-                expiry_ts: note.expiryTs
+                expiry_ts: note.expiryTs,
+                ...(recoveredDeposit && recoveredDeposit.noteId === BigInt(plan.next_note_id)
+                    ? { deposit_root: `0x${recoveredDeposit.newRoot.toString(16)}` } : {})
             });
             const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
             onStatus(balanceRefreshPending
@@ -1781,9 +2038,22 @@ class ZkapiClient extends EventTarget {
         }
     }
 
+    /**
+     * On a deployment the pinned profile closed to deposits, refuse before any
+     * chain read or wallet prompt unless a deposit was already started (it
+     * stays completable and recoverable). The runtime enforces the same rule
+     * under its wallet lock.
+     */
+    async assertDepositMayStart() {
+        if (browserWalletRuntime.depositsClosed() && !(await browserWalletRuntime.pendingDeposit())) {
+            throw browserWalletRuntime.depositsClosedError();
+        }
+    }
+
     async performDeposit(amountInput, onStatus = () => {}, { preparedOperationId = null } = {}) {
         await this.ensureTestnetAccess({ interactive: true });
         if (this.hasNote) throw new Error('This client already has an active private note.');
+        await this.assertDepositMayStart();
         const funding = this.config?.funding;
         validateNativeFunding(funding);
         await assertNativeVault(funding);
@@ -1818,6 +2088,15 @@ class ZkapiClient extends EventTarget {
         }
         const balance = BigInt(await this.ethereum.request({ method: 'eth_getBalance', params: [address, 'latest'] }));
         if (balance < nativeDepositValue(amount, funding)) throw new Error('Your wallet needs more ETH for this deposit and its network fee.');
+        // Design §6.5: the deployment pins, through the provider that will
+        // sign and through the pinned RPC, and the canary caps, before every
+        // deposit. A mismatch refuses the deposit; exits stay allowed.
+        onStatus('Verifying the vault deployment…');
+        const provider = this.ethereum;
+        await browserWalletRuntime.verifyDeploymentForDeposit({
+            walletRequest: args => provider.request(args),
+            depositWei: nativeDepositValue(amount, funding)
+        });
 
         onStatus('Generating the private note commitment locally…');
         let plan = await browserWalletRuntime.prepareDeposit(Number(amount), { preparedOperationId });
@@ -1910,7 +2189,22 @@ class ZkapiClient extends EventTarget {
         return this.confirmBrowserDepositReceipt(plan, receipt, vaultAddress, onStatus);
     }
 
-    async withdraw(mode, onStatus = () => {}, { destination } = {}) {
+    /**
+     * Withdraw the selected balance. `mode` 'mutual' asks for a cooperative
+     * close where the exit rules allow one (design §6.4 E2); the rules may
+     * turn it into an escape. 'escape' exits unilaterally now. `concede`
+     * ('zero', the default, or 'bound') is the concession of an escape
+     * forced before its settlement time T (E3).
+     */
+    async withdraw(mode, onStatus = () => {}, {
+        destination,
+        concede = 'zero',
+        fees = 'wallet',
+        feeCapWei = null,
+        bundlerUrl = null,
+        allowExpensiveGas = false,
+        selfBundle = false
+    } = {}) {
         // The password dialog must not transfer an earlier withdrawal click
         // to a successor note installed by another tab while it was open.
         const expectedNoteId = this.note?.note_id;
@@ -1921,12 +2215,37 @@ class ZkapiClient extends EventTarget {
             throw new Error('The private balance changed while withdrawal was opening. Review the current balance before continuing.');
         }
         const requestedDestination = normalizeWithdrawalDestination(destination, this.config?.funding);
-        const operationKey = `${mode}:${requestedDestination || ''}`;
+        if (!['zero', 'bound'].includes(concede)) throw new TypeError('Choose zero or bound for a forced escape.');
+        // `fees: 'payout'` pays the network fee from the payout through the
+        // withdrawal paymaster (design §3.2); 'wallet' is today's path.
+        if (!['wallet', 'payout'].includes(fees)) throw new TypeError('Choose wallet or payout for the withdrawal fees.');
+        const operationKey = `${mode}:${requestedDestination || ''}:${concede}${fees === 'payout' ? ':payout' : ''}`;
         if (this.withdrawPromise) {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const operation = this.performWithdrawal(mode, onStatus, { destination });
+        const options = { destination, concede, fees, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle };
+        const operation = (async () => {
+            try {
+                return await this.performWithdrawal(mode, onStatus, options);
+            } catch (error) {
+                // The escape gate contacts the server only at a state already
+                // sent with a private request; its Sepolia password prompt
+                // then belongs to this explicit action.
+                if (mode !== 'escape' || error?.code !== 'testnet_password_required') {
+                    throw withdrawalErrorWithMessage(error);
+                }
+                await this.ensureTestnetAccess({ interactive: true });
+                if (this.note?.note_id !== expectedNoteId) {
+                    throw new Error('The private balance changed while withdrawal was opening. Review the current balance before continuing.');
+                }
+                try {
+                    return await this.performWithdrawal(mode, onStatus, options);
+                } catch (retryError) {
+                    throw withdrawalErrorWithMessage(retryError);
+                }
+            }
+        })();
         this.withdrawPromise = operation;
         this.withdrawPromiseKey = operationKey;
         try {
@@ -1939,21 +2258,48 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async performWithdrawal(mode, onStatus = () => {}, { destination: requested } = {}) {
+    async performWithdrawal(mode, onStatus = () => {}, {
+        destination: requested,
+        concede = 'zero',
+        fees = 'wallet',
+        feeCapWei = null,
+        bundlerUrl = null,
+        allowExpensiveGas = false,
+        selfBundle = false
+    } = {}) {
         const requestedDestination = normalizeWithdrawalDestination(requested, this.config?.funding);
         const note = this.note;
         if (!note) throw new Error('There is no active private note to withdraw.');
         if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
+        if (!['wallet', 'payout'].includes(fees)) throw new TypeError('Choose wallet or payout for the withdrawal fees.');
         await this.assertBalanceNotClaimed(note.note_id);
-
-        await this.settleActiveLease(onStatus);
 
         onStatus('Connecting to MetaMask…');
         const from = await this.connectWallet();
+        if (fees === 'payout') {
+            // The sponsored path (design §3.2) branches here: the plan is
+            // bound to a transit account, every read goes to the read RPC and
+            // no transaction is ever sent from the wallet.
+            return this.performGaslessWithdrawal(mode, onStatus, {
+                requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from, note,
+                durablePrepared: await browserWalletRuntime.currentPreparedWithdrawal()
+            });
+        }
+        // G1: warn when this balance returns less than three escape fees.
+        // The gas price read is advisory and never delays the exit: the
+        // warning is shown when the read completes.
+        void browserWalletRuntime.refreshExitCost({ request: request => this.ethereum.request(request) })
+            .then(costWarning => {
+                if (costWarning) onStatus(exitCostMessage(costWarning));
+            }, () => {});
         // MetaMask connection can outlive a cross-tab update. Re-read the
         // durable plan under the wallet lock instead of trusting the UI/config
         // snapshot that existed before the prompt opened.
         const durablePrepared = await browserWalletRuntime.currentPreparedWithdrawal();
+        // A sponsored plan paid from a wallet after all (the direct-call
+        // fallback of §3.1) keeps its destination, the transit account: the
+        // payout then waits there for sweepTransit.
+        const sponsoredPlan = isGaslessWithdrawal(durablePrepared);
         const prepared = durablePrepared
             ? {
                 mode: durablePrepared.mode,
@@ -1965,8 +2311,15 @@ class ZkapiClient extends EventTarget {
             }
             : this.config?.prepared_withdrawal;
         if (prepared?.transaction_hash) mode = prepared.mode;
+        // A sponsored plan's vault destination is its transit account S; the
+        // host names the payout address Y it chose for the sponsored attempt
+        // (design §3.2), so the guard compares Y (S itself is accepted too).
+        // The transaction still pays S.
+        const boundDestinations = sponsoredPlan
+            ? [durablePrepared.payout, durablePrepared.destination].filter(Boolean).map(address => String(address).toLowerCase())
+            : [String(prepared?.destination || '').toLowerCase()];
         if (requestedDestination && prepared?.destination
-            && prepared.destination.toLowerCase() !== requestedDestination) {
+            && !boundDestinations.includes(requestedDestination)) {
             throw new Error('This withdrawal is already bound to a different destination. Resume it with its saved address.');
         }
         // The connected account only pays gas. A resumed plan keeps its
@@ -1986,7 +2339,37 @@ class ZkapiClient extends EventTarget {
         let submittedHash = prepared?.transaction_hash || null;
         let submission = null;
         let submissionMetadata = null;
-        const attempts = 3;
+        // The vault accepts any root it ever held and exits carry no Merkle
+        // path, so a saved proof is reused until its valid_until (E4.7). An
+        // expired proof or UnknownRoot() re-proves.
+        const withdrawalAttempts = 4;
+        let reprove = false;
+        // After UnknownRoot the next proof takes its path at any other root:
+        // the indexer checked against the vault, or the vault's logs (E4.1,
+        // §6.6), never the refused one. The wallet provider is read before
+        // the pinned RPC when no exit RPC is set.
+        let refusedRoot = null;
+        const walletRequest = request => this.ethereum.request(request);
+        // A simulation refusal re-proves once per reason; after that it only
+        // warns (E4.5).
+        const reproved = new Set();
+        // An escape's destination is fixed once its proof exists. Before
+        // proving, check the vault's payout push to it: a destination that
+        // rejects ETH is only credited, which anyone can claim for it later.
+        let destinationWarning = null;
+        if (mode === 'escape' && !submittedHash) {
+            try {
+                // A zero balance is never pushed. Otherwise a nominal value
+                // keeps the balance out of this read.
+                const destinationCheck = await this.checkEscapeDestination(destination, {
+                    finalBalance: Number(note.current_balance) > 0 ? 1 : 0
+                });
+                destinationWarning = destinationCheck?.warning || null;
+            } catch (error) {
+                if (error?.code === 'wrong_network') throw error;
+            }
+            if (destinationWarning) onStatus(destinationWarning);
+        }
         try {
             if (submittedHash) {
                 // A broadcast hash owns recovery. Never read a new root or
@@ -1999,19 +2382,48 @@ class ZkapiClient extends EventTarget {
                 }
                 onStatus(`Checking submitted transaction ${this.compact(submittedHash)}…`);
                 receipt = await this.waitForReceipt(submittedHash);
-            } else for (let attempt = 0; attempt < attempts; attempt += 1) {
+            } else for (let attempt = 0; attempt < withdrawalAttempts; attempt += 1) {
                 onStatus(attempt === 0
                     ? (mode === 'mutual'
-                        ? 'Requesting server clearance and generating the withdrawal proof…'
-                        : 'Generating a unilateral escape proof locally…')
-                    : 'The vault changed during preparation. Refreshing the Merkle path and proof…');
-                const expectedActiveRoot = await this.readContractUint(
-                        this.config.funding.contract_address,
-                        `0x${ABI.currentRoot}`
-                    );
-                plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, { expectedActiveRoot });
+                        ? 'Checking this balance and requesting a cooperative close…'
+                        : 'Preparing a unilateral escape locally…')
+                    : 'The withdrawal proof expired or the vault refused its root. Proving again…');
+                const expectedActiveRoot = mode === 'mutual'
+                    ? await this.readContractUint(this.config.funding.contract_address, `0x${ABI.currentRoot}`)
+                    : null;
+                try {
+                    plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
+                        expectedActiveRoot,
+                        reprove,
+                        earlyConcession: concede,
+                        walletRequest,
+                        ...(refusedRoot != null ? { refusedRoot } : {}),
+                        onProgress: (_phase, message) => onStatus(message)
+                    });
+                } catch (error) {
+                    // E4.5 is advisory: when no path at another root can be
+                    // found after UnknownRoot, the proof that exists is
+                    // submitted anyway (its refusal then only warns).
+                    if (refusedRoot == null || error?.data?.exit_path_unavailable !== true
+                        || attempt + 1 >= withdrawalAttempts) throw error;
+                    onStatus(`No Merkle path at another root was found (${error.message}). The existing proof is submitted anyway; if the vault does not know its root, the transaction reverts and costs only gas.`);
+                    refusedRoot = null;
+                    reprove = false;
+                    continue;
+                }
+                for (const warning of plan.warnings || []) {
+                    if (warning?.message) onStatus(`${warning.message} It can still be submitted.`);
+                }
                 if (Number(plan.public_inputs?.note_id) !== Number(note.note_id)) {
                     throw new Error('The private wallet returned a withdrawal for a different note.');
+                }
+                if (plan.mode !== mode) {
+                    // E2: the exit rules turned a mutual request into an escape.
+                    onStatus(plan.decision?.clearance_error_code
+                        ? 'The server did not grant a cooperative close, so this balance exits by escape, conceding nothing.'
+                        : 'This balance exits by escape.');
+                    mode = plan.mode;
+                    withdrawal.mode = mode;
                 }
                 submittedHash = plan.transactionHash || submittedHash;
                 this.rememberWithdrawal({
@@ -2027,14 +2439,16 @@ class ZkapiClient extends EventTarget {
                         note_id: withdrawal.noteId,
                         destination,
                         transaction_hash: submittedHash,
-                        clearance_reserved: plan.clearanceReserved === true || mode === 'mutual'
+                        clearance_reserved: plan.clearanceReserved === true || mode === 'mutual',
+                        clearance_granted: mode === 'mutual' && Boolean(plan.clearance?.signature)
                     };
                 }
                 const calldata = encodeWithdrawal(
                     plan,
                     mode,
                     destination,
-                    this.config.funding.contract_address
+                    this.config.funding.contract_address,
+                    { conceded: plan.public_inputs.conceded }
                 );
                 const claim = await browserWalletRuntime.claimPreparedWithdrawalSubmission();
                 submission = claim;
@@ -2043,6 +2457,12 @@ class ZkapiClient extends EventTarget {
                     onStatus(`Checking submitted transaction ${this.compact(submittedHash)}…`);
                     receipt = await this.waitForReceipt(submittedHash);
                     break;
+                }
+                // E4.6: one more bounded recovery pass before broadcast. A
+                // successor that arrives now is archived until the exit ends.
+                const late = await browserWalletRuntime.exitBeforeBroadcast().catch(() => null);
+                if (late?.lateSuccessor) {
+                    onStatus('A settled private request arrived after the exit proof was made. It is kept and applied if this exit expires unused.');
                 }
                 onStatus(mode === 'mutual'
                     ? 'Confirm the mutual close in MetaMask…'
@@ -2083,14 +2503,31 @@ class ZkapiClient extends EventTarget {
                                 );
                             },
                         null,
-                        { kind: 'withdrawal', submission }
+                        { kind: 'withdrawal', submission },
+                        0n,
+                        {
+                            exitEstimate: {
+                                blocking: error => REPROVABLE_EXIT_ERRORS.includes(error?.code)
+                                    && !reproved.has(error.code) && attempt + 1 < withdrawalAttempts,
+                                alternative: transaction => browserWalletRuntime.exitRpcEstimateGas(transaction),
+                                onAdvisory: (error, { exitRpcEstimate }) => onStatus(exitRpcEstimate != null
+                                    ? `Your wallet’s simulation refused this ${mode === 'mutual' ? 'close' : 'escape'} (${error.message}), but your exit RPC accepts it. It is submitted with that estimate.`
+                                    : `Your wallet’s simulation refused this ${mode === 'mutual' ? 'close' : 'escape'} (${error.message}). It can still be submitted, with a fixed gas limit; if the refusal is right, the transaction reverts and costs only gas.`)
+                            }
+                        }
                     );
                     break;
                 } catch (error) {
-                    if (error?.code !== 'stale_root' || attempt + 1 >= attempts) throw error;
+                    // A proof past its valid_until (E4.7) or a root the vault
+                    // does not know is proved again: another release.
+                    const reprovable = REPROVABLE_EXIT_ERRORS.includes(error?.code);
+                    if (!reprovable || attempt + 1 >= withdrawalAttempts) throw error;
+                    reproved.add(error.code);
+                    if (error.code === 'unknown_root') refusedRoot = plan.public_inputs.active_root;
                     await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
                     submission = null;
                     submissionMetadata = null;
+                    reprove = true;
                 }
             }
         } catch (failure) {
@@ -2117,6 +2554,12 @@ class ZkapiClient extends EventTarget {
             || event.finalBalance !== BigInt(plan.public_inputs.final_balance)) {
             throw new Error('The transaction succeeded, but its withdrawal event did not match the prepared note.');
         }
+        if (mode === 'escape' && event.concession
+            && (event.concession.conceded !== BigInt(plan.public_inputs.conceded)
+                || event.concession.stateBalance !== BigInt(plan.public_inputs.final_balance) + BigInt(plan.public_inputs.conceded)
+                || event.concession.nextNullifier !== BigInt(plan.public_inputs.next_nullifier))) {
+            throw new Error('The transaction succeeded, but its recorded concession did not match the prepared escape.');
+        }
 
         onStatus('Confirming the vault state and updating this browser…');
         const confirmed = await this.confirmMinedWithdrawalStatus(Number(note.note_id), receipt);
@@ -2134,12 +2577,18 @@ class ZkapiClient extends EventTarget {
                 closeBlockNumber: Number(BigInt(receipt?.blockNumber || '0x0')),
                 lastObservedBlock: Number(confirmed.observed_block || 0),
                 clearanceReserved: true,
-                createdAt: plan.createdAt
+                createdAt: plan.createdAt,
+                // Paid from a wallet to a transit account: the payout sits in
+                // the transit account until sweepTransit forwards it.
+                ...(sponsoredPlan ? { payoutVerified: false, fundsWaitingInTransit: true,
+                    transitBalanceWei: event.finalBalance * NATIVE_WEI_PER_UNIT } : {})
             });
             this.rememberWithdrawal(null);
             await this.refresh();
-            onStatus('Withdrawal returned. Finality is being checked safely in the background.');
-            return { status: 'closed', event, receipt };
+            onStatus(sponsoredPlan
+                ? `Withdrawal closed to its transit account. ${await this.transitFundsMessage(durablePrepared)}`
+                : 'Withdrawal returned. Finality is being checked safely in the background.');
+            return { status: 'closed', event, receipt, ...(sponsoredPlan ? { fundsWaitingInTransit: true, transitAccount: destination } : {}) };
         }
 
         const deadline = Number(confirmed.challenge_deadline || event.challengeDeadline);
@@ -2158,18 +2607,23 @@ class ZkapiClient extends EventTarget {
         });
         this.rememberWithdrawal(null);
         await this.refresh();
-        onStatus('Escape started. You can add a new private balance while the safety window runs.');
+        onStatus(destinationWarning
+            ? `Escape started. ${destinationWarning}`
+            : 'Escape started. You can add a new private balance while the safety window runs.');
         return {
             status: 'pending_withdrawal',
             deadline,
             event,
             receipt,
-            recordId: record.recordId
+            recordId: record.recordId,
+            conceded: BigInt(plan.public_inputs.conceded),
+            decision: plan.decision || null,
+            // Where the proof's Merkle path came from (E4.1): the saved
+            // deposit-time path, the indexer or the rebuild from the vault's
+            // logs.
+            pathSource: plan.pathSource || null,
+            ...(destinationWarning ? { destinationWarning } : {})
         };
-        this.rememberWithdrawal({ ...withdrawal, phase: 'pending', challengeDeadline: deadline });
-        await this.refresh();
-        onStatus('Escape started. Return after the safety window to finalize.');
-        return { status: 'pending_withdrawal', deadline, event, receipt };
     }
 
     async recoverFailedWithdrawalSubmission({
@@ -2289,9 +2743,11 @@ class ZkapiClient extends EventTarget {
             if (!remainingHashes.length) {
                 await browserWalletRuntime.clearPreparedWithdrawal();
                 this.rememberWithdrawal(null, { emit: false });
+                // E6: the proof reached the wallet, so the exit lock holds the
+                // balance until that proof expires; another escape is allowed.
                 error.shortMessage = rejectedBeforeSubmission
-                    ? 'MetaMask canceled the escape. No funds moved, and your private balance is ready to use.'
-                    : 'The wallet refused the escape before broadcast. No funds moved, and your private balance is ready to use.';
+                    ? 'MetaMask canceled the escape. No funds moved. The escape proof already reached the wallet, so this balance stays withdrawal-only until that proof expires; you can still escape.'
+                    : 'The wallet refused the escape before broadcast. No funds moved. The escape proof already reached the wallet, so this balance stays withdrawal-only until that proof expires; you can still escape.';
             } else {
                 error.shortMessage = 'MetaMask canceled this prompt. Another submitted withdrawal is still being checked.';
             }
@@ -2308,6 +2764,2363 @@ class ZkapiClient extends EventTarget {
             && String(receipt.transactionHash || '').toLowerCase() === String(operationHash || '').toLowerCase()
             ? receipt
             : null;
+    }
+
+    // ------------------------------------------------------------------ gasless withdrawals (design §3.2)
+    //
+    // With `fees: 'payout'` a withdrawal proof names a transit account S =
+    // CREATE2(factory, 0, creationCode ‖ (entryPoint, vault, paymaster, owner,
+    // payee)) as its destination, where owner is the connected account and
+    // payee the payout address Y. The vault call runs inside an ERC-4337 user
+    // operation sent from S and sponsored by the withdrawal paymaster P, which
+    // keeps a measured charge out of the payout and pushes the rest to Y. The
+    // connected account signs the operation's hash with personal_sign and never
+    // sends a transaction. Every read of this path goes through the exit RPC
+    // (on the vault's chain) and the pinned RPC, never the wallet provider,
+    // unless the host opts in (client.gaslessReadsViaWallet = true).
+
+    /** The timing of the sponsored submission loop (§3.1); `gaslessTimingOverrides` shortens it in tests. */
+    get gaslessTiming() {
+        return { ...GASLESS_TIMING, ...(this.gaslessTimingOverrides || {}) };
+    }
+
+    gaslessSleep(milliseconds) {
+        return new Promise(resolve => setTimeout(resolve, milliseconds));
+    }
+
+    /** The read RPC of the gasless path: exit RPC on the vault chain, then the pinned RPC (the wallet only when opted in). */
+    gaslessReader() {
+        return browserWalletRuntime.gaslessReader({
+            walletRequest: this.gaslessReadsViaWallet === true ? request => this.ethereum.request(request) : null
+        });
+    }
+
+    /** The build-pinned gasless configuration, or the `gasless_unavailable` refusal that explains why there is none. */
+    requireGaslessPins() {
+        let pins;
+        try {
+            pins = gaslessPinsOf(browserWalletRuntime.browserConfig?.trusted_deployment);
+        } catch (error) {
+            throw gaslessError('gasless_unavailable', { reason: error?.code || 'gasless_profile_invalid', detail: error?.message || null });
+        }
+        if (!pins) throw gaslessError('gasless_unavailable', { reason: 'not_pinned' });
+        return pins;
+    }
+
+    /**
+     * The pins a sponsored operation for an existing gasless record needs
+     * (a FORWARD, a FINALIZE, a new, re-sent or re-signed operation of a
+     * sponsored close or escape; an operation already sent is still looked
+     * for on chain and released, see releaseUnpinnedFinalization and
+     * recoverGaslessSubmission):
+     * the current profile's, naming the paymaster and factory the record's
+     * transit account was made under. A profile that publishes no gasless
+     * contracts any more (`gasless: null`, the paymaster's retirement) or
+     * pins others is refused with `gasless_record_not_pinned`, which names
+     * the wallet-paid recovery that keeps working from the journaled
+     * addresses: sweepTransit, claimGaslessCredit and finalizeEscape with
+     * fees: 'wallet', led by withdraw(mode, onStatus, { fees: 'wallet' })
+     * while a prepared plan's exit is not on chain yet.
+     */
+    requireRecordPins(record) {
+        const transit = record?.transit || {};
+        // A prepared plan (no withdrawal record yet) whose close or escape
+        // initiation is not on chain: the note is still open, so the
+        // wallet-paid exit is the way forward, named first.
+        const exitPending = Boolean(record) && !record.recordId && !record.transactionHash;
+        const refusal = (reason, pins = null) => gaslessError('gasless_record_not_pinned', {
+            reason,
+            transitAccount: transit.account ? String(transit.account).toLowerCase() : null,
+            paymaster: transit.paymaster ? String(transit.paymaster).toLowerCase() : null,
+            factory: transit.factory ? String(transit.factory).toLowerCase() : null,
+            pinnedPaymaster: pins ? pins.paymaster.toLowerCase() : null,
+            pinnedFactory: pins ? pins.factory.toLowerCase() : null,
+            alternatives: [...(exitPending ? [`withdraw('${record.mode === 'escape' ? 'escape' : 'mutual'}', onStatus, { fees: 'wallet' })`] : []),
+                'sweepTransit', 'claimGaslessCredit', "finalizeEscape({ fees: 'wallet' })"]
+        });
+        let pins;
+        try {
+            pins = this.requireGaslessPins();
+        } catch (error) {
+            if (error?.data?.reason === 'not_pinned') throw refusal('not_pinned');
+            throw error;
+        }
+        if ((transit.paymaster && !sameAddress(transit.paymaster, pins.paymaster))
+            || (transit.factory && !sameAddress(transit.factory, pins.factory))) {
+            throw refusal('pins_mismatch', pins);
+        }
+        return pins;
+    }
+
+    /**
+     * The contracts a wallet-paid action on an existing gasless record uses
+     * (sweepTransit; claimGaslessCredit reads the paymaster the same way):
+     * the transit account, factory, paymaster, EntryPoint, owner and payee
+     * journaled with the record, never the current profile's, so recovery
+     * keeps working after the profile retires its pins or names another
+     * paymaster. The journaled factory's getAddress(owner, payee) must name
+     * the journaled account through the read RPC; while the profile still
+     * pins the same contracts their deployment is verified too.
+     */
+    async journaledTransit(record, reader) {
+        const transit = record?.transit || {};
+        const address = value => /^0x[0-9a-fA-F]{40}$/.test(String(value || '')) ? String(value).toLowerCase() : null;
+        const journaled = {
+            account: address(transit.account), factory: address(transit.factory), paymaster: address(transit.paymaster),
+            entryPoint: address(transit.entryPoint), owner: address(transit.owner), payee: address(transit.payee || record?.payout)
+        };
+        if (Object.values(journaled).some(value => !value)) {
+            throw new Error('The journaled transit account of this withdrawal is incomplete; nothing was signed.');
+        }
+        let pins = null;
+        try {
+            pins = this.requireGaslessPins();
+        } catch {
+            pins = null;
+        }
+        if (pins && sameAddress(pins.paymaster, journaled.paymaster) && sameAddress(pins.factory, journaled.factory)
+            && sameAddress(pins.entryPoint, journaled.entryPoint)) {
+            await this.assertGaslessDeployment(pins, reader);
+        }
+        const derived = decodeAddressWord(await this.gaslessCall(reader, journaled.factory, encodeGetAddress(journaled.owner, journaled.payee)));
+        if (derived.toLowerCase() !== journaled.account) {
+            throw gaslessError('gasless_unavailable', {
+                reason: 'gasless_deployment_mismatch', field: 'factory.getAddress', expected: journaled.account, actual: derived.toLowerCase()
+            }, 'The journaled factory derives another transit account for this withdrawal’s owner and payout address. Nothing was signed.');
+        }
+        return journaled;
+    }
+
+    async gaslessCall(reader, to, data) {
+        return reader({ method: 'eth_call', params: [{ to, data }, 'latest'] });
+    }
+
+    /** The gasless contracts are checked once per session (per chain and paymaster) through the read RPC (§4.4). */
+    async assertGaslessDeployment(pins, reader) {
+        const key = `${Number(this.config.funding.chain_id)}:${pins.paymaster.toLowerCase()}`;
+        if (this.gaslessDeploymentVerified === key) return;
+        const result = await verifyGaslessDeployment({
+            request: reader,
+            trusted: browserWalletRuntime.browserConfig?.trusted_deployment,
+            chainId: this.config.funding.chain_id,
+            source: 'read_rpc'
+        });
+        if (!result.ok) throw gaslessDeploymentError([result]);
+        this.gaslessDeploymentVerified = key;
+    }
+
+    /** The transit identity of (owner, payout): S from the pinned creation code, cross-checked with factory.getAddress. */
+    async transitIdentity(pins, reader, { owner, payout, expected = null }) {
+        const vault = this.config.funding.contract_address;
+        const account = transitAccountAddress({
+            factory: pins.factory, creationCodeHex: pins.accountCreationCode, entryPoint: pins.entryPoint, vault,
+            paymaster: pins.paymaster, owner, payee: payout
+        });
+        const onChain = decodeAddressWord(await this.gaslessCall(reader, pins.factory, encodeGetAddress(owner, payout)));
+        if (onChain.toLowerCase() !== account) {
+            throw gaslessError('gasless_unavailable', {
+                reason: 'gasless_deployment_mismatch', field: 'factory.getAddress', expected: account, actual: onChain.toLowerCase()
+            }, GASLESS_MESSAGES.gasless_deployment_mismatch);
+        }
+        if (expected && String(expected).toLowerCase() !== account) {
+            throw new Error('The journaled transit account does not match its owner and payout address.');
+        }
+        return {
+            factory: pins.factory.toLowerCase(),
+            paymaster: pins.paymaster.toLowerCase(),
+            entryPoint: pins.entryPoint.toLowerCase(),
+            account,
+            owner: String(owner).toLowerCase(),
+            payee: String(payout).toLowerCase(),
+            creationCodeKeccak: pins.accountCreationCodeKeccak256
+        };
+    }
+
+    /**
+     * Everything one sponsored operation needs: the pins, the read RPC, the
+     * verified deployment, the transit identity and the bundler (a host
+     * transport on the provider, `provider.zkapiBundler`, else the URL given,
+     * the user's, or the profile's).
+     */
+    async gaslessContext({ from, payout, owner = from, expectedAccount = null, bundlerUrl = null, kind = KIND.close, record = null }) {
+        if (!this.config?.funding?.contract_address) throw new Error('Initialize the wallet before a sponsored withdrawal.');
+        // An existing record is sponsored only by the paymaster it was made under.
+        const pins = record?.transit ? this.requireRecordPins(record) : this.requireGaslessPins();
+        const reader = this.gaslessReader();
+        await this.assertGaslessDeployment(pins, reader);
+        const transit = await this.transitIdentity(pins, reader, { owner, payout, expected: expectedAccount });
+        const transport = this.ethereum?.zkapiBundler && typeof this.ethereum.zkapiBundler.sendUserOperation === 'function'
+            ? this.ethereum.zkapiBundler : null;
+        const url = transport ? null : (bundlerUrl || browserWalletRuntime.effectiveBundlerUrl());
+        const bundler = transport ? browserWalletRuntime.bundlerRpc(null, { transport }) : (url ? browserWalletRuntime.bundlerRpc(url) : null);
+        return { pins, reader, transit, payout: String(payout).toLowerCase(), bundler, bundlerUrl: url, kind };
+    }
+
+    /**
+     * The paymaster's live policy, ceilings and gas policy (checked against the
+     * pins), its float, the vault's pause, the key's attempts and S's debt.
+     */
+    async readPaymasterState(pins, reader, { kind, key = null, account = null }) {
+        const P = pins.paymaster;
+        const trusted = browserWalletRuntime.browserConfig?.trusted_deployment || {};
+        const vault = this.config.funding.contract_address;
+        const policy = decodePolicy(await this.gaslessCall(reader, P, `0x${GASLESS_ABI.policy}`));
+        const maxFeeCeiling = decodeWord(await this.gaslessCall(reader, P, `0x${GASLESS_ABI.maxFeeCeiling}`), 'maxFeeCeiling');
+        const priorityFeeCeiling = decodeWord(await this.gaslessCall(reader, P, `0x${GASLESS_ABI.priorityFeeCeiling}`), 'priorityFeeCeiling');
+        const gasPolicy = decodeGasPolicy(await this.gaslessCall(reader, P, `0x${GASLESS_ABI.gasPolicy}`));
+        gasPolicy.defaults = pins.gasPolicy.defaults;
+        const depositWei = decodeWord(await this.gaslessCall(reader, pins.entryPoint, encodeBalanceOf(P)), 'balanceOf');
+        const callCap = decodeWord(await this.gaslessCall(reader, P, encodeCallCap(kind)), 'callCap');
+        const paused = decodeBool(await this.gaslessCall(reader, vault, `0x${GASLESS_ABI.paused}`), 'paused');
+        let reopenAt = null;
+        if (paused) {
+            const pausedAt = decodeWord(await this.gaslessCall(reader, vault, `0x${GASLESS_ABI.pausedAt}`), 'pausedAt');
+            reopenAt = Number(pausedAt + BigInt(trusted.max_pause_duration || 0));
+        }
+        const attempts = key ? decodeWord(await this.gaslessCall(reader, P, encodeAttempts(key)), 'attempts') : null;
+        const owed = account ? decodeWord(await this.gaslessCall(reader, P, encodeOwed(account)), 'owed') : 0n;
+        return {
+            policy, maxFeeCeiling, priorityFeeCeiling, gasPolicy, policyMatches: sameGasPolicy(gasPolicy, pins.gasPolicy),
+            depositWei, callCap, paused, reopenAt, attempts, owed
+        };
+    }
+
+    /** The bundler's chain and EntryPoint answers; `reachable: false` when it cannot be asked at all. */
+    async probeBundler(bundler, pins, url) {
+        if (!bundler) return { reachable: false, configured: false };
+        let chainId = null;
+        try {
+            chainId = await bundler.chainId();
+        } catch (error) {
+            if (error?.code === 'bundler_unavailable') return { reachable: false, configured: true, error };
+            // A bundler that does not serve eth_chainId answers eth_supportedEntryPoints.
+        }
+        const wrongChain = chainId != null && chainId !== BigInt(this.config.funding.chain_id);
+        let entryPoints = null;
+        if (!wrongChain) {
+            try {
+                entryPoints = await bundler.supportedEntryPoints();
+            } catch (error) {
+                if (error?.code === 'bundler_unavailable') return { reachable: false, configured: true, error };
+                entryPoints = [];
+            }
+        }
+        const supportsEntryPoint = entryPoints == null ? null : entryPoints.includes(pins.entryPoint.toLowerCase());
+        if (url) browserWalletRuntime.noteBundlerChain(url, !wrongChain, supportsEntryPoint);
+        return { reachable: true, configured: true, chainId, wrongChain, entryPoints, supportsEntryPoint };
+    }
+
+    /**
+     * The pre-flight of §3.1 for one sponsorship, before any proof is made
+     * (the proof binds S): the bundler, the paymaster's policy and float, the
+     * vault's pause and the key's attempts. Publishes the snapshot's `gasless` object.
+     */
+    async gaslessPreflight(context, { kind, key = null, maxCost = null, noteId = null }) {
+        const state = await this.readPaymasterState(context.pins, context.reader, { kind, key, account: context.transit.account });
+        const bundler = await this.probeBundler(context.bundler, context.pins, context.bundlerUrl);
+        // An unreachable bundler is not asked for its tip by the sizing below.
+        context.bundlerReachable = bundler.reachable === true;
+        // The operation's prefund, before any proof binds S (§3.1 pre-flight
+        // (3)): the fees within the ceilings and the gas fields of a draft of
+        // this kind, so the float and the fee ceilings refuse here, not after
+        // the proof.
+        const sizing = maxCost == null ? await this.gaslessPreflightSizing(context, state, { kind, noteId })
+            : { fees: null, gas: null, maxCost: toBigInt(maxCost, 'maxCost'), withInitCode: null, refusal: null };
+        const first = availabilityVerdict({
+            bundler: bundler.configured ? bundler : { reachable: false },
+            policy: state.policy, policyMatches: state.policyMatches, depositWei: state.depositWei, maxCost: sizing.maxCost,
+            vaultPaused: state.paused, reopenAt: state.reopenAt, attempts: state.attempts, kind, maxAttempts: state.gasPolicy.maxAttempts
+        });
+        // A fee refusal comes after the bundler and the policy, before the float and the attempts.
+        const verdict = sizing.refusal && !GASLESS_PREFLIGHT_BEFORE_FEES.includes(first.reason) ? sizing.refusal : first;
+        const status = {
+            available: verdict.available,
+            reason: verdict.reason,
+            bundler_url: context.bundlerUrl,
+            paymaster_deposit_wei: state.depositWei.toString(),
+            policy: journalValue({
+                max_sponsored_cost_wei: state.policy.maxSponsoredCostWei, flat_fee_wei: state.policy.flatFeeWei,
+                min_escape_net_wei: state.policy.minEscapeNetWei, escapes_enabled: state.policy.escapesEnabled,
+                sponsorship_paused: state.policy.sponsorshipPaused, max_fee_ceiling_wei: state.maxFeeCeiling,
+                priority_fee_ceiling_wei: state.priorityFeeCeiling
+            }),
+            attempts_left: state.attempts == null ? null : Number(state.gasPolicy.maxAttempts - state.attempts),
+            max_cost_wei: sizing.maxCost.toString(),
+            checked_at: Date.now()
+        };
+        browserWalletRuntime.noteGaslessStatus(status);
+        return { state, bundler, verdict, status, fees: sizing.fees, gas: sizing.gas, maxCost: sizing.maxCost, withInitCode: sizing.withInitCode };
+    }
+
+    /**
+     * The prefund of a draft operation of `kind` from S at the current fees
+     * (§3.1): selectFees within the ceilings (`gas_above_paymaster_ceiling`),
+     * the gas fields from the pinned defaults with the live callCap, initCode
+     * when S has no code yet, the calldata sized as the real op's (an 836-byte
+     * vault call for a close or escape, finalizeEscape(noteId), nothing for a
+     * forward), then `maxCost` against the policy (`max_cost_above_policy`).
+     * A refusal is returned, not thrown, so the pre-flight can rank it.
+     */
+    async gaslessPreflightSizing(context, state, { kind, noteId = null }) {
+        const { pins, reader, transit } = context;
+        const refusal = error => ({ available: false, reason: error.code, message: error.shortMessage || error.message, data: error.data ?? null });
+        let fees;
+        try {
+            fees = await this.selectGaslessFees(context, state);
+        } catch (error) {
+            if (error?.code !== 'gas_above_paymaster_ceiling') throw error;
+            return { fees: null, gas: null, maxCost: 0n, withInitCode: null, refusal: refusal(error) };
+        }
+        let withInitCode = true;
+        if (transit.account) {
+            const code = await reader({ method: 'eth_getCode', params: [transit.account, 'latest'] });
+            withInitCode = !code || code === '0x';
+        }
+        const sender = transit.account || GASLESS_DRY_RUN_BENEFICIARY;
+        const owner = transit.owner || sender;
+        const payee = transit.payee || context.payout || sender;
+        const initCode = withInitCode ? transitInitCode({ factory: pins.factory, owner, payee }) : '0x';
+        const vaultCall = kind === KIND.forward ? '0x' : kind === KIND.finalize ? encodeFinalizeEscape(noteId ?? 0) : WORST_CASE_EXIT_CALL;
+        const draft = gas => buildUserOperation({
+            sender, nonce: 0n, initCode, callData: encodeTransitWithdraw(vaultCall), gas, fees, paymaster: pins.paymaster, feeCapWei: state.policy.flatFeeWei
+        });
+        const sized = gasFields({ gasPolicy: pins.gasPolicy, kind, withInitCode, calldataBytes: 0, callCap: state.callCap });
+        const sizedOp = draft(sized);
+        const calldataBytes = handleOpsCalldataBytes(sizedOp, owner);
+        const gas = gasFields({ gasPolicy: pins.gasPolicy, kind, withInitCode, calldataBytes, callCap: state.callCap, op: sizedOp });
+        const maxCost = maxCostWei(gas, fees.maxFeePerGas);
+        if (maxCost > state.policy.maxSponsoredCostWei) {
+            return { fees, gas, maxCost, withInitCode, refusal: refusal(gaslessError('max_cost_above_policy', { maxCost, cap: state.policy.maxSponsoredCostWei })) };
+        }
+        return { fees, gas, maxCost, withInitCode, refusal: null };
+    }
+
+    /**
+     * The fee fields of §3.1: a tip within the paymaster's ceiling (the
+     * bundler's own suggestion when it offers one, since a bundler refuses an
+     * operation below its minimum tip; else the chain's) and min(2 × baseFee
+     * + tip, the max-fee ceiling), refused only when baseFee + tip is above
+     * that ceiling (selectFees, the rule clientd shares).
+     */
+    async selectGaslessFees(context, state) {
+        const block = await context.reader({ method: 'eth_getBlockByNumber', params: ['latest', false] });
+        const baseFeePerGas = block?.baseFeePerGas != null ? toBigInt(block.baseFeePerGas, 'baseFeePerGas')
+            : toBigInt(await context.reader({ method: 'eth_gasPrice', params: [] }), 'gasPrice');
+        let priorityFeePerGas = null;
+        if (context.bundler && context.bundlerReachable !== false && typeof context.bundler.suggestedPriorityFee === 'function') {
+            priorityFeePerGas = await context.bundler.suggestedPriorityFee().catch(() => null);
+        }
+        if (priorityFeePerGas == null) {
+            try {
+                priorityFeePerGas = toBigInt(await context.reader({ method: 'eth_maxPriorityFeePerGas', params: [] }), 'priorityFee');
+            } catch {
+                priorityFeePerGas = null;
+            }
+        }
+        return selectFees({ baseFeePerGas, priorityFeePerGas, maxFeeCeiling: state.maxFeeCeiling, priorityFeeCeiling: state.priorityFeeCeiling });
+    }
+
+    /**
+     * One sponsored operation of `kind` from S (§3.1): the nonce from the
+     * EntryPoint, initCode on first use, gas fields from the pinned policy,
+     * fees within the ceilings, the amounts checked against P.quote, and the
+     * local hash checked against entryPoint.getUserOpHash. Unsigned.
+     */
+    async buildGaslessOperation(context, { kind, vaultCall, nullifier = null, noteId = null, payoutWei, feeCapWei = null,
+        allowExpensiveGas = false, state, fees = null, withInitCode = null, gasOverrides = {} }) {
+        const { pins, reader, transit } = context;
+        const key = nonceKeyFor(kind, { nullifier });
+        const nonceWord = decodeWord(await this.gaslessCall(reader, pins.entryPoint, encodeGetNonce(transit.account, key)), 'getNonce');
+        const { sequence } = unpackNonce(nonceWord);
+        let initCode = '0x';
+        let created = withInitCode;
+        if (created == null) {
+            const code = await reader({ method: 'eth_getCode', params: [transit.account, 'latest'] });
+            created = !code || code === '0x';
+        }
+        if (created) initCode = transitInitCode({ factory: pins.factory, owner: transit.owner, payee: transit.payee });
+        const callData = encodeTransitWithdraw(vaultCall);
+        const flatFee = state.policy.flatFeeWei;
+        const userCap = feeCapWei == null ? null : toBigInt(feeCapWei, 'feeCapWei');
+        if (userCap != null && flatFee > userCap) throw gaslessError('gasless_fee_above_cap', { flatFeeWei: flatFee, feeCapWei: userCap });
+        const selectedFees = fees || await this.selectGaslessFees(context, state);
+        const nonce = packNonce(key, sequence);
+        const draft = gas => buildUserOperation({
+            sender: transit.account, nonce, initCode, callData, gas, fees: selectedFees, paymaster: pins.paymaster, feeCapWei: flatFee
+        });
+        const sized = gasFields({ gasPolicy: pins.gasPolicy, kind, withInitCode: created, calldataBytes: 0, callCap: state.callCap, overrides: gasOverrides });
+        const sizedOp = draft(sized);
+        const calldataBytes = handleOpsCalldataBytes(sizedOp, transit.owner);
+        const gas = gasFields({ gasPolicy: pins.gasPolicy, kind, withInitCode: created, calldataBytes, callCap: state.callCap, overrides: gasOverrides,
+            op: sizedOp });
+        const op = draft(gas);
+        const maxCost = maxCostWei(gas, selectedFees.maxFeePerGas);
+        if (maxCost > state.policy.maxSponsoredCostWei) {
+            throw gaslessError('max_cost_above_policy', { maxCost, cap: state.policy.maxSponsoredCostWei });
+        }
+        // The float must cover the prefund (a bundler reserves it per pending op, EREP-010).
+        if (state.depositWei != null && state.depositWei < maxCost) {
+            throw gaslessError('paymaster_underfunded', { depositWei: state.depositWei, maxCost });
+        }
+        const finalizeReserveWei = kind === KIND.escape ? pins.gasPolicy.finalizeReserveGas * selectedFees.maxFeePerGas : 0n;
+        const amounts = gaslessAmounts({
+            kind, payoutWei, maxCost, flatFee, owed: state.owed, finalizeReserveWei, minEscapeNetWei: state.policy.minEscapeNetWei,
+            uneconomicFractionPercent: pins.uneconomicFractionPercent, allowExpensiveGas
+        });
+        const quote = decodeQuote(await this.gaslessCall(reader, pins.paymaster, encodeQuote({
+            kind, sender: transit.account, noteId: noteId ?? 0n, nullifier: nullifier ?? 0n, maxCost, maxFeePerGas: selectedFees.maxFeePerGas
+        })));
+        if (quote.requiredWei !== amounts.requiredWei || quote.owedWei !== state.owed || quote.flatFeeWei !== flatFee
+            || quote.finalizeReserveWei !== finalizeReserveWei) {
+            throw gaslessError('gasless_policy_mismatch', { local: journalValue(amounts), quote: journalValue(quote) });
+        }
+        if (!quote.attemptsLeft) throw gaslessError('gasless_attempts_exhausted');
+        if (kind === KIND.escape && !quote.escapeOpen) {
+            throw gaslessError(state.policy.escapesEnabled ? 'escape_already_sponsored' : 'escapes_disabled', { noteId },
+                state.policy.escapesEnabled ? 'An escape of this balance was already sponsored once, or this transit account still has an open sponsored escape.' : null);
+        }
+        const hash = userOpHash(op, pins.entryPoint, this.config.funding.chain_id);
+        const onChainHash = await this.gaslessCall(reader, pins.entryPoint, encodeGetUserOpHash(op));
+        if (String(onChainHash || '').toLowerCase() !== hash) {
+            throw gaslessError('entry_point_hash_mismatch', { local: hash, entryPoint: onChainHash || null });
+        }
+        return { op, hash, key, sequence, withInitCode: created, gas, fees: selectedFees, maxCost, amounts, quote, payoutWei };
+    }
+
+    /** A bundler's estimate is a cross-check only: above a cap it is refused, below the defaults ignored (§3.1). */
+    async crossCheckGaslessEstimate(context, built) {
+        if (!context.bundler || this.gaslessEstimateCheck === false) return;
+        const probe = { ...built.op, maxFeePerGas: 0n, maxPriorityFeePerGas: 0n, signature: `0x${'00'.repeat(65)}` };
+        let estimate;
+        try {
+            estimate = await context.bundler.estimateUserOperationGas(userOperationJson(probe), context.pins.entryPoint);
+        } catch {
+            return;
+        }
+        // The caps are the paymaster's (its live callCap for this kind), not
+        // the signed defaults: an estimate between a default and its cap is
+        // one the paymaster accepts and is ignored like any lower one.
+        checkEstimate(estimate, { gasPolicy: context.pins.gasPolicy, kind: context.kind, withInitCode: built.withInitCode,
+            callCap: context.state?.callCap ?? null });
+        // Except preVerificationGas: the bundler's own minimum for this op
+        // (within the paymaster's cap, checked above) is what it will take,
+        // so a higher one is returned for the op to be rebuilt with it.
+        let preVerificationGas = null;
+        try {
+            preVerificationGas = estimate?.preVerificationGas == null ? null : toBigInt(estimate.preVerificationGas, 'preVerificationGas');
+        } catch {
+            preVerificationGas = null;
+        }
+        return preVerificationGas != null && preVerificationGas > BigInt(built.op.preVerificationGas)
+            && preVerificationGas <= context.pins.gasPolicy.pvgCap ? { preVerificationGas } : null;
+    }
+
+    /**
+     * eth_call entryPoint.handleOps([op], beneficiary) through the read RPC.
+     * Unsigned, the run must end in AA24; signed it must be clean. AA10 and
+     * AA25 come back as silent errors the caller handles. AA24 is not proof
+     * that everything else passed: EntryPoint v0.7.0 reverts with it in
+     * _validateAccountAndPaymasterValidationData before it evaluates the
+     * time ranges, so it masks AA22 (the account's), AA32 (the paymaster's
+     * validAfter/validUntil) and AA34 (the paymaster's signature). The time
+     * window is therefore checked against the latest block before the prompt
+     * (gaslessAwaitTimeWindow).
+     */
+    async dryRunGaslessOperation(context, op, { signed }) {
+        const beneficiary = GASLESS_DRY_RUN_BENEFICIARY;
+        try {
+            await context.reader({
+                method: 'eth_call',
+                params: [{ from: beneficiary, to: context.pins.entryPoint, data: encodeHandleOps([op], beneficiary) }, 'latest']
+            });
+            return { ok: true };
+        } catch (error) {
+            const decoded = dryRunError(error);
+            if (!decoded) throw error;
+            if (!signed && decoded.aa === 'AA24') return { ok: true, signatureCheckPending: true };
+            throw decoded;
+        }
+    }
+
+    /**
+     * The time window the paymaster's validationData sets, against the
+     * latest block's timestamp (the clock the EntryPoint uses), before any
+     * prompt: the unsigned dry run cannot show it (AA24 masks AA32). A close
+     * or escape needs `timestamp <= validUntil − stopBeforeValidUntilSeconds`
+     * (`gasless_op_expired`, proved again); a finalization needs
+     * `timestamp >= validAfter` (the vault's challenge deadline) and waits
+     * for it up to `notDueWaitMs` (`escape_not_due` beyond).
+     */
+    async gaslessAwaitTimeWindow(context, { validAfter = null, validUntil = null, onStatus = () => {} }) {
+        if (validAfter == null && validUntil == null) return;
+        const timing = this.gaslessTiming;
+        const started = Date.now();
+        let told = false;
+        for (;;) {
+            const block = await context.reader({ method: 'eth_getBlockByNumber', params: ['latest', false] });
+            if (block?.timestamp == null) throw new Error('The read RPC returned no timestamp for the latest block.');
+            const timestamp = Number(toBigInt(block.timestamp, 'timestamp'));
+            if (validUntil != null && timestamp > Number(validUntil) - timing.stopBeforeValidUntilSeconds) {
+                throw gaslessError('gasless_op_expired', { blockTimestamp: timestamp, validUntil: Number(validUntil) });
+            }
+            if (validAfter == null || timestamp >= Number(validAfter)) return;
+            if (Date.now() - started >= timing.notDueWaitMs) {
+                throw gaslessError('escape_not_due', { blockTimestamp: timestamp, validAfter: Number(validAfter) });
+            }
+            if (!told) {
+                told = true;
+                onStatus('Waiting for the chain to reach the end of the safety window before asking for a signature…');
+            }
+            await this.gaslessSleep(timing.receiptPollMs);
+        }
+    }
+
+    /** personal_sign of the 32 raw bytes of the operation hash by the connected account, which must own S. */
+    async signGaslessOperation(context, hash, from) {
+        if (String(from || '').toLowerCase() !== context.transit.owner) {
+            throw gaslessError('wrong_owner_account', { expected: context.transit.owner, connected: String(from || '').toLowerCase() },
+                `Connect the account ${context.transit.owner} that owns this withdrawal’s transit account to sign its operation.`);
+        }
+        const signature = await this.ethereum.request({ method: 'personal_sign', params: [hash, from] });
+        if (!/^0x[0-9a-fA-F]{130}$/.test(signature || '')) throw new Error('The wallet returned an invalid signature for the sponsored operation.');
+        return signature.toLowerCase();
+    }
+
+    async gaslessBlockNumber(context) {
+        try {
+            return Number(BigInt(await context.reader({ method: 'eth_blockNumber', params: [] })));
+        } catch {
+            return null;
+        }
+    }
+
+    /** The bundle transaction receipt through the read RPC; polls while the node has not indexed it yet. */
+    async gaslessTransactionReceipt(context, transactionHash, { attempts = 60 } = {}) {
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+            let receipt = null;
+            try {
+                receipt = await context.reader({ method: 'eth_getTransactionReceipt', params: [transactionHash] });
+            } catch {
+                receipt = null;
+            }
+            if (receipt) {
+                if (String(receipt.transactionHash || '').toLowerCase() !== String(transactionHash).toLowerCase()) {
+                    throw new Error('The bundle transaction receipt has a different transaction hash.');
+                }
+                if (BigInt(receipt.status || '0x0') !== 1n) {
+                    const error = new Error(`The bundle transaction ${this.compact(transactionHash)} reverted.`);
+                    error.transactionReceipt = receipt;
+                    throw error;
+                }
+                return receipt;
+            }
+            await this.gaslessSleep(this.gaslessTiming.receiptPollMs);
+        }
+        throw new Error(`Timed out waiting for the bundle transaction ${this.compact(transactionHash)}.`);
+    }
+
+    /**
+     * The inclusion of one of `hashes` (or of S's operation at `nonce`) by
+     * the EntryPoint's UserOperationEvent logs from `fromBlock`, through the
+     * read RPC: { userOpHash, transactionHash, blockNumber, success }, or null.
+     */
+    async findUserOperationInclusion(context, hashes, fromBlock, { sender = null, nonce = null } = {}) {
+        const topics = [GASLESS_ABI.userOperationEvent];
+        const wanted = (hashes || []).map(hash => String(hash).toLowerCase());
+        if (wanted.length) topics.push(wanted.length === 1 ? wanted[0] : wanted);
+        else if (sender) topics.push(null, `0x${'0'.repeat(24)}${sender.slice(2).toLowerCase()}`);
+        else return null;
+        let logs;
+        try {
+            logs = await context.reader({
+                method: 'eth_getLogs',
+                params: [{
+                    address: context.pins.entryPoint,
+                    fromBlock: fromBlock != null ? `0x${Math.max(0, Number(fromBlock)).toString(16)}` : '0x0',
+                    toBlock: 'latest',
+                    topics
+                }]
+            });
+        } catch {
+            return null;
+        }
+        for (const log of Array.isArray(logs) ? logs : []) {
+            if (log?.removed === true || !Array.isArray(log?.topics) || log.topics.length !== 4) continue;
+            const data = String(log.data || '').replace(/^0x/, '');
+            const logNonce = data.length >= 64 ? BigInt(`0x${data.slice(0, 64)}`) : null;
+            if (nonce != null && logNonce !== BigInt(nonce)) continue;
+            return {
+                userOpHash: String(log.topics[1]).toLowerCase(),
+                transactionHash: String(log.transactionHash || '').toLowerCase(),
+                blockNumber: log.blockNumber == null ? null : Number(BigInt(log.blockNumber)),
+                success: data.length >= 128 ? BigInt(`0x${data.slice(64, 128)}`) === 1n : null
+            };
+        }
+        return null;
+    }
+
+    /** Whether a bundler's refusal means the identical operation is already known to it (then it is pending, not refused). */
+    gaslessAlreadyKnown(error) {
+        // An EntryPoint refusal (an AA code, e.g. AA10 "sender already
+        // constructed", whose user message says the account already exists)
+        // is never the bundler saying it already holds the operation.
+        if (error?.aa) return false;
+        const text = `${error?.rpcMessage || ''} ${error?.message || ''}`;
+        return /already (known|in (the )?mempool|submitted|pending|exists)|duplicate/i.test(text);
+    }
+
+    /** Whether a bundler's refusal asks for higher fees (the mempool dropped the op, or will not take it at this price). */
+    gaslessFeeTooLow(error) {
+        // Decided on the message only (bundlers answer a fee refusal with
+        // -32602 or -32500 and fee wording), never for an EntryPoint or
+        // paymaster refusal (an AA code, a decoded revert) nor for ERC-7769's
+        // -32507 (signature) and -32508 (paymaster balance): re-signing with
+        // higher fees cannot cure those, and -32508 only gets worse.
+        if (error?.aa || error?.selector || this.gaslessAlreadyKnown(error)) return false;
+        if ([-32507, -32508].includes(Number(error?.rpcCode)) || ['signature_rejected', 'paymaster_underfunded'].includes(error?.code)) return false;
+        const text = `${error?.rpcMessage || ''} ${error?.message || ''}`;
+        return /fee too low|underpriced|replacement|maxFeePerGas|maxPriorityFeePerGas|gas price/i.test(text);
+    }
+
+    /**
+     * Build, check, sign, journal, submit and follow one sponsored operation
+     * (§3.1): the unsigned dry run before any prompt, the signed dry run
+     * before any send, the write-ahead journal before eth_sendUserOperation,
+     * the hash cross-check, then polling by bundler receipt and by the
+     * EntryPoint's logs; an identical re-send after 5 minutes unknown, a fee
+     * bump within the ceilings when the bundler asks for it, and a hard stop
+     * 60 s before the proof's validUntil. `journal` is the plan's or the
+     * record's write-ahead journal; `resume` an operation journaled earlier.
+     * With `selfBundle`, a funded wallet sends handleOps itself instead.
+     */
+    async runGaslessOperation(context, build, journal, { onStatus, validUntil = null, validAfter = null, selfBundle = false, from, resume = null,
+        submission = null, amountsMessage = null, stale = null }) {
+        const { pins, bundler } = context;
+        // The proof's validUntil bounds everything: stop (and prove again) 60 s before it.
+        const expired = () => validUntil != null && Date.now() / 1_000 >= Number(validUntil) - this.gaslessTiming.stopBeforeValidUntilSeconds;
+        if (expired()) throw gaslessError('gasless_op_expired');
+        const bump = () => {
+            const bumped = bumpFees(built.fees, { maxFeeCeiling: context.state.maxFeeCeiling, priorityFeeCeiling: context.state.priorityFeeCeiling });
+            if (!bumped) throw gaslessError('gasless_fee_bump_exhausted');
+            return bumped;
+        };
+        let built;
+        const hashes = new Set();
+        // `replacing`: the nonce of an earlier variant this one replaces (a
+        // fee bump or a rebuild after a send). That variant may land while
+        // the replacement is built or signed: a moved nonce or any refusal is
+        // then not rebuilt silently but handed to `replace`, which looks for
+        // the earlier variant's inclusion first.
+        const buildChecked = async ({ withInitCode = null, fees = null, replacing = null, gasOverrides = undefined }) => {
+            // The unsigned dry run exercises every validation step but the
+            // signature; AA10 (S exists) and AA25 (nonce moved) are rebuilt.
+            for (let pass = 0; pass < 3; pass += 1) {
+                built = await build({ withInitCode, fees, ...(gasOverrides ? { gasOverrides } : {}) });
+                if (replacing != null && BigInt(built.op.nonce) !== BigInt(replacing)) {
+                    const moved = new Error(ENTRY_POINT_ERRORS.AA25.message);
+                    throw Object.assign(moved, { name: 'ZkapiEntryPointError', code: ENTRY_POINT_ERRORS.AA25.code,
+                        shortMessage: ENTRY_POINT_ERRORS.AA25.message, aa: 'AA25', silent: true });
+                }
+                try {
+                    await this.dryRunGaslessOperation(context, built.op, { signed: false });
+                    break;
+                } catch (error) {
+                    if (error?.silent && error.aa === 'AA10' && pass < 2) {
+                        withInitCode = false;
+                        continue;
+                    }
+                    if (error?.silent && error.aa === 'AA25' && pass < 2 && replacing == null) continue;
+                    throw error;
+                }
+            }
+        };
+        const prepare = async ({ withInitCode = null, fees = null, replacing = null } = {}) => {
+            await buildChecked({ withInitCode, fees, replacing });
+            const wanted = await this.crossCheckGaslessEstimate(context, built);
+            if (wanted) {
+                // The bundler asks for more preVerificationGas than the
+                // client reserved (within the paymaster's cap): the op is
+                // rebuilt with it before anything is shown or signed.
+                await buildChecked({ withInitCode: built.withInitCode, fees: built.fees, replacing, gasOverrides: wanted });
+            }
+            await this.gaslessAwaitTimeWindow(context, { validAfter, validUntil, onStatus });
+            onStatus(amountsMessage ? amountsMessage(built) : this.gaslessAmountsMessage(built), { amounts: journalValue(built.amounts) });
+            onStatus(context.kind === KIND.forward ? 'Confirm the sponsored collection in MetaMask (a signature, no transaction)…'
+                : 'Confirm the sponsored operation in MetaMask (a signature, no transaction)…');
+            built.op.signature = await this.signGaslessOperation(context, built.hash, from);
+            try {
+                await this.dryRunGaslessOperation(context, built.op, { signed: true });
+            } catch (error) {
+                if (error?.code === 'signature_rejected') throw gaslessError('signature_rejected', { owner: context.transit.owner });
+                // The chain passed the proof's validUntil while the prompt
+                // was open (the window was checked before it): nothing was
+                // journaled or sent, so the plan is proved again (§3.2).
+                if (error?.aa === 'AA32' && validUntil != null && validAfter == null) {
+                    const expiredWhileSigning = gaslessError('gasless_op_expired', { aa: 'AA32', validUntil: Number(validUntil) });
+                    expiredWhileSigning.cause = error;
+                    throw expiredWhileSigning;
+                }
+                throw error;
+            }
+            await journal.rememberBuilt(built);
+            hashes.add(built.hash);
+        };
+        // The hashes of this plan's earlier operations (released before a
+        // re-proof or a rebuild) still count for an inclusion on chain, from
+        // the earliest block any of them was tracked from: a released
+        // operation can land before the current one was even built.
+        const staleHashes = new Set([...(resume?.staleUserOpHashes || []), ...(stale?.hashes || [])].map(hash => String(hash).toLowerCase()));
+        const lookupHashes = () => [...new Set([...hashes, ...staleHashes])];
+        const fromBlock = earliestBlock(resume?.submittedAtBlock, resume?.staleSubmittedAtBlock, staleHashes.size ? stale?.fromBlock : null)
+            ?? await this.gaslessBlockNumber(context);
+        const sent = error => Object.assign(error, { userOpSent: true });
+        const settleInclusion = async found => {
+            await journal.rememberTransaction(found.transactionHash);
+            onStatus(`Sponsored operation included in ${this.compact(found.transactionHash)} · reading its settlement…`);
+            let receipt;
+            try {
+                receipt = await this.gaslessTransactionReceipt(context, found.transactionHash);
+            } catch (error) {
+                throw sent(error);
+            }
+            // Settled under the hash the EntryPoint emitted: an inclusion
+            // named by the bundler under its own hash (bundler_hash_mismatch)
+            // carries the locally computed one in its UserOperationEvent.
+            const hash = emittedUserOpHash(receipt, {
+                entryPoint: pins.entryPoint, sender: context.transit.account,
+                candidates: [found.userOpHash, built?.hash, ...lookupHashes()], nonce: built?.op?.nonce ?? null
+            }) || found.userOpHash;
+            return { receipt, hash, transactionHash: found.transactionHash, built };
+        };
+        const sequenceAt = async nonce => unpackNonce(decodeWord(await this.gaslessCall(context.reader, pins.entryPoint,
+            encodeGetNonce(context.transit.account, unpackNonce(nonce).key)), 'getNonce')).sequence;
+        const readSequence = () => sequenceAt(built.op.nonce);
+        // An inclusion of S's operation at `nonce` (the journaled one by default), when the chain's nonce moved past it.
+        const inclusionByNonce = async (nonce = built.op.nonce) => (await sequenceAt(nonce) > unpackNonce(nonce).sequence
+            ? this.findUserOperationInclusion(context, null, fromBlock, { sender: context.transit.account, nonce })
+            : null);
+        // Whether an operation of this run may sit in a mempool (accepted by
+        // the bundler, or journaled as submitted before a resume).
+        let everSubmitted = resume?.userOpPhase === 'op_submitted';
+        // Set when the chain passed validUntil while a replacement was signed.
+        let chainExpired = false;
+        /**
+         * A replacement of an operation already sent (a fee bump, a rebuild):
+         * when it cannot be prepared (its nonce moved, a dry run refused it),
+         * the earlier variant may have landed meanwhile, so it is looked for
+         * (by every hash, then by its nonce) before anything is reported. An
+         * inclusion is returned to settle; an expiry goes to the stop, which
+         * follows what was sent; any other refusal is thrown as sent.
+         */
+        const replace = async options => {
+            if (!everSubmitted) {
+                await prepare(options);
+                return null;
+            }
+            const previous = built;
+            try {
+                await prepare({ ...options, replacing: previous.op.nonce });
+                return null;
+            } catch (error) {
+                const found = await this.findUserOperationInclusion(context, lookupHashes(), fromBlock)
+                    || await inclusionByNonce(previous.op.nonce).catch(() => null);
+                built = previous;
+                if (found) return found;
+                if (error?.code === 'gasless_op_expired') {
+                    chainExpired = true;
+                    return null;
+                }
+                // A wallet's plain rejection object becomes an Error first, so the mark survives.
+                throw sent(normalizeWalletError(error));
+            }
+        };
+        if (resume?.userOp) {
+            built = {
+                op: userOperationFromJson(resume.userOp),
+                hash: String(resume.userOpHash).toLowerCase(),
+                fees: null,
+                resumed: true
+            };
+            built.fees = { maxFeePerGas: built.op.maxFeePerGas, maxPriorityFeePerGas: built.op.maxPriorityFeePerGas };
+            for (const hash of resume.userOpHashes || []) hashes.add(String(hash).toLowerCase());
+            hashes.add(built.hash);
+            onStatus(`Resuming the sponsored operation ${this.compact(built.hash)}…`);
+            // A journaled operation is looked for on chain before anything is
+            // sent again (§3.2: logs by local hash, then the nonce, then the
+            // re-send): a crash between the send and the submission write
+            // must not lose a settlement the bundle already carries.
+            const found = await this.findUserOperationInclusion(context, lookupHashes(), fromBlock) || await inclusionByNonce();
+            if (found) return settleInclusion(found);
+        } else {
+            // An operation released earlier (an expiry stop before this
+            // re-proof) may have landed meanwhile: it is looked for (by its
+            // hashes, then by its nonce) before a replacement is built, dry-run
+            // and signed, so its settlement is never mistaken for a refusal
+            // of the replacement (NoteNotActive).
+            if (staleHashes.size) {
+                const found = await this.findUserOperationInclusion(context, [...staleHashes], fromBlock)
+                    || (stale?.nonce != null ? await inclusionByNonce(BigInt(stale.nonce)) : null);
+                if (found) return settleInclusion(found);
+            }
+            await prepare();
+        }
+        if (selfBundle) {
+            onStatus('Confirm the bundle transaction in MetaMask. The paymaster still pays the operation’s gas and refunds your account as its beneficiary.');
+            let transactionHash = null;
+            const receipt = await this.sendContractTransaction(
+                from,
+                pins.entryPoint,
+                encodeHandleOps([built.op], from),
+                async hash => {
+                    transactionHash = hash;
+                    await journal.rememberTransaction(hash);
+                    onStatus(`Bundle transaction submitted ${this.compact(hash)} · waiting for confirmation…`);
+                },
+                null,
+                null,
+                { kind: 'gasless-self-bundle', submission }
+            );
+            return { receipt, hash: built.hash, transactionHash: transactionHash || receipt?.transactionHash || null, built };
+        }
+        if (!bundler) throw this.gaslessBundlerUnavailable(null);
+        let submittedAt = resume?.userOpSubmittedAt ?? null;
+        let sentHash = resume?.userOpPhase === 'op_submitted';
+        let lastLogPoll = 0;
+        let resends = 0;
+        let rebuilds = 0;
+        const started = Date.now();
+        for (;;) {
+            const timing = this.gaslessTiming;
+            if (chainExpired || expired()) {
+                // §3.1: no new operation for this key while an older one may
+                // still be in a mempool, unless its validUntil has passed.
+                // The sent one is followed until it is included (settled
+                // here), the bundler no longer knows it, or the chain is
+                // past its validUntil; only then is it released for a re-proof.
+                if (everSubmitted) {
+                    const found = await this.awaitReleasedUserOp(context, {
+                        hashes: lookupHashes(), validUntil, fromBlock, inclusionByNonce, onStatus, journal
+                    });
+                    if (found) return settleInclusion(found);
+                }
+                await journal.release().catch(() => null);
+                const stopped = gaslessError('gasless_op_expired', everSubmitted ? { releasedNonce: built.op.nonce.toString() } : null);
+                throw sentHash ? sent(stopped) : stopped;
+            }
+            if (!sentHash) {
+                let bundlerHash;
+                try {
+                    bundlerHash = await bundler.sendUserOperation(userOperationJson(built.op), pins.entryPoint);
+                } catch (error) {
+                    if (error?.code === 'bundler_unavailable') throw this.gaslessBundlerUnavailable(error);
+                    if (this.gaslessAlreadyKnown(error)) {
+                        bundlerHash = built.hash;
+                    } else if (error?.silent && (error.aa === 'AA10' || error.aa === 'AA25')) {
+                        // The bundler's view of S may lag the chain (or lie):
+                        // the read RPC decides. AA25 with the chain's nonce
+                        // moved past the op means an inclusion to find, not a
+                        // rebuild; unchanged, the refusal is the bundler's. A
+                        // rebuild (which prompts again) is bounded like the
+                        // dry run's.
+                        const refused = () => {
+                            const rejected = gaslessError('bundler_rejected', {
+                                method: 'eth_sendUserOperation', aa: error.aa, rpcCode: error.rpcCode ?? null, rpcMessage: error.rpcMessage || error.message || null
+                            }, error.aa === 'AA25'
+                                ? 'The bundler refused the operation’s nonce although the chain has not moved it. Try again later, use another bundler, or pay the fee from a wallet.'
+                                : 'The bundler says the transit account already exists although the chain shows no code. Try again later, use another bundler, or pay the fee from a wallet.');
+                            rejected.aa = error.aa;
+                            rejected.cause = error;
+                            return rejected;
+                        };
+                        if (error.aa === 'AA25') {
+                            if (await readSequence() <= unpackNonce(built.op.nonce).sequence) throw refused();
+                            const inclusion = await this.findUserOperationInclusion(context, lookupHashes(), fromBlock) || await inclusionByNonce();
+                            if (inclusion) return settleInclusion(inclusion);
+                        } else {
+                            const code = await context.reader({ method: 'eth_getCode', params: [context.transit.account, 'latest'] });
+                            if (!code || code === '0x') throw refused();
+                        }
+                        if (rebuilds >= GASLESS_BUNDLER_REBUILD_LIMIT) throw refused();
+                        rebuilds += 1;
+                        if (!everSubmitted) await journal.release().catch(() => null);
+                        const landed = await replace({ withInitCode: error.aa === 'AA10' ? false : null });
+                        if (landed) return settleInclusion(landed);
+                        continue;
+                    } else if (this.gaslessFeeTooLow(error)) {
+                        // The first send as much as a re-send: a bundler
+                        // whose minimum fee is above this op's refuses the
+                        // identical bytes forever, so it is signed again with
+                        // both fee fields raised, until the ceilings stop it
+                        // (gasless_fee_bump_exhausted).
+                        onStatus('The bundler asks for a higher fee. The operation is signed again with fees raised by 12.5%…');
+                        const landed = await replace({ fees: bump(), withInitCode: built.withInitCode });
+                        if (landed) return settleInclusion(landed);
+                        continue;
+                    } else {
+                        throw error;
+                    }
+                }
+                const ambiguous = bundlerHash !== built.hash;
+                if (ambiguous) {
+                    hashes.add(bundlerHash);
+                    onStatus(GASLESS_MESSAGES.bundler_hash_mismatch);
+                }
+                await journal.rememberSubmission({ hash: bundlerHash, ambiguous });
+                submittedAt = Date.now();
+                sentHash = true;
+                everSubmitted = true;
+                onStatus(`Sponsored operation submitted ${this.compact(built.hash)} · waiting for its bundle…`);
+            }
+            // The bundler's receipt names the bundle transaction; the chain decides.
+            let found = null;
+            for (const hash of hashes) {
+                let receipt = null;
+                try {
+                    receipt = await bundler.getUserOperationReceipt(hash);
+                } catch {
+                    receipt = null;
+                }
+                const transactionHash = userOperationReceiptTransactionHash(receipt);
+                if (transactionHash) {
+                    found = { userOpHash: hash, transactionHash };
+                    break;
+                }
+            }
+            if (!found && (lastLogPoll === 0 || Date.now() - lastLogPoll >= timing.logPollMs)) {
+                lastLogPoll = Date.now();
+                found = await this.findUserOperationInclusion(context, lookupHashes(), fromBlock);
+                // Still following: the claim stays live for other tabs.
+                if (!found) await journal.heartbeat?.().catch(() => null);
+            }
+            if (found) return settleInclusion(found);
+            if (submittedAt != null && Date.now() - submittedAt >= timing.resendAfterMs) {
+                let known = null;
+                try {
+                    known = await bundler.getUserOperationByHash(built.hash);
+                } catch {
+                    known = null;
+                }
+                if (known) {
+                    submittedAt = Date.now();
+                    await journal.heartbeat?.().catch(() => null);
+                } else {
+                    // Unknown to the bundler: included under another route, or dropped.
+                    const inclusion = await inclusionByNonce();
+                    if (inclusion) return settleInclusion(inclusion);
+                    resends += 1;
+                    sentHash = false;
+                    onStatus(resends === 1 ? 'The bundler no longer knows the operation. The identical operation is sent again…'
+                        : 'The operation is still not included. It is sent again…');
+                    continue;
+                }
+            }
+            if (Date.now() - started > timing.giveUpAfterMs && timing.giveUpAfterMs) {
+                throw sent(gaslessError('gasless_op_pending', null, 'The sponsored operation is not included yet. It stays journaled and is checked in the background.'));
+            }
+            await this.gaslessSleep(timing.receiptPollMs);
+        }
+    }
+
+    /**
+     * After the expiry stop: follow the operation(s) already sent until one
+     * is included (returned, to settle), the bundler reports every hash
+     * unknown (dropped), or the latest block is past their validUntil (the
+     * EntryPoint can no longer include them); then null, and a replacement
+     * may be built. Bounded by validUntil, i.e. by the stop's 60 s margin.
+     */
+    async awaitReleasedUserOp(context, { hashes, validUntil, fromBlock, inclusionByNonce, onStatus, journal = null }) {
+        const { bundler } = context;
+        const timing = this.gaslessTiming;
+        const onChain = async () => (await this.findUserOperationInclusion(context, hashes, fromBlock))
+            || (await inclusionByNonce().catch(() => null));
+        onStatus('The withdrawal proof is close to its expiry. The operation already sent is followed until it is included or can no longer be, before a new one is prepared…');
+        let lastLogPoll = 0;
+        for (;;) {
+            for (const hash of hashes) {
+                let receipt = null;
+                try {
+                    receipt = bundler ? await bundler.getUserOperationReceipt(hash) : null;
+                } catch {
+                    receipt = null;
+                }
+                const transactionHash = userOperationReceiptTransactionHash(receipt);
+                if (transactionHash) return { userOpHash: hash, transactionHash };
+            }
+            if (lastLogPoll === 0 || Date.now() - lastLogPoll >= timing.logPollMs) {
+                lastLogPoll = Date.now();
+                const found = await onChain();
+                if (found) return found;
+                await journal?.heartbeat?.().catch(() => null);
+            }
+            let timestamp = null;
+            try {
+                const block = await context.reader({ method: 'eth_getBlockByNumber', params: ['latest', false] });
+                timestamp = block?.timestamp == null ? null : Number(toBigInt(block.timestamp, 'timestamp'));
+            } catch {
+                timestamp = null;
+            }
+            if ((timestamp ?? Date.now() / 1_000) > Number(validUntil)) return onChain();
+            let known = false;
+            for (const hash of hashes) {
+                try {
+                    const entry = bundler ? await bundler.getUserOperationByHash(hash) : null;
+                    if (entry?.transactionHash) return { userOpHash: hash, transactionHash: String(entry.transactionHash).toLowerCase() };
+                    if (entry) known = true;
+                } catch {
+                    // An unreachable bundler may still hold it: wait for validUntil.
+                    known = true;
+                }
+            }
+            if (!known) return onChain();
+            await this.gaslessSleep(timing.receiptPollMs);
+        }
+    }
+
+    /** The `bundler_unavailable` refusal, naming the fallbacks the host can offer. */
+    gaslessBundlerUnavailable(cause) {
+        const error = gaslessError('bundler_unavailable', { fallbacks: ['self_bundle', 'direct_call'], detail: cause?.message || null });
+        error.cause = cause;
+        error.withdrawalNeedsAction = true;
+        return error;
+    }
+
+    /**
+     * What the user is told before signing (§3.1): for a close, finalize or
+     * forward, the floor the payout address receives; for an escape, only
+     * the bound on this start's debt and an estimate at today's fees, since
+     * the finalization's fee is measured when it is sent (its own floor is
+     * shown when it is signed).
+     */
+    gaslessAmountsMessage(built) {
+        const amounts = built.amounts;
+        const eth = value => formatUnits(value / NATIVE_WEI_PER_UNIT, 9);
+        if (amounts.kind === KIND.escape) {
+            return `The escape is sponsored: nothing is paid now. Its finalization deducts at most ${eth(amounts.initiationDebtMax)} ETH for this start (its network fee and the paymaster’s flat fee), plus the finalization’s own fee and flat fee, measured when the finalization is sent; at current fees the payout address would receive about ${eth(amounts.estimatedReceived)} ETH. The guaranteed minimum is shown when the finalization is signed.`;
+        }
+        return `The payout address receives at least ${eth(amounts.minimumReceived)} ETH: the sponsored network fee is at most ${eth(amounts.maxCost)} ETH`
+            + `${amounts.flatFee ? ` plus a ${eth(amounts.flatFee)} ETH flat fee` : ''}${amounts.owed ? ` and ${eth(amounts.owed)} ETH of earlier debt` : ''}; the exact charge is measured on chain.`;
+    }
+
+    gaslessSettledMessage(amounts, credited) {
+        const eth = value => formatUnits(toBigInt(value) / NATIVE_WEI_PER_UNIT, 9);
+        const parts = `charged ${eth(amounts.chargedWei)} ETH${toBigInt(amounts.owedPaidWei) ? `, ${eth(amounts.owedPaidWei)} ETH of debt paid` : ''}`;
+        if (credited) return `${GASLESS_MESSAGES.payout_credited} (${parts}, ${eth(amounts.paymasterCreditedWei ?? 0n)} ETH credited.)`;
+        return `Withdrawal settled: ${parts}, ${eth(amounts.paidOutWei)} ETH paid out.`;
+    }
+
+    /** The prepared plan's write-ahead journal of a sponsored operation (§3.2 table). */
+    preparedUserOpJournal(submission, context) {
+        return {
+            rememberBuilt: async built => browserWalletRuntime.rememberPreparedWithdrawalUserOp(submission, {
+                userOp: userOperationJson(built.op), userOpHash: built.hash, userOpNonce: built.op.nonce.toString(),
+                userOpInitCode: built.withInitCode === true, bundlerUrl: context.bundlerUrl, submittedAtBlock: await this.gaslessBlockNumber(context)
+            }),
+            rememberSubmission: details => browserWalletRuntime.rememberPreparedWithdrawalUserOpSubmission(submission, details),
+            rememberTransaction: hash => browserWalletRuntime.rememberPreparedWithdrawalTransaction(hash, submission, null),
+            release: () => browserWalletRuntime.releasePreparedWithdrawalUserOp(submission),
+            heartbeat: () => browserWalletRuntime.touchPreparedWithdrawalUserOp(submission)
+        };
+    }
+
+    /** A withdrawal record's write-ahead journal of a finalization ('finalize') or forward ('forward') operation. */
+    recordUserOpJournal(recordId, prefix, { submission = null, context }) {
+        const field = name => `${prefix}UserOp${name}`;
+        const current = async () => (await browserWalletRuntime.currentWithdrawal(recordId)) || {};
+        return {
+            rememberBuilt: async built => {
+                const record = await current();
+                await browserWalletRuntime.updateWithdrawal(recordId, {
+                    [field('')]: userOperationJson(built.op),
+                    [field('Hash')]: built.hash,
+                    [field('Hashes')]: [...new Set([...(record[field('Hashes')] || []), built.hash])],
+                    [field('Block')]: await this.gaslessBlockNumber(context),
+                    [field('BuiltAt')]: Date.now(),
+                    [field('Phase')]: 'op_built',
+                    bundlerUrl: context.bundlerUrl
+                });
+            },
+            rememberSubmission: async ({ hash, ambiguous }) => {
+                const record = await current();
+                await browserWalletRuntime.updateWithdrawal(recordId, {
+                    [field('Hashes')]: [...new Set([...(record[field('Hashes')] || []), ...(hash ? [hash] : [])])],
+                    [field('SubmittedAt')]: Date.now(),
+                    [field('Ambiguous')]: Boolean(ambiguous) || record[field('Ambiguous')] === true,
+                    [field('Phase')]: 'op_submitted'
+                });
+            },
+            rememberTransaction: async hash => {
+                if (prefix === 'finalize' && submission) {
+                    await browserWalletRuntime.rememberWithdrawalFinalization(recordId, hash, submission, null);
+                    return;
+                }
+                const record = await current();
+                await browserWalletRuntime.updateWithdrawal(recordId, {
+                    [`${prefix}TransactionHash`]: hash,
+                    [`${prefix}TransactionHashes`]: [...new Set([...(record[`${prefix}TransactionHashes`] || []), hash])]
+                });
+            },
+            release: async () => {
+                await browserWalletRuntime.updateWithdrawal(recordId, {
+                    [field('')]: null, [field('Hash')]: null, [field('Phase')]: null, [field('SubmittedAt')]: null, [field('FollowedAt')]: null
+                });
+            },
+            // The following client's heartbeat (see touchPreparedWithdrawalUserOp).
+            heartbeat: () => browserWalletRuntime.updateWithdrawal(recordId, { [field('FollowedAt')]: Date.now() })
+        };
+    }
+
+    /** The journaled operation of a record under `prefix`, in the shape `runGaslessOperation` resumes. */
+    recordUserOpResume(record, prefix) {
+        if (!record?.[`${prefix}UserOp`] || !record[`${prefix}UserOpHash`]) return null;
+        return {
+            userOp: record[`${prefix}UserOp`],
+            userOpHash: record[`${prefix}UserOpHash`],
+            userOpHashes: record[`${prefix}UserOpHashes`] || [],
+            userOpPhase: record[`${prefix}UserOpPhase`] || 'op_built',
+            userOpSubmittedAt: record[`${prefix}UserOpSubmittedAt`] ?? null,
+            submittedAtBlock: record[`${prefix}UserOpBlock`] ?? null
+        };
+    }
+
+    /**
+     * `withdraw(mode, onStatus, { fees: 'payout', ... })`: the sponsored
+     * branch of performWithdrawal (§3.2). The destination Y defaults to the
+     * connected account, which also becomes the owner of S; the plan is
+     * prepared with destination S; no eth_sendTransaction is ever sent.
+     */
+    async performGaslessWithdrawal(mode, onStatus, options) {
+        // The plan's claims this call takes are followed until it returns or
+        // throws; afterwards a resume (here or in another client of the
+        // runtime) may take them over.
+        const claimed = new Set();
+        try {
+            return await this.followGaslessWithdrawal(mode, onStatus, { ...options, claimed });
+        } finally {
+            for (const submissionId of claimed) browserWalletRuntime.endGaslessClaim(submissionId);
+        }
+    }
+
+    async followGaslessWithdrawal(mode, onStatus, { requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from,
+        durablePrepared, note, claimed }) {
+        if (durablePrepared && !isGaslessWithdrawal(durablePrepared)) throw gaslessError('gasless_plan_mismatch');
+        if (requestedDestination && durablePrepared?.payout && durablePrepared.payout.toLowerCase() !== requestedDestination) {
+            throw new Error('This withdrawal is already bound to a different destination. Resume it with its saved address.');
+        }
+        const payout = String(durablePrepared?.payout || requestedDestination || from).toLowerCase();
+        const owner = String(durablePrepared?.transit?.owner || from).toLowerCase();
+        if (durablePrepared?.transactionHash) mode = durablePrepared.mode;
+        let kind = mode === 'mutual' ? KIND.close : KIND.escape;
+        const vault = this.config.funding.contract_address;
+        const noteId = Number(note.note_id);
+        onStatus('Checking the sponsored withdrawal path…');
+        const context = await this.gaslessContext({
+            from, payout, owner, expectedAccount: durablePrepared?.transit?.account || null,
+            bundlerUrl: bundlerUrl || durablePrepared?.bundlerUrl || null, kind, record: durablePrepared || null
+        });
+        const S = context.transit.account;
+        if (!durablePrepared) {
+            onStatus(owner === payout ? GASLESS_PRIVACY_NOTE : GASLESS_PRIVACY_NOTE_SEPARATE_PAYOUT);
+            try {
+                const payoutCode = await context.reader({ method: 'eth_getCode', params: [payout, 'latest'] });
+                if (payoutCode && payoutCode !== '0x') onStatus(GASLESS_PAYOUT_CONTRACT_WARNING);
+            } catch {
+                // Advisory only.
+            }
+        }
+        const nullifierHint = durablePrepared?.public_inputs?.withdrawal_nullifier || durablePrepared?.withdrawalNullifier
+            || await browserWalletRuntime.currentWithdrawalNullifier();
+        let preflight = await this.gaslessPreflight(context, {
+            kind, key: kind === KIND.close ? attemptsKey(KIND.close, { nullifier: nullifierHint }) : attemptsKey(KIND.escape, { noteId })
+        });
+        if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
+        context.state = preflight.state;
+
+        const withdrawal = { phase: 'prepared', mode, noteId, destination: S, payout, feePayer: 'payout', transit: context.transit };
+        let plan;
+        let receipt;
+        let hash = durablePrepared?.userOpHash || null;
+        let submission = null;
+        const withdrawalAttempts = Number(this.gaslessWithdrawalAttempts) > 0 ? Number(this.gaslessWithdrawalAttempts) : 4;
+        let reprove = false;
+        // The nonce of an operation an expiry stop released: the next run looks for it on chain before building.
+        let releasedNonce = null;
+        const walletRequest = this.gaslessReadsViaWallet === true ? request => this.ethereum.request(request) : null;
+        try {
+            for (let attempt = 0; attempt < withdrawalAttempts; attempt += 1) {
+                onStatus(attempt === 0
+                    ? (mode === 'mutual'
+                        ? 'Checking this balance and requesting a cooperative close…'
+                        : 'Preparing a unilateral escape locally…')
+                    : 'The withdrawal proof expired or the vault refused its root. Proving again…');
+                // A journaled operation whose proof is still valid is resumed
+                // as it is (identical bytes, no new proof); its claim, held by
+                // this or a crashed tab, is taken over below.
+                const journaled = attempt === 0 ? await browserWalletRuntime.currentPreparedWithdrawal() : null;
+                const resumable = isGaslessWithdrawal(journaled) && journaled.userOp && !journaled.transactionHash
+                    && journaled.mode === mode && journaled.transit.account === S
+                    && Number(journaled.public_inputs?.valid_until || 0) - this.gaslessTiming.stopBeforeValidUntilSeconds > Date.now() / 1_000;
+                if (resumable) {
+                    plan = journaled;
+                } else {
+                    const expectedActiveRoot = mode === 'mutual'
+                        ? decodeWord(await this.gaslessCall(context.reader, vault, `0x${ABI.currentRoot}`), 'currentRoot')
+                        : null;
+                    plan = await browserWalletRuntime.prepareWithdrawal(mode, S, {
+                        expectedActiveRoot,
+                        reprove,
+                        earlyConcession: concede,
+                        walletRequest,
+                        gasless: { payout, transit: context.transit },
+                        onProgress: (_phase, message) => onStatus(message)
+                    });
+                }
+                for (const warning of plan.warnings || []) {
+                    if (warning?.message) onStatus(`${warning.message} It can still be submitted.`);
+                }
+                if (Number(plan.public_inputs?.note_id) !== noteId) {
+                    throw new Error('The private wallet returned a withdrawal for a different note.');
+                }
+                if (plan.mode !== mode) {
+                    // E2: the exit rules turned a mutual request into an escape.
+                    onStatus(plan.decision?.clearance_error_code
+                        ? 'The server did not grant a cooperative close, so this balance exits by escape, conceding nothing.'
+                        : 'This balance exits by escape.');
+                    mode = plan.mode;
+                    withdrawal.mode = mode;
+                    kind = mode === 'mutual' ? KIND.close : KIND.escape;
+                    context.kind = kind;
+                    preflight = await this.gaslessPreflight(context, { kind, key: attemptsKey(KIND.escape, { noteId }) });
+                    if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
+                    context.state = preflight.state;
+                }
+                const knownHash = plan.transactionHash || null;
+                this.rememberWithdrawal({ ...withdrawal, phase: knownHash ? 'submitted' : 'prepared', transactionHash: knownHash,
+                    clearanceReserved: plan.clearanceReserved === true || mode === 'mutual' });
+                if (this.config) {
+                    this.config.prepared_withdrawal = {
+                        mode, phase: knownHash ? 'submitted' : 'prepared', note_id: noteId, destination: S, payout, fee_payer: 'payout',
+                        transaction_hash: knownHash, clearance_reserved: plan.clearanceReserved === true || mode === 'mutual',
+                        clearance_granted: mode === 'mutual' && Boolean(plan.clearance?.signature), user_op_hash: plan.userOpHash || null
+                    };
+                }
+                const vaultCall = encodeWithdrawal(plan, mode, S, vault, { conceded: plan.public_inputs.conceded });
+                const claim = await browserWalletRuntime.claimPreparedWithdrawalUserOp({ liveWindowMs: this.gaslessTiming.resendAfterMs });
+                if (claim?.submissionId) claimed.add(claim.submissionId);
+                submission = claim;
+                if (claim.transactionHash) {
+                    onStatus(`Checking the bundle transaction ${this.compact(claim.transactionHash)}…`);
+                    receipt = await this.gaslessTransactionReceipt(context, claim.transactionHash);
+                    hash = plan.userOpHash || hash;
+                    break;
+                }
+                const late = await browserWalletRuntime.exitBeforeBroadcast().catch(() => null);
+                if (late?.lateSuccessor) {
+                    onStatus('A settled private request arrived after the exit proof was made. It is kept and applied if this exit expires unused.');
+                }
+                const validUntil = Number(plan.public_inputs.valid_until);
+                const payoutWei = BigInt(plan.public_inputs.final_balance) * NATIVE_WEI_PER_UNIT;
+                const nullifier = plan.public_inputs.withdrawal_nullifier;
+                const build = (options = {}) => this.buildGaslessOperation(context, {
+                    kind, vaultCall, nullifier, noteId, payoutWei, feeCapWei, allowExpensiveGas, state: context.state, ...options
+                });
+                try {
+                    // Operations this plan released earlier (an expiry stop
+                    // before a re-proof) may still land: their hashes and
+                    // the block they were tracked from join the search.
+                    const journaled = await browserWalletRuntime.currentPreparedWithdrawal().catch(() => null);
+                    const outcome = await this.runGaslessOperation(context, build, this.preparedUserOpJournal(submission, context), {
+                        onStatus, validUntil, selfBundle, from, submission,
+                        resume: claim.status === 'resumed' ? claim : null,
+                        stale: journaled?.staleUserOpHashes?.length
+                            ? { hashes: journaled.staleUserOpHashes, fromBlock: journaled.staleSubmittedAtBlock ?? null, nonce: releasedNonce } : null
+                    });
+                    receipt = outcome.receipt;
+                    hash = outcome.hash;
+                    break;
+                } catch (error) {
+                    // A proof past its valid_until (the stop 60 s before it) or
+                    // a root the vault does not know is proved again; an
+                    // operation that reached a mempool is released with its
+                    // proof: a late inclusion fails on the nullifier and costs
+                    // one attempt (§3.1).
+                    if (error?.code === 'gasless_op_expired' && error.data?.releasedNonce != null) releasedNonce = error.data.releasedNonce;
+                    const reprovable = REPROVABLE_EXIT_ERRORS.includes(error?.code) || error?.code === 'gasless_op_expired';
+                    if (reprovable && (error?.code === 'gasless_op_expired' || !error?.userOpSent) && attempt + 1 < withdrawalAttempts) {
+                        await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
+                        submission = null;
+                        reprove = true;
+                        continue;
+                    }
+                    throw error;
+                }
+            }
+        } catch (failure) {
+            const error = normalizeWalletError(failure);
+            if (submission && (!error.userOpSent || error.code === 'gasless_op_expired') && !error.transactionHash) {
+                // Nothing left the browser (or what did is past its proof):
+                // release this tab's claim so the plan can be resumed or paid
+                // from a wallet.
+                await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission).catch(() => null);
+                if (isWalletRejection(error)) {
+                    error.shortMessage = 'MetaMask canceled the signature. No funds moved; the sponsored withdrawal can be resumed or paid from a wallet.';
+                }
+            } else if (error.userOpSent) {
+                error.shortMessage = error.shortMessage || 'The sponsored operation was sent and is still being checked. It stays journaled; check the withdrawal status before anything else.';
+                error.withdrawalNeedsAction = true;
+            }
+            await this.refresh({ quiet: true });
+            throw error;
+        }
+        return this.settleGaslessWithdrawal(context, { receipt, hash, mode, plan, note, submission, onStatus });
+    }
+
+    /**
+     * The settlement of a sponsored close or escape from its bundle receipt:
+     * the UserOperationEvent, the vault's own event (noteId filtered, destination
+     * S), the paymaster's Settled / PayoutCredited / SponsorshipFailed, then the
+     * unchanged vault-state confirmation and the detach with the transit fields.
+     */
+    async settleGaslessWithdrawal(context, { receipt, hash, mode, plan, note, submission, onStatus }) {
+        const { pins, reader, transit } = context;
+        const vault = this.config.funding.contract_address;
+        const S = transit.account;
+        const noteId = Number(note.note_id);
+        const current = await browserWalletRuntime.currentPreparedWithdrawal().catch(() => null);
+        const settlement = settlementOf(receipt, { entryPoint: pins.entryPoint, paymaster: pins.paymaster, hash, sender: S, payee: transit.payee });
+        if (!settlement) throw new Error('The bundle transaction carries no settlement of this sponsored operation.');
+        const transactionHash = settlement.transactionHash || receipt?.transactionHash || null;
+        if (!settlement.success) {
+            const reason = settlement.revert?.decoded?.code || null;
+            const stranded = settlement.stranded || decodeBool(await this.gaslessCall(reader, pins.paymaster, encodeStranded(S)), 'stranded');
+            const balance = toBigInt(await reader({ method: 'eth_getBalance', params: [S, 'latest'] }), 'balance');
+            await browserWalletRuntime.rememberPreparedWithdrawalUserOpOutcome(submission, { success: false, transitBalanceWei: balance }).catch(() => null);
+            const status = await this.readBrowserWithdrawalStatus(noteId, null, { request: reader });
+            await browserWalletRuntime.markPreparedWithdrawalRetryable(transactionHash, submission).catch(() => null);
+            // The reverted operation (under every hash it was journaled
+            // under) is not a late inclusion to look for again: a retry
+            // signs a new operation at the next nonce.
+            const revertedHash = String(settlement.event?.userOpHash || hash || '').toLowerCase();
+            const journaledHashes = (current?.userOpHashes || []).map(value => String(value).toLowerCase());
+            const reverted = [revertedHash, String(hash || '').toLowerCase(),
+                ...(journaledHashes.includes(revertedHash) || journaledHashes.includes(String(hash || '').toLowerCase()) ? journaledHashes : [])];
+            await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission, { reverted }).catch(() => null);
+            if (status.status === 'closed' && (stranded || balance > 0n)) {
+                // Someone else closed the note with the same public calldata:
+                // the payout reached S and a sponsored forward collects it.
+                await browserWalletRuntime.detachClosedWithdrawal({
+                    mode: 'mutual', payoutVerified: false, noteId, destination: S, finalBalance: Number(plan.public_inputs.final_balance),
+                    transactionHash, closeBlockNumber: Number(status.observed_block || 0), lastObservedBlock: Number(status.observed_block || 0),
+                    clearanceReserved: true, createdAt: plan.createdAt, feePayer: 'payout', payout: transit.payee, transit,
+                    userOpHash: hash, userOpHashes: current?.userOpHashes || [hash], userOpSuccess: false, fundsWaitingInTransit: balance > 0n,
+                    transitBalanceWei: balance
+                });
+                this.rememberWithdrawal(null);
+                await this.refresh();
+                onStatus(GASLESS_MESSAGES.transit_funds_waiting);
+                return { status: 'closed', fundsWaitingInTransit: balance > 0n, transitBalanceWei: balance.toString(), transitAccount: S,
+                    reason, userOpHash: hash, transactionHash, recordId: browserWalletRuntime.withdrawalRecordId(noteId) };
+            }
+            const error = gaslessError('gasless_op_reverted', {
+                reason, revert: settlement.revert?.decoded?.message || null, transactionHash, userOpHash: hash, stranded,
+                transitBalanceWei: balance.toString()
+            }, reason ? `${GASLESS_MESSAGES.gasless_op_reverted} (${settlement.revert.decoded.message})` : null);
+            error.withdrawalNeedsAction = true;
+            await this.refresh({ quiet: true });
+            throw error;
+        }
+        const event = parseWithdrawalReceipt(receipt, vault, mode, { noteId });
+        if (!event || event.noteId !== BigInt(noteId)
+            || event.destination.toLowerCase() !== S
+            || event.finalBalance !== BigInt(plan.public_inputs.final_balance)) {
+            throw new Error('The operation succeeded, but its withdrawal event did not match the prepared note.');
+        }
+        if (mode === 'escape' && event.concession
+            && (event.concession.conceded !== BigInt(plan.public_inputs.conceded)
+                || event.concession.stateBalance !== BigInt(plan.public_inputs.final_balance) + BigInt(plan.public_inputs.conceded)
+                || event.concession.nextNullifier !== BigInt(plan.public_inputs.next_nullifier))) {
+            throw new Error('The operation succeeded, but its recorded concession did not match the prepared escape.');
+        }
+        const settled = settlement.settled;
+        const credited = settlement.credited;
+        const amounts = {
+            receivedWei: settled?.received ?? 0n,
+            chargedWei: settled?.charged ?? 0n,
+            owedPaidWei: settled?.owedPaid ?? 0n,
+            paidOutWei: settled?.paidOut ?? 0n,
+            paymasterCredited: Boolean(credited),
+            paymasterCreditedWei: credited?.amount ?? null
+        };
+        const initiationDebtWei = mode === 'escape' ? (settlement.owed?.owedWei ?? settled?.charged ?? null) : undefined;
+        await browserWalletRuntime.rememberPreparedWithdrawalUserOpOutcome(submission, { success: true, ...amounts,
+            ...(initiationDebtWei !== undefined ? { initiationDebtWei } : {}) }).catch(() => null);
+        onStatus('Confirming the vault state and updating this browser…');
+        const confirmed = await this.confirmMinedWithdrawalStatus(noteId, receipt, { request: reader });
+        const shared = {
+            feePayer: 'payout', payout: transit.payee, transit, userOpHash: hash, userOpHashes: current?.userOpHashes || [hash],
+            userOpSuccess: true, ...amounts, fundsWaitingInTransit: false, transitBalanceWei: 0n
+        };
+        if (mode === 'mutual') {
+            if (confirmed.status !== 'closed') {
+                throw new Error(`The vault still reports this private balance as ${confirmed.status}.`);
+            }
+            await browserWalletRuntime.detachClosedWithdrawal({
+                mode: 'mutual',
+                payoutVerified: !credited && amounts.paidOutWei > 0n,
+                noteId,
+                destination: S,
+                finalBalance: Number(event.finalBalance),
+                transactionHash,
+                closeBlockNumber: Number(BigInt(receipt?.blockNumber || '0x0')),
+                lastObservedBlock: Number(confirmed.observed_block || 0),
+                clearanceReserved: true,
+                createdAt: plan.createdAt,
+                ...shared
+            });
+            this.rememberWithdrawal(null);
+            await this.refresh();
+            onStatus(`${this.gaslessSettledMessage(amounts, Boolean(credited))} Finality is being checked safely in the background.`,
+                { amounts: journalValue(amounts) });
+            return {
+                status: 'closed', event, receipt, userOpHash: hash, transactionHash, transitAccount: S, payout: transit.payee,
+                amounts: journalValue(amounts), ...(credited ? { paymasterCredited: true } : {})
+            };
+        }
+        const deadline = Number(confirmed.challenge_deadline || event.challengeDeadline);
+        if (confirmed.status !== 'pending_withdrawal' || !deadline) {
+            throw new Error('The escape operation settled, but the vault did not report its safety deadline.');
+        }
+        const record = await browserWalletRuntime.detachEscapeWithdrawal({
+            noteId,
+            destination: S,
+            finalBalance: Number(event.finalBalance),
+            challengeDeadline: deadline,
+            transactionHash,
+            startBlockNumber: Number(BigInt(receipt?.blockNumber || '0x0')),
+            lastObservedBlock: Number(confirmed.observed_block || 0),
+            createdAt: plan.createdAt,
+            ...shared,
+            initiationDebtWei: initiationDebtWei ?? null
+        });
+        this.rememberWithdrawal(null);
+        await this.refresh();
+        onStatus(`Escape started without a transaction fee. Its finalization will deduct the ${formatUnits(toBigInt(initiationDebtWei ?? 0n) / NATIVE_WEI_PER_UNIT, 9)} ETH this start cost. You can add a new private balance while the safety window runs.`,
+            { amounts: journalValue({ ...amounts, initiationDebtWei }) });
+        return {
+            status: 'pending_withdrawal', deadline, event, receipt, recordId: record.recordId, conceded: BigInt(plan.public_inputs.conceded),
+            decision: plan.decision || null, pathSource: plan.pathSource || null, userOpHash: hash, transactionHash, transitAccount: S,
+            payout: transit.payee, initiationDebtWei: initiationDebtWei == null ? null : initiationDebtWei.toString()
+        };
+    }
+
+    /**
+     * The sponsored FINALIZE of a pending escape (§3.1): only after the
+     * deadline; an escape someone else already finalized goes straight to a
+     * FORWARD of the payout now in S.
+     */
+    async performGaslessFinalization(withdrawal, onStatus, options = {}) {
+        const claimed = new Set();
+        try {
+            return await this.followGaslessFinalization(withdrawal, onStatus, { ...options, claimed });
+        } finally {
+            for (const submissionId of claimed) browserWalletRuntime.endGaslessClaim(submissionId);
+        }
+    }
+
+    async followGaslessFinalization(withdrawal, onStatus, { bundlerUrl = null, allowExpensiveGas = false, feeCapWei = null, selfBundle = false,
+        claimed = new Set() } = {}) {
+        if (!isGaslessWithdrawal(withdrawal)) throw gaslessError('gasless_plan_mismatch', null,
+            'This escape was started to pay its fees from a wallet, so it has no transit account to sponsor. Finalize it with fees: \'wallet\'.');
+        onStatus('Connecting to MetaMask for the sponsored finalization…');
+        const from = await this.connectWallet();
+        const transit = withdrawal.transit;
+        const context = await this.gaslessContext({
+            from, payout: withdrawal.payout, owner: transit.owner, expectedAccount: transit.account,
+            bundlerUrl: bundlerUrl || withdrawal.bundlerUrl || null, kind: KIND.finalize, record: withdrawal
+        });
+        const noteId = Number(withdrawal.noteId);
+        const vault = this.config.funding.contract_address;
+        const S = transit.account;
+        const status = await this.readBrowserWithdrawalStatus(noteId, null, { request: context.reader });
+        // This record's own finalization journaled earlier (op_built /
+        // op_submitted) may have been included while no one followed it: the
+        // chain is asked first (§3.2 resume order: logs by hash, then the
+        // nonce), so a closed vault status is not mistaken for a third party's.
+        const ownInclusion = withdrawal.finalizeTransactionHash ? null : await this.recordUserOpInclusion(context, withdrawal, 'finalize');
+        if (status.status === 'closed' && !ownInclusion) {
+            onStatus('The escape was already finalized by someone else. Collecting the payout from the transit account…');
+            return this.performTransitForward(withdrawal, onStatus, { context, from, bundlerUrl, allowExpensiveGas, feeCapWei, selfBundle });
+        }
+        let pendingNullifier = null;
+        let payoutWei = null;
+        let challengeDeadline = null;
+        if (!ownInclusion) {
+            if (status.status !== 'pending_withdrawal') throw new Error(`The vault reports this balance as ${status.status}, not as a pending escape.`);
+            if (String(status.destination || '').toLowerCase() !== S) throw new Error('The pending escape does not pay this withdrawal’s transit account.');
+            pendingNullifier = BigInt(status.withdrawal_nullifier);
+            payoutWei = BigInt(status.final_balance) * NATIVE_WEI_PER_UNIT;
+            challengeDeadline = Number(status.challenge_deadline ?? withdrawal.challengeDeadline);
+            const preflight = await this.gaslessPreflight(context, { kind: KIND.finalize, key: attemptsKey(KIND.finalize, { noteId }), noteId });
+            if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
+            context.state = preflight.state;
+        }
+        let submittedHash = withdrawal.finalizeTransactionHash || null;
+        let submission = null;
+        let receipt;
+        let hash = ownInclusion?.userOpHash || withdrawal.finalizeUserOpHash || null;
+        try {
+            // A finalization already included settles under this record's
+            // own claim; otherwise a journaled one no client follows any more
+            // is taken over (no prompt), and a fresh one is claimed.
+            const claim = ownInclusion && withdrawal.finalizeSubmissionId ? {
+                status: 'resumed', transactionHash: null, recordId: withdrawal.recordId, submissionId: withdrawal.finalizeSubmissionId,
+                operationId: withdrawal.finalizeOperationId, generation: Number(withdrawal.finalizeGeneration || 0),
+                deploymentId: withdrawal.deploymentId, chainId: Number(withdrawal.chainId), contractAddress: withdrawal.contractAddress,
+                noteId: Number(withdrawal.noteId), destination: withdrawal.destination, record: withdrawal
+            } : await browserWalletRuntime.claimWithdrawalFinalization(withdrawal.recordId, {
+                resumeUserOp: true, liveWindowMs: this.gaslessTiming.resendAfterMs
+            });
+            if (claim.submissionId && !claim.transactionHash) claimed.add(claim.submissionId);
+            submittedHash = claim.transactionHash || null;
+            submission = claim;
+            withdrawal = claim.record;
+            if (!submittedHash && ownInclusion) {
+                await browserWalletRuntime.rememberWithdrawalFinalization(withdrawal.recordId, ownInclusion.transactionHash, claim, null);
+                onStatus(`Sponsored finalization included in ${this.compact(ownInclusion.transactionHash)} · reading its settlement…`);
+                submittedHash = ownInclusion.transactionHash;
+            }
+            if (submittedHash) {
+                onStatus(`Checking the bundle transaction ${this.compact(submittedHash)}…`);
+                receipt = await this.gaslessTransactionReceipt(context, submittedHash);
+            } else {
+                const build = (options = {}) => this.buildGaslessOperation(context, {
+                    kind: KIND.finalize, vaultCall: encodeFinalizeEscape(noteId), nullifier: pendingNullifier, noteId, payoutWei, feeCapWei,
+                    allowExpensiveGas, state: context.state, ...options
+                });
+                const outcome = await this.runGaslessOperation(context, build, this.recordUserOpJournal(withdrawal.recordId, 'finalize', { submission, context }), {
+                    onStatus, selfBundle, from, submission, resume: this.recordUserOpResume(withdrawal, 'finalize'),
+                    // The paymaster's validAfter is the vault's deadline (AA32 before it).
+                    validAfter: challengeDeadline
+                });
+                receipt = outcome.receipt;
+                hash = outcome.hash;
+                submittedHash = outcome.transactionHash;
+            }
+        } catch (failure) {
+            const error = normalizeWalletError(failure);
+            if (submission && !error.userOpSent && !error.transactionHash) {
+                await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { submission }).catch(() => null);
+                if (isWalletRejection(error)) error.shortMessage = 'MetaMask canceled the signature. The escape is still safe and can be finalized later.';
+            } else if (error.userOpSent) {
+                error.withdrawalNeedsAction = true;
+            }
+            await this.refresh({ quiet: true });
+            throw error;
+        }
+        const settlement = settlementOf(receipt, { entryPoint: context.pins.entryPoint, paymaster: context.pins.paymaster, hash, sender: S, payee: transit.payee });
+        if (!settlement) throw new Error('The bundle transaction carries no settlement of this finalization.');
+        if (!settlement.success) {
+            await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { transactionHash: settlement.transactionHash }).catch(() => null);
+            // Its hashes are set aside as reverted: a retry looks for no
+            // earlier inclusion of them and builds a new operation.
+            const journaled = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId).catch(() => null) || withdrawal;
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+                finalizeUserOp: null, finalizeUserOpPhase: 'reverted',
+                ...this.revertedRecordUserOpFields(journaled, 'finalize', [hash, settlement.event?.userOpHash])
+            }).catch(() => null);
+            const after = await this.readBrowserWithdrawalStatus(noteId, null, { request: context.reader });
+            if (after.status === 'closed') {
+                onStatus('A third party finalized this escape first. Collecting the payout from the transit account…');
+                await this.refresh({ quiet: true });
+                return this.performTransitForward(await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || withdrawal, onStatus,
+                    { context, from, bundlerUrl, allowExpensiveGas, feeCapWei, selfBundle });
+            }
+            const error = gaslessError('gasless_op_reverted', { reason: settlement.revert?.decoded?.code || null, transactionHash: settlement.transactionHash, userOpHash: hash });
+            error.withdrawalNeedsAction = true;
+            await this.refresh({ quiet: true });
+            throw error;
+        }
+        const event = parseWithdrawalReceipt(receipt, vault, 'finalize', { noteId });
+        const receiptBlock = Number(BigInt(receipt?.blockNumber || '0x0'));
+        const match = event ? await this.escapePayoutMatch(withdrawal, event.finalBalance, receiptBlock, { request: context.reader }) : null;
+        if (!event || event.noteId !== BigInt(noteId) || event.destination.toLowerCase() !== S || !match?.accepted) {
+            throw new Error('The finalization event did not match the pending withdrawal.');
+        }
+        const confirmed = await this.confirmMinedWithdrawalStatus(noteId, receipt, { request: context.reader });
+        if (confirmed.status !== 'closed') throw new Error(`The vault reports ${confirmed.status} after finalization.`);
+        const settled = settlement.settled;
+        const credited = settlement.credited;
+        const amounts = {
+            receivedWei: settled?.received ?? 0n, chargedWei: settled?.charged ?? 0n, owedPaidWei: settled?.owedPaid ?? 0n,
+            paidOutWei: settled?.paidOut ?? 0n, paymasterCredited: Boolean(credited), paymasterCreditedWei: credited?.amount ?? null
+        };
+        await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+            phase: 'closed_unconfirmed',
+            chainStatus: 'closed',
+            payoutVerified: !credited && amounts.paidOutWei > 0n,
+            payoutCredited: false,
+            ...journalValue(amounts),
+            finalizeUserOpHash: hash,
+            finalizeUserOpPhase: 'settled',
+            ...this.payoutMatchFields({ amount: Number(event.finalBalance), match }, onStatus),
+            closedAt: Date.now(),
+            closeBlockNumber: receiptBlock,
+            lastObservedBlock: Number(confirmed.observed_block || 0),
+            fundsWaitingInTransit: false,
+            transitBalanceWei: '0',
+            error: null
+        });
+        await this.refresh();
+        onStatus(`${this.gaslessSettledMessage(amounts, Boolean(credited))} Finality is being checked safely in the background.`,
+            { amounts: journalValue(amounts) });
+        return { status: 'closed', event, receipt, userOpHash: hash, transactionHash: submittedHash, amounts: journalValue(amounts),
+            ...(credited ? { paymasterCredited: true } : {}) };
+    }
+
+    /**
+     * The status line for a payout waiting in a plan's or record's transit
+     * account S. A sponsored forward is named only when the paymaster holds
+     * the evidence its forward rule requires (stranded[S], or
+     * escapeNotePlusOne[S] of a closed escape: a sponsored close or
+     * finalization that reverted, or a sponsored escape); a wallet-paid
+     * close or escape to S leaves none, so only sweepTransit is named.
+     * Read-only, through the journaled paymaster; any failure names the sweep.
+     */
+    async transitFundsMessage(record, { reader = null } = {}) {
+        const context = this.recordReaderContext(record, reader || this.gaslessReader());
+        if (!context) return GASLESS_MESSAGES.transit_sweep_needed;
+        try {
+            const S = context.transit.account;
+            if (decodeBool(await this.gaslessCall(context.reader, context.pins.paymaster, encodeStranded(S)), 'stranded')) {
+                return GASLESS_MESSAGES.transit_funds_waiting;
+            }
+            const notePlusOne = decodeWord(await this.gaslessCall(context.reader, context.pins.paymaster, encodeEscapeNotePlusOne(S)), 'escapeNotePlusOne');
+            if (notePlusOne !== 0n) {
+                const status = await this.readBrowserWithdrawalStatus(Number(notePlusOne - 1n), null, { request: context.reader });
+                if (status.status === 'closed') return GASLESS_MESSAGES.transit_funds_waiting;
+            }
+        } catch {
+            // Unknown evidence: the sweep works either way.
+        }
+        return GASLESS_MESSAGES.transit_sweep_needed;
+    }
+
+    /**
+     * `collectTransitBalance(recordId, onStatus)`: a sponsored FORWARD of the
+     * balance sitting in S, with the paymaster's evidence (`stranded`, or the
+     * record of S's sponsored escape that a third party finalized) (§2.4).
+     */
+    async collectTransitBalance(recordId, onStatus = () => {}, options = {}) {
+        const record = await browserWalletRuntime.currentWithdrawal(recordId);
+        if (!record) throw new Error('The withdrawal record was not found.');
+        if (!isGaslessWithdrawal(record)) throw gaslessError('gasless_plan_mismatch', null, 'This withdrawal has no transit account to collect from.');
+        return this.performTransitForward(record, onStatus, options);
+    }
+
+    async performTransitForward(withdrawal, onStatus, { context = null, from = null, bundlerUrl = null, allowExpensiveGas = false, feeCapWei = null,
+        selfBundle = false } = {}) {
+        const transit = withdrawal.transit;
+        if (!from) {
+            onStatus('Connecting to MetaMask to collect the transit balance…');
+            from = await this.connectWallet();
+        }
+        if (!context) {
+            context = await this.gaslessContext({
+                from, payout: withdrawal.payout, owner: transit.owner, expectedAccount: transit.account,
+                bundlerUrl: bundlerUrl || withdrawal.bundlerUrl || null, kind: KIND.forward, record: withdrawal
+            });
+        }
+        context.kind = KIND.forward;
+        const journal = this.recordUserOpJournal(withdrawal.recordId, 'forward', { context });
+        // This record's own forward journaled earlier (op_built /
+        // op_submitted) may have been included while no one followed it: the
+        // chain is asked first (logs by hash, then the nonce), so an emptied
+        // transit account is settled as the record's own collection, not
+        // reported as nothing to collect.
+        const ownInclusion = ['op_built', 'op_submitted'].includes(withdrawal.forwardUserOpPhase)
+            ? await this.recordUserOpInclusion(context, withdrawal, 'forward') : null;
+        let balance = null;
+        let outcome;
+        if (ownInclusion) {
+            onStatus(`Sponsored collection included in ${this.compact(ownInclusion.transactionHash)} · reading its settlement…`);
+            await journal.rememberTransaction(ownInclusion.transactionHash);
+            outcome = {
+                receipt: await this.gaslessTransactionReceipt(context, ownInclusion.transactionHash),
+                hash: ownInclusion.userOpHash,
+                transactionHash: ownInclusion.transactionHash
+            };
+        } else {
+            outcome = await this.submitTransitForward(withdrawal, onStatus, { context, from, allowExpensiveGas, feeCapWei, selfBundle, journal });
+            balance = outcome.balance;
+        }
+        return this.settleTransitForward(withdrawal, onStatus, { context, outcome, balance });
+    }
+
+    /** A new sponsored FORWARD of S's balance, with the paymaster's evidence that it is stranded (§2.4). */
+    async submitTransitForward(withdrawal, onStatus, { context, from, allowExpensiveGas, feeCapWei, selfBundle, journal }) {
+        const { pins, reader } = context;
+        const S = withdrawal.transit.account;
+        const noteId = Number(withdrawal.noteId);
+        const balance = toBigInt(await reader({ method: 'eth_getBalance', params: [S, 'latest'] }), 'balance');
+        if (balance === 0n) {
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, { fundsWaitingInTransit: false, transitBalanceWei: '0' }).catch(() => null);
+            await this.refresh({ quiet: true });
+            throw gaslessError('transit_balance_empty', { transitAccount: S });
+        }
+        const stranded = decodeBool(await this.gaslessCall(reader, pins.paymaster, encodeStranded(S)), 'stranded');
+        const notePlusOne = decodeWord(await this.gaslessCall(reader, pins.paymaster, encodeEscapeNotePlusOne(S)), 'escapeNotePlusOne');
+        let escapeClosed = false;
+        if (notePlusOne !== 0n) {
+            const status = await this.readBrowserWithdrawalStatus(Number(notePlusOne - 1n), null, { request: reader });
+            escapeClosed = status.status === 'closed';
+        }
+        if (!stranded && !escapeClosed) {
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, { fundsWaitingInTransit: true, transitBalanceWei: balance.toString() }).catch(() => null);
+            await this.refresh({ quiet: true });
+            throw gaslessError('transit_not_stranded', { transitAccount: S, transitBalanceWei: balance.toString() });
+        }
+        const preflight = await this.gaslessPreflight(context, { kind: KIND.forward, key: attemptsKey(KIND.forward, { sender: S }) });
+        if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
+        context.state = preflight.state;
+        const build = (options = {}) => this.buildGaslessOperation(context, {
+            kind: KIND.forward, vaultCall: '0x', noteId, payoutWei: balance, feeCapWei, allowExpensiveGas, state: context.state, ...options
+        });
+        let outcome;
+        try {
+            outcome = await this.runGaslessOperation(context, build, journal, {
+                onStatus, selfBundle, from, resume: this.recordUserOpResume(withdrawal, 'forward'),
+                submission: { recordId: withdrawal.recordId, noteId, destination: S },
+                amountsMessage: built => `The payout address receives at least ${formatUnits(built.amounts.minimumReceived / NATIVE_WEI_PER_UNIT, 9)} ETH of the ${formatUnits(balance / NATIVE_WEI_PER_UNIT, 9)} ETH in the transit account; the sponsored fee is at most ${formatUnits(built.amounts.maxCost / NATIVE_WEI_PER_UNIT, 9)} ETH${built.amounts.owed ? ` and ${formatUnits(built.amounts.owed / NATIVE_WEI_PER_UNIT, 9)} ETH of debt is deducted` : ''}.`
+            });
+        } catch (failure) {
+            const error = normalizeWalletError(failure);
+            if (error.userOpSent) error.withdrawalNeedsAction = true;
+            await this.refresh({ quiet: true });
+            throw error;
+        }
+        return { ...outcome, balance };
+    }
+
+    /** The settlement of a forward from its bundle receipt: the paymaster's Settled / PayoutCredited for S. */
+    async settleTransitForward(withdrawal, onStatus, { context, outcome, balance = null }) {
+        const { pins } = context;
+        const transit = withdrawal.transit;
+        const S = transit.account;
+        const settlement = settlementOf(outcome.receipt, { entryPoint: pins.entryPoint, paymaster: pins.paymaster, hash: outcome.hash, sender: S, payee: transit.payee });
+        if (!settlement?.success) {
+            const journaled = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId).catch(() => null) || withdrawal;
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+                forwardUserOp: null, forwardUserOpPhase: null,
+                ...(settlement ? this.revertedRecordUserOpFields(journaled, 'forward', [outcome.hash, settlement.event?.userOpHash]) : {})
+            }).catch(() => null);
+            const error = gaslessError('gasless_op_reverted', { reason: settlement?.revert?.decoded?.code || null, transactionHash: outcome.transactionHash, userOpHash: outcome.hash });
+            await this.refresh({ quiet: true });
+            throw error;
+        }
+        const settled = settlement.settled;
+        const credited = settlement.credited;
+        const amounts = {
+            receivedWei: settled?.received ?? balance ?? 0n, chargedWei: settled?.charged ?? 0n, owedPaidWei: settled?.owedPaid ?? 0n,
+            paidOutWei: settled?.paidOut ?? 0n, paymasterCredited: Boolean(credited), paymasterCreditedWei: credited?.amount ?? null
+        };
+        await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+            ...journalValue(amounts),
+            payoutVerified: !credited && amounts.paidOutWei > 0n,
+            forwardUserOpHash: outcome.hash,
+            forwardUserOpPhase: 'settled',
+            forwardTransactionHash: outcome.transactionHash,
+            fundsWaitingInTransit: false,
+            transitBalanceWei: '0',
+            error: null
+        });
+        await this.refresh();
+        onStatus(this.gaslessSettledMessage(amounts, Boolean(credited)), { amounts: journalValue(amounts) });
+        return { status: 'collected', recordId: withdrawal.recordId, userOpHash: outcome.hash, transactionHash: outcome.transactionHash,
+            amounts: journalValue(amounts), ...(credited ? { paymasterCredited: true } : {}) };
+    }
+
+    /**
+     * `sweepTransit(recordId, onStatus)`: the wallet-paid fallback for a
+     * payout sitting in S: `factory.createAccount(owner, payee)` first when
+     * S has no code, then `S.sweep()`, two transactions by any ETH-holding
+     * account; the paymaster deducts what S owes and pushes the rest to Y.
+     */
+    async sweepTransit(recordId, onStatus = () => {}) {
+        const record = await browserWalletRuntime.currentWithdrawal(recordId);
+        if (!record) throw new Error('The withdrawal record was not found.');
+        if (!isGaslessWithdrawal(record)) throw gaslessError('gasless_plan_mismatch', null, 'This withdrawal has no transit account to sweep.');
+        // The journaled contracts, not the current profile's: a sweep keeps
+        // working after the profile retires its gasless pins.
+        const reader = this.gaslessReader();
+        const transit = await this.journaledTransit(record, reader);
+        const S = transit.account;
+        onStatus('Connecting to MetaMask to sweep the transit account…');
+        const from = await this.connectWallet();
+        const balance = toBigInt(await reader({ method: 'eth_getBalance', params: [S, 'latest'] }), 'balance');
+        if (balance === 0n) {
+            await browserWalletRuntime.updateWithdrawal(recordId, { fundsWaitingInTransit: false, transitBalanceWei: '0' });
+            await this.refresh({ quiet: true });
+            return { status: 'empty', recordId, transitAccount: S };
+        }
+        const code = await reader({ method: 'eth_getCode', params: [S, 'latest'] });
+        let createTransactionHash = record.transitCreateTransactionHash || null;
+        if (!code || code === '0x') {
+            onStatus('Confirm the transit account creation in MetaMask. Your account pays only gas.');
+            const created = await this.sendContractTransaction(
+                from,
+                transit.factory,
+                encodeCreateAccount(transit.owner, transit.payee),
+                async hash => {
+                    createTransactionHash = hash;
+                    await browserWalletRuntime.updateWithdrawal(recordId, { transitCreateTransactionHash: hash });
+                    onStatus(`Transit account creation submitted ${this.compact(hash)} · waiting for confirmation…`);
+                },
+                null,
+                null,
+                { kind: 'transit-create', submission: { recordId, noteId: Number(record.noteId), destination: S } }
+            );
+            createTransactionHash = created?.transactionHash || createTransactionHash;
+        }
+        onStatus('Confirm the sweep in MetaMask. Your account pays only gas; the paymaster pays the payout address.');
+        let sweepTransactionHash = null;
+        const receipt = await this.sendContractTransaction(
+            from,
+            S,
+            encodeSweep(),
+            async hash => {
+                sweepTransactionHash = hash;
+                const current = await browserWalletRuntime.currentWithdrawal(recordId);
+                await browserWalletRuntime.updateWithdrawal(recordId, {
+                    sweepTransactionHash: hash,
+                    sweepTransactionHashes: [...new Set([...(current?.sweepTransactionHashes || []), hash])]
+                });
+                onStatus(`Sweep submitted ${this.compact(hash)} · waiting for confirmation…`);
+            },
+            null,
+            null,
+            { kind: 'transit-sweep', submission: { recordId, noteId: Number(record.noteId), destination: S } }
+        );
+        const collected = parseCollected(receipt, transit.paymaster, S);
+        if (!collected) throw new Error('The sweep transaction succeeded, but the paymaster recorded no collection for this transit account.');
+        const credited = parsePayoutCredited(receipt, transit.paymaster, transit.payee);
+        const amounts = {
+            receivedWei: collected.received, chargedWei: 0n, owedPaidWei: collected.owedPaid, paidOutWei: collected.paidOut,
+            paymasterCredited: Boolean(credited), paymasterCreditedWei: credited?.amount ?? null
+        };
+        await browserWalletRuntime.updateWithdrawal(recordId, {
+            ...journalValue(amounts),
+            payoutVerified: !credited && collected.paidOut > 0n,
+            sweepTransactionHash: sweepTransactionHash || receipt?.transactionHash || null,
+            transitCreateTransactionHash: createTransactionHash,
+            fundsWaitingInTransit: false,
+            transitBalanceWei: '0',
+            error: null
+        });
+        await this.refresh();
+        onStatus(credited ? GASLESS_MESSAGES.payout_credited
+            : `Transit account swept: ${formatUnits(collected.paidOut / NATIVE_WEI_PER_UNIT, 9)} ETH paid out${collected.owedPaid ? `, ${formatUnits(collected.owedPaid / NATIVE_WEI_PER_UNIT, 9)} ETH of debt paid` : ''}.`,
+            { amounts: journalValue(amounts) });
+        return { status: 'swept', recordId, transitAccount: S, transactionHash: sweepTransactionHash || receipt?.transactionHash || null,
+            createTransactionHash, amounts: journalValue(amounts), ...(credited ? { paymasterCredited: true } : {}) };
+    }
+
+    /**
+     * `claimGaslessCredit(payee, onStatus)`: the wallet-paid
+     * `P.claimCredit(payee)` for a payout the paymaster credited because its
+     * push to the payee failed. Anyone may call it; only the payee is paid.
+     * P is the paymaster journaled with this browser's sponsored records of
+     * that payee (so a claim keeps working after the profile retires its
+     * gasless pins or names another paymaster), else the pinned one; the
+     * first of them that holds a credit for the payee is claimed.
+     */
+    async claimGaslessCredit(payee, onStatus = () => {}) {
+        const destination = normalizeWithdrawalDestination(payee, this.config?.funding);
+        if (!destination) throw new TypeError('Choose the payout address whose credit to claim.');
+        let pins = null;
+        try {
+            pins = this.requireGaslessPins();
+        } catch (error) {
+            if (error?.data?.reason !== 'not_pinned') throw error;
+        }
+        const records = (await browserWalletRuntime.currentWithdrawals()).filter(record => isGaslessWithdrawal(record)
+            && String(record.payout || '').toLowerCase() === destination
+            && /^0x[0-9a-fA-F]{40}$/.test(String(record.transit?.paymaster || '')));
+        // Credited records first, then any other record of the payee, then the pins.
+        const journaled = [...records.filter(record => record.paymasterCredited === true), ...records]
+            .map(record => record.transit.paymaster.toLowerCase());
+        const paymasters = [...new Set([...journaled, ...(pins ? [pins.paymaster.toLowerCase()] : [])])];
+        if (!paymasters.length) throw gaslessError('gasless_unavailable', { reason: 'not_pinned' });
+        const reader = this.gaslessReader();
+        if (pins && paymasters.includes(pins.paymaster.toLowerCase())) await this.assertGaslessDeployment(pins, reader);
+        onStatus('Checking the payout the paymaster holds for this address…');
+        let paymaster = null;
+        let credit = 0n;
+        for (const candidate of paymasters) {
+            const held = decodeWord(await this.gaslessCall(reader, candidate, encodeCredits(destination)), 'credits');
+            if (held > 0n) {
+                paymaster = candidate;
+                credit = held;
+                break;
+            }
+        }
+        if (credit === 0n) {
+            for (const candidate of paymasters) await this.markGaslessCreditsDelivered(destination, null, candidate);
+            return { status: 'nothing_to_claim', payee: destination, amount: '0' };
+        }
+        onStatus('Connecting to MetaMask to deliver the credited payout…');
+        const from = await this.connectWallet();
+        onStatus('Confirm the credit claim in MetaMask. Your account pays only gas; the paymaster pays the payout address.');
+        let transactionHash = null;
+        const receipt = await this.sendContractTransaction(
+            from,
+            paymaster,
+            encodeClaimCredit(destination),
+            async hash => {
+                transactionHash = hash;
+                onStatus(`Credit claim submitted ${this.compact(hash)} · waiting for confirmation…`);
+            },
+            null,
+            null,
+            { kind: 'gasless-credit-claim', submission: { destination } }
+        );
+        const claimed = parseCreditClaimed(receipt, paymaster, destination);
+        if (!claimed) throw new Error('The claim transaction succeeded, but it did not pay this address.');
+        await this.markGaslessCreditsDelivered(destination, transactionHash || receipt?.transactionHash || null, paymaster);
+        await this.refresh();
+        onStatus(`Credited payout delivered: ${formatUnits(claimed.amount / NATIVE_WEI_PER_UNIT, 9)} ETH.`);
+        return { status: 'claimed', payee: destination, amount: claimed.amount.toString(), transactionHash: transactionHash || receipt?.transactionHash || null,
+            paymaster };
+    }
+
+    /** Mark the credited records of `payee` under `paymaster` (any paymaster when null) delivered. */
+    async markGaslessCreditsDelivered(payee, transactionHash, paymaster = null) {
+        for (const record of await browserWalletRuntime.currentWithdrawals()) {
+            if (record.paymasterCredited === true && String(record.payout || '').toLowerCase() === payee
+                && (!paymaster || !record.transit?.paymaster || sameAddress(record.transit.paymaster, paymaster))) {
+                await browserWalletRuntime.updateWithdrawal(record.recordId, {
+                    paymasterCredited: false, payoutVerified: true, creditClaimTransactionHash: transactionHash
+                }).catch(() => null);
+            }
+        }
+    }
+
+    /** The closed sponsored records whose payout the paymaster still holds as a credit. */
+    get paymasterCreditedPayouts() {
+        return this.withdrawals.filter(record => record.paymasterCredited === true).map(record => ({
+            recordId: record.recordId, noteId: record.noteId, payout: record.payout, creditedWei: record.paymasterCreditedWei ?? null
+        }));
+    }
+
+    /**
+     * `gaslessAvailability({ mode, destination, owner })`: the pre-flight of
+     * §3.1 without any proof: { available, reason, message, bundlerUrl,
+     * paymasterDepositWei, policy, attemptsLeft, transitAccount }.
+     */
+    async gaslessAvailability({ mode = 'mutual', destination = null, owner = null, bundlerUrl = null } = {}) {
+        const kind = mode === 'escape' ? KIND.escape : mode === 'finalize' ? KIND.finalize : mode === 'forward' ? KIND.forward : KIND.close;
+        const account = owner || this.walletAddress || null;
+        const unavailable = (reason, message, extra = {}) => ({ available: false, reason, message: message || GASLESS_MESSAGES[reason] || reason,
+            bundlerUrl: browserWalletRuntime.effectiveBundlerUrl?.() ?? null, paymasterDepositWei: null, policy: null, attemptsLeft: null,
+            transitAccount: null, ...extra });
+        let context;
+        try {
+            if (!account) {
+                const pins = this.requireGaslessPins();
+                const reader = this.gaslessReader();
+                await this.assertGaslessDeployment(pins, reader);
+                const payoutAddress = destination ? normalizeWithdrawalDestination(destination, this.config?.funding) : null;
+                context = { pins, reader, transit: { account: null }, payout: payoutAddress, bundler: browserWalletRuntime.bundlerRpc(bundlerUrl || undefined), bundlerUrl: bundlerUrl || browserWalletRuntime.effectiveBundlerUrl(), kind };
+            } else {
+                const payout = (destination ? normalizeWithdrawalDestination(destination, this.config?.funding) : null) || account.toLowerCase();
+                context = await this.gaslessContext({ from: account, payout, owner: account, bundlerUrl, kind });
+            }
+        } catch (error) {
+            return unavailable(error?.code || 'gasless_unavailable', error?.shortMessage || error?.message, { data: error?.data || null });
+        }
+        let key = null;
+        if (context.transit.account && this.note) {
+            const noteId = Number(this.note.note_id);
+            if (kind === KIND.close) {
+                const nullifier = await browserWalletRuntime.currentWithdrawalNullifier().catch(() => null);
+                key = nullifier ? attemptsKey(KIND.close, { nullifier }) : null;
+            } else if (kind === KIND.forward) key = attemptsKey(KIND.forward, { sender: context.transit.account });
+            else key = attemptsKey(kind, { noteId });
+        }
+        const preflight = await this.gaslessPreflight(context, { kind, key });
+        return {
+            available: preflight.verdict.available,
+            reason: preflight.verdict.reason,
+            message: preflight.verdict.message,
+            data: preflight.verdict.data,
+            bundlerUrl: context.bundlerUrl,
+            paymasterDepositWei: preflight.status.paymaster_deposit_wei,
+            policy: preflight.status.policy,
+            attemptsLeft: preflight.status.attempts_left,
+            owedWei: preflight.state.owed.toString(),
+            transitAccount: context.transit.account,
+            privacy: GASLESS_PRIVACY_NOTE
+        };
+    }
+
+    /**
+     * `gaslessWithdrawalQuote(mode, { destination, owner, feeCapWei,
+     * allowExpensiveGas })`: the amounts of a sponsored withdrawal of the
+     * selected balance before anything binds: never proves, never prompts.
+     */
+    async gaslessWithdrawalQuote(mode = 'mutual', { destination = null, owner = null, feeCapWei = null, allowExpensiveGas = false, bundlerUrl = null } = {}) {
+        const note = this.note;
+        if (!note) throw new Error('There is no active private note to withdraw.');
+        if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
+        const kind = mode === 'mutual' ? KIND.close : KIND.escape;
+        let account = owner || this.walletAddress || null;
+        if (!account && this.ethereum) {
+            try {
+                account = (await this.ethereum.request({ method: 'eth_accounts' }))?.[0] || null;
+            } catch {
+                account = null;
+            }
+        }
+        if (!/^0x[0-9a-fA-F]{40}$/.test(account || '')) throw new Error('Connect a wallet, or pass the owner account, to quote a sponsored withdrawal.');
+        const payout = (destination ? normalizeWithdrawalDestination(destination, this.config?.funding) : null) || account.toLowerCase();
+        const noteId = Number(note.note_id);
+        const payoutWei = BigInt(note.current_balance) * NATIVE_WEI_PER_UNIT;
+        const refusal = (reason, message, extra = {}) => ({ available: false, reason, message: message || GASLESS_MESSAGES[reason] || reason, mode, kind,
+            owner: account.toLowerCase(), payout, payoutWei: payoutWei.toString(), concededUnknown: mode === 'escape', privacy: GASLESS_PRIVACY_NOTE, ...extra });
+        let context;
+        try {
+            context = await this.gaslessContext({ from: account, payout, owner: account, bundlerUrl, kind });
+        } catch (error) {
+            return refusal(error?.code || 'gasless_unavailable', error?.shortMessage || error?.message, { data: error?.data || null });
+        }
+        const nullifier = await browserWalletRuntime.currentWithdrawalNullifier().catch(() => null);
+        const key = kind === KIND.close ? (nullifier ? attemptsKey(KIND.close, { nullifier }) : null) : attemptsKey(KIND.escape, { noteId });
+        const preflight = await this.gaslessPreflight(context, { kind, key });
+        const base = {
+            mode, kind, owner: account.toLowerCase(), payout, transitAccount: context.transit.account, payoutWei: payoutWei.toString(),
+            bundlerUrl: context.bundlerUrl, paymasterDepositWei: preflight.status.paymaster_deposit_wei, policy: preflight.status.policy,
+            attemptsLeft: preflight.status.attempts_left, concededUnknown: mode === 'escape', privacy: GASLESS_PRIVACY_NOTE
+        };
+        if (!preflight.verdict.available) return { ...base, available: false, reason: preflight.verdict.reason, message: preflight.verdict.message, data: preflight.verdict.data };
+        try {
+            const built = await this.buildGaslessOperation(context, {
+                kind, vaultCall: WORST_CASE_EXIT_CALL, nullifier: nullifier ?? 0n, noteId, payoutWei, feeCapWei, allowExpensiveGas, state: preflight.state
+            });
+            const code = await context.reader({ method: 'eth_getCode', params: [payout, 'latest'] }).catch(() => '0x');
+            return {
+                ...base, available: true, reason: null, message: null, transitExists: !built.withInitCode,
+                amounts: journalValue(built.amounts), fees: journalValue(built.fees), gas: journalValue(built.gas), maxCost: built.maxCost.toString(),
+                flatFeeWei: built.amounts.flatFee.toString(), owedWei: built.amounts.owed.toString(), minimumReceivedWei: weiString(built.amounts.minimumReceived),
+                estimatedReceivedWei: weiString(built.amounts.estimatedReceived),
+                uneconomic: built.amounts.uneconomic, payoutHasCode: Boolean(code && code !== '0x'),
+                ...(code && code !== '0x' ? { payoutWarning: GASLESS_PAYOUT_CONTRACT_WARNING } : {})
+            };
+        } catch (error) {
+            return { ...base, available: false, reason: error?.code || 'gasless_unavailable', message: error?.shortMessage || error?.message,
+                data: journalValue(error?.data || null) };
+        }
+    }
+
+    setBundlerUrl(url) {
+        const saved = browserWalletRuntime.setBundlerUrl(url);
+        this.emitChange('bundler');
+        return saved;
+    }
+
+    getBundlerUrl() {
+        return browserWalletRuntime.getBundlerUrl();
+    }
+
+    /**
+     * Background recovery of a sponsored operation journaled before its bundle
+     * transaction was known (§3.2): the chain's logs by every hash, then, when
+     * the nonce has not moved, the identical bytes re-sent (no prompt), or,
+     * when it has, the inclusion found by sender and nonce. Returns the bundle
+     * transaction hash once known.
+     */
+    async recoverGaslessSubmission(prepared, onStatus = () => {}) {
+        if (!isGaslessWithdrawal(prepared)) return null;
+        // A plan whose operation was released (a re-proof, a rebuild) keeps
+        // the hashes of what it sent in `staleUserOpHashes`: a late inclusion
+        // of one of them still settles the record.
+        const hashes = [...new Set([...(prepared.userOpHashes || []), ...(prepared.staleUserOpHashes || []), prepared.userOpHash]
+            .filter(Boolean).map(hash => String(hash).toLowerCase()))];
+        if (!prepared.userOp && !hashes.length) return null;
+        if (this.withdrawPromise) return null;
+        const timing = this.gaslessTiming;
+        if (prepared.submissionId && browserWalletRuntime.gaslessClaimLive({
+            submissionId: prepared.submissionId, owner: prepared.submissionOwner,
+            lastActiveAt: Math.max(Number(prepared.submissionStartedAt || 0), Number(prepared.userOpSubmittedAt || 0),
+                Number(prepared.userOpFollowedAt || 0))
+        }, timing.resendAfterMs)) return null;
+        const kind = prepared.mode === 'mutual' ? KIND.close : KIND.escape;
+        let context;
+        let unpinned = false;
+        try {
+            context = await this.gaslessContext({
+                from: prepared.transit.owner, payout: prepared.payout, owner: prepared.transit.owner, expectedAccount: prepared.transit.account,
+                bundlerUrl: prepared.bundlerUrl || null, kind, record: prepared
+            });
+        } catch (error) {
+            // The current profile no longer sponsors this plan's paymaster:
+            // its inclusion is still looked for through the journaled
+            // EntryPoint (read-only, no bundler), but nothing is re-sent;
+            // an operation not included is released below.
+            if (error?.code !== 'gasless_record_not_pinned') throw error;
+            context = this.recordReaderContext(prepared);
+            if (!context) throw error;
+            unpinned = true;
+        }
+        // From the earliest block any of the plan's operations was tracked from.
+        const fromBlock = earliestBlock(prepared.submittedAtBlock, prepared.staleSubmittedAtBlock);
+        let found = await this.findUserOperationInclusion(context, hashes, fromBlock);
+        // Without an operation to re-send there is nothing to claim unless an inclusion was found.
+        if (!found && !prepared.userOp) return null;
+        const submission = prepared.submissionId ? {
+            operationId: prepared.operationId, submissionId: prepared.submissionId, noteId: Number(prepared.noteId ?? prepared.public_inputs?.note_id),
+            mode: prepared.mode, destination: prepared.destination, deploymentId: browserWalletRuntime.manifest.deployment_id,
+            chainId: Number(this.config.funding.chain_id), contractAddress: this.config.funding.contract_address
+        } : (await browserWalletRuntime.claimPreparedWithdrawalUserOp({ liveWindowMs: timing.resendAfterMs }));
+        // The background pass follows the claim only for these few calls.
+        if (!prepared.submissionId) browserWalletRuntime.endGaslessClaim(submission?.submissionId);
+        if (!found && prepared.userOp) {
+            const op = userOperationFromJson(prepared.userOp);
+            const { key, sequence } = unpackNonce(op.nonce);
+            const current = unpackNonce(decodeWord(await this.gaslessCall(context.reader, context.pins.entryPoint,
+                encodeGetNonce(context.transit.account, key)), 'getNonce')).sequence;
+            if (current > sequence) {
+                found = await this.findUserOperationInclusion(context, null, fromBlock, { sender: context.transit.account, nonce: op.nonce });
+            } else if (context.bundler && Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds > Date.now() / 1_000) {
+                try {
+                    const bundlerHash = await context.bundler.sendUserOperation(userOperationJson(op), context.pins.entryPoint);
+                    await browserWalletRuntime.rememberPreparedWithdrawalUserOpSubmission(submission, { hash: bundlerHash, ambiguous: bundlerHash !== prepared.userOpHash });
+                    onStatus(`The sponsored operation ${this.compact(prepared.userOpHash)} was sent to the bundler again.`);
+                } catch (error) {
+                    if (!this.gaslessAlreadyKnown(error)) onStatus(`The bundler did not take the sponsored operation again (${error?.shortMessage || error?.message}).`);
+                }
+            }
+        }
+        if (!found && unpinned) {
+            // Not re-sent under a profile that no longer pins its paymaster:
+            // once a bundler would have included it (the re-send window from
+            // its last activity), or its proof is about to expire, it is
+            // released with the plan's claim, so the wallet-paid close or
+            // escape (fees: 'wallet') can proceed. Its hashes stay in
+            // staleUserOpHashes: a late inclusion is still settled.
+            const lastActiveAt = Math.max(Number(prepared.submissionStartedAt || 0), Number(prepared.userOpBuiltAt || 0),
+                Number(prepared.userOpSubmittedAt || 0), Number(prepared.userOpFollowedAt || 0));
+            const expiring = Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds <= Date.now() / 1_000;
+            if (expiring || Date.now() - lastActiveAt >= timing.resendAfterMs) {
+                await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission);
+                if (submission?.operationId && submission.submissionId) {
+                    await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
+                }
+                onStatus('The sponsored operation sent earlier was not included and is no longer sponsored; it was released. Pay the fee from a wallet to finish this withdrawal.');
+            }
+            return null;
+        }
+        if (!found) return null;
+        await browserWalletRuntime.rememberPreparedWithdrawalTransaction(found.transactionHash, submission, null);
+        onStatus(`The sponsored operation was included in ${this.compact(found.transactionHash)}.`);
+        return found.transactionHash;
+    }
+
+    /**
+     * The inclusion of a record's own journaled operation under `prefix`
+     * ('finalize' / 'forward'): the EntryPoint's logs by every hash it was
+     * journaled under, then, when S's nonce at the op's key moved past it, by
+     * (S, nonce); from the block it was built at. null when none is found.
+     */
+    async recordUserOpInclusion(context, record, prefix) {
+        const hashes = this.recordUserOpHashes(record, prefix);
+        if (!hashes.length) return null;
+        const fromBlock = record[`${prefix}UserOpBlock`] ?? record.startBlockNumber ?? null;
+        let found = await this.findUserOperationInclusion(context, hashes, fromBlock);
+        if (!found && record[`${prefix}UserOp`]) {
+            try {
+                const op = userOperationFromJson(record[`${prefix}UserOp`]);
+                const { key, sequence } = unpackNonce(op.nonce);
+                const current = unpackNonce(decodeWord(await this.gaslessCall(context.reader, context.pins.entryPoint,
+                    encodeGetNonce(context.transit.account, key)), 'getNonce')).sequence;
+                if (current > sequence) {
+                    found = await this.findUserOperationInclusion(context, null, fromBlock, { sender: context.transit.account, nonce: op.nonce });
+                }
+            } catch {
+                found = null;
+            }
+        }
+        return found;
+    }
+
+    /**
+     * The hashes a record's journaled operation under `prefix` may have been
+     * included under (the op body may be released already); those of an
+     * operation whose inclusion already settled as reverted
+     * (`${prefix}RevertedUserOpHashes`) are not looked for again.
+     */
+    recordUserOpHashes(record, prefix) {
+        const reverted = new Set((record?.[`${prefix}RevertedUserOpHashes`] || []).map(hash => String(hash).toLowerCase()));
+        return [...new Set([...(record?.[`${prefix}UserOpHashes`] || []), record?.[`${prefix}UserOpHash`]].filter(Boolean)
+            .map(hash => String(hash).toLowerCase()))].filter(hash => !reverted.has(hash));
+    }
+
+    /**
+     * The fields that set a record's operation under `prefix` aside as
+     * reverted: every hash it was journaled under (one nonce: none of them
+     * can land any more) and `extra`, so a retry builds a new operation.
+     */
+    revertedRecordUserOpFields(record, prefix, extra = []) {
+        const hashes = [...this.recordUserOpHashes(record, prefix), ...extra.filter(Boolean).map(hash => String(hash).toLowerCase())];
+        return {
+            [`${prefix}RevertedUserOpHashes`]: [...new Set([...(record?.[`${prefix}RevertedUserOpHashes`] || []).map(hash => String(hash).toLowerCase()),
+                ...hashes])]
+        };
+    }
+
+    /** Whether a record's finalization or forward operation was journaled but its bundle transaction is not known yet. */
+    recordUserOpUnresolved(record, prefix) {
+        // 'reverted': its inclusion was found and released (nothing to record
+        // again); 'settled': its settlement is recorded (finality later drops
+        // the bundle transaction hash, not the outcome).
+        return this.recordUserOpHashes(record, prefix).length > 0 && !['reverted', 'settled'].includes(record[`${prefix}UserOpPhase`])
+            && !record[`${prefix}TransactionHash`]
+            && !(record[`${prefix}TransactionHashes`] || []).length;
+    }
+
+    /**
+     * The EntryPoint and paymaster a gasless record's operations ran under:
+     * those journaled with its transit account, else (a record without them)
+     * the current pins; null when neither names them.
+     */
+    recordGaslessContracts(record) {
+        const transit = record?.transit || {};
+        const valid = value => /^0x[0-9a-fA-F]{40}$/.test(String(value || ''));
+        if (valid(transit.entryPoint) && valid(transit.paymaster)) {
+            return { entryPoint: transit.entryPoint.toLowerCase(), paymaster: transit.paymaster.toLowerCase() };
+        }
+        const pins = browserWalletRuntime.gaslessPins();
+        return pins ? { entryPoint: pins.entryPoint, paymaster: pins.paymaster } : null;
+    }
+
+    /**
+     * The settlement fields of a record's sponsored finalization or forward
+     * from its bundle receipt (the paymaster's Settled / PayoutCredited for
+     * S and the payee, §3.2 amounts table), read through the gasless reader;
+     * null when the receipt carries no operation of S.
+     */
+    async gaslessRecordSettlement(record, transactionHash, { reader = null, hash = null, receipt = null } = {}) {
+        if (!isGaslessWithdrawal(record)) return null;
+        const contracts = this.recordGaslessContracts(record);
+        if (!contracts) return null;
+        let bundle = receipt;
+        if (!bundle) {
+            try {
+                bundle = await (reader || this.gaslessReader())({ method: 'eth_getTransactionReceipt', params: [transactionHash] });
+            } catch {
+                return null;
+            }
+        }
+        if (!bundle || BigInt(bundle.status || '0x0') !== 1n) return null;
+        const settlement = settlementOf(bundle, {
+            entryPoint: contracts.entryPoint, paymaster: contracts.paymaster, hash, sender: record.transit.account, payee: record.payout
+        });
+        if (!settlement) return null;
+        const settled = settlement.settled;
+        const credited = settlement.credited;
+        return {
+            settlement,
+            userOpHash: settlement.event.userOpHash,
+            success: settlement.success,
+            payoutVerified: settlement.success && !credited && (settled?.paidOut ?? 0n) > 0n,
+            amounts: {
+                receivedWei: settled?.received ?? 0n, chargedWei: settled?.charged ?? 0n, owedPaidWei: settled?.owedPaid ?? 0n,
+                paidOutWei: settled?.paidOut ?? 0n, paymasterCredited: Boolean(credited), paymasterCreditedWei: credited?.amount ?? null
+            }
+        };
+    }
+
+    /**
+     * The read-only context of a gasless record's own operations: its
+     * journaled EntryPoint and paymaster (recordGaslessContracts), its
+     * transit account, and the gasless reader; no pins are required and no
+     * bundler is resolved. null when the record names no contracts.
+     */
+    recordReaderContext(record, reader = this.gaslessReader()) {
+        const contracts = this.recordGaslessContracts(record);
+        const account = String(record?.transit?.account || '');
+        if (!contracts || !/^0x[0-9a-fA-F]{40}$/.test(account)) return null;
+        return { pins: contracts, reader, transit: { account: account.toLowerCase() }, bundler: null };
+    }
+
+    /**
+     * Record the inclusion `found` of a record's own finalization or forward
+     * operation (prefix 'finalize' / 'forward'): its bundle transaction under
+     * the record's finalization claim (or the forward's hashes) and, when the
+     * bundle carries it, the paymaster's settlement.
+     */
+    async rememberRecordUserOpInclusion(record, prefix, found, reader) {
+        const settlement = await this.gaslessRecordSettlement(record, found.transactionHash, { reader, hash: found.userOpHash });
+        const settled = settlement ? {
+            ...journalValue(settlement.amounts),
+            [`${prefix}UserOpHash`]: settlement.userOpHash,
+            [`${prefix}UserOpPhase`]: settlement.success ? 'settled' : 'reverted',
+            ...(settlement.success ? { payoutVerified: settlement.payoutVerified } : {})
+        } : {};
+        if (prefix === 'finalize' && !record.finalizeSubmissionId && !FINALIZATION_CLAIMABLE_PHASES.has(record.phase)) {
+            // Past finality there is no finalization left to claim: only the
+            // outcome is recorded, so the record is not looked at again.
+            await browserWalletRuntime.updateWithdrawal(record.recordId, {
+                [`${prefix}UserOpPhase`]: found.success === false ? 'reverted' : 'settled', ...settled
+            });
+        } else if (prefix === 'finalize') {
+            const claim = record.finalizeSubmissionId ? {
+                recordId: record.recordId, submissionId: record.finalizeSubmissionId, operationId: record.finalizeOperationId,
+                generation: record.finalizeGeneration, deploymentId: record.deploymentId, chainId: record.chainId,
+                contractAddress: record.contractAddress, noteId: record.noteId, destination: record.destination
+            } : await browserWalletRuntime.claimWithdrawalFinalization(record.recordId);
+            await browserWalletRuntime.rememberWithdrawalFinalization(record.recordId, found.transactionHash, claim, null);
+            if (Object.keys(settled).length) await browserWalletRuntime.updateWithdrawal(record.recordId, settled);
+        } else {
+            await browserWalletRuntime.updateWithdrawal(record.recordId, {
+                forwardTransactionHash: found.transactionHash,
+                forwardTransactionHashes: [...new Set([...(record.forwardTransactionHashes || []), found.transactionHash])],
+                ...settled,
+                ...(settlement?.success ? { fundsWaitingInTransit: false, transitBalanceWei: '0' } : {})
+            });
+        }
+    }
+
+    /**
+     * Background pass: the bundle transactions of journaled finalization and
+     * forward operations, from the EntryPoint's logs (by every hash the
+     * record names, whether or not the op body is still journaled), then the
+     * settlement amounts of that bundle (§3.2), all through the gasless reader.
+     */
+    async recoverGaslessRecordOperations() {
+        const records = (await browserWalletRuntime.currentWithdrawals()).filter(record => isGaslessWithdrawal(record)
+            && (this.recordUserOpUnresolved(record, 'finalize') || this.recordUserOpUnresolved(record, 'forward')));
+        if (!records.length || this.finalizePromise) return;
+        // A look on chain only: the record's journaled EntryPoint and
+        // paymaster through the read RPC, never the current pins nor a
+        // bundler, so a late inclusion is still recorded after the profile
+        // retires its gasless pins or names another paymaster (as clientd's
+        // lateUserOperation does).
+        const reader = this.gaslessReader();
+        for (const record of records) {
+            const context = this.recordReaderContext(record, reader);
+            if (!context) continue;
+            // Each operation on its own: a finalization that cannot be
+            // recorded never keeps the forward from being looked for.
+            for (const prefix of ['finalize', 'forward']) {
+                if (!this.recordUserOpUnresolved(record, prefix)) continue;
+                try {
+                    const fromBlock = record[`${prefix}UserOpBlock`] ?? record.startBlockNumber ?? null;
+                    const found = await this.findUserOperationInclusion(context, this.recordUserOpHashes(record, prefix), fromBlock);
+                    if (!found) continue;
+                    await this.rememberRecordUserOpInclusion(record, prefix, found, reader);
+                } catch (error) {
+                    console.warn(`Unable to recover the sponsored ${prefix} operation of ${record.recordId}.`, error);
+                }
+            }
+        }
     }
 
     async recoverUnknownWithdrawal(onStatus = () => {}) {
@@ -2435,6 +5248,11 @@ class ZkapiClient extends EventTarget {
         let receipt;
         let plan;
         let submittedHash = null;
+        // After UnknownRoot the next close proof takes a path at another root
+        // (E4.1); a path failure then falls back to the saved one, whose
+        // simulation refusal only warns on the last attempt (E4.5).
+        let refusedRoot = null;
+        const walletRequest = request => this.ethereum.request(request);
         for (let attempt = 0; attempt < 3; attempt += 1) {
             let submission = null;
             let metadata = null;
@@ -2451,7 +5269,15 @@ class ZkapiClient extends EventTarget {
                 const expectedActiveRoot = await this.readContractUint(
                     this.config.funding.contract_address, `0x${ABI.currentRoot}`
                 );
-                plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot });
+                try {
+                    plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot,
+                        walletRequest, ...(refusedRoot != null ? { refusedRoot } : {}) });
+                } catch (error) {
+                    if (refusedRoot == null || error?.data?.exit_path_unavailable !== true) throw error;
+                    onStatus(`No Merkle path at another root was found (${error.message}). The saved path is used again.`, 'preparing');
+                    refusedRoot = null;
+                    plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot, walletRequest });
+                }
                 if (plan.mode !== 'mutual' || Number(plan.public_inputs?.note_id) !== noteId
                     || plan.destination?.toLowerCase() !== destination?.toLowerCase()
                     || Number(plan.public_inputs?.final_balance) !== Number(record.finalBalance)) {
@@ -2472,7 +5298,17 @@ class ZkapiClient extends EventTarget {
                         await browserWalletRuntime.rememberBackgroundWithdrawalSubmissionMetadata(submission, value);
                     },
                     null,
-                    { kind: 'background-withdrawal', submission }
+                    { kind: 'background-withdrawal', submission },
+                    0n,
+                    {
+                        // A root refusal re-proves while attempts remain;
+                        // otherwise the simulation only warns (E4.5).
+                        exitEstimate: {
+                            blocking: error => ['stale_root', 'unknown_root'].includes(error?.code) && attempt < 2,
+                            alternative: transaction => browserWalletRuntime.exitRpcEstimateGas(transaction),
+                            onAdvisory: error => onStatus(`Your wallet’s simulation refused this withdrawal (${error.message}). It can still be submitted, with a fixed gas limit.`, 'wallet')
+                        }
+                    }
                 );
                 break;
             } catch (failure) {
@@ -2490,7 +5326,13 @@ class ZkapiClient extends EventTarget {
                     error.shortMessage = 'The submitted withdrawal is saved for recovery. Check its status; your current balance is unchanged.';
                 } else if (submission && (error.broadcastPossible === false || isWalletRejection(error))) {
                     await browserWalletRuntime.releaseBackgroundWithdrawalSubmission(submission);
-                    if (error.code === 'stale_root' && attempt < 2) continue;
+                    // The background flow always re-proves (reusing its
+                    // persisted clearance), so either root rejection retries,
+                    // and an UnknownRoot one at another root.
+                    if (['stale_root', 'unknown_root'].includes(error.code) && attempt < 2) {
+                        if (error.code === 'unknown_root') refusedRoot = plan?.public_inputs?.active_root ?? null;
+                        continue;
+                    }
                     if (isWalletRejection(error)) {
                         error.shortMessage = 'Canceled. The old balance is still set aside and can be withdrawn later.';
                     }
@@ -3169,7 +6011,27 @@ class ZkapiClient extends EventTarget {
         const noteId = Number(this.note.note_id);
         const before = this.withdrawal;
         const prepared = this.config?.prepared_withdrawal;
-        const result = await this.readBrowserWithdrawalStatus(noteId);
+        // A sponsored plan (design §3.2) is read through the exit RPC and the
+        // pinned RPC, never the wallet provider; a wallet-paid one as before.
+        const sponsoredSync = prepared?.fee_payer === 'payout';
+        const chainRead = sponsoredSync ? this.gaslessReader() : (payload => this.ethereum.request(payload));
+        const readStatus = block => this.readBrowserWithdrawalStatus(noteId, block, sponsoredSync ? { request: chainRead } : {});
+        if (sponsoredSync) {
+            // A sponsored operation journaled before its bundle transaction
+            // was known (op_built / op_submitted): find it on chain or re-send
+            // the identical bytes, never with a prompt (design §3.2), so the
+            // branches below see its transaction hash.
+            const journaled = await browserWalletRuntime.currentPreparedWithdrawal();
+            if (isGaslessWithdrawal(journaled) && (journaled.userOp || journaled.staleUserOpHashes?.length)
+                && !(journaled.transactionHashes?.length || journaled.transactionHash)) {
+                try {
+                    await this.recoverGaslessSubmission(journaled, onStatus);
+                } catch (error) {
+                    console.warn('Unable to recover the sponsored operation.', error);
+                }
+            }
+        }
+        const result = await readStatus(null);
         if (result.status === 'closed') {
             const durable = await browserWalletRuntime.currentPreparedWithdrawal();
             const mode = durable?.mode || prepared?.mode || before?.mode || 'mutual';
@@ -3184,12 +6046,12 @@ class ZkapiClient extends EventTarget {
             let payoutVerified = false;
             if (transactionHash && mode === 'mutual') {
                 try {
-                    const receipt = await this.ethereum.request({
+                    const receipt = await chainRead({
                         method: 'eth_getTransactionReceipt',
                         params: [transactionHash]
                     });
                     const event = receipt && BigInt(receipt.status || '0x0') === 1n
-                        ? parseWithdrawalReceipt(receipt, this.config.funding.contract_address, mode)
+                        ? parseWithdrawalReceipt(receipt, this.config.funding.contract_address, mode, { noteId })
                         : null;
                     const receiptBlock = Number(BigInt(receipt?.blockNumber || '0x0'));
                     if (String(receipt?.transactionHash || '').toLowerCase() === transactionHash.toLowerCase()
@@ -3209,6 +6071,50 @@ class ZkapiClient extends EventTarget {
                     // for background recovery; retain its conservative block.
                 }
             }
+            // A sponsored plan's payout reached its transit account: it is
+            // paid out only by the paymaster's settlement in the bundle
+            // receipt (read here, or journaled earlier), else it waits there.
+            let sponsoredClose = {};
+            if (isGaslessWithdrawal(durable)) {
+                let transitBalanceWei = null;
+                try {
+                    transitBalanceWei = BigInt(await chainRead({ method: 'eth_getBalance', params: [durable.transit.account, 'latest'] }));
+                } catch {
+                    transitBalanceWei = null;
+                }
+                let settlement = null;
+                const contracts = this.recordGaslessContracts(durable);
+                // The settlement of S's operation in the bundle: by the
+                // journaled hash, or (an operation released before its late
+                // inclusion was found) by S as the sender.
+                if (transactionHash && contracts) {
+                    try {
+                        const bundle = await chainRead({ method: 'eth_getTransactionReceipt', params: [transactionHash] });
+                        settlement = bundle && BigInt(bundle.status || '0x0') === 1n ? settlementOf(bundle, {
+                            entryPoint: contracts.entryPoint, paymaster: contracts.paymaster, hash: durable.userOpHash || null,
+                            sender: durable.transit.account, payee: durable.payout
+                        }) : null;
+                    } catch {
+                        settlement = null;
+                    }
+                }
+                const settled = settlement?.settled;
+                const success = settlement ? settlement.success : durable.userOpSuccess === true;
+                const credited = settlement ? Boolean(settlement.credited) : durable.paymasterCredited === true;
+                const settledHash = settlement?.event?.userOpHash || durable.userOpHash || null;
+                sponsoredClose = {
+                    ...gaslessRecordFields(durable),
+                    ...(settledHash ? { userOpHash: settledHash, userOpHashes: [...new Set([...(durable.userOpHashes || []), settledHash])] } : {}),
+                    payoutVerified: success && !credited && (settled ? settled.paidOut > 0n : durable.userOpSuccess === true),
+                    fundsWaitingInTransit: transitBalanceWei == null ? !success : transitBalanceWei > 0n,
+                    ...(transitBalanceWei == null ? {} : { transitBalanceWei: transitBalanceWei.toString() }),
+                    ...(settlement ? {
+                        userOpSuccess: settlement.success,
+                        receivedWei: settled?.received ?? 0n, chargedWei: settled?.charged ?? 0n, owedPaidWei: settled?.owedPaid ?? 0n,
+                        paidOutWei: settled?.paidOut ?? 0n, paymasterCredited: credited, paymasterCreditedWei: settlement.credited?.amount ?? null
+                    } : {})
+                };
+            }
             await browserWalletRuntime.detachClosedWithdrawal({
                 mode,
                 noteId,
@@ -3219,12 +6125,15 @@ class ZkapiClient extends EventTarget {
                 payoutVerified,
                 lastObservedBlock: Number(result.observed_block || 0),
                 clearanceReserved: durable?.clearanceReserved === true
-                    || durable?.mode === 'mutual'
+                    || durable?.mode === 'mutual',
+                ...sponsoredClose
             });
             this.rememberWithdrawal(null);
-            onStatus(payoutVerified
-                ? 'Withdrawal returned. Finality is being checked safely in the background.'
-                : 'This balance is closed. Its payment is being checked in Payment history.');
+            onStatus(sponsoredClose.fundsWaitingInTransit
+                ? `This balance is closed to its transit account. ${await this.transitFundsMessage(durable)}`
+                : payoutVerified || sponsoredClose.payoutVerified
+                    ? 'Withdrawal returned. Finality is being checked safely in the background.'
+                    : 'This balance is closed. Its payment is being checked in Payment history.');
         } else if (result.status === 'pending_withdrawal') {
             const destination = result.destination
                 || before?.destination
@@ -3249,6 +6158,18 @@ class ZkapiClient extends EventTarget {
             // "Active" read and can never be discarded as a canceled prompt.
             await browserWalletRuntime.recoverPreparedWithdrawalSubmissionClaim();
             let durable = browserWalletRuntime.snapshot().runtime?.preparedWithdrawal || null;
+            // A sponsored operation journaled before its bundle transaction
+            // was known (op_built / op_submitted): find it on chain or re-send
+            // the identical bytes, never with a prompt (design §3.2).
+            if (isGaslessWithdrawal(durable) && (durable.userOp || durable.staleUserOpHashes?.length)
+                && !(durable.transactionHashes?.length || durable.transactionHash)) {
+                try {
+                    await this.recoverGaslessSubmission(durable, onStatus);
+                } catch (error) {
+                    console.warn('Unable to recover the sponsored operation.', error);
+                }
+                durable = browserWalletRuntime.snapshot().runtime?.preparedWithdrawal || null;
+            }
             const hashes = Array.isArray(durable?.transactionHashes)
                 ? durable.transactionHashes
                 : durable?.transactionHash ? [durable.transactionHash] : [];
@@ -3258,7 +6179,7 @@ class ZkapiClient extends EventTarget {
             for (const hash of hashes) {
                 let receipt = null;
                 try {
-                    receipt = await this.ethereum.request({
+                    receipt = await chainRead({
                         method: 'eth_getTransactionReceipt',
                         params: [hash]
                     });
@@ -3305,7 +6226,8 @@ class ZkapiClient extends EventTarget {
                     const event = parseWithdrawalReceipt(
                         receipt,
                         this.config.funding.contract_address,
-                        durableMode
+                        durableMode,
+                        { noteId }
                     );
                     if (!event || event.noteId !== BigInt(noteId)
                         || event.destination.toLowerCase() !== durable?.destination?.toLowerCase()
@@ -3328,7 +6250,7 @@ class ZkapiClient extends EventTarget {
                 }, 0);
                 let consistent = result;
                 if (Number(result.observed_block || 0) < receiptBlock) {
-                    consistent = await this.readBrowserWithdrawalStatus(noteId);
+                    consistent = await readStatus(null);
                 }
                 if (Number(consistent.observed_block || 0) < receiptBlock) {
                     const transactionHash = pendingHashes[0] || successfulAttempts[0].hash;
@@ -3340,7 +6262,8 @@ class ZkapiClient extends EventTarget {
                     const matchedEvent = parseWithdrawalReceipt(
                         successfulAttempts[0].receipt,
                         this.config.funding.contract_address,
-                        durableMode
+                        durableMode,
+                        { noteId }
                     );
                     await browserWalletRuntime.detachClosedWithdrawal({
                         mode: durableMode,
@@ -3401,7 +6324,8 @@ class ZkapiClient extends EventTarget {
                     const matchedEvent = parseWithdrawalReceipt(
                         successfulAttempts[0].receipt,
                         this.config.funding.contract_address,
-                        'escape'
+                        'escape',
+                        { noteId }
                     );
                     const record = await browserWalletRuntime.detachEscapeWithdrawal({
                         phase: 'challenged_unconfirmed',
@@ -3484,7 +6408,9 @@ class ZkapiClient extends EventTarget {
             }
             if (durableMode === 'escape' && !clearanceReserved) {
                 await browserWalletRuntime.clearPreparedWithdrawal();
-                onStatus('No escape transaction was submitted. Your private balance is ready to use.');
+                // E6: its proof was released, so the exit lock holds the
+                // balance until that proof is dead; another escape is allowed.
+                onStatus('No escape transaction was submitted. This balance stays withdrawal-only until its escape proof expires; you can escape again.');
                 this.rememberWithdrawal(null);
             } else if (successfulAttempts.length) {
                 onStatus('A mutual-close transaction mined, but the latest vault state has not caught up yet. Check again shortly.');
@@ -3500,8 +6426,11 @@ class ZkapiClient extends EventTarget {
         noteId,
         expectedStatus,
         transitionBlockNumber,
-        observedBlock = 0
+        observedBlock = 0,
+        { request = null } = {}
     ) {
+        // A sponsored record reads through the gasless reader (design §3.1).
+        const read = request || (payload => this.ethereum.request(payload));
         const transitionBlock = Number(transitionBlockNumber || 0);
         if (!['active', 'closed'].includes(expectedStatus)
             || !Number.isSafeInteger(transitionBlock) || transitionBlock <= 0) {
@@ -3511,7 +6440,7 @@ class ZkapiClient extends EventTarget {
         let finalityTag = null;
         let source = 'finalized';
         try {
-            const finalizedBlock = await this.ethereum.request({
+            const finalizedBlock = await read({
                 method: 'eth_getBlockByNumber',
                 params: ['finalized', false]
             });
@@ -3528,7 +6457,7 @@ class ZkapiClient extends EventTarget {
             source = 'confirmations';
             let head = Number(observedBlock || 0);
             try {
-                const latest = await this.ethereum.request({ method: 'eth_blockNumber' });
+                const latest = await read({ method: 'eth_blockNumber' });
                 if (/^0x[0-9a-fA-F]+$/.test(String(latest || ''))) {
                     head = Math.max(head, Number(BigInt(latest)));
                 }
@@ -3548,7 +6477,7 @@ class ZkapiClient extends EventTarget {
             return { finalized: false, checkedBlock, source };
         }
         try {
-            const status = await this.readBrowserWithdrawalStatus(noteId, finalityTag);
+            const status = await this.readBrowserWithdrawalStatus(noteId, finalityTag, { request });
             return {
                 finalized: status.status === expectedStatus,
                 checkedBlock,
@@ -3563,16 +6492,69 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async browserWithdrawalCloseFinality(noteId, closeBlockNumber, observedBlock = 0) {
+    /**
+     * Find a finalized EscapeWithdrawalChallenged(noteId indexed, nullifier,
+     * restoredRoot) log for a background escape record, between its start
+     * block and a finalized checkpoint. Read failures yield no evidence.
+     */
+    async finalizedEscapeChallenge(record, finalizedBlock, { request = null } = {}) {
+        const startBlock = Number(record?.startBlockNumber || 0);
+        if (record?.mode !== 'escape' || record.withdrawalNullifier == null
+            || !Number.isSafeInteger(startBlock) || startBlock <= 0
+            || !Number.isSafeInteger(finalizedBlock) || finalizedBlock < startBlock) return null;
+        const vault = String(this.config?.funding?.contract_address || '').toLowerCase();
+        let logs;
+        try {
+            logs = await (request || (payload => this.ethereum.request(payload)))({
+                method: 'eth_getLogs',
+                params: [{
+                    address: this.config.funding.contract_address,
+                    topics: [ABI.escapeChallengedEvent, `0x${abiWord(record.noteId)}`],
+                    fromBlock: `0x${startBlock.toString(16)}`,
+                    toBlock: `0x${finalizedBlock.toString(16)}`
+                }]
+            });
+        } catch {
+            return null;
+        }
+        for (const log of Array.isArray(logs) ? logs : []) {
+            try {
+                const data = String(log?.data || '').replace(/^0x/, '');
+                const blockNumber = Number(BigInt(log?.blockNumber || '0x0'));
+                if (log?.removed === true || String(log?.address || '').toLowerCase() !== vault
+                    || String(log?.topics?.[0] || '').toLowerCase() !== ABI.escapeChallengedEvent
+                    || BigInt(log.topics[1]) !== BigInt(record.noteId)
+                    || blockNumber < startBlock || blockNumber > finalizedBlock
+                    || !/^[0-9a-fA-F]{128,}$/.test(data)
+                    || BigInt(`0x${data.slice(0, 64)}`) !== BigInt(record.withdrawalNullifier)) continue;
+                return {
+                    noteId: Number(record.noteId),
+                    nullifier: `0x${data.slice(0, 64).toLowerCase()}`,
+                    transactionHash: /^0x[0-9a-fA-F]{64}$/.test(log.transactionHash || '')
+                        ? log.transactionHash.toLowerCase() : null,
+                    blockNumber,
+                    finalizedBlock,
+                    observedAt: Date.now()
+                };
+            } catch {
+                // A malformed log is never evidence.
+            }
+        }
+        return null;
+    }
+
+    async browserWithdrawalCloseFinality(noteId, closeBlockNumber, observedBlock = 0, { request = null } = {}) {
         return this.browserWithdrawalStateFinality(
             noteId,
             'closed',
             closeBlockNumber,
-            observedBlock
+            observedBlock,
+            { request }
         );
     }
 
-    async browserRevertedReceiptFinality(transactionHash, receipt) {
+    async browserRevertedReceiptFinality(transactionHash, receipt, { request = null } = {}) {
+        const read = request || (payload => this.ethereum.request(payload));
         const receiptBlock = receipt?.blockNumber
             && /^0x[0-9a-fA-F]+$/.test(String(receipt.blockNumber))
             ? Number(BigInt(receipt.blockNumber))
@@ -3586,7 +6568,7 @@ class ZkapiClient extends EventTarget {
         let checkedBlock = 0;
         let source = 'finalized';
         try {
-            const finalizedBlock = await this.ethereum.request({
+            const finalizedBlock = await read({
                 method: 'eth_getBlockByNumber',
                 params: ['finalized', false]
             });
@@ -3600,7 +6582,7 @@ class ZkapiClient extends EventTarget {
         if (!checkedBlock) {
             source = 'confirmations';
             try {
-                const latest = await this.ethereum.request({ method: 'eth_blockNumber' });
+                const latest = await read({ method: 'eth_blockNumber' });
                 if (/^0x[0-9a-fA-F]+$/.test(String(latest || ''))) {
                     checkedBlock = Math.max(
                         0,
@@ -3616,7 +6598,7 @@ class ZkapiClient extends EventTarget {
         }
 
         try {
-            const canonicalReceipt = await this.ethereum.request({
+            const canonicalReceipt = await read({
                 method: 'eth_getTransactionReceipt',
                 params: [transactionHash]
             });
@@ -3643,8 +6625,10 @@ class ZkapiClient extends EventTarget {
         transactionAttempt,
         noteId,
         expectedStatus,
-        observedBlock = 0
+        observedBlock = 0,
+        { request = null } = {}
     ) {
+        const read = request || (payload => this.ethereum.request(payload));
         const from = transactionAttempt?.from;
         const nonce = Number(transactionAttempt?.nonce);
         const expectedStatuses = Array.isArray(expectedStatus)
@@ -3661,7 +6645,7 @@ class ZkapiClient extends EventTarget {
         let blockTag = null;
         let source = 'finalized';
         try {
-            const finalizedBlock = await this.ethereum.request({
+            const finalizedBlock = await read({
                 method: 'eth_getBlockByNumber',
                 params: ['finalized', false]
             });
@@ -3676,7 +6660,7 @@ class ZkapiClient extends EventTarget {
             source = 'confirmations';
             let head = Number(observedBlock || 0);
             try {
-                const latest = await this.ethereum.request({ method: 'eth_blockNumber' });
+                const latest = await read({ method: 'eth_blockNumber' });
                 if (/^0x[0-9a-fA-F]+$/.test(String(latest || ''))) {
                     head = Math.max(head, Number(BigInt(latest)));
                 }
@@ -3692,11 +6676,11 @@ class ZkapiClient extends EventTarget {
 
         try {
             const [transactionCount, status] = await Promise.all([
-                this.ethereum.request({
+                read({
                     method: 'eth_getTransactionCount',
                     params: [from, blockTag]
                 }),
-                this.readBrowserWithdrawalStatus(noteId, blockTag)
+                this.readBrowserWithdrawalStatus(noteId, blockTag, { request })
             ]);
             const finalizedNonce = walletNonceNumber(transactionCount);
             if (finalizedNonce == null) {
@@ -3827,6 +6811,14 @@ class ZkapiClient extends EventTarget {
     }
 
     async syncEscapeWithdrawals(onStatus = () => {}, recordId = null) {
+        // Sponsored finalizations and forwards journaled before their bundle
+        // transaction was known are found by the EntryPoint's logs first
+        // (design §3.2); the hashes then take the existing receipt path.
+        if (this.withdrawals.some(record => isGaslessWithdrawal(record)
+            && (this.recordUserOpUnresolved(record, 'finalize') || this.recordUserOpUnresolved(record, 'forward')))) {
+            await this.recoverGaslessRecordOperations();
+            await this.refresh({ quiet: true });
+        }
 
         const records = this.withdrawals.filter(record => (record.phase !== 'closed'
                 || record.finalizeTransactionHash
@@ -3835,6 +6827,7 @@ class ZkapiClient extends EventTarget {
         const results = [];
         let changed = false;
         let failures = 0;
+        let creditedPayouts = 0;
         for (const listedRecord of records) {
             // Reconciliation needs the retained prepared plan to decide
             // whether a missing hash can be replaced by that exact proof. The
@@ -3842,9 +6835,22 @@ class ZkapiClient extends EventTarget {
             let record = await browserWalletRuntime.currentWithdrawal(
                 listedRecord.recordId
             ) || listedRecord;
+            // A sponsored record (§3.1) is read through the exit RPC and the
+            // pinned RPC, never the wallet provider: its bundle receipts and
+            // logs name the transit account and the payout address.
+            const sponsored = isGaslessWithdrawal(record);
+            const read = sponsored ? this.gaslessReader() : (payload => this.ethereum.request(payload));
+            const readOptions = sponsored ? { request: read } : {};
             try {
-                let status = await this.readBrowserWithdrawalStatus(record.noteId);
+                let status = await this.readBrowserWithdrawalStatus(record.noteId, null, readOptions);
                 let payoutVerified = false;
+                // A matching finalization receipt that also carries the
+                // vault's EscapePayoutDeferred log: closed, but only credited.
+                let payoutCredit = null;
+                // The matched finalized amount (E5), after any raise.
+                let payoutMatch = null;
+                // A sponsored finalization's settlement from its bundle (§3.2 amounts).
+                let sponsoredFinalize = {};
                 let minimumObservedBlock = Math.max(
                     Number(record.startBlockNumber || 0),
                     Number(record.lastObservedBlock || 0)
@@ -3870,7 +6876,7 @@ class ZkapiClient extends EventTarget {
                     const key = `${String(attempt?.from || '').toLowerCase()}:${attempt?.nonce}`;
                     if (!startNonceChecks.has(key)) startNonceChecks.set(key,
                         this.browserTransactionNonceConsumed(attempt, record.noteId,
-                            'active', Number(status.observed_block || 0)));
+                            'active', Number(status.observed_block || 0), readOptions));
                     return startNonceChecks.get(key);
                 };
                 const rememberResolvedStart = (hash, resolution) => {
@@ -3887,7 +6893,7 @@ class ZkapiClient extends EventTarget {
                 for (const startHash of startHashes) {
                     let startReceipt = null;
                     try {
-                        startReceipt = await this.ethereum.request({
+                        startReceipt = await read({
                             method: 'eth_getTransactionReceipt',
                             params: [startHash]
                         });
@@ -3912,11 +6918,12 @@ class ZkapiClient extends EventTarget {
                         const event = parseWithdrawalReceipt(
                             startReceipt,
                             this.config.funding.contract_address,
-                            record.mode === 'mutual' ? 'mutual' : 'escape'
+                            record.mode === 'mutual' ? 'mutual' : 'escape',
+                            { noteId: record.noteId }
                         );
                         if (!event || event.noteId !== BigInt(record.noteId)
                             || event.destination.toLowerCase() !== record.destination.toLowerCase()
-                            || event.finalBalance !== BigInt(record.finalBalance)) {
+                            || event.finalBalance !== startFinalBalance(record)) {
                             // Keep the recovery record, but do not let one bad
                             // audit hash suppress canonical status recovery.
                             startReceipt = null;
@@ -3940,7 +6947,8 @@ class ZkapiClient extends EventTarget {
                     } else if (startReceipt) {
                         const finality = await this.browserRevertedReceiptFinality(
                             startHash,
-                            startReceipt
+                            startReceipt,
+                            readOptions
                         );
                         if (!finality.finalized) {
                             unresolvedStart = true;
@@ -4016,7 +7024,7 @@ class ZkapiClient extends EventTarget {
                     record = await browserWalletRuntime.currentWithdrawal(record.recordId);
                 }
                 if (Number(status.observed_block || 0) < minimumObservedBlock) {
-                    status = await this.readBrowserWithdrawalStatus(record.noteId);
+                    status = await this.readBrowserWithdrawalStatus(record.noteId, null, readOptions);
                 }
                 if (Number(status.observed_block || 0) < minimumObservedBlock) {
                     throw new Error('The connected RPC has not caught up to this withdrawal yet.');
@@ -4089,7 +7097,7 @@ class ZkapiClient extends EventTarget {
                     const nonceStatus = await this.browserTransactionNonceConsumed({
                         from: record.finalizeSubmissionFrom,
                         nonce: Number(record.finalizeSubmissionNonce)
-                    }, record.noteId, ['pending_withdrawal', 'active'], Number(status.observed_block || 0));
+                    }, record.noteId, ['pending_withdrawal', 'active'], Number(status.observed_block || 0), readOptions);
                     if (nonceStatus.consumed) {
                         await browserWalletRuntime.releaseWithdrawalFinalization(record.recordId, {
                             submission: {
@@ -4114,7 +7122,7 @@ class ZkapiClient extends EventTarget {
                 for (const hash of finalizeHashes) {
                     let receipt = null;
                     try {
-                        receipt = await this.ethereum.request({
+                        receipt = await read({
                             method: 'eth_getTransactionReceipt',
                             params: [hash]
                         });
@@ -4128,7 +7136,8 @@ class ZkapiClient extends EventTarget {
                             transactionAttempt,
                             record.noteId,
                             ['pending_withdrawal', 'active'],
-                            Number(status.observed_block || 0)
+                            Number(status.observed_block || 0),
+                            readOptions
                         );
                         if (nonceStatus.consumed) {
                             await browserWalletRuntime.releaseWithdrawalFinalization(record.recordId, {
@@ -4139,7 +7148,7 @@ class ZkapiClient extends EventTarget {
                             missingFinalizeHashes.push(hash);
                         }
                     } else if (BigInt(receipt.status || '0x0') !== 1n) {
-                        const finality = await this.browserRevertedReceiptFinality(hash, receipt);
+                        const finality = await this.browserRevertedReceiptFinality(hash, receipt, readOptions);
                         if (finality.finalized) {
                             await browserWalletRuntime.releaseWithdrawalFinalization(record.recordId, {
                                 transactionHash: hash
@@ -4150,25 +7159,50 @@ class ZkapiClient extends EventTarget {
                         const event = parseWithdrawalReceipt(
                             receipt,
                             this.config.funding.contract_address,
-                            'finalize'
+                            'finalize',
+                            { noteId: record.noteId }
                         );
+                        const receiptBlock = Number(BigInt(receipt.blockNumber || '0x0'));
+                        // E5: after raises the vault pays B − c_final.
+                        const match = event ? await this.escapePayoutMatch(record, event.finalBalance, receiptBlock, readOptions) : null;
                         if (!event || event.noteId !== BigInt(record.noteId)
                             || event.destination.toLowerCase() !== record.destination.toLowerCase()
-                            || event.finalBalance !== BigInt(record.finalBalance)) {
+                            || !match?.accepted) {
                             await browserWalletRuntime.releaseWithdrawalFinalization(record.recordId, {
                                 transactionHash: hash
                             });
                             changed = true;
                             continue;
                         }
-                        const receiptBlock = Number(BigInt(receipt.blockNumber || '0x0'));
+                        payoutMatch = { amount: Number(event.finalBalance), match };
                         if (Number(status.observed_block || 0) < receiptBlock) {
-                            status = await this.readBrowserWithdrawalStatus(record.noteId);
+                            status = await this.readBrowserWithdrawalStatus(record.noteId, null, readOptions);
                         }
                         if (Number(status.observed_block || 0) >= receiptBlock
                             && status.status === 'closed') {
                             successfulFinalizeHashes.push(hash);
-                            payoutVerified = true;
+                            if (event.payoutCredited) {
+                                payoutCredit = {
+                                    amount: Number(event.creditedAmount),
+                                    evidence: 'receipt'
+                                };
+                            } else if (sponsored) {
+                                // The vault paid S: only the paymaster's
+                                // Settled in this bundle (paidOut > 0 and no
+                                // PayoutCredited) proves the payee was paid;
+                                // a wallet-paid finalization of a sponsored
+                                // escape leaves the payout in S.
+                                const settlement = await this.gaslessRecordSettlement(record, hash,
+                                    { reader: read, hash: record.finalizeUserOpHash || null, receipt });
+                                if (settlement?.success) {
+                                    sponsoredFinalize = {
+                                        ...journalValue(settlement.amounts),
+                                        finalizeUserOpHash: settlement.userOpHash,
+                                        finalizeUserOpPhase: 'settled'
+                                    };
+                                    if (settlement.payoutVerified) payoutVerified = true;
+                                }
+                            } else payoutVerified = true;
                         }
                     }
                 }
@@ -4192,12 +7226,61 @@ class ZkapiClient extends EventTarget {
                     ) || record;
                     if (Number(record.revision || 0) !== previousRevision) changed = true;
                 }
-                results.push({ ...status, recordId: record.recordId });
+                if (status.status !== 'closed' && Number(status.observed_block || 0) >= minimumObservedBlock
+                    && (record.payoutVerified === true || record.payoutCredited === true
+                        || record.payoutClaimed === true)) {
+                    // The note reads open again at or after the block where
+                    // it was seen Closed (minimumObservedBlock): that close
+                    // was reorganized away, and its payout reading with it.
+                    await browserWalletRuntime.updateWithdrawal(record.recordId, REOPENED_PAYOUT_FIELDS, {
+                        expectedRevision: record.revision
+                    });
+                    changed = true;
+                    record = await browserWalletRuntime.currentWithdrawal(record.recordId) || record;
+                }
+                if (status.status === 'closed' && record.mode === 'escape'
+                    && !payoutVerified && !payoutCredit && record.payoutCredited !== true
+                    && record.payoutVerified !== true) {
+                    // Another device or a third party may have finalized this
+                    // escape. Without its receipt, a credit the hardened vault
+                    // holds for the destination is the conservative reading.
+                    // (A push an earlier pass proved is not re-read.)
+                    payoutCredit = await this.observedEscapePayoutCredit(record, status, readOptions);
+                }
+                const payout = {
+                    ...sponsoredFinalize,
+                    ...closedWithdrawalPayout({ ...record, ...sponsoredFinalize }, payoutVerified, payoutCredit),
+                    ...(payoutMatch ? this.payoutMatchFields(payoutMatch, onStatus) : {})
+                };
+                if (payoutCredit && record.payoutCredited !== true) {
+                    creditedPayouts += 1;
+                    onStatus(ESCAPE_PAYOUT_CREDITED_MESSAGE);
+                }
+                results.push({
+                    ...status,
+                    recordId: record.recordId,
+                    ...(status.status === 'closed' && payout.payoutCredited ? { payout_credited: true } : {})
+                });
                 if (status.status === 'closed') {
                     try {
+                        // A sponsored escape closed without a settlement of
+                        // its own finalization (a third party's, or a
+                        // wallet-paid one) leaves the payout in S until a
+                        // FORWARD or a sweep collects it (§3.1 scheduling).
+                        let transitFields = {};
+                        if (sponsored && payout.payoutVerified !== true && payout.paymasterCredited !== true
+                            && record.paymasterCredited !== true) {
+                            try {
+                                const balance = toBigInt(await read({ method: 'eth_getBalance', params: [record.transit.account, 'latest'] }), 'balance');
+                                transitFields = { fundsWaitingInTransit: balance > 0n, transitBalanceWei: balance.toString() };
+                                if (balance > 0n && record.fundsWaitingInTransit !== true) onStatus(await this.transitFundsMessage(record, { reader: read }));
+                            } catch {
+                                transitFields = {};
+                            }
+                        }
                         const finalizeReceiptBlocks = [];
                         for (const hash of successfulFinalizeHashes) {
-                            const receipt = await this.ethereum.request({
+                            const receipt = await read({
                                 method: 'eth_getTransactionReceipt',
                                 params: [hash]
                             });
@@ -4215,13 +7298,15 @@ class ZkapiClient extends EventTarget {
                         const finality = await this.browserWithdrawalCloseFinality(
                             record.noteId,
                             closeBlockNumber,
-                            Number(status.observed_block || 0)
+                            Number(status.observed_block || 0),
+                            readOptions
                         );
                         if (!finality.finalized) {
                             const patch = {
                                 phase: 'closed_unconfirmed',
                                 chainStatus: 'closed',
-                                payoutVerified,
+                                ...payout,
+                                ...transitFields,
                                 closedAt: Number(record.closedAt || Date.now()),
                                 closeBlockNumber,
                                 lastObservedBlock: Math.max(
@@ -4248,7 +7333,8 @@ class ZkapiClient extends EventTarget {
                         await browserWalletRuntime.updateWithdrawal(record.recordId, {
                             phase: 'closed',
                             chainStatus: 'closed',
-                            payoutVerified,
+                            ...payout,
+                            ...transitFields,
                             closedAt: Date.now(),
                             closeBlockNumber,
                             finalizedBlockNumber: Number(finality.checkedBlock),
@@ -4266,6 +7352,12 @@ class ZkapiClient extends EventTarget {
                 } else if (status.status === 'pending_withdrawal') {
                     const stillFinalizing = Boolean(record.finalizeTransactionHash
                         || record.finalizeSubmissionId);
+                    // E5: an EscapeConcessionRaised lowers the payout in place;
+                    // pendingWithdrawals and pendingConcessions show it.
+                    if (status.conceded != null && record.concededCurrent != null
+                        && BigInt(status.conceded) > BigInt(record.concededCurrent)) {
+                        onStatus(`The operator raised this escape’s concession; it now pays ${this.formatMoney(Number(status.final_balance))}.`);
+                    }
                     const patch = {
                         mode: 'escape',
                         phase: record.phase === 'ambiguous'
@@ -4277,6 +7369,7 @@ class ZkapiClient extends EventTarget {
                         challengeDeadline: Number(status.challenge_deadline),
                         destination: status.destination || record.destination,
                         finalBalance: Number(status.final_balance ?? record.finalBalance),
+                        ...(status.conceded != null ? { concededCurrent: String(status.conceded) } : {}),
                         lastObservedBlock: Math.max(
                             minimumObservedBlock,
                             Number(status.observed_block || 0)
@@ -4357,7 +7450,8 @@ class ZkapiClient extends EventTarget {
                                 challengeObservedBlock,
                                 resolvedStartBlock
                             ),
-                            Number(status.observed_block || 0)
+                            Number(status.observed_block || 0),
+                            readOptions
                         );
                         if (!finality.finalized) {
                             const patch = {
@@ -4410,7 +7504,14 @@ class ZkapiClient extends EventTarget {
                             continue;
                         }
                         const phase = withdrawalOnly ? 'parked' : 'restored';
-                        if (record.phase !== phase || record.chainStatus !== 'active') {
+                        // Challenge evidence comes only from a finalized
+                        // EscapeWithdrawalChallenged log for this exact note
+                        // and nullifier. A reorged-out start or a canceled
+                        // transaction leaves no such log.
+                        const challengeEvidence = record.challengeEvidence
+                            || await this.finalizedEscapeChallenge(record, Number(finality.checkedBlock), readOptions);
+                        if (record.phase !== phase || record.chainStatus !== 'active'
+                            || (challengeEvidence && !record.challengeEvidence)) {
                             try {
                                 await browserWalletRuntime.updateWithdrawal(record.recordId, {
                                     phase,
@@ -4422,9 +7523,13 @@ class ZkapiClient extends EventTarget {
                                         minimumObservedBlock,
                                         Number(status.observed_block || 0)
                                     ),
-                                    error: withdrawalOnly && record.mode === 'escape'
-                                        ? 'The escape was challenged. This balance remains withdrawal-only because its close authorization was already reserved.'
-                                        : null
+                                    ...(challengeEvidence ? { challengeEvidence, deviceNotNewest: true } : {}),
+                                    // A defeat needs a request from this state's
+                                    // successor: this device is not the newest.
+                                    error: challengeEvidence ? DEVICE_NOT_NEWEST_MESSAGE
+                                        : withdrawalOnly && record.mode === 'escape'
+                                            ? 'The escape was defeated. This balance remains withdrawal-only because its close authorization was already reserved.'
+                                            : null
                                 }, { expectedRevision: record.revision });
                                 changed = true;
                             } catch (error) {
@@ -4459,6 +7564,8 @@ class ZkapiClient extends EventTarget {
                 : `Checked ${records.length} withdrawals; ${failures} need attention.`;
             onStatus(message);
             if (recordId) throw new Error(results.find(entry => entry.status === 'error')?.error || message);
+        } else if (creditedPayouts) {
+            onStatus(ESCAPE_PAYOUT_CREDITED_MESSAGE);
         } else if (records.length) {
             onStatus('Withdrawal status is up to date.');
         }
@@ -4477,18 +7584,50 @@ class ZkapiClient extends EventTarget {
     async cancelPreparedWithdrawal(onStatus = () => {}) {
 
         const prepared = this.config?.prepared_withdrawal;
-        if (!prepared) return false;
-        if (prepared.mode === 'mutual' || prepared.clearance_reserved === true) {
-            throw new Error('This balance already has a mutual-close authorization. Finish it, use the escape hatch, or set it aside before funding another balance.');
+        if (!prepared && !this.config?.exit?.lock) return false;
+        if (prepared && (prepared.mode === 'mutual' || prepared.clearance_reserved === true)) {
+            throw new Error(prepared.clearance_granted === true
+                ? 'This balance already has a mutual-close authorization. Finish it, use the escape hatch, or set it aside before funding another balance.'
+                : 'This balance already sent its ownership proof, so it can only be withdrawn. Finish the withdrawal (the escape hatch needs nothing from the server) before funding another balance.');
         }
-        if (prepared.transaction_hash) {
+        if (prepared?.transaction_hash) {
             throw new Error('This transaction was already submitted. Check its on-chain status instead of canceling it.');
         }
-        await browserWalletRuntime.clearPreparedWithdrawal();
+        if (prepared) await browserWalletRuntime.clearPreparedWithdrawal();
         this.rememberWithdrawal(null);
+        // E6: the exit lock is released now only if no escape or close proof
+        // was released; otherwise once every released proof is dead, read
+        // through the wallet provider before the pinned RPC.
+        const provider = this.ethereum;
+        try {
+            await browserWalletRuntime.cancelExit(typeof provider?.request === 'function'
+                ? { walletRequest: request => provider.request(request) }
+                : {});
+        } catch (error) {
+            if (error?.code !== 'exit_locked') throw error;
+            await this.refresh();
+            const after = Number(error.data?.releasable_after);
+            onStatus(Number.isSafeInteger(after)
+                ? `Withdrawal canceled. Its escape proof was already released, so this balance stays withdrawal-only until ${new Date(after * 1_000).toLocaleString()}; you can still escape.`
+                : 'Withdrawal canceled. Its escape proof was already released, so this balance stays withdrawal-only until that proof expires; you can still escape.');
+            return true;
+        }
         await this.refresh();
         onStatus('Withdrawal canceled. Your private balance is ready to use.');
         return true;
+    }
+
+    /** E7: an encrypted exit kit of the selected balance (JSON) for the user to keep. */
+    async exportExitKit(passphrase) {
+        await this.init();
+        return browserWalletRuntime.exportExitKit({ passphrase });
+    }
+
+    /** The user's own exit RPC (design §6.4 E0, §6.6), persisted for this origin; null clears it. */
+    setExitRpcUrl(url) {
+        const saved = browserWalletRuntime.setExitRpcUrl(url);
+        this.emitChange('exit-rpc');
+        return saved;
     }
 
     async restoreWithdrawal(recordId, onStatus = () => {}) {
@@ -4515,6 +7654,14 @@ class ZkapiClient extends EventTarget {
             expectedRevision: record.revision,
             observedBlock: Number(canonical.observed_block || 0)
         });
+        // A receipt the server finalized for the restored state (the reason a
+        // challenge succeeded) installs at once, so the user can withdraw
+        // from the signed next state. Quiet: restoration already succeeded.
+        try {
+            await browserWalletRuntime.recoverPending({ quiet: true, sweep: true });
+        } catch (error) {
+            console.warn('Unable to recover a settled receipt for the restored balance.', error);
+        }
         await this.refresh();
         onStatus('Private balance restored.');
         return this.wallet;
@@ -4646,13 +7793,13 @@ class ZkapiClient extends EventTarget {
         return results[0] || { status: 'submitted', transaction_hash: submittedHash };
     }
 
-    async finalizeEscape(recordIdOrStatus = null, maybeStatus = () => {}) {
+    async finalizeEscape(recordIdOrStatus = null, maybeStatus = () => {}, options = {}) {
         const key = typeof recordIdOrStatus === 'string' ? recordIdOrStatus : 'selected';
         if (this.finalizePromise) {
             if (this.finalizePromiseKey === key) return this.finalizePromise;
             throw new Error('A different escape finalization is already running.');
         }
-        const operation = this.performFinalizeEscape(recordIdOrStatus, maybeStatus);
+        const operation = this.performFinalizeEscape(recordIdOrStatus, maybeStatus, options);
         this.finalizePromise = operation;
         this.finalizePromiseKey = key;
         try {
@@ -4665,7 +7812,98 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async performFinalizeEscape(recordIdOrStatus = null, maybeStatus = () => {}) {
+    /**
+     * The sponsored finalization a gasless record journaled (its claim,
+     * `finalizeUserOp`, its hashes) when the current profile no longer pins
+     * the record's paymaster and factory (`gasless: null`, or other pins):
+     * it is never re-sent, so the wallet-paid finalization must not wait on
+     * its claim forever. It is looked for on chain through the journaled
+     * EntryPoint (the read RPC only). Included and settled, its bundle
+     * transaction and settlement are recorded and `{ result }` reports it
+     * (nothing is signed). Included but reverted (its vault call failed),
+     * it is released (claim and op body cleared, phase 'reverted', hashes
+     * kept) and the vault is read again: closed by a third party, the record
+     * is synced and `{ result }` reports the payout waiting in S for
+     * sweepTransit; still pending, `{ record }` goes on to the wallet. Not included, it is given the re-send window from its last
+     * activity (refused with `user_op_pending` meanwhile, or while a client
+     * still follows it), then released: the claim and the op body are
+     * cleared, its hashes stay journaled for the background pass's
+     * late-inclusion look, and `{ record }` is what the wallet path claims.
+     * A record whose pins still match, or with no journaled operation, is
+     * returned as is.
+     */
+    async releaseUnpinnedFinalization(withdrawal, onStatus = () => {}) {
+        const hashes = this.recordUserOpHashes(withdrawal, 'finalize');
+        if (!withdrawal?.finalizeSubmissionId || !(withdrawal.finalizeUserOp || withdrawal.finalizeUserOpHash) || !hashes.length
+            || withdrawal.finalizeTransactionHash || (withdrawal.finalizeTransactionHashes || []).length) return { record: withdrawal };
+        try {
+            this.requireRecordPins(withdrawal);
+            return { record: withdrawal };
+        } catch (error) {
+            if (error?.code !== 'gasless_record_not_pinned') throw error;
+        }
+        const reader = this.gaslessReader();
+        const context = this.recordReaderContext(withdrawal, reader);
+        if (!context) return { record: withdrawal };
+        onStatus('Looking on chain for the sponsored finalization sent earlier…');
+        const found = await this.recordUserOpInclusion(context, withdrawal, 'finalize');
+        const submission = {
+            recordId: withdrawal.recordId, submissionId: withdrawal.finalizeSubmissionId, operationId: withdrawal.finalizeOperationId,
+            generation: Number(withdrawal.finalizeGeneration || 0), deploymentId: withdrawal.deploymentId, chainId: Number(withdrawal.chainId),
+            contractAddress: withdrawal.contractAddress, noteId: Number(withdrawal.noteId), destination: withdrawal.destination
+        };
+        // Included but reverted (its vault call failed, e.g. exits paused):
+        // released as performGaslessFinalization releases it, never recorded
+        // as this record's finalization, so the wallet path is not blocked.
+        const settlement = found ? await this.gaslessRecordSettlement(withdrawal, found.transactionHash, { reader, hash: found.userOpHash }) : null;
+        if (found && (settlement ? !settlement.success : found.success === false)) {
+            await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { submission });
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+                finalizeUserOp: null, finalizeUserOpPhase: 'reverted', finalizeUserOpSubmittedAt: null, finalizeUserOpFollowedAt: null,
+                finalizeUserOpRevertedTransactionHash: found.transactionHash,
+                ...this.revertedRecordUserOpFields(withdrawal, 'finalize', [found.userOpHash])
+            });
+            const released = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || withdrawal;
+            const after = await this.readBrowserWithdrawalStatus(Number(withdrawal.noteId), null, { request: reader });
+            if (after.status === 'closed') {
+                // A third party finalized the escape first: the vault paid S,
+                // where the payout waits for sweepTransit (wallet-paid).
+                onStatus(`The sponsored finalization sent earlier reverted in ${this.compact(found.transactionHash)}; a third party finalized this escape first.`);
+                await this.syncEscapeWithdrawals(onStatus, withdrawal.recordId);
+                const closed = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || released;
+                return { result: { status: 'closed', recordId: withdrawal.recordId, finalizedByThirdParty: true,
+                    fundsWaitingInTransit: closed.fundsWaitingInTransit === true, transitAccount: context.transit.account } };
+            }
+            onStatus(`The sponsored finalization sent earlier reverted in ${this.compact(found.transactionHash)}; it was released.`);
+            return { record: released };
+        }
+        if (found) {
+            await this.rememberRecordUserOpInclusion(withdrawal, 'finalize', found, reader);
+            await this.refresh({ quiet: true });
+            onStatus(`The sponsored finalization sent earlier was included in ${this.compact(found.transactionHash)}. Nothing was signed; its settlement is checked in the background.`);
+            return { result: { status: 'finalizing', recordId: withdrawal.recordId, sponsored: true, transactionHash: found.transactionHash,
+                userOpHash: found.userOpHash } };
+        }
+        const resendAfterMs = this.gaslessTiming.resendAfterMs;
+        const lastActiveAt = Math.max(Number(withdrawal.finalizeSubmissionStartedAt || 0), Number(withdrawal.finalizeUserOpBuiltAt || 0),
+            Number(withdrawal.finalizeUserOpSubmittedAt || 0), Number(withdrawal.finalizeUserOpFollowedAt || 0));
+        const followed = browserWalletRuntime.gaslessClaimLive({
+            submissionId: withdrawal.finalizeSubmissionId, owner: withdrawal.finalizeSubmissionOwner, lastActiveAt
+        }, resendAfterMs);
+        if (followed || Date.now() - lastActiveAt < resendAfterMs) {
+            throw gaslessError('user_op_pending', {
+                userOpHash: withdrawal.finalizeUserOpHash || hashes.at(-1), retryAfterMs: Math.max(0, lastActiveAt + resendAfterMs - Date.now())
+            }, 'The sponsored finalization sent earlier may still be included. This app no longer sponsors its paymaster, so it is not sent again; finalize from the wallet once it has had time to land.');
+        }
+        await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { submission });
+        await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+            finalizeUserOp: null, finalizeUserOpPhase: 'released', finalizeUserOpSubmittedAt: null, finalizeUserOpFollowedAt: null
+        });
+        onStatus('The sponsored finalization sent earlier was not included and is no longer sponsored; it was released. A late inclusion is still recorded.');
+        return { record: await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || withdrawal };
+    }
+
+    async performFinalizeEscape(recordIdOrStatus = null, maybeStatus = () => {}, options = {}) {
         const hasRecordId = typeof recordIdOrStatus === 'string';
         const onStatus = typeof recordIdOrStatus === 'function' ? recordIdOrStatus : maybeStatus;
         let withdrawal = hasRecordId
@@ -4675,11 +7913,34 @@ class ZkapiClient extends EventTarget {
             withdrawal = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId);
         }
         const resumablePhases = ['pending', 'finalizing', 'awaiting_wallet'];
+        // A sponsored escape a third party finalized (the background sync
+        // closed the record without a settlement of S's own finalization)
+        // leaves its payout in S: finalizing it means a FORWARD (§3.1 scheduling).
+        if (isGaslessWithdrawal(withdrawal) && ['closed', 'closed_unconfirmed'].includes(withdrawal?.phase)
+            && withdrawal.payoutVerified !== true && withdrawal.paymasterCredited !== true
+            && (options?.fees ?? 'payout') === 'payout') {
+            return this.performTransitForward(withdrawal, onStatus, options);
+        }
         if (!resumablePhases.includes(withdrawal?.phase)) {
             throw new Error('There is no pending escape withdrawal.');
         }
         if (Date.now() < Number(withdrawal.challengeDeadline) * 1000) {
             throw new Error(`The safety window has ${this.formatExpiry(withdrawal.challengeDeadline)} remaining.`);
+        }
+        // A sponsored escape finalizes through the paymaster by default
+        // (design §3.2); `fees: 'wallet'` pays from the connected account and
+        // leaves the payout in the transit account for sweepTransit.
+        const fees = options?.fees ?? (isGaslessWithdrawal(withdrawal) ? 'payout' : 'wallet');
+        if (!['wallet', 'payout'].includes(fees)) throw new TypeError('Choose wallet or payout for the finalization fees.');
+        if (fees === 'payout') return this.performGaslessFinalization(withdrawal, onStatus, options);
+        const sponsoredRecord = isGaslessWithdrawal(withdrawal);
+        if (sponsoredRecord) {
+            // A sponsored finalization this record sent before the profile
+            // stopped pinning its paymaster is followed on chain, then
+            // released, before the wallet pays (it never blocks the wallet).
+            const unpinned = await this.releaseUnpinnedFinalization(withdrawal, onStatus);
+            if (unpinned.result) return unpinned.result;
+            withdrawal = unpinned.record;
         }
 
         onStatus('Connecting to MetaMask for finalization…');
@@ -4802,32 +8063,449 @@ class ZkapiClient extends EventTarget {
             throw error;
         }
         const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, 'finalize');
+        // E5: after raises the vault pays B − c_final, not the amount the
+        // escape started with.
+        const match = event
+            ? await this.escapePayoutMatch(withdrawal, event.finalBalance, Number(BigInt(receipt?.blockNumber || '0x0')))
+            : null;
         if (!event || event.noteId !== BigInt(withdrawal.noteId)
             || event.destination.toLowerCase() !== withdrawal.destination.toLowerCase()
-            || event.finalBalance !== BigInt(withdrawal.finalBalance)) {
+            || !match?.accepted) {
             throw new Error('The finalization event did not match the pending withdrawal.');
         }
         const confirmed = await this.confirmMinedWithdrawalStatus(withdrawal.noteId, receipt);
         if (confirmed.status !== 'closed') {
             throw new Error(`The vault reports ${confirmed.status} after finalization.`);
         }
+        // EscapeWithdrawalFinalized alone does not prove the payout arrived:
+        // with an EscapePayoutDeferred log the vault only credited it.
+        const credited = event.payoutCredited === true;
+        // A background pass may have read this close first, without the receipt.
+        const current = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || withdrawal;
         await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
             phase: 'closed_unconfirmed',
             chainStatus: 'closed',
-            payoutVerified: true,
+            ...closedWithdrawalPayout(current, !credited, credited ? {
+                amount: Number(event.creditedAmount),
+                evidence: 'receipt'
+            } : null),
+            ...this.payoutMatchFields({ amount: Number(event.finalBalance), match }, onStatus),
             closedAt: Date.now(),
             closeBlockNumber: Number(BigInt(receipt?.blockNumber || '0x0')),
             lastObservedBlock: Number(confirmed.observed_block || 0),
-            error: null
+            error: null,
+            // Paid from a wallet to a transit account: the vault pushed the
+            // payout to the transit account, where it waits for sweepTransit.
+            ...(sponsoredRecord && !credited ? { payoutVerified: false, fundsWaitingInTransit: true,
+                transitBalanceWei: (event.finalBalance * NATIVE_WEI_PER_UNIT).toString() } : {})
         });
         await this.refresh();
-        onStatus('Escape withdrawal returned. Finality is being checked safely in the background.');
-        return { status: 'closed', event, receipt };
+        onStatus(credited
+            ? `${ESCAPE_PAYOUT_CREDITED_MESSAGE} Finality is being checked safely in the background.`
+            : sponsoredRecord
+                ? `Escape finalized to its transit account. ${await this.transitFundsMessage(withdrawal)}`
+                : 'Escape withdrawal returned. Finality is being checked safely in the background.');
+        return { status: 'closed', event, receipt, ...(credited ? { payoutCredited: true } : {}),
+            ...(sponsoredRecord && !credited ? { fundsWaitingInTransit: true, transitAccount: withdrawal.destination } : {}) };
     }
 
-    async confirmMinedWithdrawalStatus(noteId, receipt) {
+    /**
+     * E5: whether an escape's finalized or credited amount matches its
+     * record: f' == B − c_final after every EscapeConcessionRaised of the
+     * note between initiation and `toBlock`, and B − b <= f' <= B − c_init
+     * (below B − b the record still closes, with an alert). A record saved
+     * before vault revision 3 (no B or c_init) must match exactly.
+     */
+    async escapePayoutMatch(record, amount, toBlock, { request = null } = {}) {
+        if (record?.stateBalance == null || record?.concededAtInit == null) {
+            const accepted = BigInt(amount) === BigInt(record?.finalBalance ?? -1);
+            return { accepted, exact: true, concededFinal: null, alert: null };
+        }
+        const raises = await this.escapeConcessionRaisesFor(record, toBlock, { request });
+        return matchEscapePayout({
+            stateBalance: record.stateBalance,
+            concededAtInit: record.concededAtInit,
+            boundAtState: record.boundAtState ?? null,
+            raises: raises == null ? null : [...raises, ...(record.concededCurrent != null ? [record.concededCurrent] : [])],
+            amount
+        });
+    }
+
+    /**
+     * Every EscapeConcessionRaised log of this escape (its note and
+     * nullifier) from its start block to `toBlock`, or null when the logs
+     * cannot be read.
+     */
+    async escapeConcessionRaisesFor(record, toBlock, { request = null } = {}) {
+        const fromBlock = Number(record.startBlockNumber || 0);
+        const vault = this.config?.funding?.contract_address;
+        if (!vault || !Number.isSafeInteger(fromBlock) || fromBlock <= 0
+            || !Number.isSafeInteger(Number(toBlock)) || Number(toBlock) < fromBlock) return null;
+        let logs;
         try {
-            return await this.readBrowserWithdrawalStatus(noteId);
+            // A sponsored record reads through the read RPC (design §3.1).
+            logs = await (request || (payload => this.ethereum.request(payload)))({
+                method: 'eth_getLogs',
+                params: [{ address: vault, topics: [ABI.escapeConcessionRaisedEvent, `0x${abiWord(record.noteId)}`],
+                    fromBlock: rpcQuantity(fromBlock), toBlock: rpcQuantity(Number(toBlock)) }]
+            });
+        } catch {
+            return null;
+        }
+        if (!Array.isArray(logs)) return null;
+        const raises = [];
+        for (const log of logs) {
+            let event;
+            try {
+                event = decodeVaultEvent(log, vault);
+            } catch {
+                return null;
+            }
+            if (event?.event !== 'EscapeConcessionRaised' || event.noteId !== BigInt(record.noteId)) continue;
+            if (record.withdrawalNullifier != null && event.nullifier !== BigInt(record.withdrawalNullifier)) continue;
+            raises.push({ conceded: event.conceded, finalBalance: event.finalBalance });
+        }
+        return raises;
+    }
+
+    /** The record fields of a matched payout: its amount, c_final and any alert. */
+    payoutMatchFields({ amount, match }, onStatus = () => {}) {
+        if (!match || match.concededFinal == null) return {};
+        if (match.alert) onStatus(CONCESSION_EXCEEDED_BOUND_MESSAGE);
+        return {
+            finalBalance: Number(amount),
+            concededFinal: String(match.concededFinal),
+            ...(match.alert ? { payoutAlert: match.alert } : {})
+        };
+    }
+
+    /** Credited escape payouts this browser has not yet seen delivered. */
+    get creditedEscapePayouts() {
+        return this.withdrawals.filter(record => record.payoutCredited === true
+            && record.payoutClaimed !== true
+            && ['closed_unconfirmed', 'closed'].includes(record.phase));
+    }
+
+    /**
+     * escapePayoutCredits(destination) on the hardened vault: the escape
+     * payouts (in vault units) that it holds for `destination`.
+     */
+    async readEscapePayoutCredit(destination, blockTag = 'latest', { request = null } = {}) {
+        const vault = this.config?.funding?.contract_address;
+        if (!vault) throw new Error('Initialize the wallet before reading escape payouts.');
+        // The gasless reader is chain-checked itself; the wallet provider is asked otherwise.
+        if (!request) await this.assertFundingChain();
+        const word = await (request || (payload => this.ethereum.request(payload)))({
+            method: 'eth_call',
+            params: [{
+                to: vault,
+                data: encodeEscapePayoutCredits(destination)
+            }, blockTag]
+        });
+        if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) {
+            throw Object.assign(new Error('The vault did not return an escape payout credit. This build expects a concession vault (revision 3), which holds escape payouts.'), {
+                code: 'vault_value_invalid'
+            });
+        }
+        return BigInt(word);
+    }
+
+    // A closed escape without its own finalization receipt: a nonzero credit
+    // for the destination on a hardened vault is reported as credited (the
+    // claim delivers it either way). Read failures leave the record unchanged.
+    async observedEscapePayoutCredit(record, status, { request = null } = {}) {
+        if (Number(record.finalBalance || 0) <= 0
+            || !/^0x[0-9a-fA-F]{40}$/.test(record.destination || '')) return null;
+        const observedBlock = Number(status.observed_block || 0);
+        try {
+            const credit = await this.readEscapePayoutCredit(record.destination,
+                observedBlock > 0 ? rpcQuantity(observedBlock) : 'latest', { request });
+            return credit > 0n ? { amount: null, evidence: 'vault_credit' } : null;
+        } catch (error) {
+            if (error?.code === 'wrong_network') throw error;
+            return null;
+        }
+    }
+
+    /**
+     * Delivers the escape payout a hardened vault holds for a credited
+     * withdrawal record's destination: reads escapePayoutCredits(destination)
+     * and sends claimEscapePayout(destination), which pays that address all
+     * its credits. Only an EscapePayoutClaimed log for the destination (or a
+     * zero credit once the note is closed) marks the payout delivered. The
+     * connected account only pays gas; it receives nothing.
+     */
+    async claimEscapePayout(recordId, onStatus = () => {}) {
+        if (this.payoutClaimPromise) {
+            if (this.payoutClaimPromiseKey === recordId) return this.payoutClaimPromise;
+            throw new Error('A different escape payout claim is already running.');
+        }
+        const operation = this.performClaimEscapePayout(recordId, onStatus);
+        this.payoutClaimPromise = operation;
+        this.payoutClaimPromiseKey = recordId;
+        try {
+            return await operation;
+        } finally {
+            if (this.payoutClaimPromise === operation) {
+                this.payoutClaimPromise = null;
+                this.payoutClaimPromiseKey = null;
+            }
+        }
+    }
+
+    async creditedEscapePayoutRecord(recordId) {
+        const record = await browserWalletRuntime.currentWithdrawal(recordId);
+        if (!record || record.payoutCredited !== true
+            || !['closed_unconfirmed', 'closed'].includes(record.phase)
+            || !/^0x[0-9a-fA-F]{40}$/.test(record.destination || '')) {
+            throw new Error('The vault holds no escape payout for this withdrawal.');
+        }
+        return record;
+    }
+
+    async performClaimEscapePayout(recordId, onStatus = () => {}) {
+        const vault = this.config?.funding?.contract_address;
+        if (!vault) throw new Error('Initialize the wallet before claiming an escape payout.');
+        const record = await this.creditedEscapePayoutRecord(recordId);
+        const destination = record.destination.toLowerCase();
+        const delivered = () => ({ status: 'claimed', recordId, destination,
+            transactionHash: record.payoutClaimTransactionHash || null });
+        if (record.payoutClaimed === true) {
+            onStatus('This escape payout was already delivered to its destination.');
+            return delivered();
+        }
+
+        // Claims sent earlier for this destination: before a reload, by a
+        // manual signer, or from another credited record of the same address
+        // (one claim pays all of the destination's credits).
+        const sentHashes = [...new Set((await this.unclaimedEscapeCredits(destination))
+            .flatMap(entry => entry.payoutClaimTransactionHashes || [])
+            .map(hash => String(hash).toLowerCase()))];
+        for (const hash of sentHashes) {
+            let receipt = null;
+            try {
+                receipt = await this.ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
+            } catch {
+                // An unreadable receipt proves nothing; the vault is read below.
+            }
+            const claim = receipt && BigInt(receipt.status || '0x0') === 1n
+                ? parseEscapePayoutClaim(receipt, vault, destination) : null;
+            if (claim) {
+                const settled = await this.recordEscapePayoutClaim(destination, receipt, claim);
+                if (settled.includes(recordId)) {
+                    return this.escapePayoutClaimed(recordId, destination, receipt, claim, onStatus);
+                }
+                // That claim was mined before this record's credit existed.
+                continue;
+            }
+            if (!receipt) {
+                // Still in the mempool: it pays this credit too once mined,
+                // and a second claim would only revert. A transaction the
+                // node no longer knows was dropped.
+                const transaction = await this.ethereum.request({
+                    method: 'eth_getTransactionByHash',
+                    params: [hash]
+                }).catch(() => null);
+                if (transaction) {
+                    onStatus(`The payout claim ${this.compact(hash)} is still pending. Check again after it confirms.`);
+                    return { status: 'pending', recordId, destination, transactionHash: hash };
+                }
+            }
+        }
+
+        onStatus('Checking the payout the vault holds for this address…');
+        await this.assertFundingChain();
+        const blockTag = await this.ethereum.request({ method: 'eth_blockNumber' });
+        if (!/^0x[0-9a-fA-F]+$/.test(String(blockTag || ''))) {
+            throw new Error('The wallet provider returned an invalid block number.');
+        }
+        if (await this.readEscapePayoutCredit(destination, blockTag) === 0n) {
+            return this.recordClearedEscapePayout(recordId, destination, blockTag, onStatus);
+        }
+
+        onStatus('Connecting to MetaMask to deliver the payout…');
+        const from = await this.connectWallet();
+        let receipt;
+        try {
+            onStatus('Confirm the payout claim in MetaMask. Your account pays only gas; the vault pays the destination.');
+            receipt = await this.sendContractTransaction(
+                from,
+                vault,
+                encodeClaimEscapePayout(destination),
+                async hash => {
+                    await this.rememberEscapePayoutClaim(recordId, hash);
+                    onStatus(`Payout claim submitted ${this.compact(hash)} · waiting for confirmation…`);
+                },
+                null,
+                null,
+                {
+                    kind: 'escape-payout-claim',
+                    submission: { recordId, noteId: Number(record.noteId), destination }
+                }
+            );
+        } catch (error) {
+            // Someone else delivered the credit first: the vault holds nothing
+            // more for this destination (ZeroAmount, or a reverted claim).
+            if (['zero_amount'].includes(error?.code) || error?.transactionReceipt) {
+                const latest = await this.ethereum.request({ method: 'eth_blockNumber' }).catch(() => null);
+                const remaining = /^0x[0-9a-fA-F]+$/.test(String(latest || ''))
+                    ? await this.readEscapePayoutCredit(destination, latest).catch(() => null) : null;
+                if (remaining === 0n) {
+                    return this.recordClearedEscapePayout(recordId, destination, latest, onStatus);
+                }
+            }
+            if (error?.code === 'native_transfer_failed') {
+                error.shortMessage = ESCAPE_PAYOUT_STILL_REJECTED_MESSAGE;
+            } else if (error?.transactionReceipt) {
+                error.shortMessage = 'The payout claim reverted, so the vault keeps the payout for its destination. If it reverts again, the address still does not accept ETH.';
+            } else if (isWalletRejection(error)) {
+                error.shortMessage = 'MetaMask canceled the payout claim. The vault still holds the payout for its destination.';
+            }
+            throw error;
+        }
+        const claim = parseEscapePayoutClaim(receipt, vault, destination);
+        if (!claim) {
+            throw new Error('The claim transaction succeeded, but it did not pay this destination.');
+        }
+        const settled = await this.recordEscapePayoutClaim(destination, receipt, claim);
+        if (!settled.includes(recordId)) {
+            // Only a record without a usable close block gets here. A zero
+            // credit at the claim's block settles it instead.
+            const claimBlock = /^0x[0-9a-fA-F]+$/.test(String(receipt.blockNumber || ''))
+                ? receipt.blockNumber : await this.ethereum.request({ method: 'eth_blockNumber' });
+            if (await this.readEscapePayoutCredit(destination, claimBlock) === 0n) {
+                return this.recordClearedEscapePayout(recordId, destination, claimBlock, onStatus);
+            }
+            throw new Error('The claim was mined, but the vault still holds a payout for this address. Claim again.');
+        }
+        return this.escapePayoutClaimed(recordId, destination, receipt, claim, onStatus);
+    }
+
+    // The credited records of `destination` whose payout this browser has not
+    // seen delivered, re-read from storage.
+    async unclaimedEscapeCredits(destination) {
+        return (await browserWalletRuntime.currentWithdrawals()).filter(entry => entry.payoutCredited === true
+            && entry.payoutClaimed !== true
+            && ['closed_unconfirmed', 'closed'].includes(entry.phase)
+            && sameAddress(entry.destination, destination));
+    }
+
+    async rememberEscapePayoutClaim(recordId, hash) {
+        if (!/^0x[0-9a-fA-F]{64}$/.test(hash || '')) {
+            throw new Error('MetaMask returned an invalid payout claim transaction hash.');
+        }
+        const current = await this.creditedEscapePayoutRecord(recordId);
+        const hashes = [...new Set([...(current.payoutClaimTransactionHashes || []), hash.toLowerCase()])];
+        await browserWalletRuntime.updateWithdrawal(recordId, { payoutClaimTransactionHashes: hashes });
+    }
+
+    // A mined claim pays the destination every credit the vault holds when it
+    // executes. It therefore delivered each credited record of the destination
+    // whose close, and so its credit, is in an earlier block. closeBlockNumber
+    // is never earlier than the close (a receipt's block, or the block where
+    // the note was first seen Closed). A record credited in the claim's block
+    // or later keeps its credit for a later claim. Returns the settled ids.
+    async recordEscapePayoutClaim(destination, receipt, claim) {
+        const claimBlock = Number(BigInt(receipt.blockNumber || '0x0'));
+        const settled = (await this.unclaimedEscapeCredits(destination))
+            .filter(entry => Number(entry.closeBlockNumber) > 0 && Number(entry.closeBlockNumber) < claimBlock)
+            .map(entry => entry.recordId);
+        await this.markEscapePayoutsClaimed(settled, {
+            payoutClaimed: true,
+            payoutVerified: true,
+            payoutClaimEvidence: 'claim_receipt',
+            payoutClaimTransactionHash: String(receipt.transactionHash || '').toLowerCase() || null,
+            payoutClaimBlockNumber: claimBlock,
+            payoutClaimedAmount: Number(claim.amount)
+        });
+        return settled;
+    }
+
+    escapePayoutClaimed(recordId, destination, receipt, claim, onStatus) {
+        onStatus(`Escape payout delivered to ${this.compact(destination)}.`);
+        return { status: 'claimed', recordId, destination,
+            transactionHash: String(receipt.transactionHash || '').toLowerCase() || null,
+            amount: claim.amount, receipt };
+    }
+
+    // The vault holds nothing for the destination at blockTag. Credits only
+    // leave the vault through a claim that pays the destination, so each
+    // credited record whose note reads Closed at that block was delivered.
+    async recordClearedEscapePayout(recordId, destination, blockTag, onStatus) {
+        const observedBlock = Number(BigInt(blockTag));
+        const settled = [];
+        for (const entry of await this.unclaimedEscapeCredits(destination)) {
+            const status = await this.readBrowserWithdrawalStatus(entry.noteId, blockTag);
+            if (status.status === 'closed') settled.push(entry.recordId);
+        }
+        if (!settled.includes(recordId)) {
+            throw new Error('The vault does not show this escape as closed at the latest block yet. Check again shortly.');
+        }
+        await this.markEscapePayoutsClaimed(settled, {
+            payoutClaimed: true,
+            payoutVerified: true,
+            payoutClaimEvidence: 'credit_cleared',
+            payoutClaimBlockNumber: observedBlock
+        });
+        onStatus('The vault no longer holds this payout: it was already delivered to its destination.');
+        return { status: 'claimed', recordId, transactionHash: null, observedBlock };
+    }
+
+    async markEscapePayoutsClaimed(recordIds, evidence) {
+        for (const id of recordIds) {
+            try {
+                await browserWalletRuntime.updateWithdrawal(id, { ...evidence, payoutClaimTransactionHashes: [] }, {
+                    expectedPhase: ['closed_unconfirmed', 'closed']
+                });
+            } catch (error) {
+                if (!/not found|different phase/i.test(error?.message || '')) throw error;
+            }
+        }
+        await this.refresh({ quiet: true });
+    }
+
+    /**
+     * Simulates the vault's escape payout push to `destination`: a plain ETH
+     * transfer from the vault, limited to the payout gas on a hardened vault.
+     * `accepts` is false when the destination would not be paid at
+     * finalization (a hardened vault then only credits it; an older vault
+     * cannot finalize the escape) and null when the RPC cannot tell. The
+     * simulated value is `finalBalance` vault units, 1 by default, so the
+     * check does not disclose the balance to the RPC.
+     */
+    async checkEscapeDestination(destination, { finalBalance = 1 } = {}) {
+        const vault = this.config?.funding?.contract_address;
+        if (!vault) throw new Error('Initialize the wallet before checking an escape destination.');
+        const normalized = normalizeWithdrawalDestination(destination, this.config.funding);
+        if (!normalized) throw new TypeError('Choose a valid nonzero Ethereum withdrawal address.');
+        const units = BigInt(finalBalance);
+        if (units <= 0n) return { destination: normalized, accepts: true, warning: null };
+        await this.assertFundingChain();
+        try {
+            await this.ethereum.request({
+                method: 'eth_call',
+                params: [{
+                    from: vault,
+                    to: normalized,
+                    value: rpcQuantity(units * NATIVE_WEI_PER_UNIT),
+                    gas: rpcQuantity(ESCAPE_DESTINATION_CHECK_GAS)
+                }, 'latest']
+            });
+            return { destination: normalized, accepts: true, warning: null };
+        } catch (error) {
+            if (error?.code === 'wrong_network') throw error;
+            if (!executionFailure(error)) return { destination: normalized, accepts: null, warning: null };
+            return {
+                destination: normalized,
+                accepts: false,
+                warning: ESCAPE_DESTINATION_CREDIT_WARNING
+            };
+        }
+    }
+
+    async confirmMinedWithdrawalStatus(noteId, receipt, { request = null } = {}) {
+        try {
+            return await this.readBrowserWithdrawalStatus(noteId, null, { request });
         } catch (failure) {
             // Call only after validating the successful receipt's withdrawal
             // event. An unavailable second RPC is not a failed payout. Keep
@@ -4842,15 +8520,22 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async readBrowserWithdrawalStatus(noteId, requestedBlock = null) {
+    /**
+     * The vault's canonical status of a note. By default through the wallet
+     * provider on the vault's chain; with `request` through that read RPC
+     * instead (the sponsored path reads the exit RPC or the pinned RPC, which
+     * are chain-checked themselves, so the wallet is never asked).
+     */
+    async readBrowserWithdrawalStatus(noteId, requestedBlock = null, { request = null } = {}) {
         if (noteId == null) return { status: 'no_note', challenge_deadline: null };
-        await this.assertFundingChain();
-        const blockTag = requestedBlock || await this.ethereum.request({ method: 'eth_blockNumber' });
+        const read = request || (payload => this.ethereum.request(payload));
+        if (!request) await this.assertFundingChain();
+        const blockTag = requestedBlock || await read({ method: 'eth_blockNumber' });
         if (!/^0x[0-9a-fA-F]+$/.test(String(blockTag || ''))) {
             throw new Error('The wallet provider returned an invalid block number.');
         }
         const observedBlock = Number(BigInt(blockTag));
-        const encodedNote = await this.ethereum.request({
+        const encodedNote = await read({
             method: 'eth_call',
             params: [{
                 to: this.config.funding.contract_address,
@@ -4863,8 +8548,8 @@ class ZkapiClient extends EventTarget {
         if (status === 3) return { status: 'closed', note_id: Number(noteId), challenge_deadline: null, observed_block: observedBlock };
         if (status === 1) return { status: 'active', note_id: Number(noteId), challenge_deadline: null, observed_block: observedBlock };
         if (status !== 2) throw new Error(`The vault returned unknown note status ${status}.`);
-        await this.assertFundingChain();
-        const encodedPending = await this.ethereum.request({
+        if (!request) await this.assertFundingChain();
+        const encodedPending = await read({
             method: 'eth_call',
             params: [{
                 to: this.config.funding.contract_address,
@@ -4875,6 +8560,19 @@ class ZkapiClient extends EventTarget {
         if (pendingWords.length < 6 || BigInt(`0x${pendingWords[0]}`) !== 1n) {
             throw new Error('The vault pending-withdrawal record is missing.');
         }
+        // Vault revision 3: the escape's concession at the same block
+        // (pendingWithdrawals.finalBalance + conceded == stateBalance).
+        let concession = null;
+        try {
+            const encodedConcession = await read({
+                method: 'eth_call',
+                params: [{ to: this.config.funding.contract_address, data: `0x${ABI.pendingConcessions}${abiWord(noteId)}` }, blockTag]
+            });
+            concession = decodePendingConcessions(encodedConcession);
+            if (concession.stateBalance !== BigInt(`0x${pendingWords[3]}`) + concession.conceded) concession = null;
+        } catch {
+            concession = null;
+        }
         return {
             status: 'pending_withdrawal',
             note_id: Number(noteId),
@@ -4883,6 +8581,11 @@ class ZkapiClient extends EventTarget {
             final_balance: Number(BigInt(`0x${pendingWords[3]}`)),
             destination: `0x${pendingWords[4].slice(-40)}`,
             challenge_deadline: Number(BigInt(`0x${pendingWords[5]}`)),
+            ...(concession ? {
+                next_nullifier: `0x${concession.nextNullifier.toString(16)}`,
+                state_balance: Number(concession.stateBalance),
+                conceded: Number(concession.conceded)
+            } : {}),
             observed_block: observedBlock
         };
     }

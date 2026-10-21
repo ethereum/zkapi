@@ -1,3 +1,11 @@
+# script/Deploy.s.sol links Bn254Poseidon into the vault's creation code itself
+# (forge never links it), so no remapping workaround is needed. Create the output
+# directory first (fs_permissions does not admit a missing directory):
+#   mkdir -p ../../.demo
+#   OUTPUT_PATH="$PWD/../../.demo/deployment.json" ... forge script script/Deploy.s.sol
+# The compiler settings equal protocol/contracts/foundry.toml's, so the deployed
+# runtime code is the code the protocol suites test and
+# scripts/expected-codehashes.mjs reproduces.
 [profile.default]
 src = "src"
 script = "script"
@@ -5,10 +13,14 @@ out = "out"
 libs = ["../../protocol/contracts/lib", "../../protocol/contracts/src"]
 solc = "0.8.28"
 optimizer = true
-optimizer_runs = 200
+optimizer_runs = 10000
 ffi = false
 via_ir = true
+bytecode_hash = "none"
+cbor_metadata = false
+ast = true
 fs_permissions = [
     { access = "read", path = "./" },
+    { access = "read", path = "../../protocol/setup" },
     { access = "read-write", path = "../../.demo" },
 ]

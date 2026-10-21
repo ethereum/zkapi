@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Preserve dependency license texts/declarations and release provenance."""
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -66,7 +65,9 @@ metadata = json.loads(command(["cargo", "metadata", "--locked", "--format-versio
 packages = {package["id"]: package for package in metadata["packages"]}
 nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
 pending = [package["id"] for package in metadata["packages"]
-           if Path(package["manifest_path"]) == companion / "crates/zkapi-cli/Cargo.toml"]
+           if Path(package["manifest_path"]) == companion / "crates/zkapi-companion/Cargo.toml"]
+if len(pending) != 1:
+    sys.exit("the prepared source has no crates/zkapi-companion package")
 visited = set()
 while pending:
     identifier = pending.pop()
@@ -84,20 +85,17 @@ for identifier in sorted(visited):
     "This directory preserves license/notice texts for resolved Go and Rust build dependencies\n"
     "and the locally adapted leCore retrieval code.\n"
     "dependencies.json records upstream license declarations and source references.\n"
-    "The OA ZKAPI companion and protocol declare MIT OR Apache-2.0 in their Cargo manifests;\n"
-    "their pinned source trees do not provide top-level license text files. Those declarations\n"
-    "are retained here without assigning them the zkAPI client repository's copyright notice.\n"
-    "Companion source: https://github.com/ethereum/zkapi\n"
-    "Protocol source: https://github.com/mingyech/zkapi\n"
+    "The zkAPI wallet companion and protocol crates declare MIT OR Apache-2.0 in their Cargo\n"
+    "manifests; their pinned source tree does not provide top-level license text files. Those\n"
+    "declarations are retained here without assigning them the zkAPI client's copyright notice.\n"
+    "Companion and protocol source: https://github.com/ethereum/zkapi at the commit recorded\n"
+    "as source_commit in build-info.json (crates/zkapi-companion, protocol/rust).\n"
 )
 build_info = {
     "zkapi_clientd_source": "https://github.com/ethereum/zkapi",
     "zkapi_clientd_commit": command(["git", "rev-parse", "HEAD"], repo).strip(),
     "zkapi_clientd_source_dirty": bool(command(["git", "status", "--porcelain"], repo).strip()),
-    "companion_commit": command(["git", "rev-parse", "HEAD"], companion).strip(),
-    "protocol_commit": command(["git", "rev-parse", "HEAD"], companion / "protocol").strip(),
-    "companion_patch_sha256": hashlib.sha256((repo / "zkapi-clientd/internal/zkapi/companion.patch").read_bytes()).hexdigest(),
-    "protocol_patch_sha256": hashlib.sha256((repo / "zkapi-clientd/internal/zkapi/protocol-transport.patch").read_bytes()).hexdigest(),
+    "source_commit": command(["git", "rev-parse", "HEAD"], companion).strip(),
     "go_toolchain": go_version,
     "rust_toolchain": rust_version.strip(),
     "cargo_version": command(["cargo", "--version"]).strip(),

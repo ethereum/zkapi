@@ -82,6 +82,47 @@ func paymentRequestURI(q zkapi.AddressPaymentQuote) (string, error) {
 	return fmt.Sprintf("ethereum:%s@%d?value=%s", q.Address, q.ChainID, topUp), nil
 }
 
+// minimumETH rounds upwards, never below the quoted amount. Integer wei
+// arithmetic avoids floating-point errors in funding instructions.
+func minimumETH(wei string) string { return significantETH(wei, true) }
+
+func significantETH(wei string, roundUp bool) string {
+	amount, ok := new(big.Int).SetString(wei, 10)
+	if !ok || amount.Sign() < 0 {
+		return "invalid amount"
+	}
+	if amount.Sign() == 0 {
+		return "0"
+	}
+	digits := len(amount.String())
+	if digits > 2 {
+		step := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(digits-2)), nil)
+		if roundUp {
+			amount.Add(amount, new(big.Int).Sub(step, big.NewInt(1)))
+		}
+		amount.Quo(amount, step).Mul(amount, step)
+	}
+	text := fundingUnits(amount.String(), 18)
+	decimals := max(0, 20-len(amount.String()))
+	whole, fraction, _ := strings.Cut(text, ".")
+	if decimals == 0 {
+		return whole
+	}
+	fraction += strings.Repeat("0", decimals)
+	return whole + "." + fraction[:decimals]
+}
+
+func paymentSendLine(q zkapi.AddressPaymentQuote) string {
+	line := "Send at least: " + minimumETH(q.RecommendedTopUpWei) + " ETH"
+	balance, balanceOK := new(big.Int).SetString(q.BalanceWei, 10)
+	required, requiredOK := new(big.Int).SetString(q.RequiredTotalWei, 10)
+	if balanceOK && requiredOK && balance.Sign() > 0 && required.Sign() > 0 && new(big.Int).Mul(balance, big.NewInt(100)).Cmp(required) >= 0 {
+		// Round the balance down so the display never overstates available ETH.
+		line += " (account already has " + significantETH(q.BalanceWei, false) + " ETH)"
+	}
+	return line
+}
+
 func printSetupPaymentQR(out io.Writer, q zkapi.AddressPaymentQuote) error {
 	uri, err := paymentRequestURI(q)
 	if err != nil || uri == "" {
@@ -94,7 +135,7 @@ func printSetupPaymentQR(out io.Writer, q zkapi.AddressPaymentQuote) error {
 	// Bitmap includes the standard four-module quiet zone. Half blocks preserve
 	// square modules in a normal terminal while keeping the symbol under 80 columns.
 	qr := terminalPaymentQR(code.Bitmap())
-	_, err = fmt.Fprintf(out, "\nScan with an Ethereum wallet:\n%sNetwork: %s\nSend: %s ETH (including the fee buffer)\nTo: %s\nPayment URI: %s\n", qr, fundingNetwork(q.ChainID), fundingUnits(q.RecommendedTopUpWei, 18), q.Address, uri)
+	_, err = fmt.Fprintf(out, "\nScan with an Ethereum wallet:\n%sNetwork: %s\n%s\nTo: %s\nPayment URI: %s\n", qr, fundingNetwork(q.ChainID), paymentSendLine(q), q.Address, uri)
 	return err
 }
 

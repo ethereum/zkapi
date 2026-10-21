@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <base href="/funding/">
+  <title>zkAPI local client</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">zkAPI</p>
+    <h1>Your local client is running.</h1>
+    <p>This daemon manages private access for applications using its local API. OA Chat is a separate app and is not included in this build.</p>
+    <nav aria-label="Local client information">
+      <a href="../health">Client health</a>
+      <a href="../wallet/status">Wallet status</a>
+      <a href="../v1/models">Available models</a>
+    </nav>
+    <h2>Fund or withdraw from the terminal</h2>
+    <p>For a new wallet, stop this client, then restart it with <code>zkapi client --fund-with-cast</code> and follow the prompts. Keep the same deployment and state-directory options you use for this client.</p>
+    <p>To withdraw an existing private balance, run <code>zkapi withdraw --destination 0xYourPayoutAddress</code> with the matching deployment. Withdrawal settles the active key before preparing the payout.</p>
+    <p class="note">This page does not connect to your wallet or initiate transactions.</p>
+  </main>
+</body>
+</html>

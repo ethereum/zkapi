@@ -4,8 +4,10 @@ description: Note-bound proof authorization, native ETH billing, leases, and rec
 ---
 
 The server verifies Groth16-authorized direct OpenRouter leases, reserves
-nullifiers durably, and returns Schnorr-signed state transitions after usage
-settlement. Billing uses native ETH units of one gwei.
+nullifiers durably with an append-only copy of each request proof, and returns
+Schnorr-signed state transitions after usage settlement. Billing uses native
+ETH units of one gwei. It serves circuit `zkapi-v2-concession-v1` for one
+vault, named by its deployment manifest.
 
 ## Authorize a direct lease
 
@@ -13,7 +15,7 @@ settlement. Billing uses native ETH units of one gwei.
 |---|---|
 | `GET /v2/billing/quote` | Obtain the native ETH billing quote |
 | `POST /v2/openrouter/leases` | Verify an `ApiRequestV2`, reserve its nullifier, and return a spending-limited runtime key (201) |
-| `GET /v2/openrouter/leases/{client_request_id}` | Return non-secret lease timing, usage, and status |
+| `GET /v2/openrouter/leases/{client_request_id}` | Return non-secret lease timing, usage, status, and settlement deadline |
 | `POST /v2/openrouter/leases/{client_request_id}` | Retire the lease using the original authenticated request |
 | `POST /v2/openrouter/leases/{client_request_id}/expire` | Reconcile an unaccepted native lease authorization |
 
@@ -34,6 +36,56 @@ Inference goes directly between the browser and OpenRouter. Issuance returns
 the runtime key once; recovery and lease-status responses never return that
 key. There is no ordinary proxy request endpoint.
 
+Lease status is `provisioning`, `active`, `retiring`, `disabled`, `revoking`,
+`finalized`, `exit_deferred`, `exited_unsigned` or `cancelled`. `finalized`
+means the charge is settled; the signed successor may still be pending, so
+read the nullifier's recovery status for it. `exit_deferred` means an exit
+consumed the request's nullifier on chain before its successor was signed:
+the server signs it only if that exit is defeated, and otherwise ends the
+request unsigned (`exited_unsigned`) one challenge period plus an hour after
+it first found the nullifier consumed. Until the lease is terminal, the status response
+carries `settlement_deadline`, a write-once UNIX time fixed when the lease
+record is created (issuance plus TTL, grace and
+`--openrouter-settlement-deadline-seconds`, default 21600). Lease status
+returns 404 only for a lease the store does not hold (an empty body), or with
+`error_code: "lease_record_unreadable"` (`retriable: false`) for a lease row
+the store holds but cannot decode. That row never heals by itself, and lease
+retirement and a lease retry or `/expire` that need it answer the same. In
+either 404 case, read `GET /v2/nullifiers/{request_nullifier}`, which stays
+authoritative. A finalized lease reports `charge_basis`:
+
+| `charge_basis` | Charge |
+|---|---|
+| `measured` | Measured provider usage |
+| `clamped` | Usage above the lease limit, clamped to the proof's `solvency_bound` before conversion |
+| `worst_case` | `solvency_bound`: usage was still unavailable at the deadline, or could not be settled at all |
+| `unissued` | Zero: the key never reached the client |
+| `operator_conceded` | Zero: the operator reopened a lease cancelled for a corrupt binding and conceded its charge (`zkapi settlement reopen --zero-charge`) |
+
+The signed settlement payload repeats `charge_basis`, adds `settlement_reason`
+(`settlement_deadline`, `unsettleable` or `operator_conceded`) to fallback
+settlements, and keeps the frozen `billing_quote`. Settlement never
+re-validates that quote against the server's current price configuration.
+`cancelled` marks a server record whose binding is corrupt: it is never signed
+until the operator verifies, repairs and reopens the lease; its nullifier stays
+reserved meanwhile. A retry is refused with `409 nullifier_used`, or with
+`409 replay` when the corrupt field is one the retry is compared with (the
+lease row's saved request, if it still parses, or the reservation's request
+ID, payload hash, kind or binding), or with `500 internal_error` when it is
+the lease row's `request_nullifier`, or with `404 lease_record_unreadable`
+(not retriable) when the lease row cannot be decoded, for example a saved
+request that is not a readable request. A pending lease whose row cannot be
+decoded is not settled either, not even at its settlement deadline, and its
+nullifier reads `reserved`, until the operator restores its saved request, or
+repairs by hand another column that cannot be decoded
+([restoring an unreadable pending lease](https://github.com/ethereum/zkapi/blob/main/docs/native-eth-billing.md#restoring-an-unreadable-pending-lease)).
+The server refuses to start unless TTL, grace, settlement deadline and polling
+slack fit within half of the vault's `challengePeriod()`, and unless TTL +
+grace + settlement deadline is at most the manifest's
+`settlement_window_seconds`, which clients wait for. See
+[settlement terminality](https://github.com/ethereum/zkapi/blob/main/docs/native-eth-billing.md#settlement-terminality)
+for the operator review records.
+
 `RequestPublicInputsV2` has these fields, in Groth16 public-input order:
 
 ```text
@@ -45,7 +97,14 @@ anonymous_commitment_x, anonymous_commitment_y
 
 `protocol_version` is `2`. The server recomputes the payload hash and request
 context from the exact payload bytes and request ID, then checks the
-authorization tag. Groth16 verifies the public statement against the selected
+authorization tag. It admits a request only at the exact current root, and
+only while its indexer's root and the vault's `currentRoot()` agreed within
+`--root-max-staleness-seconds` (default 60); otherwise it answers retriable
+`503 root_unavailable`. With `--request-limit-max-usd-micros`, a request whose
+lease budget exceeds that many micro-USD is refused before anything is
+reserved (`400 request_limit_exceeded`). Before issuing or delivering a key,
+it checks that the vault has not consumed the nullifier
+(`409 nullifier_used`). Groth16 verifies the public statement against the selected
 note-bound setup. The proof keeps the note identity, membership path, balance,
 and state-signature witness private.
 
@@ -59,11 +118,44 @@ directly; no public-output hash or witness envelope is part of the proof object.
 |---|---|
 | `GET /v2/requests/{client_request_id}` | Recover a prepared or finalized request |
 | `GET /v2/nullifiers/{nullifier}` | Recover state by nullifier |
+| `GET /v2/nullifiers/{nullifier}/evidence` | The request proof the server reserved at a nullifier, for a wallet's stale-device check |
 
-Both return `RecoveryResponseV2` with `status`, `nullifier_status`, and an
-optional `request_response`. Nullifier statuses are `reserved`, `finalized`,
+Both recovery routes return `RecoveryResponseV2` with `status`,
+`nullifier_status`, and an optional `request_response`. Nullifier statuses are
+`reserved`, `exit_deferred`, `exited_unsigned`, `finalized`,
 `clearance_reserved`, or `unknown`. Unknown requests return
-`status: "not_found"` without a transcript.
+`status: "not_found"` without a transcript. `request_response` is present only
+once the successor is signed (`finalized`). A `reserved` lease request whose
+charge is not settled yet also carries `settlement_deadline`, the time by which
+the server settles it. The exception is a pending lease whose row the server
+cannot decode, such as one whose saved request is unreadable: its recovery
+omits `settlement_deadline`, and it is not settled, not even at that deadline,
+until the operator repairs it.
+
+Once the nullifier is published on chain (consumed or challenged in the vault,
+or named as an escape's nullifier or successor nullifier in a vault event),
+recovery returns the status only and omits `request_response` and
+`settlement_deadline`. The server learns publication from the vault's
+`usedNullifiers` and `challengedNullifiers`, then its indexer's
+`/v1/nullifiers/{N}/published`; when that table cannot be read or no indexer
+is configured, it scans the vault's `EscapeConcessionRecorded` logs from an
+hour before the reservation, over at most 50,000 blocks. When it cannot tell,
+it answers retriable `503 chain_read_unavailable`. Clients treat that answer
+as an unreachable server.
+
+Recovery answers are authoritative only when the server could read its store.
+Only HTTP 200 with `status: "not_found"` and `nullifier_status: "unknown"`
+means unknown, and `POST .../expire` attests non-acceptance only with HTTP 200
+`expired_unaccepted` or `superseded_unaccepted`. A store that cannot be read
+(an I/O error, a corrupt page, a lock held past the busy timeout) answers
+these routes, lease status and retirement, and a lease retry with retriable
+`500 database_error`: retry later, and never read it as unknown, unaccepted or
+not found. An undecodable lease row answers lease status, retirement and a
+lease retry with `404 lease_record_unreadable` (not retriable), and `/expire`
+with `409 lease_pending` while its reservation is held; read
+`GET /v2/nullifiers/{request_nullifier}` instead, which reports it `reserved`. The
+[API specification](https://github.com/ethereum/zkapi/blob/main/docs/api-spec.md)
+has the full contract.
 
 After usage settlement, `request_response` contains:
 
@@ -77,42 +169,115 @@ RequestResponseV2 {
 }
 ```
 
-The next-state signature is a Poseidon-challenged Schnorr signature over
-Baby-JubJub. The client verifies it before committing the next wallet state.
-Preserve the exact prepared request for retries and recovery. A reserved lease
-remains pending until settlement produces a signed response.
+`next_anchor` is always `Poseidon("zkapi.v2c.anchor", request_nullifier)`, and
+the server checks that before it signs. The next-state signature is a
+Poseidon-challenged Schnorr signature over Baby-JubJub. The client checks the
+anchor, the charge against its bound for the state, the commitment update and
+the signature before committing the next wallet state. Preserve the exact
+prepared request for retries and recovery.
+
+**Evidence.** `GET /v2/nullifiers/{nullifier}/evidence` answers
+`200 {public_inputs, proof}` with the earliest request the server reserved at
+the nullifier, `404 {"status":"not_found"}` when it holds none,
+`410 published` once the nullifier is published on chain (it never serves
+evidence of a public nullifier), `503 chain_read_unavailable` when it cannot
+tell (strictly, while an indexer is configured), and `400` for a nullifier
+that is not canonical hex. Before an escape, a wallet asks it for its state's
+successor nullifier: a proof there that verifies means another device holds a
+newer state.
 
 ## Request mutual-close clearance
 
 | Field | Value |
 |---|---|
 | Method + path | `POST /v2/withdraw/clearance` |
-| Request | `{ withdrawal_nullifier: Felt252 }` |
+| Request | `ClearanceRequestV2C { withdrawal_nullifier: Felt252, ownership_proof: { public_inputs: WithdrawalPublicInputsV2C, proof: { backend: "groth16_bn254", proof: base64 } } }` |
 | Response (200) | `ClearanceResponseV2 { status, withdrawal_nullifier, signature: {r_x,r_y,s} }` |
-| Errors | `409 nullifier_used` |
+| Errors | `400 clearance_ownership_required`, `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`, `409 stale_root`, `409 nullifier_used`, `500 internal_error`, `503 capacity_exhausted` |
 
-The client includes this Schnorr signature as a private witness in a
-withdrawal proof with `has_clearance = true`. Escape withdrawals use
-`has_clearance = false` and require no server clearance.
+Both structures refuse unknown fields. `ownership_proof` is a kind-2
+withdrawal proof for the same nullifier. Its `public_inputs` use the JSON
+form of the 16 withdrawal inputs, with `kind: 2`, `next_nullifier: 0`,
+`conceded: 0`, `destination` 20 zero bytes, and `valid_until` no earlier than
+now and at most 3,600 seconds ahead. A kind-2 proof names no destination and
+no successor, and the vault refuses it, so it cannot start an escape.
+
+The server first refuses a nullifier it has already used for a request
+(`409 nullifier_used`). It then requires the proof's nullifier, kind, zero
+fields, validity window and both signing keys to match (`invalid_request`),
+and its protocol, chain and vault (`protocol_mismatch`). The proof's root must
+be the server's current root, one it observed within
+`--clearance-root-window-seconds` (default 3600), the vault's `currentRoot()`,
+or any other root the vault ever held (`knownRoots`), so a proof at the root
+of the wallet's deposit-time path is accepted. Otherwise it answers
+`409 stale_root` with the vault's root in `latest_root`; a failed vault read
+returns retriable `500 internal_error`. Groth16 verification failures return
+`400 invalid_proof`. Ownership-proof verification runs under a small
+concurrency limit; saturation returns retriable `503 capacity_exhausted`. A
+request without `ownership_proof` returns `400 clearance_ownership_required`,
+which is not retriable, and reserves nothing. The server never logs or stores
+ownership proofs.
+
+A successful request reserves the nullifier permanently
+(`clearance_reserved`); repeating it with a valid proof signs the clearance
+again. The clearance signature has no expiry. The client includes it as a
+private witness in a kind-1 close proof. Escapes (kind 0) require no server
+clearance. This circuit has no proof-less clearance:
+`--allow-legacy-clearance` refuses startup, and `/health` always reports
+`clearance_ownership_proof_required: true`.
 
 ## Operations and errors
 
 | Method and path | Purpose |
 |---|---|
-| `GET /health` | Liveness, protocol/deployment identity, current root, and `direct_openrouter` request mode |
-| `GET /v1/attestation` | Protocol/deployment identity, current root, `state_signing_key: {x,y}`, and `clearance_signing_key: {x,y}` |
-| `GET /v1/dashboard/summary` | Read-only deployment and usage summary |
+| `GET /health` | Liveness, protocol and deployment identity, current root, `direct_openrouter` request mode, `testnet_password_required`, `clearance_ownership_proof_required`, and the served statement: `circuit_id`, `setup_id`, `exit_concession` and `settlement_window_seconds` |
+| `GET /v1/attestation` | Protocol and deployment identity, current root, `state_signing_key: {x,y}`, `clearance_signing_key: {x,y}`, and the same statement fields |
+| `GET /v1/dashboard/summary` | Read-only deployment and usage summary, including settlement counts |
+| `GET /v1/dashboard/settlement` | Pending leases with their deadlines, settlements that need operator review, and the counts of `exit_deferred` and `exited_unsigned` leases |
 | `GET /v1/dashboard/recent` | Recent request events |
 | `GET /v1/dashboard/events` | Server-sent dashboard events |
+
+The statement fields of `/health` and `/v1/attestation` are informational:
+clients use their build-pinned values. Dashboard events are recorded at
+settlement and carry no successor fields (no next commitment, anchor or
+blinding delta).
+
+`GET /v1/dashboard/settlement` lists the newest settlement reviews with their
+`reason`: `usage_clamped`, `deadline_worst_case`, `unsettleable_worst_case`,
+`finalized_before_key_deletion`, `binding_corrupt` (a lease cancelled, or
+about to be cancelled, for a corrupt binding) or `binding_reopened` (a lease
+the operator reopened, or whose charge it conceded later). Reviews form a log
+keyed by `review_id`, so one lease can have several; the operator acknowledges
+each by its `review_id` in the database. The dashboard omits `review_id`: read
+it from the `settlement_reviews` table, as in the Docker guide's
+[Monitoring](https://github.com/ethereum/zkapi/blob/main/docker/aws/README.md#monitoring).
 
 The attestation endpoint publishes signer metadata. It does not supply a
 platform-signed enclave attestation. Compare its identity and keys with
 independently pinned deployment values; the endpoint alone is not a trust
-anchor.
+anchor. The server requires both signing seeds and the deployment manifest
+(`--deployment`), refuses the published development keys and a placeholder
+or provisional manifest, and refuses to start unless the derived keys equal
+the vault's immutable `stateSigningKeyX/Y` and `clearanceSigningKeyX/Y`. It
+reads them, after an `eth_chainId` check, over the native billing RPC, runs
+its startup probes (`CONCESSION_ESCAPE_VERSION() == 1`,
+`ROOT_HISTORY_WINDOW() == 86400`, the adapter's circuit and verifying-key
+hashes, and the runtime code hashes of the vault, adapter and Poseidon
+library against the manifest), and records the verified binding in the
+database that `zkapi db init` created. A restart with a matching record starts
+without the RPC, re-verifies in the background, and exits if the vault
+contradicts the record. The dashboard routes are operator surfaces; the
+reference gateway does not expose them.
 
 Protocol errors include `error_code`, `error_message`, and `retriable`, plus
 optional `latest_root`, `server_time_ms`, and `retry_after_seconds`. Examples
 include `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`,
-`409 stale_root`, `409 replay`, and `410 note_expired`. Throttled responses
-also carry `Retry-After` when available. A deployment's reverse proxy defines
-which protocol routes the browser may access.
+`400 clearance_ownership_required`, `400 request_limit_exceeded`, `404 lease_record_unreadable` (not retriable),
+`409 stale_root`, `409 replay`, `409 nullifier_used`, `410 note_expired`,
+`410 published`, `500 database_error` (retriable), `503 capacity_exhausted`,
+`503 root_unavailable` and `503 chain_read_unavailable` (both retriable).
+Throttled responses also carry `Retry-After` when available. A deployment's
+reverse proxy defines which protocol routes the browser may access. The
+reference gateway also limits `POST /v2/*` per network source and answers a
+throttled request itself with `429 gateway_rate_limited` and `Retry-After: 5`;
+that request never reached the server, so retry it unchanged.

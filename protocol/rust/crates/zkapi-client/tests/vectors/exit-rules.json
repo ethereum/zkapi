@@ -1,0 +1,1634 @@
+{
+  "schema": 2,
+  "description": "The shared exit-rule vectors of circuit zkapi-v2-concession-v1, one file for every client: the companion wallet (zkapi-client tests/shared_vectors.rs, and zkapi-companion for the exit kit), the browser SDK (sdk/test/zkapi-exit-rules-vectors.test.mjs, through its pure exit policy and the shipped WebAssembly) and zkapi-clientd (the E5 payout matcher and the exit-proof lifetime) must reproduce every expected value; a change here is a change to all of them. Sections: successor_checks (S1-S6, design §6.1); concession_allowed and ownership_proof (C3, §6.3); near_expiry (C4); constants, e_low, must_initiate_by and unsettled_escape_after (E0, §6.4); classify and decide (E1-E3, with the C5/E2.4 clearance outcomes); payout (E5); lock_releasable (E6); exit_kit (E7). C1 (one lock) and C2 (one bound per state) are tested in each implementation; E4's calldata is the shared withdrawal golden vector (protocol/contracts/test/fixtures/withdrawal-golden.json). Times are UNIX seconds, amounts are billing units. `ZKAPI_WRITE_VECTORS=1 cargo test -p zkapi-client --test shared_vectors` regenerates successor_checks; every other section is hand-written from the design.",
+  "constants": {
+    "call_timeout_seconds": 20,
+    "recovery_budget_seconds": 120,
+    "initiate_margin_seconds": 43200,
+    "mutual_cutoff_seconds": 3600,
+    "settlement_grace_seconds": 900,
+    "near_expiry_margin_seconds": 4500,
+    "unknown_reading_resolves_after_seconds": 1200,
+    "default_unsettled_escape_after_seconds": 43200,
+    "min_unsettled_escape_after_seconds": 3600,
+    "max_unsettled_escape_after_seconds": 604800,
+    "lock_release_margin_seconds": 900,
+    "exit_proof_validity_seconds": 10800,
+    "ownership_proof_validity_seconds": 3600,
+    "ownership_resend_margin_seconds": 5
+  },
+  "e_low": [
+    {
+      "expiry_ts": 1000000,
+      "pinned_rpc": null,
+      "exit_rpc": null,
+      "expected": 1000000
+    },
+    {
+      "expiry_ts": 1000000,
+      "pinned_rpc": 1100000,
+      "exit_rpc": null,
+      "expected": 1000000
+    },
+    {
+      "expiry_ts": 1000000,
+      "pinned_rpc": 1100000,
+      "exit_rpc": 1050000,
+      "expected": 1050000
+    },
+    {
+      "expiry_ts": 1000000,
+      "pinned_rpc": 1100000,
+      "exit_rpc": 990000,
+      "expected": 1000000
+    },
+    {
+      "expiry_ts": 1000000,
+      "pinned_rpc": 900000,
+      "exit_rpc": 1200000,
+      "expected": 1000000
+    }
+  ],
+  "must_initiate_by": [
+    {
+      "e_low": 1000000,
+      "expected": 956800
+    },
+    {
+      "e_low": 40000,
+      "expected": 0
+    }
+  ],
+  "near_expiry": [
+    {
+      "now": 973595,
+      "settlement_window": 21905,
+      "must_initiate_by": 1000000,
+      "expected": false
+    },
+    {
+      "now": 973596,
+      "settlement_window": 21905,
+      "must_initiate_by": 1000000,
+      "expected": true
+    }
+  ],
+  "unsettled_escape_after": [
+    {
+      "configured": null,
+      "expected": 43200
+    },
+    {
+      "configured": 100,
+      "expected": 3600
+    },
+    {
+      "configured": 7200,
+      "expected": 7200
+    },
+    {
+      "configured": 10000000,
+      "expected": 604800
+    }
+  ],
+  "classify": [
+    {
+      "record": {
+        "disposition": "pending",
+        "request_time": 1000,
+        "created_at": 1000
+      },
+      "expected": "unresolved"
+    },
+    {
+      "record": {
+        "disposition": "pending",
+        "request_time": 1000,
+        "created_at": 1000,
+        "reading": {
+          "status": "unknown",
+          "observed_at": 2199
+        }
+      },
+      "expected": "unresolved"
+    },
+    {
+      "record": {
+        "disposition": "pending",
+        "request_time": 1000,
+        "created_at": 1000,
+        "reading": {
+          "status": "unknown",
+          "observed_at": 2200
+        }
+      },
+      "expected": "resolved_unreserved"
+    },
+    {
+      "record": {
+        "disposition": "evicted",
+        "request_time": 1000,
+        "created_at": 1000,
+        "reading": {
+          "status": "unknown",
+          "observed_at": 6000
+        }
+      },
+      "expected": "resolved_unreserved"
+    },
+    {
+      "record": {
+        "disposition": "abandoned_for_escape",
+        "request_time": 1000,
+        "created_at": 1000,
+        "reading": {
+          "status": "reserved",
+          "observed_at": 9000
+        }
+      },
+      "expected": "unresolved"
+    },
+    {
+      "record": {
+        "disposition": "pending",
+        "request_time": 1000,
+        "created_at": 1000,
+        "reading": {
+          "status": "finalized",
+          "observed_at": 9000
+        }
+      },
+      "expected": "unresolved"
+    },
+    {
+      "record": {
+        "disposition": "pending",
+        "request_time": 1000,
+        "created_at": 1000,
+        "reading": {
+          "status": "exit_deferred",
+          "observed_at": 9000
+        }
+      },
+      "expected": "unresolved"
+    },
+    {
+      "record": {
+        "disposition": "pending",
+        "request_time": 1000,
+        "created_at": 1000,
+        "reading": {
+          "status": "unavailable",
+          "observed_at": 9000
+        }
+      },
+      "expected": "unresolved"
+    },
+    {
+      "record": {
+        "disposition": "pending",
+        "request_time": 1000,
+        "created_at": 1000,
+        "reading": {
+          "status": "clearance_reserved",
+          "observed_at": 1001
+        }
+      },
+      "expected": "resolved_unreserved"
+    },
+    {
+      "record": {
+        "disposition": "discarded_stale_root",
+        "request_time": 1000,
+        "created_at": 1000
+      },
+      "expected": "resolved_unreserved"
+    },
+    {
+      "record": {
+        "disposition": "discarded_expired_unaccepted",
+        "request_time": 1000,
+        "created_at": 1000
+      },
+      "expected": "resolved_unreserved"
+    },
+    {
+      "record": {
+        "disposition": "discarded_clearance_reserved",
+        "request_time": 1000,
+        "created_at": 1000
+      },
+      "expected": "resolved_unreserved"
+    },
+    {
+      "record": {
+        "disposition": "installed",
+        "request_time": 1000,
+        "created_at": 1000
+      },
+      "expected": "terminal"
+    },
+    {
+      "record": {
+        "disposition": "superseded",
+        "request_time": 1000,
+        "created_at": 1000
+      },
+      "expected": "terminal"
+    },
+    {
+      "record": {
+        "disposition": "late_successor",
+        "request_time": 1000,
+        "created_at": 1000
+      },
+      "expected": "terminal"
+    },
+    {
+      "record": {
+        "disposition": "invalid_successor",
+        "request_time": 1000,
+        "created_at": 1000
+      },
+      "expected": "unresolved"
+    }
+  ],
+  "decide": [
+    {
+      "name": "E2 nothing released: mutual close",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 0,
+        "records": []
+      },
+      "expected": {
+        "action": "mutual"
+      }
+    },
+    {
+      "name": "E2 every release resolved: mutual close",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "discarded_stale_root",
+            "request_time": 990000,
+            "created_at": 990000
+          }
+        ]
+      },
+      "expected": {
+        "action": "mutual"
+      }
+    },
+    {
+      "name": "E2 within an hour of must_initiate_by: escape conceding nothing",
+      "facts": {
+        "now": 1996400,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 0,
+        "records": []
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 0,
+        "reason": "mutual_cutoff"
+      }
+    },
+    {
+      "name": "E2 clearance refused or unreachable: escape conceding nothing",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "discarded_stale_root",
+            "request_time": 990000,
+            "created_at": 990000
+          }
+        ],
+        "mutual_outcome": "refused_or_unreachable"
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 0,
+        "reason": "mutual_refused"
+      }
+    },
+    {
+      "name": "E2 nullifier_used: E3 waits from the newest release",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "discarded_stale_root",
+            "request_time": 990000,
+            "created_at": 990000
+          }
+        ],
+        "mutual_outcome": "nullifier_used"
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1012805
+      }
+    },
+    {
+      "name": "E2 nullifier_used at T: escape conceding the bound",
+      "facts": {
+        "now": 1012805,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "discarded_stale_root",
+            "request_time": 990000,
+            "created_at": 990000
+          }
+        ],
+        "mutual_outcome": "nullifier_used"
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 1000,
+        "reason": "at_deadline"
+      }
+    },
+    {
+      "name": "E2 nullifier_used with nothing released: escape at once conceding nothing",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 0,
+        "records": [],
+        "mutual_outcome": "nullifier_used"
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 0,
+        "reason": "at_deadline"
+      }
+    },
+    {
+      "name": "E2 nullifier_used with no record of the release: escape at once conceding the bound",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [],
+        "mutual_outcome": "nullifier_used"
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 1000,
+        "reason": "at_deadline"
+      }
+    },
+    {
+      "name": "E3 pending request: wait for created_at + W + 900",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ]
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1021805
+      }
+    },
+    {
+      "name": "E3 reported settlement deadline shortens the wait",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ],
+        "settlement_deadline_reported": 1005000
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1005900
+      }
+    },
+    {
+      "name": "E3 at T: escape conceding the bound",
+      "facts": {
+        "now": 1021805,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ]
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 1000,
+        "reason": "at_deadline"
+      }
+    },
+    {
+      "name": "E3 T is capped by the escape-after knob",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 86400,
+        "unsettled_escape_after": 3600,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ]
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1002600
+      }
+    },
+    {
+      "name": "E3 T is capped by must_initiate_by",
+      "facts": {
+        "now": 1005000,
+        "must_initiate_by": 1010000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ]
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1010000
+      }
+    },
+    {
+      "name": "E3 forced early exit concedes nothing by default",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ],
+        "early_exit": "concede_nothing"
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 0,
+        "reason": "forced_early"
+      }
+    },
+    {
+      "name": "E3 forced early exit may concede the bound",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ],
+        "early_exit": "concede_bound"
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 1000,
+        "reason": "forced_early"
+      }
+    },
+    {
+      "name": "E3 lost epsilon concedes the reported charge at once",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ],
+        "lost_epsilon_charge": 400
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 400,
+        "reason": "lost_epsilon"
+      }
+    },
+    {
+      "name": "E3 lost epsilon concedes at most the bound",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ],
+        "lost_epsilon_charge": 5000
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 1000,
+        "reason": "lost_epsilon"
+      }
+    },
+    {
+      "name": "E3 the newest unresolved release sets T",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "discarded_stale_root",
+            "request_time": 999500,
+            "created_at": 999500
+          },
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          },
+          {
+            "disposition": "evicted",
+            "request_time": 998000,
+            "created_at": 998000
+          }
+        ]
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1021805
+      }
+    },
+    {
+      "name": "E3 an invalid successor is handled like a withheld one",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "invalid_successor",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ]
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1021805
+      }
+    },
+    {
+      "name": "E1 resolved an old unknown reading: fresh again",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 990000,
+            "created_at": 990000,
+            "reading": {
+              "status": "unknown",
+              "observed_at": 995000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "action": "mutual"
+      }
+    },
+    {
+      "name": "Terminal records do not block a mutual close",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "late_successor",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ]
+      },
+      "expected": {
+        "action": "mutual"
+      }
+    },
+    {
+      "name": "E2 a zero bound is fresh whatever the records say: mutual close",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 0,
+        "records": [
+          {
+            "disposition": "pending",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ]
+      },
+      "expected": {
+        "action": "mutual"
+      }
+    },
+    {
+      "name": "E3 lost epsilon is decided at once, also where the records call the state fresh",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [],
+        "lost_epsilon_charge": 400
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 400,
+        "reason": "lost_epsilon"
+      }
+    },
+    {
+      "name": "E2 within an hour of must_initiate_by the cutoff comes before a claimed reservation: escape conceding nothing",
+      "facts": {
+        "now": 1996400,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "discarded_stale_root",
+            "request_time": 1990000,
+            "created_at": 1990000
+          }
+        ],
+        "mutual_outcome": "nullifier_used"
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 0,
+        "reason": "mutual_cutoff"
+      }
+    },
+    {
+      "name": "E2 nullifier_used waits from the newest release at the state, a terminal one too",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "late_successor",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ],
+        "mutual_outcome": "nullifier_used"
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1021805
+      }
+    }
+  ],
+  "lock_releasable": [
+    {
+      "name": "no exit proof released: the user cancels",
+      "released": [],
+      "user_cancels": true,
+      "note": "active",
+      "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": false,
+      "expected": true
+    },
+    {
+      "name": "no exit proof released and no cancel: held",
+      "released": [],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "only an ownership proof released: the user cancels",
+      "released": [
+        {
+          "kind": 2,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": true,
+      "note": "active",
+      "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": false,
+      "expected": true
+    },
+    {
+      "name": "a released escape outlives a cancel",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        }
+      ],
+      "user_cancels": true,
+      "note": "active",
+      "finalized_block_timestamp": null,
+      "now": 1000,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "the finalized block is not past valid_until + 900",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 1900,
+      "now": 1901,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "dead: the finalized block and the local clock are past valid_until + 900",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 1901,
+      "now": 1901,
+      "status_trusted": false,
+      "expected": true
+    },
+    {
+      "name": "the finalized block is past valid_until + 900 but the local clock is not: an RPC never releases a live proof",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 1901,
+      "now": 1900,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "the same with a trusted reading: an Active release always waits for the local clock",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 999999,
+      "now": 1900,
+      "status_trusted": true,
+      "expected": false
+    },
+    {
+      "name": "a pending exit keeps the lock",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        }
+      ],
+      "user_cancels": false,
+      "note": "pending_withdrawal",
+      "finalized_block_timestamp": 99999,
+      "now": 99999,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "every released proof must be dead",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        },
+        {
+          "kind": 1,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 2000,
+      "now": 2000,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "every released proof is dead",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        },
+        {
+          "kind": 1,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 5901,
+      "now": 5901,
+      "status_trusted": false,
+      "expected": true
+    },
+    {
+      "name": "Closed through the exit RPC (trusted) releases a live lock",
+      "released": [
+        {
+          "kind": 1,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "closed",
+      "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": true,
+      "expected": true
+    },
+    {
+      "name": "an untrusted Closed reading waits for the local clock",
+      "released": [
+        {
+          "kind": 1,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "closed",
+      "finalized_block_timestamp": null,
+      "now": 1000,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "an untrusted Closed reading after the local clock passes",
+      "released": [
+        {
+          "kind": 1,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "closed",
+      "finalized_block_timestamp": null,
+      "now": 5901,
+      "status_trusted": false,
+      "expected": true
+    },
+    {
+      "name": "Closed with only an ownership proof released",
+      "released": [
+        {
+          "kind": 2,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "closed",
+      "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": false,
+      "expected": true
+    }
+  ],
+  "payout": [
+    {
+      "paid": 700,
+      "state_balance": 1000,
+      "conceded_at_init": 100,
+      "raises": [
+        200,
+        300
+      ],
+      "bound_at_state": 400,
+      "expected": {
+        "result": "matches",
+        "conceded_final": 300,
+        "concession_exceeded_bound": false
+      }
+    },
+    {
+      "paid": 900,
+      "state_balance": 1000,
+      "conceded_at_init": 100,
+      "raises": [
+        300
+      ],
+      "bound_at_state": 400,
+      "expected": {
+        "result": "mismatch"
+      }
+    },
+    {
+      "paid": 900,
+      "state_balance": 1000,
+      "conceded_at_init": 100,
+      "raises": [],
+      "bound_at_state": 400,
+      "expected": {
+        "result": "matches",
+        "conceded_final": 100,
+        "concession_exceeded_bound": false
+      }
+    },
+    {
+      "paid": 900,
+      "state_balance": 1000,
+      "conceded_at_init": 100,
+      "raises": [
+        50
+      ],
+      "bound_at_state": null,
+      "expected": {
+        "result": "matches",
+        "conceded_final": 100,
+        "concession_exceeded_bound": false
+      }
+    },
+    {
+      "paid": 500,
+      "state_balance": 1000,
+      "conceded_at_init": 0,
+      "raises": [
+        500
+      ],
+      "bound_at_state": 400,
+      "expected": {
+        "result": "matches",
+        "conceded_final": 500,
+        "concession_exceeded_bound": true
+      }
+    },
+    {
+      "paid": 600,
+      "state_balance": 1000,
+      "conceded_at_init": 100,
+      "raises": [],
+      "bound_at_state": null,
+      "expected": {
+        "result": "mismatch"
+      }
+    },
+    {
+      "paid": 0,
+      "state_balance": 1000,
+      "conceded_at_init": 1001,
+      "raises": [],
+      "bound_at_state": null,
+      "expected": {
+        "result": "mismatch"
+      }
+    }
+  ],
+  "concession_allowed": [
+    {
+      "conceded": 0,
+      "bound_at_state": 0,
+      "expected": true
+    },
+    {
+      "conceded": 1000,
+      "bound_at_state": 1000,
+      "expected": true
+    },
+    {
+      "conceded": 1001,
+      "bound_at_state": 1000,
+      "expected": false
+    }
+  ],
+  "ownership_proof": [
+    {
+      "name": "no ownership proof of this state was sent: make one",
+      "newest_valid_until": null,
+      "now": 1000,
+      "expected": "new"
+    },
+    {
+      "name": "the state's proof is live: send it again, also under a new lock",
+      "newest_valid_until": 1006,
+      "now": 1000,
+      "expected": "resend"
+    },
+    {
+      "name": "within the resend margin, still accepted: none until it expires",
+      "newest_valid_until": 1005,
+      "now": 1000,
+      "expected": "wait"
+    },
+    {
+      "name": "valid until now: none yet",
+      "newest_valid_until": 1000,
+      "now": 1000,
+      "expected": "wait"
+    },
+    {
+      "name": "expired: one more",
+      "newest_valid_until": 999,
+      "now": 1000,
+      "expected": "new"
+    }
+  ],
+  "successor_checks": {
+    "description": "S1-S6 (design §6.1) for circuit zkapi-v2-concession-v1. Load `state` and `journal` (a case's own `journal` replaces it), deliver each `response` for the journal's request, and expect `install`, `invalid_successor` (a correctly signed successor failing S3, S4 or S5, archived and treated as withheld) or `reject` (S1, S2 or S6 fails; nothing changes). For `install`, `installed` is the resulting balance, anchor, prev_anchor, blinding and bound_at_state.",
+    "state_signing_key": {
+      "x": "0x2ee22e021c822b4ac78593468652a9ffa0d1fc3d46a7d257a1a26990be32b504",
+      "y": "0x1aad05d53f9e1f38373cd8a397adf0de5adaeb233d2ce4c266b14232a5cc57ca"
+    },
+    "state": {
+      "protocol_version": 2,
+      "chain_id": 11155111,
+      "contract_address": "0x49fa19f9bdece7a48ebc7749fd69ad40f577590f",
+      "note_id": 9,
+      "secret_s": "0xabc",
+      "deposit_amount": 3000000,
+      "expiry_ts": 4000000000,
+      "current_balance": 3000000,
+      "balance_blinding": "0x442607ee3230a19bb84cc71b6bf4179c95a20d0a70e3382d76a036254620efd",
+      "current_commitment_x": "0x15e14d4c35f9258a473fecfef1788173407cbdfe16c853010443deffd5c8a99d",
+      "current_commitment_y": "0x213c67fb2c515206424399428809e67672d58e5e2314491e08fd9a93b248a2f3",
+      "current_anchor": "0x1",
+      "prev_anchor": null,
+      "is_genesis": true,
+      "state_signature": null,
+      "bound_at_state": 1000,
+      "state_seq": 0
+    },
+    "journal": {
+      "exists": true,
+      "client_request_id": "00000000-0000-4000-8000-000000000001",
+      "nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+      "payload_hash": "0xda3802c717259feabf86c165d9dfb2869ca5a3966bbdf1012fbfc0c54d2c036",
+      "user_rerandomization": "0x3ac2038765f43031253122cceae8b64c1cc9dc57a7ac41338d5da470a874cd",
+      "created_at_ms": 1800000000000,
+      "prepared_request": {
+        "client_request_id": "00000000-0000-4000-8000-000000000001",
+        "payload": "{}",
+        "payload_hash": "0xda3802c717259feabf86c165d9dfb2869ca5a3966bbdf1012fbfc0c54d2c036",
+        "public_inputs": {
+          "protocol_version": 2,
+          "chain_id": 11155111,
+          "contract_address": "0x49fa19f9bdece7a48ebc7749fd69ad40f577590f",
+          "active_root": "0x7",
+          "state_signing_key_x": "0x2ee22e021c822b4ac78593468652a9ffa0d1fc3d46a7d257a1a26990be32b504",
+          "state_signing_key_y": "0x1aad05d53f9e1f38373cd8a397adf0de5adaeb233d2ce4c266b14232a5cc57ca",
+          "request_time": 1800000000,
+          "solvency_bound": 1000,
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "authorization_tag": "0x1e54dee5eec006a0f7b89c0457b95c6a0dc48d556943e7a00cf1d65165f09007",
+          "anonymous_commitment_x": "0x285b244bfdda4ffa56f0a577da4fe3cdca236945ca9970effa877daa40bd064c",
+          "anonymous_commitment_y": "0x27e8cd6cc4aa975c4ebabbbdd5c52d09341f7e339ac72df5c2143cf176203985"
+        },
+        "proof": {
+          "backend": "groth16_bn254",
+          "proof": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        }
+      }
+    },
+    "cases": [
+      {
+        "name": "S3 the journaled request's bound is not bound_at_state: invalid_successor",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x24c05483c547153f5e97cf9cdf3a5497155403701627d8c7c54a308a669d938f",
+            "y": "0x11f72ba024814a890572515bb56f83a0fb606ffc2114c21db3b522652bae63fd"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0x1fcbeb7b8848f85588f7624b28ba8f35b0a2e2ae5922d608152fe7ccda2a303",
+          "next_state_signature": {
+            "r_x": "0x196c31ca0a8b4c102f817107598400af0077a16527f1f5719f6e4ce1a83b1010",
+            "r_y": "0x2566e14285c7cbe40ff27f181766479bc6047abf46d85ae32c9ce6b208eec60e",
+            "s": "0x2f04fd828f89f905e4e24bffd52030620228c9731a0ce54bbcea05b6e708423"
+          }
+        },
+        "expected": "invalid_successor",
+        "journal": {
+          "exists": true,
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "payload_hash": "0xda3802c717259feabf86c165d9dfb2869ca5a3966bbdf1012fbfc0c54d2c036",
+          "user_rerandomization": "0x3ac2038765f43031253122cceae8b64c1cc9dc57a7ac41338d5da470a874cd",
+          "created_at_ms": 1800000000000,
+          "prepared_request": {
+            "client_request_id": "00000000-0000-4000-8000-000000000001",
+            "payload": "{}",
+            "payload_hash": "0xda3802c717259feabf86c165d9dfb2869ca5a3966bbdf1012fbfc0c54d2c036",
+            "public_inputs": {
+              "protocol_version": 2,
+              "chain_id": 11155111,
+              "contract_address": "0x49fa19f9bdece7a48ebc7749fd69ad40f577590f",
+              "active_root": "0x7",
+              "state_signing_key_x": "0x2ee22e021c822b4ac78593468652a9ffa0d1fc3d46a7d257a1a26990be32b504",
+              "state_signing_key_y": "0x1aad05d53f9e1f38373cd8a397adf0de5adaeb233d2ce4c266b14232a5cc57ca",
+              "request_time": 1800000000,
+              "solvency_bound": 900,
+              "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+              "authorization_tag": "0x1e54dee5eec006a0f7b89c0457b95c6a0dc48d556943e7a00cf1d65165f09007",
+              "anonymous_commitment_x": "0x285b244bfdda4ffa56f0a577da4fe3cdca236945ca9970effa877daa40bd064c",
+              "anonymous_commitment_y": "0x27e8cd6cc4aa975c4ebabbbdd5c52d09341f7e339ac72df5c2143cf176203985"
+            },
+            "proof": {
+              "backend": "groth16_bn254",
+              "proof": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+            }
+          }
+        }
+      },
+      {
+        "name": "S1-S6 hold: install",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x27e2e9a03715f58891997d7ace2b13d834e5c0f6d17507173e47816537f4476c",
+            "y": "0x244fda4a62d25446105f971ea37ce919f2d74d1e82eb891d227fa3c1a1eaf477"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0xf3a68f2562f5df5ec22c6be4cd68e57defc73e3681f8472691eaceb38fd931",
+          "next_state_signature": {
+            "r_x": "0x55d887104090ce3a6844c721550a517ef44b00586537b76f98a47ed0950511f",
+            "r_y": "0x1265cd3a1911e2c7087528de5fda93f00e1e7abeb9cfee43332627c4b64039b8",
+            "s": "0x563520a12a48182409c6b3e9ed52a12b8d998c1d22ad30b59ff14a9392a7f12"
+          }
+        },
+        "expected": "install",
+        "installed": {
+          "balance_blinding": "0x570c9118febf4294b6c2a00687793159366b1eb3537d80b31894bd5789a5cfb",
+          "bound_at_state": "0",
+          "current_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "current_balance": "2999600",
+          "prev_anchor": "0x1"
+        }
+      },
+      {
+        "name": "charge equal to the bound: install",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 1000,
+          "next_commitment": {
+            "x": "0x1615b69d98fc2e6cdef67a321ee01be09d521ada8f07ed88b662313d4d57b98d",
+            "y": "0x170171fdea79c4cfd8914a6a5254f8e35670633124f005424c67157777805361"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0x18f17b5560190ecf809dcc0b8bcd3275cb6b2c7b6a3509b60daca1f95a683cd",
+          "next_state_signature": {
+            "r_x": "0x2b1783a01f42d37153a4bfdf026e2c249f59f57400f0ddf4b139c981b00e8868",
+            "r_y": "0x1f25b0c01f329b40672c229188393ef2074c87ef2282527b01c1627a6cf85d9b",
+            "s": "0x79af32c61ce86b155aa830b5f4b4bf2a981f0036eab4db59dc2b86c31ecf0"
+          }
+        },
+        "expected": "install",
+        "installed": {
+          "balance_blinding": "0x60c3a37c08a8f36e4b3da553c66fd57722d9d74b559305f6bd22b265ab10797",
+          "bound_at_state": "0",
+          "current_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "current_balance": "2999000",
+          "prev_anchor": "0x1"
+        }
+      },
+      {
+        "name": "S1 another request id: reject",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000002",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x2ba10cdbfa4507d3afe5048cc781e2fdbe98dccbd8b28a5df60de397017ac52c",
+            "y": "0x278ab74744ae49a57e5629bf317f37934ab7e11998603e6e7e3ac4b379bce9a3"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0x286af86270d504e7d11cb22be201922a420398ba996288226e7f8acb92e8e4a",
+          "next_state_signature": {
+            "r_x": "0x246994381e0277b6e467c6fe13a28650937260cb21ae797f90a16e96d4ccc0b2",
+            "r_y": "0x25ff1b180f82df34fd82671e5e880ec4fd79016bc92015f626af4da0604e5c40",
+            "s": "0x19777d276e5439f5942ac26d2c39573d36cf0d0ef5e3c6e85aa535df79405b1"
+          }
+        },
+        "expected": "reject"
+      },
+      {
+        "name": "S1 another nullifier: reject",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x5",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x2bab987adb62b8ca75f78172d1d3a6d7151fc89d8da7b1f273842baa6c554173",
+            "y": "0x24f37ec4c7470a48b03369749a6e315cbeebb4347a35a54e677f051f051ce04b"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0x39f9de672cf98da18e654973c8f40ea3967f222e1e148e0b6e60feac7b6f25a",
+          "next_state_signature": {
+            "r_x": "0x281e45e068c49e3206e042b0b17b1c4b5bfe36f5ea1e818af3da9b40500de2bc",
+            "r_y": "0x15d9febac65c6a8753ba9e8af6a26fce2db8b77237881ab747cad24bddd21f6c",
+            "s": "0x1a6c77974f4334acaee338e08f12b543bf81bcd09d467f2f0cdb6f9715de69"
+          }
+        },
+        "expected": "reject"
+      },
+      {
+        "name": "S2 payload hash mismatch: reject",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":false}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x917372ab8f0851cf972a4c60b21fa48ce33bfa11089762da474f95398c7d74",
+            "y": "0x2d8453f4948a3fc231af925bf8bf3064123e8b75a5052730b2a9f07595629495"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0x2c19242c137a6a8f4793c6d431ce552716664a2207220751ff179958bc24668",
+          "next_state_signature": {
+            "r_x": "0x2fe3062a94d968c65d5a6eaba18d552b8b6cd389fa8729ffecf8ebb6c8fa7ac7",
+            "r_y": "0x2351b8f1bbab6069b7ab60491d286979685aa86a372aa6c276779aa88a406acd",
+            "s": "0x3c5168f3ee985073ab4ac6e5412d83e15d25bd85964f252ed03f92ed7f57f53"
+          }
+        },
+        "expected": "reject"
+      },
+      {
+        "name": "S3 charge above bound_at_state: invalid_successor",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 1001,
+          "next_commitment": {
+            "x": "0x25d25729ea68709c9b4c5c23ffcdac56dc1bd127bc5247f77805338fb9ac5fe3",
+            "y": "0x2271574077ee3edf8af45ae909c8e74f00f3ca91bce4c7ba4b56cfc17817abee"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0x43b378a44c4d77601f224e19f0ca06c8d2909eb16467de7fea27db0970ac7e",
+          "next_state_signature": {
+            "r_x": "0x2202f9bfdef4fb7296e2104e5d1af19c161c7655bd055e0d986168f163d1327c",
+            "r_y": "0x21ff8a1700f468c15dec3f930a9e2156928a72a03783c4c9c971ddf382088483",
+            "s": "0x1c0ed5bbad9158a464bf200b87ab24d32f3b1ca0af6ad1038370cd1010527c0"
+          }
+        },
+        "expected": "invalid_successor"
+      },
+      {
+        "name": "S4 anchor 0: invalid_successor",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x1213570b5a04e7d4000cc7f6e4a10f1b8eb3ab5ce3fe9a96d4e385f3413d0dc0",
+            "y": "0xa8a7664341c7b55773d2ad42bb619b0f0751525d14f33f7747a7879984e580b"
+          },
+          "next_anchor": "0x0",
+          "blind_delta_srv": "0x2d7115cd5ddfb8a6584f87d1a335f4993d5d8aa5623d1cc09cdb5cb038ae72c",
+          "next_state_signature": {
+            "r_x": "0x22257f59d4d028738fa1ce639f87a1a26b07908e64cbca383ea8588dc28942bc",
+            "r_y": "0x1a3db2d8cdfea2ce36b00bcc36b41c889992255ff2bb95b35ea09fe8e416f859",
+            "s": "0x52618c27b83fffc43fae3d5d9d0b5dc14229e8f2062a6a7c0d1bd8e424c80b0"
+          }
+        },
+        "expected": "invalid_successor"
+      },
+      {
+        "name": "S4 born-spent anchor 1: invalid_successor",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x15844c9850a1ed56f1181f8eef0161f5bff921a29dc9901028e7ef13a6d0db27",
+            "y": "0xa5dac821153300fbca9f035fe17f97939c130c36e597369cdcca731c558013d"
+          },
+          "next_anchor": "0x1",
+          "blind_delta_srv": "0x2b93f86b14d24dfcc119d2c41a043e636ec0f4f3701d569cebb94d854b40882",
+          "next_state_signature": {
+            "r_x": "0x2235635ad95ef9e3c5571e9f356ff8441c951329006daa79ee39f1f78ad2474",
+            "r_y": "0x72dd01d249e9e234f0e98694b973ccac16bd7c824f8bef78069fa2502cd69b7",
+            "s": "0x5f738cc79d558cfe90c08dea4efe0e971f5a88be874584c12d178949d6efaf7"
+          }
+        },
+        "expected": "invalid_successor"
+      },
+      {
+        "name": "S4 reused anchor: invalid_successor",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x819018aa865baee6912ebc9771d393dd7def6b757d4158e2a901fe3ef7e9726",
+            "y": "0x1eef663633479f6b9ee6b0e3cccd92426c48738243fd788af4cb5627c47e59ea"
+          },
+          "next_anchor": "0x1",
+          "blind_delta_srv": "0x2f76391ff0fa8fe1355f3e1263fa778d2c508774b81bb0ee6b28fb112b8132e",
+          "next_state_signature": {
+            "r_x": "0xa6b3a3e4ebe4c07a908208ee175a5aac335a1b3850ddcdbf9ef1f31485df4d2",
+            "r_y": "0x26fd6826ce2c60a14cdd24dd2b2e64ef3b8c9089aa70993bb8c4d6f04c51838d",
+            "s": "0xd346d9358bc1ed597d7c8b26ffb44aff88da6a21a7d8fe2849682c7d795810"
+          }
+        },
+        "expected": "invalid_successor"
+      },
+      {
+        "name": "S4 random anchor: invalid_successor",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x903dde296c88b70bd187b615d875ea85a71f1ed80b5cb4678213bda1388c490",
+            "y": "0x29a178987b96dc9292ee4aa54448da4ea27d525ca98451de5fbd56b18be512bd"
+          },
+          "next_anchor": "0xdeadbeef",
+          "blind_delta_srv": "0x27efa1f87334792a7990f81df6b4915a618d4fa0aa5985e21cd092179854354",
+          "next_state_signature": {
+            "r_x": "0x2d39a12de08fe91175cd897351f7f3e5ef833d4d350b20c8756a5cd63353a95f",
+            "r_y": "0xdcae8f4c14fcf4ccc2f725120ee6992176d86cc241138cc03659a03c407a0e",
+            "s": "0x3ac70de67143cc042590d78c9464037f069790136f0c868551529f90298e69f"
+          }
+        },
+        "expected": "invalid_successor"
+      },
+      {
+        "name": "S4 another note's derived anchor: invalid_successor",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x624fd77bc6e84f1402fab888e3e76b453d571537c012a19e8254fa8ff36df18",
+            "y": "0x152be825ee3ef6974389e2ea5a6618199f7a1d8468d4b589829d3af00408e5f2"
+          },
+          "next_anchor": "0x15b01d368a8ad436714b84e9863931a3adedf1165837fb1c3e87ab2dab9d4030",
+          "blind_delta_srv": "0x498e2656a239b499e00df5c24a474f646b97e3170f75df197ab112875f4ccc2",
+          "next_state_signature": {
+            "r_x": "0x255da919be81821039c3340d3c7299d5d6b8ed3e273c99d0c8e5670a88b45922",
+            "r_y": "0xee0c44ccb283fcf2690f72c8cda1a228e4facacf92e551368477dad119949f0",
+            "s": "0x53556edf0f23e26fa2dff0b0835e6d786d21e89cf711cadc109f0964991b9a9"
+          }
+        },
+        "expected": "invalid_successor"
+      },
+      {
+        "name": "S5 phantom commitment: invalid_successor",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x29f34232beda8c239a47c172278184e1f78cf74555d5efa64627a985e06d2ced",
+            "y": "0x2ee6ac14556ff672e43a1f1d8d88a3e85eebabce97870d68606c634c0650eb8b"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0x458355af172b48ab9343ee57b9538e45c7d241a55a3a55036b7e42fb3d67b4d",
+          "next_state_signature": {
+            "r_x": "0x276c754fade2986c09c45af2e448a0393e565d758131e5886c4d19fd9974762d",
+            "r_y": "0x1707fc285e6f66600764130c82c7cdd34c4c3549fc84b4e5ce7e75d03cab526",
+            "s": "0x509be88750d91e76e484789f966abe07890fd781eee8d3e52b728d3cd326947"
+          }
+        },
+        "expected": "invalid_successor"
+      },
+      {
+        "name": "S6 signed by another key: reject",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x184932d9a274c9377a4afd40ab5b480fa7d6d43c981b8e072a1dd0f0af801197",
+            "y": "0x234d16e1a20dfcd52f23c8c4e5f2e999e27e2888fc4bbf411e7fc6137b5ff68c"
+          },
+          "next_anchor": "0x2439da4779b312e9756e90785b364d506d74b3aa530cdeb3e4261f6ac23ae4d8",
+          "blind_delta_srv": "0x5b4ac88e263a2b2e797525ed0442c464c3bae75d66d50e3936c19369ebf6a61",
+          "next_state_signature": {
+            "r_x": "0xd3cd92c02fe4476031b1ec8432e86b2d8e777df7356d5a12b86901db6135cfc",
+            "r_y": "0x2ddf7735aca38264817c4bb2ab73cac0478a0f63ff2ce4657d41e761c5a2ebd6",
+            "s": "0x1004c26500ac925bfff1ce52c23f3787b878985f186cecb30fc1383d04ad782"
+          }
+        },
+        "expected": "reject"
+      },
+      {
+        "name": "S6 checked before S4: an unsigned non-derived anchor is rejected",
+        "response": {
+          "status": "ok",
+          "client_request_id": "00000000-0000-4000-8000-000000000001",
+          "request_nullifier": "0x271df8e891159e2660897b815a078d179feb0a3a3e2f6839bd9ac5b724e5bcc3",
+          "response_code": 200,
+          "response_payload": "{\"ok\":true}",
+          "response_hash": "0x18af8ac6d030a05b12b5d17de4731d8c3084df0edcf8e4dd09395bf22cc07bee",
+          "charge_applied": 400,
+          "next_commitment": {
+            "x": "0x18da414f08462d8fb544fea75bcf43ba51030be55c67598b5ebcf58b26991cca",
+            "y": "0x1fbb2055aac1aed9bc40c89a69d7153f695342c8a2922a0027a07d8f12eef9be"
+          },
+          "next_anchor": "0x1",
+          "blind_delta_srv": "0x441b796a377bb53cd55ea4d0eef277c4955f8dfc16fedab78d2ca6270296c00",
+          "next_state_signature": {
+            "r_x": "0xe1db27cd2e3a88c3d1bf7b90b869ce74de988e1c2051a1173a317eef5f649b7",
+            "r_y": "0xe0b0cc13aa2a01e6739f9d31d34f18400371694ed2255b61253a697d9d517d2",
+            "s": "0x53ea4bccce38e8d05af004c805d11c2f85c364d2d6be6644acb19100a2b99d7"
+          }
+        },
+        "expected": "reject"
+      }
+    ]
+  },
+  "exit_kit": {
+    "description": "E7: a zkapi-exit-kit-v1 the browser SDK sealed (buildExitKitPayload and sealExitKit, crates/zkapi-companion/tests/fixtures/make-sdk-exit-kit.mjs). Every client opens `fixture` with `passphrase`, refuses `wrong_passphrase`, and reads `expected`.",
+    "fixture": "crates/zkapi-companion/tests/fixtures/sdk-exit-kit-v1.json",
+    "passphrase": "zkapi exit kit fixture",
+    "wrong_passphrase": "not the passphrase",
+    "expected": {
+      "format": "zkapi-exit-kit-v1",
+      "deployment_id": "sdk-kit-fixture",
+      "contract_address": "0x7777777777777777777777777777777777777777",
+      "note_id": 4,
+      "deposit_amount": "5000000",
+      "current_balance": "5000000",
+      "current_anchor": "0x1",
+      "bound_at_state": "1000000",
+      "state_seq": 1,
+      "exported_at": 1800000000,
+      "merkle_path_root": "0x18bb7959b7676a4a4b9404dc4c4d65ada97ec901d26d4719ff4fc64e2a851eb6",
+      "merkle_path_siblings": 32
+    }
+  }
+}

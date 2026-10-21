@@ -83,8 +83,10 @@ func (c *Client) settleGroup(ctx context.Context) error {
 		key = group.serial
 	}
 	started := time.Now()
+	activity.Diagnostic(ctx, "settlement start key=%d; retiring unused access", key)
 	activity.Report(ctx, activity.Event{Kind: activity.SettlementStarted, Key: key})
 	err := c.retireLease(ctx)
+	activity.Diagnostic(ctx, "settlement finish key=%d ready=%t elapsed=%.3fs; verified amounts follow in wallet events", key, err == nil, time.Since(started).Seconds())
 	activity.Report(ctx, activity.Event{Kind: activity.SettlementFinished, Key: key, Complete: err == nil, Duration: time.Since(started)})
 	if group != nil {
 		group.err = err

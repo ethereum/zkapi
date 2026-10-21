@@ -49,6 +49,7 @@ pub fn verify_membership(
 }
 
 /// In-memory Merkle tree for the indexer and testing.
+#[derive(Clone)]
 pub struct MerkleTree {
     /// Number of leaves inserted so far.
     next_index: u32,

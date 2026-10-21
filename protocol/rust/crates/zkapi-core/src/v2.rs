@@ -1,4 +1,16 @@
-//! Native zkAPI v2 primitives over the BN254 scalar field.
+//! Native zkAPI v2 primitives over the BN254 scalar field, circuit
+//! `zkapi-v2-concession-v1`.
+//!
+//! Every Poseidon hash here has a fixed arity (domain included) and is
+//! mirrored by `zkapi_proof::groth16`. The state chain of a note `n` with
+//! secret `s` is
+//!
+//! ```text
+//! τ_0 = 1,  N_i = N(τ_i) = H(d_null', s, n, τ_i),  τ_{i+1} = succ(N_i) = H(d_anchor', N_i)
+//! ```
+//!
+//! Anyone can compute `τ_{i+1}` from `N_i`; only the holder of `s` can
+//! compute `N_{i+1}`.
 
 use std::sync::OnceLock;
 
@@ -13,13 +25,17 @@ use zkapi_types::{Felt252, MERKLE_DEPTH};
 const DOMAIN_REG: &[u8] = b"zkapi.v2.reg";
 const DOMAIN_LEAF: &[u8] = b"zkapi.v2.leaf";
 const DOMAIN_NODE: &[u8] = b"zkapi.v2.node";
-const DOMAIN_NULLIFIER: &[u8] = b"zkapi.v2.null";
+/// Note-bound nullifier domain, arity 4: `H(d_null', s, note_id, τ)`.
+pub const DOMAIN_NULLIFIER: &[u8] = b"zkapi.v2c.null";
 const DOMAIN_AUTHORIZATION: &[u8] = b"zkapi.v2.auth";
 const DOMAIN_STATE: &[u8] = b"zkapi.v2.state";
 const DOMAIN_CLEARANCE: &[u8] = b"zkapi.v2.clear";
-const DOMAIN_WITHDRAWAL: &[u8] = b"zkapi.v2.withdraw";
-const DOMAIN_ANCHOR: &[u8] = b"zkapi.v2.anchor";
-const DOMAIN_BLIND: &[u8] = b"zkapi.v2.blind";
+/// Derived successor-anchor domain, arity 2: `H(d_anchor', N)`.
+pub const DOMAIN_ANCHOR: &[u8] = b"zkapi.v2c.anchor";
+
+/// The anchor of every genesis state (`τ_0`). A signed state at this anchor
+/// is unprovable in both circuits.
+pub const GENESIS_ANCHOR: Felt252 = Felt252::ONE;
 
 fn config() -> &'static PoseidonConfig<Fr> {
     static CONFIG: OnceLock<PoseidonConfig<Fr>> = OnceLock::new();
@@ -50,6 +66,12 @@ fn domain(label: &[u8]) -> Fr {
     Fr::from_be_bytes_mod_order(label)
 }
 
+/// The field value of a domain label (its big-endian bytes, as Solidity and
+/// Go spell the constants).
+pub fn domain_value(label: &[u8]) -> Felt252 {
+    field_to_felt(&domain(label))
+}
+
 pub fn felt_to_field(value: &Felt252) -> Fr {
     Fr::from_be_bytes_mod_order(value.as_bytes())
 }
@@ -70,6 +92,19 @@ pub fn hash_fields(inputs: &[Fr]) -> Fr {
 pub fn hash_felts(inputs: &[Felt252]) -> Felt252 {
     let fields = inputs.iter().map(felt_to_field).collect::<Vec<_>>();
     field_to_felt(&hash_fields(&fields))
+}
+
+/// One Poseidon permutation of the state `(capacity, left, right)`, returning
+/// its first rate lane: the two-to-one compression the note tree's nodes use.
+/// The domain sits in the capacity lane, so a node costs one permutation where
+/// the sponge over `(domain, left, right)` costs two, and no sponge hash (whose
+/// capacity lane starts at zero) can collide with a node.
+pub fn compress_fields(capacity: Fr, left: Fr, right: Fr) -> Fr {
+    let mut sponge = PoseidonSponge::new(config());
+    sponge.state[0] = capacity;
+    let inputs: &[Fr] = &[left, right];
+    sponge.absorb(&inputs);
+    sponge.squeeze_native_field_elements(1)[0]
 }
 
 fn hash_domain(label: &[u8], inputs: &[Felt252]) -> Felt252 {
@@ -100,8 +135,13 @@ pub fn note_leaf(
     )
 }
 
+/// `P(DOMAIN_NODE, left, right)[1]`: see [`compress_fields`].
 pub fn merkle_node(left: &Felt252, right: &Felt252) -> Felt252 {
-    hash_domain(DOMAIN_NODE, &[*left, *right])
+    field_to_felt(&compress_fields(
+        domain(DOMAIN_NODE),
+        felt_to_field(left),
+        felt_to_field(right),
+    ))
 }
 
 pub fn merkle_root(note_id: u32, leaf: &Felt252, siblings: &[Felt252; MERKLE_DEPTH]) -> Felt252 {
@@ -124,8 +164,29 @@ pub fn zero_hashes() -> [Felt252; MERKLE_DEPTH + 1] {
     values
 }
 
-pub fn nullifier(secret: &Felt252, anchor: &Felt252) -> Felt252 {
-    hash_domain(DOMAIN_NULLIFIER, &[*secret, *anchor])
+/// `N(τ) = H(d_null', s, note_id, τ)`. Binding the note id keeps the chains of
+/// two notes that share a secret disjoint.
+pub fn nullifier(secret: &Felt252, note_id: u32, anchor: &Felt252) -> Felt252 {
+    hash_domain(
+        DOMAIN_NULLIFIER,
+        &[*secret, Felt252::from_u64(note_id as u64), *anchor],
+    )
+}
+
+/// `succ(N) = H(d_anchor', N)`: the only anchor at which an honest operator
+/// signs the successor of the state whose request spent `N`.
+pub fn next_anchor(request_nullifier: &Felt252) -> Felt252 {
+    hash_domain(DOMAIN_ANCHOR, &[*request_nullifier])
+}
+
+/// `N(succ(N(τ)))`: the nullifier of the successor of the state at `τ`. An
+/// escape from that state publishes it as `next_nullifier`.
+pub fn successor_nullifier(secret: &Felt252, note_id: u32, anchor: &Felt252) -> Felt252 {
+    nullifier(
+        secret,
+        note_id,
+        &next_anchor(&nullifier(secret, note_id, anchor)),
+    )
 }
 
 pub fn authorization_tag(nullifier: &Felt252, request_context: &Felt252) -> Felt252 {
@@ -170,44 +231,6 @@ pub fn clearance_message(
     )
 }
 
-pub fn withdrawal_tag(
-    nullifier: &Felt252,
-    destination: &Felt252,
-    final_balance: u128,
-    has_clearance: bool,
-) -> Felt252 {
-    hash_domain(
-        DOMAIN_WITHDRAWAL,
-        &[
-            *nullifier,
-            *destination,
-            Felt252::from_u128(final_balance),
-            Felt252::from_u64(has_clearance as u64),
-        ],
-    )
-}
-
-pub fn next_anchor(
-    server_randomness: &Felt252,
-    request_nullifier: &Felt252,
-    commitment_x: &Felt252,
-    commitment_y: &Felt252,
-) -> Felt252 {
-    hash_domain(
-        DOMAIN_ANCHOR,
-        &[
-            *server_randomness,
-            *request_nullifier,
-            *commitment_x,
-            *commitment_y,
-        ],
-    )
-}
-
-pub fn blind_delta(server_randomness: &Felt252, request_nullifier: &Felt252) -> Felt252 {
-    hash_domain(DOMAIN_BLIND, &[*server_randomness, *request_nullifier])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +244,87 @@ mod tests {
         assert_eq!(
             merkle_root(0, &leaf, &siblings),
             merkle_root(0, &leaf, &siblings)
+        );
+    }
+
+    #[test]
+    fn concession_domains_match_the_specification() {
+        assert_eq!(
+            domain_value(DOMAIN_NULLIFIER),
+            Felt252::from_hex("0x7a6b6170692e7632632e6e756c6c").unwrap()
+        );
+        assert_eq!(
+            domain_value(DOMAIN_ANCHOR),
+            Felt252::from_hex("0x7a6b6170692e7632632e616e63686f72").unwrap()
+        );
+        // The retired v2 domains must not be reused by the new hashes.
+        assert_ne!(
+            domain_value(DOMAIN_NULLIFIER),
+            domain_value(b"zkapi.v2.null")
+        );
+        assert_ne!(
+            domain_value(DOMAIN_ANCHOR),
+            domain_value(b"zkapi.v2.anchor")
+        );
+    }
+
+    #[test]
+    fn nullifier_and_anchor_have_fixed_even_arity() {
+        let secret = Felt252::from_u64(42);
+        let anchor = Felt252::from_u64(9);
+        let n = nullifier(&secret, 7, &anchor);
+        assert_eq!(
+            n,
+            hash_felts(&[
+                domain_value(DOMAIN_NULLIFIER),
+                secret,
+                Felt252::from_u64(7),
+                anchor
+            ])
+        );
+        assert_eq!(
+            next_anchor(&n),
+            hash_felts(&[domain_value(DOMAIN_ANCHOR), n])
+        );
+        // Zero-padding to the next even arity changes the hash, so no shorter or
+        // longer preimage in the same domain collides with these.
+        assert_ne!(
+            next_anchor(&n),
+            hash_felts(&[domain_value(DOMAIN_ANCHOR), n, Felt252::ZERO])
+        );
+        assert_ne!(
+            next_anchor(&n),
+            hash_felts(&[domain_value(DOMAIN_ANCHOR), n, Felt252::ZERO, Felt252::ZERO])
+        );
+    }
+
+    #[test]
+    fn state_chain_is_derived_from_the_nullifier() {
+        let secret = Felt252::from_u64(42);
+        let note_id = 3;
+        let n0 = nullifier(&secret, note_id, &GENESIS_ANCHOR);
+        let tau1 = next_anchor(&n0);
+        assert!(tau1 != Felt252::ZERO && tau1 != GENESIS_ANCHOR);
+        let n1 = nullifier(&secret, note_id, &tau1);
+        assert_eq!(successor_nullifier(&secret, note_id, &GENESIS_ANCHOR), n1);
+        let tau2 = next_anchor(&n1);
+        assert_eq!(
+            successor_nullifier(&secret, note_id, &tau1),
+            nullifier(&secret, note_id, &tau2)
+        );
+        assert_ne!(n0, n1);
+    }
+
+    #[test]
+    fn notes_sharing_a_secret_have_disjoint_nullifiers() {
+        let secret = Felt252::from_u64(42);
+        assert_ne!(
+            nullifier(&secret, 0, &GENESIS_ANCHOR),
+            nullifier(&secret, 1, &GENESIS_ANCHOR)
+        );
+        assert_ne!(
+            successor_nullifier(&secret, 0, &GENESIS_ANCHOR),
+            successor_nullifier(&secret, 1, &GENESIS_ANCHOR)
         );
     }
 }

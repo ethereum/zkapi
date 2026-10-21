@@ -24,14 +24,19 @@ Native ETH vault <-------- challenge service
 
 `protocol/rust/crates/zkapi-types/src/wire.rs` defines the protocol's JSON
 messages. Runtime handlers in `crates/zkapi-serverd/src/routes.rs` and
-`crates/zkapi-indexerd/src/http.rs` define the supported routes.
+`crates/zkapi-indexerd/src/http.rs` define the supported routes. The challenge
+service reads the server's append-only request evidence and the vault's
+pending escapes, and submits defeats, raises and leaf retirements through a
+restricted signer.
 
 ## Proof and field encoding
 
-The active circuit revision is `zkapi-v2-note-bound-v1`, using the v2 JSON
-shapes and public-input order. The proving/verifying keys and vault's Groth16
-adapter must match that circuit and setup. Pin the circuit ID, artifact hashes,
-vault address, and server signing keys for the configured deployment.
+The active circuit is `zkapi-v2-concession-v1`. Requests keep the v2 JSON
+shapes and public-input order; withdrawals and clearances use the 16-input
+`WithdrawalPublicInputsV2C`. The proving/verifying keys and the vault's Groth16
+adapter must match that circuit and setup. Pin the circuit ID, setup ID,
+artifact hashes, vault address, contract code hashes and server signing keys
+for the configured deployment.
 
 Field values use `0x`-prefixed hexadecimal strings. The Rust type
 `Felt252` carries BN254 scalar-field values; it does not select the

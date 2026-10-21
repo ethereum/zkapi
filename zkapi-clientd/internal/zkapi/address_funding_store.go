@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 )
@@ -36,6 +38,21 @@ type addressFundingRecord struct {
 	Withdrawal      *addressWithdrawalRecord `json:"withdrawal,omitempty"`
 	Quote           *AddressPaymentQuote     `json:"quote,omitempty"`
 	Return          *addressReturnRecord     `json:"return,omitempty"`
+	// CreditedPayouts keeps every credited escape payout (a complete
+	// withdrawal with PayoutCredited) after a later deposit replaced its
+	// withdrawal record, so status keeps reporting its claim until the
+	// vault no longer holds a credit for the destination.
+	CreditedPayouts []addressCreditedPayout `json:"credited_payouts,omitempty"`
+}
+
+// addressCreditedPayout is a finalized escape that closed a note without
+// paying its destination: the vault credited the balance to
+// escapePayoutCredits(Destination) instead.
+type addressCreditedPayout struct {
+	NoteID         uint64 `json:"note_id"`
+	Destination    string `json:"destination"`
+	Amount         uint64 `json:"amount"`
+	SettlementHash string `json:"settlement_hash"`
 }
 
 type addressTransaction struct {
@@ -48,6 +65,12 @@ type addressTransaction struct {
 	Nonce             uint64 `json:"nonce"`
 	FinalizedRevert   bool   `json:"finalized_revert,omitempty"`
 	ApprovedFeeWei    string `json:"approved_fee_wei,omitempty"`
+	// SignedAt is when the transaction was signed (Unix seconds; 0 in
+	// records of earlier builds).
+	SignedAt int64 `json:"signed_at,omitempty"`
+	// Unmined marks an escape transaction retired without a receipt once
+	// it could no longer be included (deadEscapeTransaction).
+	Unmined bool `json:"unmined,omitempty"`
 }
 
 func (h *FundingHandler) addressStatePath() string {
@@ -104,8 +127,13 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 	} else if record.Version != 1 || record.BillingAsset == "native_eth" {
 		return nil, errors.New("native payment recovery cannot be used for token funding; preserve the recovery file")
 	}
-	if record.Pending != nil && record.Pending.FinalizedRevert {
+	if record.Pending != nil && (record.Pending.FinalizedRevert || record.Pending.Unmined) {
 		return nil, errors.New("pending payment is incorrectly marked as retired; preserve the recovery file")
+	}
+	for _, entry := range record.History {
+		if entry.Unmined && (entry.FinalizedRevert || entry.ActualFeeWei != "" || !escapeKinds[entry.Kind]) {
+			return nil, errors.New("an unmined payment record is invalid; preserve the recovery file")
+		}
 	}
 	for _, entry := range append(append([]addressTransaction{}, record.History...), pendingAddressTransaction(record.Pending)...) {
 		encoded, decodeErr := hex.DecodeString(strings.TrimPrefix(entry.Raw, "0x"))
@@ -129,7 +157,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 			}
 		}
 		from, senderErr := types.Sender(types.LatestSignerForChainID(tx.ChainId()), &tx)
-		if senderErr != nil || !strings.EqualFold(from.Hex(), record.Address) || tx.To() == nil || (entry.Kind != "deposit" && entry.Kind != "approval" && entry.Kind != "approval_reset" && entry.Kind != "withdrawal" && entry.Kind != "return") {
+		if senderErr != nil || !strings.EqualFold(from.Hex(), record.Address) || tx.To() == nil || (entry.Kind != "deposit" && entry.Kind != "approval" && entry.Kind != "approval_reset" && entry.Kind != "withdrawal" && entry.Kind != "return" && !escapeKinds[entry.Kind] && !transitKinds[entry.Kind]) {
 			return nil, errors.New("payment transaction recovery signature is invalid; preserve the file")
 		}
 		if config.nativeETH() {
@@ -138,7 +166,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 			}
 			if entry.Kind == "deposit" {
 				data := tx.Data()
-				if len(data) != 4+34*32 || hex.EncodeToString(data[:4]) != "c588341c" {
+				if !isDepositCalldata(data) {
 					return nil, errors.New("native deposit recovery call is invalid; preserve the file")
 				}
 				amount := new(big.Int).SetBytes(data[36:68])
@@ -162,14 +190,62 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 				return nil, errors.New("return recovery authorization is invalid; preserve the file")
 			}
 		}
-		if entry.Kind == "deposit" || entry.Kind == "withdrawal" {
+		if entry.Kind == "deposit" || entry.Kind == "withdrawal" || escapeKinds[entry.Kind] {
 			expected = config.Contract
+		}
+		if transitKinds[entry.Kind] && record.Pending != nil && strings.EqualFold(record.Pending.Hash, entry.Hash) {
+			// A pending transit transaction of the gasless path calls the
+			// factory, the transit account or the paymaster of the saved
+			// withdrawal with exactly its intent.
+			w := record.Withdrawal
+			if w == nil || w.Transit == nil {
+				return nil, errors.New("transit transaction recovery data is missing its withdrawal; preserve the file")
+			}
+			var data string
+			expected, data = transitTransactionData(entry.Kind, w)
+			if !strings.EqualFold("0x"+hex.EncodeToString(tx.Data()), data) || tx.Value().Sign() != 0 {
+				return nil, errors.New("transit transaction recovery call is invalid; preserve the file")
+			}
+		} else if transitKinds[entry.Kind] {
+			// A finished one stays in the history after its withdrawal was
+			// retired for the next note (whose transit account, if any, is
+			// another): it was checked against its withdrawal when signed,
+			// and carries no value.
+			if tx.Value().Sign() != 0 {
+				return nil, errors.New("transit transaction recovery call is invalid; preserve the file")
+			}
+			expected = tx.To().Hex()
 		}
 		if !strings.EqualFold(tx.To().Hex(), expected) {
 			return nil, errors.New("payment transaction recovery destination is invalid; preserve the file")
 		}
-		if entry.Kind == "withdrawal" && (len(tx.Data()) != 4+56*32 || hex.EncodeToString(tx.Data()[:4]) != withdrawalSelector) {
+		if entry.Kind == "withdrawal" && (len(tx.Data()) != withdrawalCalldataLength || hex.EncodeToString(tx.Data()[:4]) != withdrawalSelector) {
 			return nil, errors.New("withdrawal transaction recovery call is invalid; preserve the file")
+		}
+		if escapeKinds[entry.Kind] {
+			pending := record.Pending != nil && strings.EqualFold(entry.Hash, record.Pending.Hash)
+			w := record.Withdrawal
+			if pending && (w == nil || w.Mode != "escape") {
+				return nil, errors.New("pending escape authorization is invalid; preserve the file")
+			}
+			if pending {
+				var err error
+				switch entry.Kind {
+				case "escape":
+					err = validateSignedEscape(tx.Data(), config, w, time.Time{})
+				case "escape_finalize":
+					if "0x"+hex.EncodeToString(tx.Data()) != finalizeEscapeCalldata(w.NoteID) {
+						err = errors.New("escape finalization recovery call is invalid; preserve the file")
+					}
+				case "escape_claim":
+					if !strings.EqualFold("0x"+hex.EncodeToString(tx.Data()), claimEscapeCalldata(w.Destination)) {
+						err = errors.New("escape payout claim recovery call is invalid; preserve the file")
+					}
+				}
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 		if entry.Kind == "withdrawal" {
 			pending := record.Pending != nil && strings.EqualFold(entry.Hash, record.Pending.Hash)
@@ -177,7 +253,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 				return nil, errors.New("pending withdrawal authorization is invalid; preserve the file")
 			}
 			if pending || (record.Withdrawal != nil && strings.EqualFold(entry.Hash, record.Withdrawal.TransactionHash)) {
-				if err := validateSignedWithdrawal(tx.Data(), config, record.Withdrawal); err != nil {
+				if err := validateSignedWithdrawal(tx.Data(), config, record.Withdrawal, time.Time{}); err != nil {
 					return nil, err
 				}
 			}
@@ -197,27 +273,64 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 			return nil, errors.New("pending public return is missing its authorization; preserve the file")
 		}
 	}
+	for _, credit := range record.CreditedPayouts {
+		if _, err := NormalizeWithdrawalDestination(credit.Destination); err != nil || credit.NoteID > 0xffffffff || !isHex(credit.SettlementHash, 32) {
+			return nil, errors.New("credited escape payout recovery data is invalid; preserve the file")
+		}
+	}
 	if w := record.Withdrawal; w != nil {
 		if _, err := NormalizeWithdrawalDestination(w.Destination); err != nil || w.NoteID > 0xffffffff || (w.Binding != "" && (!isHex(w.Binding, 32) || !isHex(w.Nullifier, 32))) {
 			return nil, errors.New("withdrawal recovery data is invalid; preserve the file")
 		}
+		if w.Mode == "escape" {
+			if err := validateEscapeRecord(record, w); err != nil {
+				return nil, err
+			}
+			return &record, nil
+		}
+		if w.Mode != "" {
+			return nil, errors.New("withdrawal recovery mode is invalid; preserve the file")
+		}
+		if err := validateGaslessRecord(config, w); err != nil {
+			return nil, err
+		}
+		// A record with a transit account follows the gasless journal
+		// whatever pays its fee now: after the --fees wallet fallback the
+		// transit account's balance is still forwarded by a sponsored
+		// operation, journaled under the same phases.
+		gasless := w.Transit != nil
 		switch w.Phase {
 		case "quoted", "withdrawal_pending", "waiting_settlement", "waiting_funds", "confirming", "reverted", "complete":
+		case "op_built", "op_submitted", "op_reverted", "forward_op_built", "forward_op_submitted":
+			if !gasless || w.UserOp == nil {
+				return nil, errors.New("withdrawal recovery phase is invalid; preserve the file")
+			}
+		case "gasless_refused":
+			if !gasless {
+				return nil, errors.New("withdrawal recovery phase is invalid; preserve the file")
+			}
 		default:
 			return nil, errors.New("withdrawal recovery phase is invalid; preserve the file")
 		}
-		if w.Phase == "complete" && (!isHex(w.TransactionHash, 32) || w.Binding == "") {
+		if (w.Phase == "complete" || w.Phase == "forward_op_built" || w.Phase == "forward_op_submitted") && ((!isHex(w.TransactionHash, 32) && !(gasless && isHex(w.SettlementHash, 32))) || w.Binding == "") {
 			return nil, errors.New("completed withdrawal recovery data is invalid; preserve the file")
 		}
+		// Only an independently relayed escape, or the paymaster, can leave
+		// a credited payout.
+		if w.PayoutCredited && !w.PaymasterCredited && (w.SettlementHash == "" || (w.Phase != "confirming" && w.Phase != "complete")) {
+			return nil, errors.New("credited escape payout recovery data is invalid; preserve the file")
+		}
 		if w.SettlementHash != "" {
-			if !isHex(w.SettlementHash, 32) || !isHex(w.TransactionHash, 32) || strings.EqualFold(w.SettlementHash, w.TransactionHash) || w.Binding == "" || (w.Phase != "confirming" && w.Phase != "complete") {
+			if !isHex(w.SettlementHash, 32) || (!gasless && !isHex(w.TransactionHash, 32)) || strings.EqualFold(w.SettlementHash, w.TransactionHash) || w.Binding == "" || (w.Phase != "confirming" && w.Phase != "complete" && w.Phase != "forward_op_built" && w.Phase != "forward_op_submitted" && w.Phase != "gasless_refused") {
 				return nil, errors.New("alternate withdrawal settlement is invalid; preserve the file")
 			}
-			if w.Phase == "confirming" && (record.Pending == nil || record.Pending.Kind != "withdrawal" || !strings.EqualFold(record.Pending.Hash, w.TransactionHash)) {
+			if w.Phase == "confirming" && !gasless && (record.Pending == nil || record.Pending.Kind != "withdrawal" || !strings.EqualFold(record.Pending.Hash, w.TransactionHash)) {
 				return nil, errors.New("alternate withdrawal settlement lost its signed intent; preserve the file")
 			}
 		}
-		if w.Phase == "complete" {
+		if w.Phase == "complete" && w.FeePayer != "payout" && (!gasless || isHex(w.TransactionHash, 32)) {
+			// A wallet-paid close (the plain path, or the fallback of a
+			// gasless record) retired its signed transaction to the history.
 			found := false
 			for _, entry := range record.History {
 				// A relayer's finalized payout permits retiring the original
@@ -232,6 +345,50 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 		}
 	}
 	return &record, nil
+}
+
+// validateEscapeRecord checks a saved escape: its phase, amounts and the
+// transactions its phase names.
+func validateEscapeRecord(record addressFundingRecord, w *addressWithdrawalRecord) error {
+	invalid := errors.New("escape recovery data is invalid; preserve the file")
+	if err := validateGaslessRecord(fundingConfig{ChainID: record.ChainID, Contract: record.Contract}, w); err != nil {
+		return err
+	}
+	gasless := w.Transit != nil
+	switch w.Phase {
+	case "escape_decision", "escape_wait", "quoted", "waiting_funds", "reverted", "escape_expired":
+	case "escape_pending", "escape_initiated", "finalize_pending", "defeated":
+		if w.Binding == "" || !isHex(w.NextNullifier, 32) {
+			return invalid
+		}
+	case "op_built", "op_submitted", "op_reverted", "finalize_op_built", "finalize_op_submitted", "forward_op_built", "forward_op_submitted":
+		if !gasless || w.UserOp == nil || w.Binding == "" || !isHex(w.NextNullifier, 32) {
+			return invalid
+		}
+	case "gasless_refused":
+		if !gasless {
+			return invalid
+		}
+	case "complete":
+		if w.Binding == "" || !isHex(w.FinalizeHash, 32) || !strings.EqualFold(w.SettlementHash, w.FinalizeHash) {
+			return invalid
+		}
+	default:
+		return invalid
+	}
+	if w.Conceded > w.StateBalance || (w.Conceded != 0 && w.Conceded > w.Bound) {
+		return invalid
+	}
+	if w.InitiateHash != "" && !isHex(w.InitiateHash, 32) {
+		return invalid
+	}
+	if record.Pending != nil && escapeKinds[record.Pending.Kind] {
+		want := map[string]string{"escape": "escape_pending", "escape_finalize": "finalize_pending", "escape_claim": "complete"}[record.Pending.Kind]
+		if w.Phase != want {
+			return invalid
+		}
+	}
+	return nil
 }
 
 func pendingAddressTransaction(entry *addressTransaction) []addressTransaction {
@@ -275,6 +432,110 @@ func (h *FundingHandler) saveAddress(record *addressFundingRecord) error {
 	}
 	if err != nil {
 		return errors.New("cannot persist payment address recovery data; no new transaction was sent")
+	}
+	return nil
+}
+
+// validateGaslessRecord checks a withdrawal's transit account and user
+// operation: the transit account is the CREATE2 of its owner key and payout
+// address under the pinned gasless contracts (when this release pins them),
+// the proof destination is that account, and a saved operation hashes to
+// its saved hash, is signed by the owner and carries exactly the exit the
+// record authorizes (the close or escape words, the finalization of the
+// note, or nothing for a forward).
+func validateGaslessRecord(config fundingConfig, w *addressWithdrawalRecord) error {
+	invalid := errors.New("gasless withdrawal recovery data is invalid; preserve the file")
+	if w.Transit == nil {
+		if w.FeePayer == "payout" || w.ProofDestination != "" || w.UserOp != nil {
+			return invalid
+		}
+		return nil
+	}
+	t := w.Transit
+	for _, address := range []string{t.Factory, t.Paymaster, t.EntryPoint, t.Account, t.Owner} {
+		if !isHex(address, 20) {
+			return invalid
+		}
+	}
+	key, err := crypto.HexToECDSA(t.OwnerKey)
+	if err != nil || !strings.EqualFold(crypto.PubkeyToAddress(key.PublicKey).Hex(), t.Owner) || !isHex(t.CreationCodeKeccak, 32) || !strings.EqualFold(w.ProofDestination, t.Account) {
+		return invalid
+	}
+	if w.FeePayer != "payout" && w.FeePayer != "wallet" {
+		return invalid
+	}
+	// A funding key never owns a transit account.
+	if w.UserOp == nil {
+		return nil
+	}
+	u := w.UserOp
+	var encoded gaslessUserOpJSON
+	if json.Unmarshal(u.JSON, &encoded) != nil || !isHex(u.Hash, 32) {
+		return invalid
+	}
+	op, err := gaslessUserOpFromJSON(encoded)
+	if err != nil || !strings.EqualFold(op.Sender.Hex(), t.Account) || !strings.EqualFold(op.Paymaster.Hex(), t.Paymaster) {
+		return invalid
+	}
+	hash := op.hash(common.HexToAddress(t.EntryPoint), config.ChainID)
+	if !strings.EqualFold(hash.Hex(), u.Hash) {
+		return invalid
+	}
+	if signer, err := recoverUserOpSigner(hash, op.Signature); err != nil || !strings.EqualFold(signer.Hex(), t.Owner) {
+		return invalid
+	}
+	vaultCall, err := vaultCallOfTransitCallData(op.CallData)
+	if err != nil {
+		return invalid
+	}
+	nullifier := new(big.Int)
+	if isHex(w.Nullifier, 32) {
+		nullifier.SetBytes(common.FromHex(w.Nullifier))
+	}
+	switch gaslessKindOf(u.Kind) {
+	case gaslessKindClose:
+		if w.Mode != "" || validateSignedWithdrawal(vaultCall, config, w, time.Time{}) != nil {
+			return invalid
+		}
+	case gaslessKindEscape:
+		if w.Mode != "escape" || validateSignedEscape(vaultCall, config, w, time.Time{}) != nil {
+			return invalid
+		}
+	case gaslessKindFinalize:
+		if w.Mode != "escape" || "0x"+hex.EncodeToString(vaultCall) != finalizeEscapeCalldata(w.NoteID) {
+			return invalid
+		}
+	case gaslessKindForward:
+		if len(vaultCall) != 0 {
+			return invalid
+		}
+	default:
+		return invalid
+	}
+	if new(big.Int).Rsh(op.Nonce, 64).Cmp(gaslessNonceKey(gaslessKindOf(u.Kind), nullifier)) != 0 {
+		return invalid
+	}
+	for _, listed := range u.Hashes {
+		if !isHex(listed, 32) {
+			return invalid
+		}
+	}
+	if u.TransactionHash != "" && !isHex(u.TransactionHash, 32) {
+		return invalid
+	}
+	// The included copy is one of the journaled hashes (the signed one, or
+	// an earlier copy a bundler included after a re-sign).
+	if u.IncludedHash != "" {
+		if !isHex(u.IncludedHash, 32) {
+			return invalid
+		}
+		listed := strings.EqualFold(u.IncludedHash, u.Hash)
+		for _, hash := range u.Hashes {
+			listed = listed || strings.EqualFold(hash, u.IncludedHash)
+		}
+		if !listed {
+			return invalid
+		}
 	}
 	return nil
 }

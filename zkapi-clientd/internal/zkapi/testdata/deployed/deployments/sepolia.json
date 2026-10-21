@@ -1,0 +1,73 @@
+{
+  "deployment_status": "deployed",
+  "deployment_id": "zkapi-native-eth-sepolia-concession-v1-test",
+  "network": "sepolia",
+  "chain_id": 11155111,
+  "rpc_url": "https://ethereum-sepolia-rpc.publicnode.com",
+  "protocol_version": 2,
+  "contract_address": "0xC0C0000000000000000000000000000000000002",
+  "billing_asset": "native_eth",
+  "billing_unit": "gwei",
+  "billing_token_address": null,
+  "native_asset_wei_per_unit": "1000000000",
+  "native_price_feed_address": "0x694AA1769357215DE4FAC081bf1f309aDC325306",
+  "native_price_feed_decimals": 8,
+  "native_price_max_age_seconds": 4500,
+  "demo_mint_enabled": false,
+  "proof_adapter_address": "0xADA0000000000000000000000000000000000002",
+  "poseidon_library_address": "0x9055000000000000000000000000000000000002",
+  "deploy_block": 100,
+  "protocol_server_url": "https://zkapi-sepolia.openanonymity.ai",
+  "indexer_url": "https://zkapi-sepolia.openanonymity.ai",
+  "config_url": "https://zkapi-sepolia.openanonymity.ai/config.json",
+  "request_charge_cap": 50000,
+  "note_ttl_seconds": 2592000,
+  "challenge_period_seconds": 43200,
+  "max_pause_duration_seconds": 604800,
+  "settlement_window_seconds": 14705,
+  "vault_revision": 3,
+  "exit_concession": 1,
+  "clearance_ownership_proof": "required",
+  "auth_scheme": "state-anchor",
+  "provider": "native_leases",
+  "upstreams": [
+    "openrouter"
+  ],
+  "proof_backend": "groth16_bn254",
+  "proof_setup": {
+    "repository_path": "protocol/setup/v2-concession",
+    "circuit_id": "zkapi-v2-concession-v1",
+    "setup_id": "dev",
+    "request_proving_key_sha256": "7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba",
+    "request_verifying_key_sha256": "11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf",
+    "withdrawal_proving_key_sha256": "43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1",
+    "withdrawal_verifying_key_sha256": "d816b9937021361381c52e17d554d975b8ecedeee7edbcecf1bb3393e0f0edb9",
+    "request_vk_keccak256": "0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790",
+    "withdrawal_vk_keccak256": "0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1"
+  },
+  "clearance_signing_key": {
+    "x": "0x2b8dc190013bb10de72398ca462027f21b7a35eb6cb957b9319d76bd3c3c1b7d",
+    "y": "0xa6744dc1bc99bf78b29d6e76db2a0b5598c79d1ce2377b9044aa9dc323dd963"
+  },
+  "state_signing_key": {
+    "x": "0x25a4453190e930f9716eebcab165170706d31d1b3969d106a50d7ae374a23d61",
+    "y": "0x1b0f74306dfce1371752a0d7c7d27359c398b8305798492fd1095074c0639953"
+  },
+  "privacy_mode": {
+    "ephemeral_key_source": "oa_org",
+    "issuer_url": "https://org-staging.openanonymity.ai",
+    "verifier_url": "https://verifier2.openanonymity.ai",
+    "openrouter_inference_base": "https://openrouter.ai/api/v1",
+    "lease_ttl_seconds": 300
+  },
+  "deployment_evidence": {
+    "vault_runtime_keccak256": "0x7910917e8f05b0afca92d132a4ab778c1bedc944d0edd499f287f7e607aaa20d",
+    "adapter_runtime_keccak256": "0x5fc732f90325986524ddccd5b8276da840cb1c9c0bc9a3b62ecb97656f2b7a87",
+    "poseidon_runtime_keccak256": "0x253e8b1722376a150140d98c81a747f309be5d39d78031c2b562724f59f9f87a"
+  },
+  "models": [],
+  "limitations": [
+    "Test fixture: a deployed concession-exit profile with invented addresses; its code pins are keccak256 of the fixture code 0x600160015b (vault), 0x600260025b (adapter) and 0x600360035b (Poseidon)."
+  ],
+  "treasury_address": "0x7EA5000000000000000000000000000000000002"
+}

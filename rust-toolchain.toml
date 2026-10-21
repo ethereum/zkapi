@@ -1,0 +1,9 @@
+# The Rust toolchain of every build in this repository. The browser
+# WebAssembly is built reproducibly with it (scripts/build-browser-client.sh,
+# which also pins wasm-bindgen-cli 0.2.117 and remaps build paths), so its
+# hash in sdk/assets/manifest.json can be checked by rebuilding.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

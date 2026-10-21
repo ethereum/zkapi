@@ -21,7 +21,7 @@ func testPolicy(network string) map[string]any {
 	if err != nil {
 		panic(err)
 	}
-	return map[string]any{"bridge_version": 4, "chain_id": p.ChainID, "mode": "direct_openrouter", "require_oa_org_key_source": true, "deployment_id": p.ID, "contract_address": p.Contract, "billing_asset": p.Asset, "billing_unit": p.Unit, "circuit_id": p.Proof.Circuit}
+	return map[string]any{"bridge_version": 5, "chain_id": p.ChainID, "mode": "direct_openrouter", "require_oa_org_key_source": true, "deployment_id": p.ID, "contract_address": p.Contract, "billing_asset": p.Asset, "billing_unit": p.Unit, "circuit_id": p.Proof.Circuit, "exit_concession": 1, "setup_id": p.Proof.SetupID, "escape_routes_version": 2}
 }
 
 func newTestClient(t *testing.T, handler http.HandlerFunc, inference *httptest.Server) *Client {
@@ -43,8 +43,20 @@ func newTestClient(t *testing.T, handler http.HandlerFunc, inference *httptest.S
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Fixtures serve chain and indexer reads from local TLS servers; a
+	// companion must still name these exact endpoints.
+	c.endpoints = &chainEndpoints{RPC: inference.URL, Indexer: inference.URL, ProtocolServer: testProtocolServerURL(t, "mainnet")}
 	addTestModelPolicy(c, map[string]uint64{"example/model": 1}, nil)
 	return c
+}
+
+func testProtocolServerURL(t *testing.T, network string) string {
+	t.Helper()
+	deployment, _, err := pinnedDeployment(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deployment.ProtocolServerURL
 }
 
 func TestCompleteReturnsLiveSSEAndSendsNoPromptToCompanion(t *testing.T) {

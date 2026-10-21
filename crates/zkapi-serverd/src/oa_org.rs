@@ -4,7 +4,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use zkapi_types::wire::OpenRouterLeaseResponse;
 
 use crate::error::ServerError;
@@ -67,28 +66,6 @@ pub(crate) struct OaOrgUsageExpectation {
     pub limit_credits: u128,
     pub minimum_expires_at: u64,
     pub maximum_expires_at: u64,
-}
-
-/// Existing issuer metadata only. Reconciliation never returns a runtime key
-/// or grants permission to perform another issuance.
-pub(crate) struct OaOrgReconciledKey {
-    pub key_hash: String,
-    pub expires_at: u64,
-}
-
-#[derive(Deserialize)]
-struct OaOrgReconciliationResponse {
-    source: String,
-    version: u64,
-    status: String,
-    client_request_id: String,
-    station_request_id: Option<String>,
-    key_hash: Option<String>,
-    credit_limit: Option<f64>,
-    credit_limit_credits: Option<u128>,
-    duration_minutes: Option<u64>,
-    expires_at_unix: Option<u64>,
-    station_id: Option<String>,
 }
 
 pub struct OaOrgProvisioner {
@@ -229,36 +206,6 @@ impl OaOrgProvisioner {
                 org_signature: response.org_signature,
             },
         })
-    }
-
-    pub(crate) async fn reconcile_key(
-        &self,
-        client_request_id: &str,
-        expectation: OaOrgUsageExpectation,
-    ) -> Result<Option<OaOrgReconciledKey>, ServerError> {
-        let response = self
-            .http
-            .post(format!("{}/api/zkapi/reconcile_key", self.base_url))
-            .bearer_auth(&self.shared_secret)
-            .json(&json!({
-                "client_request_id": client_request_id,
-                "credit_limit": expectation.credit_limit_usd,
-                "credit_limit_credits": expectation.limit_credits,
-                "duration_minutes": expectation.duration_minutes,
-            }))
-            .send()
-            .await
-            .map_err(|error| ServerError::Internal(format!("OA reconciliation failed: {error}")))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ServerError::Internal(format!(
-                "OA reconciliation returned {status}"
-            )));
-        }
-        let response: OaOrgReconciliationResponse = response.json().await.map_err(|error| {
-            ServerError::Internal(format!("invalid OA reconciliation response: {error}"))
-        })?;
-        validate_reconciliation_response(response, client_request_id, expectation)
     }
 
     pub(crate) async fn get_key_usage(
@@ -486,73 +433,6 @@ fn normalize_machine_reason(value: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn station_request_id(client_request_id: &str) -> String {
-    hex::encode(Sha256::digest(
-        format!("oa-org:zkapi:v1:{client_request_id}").as_bytes(),
-    ))
-}
-
-fn validate_reconciliation_response(
-    response: OaOrgReconciliationResponse,
-    client_request_id: &str,
-    expectation: OaOrgUsageExpectation,
-) -> Result<Option<OaOrgReconciledKey>, ServerError> {
-    if response.source != "oa_org"
-        || response.version != 1
-        || response.client_request_id != client_request_id
-    {
-        return Err(ServerError::Internal(
-            "OA org returned mismatched reconciliation evidence".into(),
-        ));
-    }
-    if response.status == "unknown" {
-        // Absence of an issuer record does not prove absence of a side effect.
-        return Ok(None);
-    }
-    let (
-        Some(station_request_id),
-        Some(key_hash),
-        Some(credit_limit),
-        Some(credit_limit_credits),
-        Some(duration_minutes),
-        Some(expires_at),
-        Some(station_id),
-    ) = (
-        response.station_request_id,
-        response.key_hash,
-        response.credit_limit,
-        response.credit_limit_credits,
-        response.duration_minutes,
-        response.expires_at_unix,
-        response.station_id,
-    )
-    else {
-        return Err(ServerError::Internal(
-            "OA org returned incomplete reconciliation evidence".into(),
-        ));
-    };
-    if response.status != "issued"
-        || station_request_id != self::station_request_id(client_request_id)
-        || key_hash.is_empty()
-        || station_id.is_empty()
-        || !credit_limit.is_finite()
-        || (credit_limit - expectation.credit_limit_usd).abs()
-            > f64::EPSILON.max(expectation.credit_limit_usd * 1e-9)
-        || credit_limit_credits != expectation.limit_credits
-        || duration_minutes != expectation.duration_minutes
-        || expires_at < expectation.minimum_expires_at
-        || expires_at > expectation.maximum_expires_at
-    {
-        return Err(ServerError::Internal(
-            "OA org returned reconciliation outside the accepted lease bounds".into(),
-        ));
-    }
-    Ok(Some(OaOrgReconciledKey {
-        key_hash,
-        expires_at,
-    }))
-}
-
 fn validate_response(
     response: &OaOrgKeyResponse,
     requested_limit_usd: f64,
@@ -643,8 +523,10 @@ fn validate_usage_response(
             "OA org returned incomplete final usage evidence".to_string(),
         ));
     };
+    // Reported usage above the issued limit is returned as is: settlement
+    // clamps it to the proof-bound budget. Rejecting it here would leave the
+    // lease unsettleable. The limit itself must match the issued binding.
     if response.status != "finalized"
-        || usage_credits > expected_limit_credits
         || credit_limit_credits != expected_limit_credits
         || expires_at < minimum_expires_at
         || expires_at > maximum_expires_at
@@ -843,65 +725,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reconciliation_accepts_expired_issued_binding_but_rejects_mismatches() {
-        let now = current_timestamp();
-        let expectation = OaOrgUsageExpectation {
-            credit_limit_usd: 3.0,
-            duration_minutes: 5,
-            limit_credits: 3_000_000,
-            minimum_expires_at: now - 200,
-            maximum_expires_at: now + 330,
-        };
-        let value = json!({"source":"oa_org", "version":1, "status":"issued",
-            "client_request_id":"saved-request", "station_request_id":station_request_id("saved-request"),
-            "key_hash":"existing-key-hash", "station_id":"saved-station",
-            "credit_limit":3.0, "credit_limit_credits":3_000_000, "duration_minutes":5,
-            "expires_at_unix":now - 100});
-        let binding = validate_reconciliation_response(
-            serde_json::from_value(value.clone()).unwrap(),
-            "saved-request",
-            expectation,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(binding.key_hash, "existing-key-hash");
-        assert_eq!(binding.expires_at, now - 100);
-        for (field, bad) in [
-            ("source", json!("other")),
-            ("version", json!(2)),
-            ("status", json!("unissued")),
-            ("client_request_id", json!("other")),
-            ("station_request_id", json!("invalid")),
-            ("station_id", json!("")),
-            ("key_hash", json!("")),
-            ("credit_limit", json!(4.0)),
-            ("credit_limit_credits", json!(2_000_000)),
-            ("duration_minutes", json!(6)),
-            ("expires_at_unix", json!(now - 300)),
-        ] {
-            let mut mismatched = value.clone();
-            mismatched[field] = bad;
-            assert!(
-                validate_reconciliation_response(
-                    serde_json::from_value(mismatched).unwrap(),
-                    "saved-request",
-                    expectation,
-                )
-                .is_err(),
-                "accepted mismatched {field}"
-            );
-        }
-        let unknown = serde_json::from_value(json!({"source":"oa_org", "version":1,
-            "status":"unknown", "client_request_id":"saved-request"}))
-        .unwrap();
-        assert!(
-            validate_reconciliation_response(unknown, "saved-request", expectation)
-                .unwrap()
-                .is_none()
-        );
-    }
-
     #[tokio::test]
     async fn create_key_turns_an_oa_429_into_a_typed_retriable_error() {
         async fn rate_limited() -> (
@@ -1063,6 +886,47 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(usage, OaOrgUsage::Finalized(_)));
+    }
+
+    #[test]
+    fn usage_above_limit_is_returned_for_clamping() {
+        let response = |usage_credits, credit_limit_credits| OaOrgUsageResponse {
+            source: "oa_org".to_string(),
+            version: 1,
+            status: "finalized".to_string(),
+            client_request_id: "request-12345678".to_string(),
+            station_request_id: "ab".repeat(32),
+            key_hash: "provider-hash".to_string(),
+            retry_after_seconds: None,
+            usage_credits: Some(usage_credits),
+            credit_limit_credits: Some(credit_limit_credits),
+            expires_at_unix: Some(1_000),
+            closed_at_unix: Some(900),
+            finalized_at_unix: Some(1_020),
+            station_id: Some("station".to_string()),
+            station_signature: Some("ab".repeat(64)),
+            org_signature: Some("cd".repeat(64)),
+        };
+        let validate = |response| {
+            validate_usage_response(
+                response,
+                "request-12345678",
+                "provider-hash",
+                10_000,
+                970,
+                1_000,
+                1,
+            )
+        };
+        assert!(matches!(
+            validate(response(20_000, 10_000)).unwrap(),
+            OaOrgUsage::Finalized(OaOrgFinalUsage {
+                usage_credits: 20_000,
+                ..
+            })
+        ));
+        // The issued limit is evidence identity, not a usage bound.
+        assert!(validate(response(5_000, 20_000)).is_err());
     }
 
     #[test]

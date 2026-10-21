@@ -8,6 +8,11 @@ license.workspace = true
 [dependencies]
 zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
 zkapi-core = { path = "../../protocol/rust/crates/zkapi-core" }
+# Never enable `dev-setup` here: a default production build loads only the
+# pinned ceremony keys, and a single-party image asks for the feature on its
+# command line (docker/Dockerfile's ALLOW_DEV_SETUP=1). `zkapi-proof --bin
+# release_policy_check` checks the Docker build. The tests enable it through
+# the dev-dependency below.
 zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof" }
 anyhow = { workspace = true }
 axum = { workspace = true }
@@ -29,8 +34,26 @@ futures-util = "0.3"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[features]
+# Drill and acceptance builds only: `zkapi --adversary <mode> serverd` makes
+# the server misbehave (withhold, born-spent, reuse-anchor, random-anchor,
+# overcharge, lie-expired, hang). Never enabled by a release or Docker build;
+# a release binary rejects the flag (CI checks it).
+adversary = []
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 uuid = { workspace = true }
 tempfile = { workspace = true }
+# Tests load the development setup (protocol/setup/v2-concession-dev) and use
+# the published development fixtures. Dev-dependency features never reach a
+# release build (resolver 2).
+zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof", features = ["dev-setup", "dev-fixtures"] }
+# The scripts/v2-acceptance.mjs wallet driver (examples/v2_acceptance_wallet.rs)
+# runs the browser wallet core of circuit zkapi-v2-concession-v1. A
+# dev-dependency: never part of a server build.
 zkapi-browser = { path = "../../protocol/rust/crates/zkapi-browser" }
+# The driver's `spend_refused_successor` synthesizes the request circuit for a
+# successor the client refused, to show the circuit itself cannot spend it.
+ark-bn254 = "0.5"
+ark-relations = "0.5"

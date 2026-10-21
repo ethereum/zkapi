@@ -44,15 +44,15 @@ func TestConfigureDefaultPromptsThenShowsTwentyDollarPayment(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "declined") || service.quoteCalls != 2 || service.approveCalls+service.resumeCalls != 0 {
 		t.Fatal("default config did not wait for funding before declining the deposit", err)
 	}
-	for _, want := range []string{"Deposit amount in USD (network fees are extra) [20]:", "Selected deposit: $20", "Funding address:", "Scan with an Ethereum wallet:", "?value=750001000030000", "config --edit", "config --menu", "Receiving account balance: 0.000000000000000000 ETH", "Waiting for ETH: receiving account balance 0.000000000000000000 ETH", "Payment information updated.", "Funds available. Receiving account balance: 0.001000000000000000 ETH.", "Press Enter to continue with this deposit, or type cancel:"} {
+	for _, want := range []string{"Deposit amount in USD (network fees are extra) [20]:", "Selected deposit: $20", "To:", "Scan with an Ethereum wallet:", "?value=750001000030000", "config --edit", "config --menu", "Send at least: 0.00076 ETH", "Funds available. Receiving account balance: 0.001000000000000000 ETH.", "Press Enter to continue with this deposit, or type cancel:"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("payment display missing %q", want)
 		}
 	}
-	if strings.Index(output.String(), "Deposit amount in USD") > strings.Index(output.String(), "Funding address:") {
+	if strings.Index(output.String(), "Deposit amount in USD") > strings.Index(output.String(), "To:") {
 		t.Fatal("payment shown before amount selection")
 	}
-	if strings.Index(output.String(), "Waiting for ETH:") > strings.Index(output.String(), "Funds available.") || strings.Index(output.String(), "Funds available.") > strings.Index(output.String(), "Press Enter to continue with this deposit") {
+	if strings.Index(output.String(), "Send at least:") > strings.Index(output.String(), "Funds available.") || strings.Index(output.String(), "Funds available.") > strings.Index(output.String(), "Press Enter to continue with this deposit") {
 		t.Fatal("continuation prompt appeared before waiting and showing the funded balance")
 	}
 	for _, unwanted := range []string{"openai/gpt-4.1-mini", "request cap", "enough for", "Automatically deposit this fixed amount", "(yes/no)"} {
@@ -139,7 +139,7 @@ func TestConfigureEditPreservesCredentialsAndAdvancedSettings(t *testing.T) {
 	if err := config.Update(dir, prior, original); err != nil {
 		t.Fatal(err)
 	}
-	ui := &startTestUI{answers: []string{"sepolia", "127.0.0.1:9876", "direct"}}
+	ui := &startTestUI{answers: []string{"sepolia", "127.0.0.1:9876", "direct", ""}}
 	called := false
 	err = configure(context.Background(), dir, []string{"--edit"}, ui, io.Discard, func(_ context.Context, _ string, c config.Config, action string, _ setupPrompter, _ io.Writer) error {
 		called = true
@@ -208,7 +208,7 @@ func TestConfigureNetworkEditsFollowDefaultVerifier(t *testing.T) {
 					ui := &startTestUI{}
 					if interactive {
 						args = []string{"--edit"}
-						ui.answers = []string{to, c.Listen, "direct"}
+						ui.answers = []string{to, c.Listen, "direct", ""}
 					}
 					want := c
 					want.ZKAPI.Network = to
@@ -301,7 +301,7 @@ func TestConfigureStatusAndExplicitKeyNeverStartService(t *testing.T) {
 }
 
 func TestConfigureMenuActionsAndNoOpCheck(t *testing.T) {
-	for _, choice := range []string{"check", "withdraw", "return", "quit"} {
+	for _, choice := range []string{"check", "withdraw", "return", "repair", "quit"} {
 		t.Run(choice, func(t *testing.T) {
 			dir, original := startTestConfig(t)
 			before, _ := os.ReadFile(filepath.Join(dir, "config.json"))

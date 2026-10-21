@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
-import { RpcError, createSigner, createUpstream, parseChainId } from './signer.mjs';
+import { ConfigError, RpcError, createSigner, createUpstream, parseSignerConfig } from './signer.mjs';
 
 export function createHttpServer(signer) {
   return createServer(async (request, response) => {
@@ -9,7 +9,10 @@ export function createHttpServer(signer) {
     if (request.method === 'GET' && request.url === '/health') {
       try {
         await signer.checkChain();
-        response.end(JSON.stringify({ status: 'ok', chain_id: Number(signer.chainId), sender: signer.sender, vault: signer.vault }));
+        const { sender, vault, ...policy } = signer.policy;
+        // Retirement refusals are reported, never a failed health check: a
+        // restart would start a new budget window.
+        response.end(JSON.stringify({ status: 'ok', chain_id: Number(signer.chainId), sender, vault, ...policy, ...signer.retirementStatus() }));
       } catch {
         response.statusCode = 503;
         response.end(JSON.stringify({ status: 'unavailable' }));
@@ -41,36 +44,53 @@ export function createHttpServer(signer) {
       const result = await signer.handle(payload.method, payload.params ?? []);
       response.end(JSON.stringify({ jsonrpc: '2.0', id, result }));
     } catch (error) {
-      // Never serialize unexpected Error objects or provider details.
+      // Never serialize unexpected Error objects or provider details. Signer
+      // errors carry only fixed messages and structured, secret-free data.
       const safe = error instanceof RpcError ? error : new RpcError(-32603, 'Signer request failed');
-      response.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: safe.code, message: safe.message } }));
+      const body = { code: safe.code, message: safe.message };
+      if (safe.data) body.data = safe.data;
+      response.end(JSON.stringify({ jsonrpc: '2.0', id, error: body }));
     }
   });
 }
 
+const decimal = value => BigInt(value).toString(10);
+
 async function main() {
-  const signer = createSigner({
-    privateKey: process.env.ZKAPI_CHALLENGE_PRIVATE_KEY,
-    chainId: parseChainId(process.env.ZKAPI_CHALLENGE_CHAIN_ID),
-    vault: process.env.ZKAPI_CHALLENGE_VAULT,
-    rpc: createUpstream(process.env.ZKAPI_CHALLENGE_RPC_URL),
-    maxGas: BigInt(process.env.ZKAPI_CHALLENGE_MAX_GAS ?? '12000000'),
-    maxGasPrice: BigInt(process.env.ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI ?? '10000000000'),
-  });
+  const { rpcUrl, listenHost, port, ...options } = parseSignerConfig(process.env);
+  const signer = createSigner({ ...options, rpc: createUpstream(rpcUrl) });
   delete process.env.ZKAPI_CHALLENGE_PRIVATE_KEY;
-  await signer.checkChain();
+  // Fails on a wrong chain or a block without a base fee. A low balance or a
+  // base fee above the cap only warns: the challenger waits for a healthy signer.
+  const status = await signer.status();
   const server = createHttpServer(signer);
   server.requestTimeout = 30_000;
   server.headersTimeout = 10_000;
-  const port = Number(process.env.ZKAPI_CHALLENGE_PORT ?? '8547');
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid port');
-  server.listen(port, process.env.ZKAPI_CHALLENGE_LISTEN_HOST ?? '127.0.0.1', () => {
-    console.log(JSON.stringify({ status: 'listening', chain_id: Number(signer.chainId), sender: signer.sender, vault: signer.vault }));
+  server.listen(port, listenHost, () => {
+    console.log(JSON.stringify({
+      status: 'listening', chain_id: Number(signer.chainId), sender: signer.sender, vault: signer.vault,
+      fee_model: 'eip1559', fee_cap_source: status.fee_cap_source,
+      max_fee_per_gas_wei: decimal(status.max_fee_per_gas), priority_fee_per_gas_wei: decimal(status.priority_fee_per_gas),
+      max_priority_fee_per_gas_wei: decimal(status.max_priority_fee_per_gas), fee_ceiling_wei: decimal(status.fee_ceiling),
+      // The highest maxFeePerGas a MAX_GAS transaction can bid within the tx fee cap.
+      tx_fee_cap_wei: decimal(status.tx_fee_cap_wei), max_fee_per_gas_allowed_at_max_gas_wei: decimal(BigInt(status.tx_fee_cap_wei) / BigInt(status.max_gas)),
+      max_gas: decimal(status.max_gas), required_balance_wei: decimal(status.required_balance), balance_wei: decimal(status.balance),
+      max_retirements_per_day: status.max_retirements_per_day, retire_on_miss: status.retire_on_miss,
+      retirement_lookback_blocks: status.retirement_lookback_blocks,
+      base_fee_per_gas_wei: decimal(status.base_fee_per_gas), warnings: status.warnings,
+    }));
   });
   process.on('SIGTERM', () => server.close());
   process.on('SIGINT', () => server.close());
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(() => { console.error('Challenge signer startup failed; check its private configuration and upstream RPC.'); process.exitCode = 1; });
+  main().catch(error => {
+    // Only fixed, secret-free messages are printed; anything else stays generic.
+    const reason = error instanceof ConfigError || error instanceof RpcError
+      ? `${error.message}${error.data?.reason ? ` (${error.data.reason})` : ''}`
+      : 'check its private configuration and upstream RPC';
+    console.error(`Challenge signer startup failed: ${reason}`);
+    process.exitCode = 1;
+  });
 }

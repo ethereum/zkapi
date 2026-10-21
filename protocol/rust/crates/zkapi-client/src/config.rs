@@ -33,4 +33,7 @@ pub struct ClientConfig {
     /// Server signing keys pinned by the deployment contract/configuration.
     pub state_signing_key: CurvePointWire,
     pub clearance_signing_key: CurvePointWire,
+    /// W: the build-pinned `settlement_window_seconds` of the deployment,
+    /// for the near-expiry refusal (C4).
+    pub settlement_window_seconds: u64,
 }

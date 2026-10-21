@@ -11,6 +11,17 @@ zkapi-core   = { workspace = true }
 zkapi-proof  = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
+hex          = { workspace = true }
 uuid         = { workspace = true }
 reqwest      = { workspace = true }
-thiserror       = { workspace = true }
+thiserror    = { workspace = true }
+# Clearance retry backoff; already in the graph through reqwest.
+tokio        = { version = "1", features = ["time"] }
+tracing      = "0.1"
+
+[dev-dependencies]
+tokio        = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
+# The tests prove with the committed development setup
+# (protocol/setup/v2-concession-dev), which only a `dev-setup` build loads.
+# A dev-dependency feature never reaches a normal build of this crate.
+zkapi-proof  = { workspace = true, features = ["dev-setup"] }

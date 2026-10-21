@@ -51,7 +51,7 @@ func (c *Client) NativeUSDQuote(ctx context.Context) (NativeUSDQuote, error) {
 	if err := decoder.Decode(&quote); err != nil {
 		return NativeUSDQuote{}, &Error{http.StatusBadGateway, "invalid_native_quote"}
 	}
-	_, manifest, err := pinnedDeployment(c.config.Network)
+	_, manifest, err := deployedDeployment(c.config.Network)
 	if err != nil {
 		return NativeUSDQuote{}, err
 	}

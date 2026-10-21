@@ -7,7 +7,13 @@ optimizer = true
 optimizer_runs = 10000
 ffi = false
 via_ir = true
-fs_permissions = [{ access = "read", path = "./" }]
+# Reproducible runtime code (expected codehashes, scripts/expected-codehashes.mjs): no metadata
+# hash and no CBOR trailer, so the code depends only on source, settings, immutables and links.
+bytecode_hash = "none"
+cbor_metadata = false
+# Artifacts carry the AST, which expected-codehashes.mjs reads to name immutableReferences.
+ast = true
+fs_permissions = [{ access = "read", path = "./" }, { access = "read", path = "../setup" }]
 
 [profile.default.fuzz]
 runs = 256

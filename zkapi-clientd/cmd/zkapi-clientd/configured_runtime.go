@@ -30,13 +30,14 @@ func configuredRuntime(expected config.Config) startRuntime {
 	}
 }
 
-// Serve never reads the terminal or authorizes funding.
-// It uses the same authenticated startup checks as config, then stays running.
+// Serve opens a missing note through the authenticated funding flow, then stays running.
+// A reserved withdrawal or uncertain transaction is never replaced.
 func runConfiguredServe(ctx context.Context, dir string, c, expected config.Config, out io.Writer) error {
+	ctx = context.WithValue(ctx, coverServeKey{}, true)
 	ui := &noninteractiveSetup{out: out}
 	runtime := configuredRuntime(expected)
 	runtime.testnet = checkSepoliaAccess
-	runtime.fund = checkConfiguredZKAPI
+	runtime.fund = ensureServeFunding
 	err := guidedStart(ctx, dir, startOptions{prepared: &c, checkOnly: true}, ui, out, runtime)
 	if ctx.Err() != nil {
 		return nil
@@ -128,6 +129,10 @@ func runConfigActionWithUSD(ctx context.Context, dir string, c config.Config, ac
 		runtime.fund = func(ctx context.Context, c config.Config, _, _ string, ui setupPrompter) error {
 			return configurePayment(ctx, c, action, ui)
 		}
+	case "repair":
+		runtime.fund = func(ctx context.Context, c config.Config, _, _ string, ui setupPrompter) error {
+			return runGuidedRepair(ctx, c, ui)
+		}
 	case "status":
 		runtime.fund = checkConfiguredZKAPI
 	default:
@@ -150,7 +155,7 @@ func runConfigActionWithUSD(ctx context.Context, dir string, c config.Config, ac
 
 func configurePayment(ctx context.Context, c config.Config, action string, ui setupPrompter) error {
 	if action == "withdraw" {
-		return runGuidedWithdrawal(ctx, c, ui)
+		return withdrawWithRemainder(ctx, c, ui)
 	}
 	out := setupUIWriter{ui}
 	var selectedDestination, selectedAmount string

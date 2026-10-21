@@ -1,0 +1,2 @@
+# Unified diff context starts with a space, including blank lines and Go tabs.
+privacy.patch -whitespace

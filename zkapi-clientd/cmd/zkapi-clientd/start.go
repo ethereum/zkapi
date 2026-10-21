@@ -387,6 +387,9 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 	if err != nil {
 		return err
 	}
+	if err := zkapi.RequireDeployment(c.ZKAPI.Network); err != nil {
+		return err
+	}
 	if options.prepared == nil && runtime.active != nil {
 		checkCtx, checkCancel := context.WithTimeout(ctx, 3*time.Second)
 		active, activeErr := runtime.active(checkCtx, c)

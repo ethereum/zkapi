@@ -1,5 +1,15 @@
 FROM nginx:1.28-alpine
 
-# Public proving artifacts must come from the same checkout as the daemon image.
-COPY protocol/setup/v2/request.pk protocol/setup/v2/withdrawal.pk protocol/setup/v2/manifest.json /srv/zkapi/proofs/
+# Public proving artifacts must come from the same checkout as the daemon image,
+# and be built with the same ALLOW_DEV_SETUP (compose.yml passes it to both):
+# the ceremony setup of circuit zkapi-v2-concession-v1 by default, or with
+# ALLOW_DEV_SETUP=1 the single-party development setup. nginx serves only
+# request.pk, withdrawal.pk and manifest.json; until G-SETUP commits the
+# ceremony keys those routes answer 404 in a default build.
+ARG ALLOW_DEV_SETUP=
+RUN case "$ALLOW_DEV_SETUP" in \
+        '' | 1) ;; \
+        *) echo "ALLOW_DEV_SETUP must be 1 or unset" >&2; exit 1 ;; \
+    esac
+COPY protocol/setup/v2-concession${ALLOW_DEV_SETUP:+-dev}/ /srv/zkapi/proofs/
 COPY docker/aws/nginx.conf /etc/nginx/nginx.conf

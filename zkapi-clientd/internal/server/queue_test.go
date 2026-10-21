@@ -63,7 +63,12 @@ func TestConcurrentBurstWaitsInsteadOfRejecting(t *testing.T) {
 			results <- resp.StatusCode
 		}()
 	}
-	waitForRequests(t, func() bool { return len(api.pending) == burst })
+	// Every request is admitted and one holds the only slot. A request is
+	// counted pending before it takes a slot, so the one that holds it may
+	// not have reached the backend yet: wait for it too, then check that no
+	// queued request started backend work.
+	waitForRequests(t, func() bool { return len(api.pending) == burst && backend.calls.Load() >= 1 })
+	time.Sleep(20 * time.Millisecond)
 	if backend.calls.Load() != 1 {
 		t.Fatal("waiting request started backend work")
 	}

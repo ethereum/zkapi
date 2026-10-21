@@ -1,6 +1,24 @@
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
+import {
+    EVICTED_DISPOSITION,
+    REQUEST_JOURNAL_TYPE,
+    anchorArchiveCapacity,
+    buildRequestEvidenceRecord,
+    buildRequestJournalRecord,
+    feltKey,
+    isRequestArchiveRecord,
+    isUnresolved,
+    journalClientRequestId,
+    mergeRequestArchiveRecord,
+    requestJournalArchiveId,
+    sequenceObservationUpdates,
+    terminalRequestArchiveToPrune
+} from './zkapiRequestArchive.mjs';
 
 const DB_NAME = 'zkapi-browser-wallet-v1';
+// Never bump: older builds must keep opening this shared same-origin database
+// (they are the legacy exit route for notes in an older immutable vault).
+// Request-archive records reuse the existing 'archives' store instead.
 const DB_VERSION = 3;
 const RUNTIME_STORE = 'runtime';
 const ARCHIVE_STORE = 'archives';
@@ -16,6 +34,8 @@ const LATE_WITHDRAWAL_TERMINAL_STATUSES = new Set([
     'quarantined'
 ]);
 
+const LATE_DEPOSIT_TERMINAL_STATUSES = new Set(['confirmed', 'reverted', 'superseded']);
+
 const EMPTY_RUNTIME = Object.freeze({
     version: 1,
     deploymentId: null,
@@ -24,6 +44,9 @@ const EMPTY_RUNTIME = Object.freeze({
     pendingDeposit: null,
     depositQuote: null,
     preparedWithdrawal: null,
+    // Design §6.2: { noteId, anchor, mode, since, released: [...] } while an
+    // exit decision or a released exit proof freezes the note (C3, E6).
+    exitLock: null,
     lease: null,
     lateWithdrawalAttempts: [],
     lateDepositAttempts: [],
@@ -248,6 +271,126 @@ function pendingDepositRecords(runtime, deploymentId) {
     return [...records.values()];
 }
 
+function requestArchiveMap(archives) {
+    return new Map((archives || []).filter(isRequestArchiveRecord)
+        .map(record => [record.archiveId, record]));
+}
+
+function requestArchiveRecords(archive, deploymentId) {
+    return [...archive.values()]
+        .filter(record => !deploymentId || record.deploymentId === deploymentId)
+        .map(record => structuredClone(record));
+}
+
+function sameFeltValue(left, right) {
+    try {
+        return feltKey(left) === feltKey(right);
+    } catch {
+        return false;
+    }
+}
+
+function requestArchiveError(message, code, status = null) {
+    return Object.assign(new Error(message), { code, ...(status ? { status } : {}) });
+}
+
+/**
+ * Merge request-archive updates into an in-memory snapshot of the store.
+ * Throws on an identity conflict or when a new unresolved request would exceed
+ * its anchor's bound. Eviction is non-terminal and keeps every journal intact.
+ * Every appended observation is stamped with its save order here, inside the
+ * write transaction that holds every record. Returns the ids that must be
+ * written.
+ */
+function mergeRequestArchiveUpdates(archive, updates, now, { enforceCapacity = true } = {}) {
+    const changed = new Set();
+    for (const update of sequenceObservationUpdates([...archive.values()], updates)) {
+        const previous = archive.get(update?.archiveId) || null;
+        if (!previous && enforceCapacity && update?.type === REQUEST_JOURNAL_TYPE && isUnresolved(update)) {
+            const capacity = anchorArchiveCapacity([...archive.values()], update);
+            if (!capacity.available) {
+                throw requestArchiveError(
+                    'Too many unsettled private requests are recorded for this balance state, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw this balance.',
+                    'request_archive_limit',
+                    409
+                );
+            }
+            for (const archiveId of capacity.evict) {
+                const evicted = mergeRequestArchiveRecord(archive.get(archiveId),
+                    { archiveId, disposition: EVICTED_DISPOSITION }, now);
+                archive.set(archiveId, evicted);
+                changed.add(archiveId);
+            }
+        }
+        const merged = mergeRequestArchiveRecord(previous, update, now);
+        if (merged && merged !== previous) {
+            archive.set(merged.archiveId, merged);
+            changed.add(merged.archiveId);
+        }
+    }
+    return changed;
+}
+
+function writeRequestArchiveChanges(store, archive, changed) {
+    if (!changed.size) return;
+    for (const archiveId of changed) store.put(archive.get(archiveId));
+    const deployments = new Set([...changed].map(archiveId => archive.get(archiveId)?.deploymentId).filter(Boolean));
+    for (const deploymentId of deployments) {
+        for (const archiveId of terminalRequestArchiveToPrune([...archive.values()], deploymentId)) {
+            // Prune filters by request type and prefix, so note archives are untouched.
+            archive.delete(archiveId);
+            store.delete(archiveId);
+        }
+    }
+}
+
+/** Supersede every unresolved request record of a closed or sanitized note. */
+function supersedeNoteRequestArchive(archive, deploymentId, noteId, now) {
+    if (!deploymentId || noteId == null) return new Set();
+    const updates = [...archive.values()]
+        .filter(record => record.deploymentId === deploymentId && Number(record.noteId) === Number(noteId)
+            && isUnresolved(record))
+        .map(record => ({ archiveId: record.archiveId, disposition: 'superseded' }));
+    return mergeRequestArchiveUpdates(archive, updates, now, { enforceCapacity: false });
+}
+
+/**
+ * The archive record an existing transmitted journal needs before this write
+ * may drop it: null when the journal is kept, has no request identity (legacy),
+ * or the write installs a different note or a later anchor (a verified receipt).
+ */
+function journalDropArchiveId(current, next) {
+    const clientRequestId = journalClientRequestId(current?.journal);
+    if (!clientRequestId || !current?.deploymentId || current.state?.note_id == null
+        || current.state.current_anchor == null) return null;
+    if (journalClientRequestId(next?.journal) === clientRequestId) return null;
+    if (next?.state && (Number(next.state.note_id) !== Number(current.state.note_id)
+        || !sameFeltValue(next.state.current_anchor, current.state.current_anchor))) return null;
+    try {
+        return requestJournalArchiveId(current.deploymentId, current.state.note_id, clientRequestId);
+    } catch {
+        return null;
+    }
+}
+
+/** A durable request journal written by an older build becomes archive-covered on first read. */
+function migratedRuntimeJournal(runtime, archive) {
+    if (!runtime.deploymentId || !runtime.state || runtime.state.current_anchor == null
+        || runtime.journal?.nullifier == null || !journalClientRequestId(runtime.journal)) return null;
+    let record;
+    try {
+        record = buildRequestJournalRecord({
+            deploymentId: runtime.deploymentId,
+            state: runtime.state,
+            journal: runtime.journal,
+            source: 'migrated_runtime_journal'
+        });
+    } catch {
+        return null;
+    }
+    return archive.has(record.archiveId) ? null : record;
+}
+
 /** Project public rows without another fallible storage operation after commit. */
 export function projectBrowserDeposits(runtime, records, deploymentId, depositConfirmation = {}) {
     const history = depositRecordMap((records || []).filter(record => record.status === 'confirmed'));
@@ -260,6 +403,126 @@ export function projectBrowserDeposits(runtime, records, deploymentId, depositCo
             : deposit.noteId === record.noteId && deposit.amount === record.amount)));
     return [...confirmed, ...pending].sort((left, right) =>
         Number(right.createdAt || right.confirmedAt || 0) - Number(left.createdAt || left.confirmedAt || 0));
+}
+
+/**
+ * Whether a stored runtime slot holds durable wallet state: a note, journal,
+ * exit lock, lease, pending deposit, deposit draft, prepared withdrawal or
+ * unfinished late attempt. A runtime for another deployment refuses to load
+ * over such a slot.
+ */
+export function browserRuntimeHoldsState(runtime) {
+    const value = runtime || {};
+    return Boolean(
+        value.state
+        || value.journal
+        || value.exitLock
+        || value.pendingDeposit
+        || value.depositQuote
+        || value.preparedWithdrawal
+        || value.lease
+        || (Array.isArray(value.lateWithdrawalAttempts)
+            && value.lateWithdrawalAttempts.some(attempt => !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt?.status)))
+        || (Array.isArray(value.lateDepositAttempts)
+            && value.lateDepositAttempts.some(attempt => !LATE_DEPOSIT_TERMINAL_STATUSES.has(attempt?.status)))
+    );
+}
+
+/**
+ * Whether a withdrawal record can still hold, return or pay out a note: every
+ * record except a finalized close (phase 'closed' with no finalization in
+ * flight). That covers set-aside mutual closes, pending and challenged
+ * escapes, closes awaiting finality and finalizations in flight. Only its own
+ * deployment's runtime can act on it.
+ */
+export function isOpenBrowserWithdrawal(record) {
+    if (!record || record.phase !== 'closed') return Boolean(record);
+    const hashes = Array.isArray(record.finalizeTransactionHashes)
+        ? record.finalizeTransactionHashes
+        : record.finalizeTransactionHash ? [record.finalizeTransactionHash] : [];
+    return Boolean(record.finalizeSubmissionId || hashes.length);
+}
+
+/** The public identity of an open withdrawal record: no note state or proof. */
+function withdrawalHolding(record) {
+    return {
+        recordId: record.recordId,
+        noteId: record.noteId == null ? null : Number(record.noteId),
+        mode: record.mode || null,
+        phase: record.phase || null
+    };
+}
+
+/**
+ * The deployments this browser still holds funds or unfinished recovery for,
+ * from one readBrowserWalletSnapshot(): the runtime slot's deployment while
+ * browserRuntimeHoldsState(runtime), and every deployment with an open
+ * withdrawal record (isOpenBrowserWithdrawal). Returns
+ * [{ deploymentId, runtime, withdrawals: [{ recordId, noteId, mode, phase }] }],
+ * the runtime slot's deployment first: only that one can load while its slot
+ * holds state. Hosts select a deployment's profile while it is listed.
+ */
+export function browserWalletHoldings(snapshot) {
+    const holdings = new Map();
+    const entry = deploymentId => {
+        if (!holdings.has(deploymentId)) holdings.set(deploymentId, { deploymentId, runtime: false, withdrawals: [] });
+        return holdings.get(deploymentId);
+    };
+    const runtime = snapshot?.runtime;
+    if (browserRuntimeHoldsState(runtime)) entry(runtime.deploymentId || null).runtime = true;
+    for (const record of snapshot?.withdrawals || []) {
+        if (isOpenBrowserWithdrawal(record)) entry(record.deploymentId || null).withdrawals.push(withdrawalHolding(record));
+    }
+    return [...holdings.values()].sort((left, right) => Number(right.runtime) - Number(left.runtime)
+        || String(left.deploymentId).localeCompare(String(right.deploymentId)));
+}
+
+/** browserWalletHoldings of the current stored wallet (every deployment). */
+export async function readBrowserWalletHoldings() {
+    return browserWalletHoldings(await readBrowserWalletSnapshot());
+}
+
+/**
+ * Whether a withdrawal record is a closed escape whose payout the vault only
+ * credited (EscapePayoutDeferred) and that this browser has not seen
+ * delivered. Once its close is final it holds no note, so it does not keep its
+ * deployment in browserWalletHoldings and does not block a deposit elsewhere;
+ * what remains is claimEscapePayout(destination) on its vault.
+ */
+export function isUnclaimedPayoutCredit(record) {
+    return record?.payoutCredited === true && record.payoutClaimed !== true
+        && ['closed_unconfirmed', 'closed'].includes(record.phase);
+}
+
+/** The public identity of an unclaimed payout credit: where it can be claimed. */
+function payoutCreditHolding(record) {
+    return {
+        deploymentId: record.deploymentId || null,
+        recordId: record.recordId,
+        noteId: record.noteId == null ? null : Number(record.noteId),
+        chainId: record.chainId == null ? null : Number(record.chainId),
+        contractAddress: record.contractAddress || null,
+        destination: record.destination || null,
+        creditedAmount: record.creditedAmount ?? null
+    };
+}
+
+/**
+ * The unclaimed escape payout credits of every deployment in one
+ * readBrowserWalletSnapshot(), newest first:
+ * [{ deploymentId, recordId, noteId, chainId, contractAddress, destination,
+ * creditedAmount }]. creditedAmount (vault units) is null when the credit was
+ * read from the vault's balance rather than from the finalization receipt.
+ */
+export function browserWalletPayoutCredits(snapshot) {
+    return (snapshot?.withdrawals || []).filter(isUnclaimedPayoutCredit)
+        .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
+        .map(payoutCreditHolding);
+}
+
+/** browserWalletPayoutCredits of the current stored wallet (every deployment). */
+export async function readBrowserWalletPayoutCredits() {
+    return browserWalletPayoutCredits(await readBrowserWalletSnapshot());
 }
 
 export async function readBrowserWallet() {
@@ -288,8 +551,18 @@ export async function readBrowserWalletSnapshot(deploymentId = null) {
     for (const record of records) {
         mergeDepositRecord(history, depositRecord(record.state, record.deploymentId), depositStore);
     }
+    // Request-archive records carry no note state, so older builds running
+    // this same loop derive no deposit row from them.
     for (const archive of archives) {
         mergeDepositRecord(history, depositRecord(archive.state, archiveDeploymentId(archive)), depositStore);
+    }
+    const requestArchive = requestArchiveMap(archives);
+    // Lazy, cap-exempt migration: an in-flight journal from an older build
+    // becomes a transmitted-anchor record without touching the runtime slot.
+    const migrated = migratedRuntimeJournal(runtime, requestArchive);
+    if (migrated) {
+        requestArchive.set(migrated.archiveId, migrated);
+        transaction.objectStore(ARCHIVE_STORE).put(migrated);
     }
     await transactionDone(transaction);
     return {
@@ -297,30 +570,113 @@ export async function readBrowserWalletSnapshot(deploymentId = null) {
         deposits: projectBrowserDeposits(runtime, [...history.values()], deploymentId),
         withdrawals: records
             .filter(record => !deploymentId || record.deploymentId === deploymentId)
-            .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
+            .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0)),
+        // Open withdrawals of other deployments, which this deployment's
+        // runtime can neither see nor act on (empty without a filter).
+        otherDeploymentWithdrawals: deploymentId
+            ? records.filter(record => record.deploymentId !== deploymentId && isOpenBrowserWithdrawal(record))
+                .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
+                .map(record => ({ deploymentId: record.deploymentId || null, ...withdrawalHolding(record) }))
+            : [],
+        // Unclaimed escape payout credits of other deployments. They hold no
+        // note, but only their own deployment's runtime offers the claim.
+        otherDeploymentCredits: deploymentId
+            ? browserWalletPayoutCredits({
+                withdrawals: records.filter(record => record.deploymentId !== deploymentId)
+            })
+            : [],
+        requestArchive: requestArchiveRecords(requestArchive, deploymentId)
     };
 }
 
 /**
- * Commit the entire private wallet snapshot in one IndexedDB write. The caller
- * must put a write-ahead journal here before transmitting a proved request and
- * clear it only in the same write that installs the verified next note state.
+ * Commit the entire private wallet snapshot in one IndexedDB write, together
+ * with any transmitted-request archive records. The caller must put a
+ * write-ahead journal and its archive record here before transmitting a proved
+ * request. This boundary enforces that a transmitted journal leaves the
+ * runtime only in the same write that installs a verified next note state
+ * (a later anchor or a different note) or records a non-pending archive
+ * disposition for it. Returns the runtime and, when the archive was read, the
+ * deployment's merged request records (no fallible read after commit).
  */
-export async function writeBrowserWallet(next, { depositConfirmation = null } = {}) {
+export async function commitBrowserWallet(next, { depositConfirmation = null, requestArchive = [] } = {}) {
+    const updates = (Array.isArray(requestArchive) ? requestArchive : []).filter(Boolean);
     const database = await openDatabase();
-    const transaction = durableTransaction(database, [RUNTIME_STORE, DEPOSIT_STORE]);
+    const transaction = durableTransaction(database, [RUNTIME_STORE, DEPOSIT_STORE, ARCHIVE_STORE]);
     const value = normalizeRuntime({ ...next, updatedAt: Date.now() });
     const depositStore = transaction.objectStore(DEPOSIT_STORE);
+    const archiveStore = transaction.objectStore(ARCHIVE_STORE);
     const [current, deposits] = await Promise.all([
         requestResult(transaction.objectStore(RUNTIME_STORE).get(RUNTIME_KEY)),
         requestResult(depositStore.getAll())
     ]);
+    const requiredArchiveId = journalDropArchiveId(normalizeRuntime(current), value);
+    let archive = null;
+    let changed = new Set();
+    // Validate before any put: a rejected write must leave every store unchanged.
+    try {
+        if (updates.length || requiredArchiveId) {
+            archive = requestArchiveMap(await requestResult(archiveStore.getAll()));
+            changed = mergeRequestArchiveUpdates(archive, updates, value.updatedAt);
+            const record = requiredArchiveId ? archive.get(requiredArchiveId) : null;
+            if (requiredArchiveId && (!record || record.disposition === 'pending')) {
+                throw requestArchiveError(
+                    'A transmitted request journal can only be cleared after the archive records its outcome.',
+                    'request_journal_unarchived'
+                );
+            }
+        }
+    } catch (error) {
+        try { transaction.abort(); } catch { /* Preserve the validation failure. */ }
+        throw error;
+    }
     const history = depositRecordMap(deposits);
     mergeDepositRecord(history, depositRecord(current?.state, current?.deploymentId), depositStore);
     mergeDepositRecord(history, depositRecord(value.state, value.deploymentId, depositConfirmation || {}), depositStore);
     transaction.objectStore(RUNTIME_STORE).put(value, RUNTIME_KEY);
+    if (archive) writeRequestArchiveChanges(archiveStore, archive, changed);
     await transactionDone(transaction);
-    return value;
+    return {
+        runtime: value,
+        requestArchive: archive ? requestArchiveRecords(archive, value.deploymentId) : null
+    };
+}
+
+/** Commit the wallet snapshot; see commitBrowserWallet for the journal invariant. */
+export async function writeBrowserWallet(next, options = {}) {
+    return (await commitBrowserWallet(next, options)).runtime;
+}
+
+/** Read the deployment's transmitted-request archive records. */
+export async function listBrowserRequestArchive(deploymentId = null) {
+    const database = await openDatabase();
+    const transaction = database.transaction(ARCHIVE_STORE, 'readonly');
+    const archives = await requestResult(transaction.objectStore(ARCHIVE_STORE).getAll());
+    await transactionDone(transaction);
+    return requestArchiveRecords(requestArchiveMap(archives), deploymentId);
+}
+
+/**
+ * Durably merge request-archive records or patches (observations, evidence,
+ * dispositions) without touching the runtime slot. Returns the merged records
+ * of the given deployment.
+ */
+export async function putBrowserRequestArchive(records, { deploymentId = null } = {}) {
+    const updates = (Array.isArray(records) ? records : [records]).filter(Boolean);
+    const database = await openDatabase();
+    const transaction = durableTransaction(database, ARCHIVE_STORE);
+    const store = transaction.objectStore(ARCHIVE_STORE);
+    const archive = requestArchiveMap(await requestResult(store.getAll()));
+    let changed;
+    try {
+        changed = mergeRequestArchiveUpdates(archive, updates, Date.now());
+    } catch (error) {
+        try { transaction.abort(); } catch { /* Preserve the validation failure. */ }
+        throw error;
+    }
+    writeRequestArchiveChanges(store, archive, changed);
+    await transactionDone(transaction);
+    return requestArchiveRecords(archive, deploymentId);
 }
 
 /**
@@ -393,6 +749,15 @@ export async function archiveBrowserWallet(reason = 'closed', expectedNoteId = n
             throw new Error('This private note has no matching confirmed expiry claim.');
         }
     }
+    const archiveStore = transaction.objectStore(ARCHIVE_STORE);
+    // A closed note's transmitted requests can never install again. Compact
+    // them so their proofs and rerandomization do not outlive the note.
+    const requestArchive = current.state
+        ? requestArchiveMap(await requestResult(archiveStore.getAll()))
+        : new Map();
+    const supersededRequests = current.state
+        ? supersedeNoteRequestArchive(requestArchive, current.deploymentId, current.state.note_id, Date.now())
+        : new Set();
     if (current.state) {
         transaction.objectStore(ARCHIVE_STORE).put({
             archiveId: `${current.deploymentId || 'deployment'}:${current.state.note_id}:${Date.now()}`,
@@ -417,6 +782,7 @@ export async function archiveBrowserWallet(reason = 'closed', expectedNoteId = n
         updatedAt: Date.now()
     });
     runtimeStore.put(next, RUNTIME_KEY);
+    writeRequestArchiveChanges(archiveStore, requestArchive, supersededRequests);
     await transactionDone(transaction);
     return next;
 }
@@ -468,6 +834,9 @@ export async function detachBrowserEscapeWithdrawal(record) {
         deploymentId: record.deploymentId || current.deploymentId,
         state: current.state,
         preparedWithdrawal: current.preparedWithdrawal,
+        // The exit lock (design §6.2) stays with the note until it closes or
+        // its released proofs expire (E6).
+        exitLock: current.exitLock || null,
         clearanceReserved: current.preparedWithdrawal?.clearanceReserved === true
             || record.clearanceReserved === true,
         withdrawalNullifier: current.preparedWithdrawal?.withdrawalNullifier
@@ -519,6 +888,9 @@ export async function detachBrowserClosedWithdrawal(record) {
         phase: 'closed_unconfirmed',
         state: current.state,
         preparedWithdrawal: current.preparedWithdrawal,
+        // The exit lock (design §6.2) stays with the note until it closes or
+        // its released proofs expire (E6).
+        exitLock: current.exitLock || null,
         clearanceReserved: current.preparedWithdrawal?.clearanceReserved === true
             || current.preparedWithdrawal?.mode === 'mutual'
             || record.clearanceReserved === true,
@@ -744,6 +1116,7 @@ export async function transferBrowserLateWithdrawalAttempt(identity, record) {
         noteId: Number(identity.noteId),
         state: existing?.state || current.state,
         preparedWithdrawal,
+        exitLock: existing?.exitLock || (selectedOwns ? current.exitLock || null : null),
         clearanceReserved: existing?.clearanceReserved === true
             || preparedWithdrawal?.clearanceReserved === true
             || preparedWithdrawal?.mode === 'mutual'
@@ -851,6 +1224,7 @@ export async function transferBrowserLateWithdrawalAttempt(identity, record) {
             state: null,
             journal: null,
             preparedWithdrawal: null,
+            exitLock: null,
             lease: null
         } : {}),
         lateWithdrawalAttempts: [...terminalHistory, ...unresolved],
@@ -1634,6 +2008,24 @@ export async function releaseBrowserWithdrawalStartSubmission(recordId, submissi
 }
 
 /** Park a withdrawal-only mutual-close note so a fresh note can be funded. */
+/**
+ * Whether a prepared withdrawal may be set aside (parked): a mutual close
+ * whose clearance the server granted for exactly its state's nullifier, with
+ * no escape proof released from its exit lock. A parked note leaves only by
+ * that close (performBackgroundWithdrawal), which then needs nothing more
+ * from the operator; a note without a granted clearance must exit through
+ * the exit rules first (escape, E2.5 and E3).
+ */
+export function preparedWithdrawalParkable(prepared, exitLock = null) {
+    const nullifier = prepared?.withdrawalNullifier ?? prepared?.public_inputs?.withdrawal_nullifier ?? null;
+    const clearance = prepared?.clearance;
+    return Boolean(prepared && prepared.mode === 'mutual' && nullifier != null && clearance?.signature
+        && clearance.withdrawal_nullifier != null && sameFeltValue(clearance.withdrawal_nullifier, nullifier)
+        && !(exitLock?.released || []).some(entry => Number(entry.kind) === 0));
+}
+
+export const PARK_REQUIRES_CLEARANCE_MESSAGE = 'Only a balance whose cooperative close the server granted can be set aside. Withdraw this balance first: its escape needs nothing from the server.';
+
 export async function parkBrowserWithdrawal(record) {
     if (!record?.recordId || record.noteId == null) {
         throw new Error('A parked withdrawal requires a durable note identity.');
@@ -1651,6 +2043,10 @@ export async function parkBrowserWithdrawal(record) {
         transaction.abort();
         throw new Error('Finish the other private-balance operation before setting this balance aside.');
     }
+    if (!preparedWithdrawalParkable(current.preparedWithdrawal, current.exitLock)) {
+        transaction.abort();
+        throw Object.assign(new Error(PARK_REQUIRES_CLEARANCE_MESSAGE), { code: 'park_requires_clearance', status: 409 });
+    }
     const prepared = current.preparedWithdrawal;
     const hashes = Array.isArray(prepared.transactionHashes)
         ? prepared.transactionHashes
@@ -1666,6 +2062,9 @@ export async function parkBrowserWithdrawal(record) {
         deploymentId: record.deploymentId || current.deploymentId,
         state: current.state,
         preparedWithdrawal: current.preparedWithdrawal,
+        // The exit lock (design §6.2) stays with the note until it closes or
+        // its released proofs expire (E6).
+        exitLock: current.exitLock || null,
         clearanceReserved: current.preparedWithdrawal.clearanceReserved === true
             || current.preparedWithdrawal.mode === 'mutual',
         withdrawalNullifier: current.preparedWithdrawal.withdrawalNullifier
@@ -1694,12 +2093,14 @@ export async function parkBrowserWithdrawal(record) {
  */
 export async function restoreBrowserWithdrawal(recordId, identity = {}, expectedRevision = null) {
     const database = await openDatabase();
-    const transaction = durableTransaction(database, [RUNTIME_STORE, WITHDRAWAL_STORE]);
+    const transaction = durableTransaction(database, [RUNTIME_STORE, WITHDRAWAL_STORE, ARCHIVE_STORE]);
     const runtimeStore = transaction.objectStore(RUNTIME_STORE);
     const withdrawalStore = transaction.objectStore(WITHDRAWAL_STORE);
-    const [current, record] = await Promise.all([
+    const archiveStore = transaction.objectStore(ARCHIVE_STORE);
+    const [current, record, archives] = await Promise.all([
         requestResult(runtimeStore.get(RUNTIME_KEY)).then(normalizeRuntime),
-        requestResult(withdrawalStore.get(recordId))
+        requestResult(withdrawalStore.get(recordId)),
+        requestResult(archiveStore.getAll())
     ]);
     if (!record?.state) {
         transaction.abort();
@@ -1782,16 +2183,44 @@ export async function restoreBrowserWithdrawal(recordId, identity = {}, expected
         delete preparedWithdrawal.submissionOwner;
         delete preparedWithdrawal.submissionStartedAt;
     }
+    // Only a finalized EscapeWithdrawalChallenged log for this exact note and
+    // nullifier (verified by the reconciler) becomes challenge evidence. A
+    // reorged-out start or a canceled replacement carries none.
+    const requestArchive = requestArchiveMap(archives);
+    let evidenceChanges = new Set();
+    const challenge = record.challengeEvidence;
+    if (record.mode === 'escape' && challenge && record.state.current_anchor != null
+        && Number(challenge.noteId) === Number(record.noteId)
+        && challenge.nullifier != null && record.withdrawalNullifier != null
+        && sameFeltValue(challenge.nullifier, record.withdrawalNullifier)) {
+        try {
+            evidenceChanges = mergeRequestArchiveUpdates(requestArchive, [buildRequestEvidenceRecord({
+                deploymentId: record.deploymentId,
+                noteId: record.noteId,
+                anchor: record.state.current_anchor,
+                nullifier: challenge.nullifier,
+                source: 'escape_challenged',
+                evidence: challenge
+            })], Date.now(), { enforceCapacity: false });
+        } catch (error) {
+            transaction.abort();
+            throw error;
+        }
+    }
     const next = normalizeRuntime({
         deploymentId: record.deploymentId,
         state: record.state,
         preparedWithdrawal,
+        // A defeated escape's proof cannot land again, but the lock is
+        // released only by the E6 rules.
+        exitLock: record.exitLock || null,
         lateWithdrawalAttempts: current.lateWithdrawalAttempts || [],
         lateDepositAttempts: current.lateDepositAttempts || [],
         updatedAt: Date.now()
     });
     runtimeStore.put(next, RUNTIME_KEY);
     withdrawalStore.delete(recordId);
+    writeRequestArchiveChanges(archiveStore, requestArchive, evidenceChanges);
     await transactionDone(transaction);
     return next;
 }
@@ -1803,7 +2232,8 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
     expectedFinalizeTransactionHash = undefined
 } = {}) {
     const database = await openDatabase();
-    const transaction = durableTransaction(database, [WITHDRAWAL_STORE, DEPOSIT_STORE]);
+    const transaction = durableTransaction(database,
+        sanitize ? [WITHDRAWAL_STORE, DEPOSIT_STORE, ARCHIVE_STORE] : [WITHDRAWAL_STORE, DEPOSIT_STORE]);
     const store = transaction.objectStore(WITHDRAWAL_STORE);
     const current = await requestResult(store.get(recordId));
     if (!current) {
@@ -1838,7 +2268,17 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
         // Preserve the original deposit before finality removes the last copy
         // of a legacy note's private recovery state.
         const depositStore = transaction.objectStore(DEPOSIT_STORE);
-        const deposits = await requestResult(depositStore.getAll());
+        const archiveStore = transaction.objectStore(ARCHIVE_STORE);
+        const [deposits, archives] = await Promise.all([
+            requestResult(depositStore.getAll()),
+            requestResult(archiveStore.getAll())
+        ]);
+        if (next.phase === 'closed') {
+            // A finalized close retires every transmitted request of this note.
+            const requestArchive = requestArchiveMap(archives);
+            writeRequestArchiveChanges(archiveStore, requestArchive, supersedeNoteRequestArchive(
+                requestArchive, current.deploymentId, current.noteId ?? current.state?.note_id, Date.now()));
+        }
         mergeDepositRecord(depositRecordMap(deposits),
             depositRecord(current.state, current.deploymentId), depositStore);
         if (next.phase === 'closed') {
@@ -1874,6 +2314,7 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
         }
         delete next.state;
         delete next.preparedWithdrawal;
+        delete next.exitLock;
         delete next.proof;
         delete next.withdrawalNullifier;
         delete next.finalizeTransactionHash;
@@ -1885,10 +2326,72 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
         delete next.finalizeSubmissionFrom;
         delete next.finalizeSubmissionNonce;
         delete next.finalizeSubmissionError;
+        // A sponsored (gasless) record keeps its transit identity, amounts
+        // and operation hashes; the signed operation bodies go with the
+        // other recovery material (GASLESS_WITHDRAWAL_FIELDS).
+        delete next.finalizeUserOp;
+        delete next.forwardUserOp;
     }
     store.put(next);
     await transactionDone(transaction);
     return next;
+}
+
+/**
+ * The fields a sponsored (gasless, design §3.2) withdrawal adds to the
+ * durable journal. On `runtime.preparedWithdrawal` (the selected plan):
+ * `feePayer: 'payout'`, `payout` (the payout address Y), `transit`
+ * ({ factory, paymaster, entryPoint, account (S), owner, creationCodeKeccak }),
+ * `userOp` (the full unpacked operation incl. its signature), `userOpHash`,
+ * `userOpHashes[]`, `userOpNonce`, `userOpInitCode`, `bundlerUrl`,
+ * `userOpBuiltAt`, `submittedAtBlock`, `userOpSubmittedAt`, `userOpFollowedAt`
+ * (the following client's heartbeat, which keeps its claim live), `userOpAmbiguous`,
+ * `userOpPhase` ('op_built' before the first eth_sendUserOperation,
+ * 'op_submitted' after the bundler answered or timed out; the plan's own
+ * `phase` stays 'awaiting_wallet' until the bundle transaction is known, then
+ * 'submitted' as for a wallet-paid exit), `staleUserOpHashes[]` (the hashes
+ * of operations released before inclusion, kept across a re-proof, with
+ * `staleSubmittedAtBlock`, the earliest block their inclusion is searched
+ * from; an operation whose inclusion settled as reverted is dropped from it),
+ * and after
+ * the receipt `userOpSuccess`, `chargedWei`, `owedPaidWei`, `receivedWei`,
+ * `paidOutWei`, `paymasterCredited`, `paymasterCreditedWei`,
+ * `initiationDebtWei`. On a `withdrawals[]` record: `feePayer`, `payout`,
+ * `transit`, `userOpHash`, `userOpHashes`, the amounts, `initiationDebtWei`,
+ * `finalizeUserOp`, `finalizeUserOpHash`, `finalizeUserOpHashes[]`,
+ * `finalizeUserOpPhase`, `finalizeUserOpFollowedAt`, `forwardUserOp`, `forwardUserOpHash`,
+ * `forwardUserOpHashes[]`, `forwardUserOpPhase`, `finalizeRevertedUserOpHashes[]` and
+ * `forwardRevertedUserOpHashes[]` (hashes whose inclusion settled as reverted,
+ * never looked for again, so a retry builds a new operation), `forwardTransactionHash`,
+ * `sweepTransactionHash`, `transitCreateTransactionHash`,
+ * `creditClaimTransactionHash`, `fundsWaitingInTransit`, `transitBalanceWei`.
+ * A paymaster credit uses its own fields (`paymasterCredited`), never the
+ * vault's `payoutCredited`, so the vault's claim flow never acts on it.
+ * Amounts are decimal wei strings.
+ */
+export const GASLESS_WITHDRAWAL_FIELDS = Object.freeze([
+    'feePayer', 'payout', 'transit', 'userOpHash', 'userOpHashes', 'staleUserOpHashes', 'userOpSuccess', 'chargedWei', 'owedPaidWei',
+    'receivedWei', 'paidOutWei', 'paymasterCredited', 'paymasterCreditedWei', 'initiationDebtWei', 'finalizeUserOpHash',
+    'finalizeUserOpHashes', 'finalizeUserOpPhase', 'forwardUserOpHash', 'forwardUserOpHashes', 'forwardUserOpPhase',
+    'finalizeRevertedUserOpHashes', 'forwardRevertedUserOpHashes',
+    'forwardTransactionHash', 'sweepTransactionHash', 'transitCreateTransactionHash', 'creditClaimTransactionHash',
+    'fundsWaitingInTransit', 'transitBalanceWei'
+]);
+
+/** Whether a prepared plan or a record pays its network fee from the payout through a transit account. */
+export function isGaslessWithdrawal(value) {
+    return value?.feePayer === 'payout' && /^0x[0-9a-fA-F]{40}$/.test(value?.transit?.account || '');
+}
+
+/** The gasless fields of a plan or record a detached record carries over (none for a wallet-paid one). */
+export function gaslessRecordFields(source) {
+    if (!isGaslessWithdrawal(source)) return {};
+    const fields = {};
+    for (const field of ['feePayer', 'payout', 'transit', 'userOpHash', 'userOpHashes', 'staleUserOpHashes', 'userOpSuccess', 'chargedWei',
+        'owedPaidWei', 'receivedWei', 'paidOutWei', 'paymasterCredited', 'paymasterCreditedWei', 'initiationDebtWei']) {
+        if (source[field] !== undefined) fields[field] = structuredClone(source[field]);
+    }
+    return fields;
 }
 
 const FINALIZATION_TERMINAL_PHASES = new Set(['closed', 'restored', 'parked']);
@@ -1935,7 +2438,10 @@ function matchesFinalizationClaim(record, reference) {
             === String(record.destination || '').toLowerCase());
 }
 
-export async function claimBrowserWithdrawalFinalization(recordId, ownerId) {
+/** The refusal of a finalization claim another client (or tab) still holds. */
+export const FINALIZATION_CLAIM_LIVE_MESSAGE = 'This escape is already awaiting MetaMask in this or another tab.';
+
+export async function claimBrowserWithdrawalFinalization(recordId, ownerId, { takeOver = null } = {}) {
     const database = await openDatabase();
     const transaction = durableTransaction(database, WITHDRAWAL_STORE);
     const store = transaction.objectStore(WITHDRAWAL_STORE);
@@ -1968,8 +2474,33 @@ export async function claimBrowserWithdrawalFinalization(recordId, ownerId) {
         throw new Error('The previous MetaMask request has an unknown result. Check its status, then explicitly retry if the escape is still pending.');
     }
     if (current.finalizeSubmissionId) {
+        // A journaled sponsored finalization (its signed operation is in the
+        // record) is resumed without a prompt: the claim moves to the caller
+        // when `takeOver(record)` says no one follows it any more.
+        if (typeof takeOver === 'function' && current.finalizeUserOp && current.finalizeUserOpHash && takeOver(current)) {
+            const now = Date.now();
+            const next = {
+                ...current,
+                finalizeSubmissionId: crypto.randomUUID(),
+                finalizeSubmissionOwner: ownerId,
+                finalizeSubmissionStartedAt: now,
+                revision: Number(current.revision || 0) + 1,
+                updatedAt: now
+            };
+            store.put(next);
+            await transactionDone(transaction);
+            return {
+                status: 'resumed',
+                transactionHash: null,
+                ...finalizationIdentity(next),
+                submissionId: next.finalizeSubmissionId,
+                operationId: next.finalizeOperationId,
+                generation: Number(next.finalizeGeneration || 0),
+                record: next
+            };
+        }
         transaction.abort();
-        throw new Error('This escape is already awaiting MetaMask in this or another tab.');
+        throw new Error(FINALIZATION_CLAIM_LIVE_MESSAGE);
     }
     const now = Date.now();
     const submissionId = crypto.randomUUID();

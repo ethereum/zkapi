@@ -13,6 +13,10 @@ import (
 // dialSOCKS5 sends domain names to the proxy, so the local resolver never sees
 // destination names. A failed proxy handshake never falls back to direct TCP.
 func dialSOCKS5(ctx context.Context, proxyAddress, network, destination string) (net.Conn, error) {
+	return dialSOCKS5Auth(ctx, proxyAddress, network, destination, "")
+}
+
+func dialSOCKS5Auth(ctx context.Context, proxyAddress, network, destination, identity string) (net.Conn, error) {
 	if network != "tcp" {
 		return nil, errors.New("SOCKS5 requires TCP")
 	}
@@ -50,12 +54,29 @@ func dialSOCKS5(ctx context.Context, proxyAddress, network, destination string) 
 	if err := conn.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
 		return nil, err
 	}
-	if _, err := io.Copy(conn, bytes.NewReader([]byte{5, 1, 0})); err != nil {
+	method := byte(0)
+	if identity != "" {
+		if len(identity) > 255 {
+			return nil, errors.New("invalid Tor isolation identity")
+		}
+		method = 2 // RFC 1929; never offer no-auth as a Tor fallback.
+	}
+	if _, err := io.Copy(conn, bytes.NewReader([]byte{5, 1, method})); err != nil {
 		return nil, errors.New("SOCKS5 greeting failed")
 	}
 	var reply [4]byte
-	if _, err := io.ReadFull(conn, reply[:2]); err != nil || reply[0] != 5 || reply[1] != 0 {
-		return nil, errors.New("SOCKS5 proxy rejected no-authentication method")
+	if _, err := io.ReadFull(conn, reply[:2]); err != nil || reply[0] != 5 || reply[1] != method {
+		return nil, errors.New("SOCKS5 proxy rejected required authentication method")
+	}
+	if method == 2 {
+		auth := append([]byte{1, byte(len(identity))}, []byte(identity)...)
+		auth = append(auth, 1, 'x')
+		if _, err := io.Copy(conn, bytes.NewReader(auth)); err != nil {
+			return nil, errors.New("Tor isolation authentication failed")
+		}
+		if _, err := io.ReadFull(conn, reply[:2]); err != nil || reply[0] != 1 || reply[1] != 0 {
+			return nil, errors.New("Tor isolation authentication rejected")
+		}
 	}
 	request := []byte{5, 1, 0, addressType}
 	if addressType == 3 {

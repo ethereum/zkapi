@@ -54,7 +54,7 @@ func TestConfigureUsesKeyboardChoices(t *testing.T) {
 		called = operation == "withdraw"
 		return nil
 	})
-	if err != nil || !called || len(ui.choices) != 7 || ui.choices[2].value != "password" || ui.choices[6].value != "quit" {
+	if err != nil || !called || len(ui.choices) != 8 || ui.choices[2].value != "password" || ui.choices[5].value != "repair" || ui.choices[7].value != "quit" {
 		t.Fatalf("menu did not use named choices: called=%v err=%v choices=%v", called, err, ui.choices)
 	}
 	ui.selected = "mainnet"

@@ -272,6 +272,49 @@ impl OpenRouterProvisioner {
     /// never be recovered from the Management API, so revocation is the only
     /// safe reconciliation.
     pub async fn delete_keys_named(&self, name: &str) -> Result<(), ServerError> {
+        for hash in self.key_hashes_named(name).await? {
+            self.delete_key(&hash).await?;
+        }
+        Ok(())
+    }
+
+    /// Background cleanup of a terminal lease's key: disable it, then delete
+    /// it. A key that no longer exists (404) is already cleaned up.
+    pub async fn retire_key(&self, hash: &str) -> Result<(), ServerError> {
+        let response = self
+            .http
+            .patch(self.key_url(hash))
+            .bearer_auth(&self.management_key)
+            .json(&json!({ "disabled": true }))
+            .send()
+            .await
+            .map_err(|error| {
+                ServerError::Internal(format!("OpenRouter key disable failed: {error}"))
+            })?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(ServerError::Internal(format!(
+                "OpenRouter key disable returned {status}: {}",
+                truncate(&text, 200)
+            )));
+        }
+        self.delete_key(hash).await
+    }
+
+    /// Clean up any key a failed or abandoned issuance may have created
+    /// under the lease's request-unique name.
+    pub async fn retire_keys_named(&self, name: &str) -> Result<(), ServerError> {
+        for hash in self.key_hashes_named(name).await? {
+            self.retire_key(&hash).await?;
+        }
+        Ok(())
+    }
+
+    async fn key_hashes_named(&self, name: &str) -> Result<Vec<String>, ServerError> {
         let mut offset = 0usize;
         let mut matching_hashes = Vec::new();
         loop {
@@ -315,10 +358,7 @@ impl OpenRouterProvisioner {
                 ));
             }
         }
-        for hash in matching_hashes {
-            self.delete_key(&hash).await?;
-        }
-        Ok(())
+        Ok(matching_hashes)
     }
 }
 
