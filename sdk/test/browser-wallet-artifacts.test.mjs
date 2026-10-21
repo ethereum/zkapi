@@ -154,12 +154,14 @@ test('static proof keys are the concession development setup and match its manif
     }
 });
 
+// Sepolia pins its staging deployment; mainnet is still a placeholder.
 for (const network of ['sepolia', 'mainnet']) {
-    test(`the ${network} profile is a not_deployed placeholder pinning the shipped circuit, setup and keys`, () => {
+    const deployed = network === 'sepolia';
+    test(`the ${network} profile ${deployed ? 'pins its deployment' : 'is a not_deployed placeholder'} with the shipped circuit, setup and keys`, () => {
         const config = JSON.parse(fs.readFileSync(path.join(__dirname, `assets/config/${network}.json`), 'utf8'));
         const manifest = JSON.parse(fs.readFileSync(path.join(root, 'assets/manifest.json'), 'utf8'));
         const trusted = config.trusted_deployment;
-        assert.equal(trusted.deployment_status, 'not_deployed');
+        assert.equal(trusted.deployment_status, deployed ? 'deployed' : 'not_deployed');
         assert.equal(trusted.chain_id, network === 'mainnet' ? 1 : 11155111);
         assert.equal(trusted.circuit_id, 'zkapi-v2-concession-v2');
         assert.equal(trusted.setup_id, manifest.setupId);
@@ -176,11 +178,30 @@ for (const network of ['sepolia', 'mainnet']) {
         assert.equal(trusted.min_deposit_units, 1_000_000);
         assert.equal(trusted.fresh_slot_gas, network === 'mainnet' ? 22_100 : 110_000);
         assert.equal(trusted.clearance_ownership_proof, 'required');
-        // Nothing that only a deployment determines is pinned yet.
-        for (const field of ['deployment_id', 'contract_address', 'deploy_block', 'protocol_server_url', 'indexer_url',
+        // What only a deployment determines: pinned for a deployed network,
+        // still null on a placeholder.
+        const deploymentFields = ['deployment_id', 'contract_address', 'deploy_block', 'protocol_server_url', 'indexer_url',
             'state_signing_key', 'clearance_signing_key', 'vault_runtime_codehash', 'proof_adapter_address',
-            'adapter_runtime_codehash', 'poseidon_library_address', 'poseidon_runtime_codehash', 'verifier_url']) {
-            assert.equal(trusted[field], null, field);
+            'adapter_runtime_codehash', 'poseidon_library_address', 'poseidon_runtime_codehash', 'verifier_url'];
+        if (deployed) {
+            assert.equal(typeof trusted.deployment_id, 'string');
+            assert.ok(trusted.deployment_id.length > 0, 'deployment_id');
+            for (const field of ['contract_address', 'proof_adapter_address', 'poseidon_library_address']) {
+                assert.match(trusted[field], /^0x[0-9a-fA-F]{40}$/, field);
+            }
+            for (const field of ['vault_runtime_codehash', 'adapter_runtime_codehash', 'poseidon_runtime_codehash']) {
+                assert.match(trusted[field], /^0x[0-9a-f]{64}$/, field);
+            }
+            assert.ok(Number.isSafeInteger(trusted.deploy_block) && trusted.deploy_block > 0, 'deploy_block');
+            for (const field of ['protocol_server_url', 'indexer_url', 'verifier_url']) {
+                assert.equal(new URL(trusted[field]).protocol, 'https:', field);
+            }
+            for (const field of ['state_signing_key', 'clearance_signing_key']) {
+                assert.match(trusted[field].x, /^0x[0-9a-f]{64}$/, `${field}.x`);
+                assert.match(trusted[field].y, /^0x[0-9a-f]{64}$/, `${field}.y`);
+            }
+        } else {
+            for (const field of deploymentFields) assert.equal(trusted[field], null, field);
         }
         assert.equal(config.deployment_manifest_url, null);
         assert.deepEqual(config.allowed_deployment_manifest_urls, []);

@@ -75,17 +75,26 @@ test('host configuration resolves explicit paths and retains trusted same-origin
     }
 });
 
-test('the shipped network profiles are placeholders that no host build accepts', async () => {
+test('the shipped sepolia profile builds and the mainnet placeholder is refused', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'zkapi-sdk-assets-'));
     try {
         const pinned = await verifyBrowserSdkAssets();
         assert.equal(pinned.schema, 2);
         assert.equal(pinned.circuitId, 'zkapi-v2-concession-v2');
-        for (const network of ['sepolia', 'mainnet']) {
-            await assert.rejects(buildBrowserSdkAssets({ outDir: path.join(temp, network), network, build }),
-                { code: 'deployment_not_deployed' });
-            await assert.rejects(fs.access(path.join(temp, network)), 'nothing was written');
+        // Sepolia pins its staging deployment: a host build accepts it with the pinned keys.
+        const shipped = JSON.parse(await fs.readFile(new URL('../assets/config/sepolia.json', import.meta.url), 'utf8'));
+        const sepolia = await buildBrowserSdkAssets({ outDir: path.join(temp, 'sepolia'), network: 'sepolia', build });
+        assert.equal(sepolia.config.trusted_deployment.deployment_status, 'deployed');
+        assert.equal(sepolia.config.trusted_deployment.deployment_id, shipped.trusted_deployment.deployment_id);
+        assert.equal(sepolia.config.trusted_deployment.chain_id, 11155111);
+        assert.equal(sepolia.config.trusted_deployment.setup_id, pinned.setupId);
+        for (const file of ['request.pk', 'withdrawal.pk', 'request.vk']) {
+            assert.equal(sepolia.files[`proofs/${file}`], pinned.files[`assets/proofs/${file}`], file);
         }
+        // Mainnet is still a placeholder: no host build accepts it, and nothing is written.
+        await assert.rejects(buildBrowserSdkAssets({ outDir: path.join(temp, 'mainnet'), network: 'mainnet', build }),
+            { code: 'deployment_not_deployed' });
+        await assert.rejects(fs.access(path.join(temp, 'mainnet')), 'nothing was written');
         await assert.rejects(buildBrowserSdkAssets({outDir: temp, network: 'invalid', build}), /Network/);
         await assert.rejects(buildBrowserSdkAssets({outDir: temp, publicPath: '//other.example/', build}), /same-origin/);
     } finally { await fs.rm(temp, { recursive: true, force: true }); }
