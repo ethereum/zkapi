@@ -88,6 +88,18 @@ type AddressPaymentQuote struct {
 	// deducts it, so it is the floor whether the push succeeds or not.
 	PayeeHasCode       bool   `json:"payee_has_code,omitempty"`
 	CreditSurchargeWei string `json:"credit_surcharge_wei,omitempty"`
+	// The bounded authorization a payout close is approved under (authorize
+	// once). MaxTotalFeeWei is the most the payout may lose to every
+	// operation signed under it (maximum cost plus the flat fee cap, plus the
+	// credit surcharge for a contract payee); MinNetPayoutWei is what the
+	// payout address receives at least (payout − MaxTotalFeeWei − owed).
+	// ExpectedFeeWei stays an estimate: FeeMayChange says the actual fee may
+	// differ, and the daemon rebuilds, re-signs and re-proves within the
+	// bound without asking again. FeeCapWei and MinimumReceivedWei describe
+	// only the operation as it would be built now.
+	MaxTotalFeeWei  string `json:"max_total_fee_wei,omitempty"`
+	MinNetPayoutWei string `json:"min_net_payout_wei,omitempty"`
+	FeeMayChange    bool   `json:"fee_may_change,omitempty"`
 }
 
 // quoteID is a fresh 32-byte approval ID.

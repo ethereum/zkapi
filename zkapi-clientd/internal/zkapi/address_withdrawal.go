@@ -87,6 +87,20 @@ type AddressWithdrawalStatus struct {
 	// fail and the payout be credited).
 	PayeeHasCode    bool   `json:"payee_has_code,omitempty"`
 	GaslessAdvisory string `json:"gasless_advisory,omitempty"`
+	// NewWithdrawalFees is how a new withdrawal on this deployment pays its
+	// network fee: "payout" where the deployment publishes reviewed gasless
+	// support (the only option offered), else "wallet".
+	NewWithdrawalFees string `json:"new_withdrawal_fees,omitempty"`
+	// The bounded authorization of a payout withdrawal, while it can still
+	// be used: the most the payout may lose to the fee and the least the
+	// payout address receives. EstimatedFeeWei is the latest estimate.
+	AuthorizedMaxFeeWei       string `json:"authorized_max_fee_wei,omitempty"`
+	AuthorizedMinNetPayoutWei string `json:"authorized_min_net_payout_wei,omitempty"`
+	EstimatedFeeWei           string `json:"estimated_fee_wei,omitempty"`
+	// GaslessRetryable marks a gasless_refused withdrawal whose authorization
+	// still holds: the next POST /admin/withdrawal retries it (rebuilding,
+	// re-signing or re-proving within the bound) without a new approval.
+	GaslessRetryable bool `json:"gasless_retryable,omitempty"`
 }
 
 type addressWithdrawalRecord struct {

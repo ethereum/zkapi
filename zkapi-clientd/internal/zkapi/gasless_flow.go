@@ -166,6 +166,21 @@ type gaslessRefusal struct {
 
 func (e *gaslessRefusal) Error() string { return e.Code + ": " + e.Message }
 
+// Refusal codes the management API names for the payout-only withdrawal.
+const (
+	// A new withdrawal on a deployment with reviewed gasless support asked
+	// for a wallet-paid fee; only the payout pays it.
+	CodeWalletFeesUnavailable = "wallet_fees_unavailable"
+	// The operation needed now would exceed the authorized maximum fee (or
+	// a raised flat fee or debt); the authorization holds and a later retry
+	// may fit, or a new quote authorizes a new maximum.
+	CodeFeeAboveAuthorization = "fee_above_authorization"
+	// The payout address cannot receive a sponsored payout.
+	CodeInvalidPayee = "invalid_payee"
+	// The approved quote was replaced or no longer matches the withdrawal.
+	CodeQuoteChanged = "quote_changed"
+)
+
 func refuse(code, format string, args ...any) error {
 	return &gaslessRefusal{Code: code, Message: fmt.Sprintf(format, args...)}
 }
@@ -2367,6 +2382,9 @@ func (h *FundingHandler) followTransitTransaction(ctx context.Context, config fu
 // GaslessAvailability is whether --fees payout can carry the next
 // withdrawal (design 3.1 pre-flight), and why not.
 type GaslessAvailability struct {
+	// Required: new withdrawals on this deployment pay the fee from the
+	// payout; there is no wallet-paid alternative to offer.
+	Required            bool   `json:"required,omitempty"`
 	Available           bool   `json:"available"`
 	Reason              string `json:"reason,omitempty"`
 	Message             string `json:"message,omitempty"`
