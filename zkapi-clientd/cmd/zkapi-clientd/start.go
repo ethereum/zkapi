@@ -394,6 +394,10 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 		checkCtx, checkCancel := context.WithTimeout(ctx, 3*time.Second)
 		active, activeErr := runtime.active(checkCtx, c)
 		checkCancel()
+		var mismatch *daemonDeploymentError
+		if errors.As(activeErr, &mismatch) {
+			return activeErr
+		}
 		if activeErr == nil {
 			if active.Backend != "zkapi" || active.ZKAPI.Network != c.ZKAPI.Network {
 				return errors.New("the running daemon's network differs from this configuration; preserve the wallet and stop the conflicting service yourself")
@@ -407,8 +411,10 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 		ui.Printf("The legacy --model option does not affect funding; select a model on each inference request.\n")
 	}
 	if !options.quietStartup {
-		ui.Printf("Network: %s.\n", c.ZKAPI.Network)
+		ui.Printf("Network: %s.\n", deploymentSummary(c.ZKAPI.Network))
 	}
+	// Guided funding repeats these before it shows a new funding address.
+	ctx = context.WithValue(ctx, earlierDeploymentsKey{}, zkapi.EarlierDeploymentWarnings(dir, c.ZKAPI.Network))
 	attached, err := runtime.probe(ctx, c)
 	if err != nil {
 		return err
@@ -539,6 +545,10 @@ func probeSetupService(ctx context.Context, c config.Config) (bool, error) {
 	if err != nil {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
+		}
+		var mismatch *daemonDeploymentError
+		if errors.As(err, &mismatch) {
+			return false, err
 		}
 		return false, errors.New("the configured API port is occupied but its daemon could not be authenticated; stop the conflicting service yourself or choose a separate configuration and listen address")
 	}

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -139,6 +140,8 @@ func run(args []string) error {
 		return runModels(ctx, dir, c, args[0], args[1:], os.Stdout)
 	}
 	if args[0] == "withdraw" {
+		// Stderr: explicit withdraw options print machine-readable results.
+		printEarlierDeployments(os.Stderr, dir, c.ZKAPI.Network)
 		action := "withdraw"
 		if len(args) == 2 && args[1] == "--public" {
 			action = "return"
@@ -191,7 +194,7 @@ func help() {
   config                 Print saved config as JSON; --help for settings
                          --setup: prepare wallet; --menu: wallet actions
   serve [--model MODEL]  Open a missing note when funded, then serve inference
-  withdraw [OPTIONS]     Guided withdrawal; --escape / --fees payout / --public
+  withdraw [OPTIONS]     Guided withdrawal (fee paid from the payout where sponsored); --escape / --public
   list-models            List supported model IDs and per-query caps
 
 Run zkapi-clientd config --help for configuration options.
@@ -362,6 +365,12 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	if err != nil {
 		return err
 	}
+	// Earlier deployments' wallets (including the earlier release's payment
+	// files) sit beside this one in the profile; name them in either
+	// companion mode. They never stop the service.
+	for _, warning := range zkapi.EarlierDeploymentWarnings(dir, c.ZKAPI.Network) {
+		logger.Print(warning)
+	}
 	if !c.ZKAPI.ExternalCompanion {
 		// Keep the local HTTPS-only bridge in both routing modes so the
 		// companion cannot follow a redirect to plaintext HTTP.
@@ -370,12 +379,6 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 			return err
 		}
 		defer proxy.Close()
-		if warning := zkapi.LegacyWalletWarning(filepath.Join(dir, "zkapi"), c.ZKAPI.Network); warning != "" {
-			logger.Print(warning)
-		}
-		if warning := zkapi.LegacyFundingWarning(filepath.Join(dir, "funding"), c.ZKAPI.Network); warning != "" {
-			logger.Print(warning)
-		}
 		cmd, err := zkapi.CompanionCommand(life, zc, zkapi.CompanionConfig{Binary: c.ZKAPI.Binary, SetupDir: c.ZKAPI.ProofSetupDir, StateDir: filepath.Join(dir, "zkapi"), VerifierURL: c.VerifierURL, ProxyURL: proxy.URL, TestnetPassword: password, ExitRPCURL: c.ZKAPI.ExitRPCURL})
 		if err != nil {
 			return err
@@ -429,6 +432,9 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	api.Status = server.ServiceStatus{Backend: c.Backend}
 	api.Status.Network = c.ZKAPI.Network
 	api.Status.RequestBudgetPolicy = "model"
+	if deployment, err := zkapi.PackagedDeployment(c.ZKAPI.Network); err == nil {
+		api.Status.DeploymentID = deployment.ID
+	}
 	if funding != nil {
 		// server.API rejects browser origins and requires both the local bearer
 		// and owner-only credential before dispatching any wallet operation.
@@ -452,7 +458,7 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 		transport = "encrypted relay required"
 	}
 	logger.Printf("zkAPI client %s listening at http://%s/v1 (%s); %s", version, c.Listen, c.Backend, transport)
-	logger.Printf("zkAPI network: %s", c.ZKAPI.Network)
+	logger.Printf("zkAPI network: %s", deploymentSummary(c.ZKAPI.Network))
 	if c.WebSearch {
 		logger.Print("Web search: on by default (OpenRouter; search charges apply)")
 	} else {
@@ -508,12 +514,16 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	return result
 }
 
-func status(ctx context.Context, dir string, c config.Config) error {
+func status(ctx context.Context, dir string, c config.Config, out, warnings io.Writer) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	result := map[string]any{"default_backend": c.Backend, "api_base": "http://" + c.Listen + "/v1", "relay_required": c.RelayURL != ""}
 	active, err := resolveActiveConfig(ctx, c)
 	result["service_running"] = err == nil
+	var mismatch *daemonDeploymentError
+	if errors.As(err, &mismatch) {
+		return err
+	}
 	if err == nil {
 		c = active
 	} else if _, healthErr := localRequest(ctx, c, "GET", "/healthz"); healthErr == nil {
@@ -525,6 +535,20 @@ func status(ctx context.Context, dir string, c config.Config) error {
 	result["billing_asset"] = "native_eth"
 	result["billing_unit"] = "gwei"
 	result["request_budget_policy"] = "model"
+	// Public identity only. Earlier deployments list which recovery files
+	// exist, never their contents.
+	if deployment, err := zkapi.PackagedDeployment(c.ZKAPI.Network); err == nil {
+		result["deployment_id"] = deployment.ID
+		result["deployment_display"] = deployment.Display
+		result["contract_address"] = deployment.Contract
+		result["protocol_server_url"] = deployment.ProtocolServerURL
+	}
+	earlier := zkapi.EarlierDeploymentState(dir, c.ZKAPI.Network)
+	if earlier == nil {
+		earlier = []zkapi.EarlierDeployment{}
+	}
+	result["earlier_deployments"] = earlier
+	printEarlierDeployments(warnings, dir, c.ZKAPI.Network)
 	wallet, err := zkapi.New(zkConfig(c, client))
 	if err != nil {
 		return err
@@ -545,13 +569,60 @@ func status(ctx context.Context, dir string, c config.Config) error {
 			result["pending_settlement"] = state.PendingRequest
 		}
 	}
-	e := json.NewEncoder(os.Stdout)
+	e := json.NewEncoder(out)
 	e.SetIndent("", "  ")
 	return e.Encode(result)
 }
 
-// Management commands authenticate the running daemon and its network.
-// This copy does not migrate or modify wallet state.
+// deploymentSummary names the network's packaged deployment for people: its
+// display name, ID and vault, all from this build (never from a server URL).
+func deploymentSummary(network string) string {
+	if network == "" {
+		network = "mainnet"
+	}
+	deployment, err := zkapi.PackagedDeployment(network)
+	if err != nil {
+		return network
+	}
+	var details []string
+	// An unnamed deployment's fallback name already carries its ID.
+	if !strings.Contains(deployment.Display, deployment.ID) {
+		details = append(details, "deployment "+deployment.ID)
+	}
+	if deployment.Deployed {
+		details = append(details, "vault "+deployment.Contract)
+	} else {
+		details = append(details, "not deployed")
+	}
+	return fmt.Sprintf("%s — %s (%s)", network, deployment.Display, strings.Join(details, ", "))
+}
+
+// printEarlierDeployments repeats the earlier-deployment warnings; they
+// inform and never stop the command.
+func printEarlierDeployments(w io.Writer, dir, network string) {
+	for _, warning := range zkapi.EarlierDeploymentWarnings(dir, network) {
+		fmt.Fprintln(w, "WARNING:", warning)
+	}
+}
+
+// daemonDeploymentError refuses a running daemon whose build serves another
+// zkAPI deployment: its wallet directories are not this build's.
+type daemonDeploymentError struct{ running, packaged string }
+
+func (e *daemonDeploymentError) Error() string {
+	return fmt.Sprintf("the running daemon serves zkAPI deployment %s, but this build serves %s; restart the daemon with this build; your other wallet is untouched", e.running, e.packaged)
+}
+
+// A daemon from a build before deployment reporting is noted once per
+// process on daemonNotices, then attached as before.
+var (
+	daemonNotices    io.Writer = os.Stderr
+	daemonNoticeOnce sync.Once
+)
+
+// Management commands authenticate the running daemon, its network and,
+// when it reports one, its deployment. This copy does not migrate or modify
+// wallet state.
 func resolveActiveConfig(ctx context.Context, c config.Config) (config.Config, error) {
 	data, err := localRequest(ctx, c, http.MethodGet, "/admin/status")
 	if err != nil {
@@ -562,6 +633,17 @@ func resolveActiveConfig(ctx context.Context, c config.Config) (config.Config, e
 		active.Backend != "zkapi" ||
 		(active.Network != "mainnet" && active.Network != "sepolia") {
 		return config.Config{}, errors.New("local service returned invalid active-mode metadata; restart it with the current client")
+	}
+	packaged, err := zkapi.PackagedDeployment(active.Network)
+	if err != nil {
+		return config.Config{}, err
+	}
+	if active.DeploymentID == "" {
+		daemonNoticeOnce.Do(func() {
+			fmt.Fprintf(daemonNotices, "WARNING: the running daemon does not report its zkAPI deployment (an earlier build); continuing as if it serves %s. Restart it with this build to confirm.\n", packaged.ID)
+		})
+	} else if active.DeploymentID != packaged.ID {
+		return config.Config{}, &daemonDeploymentError{running: active.DeploymentID, packaged: packaged.ID}
 	}
 	c.Backend = active.Backend
 	c.ZKAPI.Network = active.Network

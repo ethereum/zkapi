@@ -210,10 +210,15 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 		if errors.As(err, &companion) && (companion.Code == "unsettled_request_state" || companion.Code == "unsettled_clearance_reserved" || companion.Code == "receipt_journal_missing" || companion.Code == "ownership_proof_sent" || companion.Code == "escape_required" || companion.Code == "device_not_newest" || companion.Code == "conceded_mismatch") {
 			failure["code"] = companion.Code
 		}
-		// A gasless refusal names its reason so a guided flow can offer the
-		// wallet-paid path.
+		// A gasless refusal names its reason so a client can act on it (wait
+		// and retry, ask for a new destination or a new quote); an approval
+		// whose quote expired or was replaced says so.
 		if code := GaslessRefusalCode(err); code != "" {
 			failure["code"] = code
+		} else if errors.Is(err, errGaslessPayee) {
+			failure["code"] = CodeInvalidPayee
+		} else if errors.Is(err, errAddressQuoteChanged) {
+			failure["code"] = CodeQuoteChanged
 		}
 		_ = json.NewEncoder(w).Encode(failure)
 		return

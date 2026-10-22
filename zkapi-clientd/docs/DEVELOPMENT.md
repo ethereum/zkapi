@@ -8,8 +8,10 @@ model defaults, funding/withdrawal UI and saved vault-stack selection.
 
 It is **development source, not a production wallet release**:
 
-- Shipping concession manifests are `not_deployed`; production ceremony keys
+- The Mainnet concession manifest is `not_deployed`; production ceremony keys
   are missing. Never use development keys or legacy addresses to bypass this.
+  Sepolia ships the leaf-bound staging deployment (zkAPI v0.2), which uses the
+  development setup; see [Sepolia staging bundle](#sepolia-staging-bundle).
 - Legacy uses historical protocol source plus current shared privacy code.
   Live legacy deposit/admission availability has not been established.
 - Wallets, journals, installed proving assets and local binaries are not tracked.
@@ -64,8 +66,11 @@ cargo build --release --locked -p zkapi-companion --bin zkapi-walletd
 install -m 755 target/release/zkapi-walletd zkapi-clientd/bin/zkapi-walletd-concession
 ```
 
-Do not enable `dev-setup` for a production companion. Compiling it does not supply
-reviewed deployed manifests or production proving keys.
+Do not enable `dev-setup` for a production companion (Mainnet, or any
+deployment pinned to ceremony keys). Compiling it does not supply reviewed
+deployed manifests or production proving keys. The Sepolia staging deployment
+is the only exception, with a separately named companion; see
+[Sepolia staging bundle](#sepolia-staging-bundle).
 
 The local legacy selector separately pins the historical `zkapi-walletd`
 companion hash in `cmd/zkapi-clientd/vault_protocol.go`. A new clone does not
@@ -75,6 +80,70 @@ protocol. The checkpoint retains historical companion source-preparation scripts
 but obtaining/rebuilding that bundle is not an automated production release
 process here. A mismatched or absent companion is an explicit blocker, not a
 reason to substitute the concession companion or disable verification.
+
+## Sepolia staging bundle
+
+Sepolia ships the leaf-bound staging deployment
+`zkapi-native-eth-sepolia-leaf-v4-20261020`, shown as **zkAPI v0.2**: vault
+`0x67eb750d9c0d63a99684ac3f3e65f0c610276993`, protocol server and indexer
+`https://zkapi-sepolia.openanonymity.ai/v0.4`, bundler at its `/bundler`, pinned
+RPC `https://ethereum-sepolia-rpc.publicnode.com`. Its proofs use the committed
+development setup `protocol/setup/v2-concession-dev`, which only a companion
+built with `dev-setup` loads. Use test ETH only, and keep this companion apart
+from any production one. From the repository root:
+
+```sh
+cargo build --release --locked -p zkapi-companion --bin zkapi-walletd \
+  --features zkapi-proof/dev-setup
+install -m 755 target/release/zkapi-walletd zkapi-clientd/bin/zkapi-walletd-sepolia-dev
+(cd zkapi-clientd && go build -trimpath -o bin/zkapi-clientd-concession-tor ./cmd/zkapi-clientd)
+
+CLIENT="$PWD/zkapi-clientd/bin/zkapi-clientd-concession-tor"
+PROFILE=/tmp/zkapi-sepolia-staging    # an isolated test profile
+$CLIENT --config-dir "$PROFILE" config --setup --network sepolia \
+  --zkapi-binary "$PWD/zkapi-clientd/bin/zkapi-walletd-sepolia-dev" \
+  --proof-setup-dir "$PWD/protocol/setup/v2-concession-dev"
+$CLIENT --config-dir "$PROFILE" serve
+```
+
+- Name the companion and setup with explicit absolute paths: the companion
+  checks the setup's four key files against the manifest's SHA-256 pins before
+  it opens a wallet, and the default installed setup is not this one.
+- Keep a throwaway profile such as the `/tmp` one above (and repeat the same
+  `--config-dir` on every command). Never point a staging build at your real
+  profile to try it out.
+- The deployment asks for the shared Sepolia access password. Setup prompts
+  for it with input hidden and saves it owner-only in the profile; for scripted
+  runs, set `OA_ZKAPI_TESTNET_PASSWORD_FILE` to an owner-only (`chmod 600`)
+  file instead. Never pass it on the command line.
+- The pinned public RPC rejects some multi-block `eth_getLogs` queries. If an
+  exit, a withdrawal's recovery or a receipt check reports that the RPC is
+  unavailable, configure your own RPC with `config --exit-rpc-url URL` (HTTPS,
+  or `http://` to this machine). The client uses exactly the endpoint you save
+  and never rewrites or substitutes a provider on its own; `--exit-rpc-url
+  none` clears it.
+- A profile that already holds a wallet of an earlier Sepolia deployment keeps
+  it: this build opens new sibling directories for the leaf-v4 deployment and
+  warns about the earlier one (see
+  [deployment origins](CLI_ZKAPI.md#deployment-origins)).
+
+Read-only acceptance of the live deployment is opt-in and sends no
+transaction:
+
+```sh
+cd zkapi-clientd
+ZKAPI_TEST_SEPOLIA=1 go test -v ./internal/zkapi -run '^TestLiveSepoliaDeployment$'
+# Optional: your own RPC for the chain reads, and the dev-setup companion.
+ZKAPI_TEST_SEPOLIA=1 ZKAPI_TEST_EXIT_RPC=https://rpc.example \
+  ZKAPI_TEST_COMPANION="$PWD/bin/zkapi-walletd-sepolia-dev" \
+  ZKAPI_TEST_PASSWORD_FILE=/path/to/owner-only-password \
+  go test -v ./internal/zkapi -run '^TestLiveSepolia'
+```
+
+The first checks the pinned code hashes, vault and adapter getters, gasless
+contracts, the bundler's EntryPoint and the server's `config.json` and
+`/v1/attestation` against the manifest; the second starts the companion on an
+empty temporary wallet and reads its status only.
 
 ## Run and configure
 

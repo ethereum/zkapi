@@ -129,3 +129,48 @@ func TestWithdrawEscapeCancel(t *testing.T) {
 		}
 	}
 }
+
+// A new escape names no fee mode unless one is named: the daemon pays it
+// from the payout where the deployment sponsors it, and a configured wallet
+// default is never sent. An explicit --fees wallet escape stays available
+// (the exit that needs no operator), even on a payout deployment.
+func TestWithdrawEscapeSendsNoFeeModeUnlessNamed(t *testing.T) {
+	for name, test := range map[string]struct {
+		args       []string
+		configured string
+		want       any
+	}{
+		"default":                   {args: []string{"--escape", "--to", withdrawalTestDestination}, want: nil},
+		"configured wallet default": {args: []string{"--escape", "--to", withdrawalTestDestination}, configured: "wallet", want: nil},
+		"explicit wallet":           {args: []string{"--escape", "--to", withdrawalTestDestination, "--fees", "wallet"}, want: "wallet"},
+		"explicit payout":           {args: []string{"--escape", "--to", withdrawalTestDestination, "--fees", "payout"}, want: "payout"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var bodies []map[string]any
+			s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method + " " + r.URL.Path {
+				case "GET /admin/escape":
+					state := withdrawalTestStatus("ready")
+					state["new_withdrawal_fees"] = "payout"
+					_ = json.NewEncoder(w).Encode(state)
+				case "POST /admin/escape":
+					var body map[string]any
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					bodies = append(bodies, body)
+					_ = json.NewEncoder(w).Encode(escapeTestStatus("escape_decision"))
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer s.Close()
+			c := withdrawalTestConfig(s)
+			c.ZKAPI.WithdrawalFees = test.configured
+			if err := runWithdrawal(context.Background(), c, test.args, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(bodies) != 1 || bodies[0]["fees"] != test.want {
+				t.Fatalf("escape fee mode: %+v", bodies)
+			}
+		})
+	}
+}

@@ -70,12 +70,16 @@ func TestGaslessInvalidBundlerHintsUseValidatedChainFallback(t *testing.T) {
 	}
 }
 
-func TestGaslessBundlerHintCannotRepriceApprovedOperation(t *testing.T) {
+// An authorize-once approval prices the operation when it is signed, within
+// the approved maximum (a tip that rose since the quote is followed, not
+// refused or asked about again); a signed operation is never repriced by a
+// later hint.
+func TestGaslessBundlerHintPricesAtApprovalNeverASignedOperation(t *testing.T) {
 	f, g := newGaslessWithdrawalFixture(t)
 	g.pimlicoFees = map[string]any{"standard": map[string]string{"maxPriorityFeePerGas": "0x1"}}
 	q, err := f.h.QuoteAddressWithdrawal(payoutContext(payoutFees), withdrawalTestDestination, f.noteID, "", false)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || q.MaxTotalFeeWei == "" || !q.FeeMayChange {
+		t.Fatalf("no authorize-once quote: %+v %v", q, err)
 	}
 	f.mu.Lock()
 	g.pimlicoFees = map[string]any{"standard": map[string]string{"maxPriorityFeePerGas": "0x3b9aca00"}}
@@ -85,8 +89,10 @@ func TestGaslessBundlerHintCannotRepriceApprovedOperation(t *testing.T) {
 		t.Fatalf("approval: %+v %v", status, err)
 	}
 	op, _ := gasfromJSON(t, g.ops[status.UserOpHash])
-	if op.MaxFeePerGas.String() != q.MaxFeePerGas || op.MaxPriorityFeePerGas.String() != q.MaxPriorityFeePerGas {
-		t.Fatal("changed hint repriced approved operation")
+	quoted, _ := new(big.Int).SetString(q.MaxPriorityFeePerGas, 10)
+	maximum, _ := new(big.Int).SetString(q.MaxTotalFeeWei, 10)
+	if op.MaxPriorityFeePerGas.Cmp(quoted) <= 0 || new(big.Int).Add(op.maxCost(), g.flatFee).Cmp(maximum) > 0 {
+		t.Fatalf("the approval did not price the operation within the maximum when it signed: tip %s (quoted %s), loss %s (max %s)", op.MaxPriorityFeePerGas, quoted, new(big.Int).Add(op.maxCost(), g.flatFee), maximum)
 	}
 	// Reopening the journal and a zero hint must not downgrade or replace the
 	// operation already signed under the approved cap either.

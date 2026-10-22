@@ -120,6 +120,9 @@ type addressQuoteMode struct {
 	// expired note whose current state has an unsettled request: the
 	// companion may then send the ownership proof the server requires.
 	AcceptUnsettledRequestRisk bool
+	// Authorized resumes a payout close under its journaled authorization:
+	// the operation is built, signed and sent within it with no quote.
+	Authorized *gaslessAuthorization
 }
 
 func quoteMode(ctx context.Context) *addressQuoteMode {

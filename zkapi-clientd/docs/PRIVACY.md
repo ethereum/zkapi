@@ -174,8 +174,11 @@ exit RPC on another chain is never trusted.
 Deposit/withdrawal QR codes are generated locally and contain only public
 payment address, chain and amount. No external QR service receives them.
 A withdrawal fee QR funds the local signing address, never the private payout.
-With `--fees payout` no local signing address pays for the withdrawal and no
-withdrawal fee QR is needed; a fresh owner key per withdrawal signs the
+With the fee paid from the payout (the only new withdrawal where the
+deployment sponsors withdrawals) no local signing address pays for the
+withdrawal and no withdrawal fee QR is needed; a quote shows the RPC and the
+bundler neither the exit proof nor a valid signature, only the approved
+operation reaches them; a fresh owner key per withdrawal signs the
 operation and the payout address appears on chain only as the transit
 account's payee. The bundler (the deployment's, or your own `--bundler-url`)
 sees the operation and your client IP before inclusion, as an RPC does.
@@ -287,8 +290,10 @@ endpoint, which is also used by the web client; that does not add ticket
 wallet, issuance or redemption support. Exact balances and prompt sizes do
 not choose the bucket.
 
-The protocol is experimental. Release builds load only the keys of the
-multi-party setup, which has not run yet; until then the packaged profiles
-are placeholders and no note can be funded. See the
+The protocol is experimental. Production companions load only the keys of
+the multi-party setup, which has not run yet; until then the Mainnet profile
+is a placeholder and no Mainnet note can be funded. The Sepolia staging
+deployment (zkAPI v0.2) uses the committed development setup, whose keys come
+from no ceremony, so it must only ever hold test ETH. See the
 repository's [concession exit design](../../docs/design/concession-exit.md)
 and [native ETH architecture](../../docs/architecture.md).

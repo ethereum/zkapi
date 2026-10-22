@@ -138,6 +138,10 @@ func chooseSetupDepositUSD(ctx context.Context, usdText string, ui setupPrompter
 	}
 }
 
+// earlierDeploymentsKey carries guidedStart's earlier-deployment warnings
+// for its profile ([]string) to guided funding.
+type earlierDeploymentsKey struct{}
+
 func guidedFunding(ctx context.Context, service guidedFundingService, usdText string, ui setupPrompter, wait func(context.Context) error) error {
 	defer clearSetupProgress(ui)
 	setupProgress(ui, "Checking wallet status...")
@@ -189,6 +193,13 @@ func guidedFunding(ctx context.Context, service guidedFundingService, usdText st
 		}
 		var usd uint64
 		if state.Amount == 0 {
+			// A new deposit gets a new funding address. Say again, without a
+			// question, that an earlier deployment's wallet in this profile
+			// may still hold funds this build never sees.
+			warnings, _ := ctx.Value(earlierDeploymentsKey{}).([]string)
+			for _, warning := range warnings {
+				ui.Printf("WARNING: %s\n", warning)
+			}
 			usd, err = chooseSetupDepositUSD(ctx, usdText, ui)
 			if err != nil {
 				return err

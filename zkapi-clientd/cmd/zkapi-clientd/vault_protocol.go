@@ -26,12 +26,19 @@ var legacyClientHash = strings.TrimSpace(legacyClientPin)
 
 const legacyCompanionHash = "84d57456c3cdea682e5201d1bb29a5219753404d390140c30897fe0b3cf06909"
 
+// errConcessionV1Selected refuses --vault-protocol or ZKAPI_VAULT_PROTOCOL
+// concession-v1, a stack only the origin/v0.2 local CLI bundle carries. It
+// is named rather than called invalid, so the owner finds that bundle.
+var errConcessionV1Selected = errors.New("vault protocol concession-v1 (from --vault-protocol or ZKAPI_VAULT_PROTOCOL) selects the Sepolia revision-3 vault (deployment zkapi-native-eth-sepolia-concession-v1-r3) of the local CLI bundle built from git branch origin/v0.2. This build serves only the leaf-bound revision-4 vault and cannot open that wallet; run that bundle with the same --config-dir to recover it. Nothing was changed")
+
 func vaultProtocol(flagValue string) (string, error) {
 	switch flagValue {
 	case "", "concession":
 		return "concession", nil
 	case "legacy":
 		return "legacy", nil
+	case "concession-v1":
+		return "", errConcessionV1Selected
 	default:
 		return "", errors.New("vault protocol must be legacy or concession (no automatic fallback)")
 	}

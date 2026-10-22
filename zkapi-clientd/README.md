@@ -2,11 +2,15 @@
 
 A local OpenAI-compatible API, paid from your private ETH balance. No OA account or OpenRouter API key needed.
 
-> **Local migration build:** this worktree targets the new concession protocol,
-> but Mainnet and Sepolia are not deployed in its shipping manifests and production
-> proving keys are not available. Do not use the older installer below to obtain
-> this build. See [local migration status](docs/LOCAL_PROTOCOL_MIGRATION.md) for
-> binary paths, preserved Tor features, withdrawal options and deployment blockers.
+> **Local migration build:** this worktree targets the new concession protocol.
+> Sepolia ships its leaf-bound staging deployment, shown as **zkAPI v0.2**
+> (`zkapi-native-eth-sepolia-leaf-v4-20261020`, development proving setup; see
+> the [Sepolia staging bundle](docs/DEVELOPMENT.md#sepolia-staging-bundle)).
+> Mainnet is not deployed in its shipping manifests and production proving keys
+> are not available. Do not use the older installer below to obtain this build.
+> See [local migration status](docs/LOCAL_PROTOCOL_MIGRATION.md) for binary
+> paths, preserved Tor features, withdrawal options, earlier deployments and
+> deployment blockers.
 
 ## Configuration
 
@@ -53,7 +57,7 @@ protocol selector; do not use their installer to update this build.
 The examples below assume `zkapi-clientd` refers to the newly built
 `bin/zkapi-clientd-concession-tor` entry point. Global `--config-dir DIR` belongs
 **before** the command. Select the correct existing profile/protocol before any
-wallet operation; concession funding currently refuses undeployed networks.
+wallet operation; concession funding refuses Mainnet, which is not deployed yet.
 
 ## Usage
 
@@ -138,17 +142,19 @@ To update this branch, stop `serve`, rebuild both engines as documented, and
 restart using the same profile. Do not replace a live wallet or proving setup.
 See [wallet storage and updates](docs/CLI_PACKAGING.md#wallet-storage-and-updates).
 
-To withdraw, run `zkapi-clientd config --menu` and choose `withdraw`. It asks for the destination and waits for extra ETH for fees only if needed.
+To withdraw, run `zkapi-clientd config --menu` and choose `withdraw`, or
+`zkapi-clientd withdraw --to ADDRESS` then `--approve QUOTE_ID`.
 
-Where the deployment publishes a gasless withdrawal paymaster, the menu also
-offers to pay the network fee from the payout itself ("no ETH needed"): the
-withdrawal is then carried by an ERC-4337 user operation from a transit
-account bound to your destination, signed with a fresh key per withdrawal and
-sponsored by the paymaster, which keeps a measured gas charge and pushes the
-rest to the destination. On the command line this is `zkapi-clientd withdraw
---to ADDRESS --fees payout` (defaults: `config --withdrawal-fees payout
---bundler-url URL`); `--collect`, `--sweep` and `--claim-credit` deliver a
-payout that is waiting in the transit account or the paymaster. See
+Where the deployment publishes a gasless withdrawal paymaster (Sepolia today),
+sending to an address with the network fee paid from the payout is the only
+new withdrawal, as in the web app: the local signing address needs no ETH, no
+fee QR appears and no wallet-paid fee is offered. The withdrawal is carried by
+an ERC-4337 user operation from a transit account bound to your destination,
+signed with a fresh key per withdrawal and sponsored by the paymaster, which
+keeps a measured gas charge and pushes the rest to the destination. The quote
+shows the estimated fee (the actual fee may change), the most the fee may take
+and the least the destination receives; you approve once, and fee changes
+within that maximum are handled without asking again. See
 [gasless withdrawals](docs/CLI_ZKAPI.md#paying-the-fee-from-the-payout-gasless-withdrawals).
 
 For chain and protocol access the client uses only the RPC, zkAPI indexer and

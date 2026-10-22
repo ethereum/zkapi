@@ -43,6 +43,9 @@ func withdrawalTestStatus(phase string) map[string]any {
 		"token_address": "", "token_decimals": 9, "billing_asset": "native_eth", "billing_unit": "gwei", "native_asset_wei_per_unit": "1000000000",
 		"eth_balance": "1000000000000000", "private_balance": 99971, "amount": 99971,
 		"note_id": 58, "phase": phase, "message": "Withdrawal progress saved locally.",
+		// A current daemon on a deployment without sponsorship; tests of the
+		// payout-only flow set "payout", tests of an older daemon remove it.
+		"new_withdrawal_fees": "wallet",
 	}
 	if phase != "ready" && phase != "no_note" {
 		state["destination"] = withdrawalTestDestination

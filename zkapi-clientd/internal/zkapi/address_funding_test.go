@@ -35,14 +35,16 @@ type addressFixture struct {
 	mu                                                             sync.Mutex
 	h                                                              *FundingHandler
 	chain, decimals, gas, gasPrice, balance, eth, allowance, nonce string
-	finalized, canonical                                           string
-	accepted                                                       map[string]*types.Transaction
-	receipts                                                       map[string]map[string]any
-	submitted                                                      []string
-	ambiguous                                                      bool
-	active                                                         bool
-	prepared, activated, paths                                     int
-	rpcCalls                                                       []string
+	// outbound is every RPC request (method and parameters) the client made.
+	outbound                   []string
+	finalized, canonical       string
+	accepted                   map[string]*types.Transaction
+	receipts                   map[string]map[string]any
+	submitted                  []string
+	ambiguous                  bool
+	active                     bool
+	prepared, activated, paths int
+	rpcCalls                   []string
 	// Independent corroboration sources. The RPC answers the vault's
 	// noteRecord() from vaultNotes, and nextNoteId() and noteLeaves() from
 	// leaves; the separate indexer server serves leaves too. mine registers
@@ -220,6 +222,15 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			f.exitCalls = append(f.exitCalls, request.Method)
 		} else {
 			f.rpcCalls = append(f.rpcCalls, request.Method)
+		}
+		if params, err := json.Marshal(request.Params); err == nil {
+			f.outbound = append(f.outbound, request.Method+" "+string(params))
+		}
+		// A dry run whose answer is lost (the RPC dropped the connection).
+		if f.gasless != nil && f.gasless.dropDryRunOnce && request.Method == "eth_call" && len(request.Params) > 0 && strings.Contains(string(request.Params[0]), `"from"`) {
+			f.gasless.dropDryRunOnce = false
+			w.WriteHeader(http.StatusBadGateway)
+			return
 		}
 		var result any
 		// The gasless fixture (gasless_fixture_test.go) answers the gasless

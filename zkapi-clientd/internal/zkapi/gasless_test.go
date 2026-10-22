@@ -877,7 +877,7 @@ func TestGaslessWithdrawalResumeBumpsTheFeesAndJournalsEveryHash(t *testing.T) {
 	f.editJournal(t, func(record *addressFundingRecord) { record.Withdrawal.UserOp.SubmittedAt -= 400 })
 	g.known[second] = false
 	status, err = f.h.WithdrawAddress(ctx, withdrawalTestDestination, f.noteID)
-	if err != nil || status.Phase != "gasless_refused" || !strings.Contains(status.GaslessRefusal, "fee_bump_needs_quote") || !strings.Contains(status.GaslessRefusal, "--fee-cap-gwei of 4000000 gwei") || len(g.sends) != 3 {
+	if err != nil || status.Phase != "gasless_refused" || !strings.Contains(status.GaslessRefusal, CodeFeeAboveAuthorization) || !strings.Contains(status.GaslessRefusal, "4000000000000000 wei you authorized") || !status.GaslessRetryable || len(g.sends) != 3 {
 		t.Fatalf("a raise above the cap: %+v %v %v", status, err, g.sends)
 	}
 	if u := f.journal(t).Withdrawal.UserOp; u == nil || u.Hash != second || len(u.Hashes) != 2 {
@@ -955,42 +955,37 @@ func TestGaslessWithdrawalLateInclusionOfAnEarlierCopyKeepsTheJournalLoadable(t 
 	}
 }
 
-// Without --fee-cap-gwei the approval binds the quoted maximum: a dropped
-// operation is never re-signed above it (design 3.3: the approval binds the
-// fees), the record stops with the reason, and the next quote is made at
-// the current fees.
-func TestGaslessWithdrawalWithoutAFeeCapIsNeverResignedAboveTheApprovedMaximum(t *testing.T) {
+// Without --fee-cap-gwei the approval binds the deployment's normal maximum
+// (the uneconomic fraction of the payout, at most the paymaster's policy):
+// a dropped operation is re-signed with higher fees within it, without a
+// new quote or approval, and the re-signed copy keeps the nonce.
+func TestGaslessWithdrawalWithoutAFeeCapIsResignedWithinTheAuthorizedMaximum(t *testing.T) {
 	f, g := newGaslessWithdrawalFixture(t)
 	ctx := payoutContext(payoutFees)
 	quote, err := f.h.QuoteAddressWithdrawal(ctx, withdrawalTestDestination, f.noteID, "", false)
-	if err != nil || quote.FeeBumpCapWei != quote.FeeCapWei || quote.FeeCapGwei != 0 {
-		t.Fatalf("the quote does not bind its maximum: %+v %v", quote, err)
+	quarter := new(big.Int).Quo(gaslessPayoutWei, big.NewInt(4))
+	if err != nil || quote.MaxTotalFeeWei != quarter.String() || quote.FeeBumpCapWei != quote.MaxTotalFeeWei || quote.FeeCapGwei != 0 || quote.MinNetPayoutWei != new(big.Int).Sub(gaslessPayoutWei, quarter).String() {
+		t.Fatalf("the quote does not show the authorized maximum: %+v %v", quote, err)
 	}
 	if _, err := f.h.ApproveAddressWithdrawal(ctx, quote.ID); err != nil {
 		t.Fatal(err)
 	}
 	first := f.journal(t).Withdrawal.UserOp
-	if first.FeeCapWei != quote.FeeCapWei {
-		t.Fatalf("the journaled bound is %s, the approved maximum %s", first.FeeCapWei, quote.FeeCapWei)
+	if first.FeeCapWei != quote.MaxTotalFeeWei || f.journal(t).Withdrawal.Authorization.Nonce != first.Nonce {
+		t.Fatalf("the journaled bound is %s, the authorized maximum %s", first.FeeCapWei, quote.MaxTotalFeeWei)
 	}
 	f.editJournal(t, func(record *addressFundingRecord) { record.Withdrawal.UserOp.SubmittedAt -= 400 })
 	g.known[first.Hash], g.refuseResend = false, true
 	status, err := f.h.WithdrawAddress(ctx, withdrawalTestDestination, f.noteID)
-	if err != nil || status.Phase != "gasless_refused" || !strings.Contains(status.GaslessRefusal, "fee_bump_needs_quote") || !strings.Contains(status.GaslessRefusal, "approved maximum") || len(g.sends) != 1 {
-		t.Fatalf("re-signed above the approved maximum: %+v %v %v", status, err, g.sends)
+	if err != nil || status.Phase != "op_submitted" || status.UserOpHash == first.Hash || len(g.sends) != 2 {
+		t.Fatalf("not re-signed within the authorization: %+v %v %v", status, err, g.sends)
 	}
-	if u := f.journal(t).Withdrawal.UserOp; u == nil || u.Hash != first.Hash || len(u.Hashes) != 1 {
-		t.Fatalf("a re-signed copy was journaled: %+v", u)
+	bumped, _ := gasfromJSON(t, g.ops[status.UserOpHash])
+	if new(big.Int).Add(bumped.maxCost(), g.flatFee).Cmp(quarter) > 0 || bumped.Nonce.String() != first.Nonce {
+		t.Fatal("the re-signed copy left the authorization or its nonce")
 	}
-	// The way out is a fresh quote at the current fees (the dropped
-	// operation was not included).
-	g.refuseResend = false
-	quote, err = f.h.QuoteAddressWithdrawal(ctx, withdrawalTestDestination, f.noteID, "", false)
-	if err != nil || quote.UserOpKind != "close" || quote.FeePolicy != "payout" {
-		t.Fatalf("no fresh quote: %+v %v", quote, err)
-	}
-	if w := f.journal(t).Withdrawal; w.UserOp != nil || w.Phase != "quoted" {
-		t.Fatalf("the refused operation was kept: %+v", w)
+	if u := f.journal(t).Withdrawal.UserOp; len(u.Hashes) != 2 || u.Hashes[0] != first.Hash {
+		t.Fatalf("both copies are not journaled: %+v", u)
 	}
 }
 
@@ -1213,21 +1208,27 @@ func TestGaslessWalletFallbackIsNamedThroughTheManagementAPI(t *testing.T) {
 		_ = json.Unmarshal(recorder.Body.Bytes(), &answer)
 		return recorder.Code, answer
 	}
+	// A quote simulates nothing; the approval's signed dry run meets the
+	// paymaster's refusal, which ends the sponsored path for this record.
 	code, answer := post(fmt.Sprintf(`{"destination":%q,"note_id":%d,"fees":"payout"}`, withdrawalTestDestination, f.noteID))
-	if code == http.StatusOK || answer["code"] != "payout_below_gas" {
-		t.Fatalf("sponsored refusal: %d %+v", code, answer)
+	if code != http.StatusOK || answer["fee_policy"] != "payout" {
+		t.Fatalf("sponsored quote: %d %+v", code, answer)
 	}
-	// No fee mode named: the saved sponsored mode is kept (and refused again).
-	code, answer = post(fmt.Sprintf(`{"destination":%q,"note_id":%d}`, withdrawalTestDestination, f.noteID))
-	if code == http.StatusOK || answer["code"] != "payout_below_gas" || f.journal(t).Withdrawal.FeePayer != "payout" {
-		t.Fatalf("a plain request changed the fee mode: %d %+v", code, answer)
+	approve := httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal/approve", strings.NewReader(`{"quote_id":"`+answer["id"].(string)+`"}`))
+	approve.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	f.h.ServeAdminHTTP(recorder, approve)
+	var refused map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &refused)
+	if recorder.Code == http.StatusOK || refused["code"] != "payout_below_gas" || f.journal(t).Withdrawal.FeePayer != "payout" {
+		t.Fatalf("sponsored refusal: %d %+v", recorder.Code, refused)
 	}
 	code, answer = post(fmt.Sprintf(`{"destination":%q,"note_id":%d,"fees":"wallet"}`, withdrawalTestDestination, f.noteID))
 	if code != http.StatusOK || answer["fee_policy"] == "payout" || answer["kind"] != "withdrawal" {
 		t.Fatalf("the named wallet fallback was not taken: %d %+v", code, answer)
 	}
 	w := f.journal(t).Withdrawal
-	if w.FeePayer != "wallet" || w.Phase != "quoted" || w.UserOp != nil || w.ProofDestination != w.Transit.Account || len(g.sends) != 0 {
+	if w.FeePayer != "wallet" || w.Phase != "quoted" || w.UserOp != nil || w.ProofDestination != w.Transit.Account || len(g.sends) != 0 || w.Authorization.usable() {
 		t.Fatalf("the record was not switched to the wallet: %+v", w)
 	}
 }
@@ -1244,7 +1245,15 @@ func TestGaslessWithdrawalFallsBackToTheWalletAndSweeps(t *testing.T) {
 	inner := common.FromHex(selectorOf("PayoutBelowCost(uint256,uint256)") + uintWord(5) + uintWord(3))
 	revert := selectorFailedOpWithRevert + uintWord(0) + addressABIWord("60") + addressABIWord("a0") + uintWord(13) + hex.EncodeToString(common.RightPadBytes([]byte("AA33 reverted"), 32)) + uintWord(uint64(len(inner))) + hex.EncodeToString(common.RightPadBytes(inner, 96))
 	g.dryRunRevert = common.FromHex(revert)
-	_, err := f.h.QuoteAddressWithdrawal(ctx, withdrawalTestDestination, f.noteID, "", false)
+	quoteAndApprove := func() error {
+		quote, err := f.h.QuoteAddressWithdrawal(ctx, withdrawalTestDestination, f.noteID, "", false)
+		if err != nil {
+			return err
+		}
+		_, err = f.h.ApproveAddressWithdrawal(ctx, quote.ID)
+		return err
+	}
+	err := quoteAndApprove()
 	if GaslessRefusalCode(err) != "payout_below_gas" {
 		t.Fatalf("dry run refusal: %v", err)
 	}
@@ -1255,7 +1264,7 @@ func TestGaslessWithdrawalFallsBackToTheWalletAndSweeps(t *testing.T) {
 	w := f.journal(t).Withdrawal
 	transit := common.HexToAddress(w.Transit.Account)
 	// Rerunning with payout fees tries again (and is refused again).
-	if _, err := f.h.QuoteAddressWithdrawal(ctx, withdrawalTestDestination, f.noteID, "", false); GaslessRefusalCode(err) != "payout_below_gas" || len(g.sends) != 0 {
+	if err := quoteAndApprove(); GaslessRefusalCode(err) != "payout_below_gas" || len(g.sends) != 0 {
 		t.Fatalf("second try: %v", err)
 	}
 	wallet := payoutContext(addressWithdrawalOptions{Fees: "wallet"})
@@ -1459,7 +1468,9 @@ func TestGaslessWithdrawalPreflightRefusesBeforeReserving(t *testing.T) {
 			return "exits_paused"
 		},
 		"uneconomic payout": func(f *withdrawalFixture, g *gaslessFixture) string {
-			f.walletBalance, f.planBalance = 8_000_000, 8_000_000
+			// A quarter of 0.004 ETH cannot carry the close even at the
+			// current base fee, so no lower maximum fee fits.
+			f.walletBalance, f.planBalance = 4_000_000, 4_000_000
 			return "gasless_uneconomic"
 		},
 		"payout below the fee": func(f *withdrawalFixture, g *gaslessFixture) string {
@@ -1507,15 +1518,21 @@ func TestGaslessWithdrawalPreflightRefusesBeforeReserving(t *testing.T) {
 			if f.prepareCalls != 0 || f.journal(t).Withdrawal != nil || len(g.sends) != 0 {
 				t.Fatalf("something was reserved or sent: %d %+v", f.prepareCalls, f.journal(t).Withdrawal)
 			}
-			// The wallet path is unaffected.
-			if _, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, "", false); err != nil && code != "vault paused" {
-				t.Fatalf("the wallet path was refused: %v", err)
+			// No wallet-paid fallback: a new withdrawal on this deployment
+			// pays from the payout only, and asking for the wallet reserves
+			// nothing either.
+			accepted := len(f.accepted)
+			if _, err := f.h.QuoteAddressWithdrawal(payoutContext(addressWithdrawalOptions{Fees: "wallet"}), withdrawalTestDestination, f.noteID, "", false); GaslessRefusalCode(err) != CodeWalletFeesUnavailable {
+				t.Fatalf("a wallet-paid fallback: %v", err)
+			}
+			if f.prepareCalls != 0 || f.journal(t).Withdrawal != nil || len(f.accepted) != accepted {
+				t.Fatal("the wallet request reserved or signed something")
 			}
 		})
 	}
 	// Accepting an expensive fee lifts only the uneconomic refusal.
 	f, _ := newGaslessWithdrawalFixture(t)
-	f.walletBalance, f.planBalance = 8_000_000, 8_000_000
+	f.walletBalance, f.planBalance = 4_000_000, 4_000_000
 	if _, err := f.h.QuoteAddressWithdrawal(payoutContext(addressWithdrawalOptions{Fees: "payout", AllowExpensiveGas: true}), withdrawalTestDestination, f.noteID, "", false); err != nil {
 		t.Fatalf("an accepted expensive fee was refused: %v", err)
 	}
@@ -1612,8 +1629,11 @@ func TestGaslessDeploymentChecksDisableOnlyThePayoutPath(t *testing.T) {
 			if err := f.h.client.CheckDeployment(context.Background()); err != nil {
 				t.Fatalf("the vault checks were affected: %v", err)
 			}
-			if _, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, "", false); err != nil {
-				t.Fatalf("the wallet path was refused: %v", err)
+			// The deployment publishes gasless support, so a new withdrawal
+			// pays from the payout only: with the payout path down there is
+			// no silent wallet-paid fallback (the escape hatch stays).
+			if _, err := f.h.QuoteAddressWithdrawal(payoutContext(addressWithdrawalOptions{Fees: "wallet"}), withdrawalTestDestination, f.noteID, "", false); GaslessRefusalCode(err) != CodeWalletFeesUnavailable || f.journal(t).Withdrawal != nil {
+				t.Fatalf("a wallet-paid fallback: %v", err)
 			}
 		})
 	}

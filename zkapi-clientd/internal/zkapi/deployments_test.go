@@ -7,12 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Sepolia ships the deployed concession vault and gasless paymaster. Mainnet
@@ -407,6 +409,296 @@ func TestMatchesDeploymentUsesExactNetworkIDAndVault(t *testing.T) {
 		}
 		if MatchesDeployment("unknown", deployment.ID, deployment.Contract) || MatchesDeployment(network, deployment.ID+"-other", deployment.Contract) || MatchesDeployment(network, deployment.ID, "0x1111111111111111111111111111111111111111") {
 			t.Fatal("mismatched deployment accepted")
+		}
+	}
+}
+
+// shippedSepoliaID is the leaf-bound staging deployment this build serves on
+// Sepolia, displayed as "zkAPI v0.2".
+const shippedSepoliaID = "zkapi-native-eth-sepolia-leaf-v4-20261020"
+
+// Sepolia ships the newest deployed leaf-bound vault: its ID, contract,
+// endpoints, revision-4 leaf-bound exits and development setup, displayed as
+// zkAPI v0.2. Its wallet lives in per-deployment directories of its own.
+func TestShippedSepoliaIsTheLeafBoundV4Deployment(t *testing.T) {
+	restore := SetPackagedDeploymentsForTesting(deploymentFiles)
+	defer restore()
+	identity, raw, err := deployedDeployment("sepolia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gasless, err := identity.Gasless.validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const server = "https://zkapi-sepolia.openanonymity.ai/v0.4"
+	if identity.ID != shippedSepoliaID || identity.Contract != "0x67eb750d9c0d63a99684ac3f3e65f0c610276993" || identity.ChainID != 11155111 {
+		t.Fatalf("Sepolia ships %s at %s", identity.ID, identity.Contract)
+	}
+	if identity.RPC != "https://ethereum-sepolia-rpc.publicnode.com" || identity.IndexerURL != server || identity.ProtocolServerURL != server || gasless.BundlerURL != server+"/bundler" {
+		t.Fatal("Sepolia's packaged endpoints changed")
+	}
+	if identity.VaultRevision != 4 || identity.LeafBoundExit != 1 || identity.ExitConcession != 1 || identity.Proof.Circuit != RequiredCircuitID || identity.Proof.SetupID != "dev" {
+		t.Fatal("Sepolia does not ship the leaf-bound revision-4 vault with the development setup")
+	}
+	info, err := PackagedDeployment("sepolia")
+	if err != nil || info != (PackagedDeploymentInfo{ID: shippedSepoliaID, Display: "zkAPI v0.2", Contract: identity.Contract, ProtocolServerURL: server, BundlerURL: server + "/bundler", VaultRevision: 4, ChainID: 11155111, Deployed: true}) {
+		t.Fatalf("packaged Sepolia deployment %+v, %v", info, err)
+	}
+	// The label belongs to the deployment, not to a URL path: /v0.2 was the
+	// revision-3 server's.
+	for id, want := range map[string]string{"zkapi-native-eth-sepolia-concession-v1-r3": "zkAPI deployment zkapi-native-eth-sepolia-concession-v1-r3", "zkapi-native-eth-sepolia-concession-v2-r4-20261017": "zkAPI deployment zkapi-native-eth-sepolia-concession-v2-r4-20261017"} {
+		if DeploymentDisplay(id) != want {
+			t.Fatalf("%s is displayed as %q", id, DeploymentDisplay(id))
+		}
+	}
+	mainnet, err := PackagedDeployment("mainnet")
+	if err != nil || mainnet.Deployed || mainnet.Contract != "" || mainnet.Display != "zkAPI deployment "+mainnet.ID {
+		t.Fatalf("mainnet placeholder %+v, %v", mainnet, err)
+	}
+	cfg := t.TempDir()
+	funding, err := fundingStateDir(filepath.Join(cfg, "funding"), "sepolia")
+	if err != nil || funding != filepath.Join(cfg, "funding", "sepolia", shippedSepoliaID) {
+		t.Fatalf("payment state directory %s, %v", funding, err)
+	}
+	client, err := New(Config{Network: "sepolia", BridgeToken: testBridgeToken, HTTPClient: &http.Client{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewFundingHandler(client, "http://127.0.0.1:8787", filepath.Join(cfg, "funding"))
+	if err != nil || handler.statePath != filepath.Join(funding, "pending-deposit.json") {
+		t.Fatalf("payment handler state %v", err)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := CompanionCommand(context.Background(), Config{Network: "sepolia", BridgeToken: testBridgeToken, HTTPClient: &http.Client{}}, CompanionConfig{Binary: binary, SetupDir: devSetupDir, StateDir: filepath.Join(cfg, "zkapi"), ProxyURL: "http://bridge:private-local-token@127.0.0.1:8791"})
+	if err != nil || cmd == nil {
+		t.Fatalf("the shipped Sepolia deployment did not start its companion: %v", err)
+	}
+	wallet := filepath.Join(cfg, "zkapi", "sepolia", shippedSepoliaID)
+	if !strings.Contains(strings.Join(cmd.Args, " "), "--state-dir "+wallet) {
+		t.Fatal("the companion does not use the per-deployment wallet directory")
+	}
+	saved, err := os.ReadFile(filepath.Join(wallet, "deployment-manifest.json"))
+	if err != nil || !bytes.Equal(saved, raw) {
+		t.Fatal("the companion did not save the exact embedded manifest")
+	}
+}
+
+// Existing leaf-v4 wallets saved these exact bytes as their deployment
+// manifest, and writeDeploymentManifest refuses any other: editing
+// deployments/sepolia.json would strand every one of them. Another Sepolia
+// vault gets another deployment ID, and so its own directories, instead.
+func TestEmbeddedSepoliaManifestBytesArePinned(t *testing.T) {
+	raw, err := fs.ReadFile(deploymentFiles, "deployments/sepolia.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	if got := hex.EncodeToString(sum[:]); got != "0da4ccbaa8bebd0dbb59801a87a4e483382f9af14bd75840a7c081dcefc998ca" {
+		t.Fatalf("deployments/sepolia.json changed (SHA-256 %s); saved leaf-v4 wallets would no longer load", got)
+	}
+}
+
+// The staging deployment pins the committed development setup: the setup's
+// manifest and its key files carry exactly the embedded hashes.
+func TestShippedSepoliaPinsTheCommittedDevelopmentSetup(t *testing.T) {
+	restore := SetPackagedDeploymentsForTesting(deploymentFiles)
+	defer restore()
+	identity, raw, err := pinnedDeployment("sepolia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var embedded struct {
+		Proof struct {
+			Path string `json:"repository_path"`
+		} `json:"proof_setup"`
+	}
+	if err := json.Unmarshal(raw, &embedded); err != nil || embedded.Proof.Path != "protocol/setup/v2-concession-dev" {
+		t.Fatalf("Sepolia names setup %q", embedded.Proof.Path)
+	}
+	setupRaw, err := os.ReadFile(filepath.Join(devSetupDir, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var setup struct {
+		Circuit string            `json:"circuit_id"`
+		SetupID string            `json:"setup_id"`
+		Files   map[string]string `json:"files"`
+		VK      struct {
+			Request    string `json:"request"`
+			Withdrawal string `json:"withdrawal"`
+		} `json:"vk_keccak256"`
+	}
+	if err := json.Unmarshal(setupRaw, &setup); err != nil {
+		t.Fatal(err)
+	}
+	proof := identity.Proof
+	if setup.Circuit != proof.Circuit || setup.SetupID != proof.SetupID || setup.VK.Request != proof.RequestVKKeccak256 || setup.VK.Withdrawal != proof.WithdrawalVKKeccak256 {
+		t.Fatal("the embedded circuit, setup or verifying-key hashes differ from the development setup")
+	}
+	for name, pin := range map[string]string{"request.pk": proof.RequestProvingKeySHA256, "request.vk": proof.RequestVerifyingKeySHA256, "withdrawal.pk": proof.WithdrawalProvingKeySHA256, "withdrawal.vk": proof.WithdrawalVerifyingKeySHA256} {
+		if setup.Files[name] != pin {
+			t.Fatalf("the embedded %s hash differs from the development setup's", name)
+		}
+	}
+	if err := verifyProofSetup(devSetupDir, proof); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Wallets of the deployments earlier builds served stay beside this one in
+// the profile. Each is named, with its directories and its way out, and
+// never opened: starting this build's companion and payment handler on the
+// same profile leaves every byte, mode and modification time alone. Empty
+// directories, or a saved manifest alone, are no wallet and warn nothing.
+func TestEarlierDeploymentsAreWarnedNeverOpened(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(earlierDeployments["sepolia"]) != 4 || len(earlierDeployments["mainnet"]) != 2 {
+		t.Fatal("an earlier deployment is missing from the registry")
+	}
+	stamp := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	for network, earlier := range earlierDeployments {
+		for _, deployment := range earlier {
+			t.Run(deployment.id, func(t *testing.T) {
+				cfg := t.TempDir()
+				walletDir := filepath.Join(cfg, "zkapi", network, deployment.id)
+				fundingDir := filepath.Join(cfg, "funding", network, deployment.id)
+				for _, dir := range []string{walletDir, fundingDir} {
+					if err := os.MkdirAll(dir, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(walletDir, "deployment-manifest.json"), []byte(`{"deployment_id":"`+deployment.id+`"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if state, warnings := EarlierDeploymentState(cfg, network), EarlierDeploymentWarnings(cfg, network); len(state) != 0 || len(warnings) != 0 {
+					t.Fatalf("an empty earlier wallet warned: %v", warnings)
+				}
+				files := map[string]os.FileMode{}
+				for _, name := range companionRecoveryFiles {
+					files[filepath.Join("zkapi", network, deployment.id, name)] = 0600
+				}
+				for _, name := range fundingRecoveryFiles {
+					files[filepath.Join("funding", network, deployment.id, name)] = 0400
+				}
+				for relative, mode := range files {
+					path := filepath.Join(cfg, relative)
+					if err := os.WriteFile(path, []byte("synthetic recovery file "+relative), 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chmod(path, mode); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chtimes(path, stamp, stamp); err != nil {
+						t.Fatal(err)
+					}
+				}
+				state := EarlierDeploymentState(cfg, network)
+				if len(state) != 1 || state[0].ID != deployment.id || state[0].Display != deployment.display || state[0].Recovery != deployment.recovery || len(state[0].Files) != len(files) {
+					t.Fatalf("earlier deployment state %+v", state)
+				}
+				for _, relative := range state[0].Files {
+					if _, ok := files[relative]; !ok {
+						t.Fatalf("listed %s, which was not written", relative)
+					}
+				}
+				warnings := EarlierDeploymentWarnings(cfg, network)
+				if len(warnings) != 1 {
+					t.Fatalf("warnings %v", warnings)
+				}
+				for _, want := range []string{deployment.id, walletDir, fundingDir, deployment.recovery, "never opens, changes or migrates"} {
+					if !strings.Contains(warnings[0], want) {
+						t.Fatalf("the warning does not name %q: %s", want, warnings[0])
+					}
+				}
+				if deployment.noteBound != strings.Contains(warnings[0], LegacyRelease) || !deployment.noteBound && !strings.Contains(warnings[0], "origin/v0.2") {
+					t.Fatalf("the warning names the wrong way out: %s", warnings[0])
+				}
+				if strings.Contains(warnings[0], "synthetic recovery file") {
+					t.Fatal("the warning read a recovery file")
+				}
+				cmd, err := CompanionCommand(context.Background(), Config{Network: network, BridgeToken: testBridgeToken, HTTPClient: &http.Client{}}, CompanionConfig{Binary: binary, SetupDir: devSetupDir, StateDir: filepath.Join(cfg, "zkapi"), ProxyURL: "http://bridge:private-local-token@127.0.0.1:8791"})
+				if err != nil || cmd == nil {
+					t.Fatalf("an earlier wallet stopped this build's companion: %v", err)
+				}
+				client, err := New(Config{Network: network, BridgeToken: testBridgeToken, HTTPClient: &http.Client{}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := NewFundingHandler(client, "http://127.0.0.1:8787", filepath.Join(cfg, "funding")); err != nil {
+					t.Fatal(err)
+				}
+				for relative, mode := range files {
+					path := filepath.Join(cfg, relative)
+					info, err := os.Lstat(path)
+					contents, readErr := os.ReadFile(path)
+					if err != nil || readErr != nil || string(contents) != "synthetic recovery file "+relative || info.Mode().Perm() != mode || !info.ModTime().Equal(stamp) {
+						t.Fatalf("%s changed", relative)
+					}
+				}
+				for dir, want := range map[string]int{walletDir: len(companionRecoveryFiles) + 1, fundingDir: len(fundingRecoveryFiles)} {
+					if entries, err := os.ReadDir(dir); err != nil || len(entries) != want {
+						t.Fatalf("this build wrote into %s", dir)
+					}
+				}
+				if manifest, err := os.ReadFile(filepath.Join(walletDir, "deployment-manifest.json")); err != nil || string(manifest) != `{"deployment_id":"`+deployment.id+`"}` {
+					t.Fatal("the earlier deployment's saved manifest changed")
+				}
+			})
+		}
+	}
+	// The earlier release kept its payment files per network.
+	cfg := t.TempDir()
+	root := filepath.Join(cfg, "funding", "sepolia")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "address-funding.json"), []byte("synthetic earlier payment key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	state := EarlierDeploymentState(cfg, "sepolia")
+	warnings := EarlierDeploymentWarnings(cfg, "sepolia")
+	if len(state) != 1 || state[0].ID != "" || len(state[0].Files) != 1 || state[0].Files[0] != filepath.Join("funding", "sepolia", "address-funding.json") || len(warnings) != 1 || warnings[0] != LegacyFundingWarning(filepath.Join(cfg, "funding"), "sepolia") {
+		t.Fatalf("earlier release payment files: %+v %v", state, warnings)
+	}
+	if EarlierDeploymentState(cfg, "mainnet") != nil {
+		t.Fatal("Sepolia's earlier files were reported on mainnet")
+	}
+}
+
+// Compatibility exception: this build cannot load the exact manifests of the
+// earlier Sepolia concession deployments. Revision 3
+// (zkapi-native-eth-sepolia-concession-v1-r3) proves another circuit, and
+// zkapi-native-eth-sepolia-concession-v2-r4-20261017 has no leaf-bound exits
+// (and other verifying keys). Their wallets keep their own directories and
+// are recovered with the origin/v0.2 local CLI bundle.
+func TestEarlierConcessionDeploymentsCannotLoadInThisBuild(t *testing.T) {
+	restore := SetPackagedDeploymentsForTesting(deploymentFiles)
+	defer restore()
+	_, raw, err := pinnedDeployment("sepolia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, changes := range map[string][][2]string{
+		"zkapi-native-eth-sepolia-concession-v1-r3":          {{`"vault_revision": 4`, `"vault_revision": 3`}, {`"circuit_id": "zkapi-v2-concession-v2"`, `"circuit_id": "zkapi-v2-concession-v1"`}, {`"leaf_bound_exit": 1,`, ``}},
+		"zkapi-native-eth-sepolia-concession-v2-r4-20261017": {{`"leaf_bound_exit": 1,`, ``}},
+	} {
+		earlier := bytes.Replace(raw, []byte(shippedSepoliaID), []byte(id), 1)
+		for _, change := range changes {
+			changed := bytes.Replace(earlier, []byte(change[0]), []byte(change[1]), 1)
+			if bytes.Equal(changed, earlier) {
+				t.Fatalf("%s: the manifest has no %s", id, change[0])
+			}
+			earlier = changed
+		}
+		if _, err := parseDeploymentIdentity("sepolia", earlier); err == nil {
+			t.Fatalf("this build loaded the %s profile", id)
 		}
 	}
 }

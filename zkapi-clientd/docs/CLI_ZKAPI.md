@@ -299,41 +299,88 @@ do not attach to or reconfigure an already-running daemon.
 
 This release serves only the leaf-bound concession-exit vault (circuit
 `zkapi-v2-concession-v2`, vault revision 4); it refuses a revision-3 profile
-(circuit `zkapi-v2-concession-v1`). Its embedded profiles are
-`zkapi-native-eth-mainnet-concession-v1` and
-`zkapi-native-eth-sepolia-concession-v1`. Until that vault is deployed on a
-network, its profile ships as a placeholder (`"deployment_status":
-"not_deployed"`, no contract, adapter, endpoints or signing keys) and the
-client refuses to fund, use or withdraw a note there with
-`deployment_not_deployed`. A release that pins the deployed vault replaces
-the placeholder.
+(circuit `zkapi-v2-concession-v1`) and a revision-4 profile without leaf-bound
+exits. Its embedded profiles are:
+
+| Network | Deployment | Shown as | Vault | Protocol server |
+| --- | --- | --- | --- | --- |
+| Sepolia | `zkapi-native-eth-sepolia-leaf-v4-20261020` | zkAPI v0.2 | `0x67eb750d9c0d63a99684ac3f3e65f0c610276993` | `https://zkapi-sepolia.openanonymity.ai/v0.4` |
+| Mainnet | `zkapi-native-eth-mainnet-concession-v1` | (placeholder) | none | none |
+
+"zkAPI v0.2" is the build's display name for the Sepolia deployment (vault
+revision 4 in the deployment registry, leaf-bound exits, development proving
+setup `protocol/setup/v2-concession-dev`); it is not
+derived from the server path (`/v0.2` was the revision-3 server's path). The
+configuration summary, the wallet menu, guided setup and `serve` show it with
+the deployment ID and vault. Mainnet's profile ships as a placeholder
+(`"deployment_status": "not_deployed"`, no contract, adapter, endpoints or
+signing keys) and the client refuses to fund, use or withdraw a note there
+with `deployment_not_deployed`. A release that pins the deployed vault
+replaces the placeholder.
+
+A wallet saves its deployment manifest's exact bytes
+(`zkapi/<network>/<deployment_id>/deployment-manifest.json`) and refuses to
+start with any other, so an embedded deployed manifest is never edited in
+place: a test pins the SHA-256 of the Sepolia manifest, and existing leaf-v4
+wallets keep loading. Another vault gets another deployment ID and so its
+own directories.
 
 The embedded profiles pin the deployment IDs, contracts, the proof adapter
 and Poseidon library, their runtime-code hashes, signing keys, oracle,
 challenge period, note term, maximum pause, the settlement window `W`, the
-vault's minimum deposit (`min_deposit_units`, 1,000,000 gwei on the packaged
-placeholders), the network's fresh-slot gas (`fresh_slot_gas`: 22,100 under
+vault's minimum deposit (`min_deposit_units`, 1,000,000 gwei in both packaged
+profiles), the network's fresh-slot gas (`fresh_slot_gas`: 22,100 under
 mainnet rules, 110,000 on Sepolia under EIP-8037), the deploy block and the
 proof setup (circuit, setup ID and key hashes). Wallet
 funding and recovery records are bound to the configured network and
 deployment. Unknown origins or unapproved manifest differences fail closed.
 Do not delete recovery data to bypass a configuration mismatch.
 
-A note of the earlier vault (circuit `zkapi-v2-note-bound-v1`) lives in its
-own wallet directory, which this release never opens. When one is still open,
-startup prints a warning naming its directory: withdraw it with zkapi-clientd
-0.1.7 from the earlier release line (`release/v2-note-bound`), which closes
-deposits on that vault and keeps its mutual close and an escape (`withdraw
---escape`, with a runbook in that release's `docs/LEGACY_ESCAPE.md`), then
-fund this release.
+All wallet state is kept per deployment under the configuration directory:
 
-Payment state (the local signing address and its key, pending deposits and
-their recovery records) is kept per deployment as well, in
-`funding/<network>/<deployment_id>/` under the configuration directory. The
-earlier release kept its own in `funding/<network>/`; this release neither
-reads nor changes those files, and startup prints a warning naming them while
-they exist. Keep them for the earlier release until its note is withdrawn and
-its signing address emptied.
+- `zkapi/<network>/<deployment_id>/`: the companion's wallet
+  (`note_state.json`, `pending_journal.json`, `prepared_withdrawal.json`,
+  `oa-withdrawal.json`, `exit_lock.json`, `escape_withdrawal.json`) and the
+  saved manifest;
+- `funding/<network>/<deployment_id>/`: the payment state (the local signing
+  address and its key in `address-funding.json`, a pending deposit and its
+  recovery record in `pending-deposit.json`).
+
+A build opens only its own deployment's directories. It never migrates,
+reads or changes another deployment's: an already funded note and a saved
+in-flight withdrawal of an earlier deployment stay exactly where that build
+left them. When an earlier deployment's recovery files exist in the profile,
+`serve` (managed or external companion), `config --setup`, `config --menu`,
+`withdraw` and guided funding (before it shows a new funding address) print a
+warning naming the deployment, its directories and its way out. The warning
+never asks a question or stops the command, and only checks which files
+exist (it never reads them). Earlier deployments:
+
+| Network | Deployment | Recovery |
+| --- | --- | --- |
+| Sepolia | `zkapi-native-eth-sepolia-concession-v2-r4-20261017` (vault `0x7ff4ba06…`, `/v0.3`, revision 4 without leaf-bound exits) | the local CLI bundle built from git branch `origin/v0.2`, with the same `--config-dir` (its default concession stack) |
+| Sepolia | `zkapi-native-eth-sepolia-concession-v1-r3` (vault `0x1670d773…`, `/v0.2`, revision 3) | the same `origin/v0.2` bundle and `--config-dir`, with `--vault-protocol concession-v1` |
+| Sepolia, Mainnet | `zkapi-native-eth-<network>-note-bound-v1-fresh-20260930`, `…-20260928` | the legacy dispatcher (`--vault-protocol legacy` with the original profile) or zkapi-clientd 0.1.7 from the earlier release line (`release/v2-note-bound`), which closes deposits on that vault and keeps its mutual close and an escape (`withdraw --escape`, runbook in that release's `docs/LEGACY_ESCAPE.md`) |
+
+**Compatibility exception:** this build cannot load the exact manifests of
+the two earlier Sepolia concession deployments (revision 3 proves circuit
+`zkapi-v2-concession-v1`; `concession-v2-r4-20261017` has no leaf-bound exits
+and other verifying keys). Their files are preserved and warned about, and
+their notes and saved withdrawals are recovered with the `origin/v0.2`
+bundle. A profile whose saved vault protocol is `concession-v1` (saved by
+that bundle) is refused with that guidance, and the `vault-protocol` file is
+left unchanged; so is `--vault-protocol concession-v1` or
+`ZKAPI_VAULT_PROTOCOL=concession-v1`.
+
+The earlier note-bound release kept its payment files in `funding/<network>/`
+itself; this release neither reads nor changes them, and the same warning
+names them while they exist. Keep them for that release until its note is
+withdrawn and its signing address emptied.
+
+A running daemon reports the deployment its build serves. A command from a
+build pinning another deployment refuses to attach to it ("restart the daemon
+with this build; your other wallet is untouched"); a daemon from a build that
+predates this report gets a one-line warning and is used as before.
 
 ### Deployment checks and the exit RPC
 
@@ -650,7 +697,11 @@ stop with `clearance_reserved_state` ("reserved for withdrawal"); choose
 ## Withdrawals
 
 Choose `withdraw` in `config --menu`. A new withdrawal asks for the destination
-once and shows its full private payout. The vault's own contract address is
+once and shows its full private payout. On a deployment that publishes a
+gasless withdrawal paymaster the fee is paid from the payout (next section)
+and nothing below about fee QRs applies; the wallet-paid flow described here
+serves deployments without one and withdrawals saved wallet-paid before
+sponsorship. The vault's own contract address is
 refused as a destination, before anything is reserved: the vault cannot
 receive its own payout, so every close to it would revert. If gas is insufficient, it shows the
 same address/QR and live balance UI as a deposit, but requests only public ETH
@@ -684,40 +735,83 @@ transfer and requires destination, amount and fee approval.
 
 On a deployment that publishes a gasless withdrawal paymaster (the profile's
 `gasless` object: an ERC-4337 EntryPoint v0.7.0, the `ZkApiWithdrawalPaymaster`
-and its account factory), the withdrawal's network fee can be paid from the
-payout instead of by the local signing address, so the destination needs no
-ETH and no fee QR appears:
+and its account factory), a new withdrawal pays its network fee from the
+payout: sending to an address this way is the only new withdrawal offered,
+as in the web app, the local signing address needs no ETH and no fee QR
+appears. A wallet-paid fee is neither offered nor taken as a fallback
+(`--fees wallet` on a new withdrawal is refused with `wallet_fees_unavailable`
+before anything is reserved), also when the bundler or paymaster is
+unavailable: the withdrawal waits and is retried.
 
 ```sh
-zkapi-clientd withdraw --to 0xDESTINATION --fees payout                       # quote a sponsored close
-zkapi-clientd withdraw --approve QUOTE_ID                                     # sign and send the operation
-zkapi-clientd withdraw --resume                                               # follow a sent operation
-zkapi-clientd withdraw --to 0xDESTINATION --fees payout --fee-cap-gwei 2000000 \
-    --bundler-url https://bundler.example/rpc --allow-expensive-gas          # bounds and your own bundler
+zkapi-clientd withdraw --to 0xDESTINATION                                     # quote: estimate, maximum, floor
+zkapi-clientd withdraw --approve QUOTE_ID                                     # approve once; signed and sent within the maximum
+zkapi-clientd withdraw --resume                                               # follow it, or retry it within the approval
+zkapi-clientd withdraw --to 0xDESTINATION --fee-cap-gwei 2000000 \
+    --bundler-url https://bundler.example/rpc --allow-expensive-gas          # a tighter maximum and your own bundler
 zkapi-clientd withdraw --to 0xDESTINATION --collect                           # forward a payout waiting in the transit account (sponsored)
-zkapi-clientd withdraw --to 0xDESTINATION --sweep                             # ... or sweep it, paid by the local signing address
-zkapi-clientd withdraw --to 0xDESTINATION --claim-credit                      # deliver a payout the paymaster credited
-zkapi-clientd config --withdrawal-fees payout --bundler-url https://bundler.example/rpc   # defaults
+zkapi-clientd withdraw --to 0xDESTINATION --sweep                             # recovery: sweep it, paid by the local signing address
+zkapi-clientd withdraw --to 0xDESTINATION --claim-credit                      # recovery: deliver a payout the paymaster credited
+zkapi-clientd config --bundler-url https://bundler.example/rpc                # your own bundler by default
 ```
 
-The guided **withdraw** menu offers "Pay the network fee from the payout (no
-ETH needed)" whenever the pre-flight says the paymaster can sponsor the exit,
-before any fee QR; a saved sponsored withdrawal that stopped as
-`gasless_refused` while the sponsored path is unavailable falls back to the
-wallet-paid fee without asking (its quote is still reviewed). `--fees` resolves from the flag, then
-`zkapi.withdrawal_fees` (`wallet` by default); `--bundler-url` from the flag,
-then `zkapi.bundler_url`, then the deployment's published bundler. The bundler
+**Approve once.** The quote shows the estimated fee, says plainly that the
+actual fee may change, and shows the most the fee may take from the payout
+(`max_total_fee_wei`) and the least the destination receives
+(`min_net_payout_wei` = payout − maximum − debt). The maximum is the
+deployment's normal limit, as the web app uses it: the uneconomic fraction
+(25%) of the payout, at most what the paymaster's policy lets one operation
+cost plus its flat fee (and, for a destination with code, the credit
+surcharge of a failed push); `--fee-cap-gwei` tightens it, nothing widens it,
+and `--allow-expensive-gas` lifts the fraction. One approval (the guided
+Enter, `--approve`, or `POST /admin/withdrawal/approve`) covers this
+destination, note, transit account and bundler: it is journaled before
+anything is signed, and the operation is built at the fees of the moment it
+is signed. Fees that fell or rose since the quote, a bundler that drops or
+refuses a copy for its price, a proof that expired, a lost answer or a
+restart are all handled within the maximum without asking again: the copy
+is rebuilt, re-signed with higher fees, or proved again from the kept
+clearance, always at the nonce of the first copy signed under the approval,
+so at most one copy is ever included and charged. When the fee needed now
+exceeds the maximum (or the bundler or paymaster is unavailable) nothing is
+signed and the status is `gasless_refused` with `gasless_retryable` true:
+the running `withdraw` command, `--resume`, the guided flow or a restarted
+daemon retries it later, at most eight rebuilds per approval. A new
+destination or note, a higher maximum, a raised flat fee or debt, a reverted
+operation (it used one of the key's attempts) or a nonce that moved need a
+new quote and approval. The guided flow asks for Enter once; an approval
+whose quote expired (quotes are approvable for 30 minutes) is re-quoted and
+approved without asking only if the identity is unchanged, the maximum is not
+higher and the floor not lower. A quote publishes nothing executable: no
+valid owner signature and no exit proof reach the RPC or the bundler before
+the approval (the gas estimate and the EntryPoint hash check use a copy whose
+proof no verifier accepts, and nothing is simulated); the signed dry run runs
+after the approval, once the copy is journaled.
+
+A CLI from this build attached to a daemon an older build started (it reports
+no `new_withdrawal_fees`) quotes and approves nothing through it, and names
+the restart; a withdrawal that daemon already signed is still followed.
+
+`--bundler-url` resolves from the flag, then `zkapi.bundler_url`, then the
+deployment's published bundler; `zkapi.withdrawal_fees` applies only to
+deployments without sponsorship. The bundler
 URL follows the exit RPC's rules (HTTPS, or plain HTTP to this machine). It
 is resolved once, when the quote is made (the quote shows it), and
 `--approve` sends the operation to that bundler; an approval that would
-resolve another one is refused before it is contacted. `--fees wallet` named
-on the command line (or chosen in the guided menu) is sent to the daemon even
-when it is the default, so it switches a saved sponsored withdrawal to the
-wallet-paid path; a rerun without `--fees` keeps a saved withdrawal's mode
-(the configured `zkapi.withdrawal_fees` is sent only for a new withdrawal).
-`--fee-cap-gwei` bounds what the payout may lose: the sponsored fee's maximum
-plus, for a destination with code, the paymaster's credit surcharge of a
-failed push.
+resolve another one is refused before it is contacted.
+
+**Compatibility exceptions** (recovery, not a normal option): a withdrawal
+saved wallet-paid before sponsorship (no transit account) finishes
+wallet-paid with its fee QR; a saved sponsored withdrawal whose sponsored path
+stopped for good (refused with no retry, an operation that reverted, its
+attempts used up, or a record the profile no longer pins) may be closed
+wallet-paid with an explicit `--to ADDRESS --fees wallet` on the command line,
+never from the guided flow and never automatically; `--sweep` and
+`--claim-credit` deliver a payout waiting in the transit account or the
+paymaster, paid by the local signing address; an escape keeps its own fee
+choice (`--escape --fees wallet` is the operator-independent exit);
+`withdraw --public` returns public ETH; deployments without a `gasless`
+object, and the legacy protocol, stay wallet-paid.
 
 How it works. Before anything is reserved, the client checks the gasless
 contracts against this release's pins (the runtime code of the EntryPoint,
@@ -763,11 +857,11 @@ margin, B the reference bundler's minimum (21,000 + 18,300 + 4 per word +
 4 / 16 per zero / non-zero byte of the encoded operation) and C 21,000 + 16
 per byte of `handleOps` calldata + 10,000; a higher `preVerificationGas` from
 the bundler's `eth_estimateUserOperationGas` within the paymaster's cap is
-what that bundler requires and is adopted in the quote, and so in the signed
-operation. The operation (`S.withdraw(mutualClose(...))`, packed per EntryPoint
+what that bundler requires and is adopted when the approved operation is
+built. The operation (`S.withdraw(mutualClose(...))`, packed per EntryPoint
 v0.7.0, hashed locally and cross-checked with `getUserOpHash`, signed EIP-191
-with the owner key, dry-run through `eth_call handleOps`) is journaled before
-it is sent (`user_op` with its hash, nonce, bundler and every hash of a
+with the owner key after the approval, journaled, then dry-run through
+`eth_call handleOps`) is journaled before any RPC or bundler sees it (`user_op` with its hash, nonce, bundler and every hash of a
 re-signed copy), then sent with `eth_sendUserOperation`.
 
 Phases: `quoted` → `op_built` (journaled, being sent) → `op_submitted` (at the
@@ -780,17 +874,16 @@ your exit RPC when one is set, and needs Ethereum finality; after five
 minutes without inclusion the bundler is asked again, an operation it forgot
 is re-sent, one it refuses because the transit account was created meanwhile
 (`AA10`) is rebuilt without `initCode`, and one it refuses as underpriced is
-re-signed with both fees raised an eighth (dry-run before it is journaled), within the paymaster's ceilings and within what the
-approval allows: your `--fee-cap-gwei` when the quote was made with one
-(without one an approved operation is never re-signed above its approved
-maximum), the payout's floor, the uneconomic fraction, and the paymaster's
-policy and deposit. A raise beyond them is not signed: the record stops as
-`gasless_refused` (reason `fee_bump_needs_quote`), and rerunning `--to`
-quotes again at the current fees, after looking once more for an inclusion
-of any journaled copy of the dropped operation, which is adopted (so does
-`--fees wallet`, which then refuses the wallet quote and names the resume). The operation is abandoned
-60 seconds before the proof's `valid_until` (phase `gasless_refused`, reason
-`op_expired`; rerun `--to` to prove again). An operation found on chain is
+re-signed with both fees raised an eighth (journaled, then dry-run), within the paymaster's ceilings and within the approval's maximum, the payout's floor and the paymaster's
+policy and deposit, at the payout address's current state. A raise beyond
+the maximum is not signed: the record waits as `gasless_refused`
+(`fee_above_authorization`, retried under the approval), after looking once
+more for an inclusion of any journaled copy, which is adopted. A withdrawal
+saved by an older build without an approval keeps its old rule: a raise
+beyond its approved maximum stops it with `fee_bump_needs_quote`, and
+rerunning `--to` quotes again. The operation is abandoned 60 seconds before
+the proof's `valid_until` (`op_expired`); under an approval it is proved
+again, at the same nonce, once the expired copy can no longer be included. An operation found on chain is
 never taken for a dropped one later: an escape whose sponsored initiation was
 included and whose finalization is then refused stops as `gasless_refused`,
 and `--fees wallet` signs the wallet-paid finalization. `op_reverted` is an operation

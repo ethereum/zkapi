@@ -171,6 +171,10 @@ type addressWithdrawalRecord struct {
 	// PayeeHasCode records that the payout address had code when the
 	// withdrawal was prepared (design 3.1's advisory).
 	PayeeHasCode bool `json:"payee_has_code,omitempty"`
+	// Authorization is the owner's bounded approval of a payout close
+	// (gasless_authorization.go): signed copies are built within it, at the
+	// fees of their moment, without asking again.
+	Authorization *gaslessAuthorization `json:"authorization,omitempty"`
 }
 
 // proofDestination is the address the proof and the vault's logs name: the
@@ -218,6 +222,11 @@ func setGaslessStatus(status *AddressWithdrawalStatus, w *addressWithdrawalRecor
 	status.PaymasterCredited, status.PaymasterAddress = false, ""
 	if w.PaymasterCredited {
 		status.PaymasterCredited, status.PaymasterAddress = true, w.Transit.Paymaster
+	}
+	status.AuthorizedMaxFeeWei, status.AuthorizedMinNetPayoutWei, status.EstimatedFeeWei, status.GaslessRetryable = "", "", "", false
+	if a := usableAuthorization(w); a != nil && w.Phase != "complete" {
+		status.AuthorizedMaxFeeWei, status.AuthorizedMinNetPayoutWei, status.EstimatedFeeWei = a.MaxTotalFeeWei, a.MinNetPayoutWei, a.EstimatedFeeWei
+		status.GaslessRetryable = retryableUnderAuthorization(w)
 	}
 }
 
@@ -486,7 +495,7 @@ func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig,
 // (exitConfig).
 func (h *FundingHandler) withdrawalSnapshotFor(ctx context.Context, exit bool) (fundingConfig, *addressFundingRecord, withdrawalWallet, AddressWithdrawalStatus, error) {
 	config, record, payment, err := h.addressSnapshotFor(ctx, exit)
-	status := AddressWithdrawalStatus{Address: payment.Address, ChainID: payment.ChainID, TokenAddress: payment.TokenAddress, TokenDecimals: payment.TokenDecimals, DeploymentID: payment.DeploymentID, BillingAsset: payment.BillingAsset, BillingUnit: payment.BillingUnit, WeiPerUnit: payment.WeiPerUnit, ETHBalance: payment.ETHBalance, EscapePayoutCredits: payment.EscapePayoutCredits}
+	status := AddressWithdrawalStatus{Address: payment.Address, ChainID: payment.ChainID, TokenAddress: payment.TokenAddress, TokenDecimals: payment.TokenDecimals, DeploymentID: payment.DeploymentID, BillingAsset: payment.BillingAsset, BillingUnit: payment.BillingUnit, WeiPerUnit: payment.WeiPerUnit, ETHBalance: payment.ETHBalance, EscapePayoutCredits: payment.EscapePayoutCredits, NewWithdrawalFees: h.newWithdrawalFees()}
 	var wallet withdrawalWallet
 	if err != nil {
 		return config, record, wallet, status, err
@@ -625,6 +634,9 @@ func setWithdrawalMessage(status *AddressWithdrawalStatus) {
 	switch status.Phase {
 	case "ready":
 		status.Message = "Withdraw the entire remaining private balance to an explicit Ethereum address. The local payment address pays network fees."
+		if status.NewWithdrawalFees == "payout" {
+			status.Message = "Withdraw the entire remaining private balance to an explicit Ethereum address. The network fee is paid from the payout by a sponsored operation; this wallet needs no ETH."
+		}
 	case "no_note":
 		status.Message = "There is no active private balance to withdraw."
 	case "waiting_settlement":
@@ -670,7 +682,17 @@ func setGaslessMessage(status *AddressWithdrawalStatus) bool {
 	case "op_reverted":
 		status.Message = fmt.Sprintf("The sponsored operation (%s) was included in %s but reverted (%s). If another transaction closed the note first, the payout sits in the transit account %s: deliver it with zkapi-clientd withdraw --collect --to %s (sponsored) or --sweep --to %s (paid by the local signing address). Otherwise rerun %s to prove again.", status.UserOpHash, status.TransactionHash, status.GaslessRefusal, status.TransitAccount, status.Destination, status.Destination, command)
 	case "gasless_refused":
-		status.Message = fmt.Sprintf("The gasless path stopped: %s. Rerun %s to try again, or add --fees wallet to pay the fee from the local signing address; the payout then reaches the transit account %s and zkapi-clientd withdraw --sweep --to %s delivers it.", status.GaslessRefusal, command, status.TransitAccount, status.Destination)
+		switch {
+		case escape:
+			status.Message = fmt.Sprintf("The gasless path stopped: %s. Rerun %s to try again, or add --fees wallet to pay the fee from the local signing address; the payout then reaches the transit account %s and zkapi-clientd withdraw --sweep --to %s delivers it.", status.GaslessRefusal, command, status.TransitAccount, status.Destination)
+		case status.GaslessRetryable:
+			status.Message = fmt.Sprintf("The sponsored withdrawal is waiting: %s. Your authorization (at most %s wei from the payout; %s receives at least %s wei) still holds: it is retried without a new approval while the withdraw command keeps running, or resume with zkapi-clientd withdraw --resume.", status.GaslessRefusal, status.AuthorizedMaxFeeWei, status.Destination, status.AuthorizedMinNetPayoutWei)
+		default:
+			// A saved record the sponsored path can no longer carry (its
+			// attempts used up, a payout below the fee) keeps the explicit
+			// wallet-paid recovery; it is never taken without the owner.
+			status.Message = fmt.Sprintf("The sponsored withdrawal stopped: %s. Rerun %s to review a new quote; nothing more is signed without your approval. If the sponsored path cannot carry this note any more, the explicit recovery is %s --fees wallet, paid from the local signing address; the payout then reaches the transit account %s and zkapi-clientd withdraw --sweep --to %s delivers it.", status.GaslessRefusal, command, command, status.TransitAccount, status.Destination)
+		}
 		if status.FundsWaitingInTransit {
 			status.Message = fmt.Sprintf("The gasless path stopped: %s. The payout waits in the transit account %s: deliver it with zkapi-clientd withdraw --collect --to %s (sponsored) or --sweep --to %s (paid by the local signing address).", status.GaslessRefusal, status.TransitAccount, status.Destination, status.Destination)
 		}
@@ -790,6 +812,16 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		if transitAction {
 			return status, errors.New("there is no saved gasless withdrawal with a transit account to collect, sweep or claim from")
 		}
+		if h.newWithdrawalFees() == "payout" {
+			// A deployment with reviewed gasless support offers one new
+			// withdrawal: the fee is paid from the payout, as in the web
+			// app. Nothing is reserved for a wallet-paid one, and nothing at
+			// all without a quote to approve.
+			if options.Fees == "wallet" {
+				return status, refuse(CodeWalletFeesUnavailable, "new withdrawals on this deployment pay the network fee from the payout by a sponsored operation; the local signing address needs no ETH, and a wallet-paid fee is not offered")
+			}
+			options.Fees = "payout"
+		}
 		if err := h.requireClearanceOwnershipCapability(ctx); err != nil {
 			return status, err
 		}
@@ -804,6 +836,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		if options.Fees == "payout" {
 			if payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindClose, wallet.Note.Balance, destination); err != nil {
 				return status, err
+			}
+			if quoteMode(ctx) == nil {
+				return status, errors.New("quote the withdrawal and approve that quote first (zkapi-clientd withdraw --to ADDRESS); nothing was reserved")
 			}
 			profile, _, err := h.gaslessProfile()
 			if err != nil {
@@ -837,6 +872,14 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	// the payout) while no operation is in flight; --fees payout cannot be
 	// added to a reservation made for the payout address.
 	if w.Transit != nil && options.Fees == "wallet" && w.FeePayer == "payout" {
+		// Where the deployment still sponsors this record, paying from the
+		// wallet is a recovery only once the sponsored path stopped for good
+		// (refused with no retry under an approval, or reverted); while it
+		// is quoted, waiting or retried under its approval it stays
+		// sponsored. A record the profile no longer pins keeps the wallet.
+		if _, _, pinned := h.recordProfile(w); pinned == nil && h.newWithdrawalFees() == "payout" && (w.Phase == "quoted" || w.Phase == "waiting_settlement" || retryableUnderAuthorization(w)) {
+			return update(), refuse(CodeWalletFeesUnavailable, "this withdrawal pays its network fee from the payout; a wallet-paid fee is only a recovery after the sponsored path stopped for good. Resume it with zkapi-clientd withdraw --resume")
+		}
 		switch w.Phase {
 		case "quoted", "waiting_settlement", "gasless_refused", "op_reverted":
 			// A dropped operation the bundler included after all closed the
@@ -850,6 +893,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			// The bundle transaction of a reverted operation is not this
 			// wallet-paid close's: the record starts clean, as a retry does.
 			w.FeePayer, w.UserOp, w.GaslessRefusal, w.TransactionHash = "wallet", nil, "", ""
+			w.Authorization.revoke("wallet_recovery: the owner paid the fee from the wallet")
 			w.Phase = "quoted"
 			if err := h.saveAddress(record); err != nil {
 				return update(), err
@@ -887,6 +931,17 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	if transitAction {
 		return h.transitAction(ctx, config, record, options, update)
 	}
+	// A close approved under an authorization is carried on by any resume
+	// (the CLI's poll, --resume, the guided flow, a restarted daemon): no
+	// quote, no new approval, while it is retried within its maximum.
+	if a := usableAuthorization(w); a != nil && quoteMode(ctx) == nil && record.Pending == nil && (w.Phase == "quoted" || retryableUnderAuthorization(w)) {
+		if w.Phase == "gasless_refused" && refusalCode(w.GaslessRefusal) == "op_expired" && w.UserOp != nil && w.UserOp.ValidUntil != 0 && time.Now().Before(time.Unix(int64(w.UserOp.ValidUntil), 0).Add(authorizedReproveWait)) {
+			// The expired copy can still be included until its lifetime
+			// ends; the proof is renewed once it no longer can.
+			return update(), nil
+		}
+		ctx = context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Authorized: a})
+	}
 	if record.Pending != nil && transitKinds[record.Pending.Kind] {
 		if err := h.followTransitTransaction(ctx, config, record); err != nil {
 			return update(), err
@@ -918,11 +973,15 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			w.UserOp, w.Phase, w.TransactionHash, w.GaslessRefusal = nil, "quoted", "", ""
 		case "gasless_refused":
 			// A dropped operation the bundler included after all is
-			// followed; otherwise the close is proved again.
+			// followed; otherwise the close is proved again. Under an
+			// authorization its copies stay journaled with the next one.
 			if late, err := h.lateUserOperation(ctx, config, record); err != nil {
 				return update(), err
 			} else if late {
 				return h.resumeGaslessClose(ctx, config, record, update)
+			}
+			if a := usableAuthorization(w); a != nil {
+				a.remember(w.UserOp)
 			}
 			w.UserOp, w.Phase, w.TransactionHash, w.GaslessRefusal = nil, "quoted", "", ""
 		}
@@ -1112,8 +1171,16 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		if err := h.submitUserOperation(ctx, config, record, gaslessKindClose, vaultCall); err != nil {
 			if code := GaslessRefusalCode(err); code != "" {
 				w.Phase, w.GaslessRefusal = "gasless_refused", err.Error()
+				if !retryableRefusal(err.Error()) {
+					w.Authorization.revoke(err.Error())
+				}
 				if saveErr := h.saveAddress(record); saveErr != nil {
 					return update(), saveErr
+				}
+				// Under an approval a refusal for now is a state, not a
+				// failure: the status says it is retried within it.
+				if mode := quoteMode(ctx); mode != nil && mode.Capture == nil && retryableUnderAuthorization(w) {
+					return update(), nil
 				}
 			}
 			return update(), err

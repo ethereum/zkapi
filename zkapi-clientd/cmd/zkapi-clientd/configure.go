@@ -38,7 +38,7 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.StringVar(&o.proofs, "proof-setup-dir", "", "path to the installed proving assets")
 	f.StringVar(&o.exitRPC, "exit-rpc-url", "", "your own Ethereum RPC for exits: deployment checks also use it and exit transactions are sent through it (HTTPS, or http:// to this machine; 'none' clears it)")
 	f.StringVar(&o.bundlerURL, "bundler-url", "", "your own ERC-4337 bundler for gasless withdrawals (--fees payout): HTTPS, or http:// to this machine; 'none' clears it and the deployment's published bundler is used")
-	f.StringVar(&o.withdrawalFees, "withdrawal-fees", "", "how withdrawals pay the network fee by default: wallet (the local signing address) or payout (a sponsored operation paid from the payout, no ETH needed)")
+	f.StringVar(&o.withdrawalFees, "withdrawal-fees", "", "deployments without sponsorship only: how withdrawals pay the network fee by default, wallet or payout; where a deployment sponsors withdrawals the payout always pays")
 	f.StringVar(&o.usd, "usd", "", "skip the new-deposit USD amount prompt (prompt default: 20; network fees are extra)")
 	f.BoolVar(&o.status, "status", false, "show saved configuration status without setup")
 	f.BoolVar(&o.apiKey, "api-key", false, "print the local inference API key explicitly")
@@ -195,13 +195,15 @@ func configure(ctx context.Context, dir string, args []string, ui setupPrompter,
 		return err
 	}
 	if o.menu {
-		ui.Printf("Wallet menu (zkAPI network: %s).\n", c.ZKAPI.Network)
+		ui.Printf("Wallet menu for zkAPI network %s.\n", deploymentSummary(c.ZKAPI.Network))
 	} else {
 		showConfigureSummary(c, ui)
 	}
 	if o.status {
 		return nil
 	}
+	// Informational only: no question, so scripted setup is unchanged.
+	printEarlierDeployments(setupUIWriter{ui}, dir, c.ZKAPI.Network)
 	if len(o.fields) != 0 {
 		return saveConfiguredSettings(ctx, dir, c, applyConfigureOptions(c, o), ui, out, action)
 	}
@@ -319,7 +321,7 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 	} else if c.RelayURL != "" {
 		transport = "Wisp relay enabled"
 	}
-	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", c.ZKAPI.Network, transport)
+	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", deploymentSummary(c.ZKAPI.Network), transport)
 	if c.ZKAPI.ExitRPCURL != "" {
 		ui.Printf("Exit RPC: %s (deployment checks and exit transactions)\n", c.ZKAPI.ExitRPCURL)
 	}
