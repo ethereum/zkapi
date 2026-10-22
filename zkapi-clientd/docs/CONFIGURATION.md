@@ -106,6 +106,15 @@ target rewrites are not silently regenerated. See [evaluation](REWRITER_EVALUATI
 ```
 
 Use `config --setup` instead of bare `config` in old setup/funding instructions.
+`--setup` accepts the profile options it applies before preparing the wallet
+(`--network`, `--listen`, `--relay-url`, `--zkapi-binary`, `--proof-setup-dir`,
+`--exit-rpc-url`, `--bundler-url`, `--key-reuse-window-seconds`,
+`--require-api-key`, `--web-search`) and the new-deposit amount `--usd`, for
+example `config --setup --network sepolia --listen 127.0.0.1:18877 --usd 5`.
+Without `--setup` the same profile options only save settings; they never
+create a profile, prepare a wallet or fund it, and `--usd` beside them is
+refused. Model, rewriter, cover and vault settings are saved with their own
+`config` edit first; `--setup` refuses them, and `--setup=false` is refused.
 `serve` retains its existing autofunding behavior; diagnostic logging flags
 remain runtime-only because they expose private prompts/responses. No saved
 settings, active services, notes or recovery journals are changed by an upgrade.

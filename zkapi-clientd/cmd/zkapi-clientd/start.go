@@ -73,7 +73,7 @@ func (p *terminalSetupPrompter) openTerminal() error {
 	if p.input == nil {
 		fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 		if err != nil {
-			return errors.New("setup needs an interactive terminal; run zkapi-clientd config in a terminal to answer the setup questions")
+			return errors.New("setup needs an interactive terminal; run zkapi-clientd config --setup in a terminal to answer the setup questions")
 		}
 		device := &setupTerminal{fd: fd}
 		p.device, p.input = device, bufio.NewReader(device)
@@ -146,7 +146,7 @@ func (p *terminalSetupPrompter) Ask(ctx context.Context, question, fallback stri
 			}
 		}
 		if err != nil {
-			return "", errors.New("setup input ended; run zkapi-clientd config again to continue")
+			return "", errors.New("setup input ended; run zkapi-clientd config --setup again to continue")
 		}
 		if b == '\n' {
 			if err := ctx.Err(); err != nil {
@@ -196,7 +196,7 @@ func (p *terminalSetupPrompter) Continue(ctx context.Context, question string) (
 		if p.device != nil {
 			p.input.Reset(p.device)
 			if err := flushTerminalInput(p.device.fd); err != nil {
-				return false, errors.New("could not clear pending setup input; run zkapi-clientd config again to continue")
+				return false, errors.New("could not clear pending setup input; run zkapi-clientd config --setup again to continue")
 			}
 		}
 		answer, err := p.Ask(ctx, question, "")
@@ -476,7 +476,7 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 			if life.Err() != nil {
 				return life.Err()
 			}
-			return errors.New("setup timed out waiting for the local API and companion; check that zkapi-clientd, zkapi-walletd, and proving assets are installed together, then run zkapi-clientd config")
+			return errors.New("setup timed out waiting for the local API and companion; check that zkapi-clientd, zkapi-walletd, and proving assets are installed together, then run zkapi-clientd config --setup")
 		case <-timer.C:
 		}
 	}

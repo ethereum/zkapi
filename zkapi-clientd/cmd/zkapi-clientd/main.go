@@ -117,7 +117,7 @@ func run(args []string) error {
 		return runConfigure(ctx, dir, args[1:], ui, os.Stdout)
 	}
 	if args[0] == "serve" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-		fmt.Println("Usage: zkapi-clientd serve [--model MODEL] [--semi-verbose | --verbose]\nOpens a missing private note automatically when the funding address has enough ETH. Verbose modes log private prompt/response content. Run the saved configuration. Run zkapi-clientd config to configure missing prerequisites.")
+		fmt.Println("Usage: zkapi-clientd serve [--model MODEL] [--semi-verbose | --verbose]\nOpens a missing private note automatically when the funding address has enough ETH. Verbose modes log private prompt/response content. Run the saved configuration. Run zkapi-clientd config --setup to configure missing prerequisites.")
 		return nil
 	}
 	if args[0] == "withdraw" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
@@ -289,7 +289,7 @@ func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.
 		}
 		switch remote.Status {
 		case http.StatusPaymentRequired:
-			return nil, &server.BackendError{Status: 402, Code: "funding_required", Message: "The private balance needs funding. Run zkapi-clientd config to add funding."}
+			return nil, &server.BackendError{Status: 402, Code: "funding_required", Message: "The private balance needs funding. Run zkapi-clientd config --setup to add funding."}
 		case http.StatusConflict:
 			if remote.Code == "withdrawal_pending" || remote.Code == "withdrawal_conflict" {
 				return nil, &server.BackendError{Status: 409, Code: "withdrawal_pending", Message: "The private balance is reserved for withdrawal. Run zkapi-clientd config --menu and choose withdraw to recover the saved destination."}

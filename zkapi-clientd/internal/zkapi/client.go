@@ -108,7 +108,7 @@ type Error struct {
 
 func (e *Error) Error() string {
 	if e.Code == "testnet_password_required" {
-		return "Sepolia password is missing or incorrect; stop the daemon and run zkapi-clientd config to enter the current shared password"
+		return "Sepolia password is missing or incorrect; stop the daemon and run zkapi-clientd config --setup to enter the current shared password"
 	}
 	if e.Code == "withdrawal_conflict" || e.Code == "withdrawal_pending" {
 		return "zkAPI withdrawal is reserved; run zkapi-clientd config --menu and choose withdraw to resume the saved destination"
@@ -145,7 +145,7 @@ func (e *Error) Error() string {
 		return "zkAPI invalid_successor: the server signed a note state that fails the wallet's checks; it is treated as withheld. Withdraw with zkapi-clientd withdraw --escape --to ADDRESS"
 	}
 	if e.Status == http.StatusPaymentRequired {
-		return "zkAPI private balance needs funding; run zkapi-clientd config to add funding"
+		return "zkAPI private balance needs funding; run zkapi-clientd config --setup to add funding"
 	}
 	if e.Status == http.StatusConflict {
 		return "zkAPI wallet has a pending lease; wait for settlement or recover it"

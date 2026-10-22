@@ -47,14 +47,17 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.BoolVar(&o.webSearch, "web-search", true, "automatically enable OpenRouter web search for chat completions; use --web-search=false to disable (search charges apply)")
 	f.BoolVar(&o.edit, "edit", false, "edit network, listener, transport, and web search interactively")
 	f.BoolVar(&o.menu, "menu", false, "open configuration and wallet management actions")
-	f.Bool("setup", false, "explicitly prepare/fund wallet (bare config only displays JSON)")
+	setup := f.Bool("setup", false, "explicitly prepare/fund wallet (bare config only displays JSON)")
 	if err := f.Parse(args); err != nil {
 		return o, err
 	}
 	o.fields = make(map[string]bool)
 	invalid := false
 	f.Visit(func(field *flag.Flag) {
-		if field.Name == "setup" || field.Name == "status" || field.Name == "api-key" || field.Name == "edit" || field.Name == "menu" {
+		if field.Name == "setup" {
+			return
+		}
+		if field.Name == "status" || field.Name == "api-key" || field.Name == "edit" || field.Name == "menu" {
 			return
 		}
 		if field.Name != "usd" {
@@ -64,6 +67,10 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	})
 	if invalid || f.NArg() != 0 {
 		return o, errors.New("config flags require nonempty values except --relay-url; unexpected arguments are not accepted")
+	}
+	if flagSet(f, "setup") && !*setup {
+		// --setup=false must not prepare or fund a wallet by accident.
+		return o, errors.New("use --setup without =false; settings-only edits omit it; nothing saved")
 	}
 	selectors := 0
 	for _, selected := range []bool{o.status, o.apiKey, o.edit, o.menu} {
@@ -96,6 +103,12 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	return o, nil
 }
 
+func flagSet(f *flag.FlagSet, name string) bool {
+	set := false
+	f.Visit(func(field *flag.Flag) { set = set || field.Name == name })
+	return set
+}
+
 func runConfigure(ctx context.Context, dir string, args []string, ui setupPrompter, out io.Writer) error {
 	err := configure(ctx, dir, args, ui, out, nil)
 	if errors.Is(err, errSetupSelectionCanceled) {
@@ -103,7 +116,7 @@ func runConfigure(ctx context.Context, dir string, args []string, ui setupPrompt
 		return nil
 	}
 	if ctx.Err() != nil {
-		ui.Printf("\nStopped. Your saved configuration and wallet state are preserved; run zkapi-clientd config to continue.\n")
+		ui.Printf("\nStopped. Your saved configuration and wallet state are preserved; run zkapi-clientd config --setup to continue.\n")
 		return nil
 	}
 	return err
@@ -133,7 +146,7 @@ func configure(ctx context.Context, dir string, args []string, ui setupPrompter,
 	_, err = os.Lstat(filepath.Join(dir, "config.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		if o.apiKey || o.menu {
-			return errors.New("configuration is missing; run zkapi-clientd config to create it")
+			return errors.New("configuration is missing; run zkapi-clientd config --setup to create it")
 		}
 		ui.Printf("Configuration: not configured.\n")
 		if o.status {

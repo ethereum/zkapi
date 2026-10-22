@@ -15,7 +15,7 @@ import (
 )
 
 func configurationRequired(err error) error {
-	return fmt.Errorf("%w. Run zkapi-clientd config to review and complete configuration (use the same --config-dir if set)", err)
+	return fmt.Errorf("%w. Run zkapi-clientd config --setup to review and complete configuration (use the same --config-dir if set)", err)
 }
 
 func configuredRuntime(expected config.Config) startRuntime {
@@ -51,13 +51,13 @@ func runConfiguredServe(ctx context.Context, dir string, c, expected config.Conf
 type noninteractiveSetup struct{ out io.Writer }
 
 func (p *noninteractiveSetup) Ask(context.Context, string, string) (string, error) {
-	return "", errors.New("configuration needs interactive input; run zkapi-clientd config")
+	return "", errors.New("configuration needs interactive input; run zkapi-clientd config --setup")
 }
 func (p *noninteractiveSetup) Confirm(context.Context, string) (bool, error) {
-	return false, errors.New("funding needs your approval; run zkapi-clientd config")
+	return false, errors.New("funding needs your approval; run zkapi-clientd config --setup")
 }
 func (p *noninteractiveSetup) Continue(context.Context, string) (bool, error) {
-	return false, errors.New("funding needs your approval; run zkapi-clientd config")
+	return false, errors.New("funding needs your approval; run zkapi-clientd config --setup")
 }
 func (p *noninteractiveSetup) Printf(format string, args ...any) {
 	fmt.Fprintf(p.out, format, args...)
@@ -119,7 +119,7 @@ func runConfigActionWithUSD(ctx context.Context, dir string, c config.Config, ac
 		if err := changeSepoliaAccess(ctx, dir, c, ui); err != nil {
 			return err
 		}
-		ui.Printf("Sepolia password saved. Restart any running daemon to use it. Run zkapi-clientd config to check readiness.\n")
+		ui.Printf("Sepolia password saved. Restart any running daemon to use it. Run zkapi-clientd config --setup to check readiness.\n")
 		return nil
 	}
 	runtime := configuredRuntime(c)
@@ -148,7 +148,7 @@ func runConfigActionWithUSD(ctx context.Context, dir string, c config.Config, ac
 		ui.Printf("Run zkapi-clientd serve to serve inference.\n")
 		showCustomProfileHint(dir, ui)
 	} else if action != "withdraw" {
-		ui.Printf("\nWallet operation complete. Run zkapi-clientd config to check readiness before serving.\n")
+		ui.Printf("\nWallet operation complete. Run zkapi-clientd config --setup to check readiness before serving.\n")
 	}
 	return nil
 }
