@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 /// @notice The two statements' public inputs as design §3.2 and §4.1 specify them
-///         (circuit zkapi-v2-concession-v1), for compiling the generated adapter alone in
+///         (circuit zkapi-v2-concession-v2, leaf-bound exits), for compiling the generated adapter alone in
 ///         the companion's Anvil test. Field order is the public-input order.
 library Types {
     struct RequestPublicInputs {
@@ -24,12 +24,12 @@ library Types {
         uint16 protocolVersion;
         uint64 chainId;
         address contractAddress;
-        uint256 activeRoot;
+        uint256 noteLeaf;
         uint256 stateSigningKeyX;
         uint256 stateSigningKeyY;
         uint256 clearanceSigningKeyX;
         uint256 clearanceSigningKeyY;
-        uint32 noteId;
+        uint256 noteFields;
         uint128 finalBalance;
         address destination;
         uint256 withdrawalNullifier;

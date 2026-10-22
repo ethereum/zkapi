@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"os"
 	"strings"
 	"testing"
@@ -59,24 +58,25 @@ func TestWithdrawalRequiresClearanceOwnershipCapability(t *testing.T) {
 	}
 }
 
-// Review root cause on the withdrawal side: one RPC must not decide that the
-// note closed. A forged MutualClose receipt never deletes the companion's
-// note state or archives the deposit recovery file.
+// Review root cause on the withdrawal side: a forged MutualClose receipt
+// never deletes the companion's note state or archives the deposit recovery
+// file. The vault, read at the payout block, must show the note Closed. A
+// close leaves the note's leaf in the tree, so the indexer cannot attest it;
+// when the owner configured an exit RPC, the note must read Closed through
+// it as well, so the pinned RPC that served the receipt never decides alone.
 func TestForgedMutualCloseReceiptNeverClosesNote(t *testing.T) {
-	for _, vault := range []string{"forged closed", "honest active"} {
+	for _, vault := range []string{"honest active", "forged closed, exit RPC honest"} {
 		t.Run(vault, func(t *testing.T) {
 			f := newWithdrawalFixture(t)
 			hash := f.withdraw(t)
-			f.mu.Lock()
-			leaf := new(big.Int).Set(f.leaves[12])
-			f.mu.Unlock()
 			f.mineWithdrawal(t, hash, withdrawalTestDestination, false)
 			f.mu.Lock()
-			f.setLeaf(12, leaf) // The indexer never saw a close.
-			if vault == "honest active" {
-				note := f.vaultNotes[12]
-				note.status = noteActive
-				f.vaultNotes[12] = note
+			note := f.vaultNotes[12]
+			note.status = noteActive
+			f.vaultNotes[12] = note
+			if vault != "honest active" {
+				f.h.client.config.ExitRPCURL = f.exitRPC
+				f.pinnedNoteStatus = map[uint32]uint8{12: noteClosed}
 			}
 			f.mu.Unlock()
 			for range 2 {
@@ -97,6 +97,10 @@ func TestForgedMutualCloseReceiptNeverClosesNote(t *testing.T) {
 			status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
 			if err != nil || status.Phase != "complete" || f.confirmCalls != 1 {
 				t.Fatalf("corroborated close did not complete: %+v %v", status, err)
+			}
+			// The leaf stays in the tree: the indexer was never asked.
+			if f.leaves[12].Sign() == 0 {
+				t.Fatal("the fixture removed a closed note's leaf")
 			}
 		})
 	}

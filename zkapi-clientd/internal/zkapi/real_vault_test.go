@@ -12,13 +12,14 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// realVaultLayout is the revision-3 vault's selectors and event layouts as
+// realVaultLayout is the revision-4 vault's selectors and event layouts as
 // the compiled protocol/contracts sources produce them
 // (crates/zkapi-serverd/tests/fixtures/vault_calldata_golden.json, which
 // check-calldata-golden.sh keeps equal to the contracts).
 type realVaultLayout struct {
-	Selectors map[string]string `json:"selectors"`
-	Events    map[string]struct {
+	Selectors   map[string]string `json:"selectors"`
+	GetterWords map[string]int    `json:"getter_words"`
+	Events      map[string]struct {
 		Topic0 string `json:"topic0"`
 		Topics string `json:"topics"`
 		Data   string `json:"data"`
@@ -46,7 +47,10 @@ func TestEverySelectorAndTopicIsTheRealVaults(t *testing.T) {
 		"finalizeEscapeWithdrawal":  finalizeEscapeSelector,
 		"claimEscapePayout":         claimEscapePayoutSelector,
 		"escapePayoutCredits":       escapePayoutCreditsSelector,
-		"notes":                     notesSelector,
+		"noteRecord":                noteRecordSelector,
+		"nextNoteId":                nextNoteIDSelector,
+		"noteLeaves":                noteLeavesSelector,
+		"minDeposit":                selectorMinDeposit,
 		"proofAdapter":              selectorProofAdapter,
 		"stateSigningKeyX":          selectorStateSigningKeyX,
 		"stateSigningKeyY":          selectorStateSigningKeyY,
@@ -56,7 +60,7 @@ func TestEverySelectorAndTopicIsTheRealVaults(t *testing.T) {
 		"noteTtl":                   selectorNoteTTL,
 		"maxPauseDuration":          selectorMaxPauseDuration,
 		"CONCESSION_ESCAPE_VERSION": selectorConcessionEscapeVersion,
-		"ROOT_HISTORY_WINDOW":       selectorRootHistoryWindow,
+		"LEAF_BOUND_EXIT_VERSION":   selectorLeafBoundExitVersion,
 		"CIRCUIT_ID_HASH":           selectorCircuitIDHash,
 		"REQUEST_VK_HASH":           selectorRequestVKHash,
 		"WITHDRAWAL_VK_HASH":        selectorWithdrawalVKHash,
@@ -95,6 +99,15 @@ func TestEverySelectorAndTopicIsTheRealVaults(t *testing.T) {
 	}
 	if deferred := layout.Events["EscapePayoutDeferred"]; len(deferred.Topics) != 2+3*64 || !isHex(deferred.Data, 32) {
 		t.Fatalf("EscapePayoutDeferred layout changed: %+v", deferred)
+	}
+	// matchDepositEvent reads NoteDeposited as three topics and two data
+	// words (amount, expiryTs): no root. decodeVaultNote reads noteRecord's
+	// two words (leaf, status).
+	if deposited := layout.Events["NoteDeposited"]; len(deposited.Topics) != 2+3*64 || !isHex(deposited.Data, 64) {
+		t.Fatalf("NoteDeposited layout changed: %+v", deposited)
+	}
+	if layout.GetterWords["noteRecord"] != 2 {
+		t.Fatalf("noteRecord returns %d words", layout.GetterWords["noteRecord"])
 	}
 }
 

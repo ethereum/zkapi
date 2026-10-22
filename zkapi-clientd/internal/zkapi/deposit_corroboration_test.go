@@ -60,7 +60,12 @@ func bucketedExpiry() uint64 {
 	return (uint64(time.Now().Unix()) + 2592000 + vaultExpiryBucket - 1) / vaultExpiryBucket * vaultExpiryBucket
 }
 
-func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
+// Vault revision 4 stores only each note's leaf, which commits to the note
+// ID, the commitment, the amount and the expiry: activation requires the
+// vault's leaf at the receipt block to be exactly ours. The indexer is no
+// longer needed for that, but an indexer view of the receipt block that
+// disagrees is still a conflict.
+func TestDepositActivationRequiresTheVaultLeafAndNoIndexerDisagreement(t *testing.T) {
 	commitment := "0x" + addressABIWord("0x1234")
 	conflicts := map[string]func(f *addressFixture){
 		"vault commitment": func(f *addressFixture) {
@@ -75,7 +80,12 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 			note.status = notePendingWithdrawal
 			f.vaultNotes[12] = note
 		},
-		"vault closed":   func(f *addressFixture) { note := f.vaultNotes[12]; note.status = noteClosed; f.vaultNotes[12] = note },
+		"vault closed": func(f *addressFixture) { note := f.vaultNotes[12]; note.status = noteClosed; f.vaultNotes[12] = note },
+		"vault retired": func(f *addressFixture) {
+			note := f.vaultNotes[12]
+			note.status, note.retired = noteClosed, true
+			f.vaultNotes[12] = note
+		},
 		"indexer absent": func(f *addressFixture) { f.leaves = f.leaves[:12]; f.leafVersion++ },
 		"indexer other leaf": func(f *addressFixture) {
 			f.setLeaf(12, noteLeaf(12, fieldValue("0x5678"), 100000, f.vaultNotes[12].expiry))
@@ -112,7 +122,11 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 			}
 		})
 	}
-	pending := map[string]func(f *addressFixture){
+	// Without the indexer's view of the receipt block, the payment RPC's
+	// receipt and vault read alone never activate the note: it stays pending
+	// without an exit RPC, and activates once the owner's exit RPC reads the
+	// same leaf at the receipt's canonical block.
+	unavailable := map[string]func(f *addressFixture){
 		"indexer 503":           func(f *addressFixture) { f.indexerStatus = http.StatusServiceUnavailable },
 		"indexer 404":           func(f *addressFixture) { f.indexerStatus = http.StatusNotFound },
 		"indexer down":          func(f *addressFixture) { f.indexer.Close() },
@@ -121,29 +135,81 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 		"indexer forked":        func(f *addressFixture) { f.indexerHash = "0x" + strings.Repeat("c", 64) },
 		"indexer malformed":     func(f *addressFixture) { f.leaves[3] = new(big.Int).Set(bn254ScalarModulus); f.leafVersion++ },
 		"indexer inconsistent":  func(f *addressFixture) { f.indexerStatus = -1 },
-		"vault uninitialized":   func(f *addressFixture) { delete(f.vaultNotes, 12) },
 	}
-	for name, mutate := range pending {
-		t.Run("pending/"+name, func(t *testing.T) {
+	for name, mutate := range unavailable {
+		t.Run("one RPC stays pending/"+name, func(t *testing.T) {
 			f, hash := minedNativeDeposit(t)
 			f.mu.Lock()
 			mutate(f)
 			f.mu.Unlock()
 			status, err := f.h.FundAddress(context.Background(), 100000)
 			if err != nil || status.Phase != "confirming" || status.DepositStage != "verifying" || status.TransactionHash != hash {
-				t.Fatalf("unverified deposit did not wait: %+v %v", status, err)
+				t.Fatalf("the payment RPC alone did not leave the deposit pending: %+v %v", status, err)
 			}
-			if f.activated != 0 || f.savedDeposit(t).Active {
-				t.Fatal("deposit activated without corroboration")
+			if f.activated != 0 || len(f.confirmBodies) != 0 || f.savedDeposit(t).Active {
+				t.Fatal("the note secret reached the companion on one RPC's word")
+			}
+			// The owner's exit RPC reads the same leaf at the receipt block.
+			f.mu.Lock()
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			f.mu.Unlock()
+			status, err = f.h.FundAddress(context.Background(), 100000)
+			if err != nil || status.Phase != "active" || f.activated != 1 || status.TransactionHash != hash {
+				t.Fatalf("the exit RPC's agreement did not activate the deposit: %+v %v", status, err)
+			}
+			if binding := f.savedDeposit(t).Binding; binding == nil || binding.NoteID != 12 || binding.IndexerBlock != 0 || !binding.ExitRPCConfirmed {
+				t.Fatalf("binding does not record the exit RPC's confirmation: %+v", binding)
 			}
 		})
 	}
+	exitDisagrees := map[string]struct {
+		mutate func(f *addressFixture)
+		phase  string
+	}{
+		"other leaf": {func(f *addressFixture) {
+			note := f.vaultNotes[12]
+			note.amount++
+			f.exitNotes = map[uint32]fixtureNote{12: note}
+		}, "verification_conflict"},
+		"note not there": {func(f *addressFixture) { f.exitNotes = map[uint32]fixtureNote{12: {}} }, "confirming"},
+		"unreachable":    {func(f *addressFixture) { f.h.client.config.ExitRPCURL = "https://127.0.0.1:1" }, "confirming"},
+	}
+	for name, c := range exitDisagrees {
+		t.Run("exit RPC/"+name, func(t *testing.T) {
+			f, _ := minedNativeDeposit(t)
+			f.mu.Lock()
+			f.indexerStatus = http.StatusServiceUnavailable
+			f.h.client.config.ExitRPCURL = f.exitRPC
+			c.mutate(f)
+			f.mu.Unlock()
+			status, err := f.h.FundAddress(context.Background(), 100000)
+			if err != nil || status.Phase != c.phase || f.activated != 0 || len(f.confirmBodies) != 0 {
+				t.Fatalf("an exit RPC that does not confirm the deposit activated it or was misread: %+v %v", status, err)
+			}
+			if c.phase == "confirming" && status.DepositStage != "verifying" {
+				t.Fatalf("not pending: %+v", status)
+			}
+		})
+	}
+	t.Run("pending/vault uninitialized", func(t *testing.T) {
+		f, hash := minedNativeDeposit(t)
+		f.mu.Lock()
+		delete(f.vaultNotes, 12)
+		f.mu.Unlock()
+		status, err := f.h.FundAddress(context.Background(), 100000)
+		if err != nil || status.Phase != "confirming" || status.DepositStage != "verifying" || status.TransactionHash != hash {
+			t.Fatalf("unverified deposit did not wait: %+v %v", status, err)
+		}
+		if f.activated != 0 || f.savedDeposit(t).Active {
+			t.Fatal("deposit activated without corroboration")
+		}
+	})
 	t.Run("pending/vault read fails", func(t *testing.T) {
 		f, _ := minedNativeDeposit(t)
 		upstream := f.h.client.inference.Transport
 		f.h.client.inference.Transport = withdrawalRoundTripper(func(r *http.Request) (*http.Response, error) {
 			raw, _ := ioReadAndRestore(r)
-			if strings.Contains(string(raw), notesSelector) {
+			if strings.Contains(string(raw), noteRecordSelector) {
 				return withdrawalJSONResponse(r, 502, map[string]any{"error": "sensitive"}), nil
 			}
 			return upstream.RoundTrip(r)
@@ -219,7 +285,7 @@ func TestDepositActivationReadsFinalizedStateWhenReceiptStateIsPruned(t *testing
 					number := f.finalized
 					f.mu.Unlock()
 					return withdrawalJSONResponse(r, 200, map[string]any{"jsonrpc": "2.0", "id": 1, "result": map[string]string{"number": number, "hash": finalizedHash}}), nil
-				case request.Method == "eth_call" && strings.Contains(string(raw), notesSelector) && strings.Contains(string(raw), addressTestBlock[2:]):
+				case request.Method == "eth_call" && strings.Contains(string(raw), noteRecordSelector) && strings.Contains(string(raw), addressTestBlock[2:]):
 					prunedReads++
 					return withdrawalJSONResponse(r, 200, map[string]any{"jsonrpc": "2.0", "id": 1, "error": map[string]any{"code": -32000, "message": "missing trie node"}}), nil
 				case request.Method == "eth_call" && strings.Contains(string(raw), finalizedHash[2:]):
@@ -246,7 +312,8 @@ func TestDepositActivationReadsFinalizedStateWhenReceiptStateIsPruned(t *testing
 }
 
 // Review regressions 1 and 3: an RPC that withholds the deposit and forges
-// its receipt (and even notes()) never activates it or learns the secret.
+// its receipt (and even noteRecord()) never activates it while the indexer's
+// view of the receipt block does not show the note.
 func TestForgedReceiptForUnrelayedDepositNeverActivates(t *testing.T) {
 	for _, forged := range []struct {
 		name   string
@@ -298,32 +365,27 @@ func TestForgedReceiptForUnrelayedDepositNeverActivates(t *testing.T) {
 	}
 }
 
-// The companion's refreshed empty-leaf path must prove the indexer's next
-// slot before a deposit is signed; the slot is journaled with the note.
-func TestDepositPathMustMatchIndexerTree(t *testing.T) {
+// A deposit carries no path (vault revision 4): it is bound to the indexer
+// view's next slot, journaled with the note before signing, and nothing is
+// signed while that view is unavailable.
+func TestDepositSlotIsJournaledBeforeSigningWithoutAPath(t *testing.T) {
 	f := newAddressFixture(t, true)
 	quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstream := f.h.client.local.Transport
-	f.h.client.local.Transport = withdrawalRoundTripper(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/oa/v1/deposit/path" {
-			path := make([]string, 32)
-			for i := range path {
-				path[i] = "0xa"
-			}
-			return withdrawalJSONResponse(r, 200, map[string]any{"zero_path": path}), nil
-		}
-		return upstream.RoundTrip(r)
-	})
-	if _, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err == nil || !strings.Contains(err.Error(), "witness does not match") {
-		t.Fatalf("an unbound deposit witness was accepted: %v", err)
+	f.mu.Lock()
+	f.indexerStatus = http.StatusServiceUnavailable
+	f.mu.Unlock()
+	if _, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err == nil || !strings.Contains(err.Error(), "no deposit was signed") {
+		t.Fatalf("a deposit was approved without the indexer's slot: %v", err)
 	}
 	if len(f.accepted) != 0 || f.savedDeposit(t).Slot != nil {
-		t.Fatal("deposit signed or slot recorded without a matching witness")
+		t.Fatal("deposit signed or slot recorded without the indexer's view")
 	}
-	f.h.client.local.Transport = upstream
+	f.mu.Lock()
+	f.indexerStatus = 0
+	f.mu.Unlock()
 	quote, err = f.h.QuoteAddressDeposit(context.Background(), 100000)
 	if err != nil {
 		t.Fatal(err)
@@ -332,8 +394,8 @@ func TestDepositPathMustMatchIndexerTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	slot := f.savedDeposit(t).Slot
-	if len(f.accepted) != 1 || slot == nil || slot.NoteID != 12 || slot.PreparedAt == 0 {
-		t.Fatalf("matching witness did not sign with its slot: %+v", slot)
+	if len(f.accepted) != 1 || slot == nil || slot.NoteID != 12 || slot.PreparedAt == 0 || f.paths != 0 {
+		t.Fatalf("deposit did not sign with its slot: %+v", slot)
 	}
 	for _, tx := range f.accepted {
 		if depositPathDigest(tx.Data()) != slot.PathSHA256 {
@@ -1094,7 +1156,10 @@ func TestRebindRefusesWhileDifferentSavedDepositIsUnconfirmed(t *testing.T) {
 	}
 }
 
-func TestRebindRequiresFinalizedVaultAndIndexerAgreement(t *testing.T) {
+// A rebind binds only a note whose finalized vault leaf is this deposit's;
+// the indexer corroborates when its view covers the finalized block, and a
+// view that disagrees refuses the rebind.
+func TestRebindRequiresTheFinalizedVaultLeafAndNoIndexerDisagreement(t *testing.T) {
 	for name, mutate := range map[string]func(f *addressFixture){
 		"vault uninitialized": func(f *addressFixture) { delete(f.vaultNotes, 12) },
 		"vault other note": func(f *addressFixture) {
@@ -1107,8 +1172,22 @@ func TestRebindRequiresFinalizedVaultAndIndexerAgreement(t *testing.T) {
 			note.status = notePendingWithdrawal
 			f.vaultNotes[12] = note
 		},
-		"indexer behind finality": func(f *addressFixture) { f.indexerBlock = 0x1f },
-		"indexer other leaf":      func(f *addressFixture) { f.setLeaf(12, big.NewInt(77)) },
+		"vault closed": func(f *addressFixture) {
+			note := f.vaultNotes[12]
+			note.status = noteClosed
+			f.vaultNotes[12] = note
+		},
+		"vault other amount": func(f *addressFixture) {
+			note := f.vaultNotes[12]
+			note.amount++
+			f.vaultNotes[12] = note
+		},
+		"vault expiry outside the searched days": func(f *addressFixture) {
+			note := f.vaultNotes[12]
+			note.expiry += 90 * vaultExpiryBucket
+			f.vaultNotes[12] = note
+		},
+		"indexer other leaf": func(f *addressFixture) { f.setLeaf(12, big.NewInt(77)) },
 		"foreign 1 gwei note": func(f *addressFixture) {
 			f.registerDeposit(12, "0x1234", 1, f.vaultNotes[12].expiry)
 		},
@@ -1125,6 +1204,25 @@ func TestRebindRequiresFinalizedVaultAndIndexerAgreement(t *testing.T) {
 			}
 			if f.activated != 0 || f.resetCalls != 0 || f.savedDeposit(t).Active || f.savedDeposit(t).Binding != nil {
 				t.Fatal("refused rebind changed state")
+			}
+		})
+	}
+	for name, mutate := range map[string]func(f *addressFixture){
+		"indexer behind finality": func(f *addressFixture) { f.indexerBlock = 0x1f },
+		"indexer down":            func(f *addressFixture) { f.indexerStatus = http.StatusServiceUnavailable },
+	} {
+		t.Run("vault alone/"+name, func(t *testing.T) {
+			f, _ := minedNativeDeposit(t)
+			f.finalized = "0x20"
+			f.mu.Lock()
+			mutate(f)
+			f.mu.Unlock()
+			note := uint64(12)
+			if _, err := f.h.RebindDeposit(context.Background(), &note, nil); err != nil {
+				t.Fatalf("the finalized vault leaf did not rebind: %v", err)
+			}
+			if binding := f.savedDeposit(t).Binding; binding == nil || binding.NoteID != 12 || binding.ExpiryTs != f.vaultNotes[12].expiry || binding.IndexerBlock != 0 {
+				t.Fatalf("wrong binding: %+v", binding)
 			}
 		})
 	}

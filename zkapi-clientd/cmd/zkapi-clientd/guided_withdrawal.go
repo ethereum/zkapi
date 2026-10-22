@@ -15,14 +15,11 @@ import (
 )
 
 // Quoting reserves the selected note and destination, but cannot sign. Resume
-// is used only after the journal has an identified signed transaction.
+// is used only after the journal has an identified signed transaction, or
+// for a payout withdrawal approved within its maximum fee.
 type guidedWithdrawalService interface {
 	Status(context.Context) (zkapi.AddressWithdrawalStatus, error)
-	// The boolean is the owner's acknowledgement for an expired note at a
-	// state with an unsettled request (see confirmUnsettledWithdrawal); the
-	// last argument is how the fee is paid ("payout" for a sponsored
-	// operation paid from the payout, else from the wallet).
-	Quote(context.Context, string, uint64, string, bool, string) (zkapi.AddressPaymentQuote, error)
+	Quote(context.Context, string, uint64, string, guidedQuoteOptions) (zkapi.AddressPaymentQuote, error)
 	Approve(context.Context, string) (zkapi.AddressWithdrawalStatus, error)
 	Resume(context.Context, string, uint64) (zkapi.AddressWithdrawalStatus, error)
 	Confirm(context.Context, string, uint64, string) (zkapi.AddressWithdrawalStatus, error)
@@ -31,28 +28,40 @@ type guidedWithdrawalService interface {
 	GaslessAvailability(context.Context) (zkapi.GaslessAvailability, error)
 }
 
+// guidedQuoteOptions are a guided quote's choices. acceptUnsettledRequestRisk
+// is the owner's acknowledgement for an expired note at a state with an
+// unsettled request (see confirmUnsettledWithdrawal). payout asks for the
+// fee to be paid from the payout; otherwise no fee mode is named (the
+// daemon's policy, and a saved withdrawal keeps its mode): the guided flow
+// never asks for a wallet-paid fee. allowExpensiveGas is the owner's
+// acceptance of a fee above the deployment's uneconomic fraction.
+type guidedQuoteOptions struct {
+	acceptUnsettledRequestRisk bool
+	payout                     bool
+	allowExpensiveGas          bool
+}
+
 type localGuidedWithdrawal struct{ config config.Config }
 
 func (s localGuidedWithdrawal) Status(ctx context.Context) (zkapi.AddressWithdrawalStatus, error) {
 	return requestWithdrawal(ctx, s.config, http.MethodGet, nil)
 }
-func (s localGuidedWithdrawal) Quote(ctx context.Context, destination string, note uint64, retry string, acceptUnsettledRequestRisk bool, fees string) (zkapi.AddressPaymentQuote, error) {
+func (s localGuidedWithdrawal) Quote(ctx context.Context, destination string, note uint64, retry string, o guidedQuoteOptions) (zkapi.AddressPaymentQuote, error) {
 	body := map[string]any{"destination": destination, "note_id": note}
 	if retry != "" {
 		body["retry_transaction_hash"] = retry
 	}
-	if acceptUnsettledRequestRisk {
+	if o.acceptUnsettledRequestRisk {
 		body["accept_unsettled_request_risk"] = true
 	}
-	// A chosen fee mode is sent as such: "payout" asks for the sponsored
-	// path, "wallet" (chosen when it was offered) falls a saved sponsored
-	// withdrawal back to the wallet-paid path; "" keeps the daemon's
-	// default and a saved withdrawal's mode.
-	if fees != "" {
-		body["fees"] = fees
+	if o.payout {
+		body["fees"] = "payout"
+		if s.config.ZKAPI.BundlerURL != "" {
+			body["bundler_url"] = s.config.ZKAPI.BundlerURL
+		}
 	}
-	if fees == "payout" && s.config.ZKAPI.BundlerURL != "" {
-		body["bundler_url"] = s.config.ZKAPI.BundlerURL
+	if o.allowExpensiveGas {
+		body["allow_expensive_gas"] = true
 	}
 	return requestPaymentQuote(ctx, s.config, http.MethodPost, "/admin/withdrawal/quote", "withdrawal", body)
 }
@@ -76,12 +85,14 @@ func (s localGuidedWithdrawal) Confirm(ctx context.Context, destination string, 
 }
 
 func runGuidedWithdrawal(ctx context.Context, c config.Config, ui setupPrompter) error {
-	return guidedWithdrawal(ctx, localGuidedWithdrawal{c}, ui, waitFundingPoll, c.ZKAPI.WithdrawalFees)
+	return guidedWithdrawal(ctx, localGuidedWithdrawal{c}, ui, waitFundingPoll)
 }
 
-// guidedWithdrawal runs the guided withdrawal; defaultFees is the
-// configured fee mode ("payout" or "", wallet) the fee question defaults to.
-func guidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui setupPrompter, wait func(context.Context) error, defaultFees string) error {
+// guidedWithdrawal runs the guided withdrawal. Where the deployment sponsors
+// withdrawals (and for a saved sponsored withdrawal) the fee is paid from the
+// payout, the only option: no fee question, no QR, no wallet fallback. A
+// saved wallet-paid withdrawal keeps its funding, QR and approval flow.
+func guidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui setupPrompter, wait func(context.Context) error) error {
 	defer clearSetupProgress(ui)
 	setupProgress(ui, "Checking withdrawal status...")
 	initial, err := service.Status(ctx)
@@ -102,35 +113,70 @@ func guidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui s
 		ui.Printf("%s\nFollow the escape with: zkapi-clientd withdraw --escape --to %s\n", initial.Message, initial.Destination)
 		return nil
 	}
+	// A daemon an older build started offers no payout-only withdrawal and
+	// keeps no authorization: only a withdrawal it already signed is
+	// followed through it.
+	if err := checkWithdrawalDaemon(initial); err != nil {
+		clearSetupProgress(ui)
+		return err
+	}
 	switch initial.Phase {
 	case "no_note":
 		ui.Printf("There is no open private balance to withdraw.\n")
 		return nil
 	case "complete", "withdrawal_pending", "confirming", "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
 		return finishGuidedWithdrawal(ctx, service, initial, ui, wait)
-	case "ready", "quoted", "waiting_funds", "waiting_settlement", "reverted", "gasless_refused":
+	case "quoted", "gasless_refused":
+		if usableAuthorization(initial) {
+			// Approved within its maximum fee (a restart before signing, or a
+			// retry the daemon makes within it): continue without asking.
+			return finishGuidedWithdrawal(ctx, service, initial, ui, wait)
+		}
+	case "ready", "waiting_funds", "waiting_settlement", "reverted":
 	case "op_reverted":
 		clearSetupProgress(ui)
 		return errors.New(initial.Message)
 	default:
 		return errors.New("withdrawal needs recovery; preserve the wallet files and run zkapi-clientd config --menu")
 	}
+	// Design 3.3: where the deployment sponsors withdrawals the fee is paid
+	// from the payout, the only option (the proof binds the transit account,
+	// so it is settled before the note is reserved). A saved wallet-paid
+	// withdrawal finishes as it was reserved.
+	payout := false
+	if walletBoundWithdrawal(initial) {
+		if initial.NewWithdrawalFees == "payout" {
+			clearSetupProgress(ui)
+			if initial.TransitAccount == "" {
+				ui.Printf("This withdrawal was reserved with a wallet-paid network fee before sponsorship; it finishes that way (a fee QR appears when ETH is needed).\n")
+			} else {
+				ui.Printf("This withdrawal was moved to a wallet-paid network fee as recovery; it finishes that way (a fee QR appears when ETH is needed).\n")
+			}
+		}
+	} else if initial.NewWithdrawalFees == "payout" || (savedWithdrawal(initial) && initial.TransitAccount != "") {
+		payout = true
+		availability, err := service.GaslessAvailability(ctx)
+		if err != nil || !availability.Available {
+			clearSetupProgress(ui)
+			reason := availability.Message
+			if reason == "" {
+				reason = availability.Reason
+			}
+			if err != nil {
+				reason = err.Error()
+			}
+			if reason == "" {
+				reason = "the sponsored path is unavailable"
+			}
+			return fmt.Errorf("the network fee cannot be paid from the payout now (%s). Nothing was reserved or signed. Try again later, or use your own ERC-4337 bundler with zkapi-clientd config --bundler-url URL", withoutWalletFeeAdvice(reason))
+		}
+	}
 	destination := initial.Destination
 	if destination == "" {
 		clearSetupProgress(ui)
-		for {
-			answer, err := ui.Ask(ctx, "Withdraw the full private balance to Ethereum address", "")
-			if err != nil {
-				return err
-			}
-			destination, err = zkapi.NormalizeWithdrawalDestination(strings.TrimSpace(answer))
-			if err == nil {
-				err = zkapi.CheckWithdrawalDestination(initial.ChainID, destination)
-			}
-			if err == nil {
-				break
-			}
-			ui.Printf("%s. Please enter the destination address.\n", err)
+		var err error
+		if destination, err = askGuidedDestination(ctx, ui, initial.ChainID); err != nil {
+			return err
 		}
 	} else if _, err := zkapi.NormalizeWithdrawalDestination(destination); err != nil {
 		return errors.New("the saved withdrawal destination is invalid; preserve recovery files")
@@ -171,58 +217,27 @@ func guidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui s
 	} else if initial.TransactionHash != "" {
 		return errors.New("saved withdrawal transaction needs recovery before preparing another quote")
 	}
-	// Design 3.3: when the deployment's paymaster can sponsor the exit, the
-	// fee may be paid from the payout, so no ETH (and no fee QR) is needed.
-	// The choice is made before the note is reserved (the proof binds the
-	// transit account), or again after the sponsored path refused.
-	fees := ""
-	switch {
-	case initial.FeePayer == "payout" && initial.Phase != "gasless_refused":
-		fees = "payout"
-	case initial.Destination == "" || initial.Phase == "gasless_refused":
-		fees = chooseGuidedFees(ctx, service, ui, defaultFees, initial.Phase == "gasless_refused" && initial.FeePayer == "payout")
-	}
 	setupProgress(ui, "Preparing withdrawal; this can take a few minutes.")
-	return waitAndWithdraw(ctx, service, initial, destination, retryHash, fees, ui, wait)
+	return waitAndWithdraw(ctx, service, initial, destination, retryHash, payout, ui, wait)
 }
 
-// chooseGuidedFees asks how the fee is paid when the payout can pay it:
-// "payout" or "wallet" as chosen (a chosen wallet is named to the daemon,
-// which falls a refused sponsored withdrawal back to the wallet-paid
-// path); "" (the daemon's default) when the choice is not offered. A
-// refused sponsored withdrawal (refused) whose sponsored path is
-// unavailable has only the wallet-paid way out, so "wallet" is named
-// without asking (the quote is still reviewed before anything is signed).
-func chooseGuidedFees(ctx context.Context, service guidedWithdrawalService, ui setupPrompter, defaultFees string, refused bool) string {
-	availability, err := service.GaslessAvailability(ctx)
-	if err != nil || !availability.Available {
-		if refused {
-			clearSetupProgress(ui)
-			reason := availability.Message
-			if err != nil || reason == "" {
-				reason = "the sponsored path is unavailable"
-			}
-			ui.Printf("The network fee cannot be paid from the payout now (%s). The saved withdrawal falls back to this wallet's public ETH (a fee QR appears when needed); its payout then waits in the transit account for zkapi-clientd withdraw --to DESTINATION --sweep.\n", reason)
-			return "wallet"
+// askGuidedDestination asks for the withdrawal's destination until it is a
+// valid address that can receive the payout on this chain.
+func askGuidedDestination(ctx context.Context, ui setupPrompter, chain uint64) (string, error) {
+	for {
+		answer, err := ui.Ask(ctx, "Withdraw the full private balance to Ethereum address", "")
+		if err != nil {
+			return "", err
 		}
-		return ""
+		destination, err := zkapi.NormalizeWithdrawalDestination(strings.TrimSpace(answer))
+		if err == nil {
+			err = zkapi.CheckWithdrawalDestination(chain, destination)
+		}
+		if err == nil {
+			return destination, nil
+		}
+		ui.Printf("%s. Please enter the destination address.\n", err)
 	}
-	clearSetupProgress(ui)
-	fallback := "wallet"
-	if defaultFees == "payout" {
-		fallback = "payout"
-	}
-	choice, err := selectSetupChoice(ctx, ui, "How is the network fee paid? wallet (this wallet's public ETH; a fee QR appears when needed) or payout (taken from the payout; no ETH needed)", fallback, []setupChoice{
-		{value: "wallet", label: "Pay the network fee from this wallet's public ETH (fee QR when needed)"},
-		{value: "payout", label: "Pay the network fee from the payout (no ETH needed)"},
-	})
-	if err != nil {
-		return ""
-	}
-	if strings.ToLower(strings.TrimSpace(choice)) == "payout" {
-		return "payout"
-	}
-	return "wallet"
 }
 
 // sameGuidedWithdrawalOperation compares the saved transaction of two
@@ -240,25 +255,34 @@ func sameGuidedWithdrawalWallet(a, b zkapi.AddressWithdrawalStatus) bool {
 	return a.BillingAsset == "native_eth" && b.BillingAsset == a.BillingAsset && a.ChainID == b.ChainID && a.DeploymentID == b.DeploymentID && strings.EqualFold(a.Address, b.Address) && a.NoteID == b.NoteID
 }
 
+// sameGuidedWithdrawalQuote compares the identity two quotes of one
+// withdrawal must share: the wallet, vault, note, destination, amount,
+// binding, transit account (which a payout approval covers) and retry.
 func sameGuidedWithdrawalQuote(a, b zkapi.AddressPaymentQuote) bool {
-	return a.Kind == "withdrawal" && b.Kind == a.Kind && a.ChainID == b.ChainID && a.DeploymentID == b.DeploymentID && strings.EqualFold(a.Contract, b.Contract) && strings.EqualFold(a.Address, b.Address) && a.NoteID == b.NoteID && strings.EqualFold(a.Destination, b.Destination) && a.Amount == b.Amount && a.PrincipalWei == "0" && b.PrincipalWei == a.PrincipalWei && a.Binding != "" && a.Binding == b.Binding && a.Commitment == "" && b.Commitment == "" && a.Nonce == b.Nonce && a.RetryHash == b.RetryHash
+	return a.Kind == "withdrawal" && b.Kind == a.Kind && a.ChainID == b.ChainID && a.DeploymentID == b.DeploymentID && strings.EqualFold(a.Contract, b.Contract) && strings.EqualFold(a.Address, b.Address) && a.NoteID == b.NoteID && strings.EqualFold(a.Destination, b.Destination) && a.Amount == b.Amount && a.PrincipalWei == "0" && b.PrincipalWei == a.PrincipalWei && a.Binding != "" && a.Binding == b.Binding && a.Commitment == "" && b.Commitment == "" && a.Nonce == b.Nonce && a.RetryHash == b.RetryHash && strings.EqualFold(a.TransitAccount, b.TransitAccount)
 }
 
 func withdrawalStateMatchesQuote(state zkapi.AddressWithdrawalStatus, quote zkapi.AddressPaymentQuote) bool {
-	return state.BillingAsset == "native_eth" && state.ChainID == quote.ChainID && state.DeploymentID == quote.DeploymentID && strings.EqualFold(state.Address, quote.Address) && state.NoteID == quote.NoteID && state.Amount == quote.Amount && strings.EqualFold(state.Destination, quote.Destination)
+	return state.BillingAsset == "native_eth" && state.ChainID == quote.ChainID && state.DeploymentID == quote.DeploymentID && strings.EqualFold(state.Address, quote.Address) && state.NoteID == quote.NoteID && state.Amount == quote.Amount && strings.EqualFold(state.Destination, quote.Destination) && (quote.TransitAccount == "" || strings.EqualFold(state.TransitAccount, quote.TransitAccount))
 }
 
-func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initial zkapi.AddressWithdrawalStatus, destination, retryHash, fees string, ui setupPrompter, wait func(context.Context) error) error {
+// waitAndWithdraw quotes, shows and approves the withdrawal. A wallet-paid
+// one waits for fee funds (QR) and approves a fresh quote within the fee the
+// owner accepted. A payout one shows its bounded terms once and approves the
+// displayed quote: the daemon builds the operation at the fees of the moment
+// within that maximum. A quote that expired or was replaced before the
+// approval was saved is quoted again, and approved without asking when its
+// identity is the same and its bound no looser than the accepted one.
+func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initial zkapi.AddressWithdrawalStatus, destination, retryHash string, payout bool, ui setupPrompter, wait func(context.Context) error) error {
 	defer clearSetupProgress(ui)
-	var frozen *zkapi.AddressPaymentQuote
-	var displayedPayment *zkapi.AddressPaymentQuote
-	approved, retrying, settling, acceptedUnsettled := false, false, false, false
-	ceiling, lastProgress := "", ""
+	var frozen, displayedPayment, accepted *zkapi.AddressPaymentQuote
+	approved, retrying, settling, acceptedUnsettled, allowExpensiveGas := false, false, false, false, false
+	ceiling, lastProgress, changes := "", "", 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		quote, err := service.Quote(ctx, destination, initial.NoteID, retryHash, acceptedUnsettled, fees)
+		quote, err := service.Quote(ctx, destination, initial.NoteID, retryHash, guidedQuoteOptions{acceptUnsettledRequestRisk: acceptedUnsettled, payout: payout, allowExpensiveGas: allowExpensiveGas})
 		if managementErrorCode(err) == "receipt_journal_missing" {
 			// Waiting cannot help; the message names the nullifier the
 			// operator needs.
@@ -287,17 +311,47 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 			setupProgress(ui, "Preparing withdrawal with the ownership proof; this can take a few minutes.")
 			continue
 		}
-		if fees == "payout" && managementErrorCode(err) != "" {
-			// A gasless refusal does not clear by waiting: the wallet-paid
-			// path is the way out.
-			clearSetupProgress(ui)
-			return fmt.Errorf("%w. The fee cannot be paid from the payout now; run zkapi-clientd config --menu, choose withdraw and the wallet-paid fee, or zkapi-clientd withdraw --to %s --fees wallet", err, destination)
+		if code := managementErrorCode(err); payout && code != "" {
+			// A refusal of the payout path does not clear by waiting, and
+			// there is no wallet-paid fallback: explain it and stop, except
+			// for the two the owner can answer here.
+			switch {
+			case code == "gasless_uneconomic" && !allowExpensiveGas:
+				clearSetupProgress(ui)
+				ui.Printf("The network fee is unusually high for this payout right now (%s). You can stop and try again later, or accept the higher fee; its maximum is shown before you approve.\n", payoutRefusal(err))
+				accept, err := ui.Confirm(ctx, "Accept a network fee above the usual share of the payout")
+				if err != nil {
+					return err
+				}
+				if !accept {
+					return errors.New("withdrawal stopped; nothing was approved or signed; try again later from zkapi-clientd config --menu")
+				}
+				allowExpensiveGas, lastProgress = true, ""
+				setupProgress(ui, "Preparing withdrawal; this can take a few minutes.")
+				continue
+			case code == zkapi.CodeInvalidPayee && initial.Destination == "" && frozen == nil:
+				// Refused before anything was reserved for it: another
+				// destination may be chosen.
+				clearSetupProgress(ui)
+				ui.Printf("%s cannot receive this payout (%s).\n", destination, payoutRefusal(err))
+				if destination, err = askGuidedDestination(ctx, ui, initial.ChainID); err != nil {
+					return err
+				}
+				lastProgress = ""
+				setupProgress(ui, "Preparing withdrawal; this can take a few minutes.")
+				continue
+			}
+			return guidedPayoutStopped(ui, err)
 		}
 		if err != nil {
 			state, statusErr := service.Status(ctx)
 			if statusErr == nil {
 				if !sameGuidedWithdrawalWallet(initial, state) || (state.Destination != "" && !strings.EqualFold(destination, state.Destination)) || (frozen != nil && !withdrawalStateMatchesQuote(state, *frozen)) {
 					return errors.New("saved withdrawal changed while waiting; stopped without authorizing another transaction")
+				}
+				if payout && usableAuthorization(state) {
+					// Approved within its maximum fee meanwhile: follow it.
+					return finishGuidedWithdrawal(ctx, service, state, ui, wait)
 				}
 				switch state.Phase {
 				case "withdrawal_pending", "confirming", "complete", "op_built", "op_submitted":
@@ -317,14 +371,12 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 						return errors.New("withdrawal reverted; run zkapi-clientd config --menu to review recovery; no retry was authorized")
 					}
 				case "gasless_refused":
-					// The sponsored path stopped; waiting does not clear it,
-					// and the wallet-paid fee is the way out.
+					// The sponsored path stopped; waiting does not clear it.
 					clearSetupProgress(ui)
-					reason := state.GaslessRefusal
-					if reason == "" {
-						reason = err.Error()
+					if state.GaslessRefusal == "" {
+						state.GaslessRefusal = err.Error()
 					}
-					return fmt.Errorf("the sponsored withdrawal stopped: %s. Pay the network fee from this wallet instead: run zkapi-clientd config --menu and choose withdraw (the wallet-paid fee is offered), or zkapi-clientd withdraw --to %s --fees wallet", reason, destination)
+					return sponsoredWithdrawalStopped(state)
 				default:
 					return errors.New("saved withdrawal needs recovery; run zkapi-clientd config --menu")
 				}
@@ -342,9 +394,14 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 		}
 		retrying, settling = false, false
 		if quote.ChainID != initial.ChainID || quote.DeploymentID != initial.DeploymentID || !strings.EqualFold(quote.Address, initial.Address) || quote.NoteID != initial.NoteID || !strings.EqualFold(quote.Destination, destination) || quote.RetryHash != retryHash || !sameGuidedWithdrawalQuote(quote, quote) || (frozen != nil && !sameGuidedWithdrawalQuote(*frozen, quote)) || (initial.Phase == "reverted" && quote.Amount != initial.Amount) {
-			return errors.New("withdrawal quote changed the selected wallet, note, destination, amount, or transaction; stopped without approving")
+			return errors.New("withdrawal quote changed the selected wallet, note, destination, transit account, amount, or transaction; stopped without approving")
 		}
-		if quote.FeePolicy != "payout" {
+		if payout != (quote.FeePolicy == "payout") {
+			// How the fee is paid never changes silently: a payout
+			// withdrawal is never quoted wallet-paid, nor the reverse.
+			return errors.New("withdrawal quote changed how the network fee is paid; stopped without approving")
+		}
+		if !payout {
 			// A payout quote never shows a payment request.
 			if _, err := paymentRequestURI(quote); err != nil {
 				return err
@@ -354,9 +411,65 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 			copy := quote
 			frozen = &copy
 			ui.Printf("\nWithdraw %s ETH on %s\nDestination: %s\n", fundingUnits(strconv.FormatUint(quote.Amount, 10), 9), fundingNetwork(quote.ChainID), quote.Destination)
-			if quote.FeePolicy == "payout" {
+			if payout {
 				ui.Printf("The network fee is paid from the payout by a sponsored operation; no ETH is needed from this wallet. Transit account: %s\n", quote.TransitAccount)
 			}
+		}
+		if payout {
+			if accepted == nil || !payoutWithinBound(quote, *accepted) {
+				clearSetupProgress(ui)
+				if accepted != nil {
+					ui.Printf("The refreshed quote raises the maximum fee or lowers what %s receives; review the new terms.\n", quote.Destination)
+				}
+				printPayoutTerms(setupUIWriter{ui}, quote)
+				proceed, err := ui.Continue(ctx, "Press Enter to approve this withdrawal, or type cancel")
+				if err != nil {
+					return err
+				}
+				if !proceed {
+					return errors.New("withdrawal declined; no transaction was authorized")
+				}
+				copy := quote
+				accepted = &copy
+			}
+			setupProgress(ui, "Submitting withdrawal...")
+			state, err := service.Approve(ctx, quote.ID)
+			if managementErrorCode(err) == zkapi.CodeQuoteChanged {
+				// Refused before the authorization was saved (the quote
+				// expired or was replaced): nothing was approved. The next
+				// quote is approved without asking if it fits the accepted
+				// terms.
+				if changes++; changes > 3 {
+					return fmt.Errorf("%w; the quote kept changing and nothing was approved; try again from zkapi-clientd config --menu", err)
+				}
+				setupProgress(ui, "The quote expired or was replaced; refreshing it within the approved maximum.")
+				continue
+			}
+			if err != nil {
+				// A lost response may follow a saved authorization or a
+				// signature: only inspect and follow what was saved.
+				refusal := err
+				setupProgress(ui, "Checking saved withdrawal progress after an interrupted response.")
+				if state, err = readGuidedWithdrawal(ctx, service, ui, wait); err != nil {
+					return err
+				}
+				if state.Phase != "withdrawal_pending" && state.Phase != "confirming" && state.Phase != "complete" && !zkapi.GaslessPendingPhase(state.Phase) && !usableAuthorization(state) {
+					if state.Phase == "gasless_refused" && withdrawalStateMatchesQuote(state, quote) {
+						return sponsoredWithdrawalStopped(state)
+					}
+					if managementErrorCode(refusal) != "" {
+						return guidedPayoutStopped(ui, refusal)
+					}
+					return errors.New("withdrawal was not confirmed; run zkapi-clientd config --menu to inspect saved progress before approving again")
+				}
+			}
+			if !withdrawalStateMatchesQuote(state, quote) {
+				return errors.New("saved withdrawal no longer matches the approved operation; preserve recovery files")
+			}
+			if state.Phase == "gasless_refused" && !state.GaslessRetryable {
+				return sponsoredWithdrawalStopped(state)
+			}
+			return finishGuidedWithdrawal(ctx, service, state, ui, wait)
 		}
 		if quote.ShortfallWei != "0" {
 			if approved {
@@ -389,14 +502,7 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 			if approved {
 				ui.Printf("Network fees increased; review the updated maximum.\n")
 			}
-			if quote.FeePolicy == "payout" {
-				ui.Printf("Fee taken from the payout: at most %s ETH (expected charge at today's base fee: about %s ETH, an estimate); %s receives at least %s ETH.\n", fundingUnits(quote.FeeCapWei, 18), fundingUnits(quote.ExpectedFeeWei, 18), quote.Destination, fundingUnits(quote.MinimumReceivedWei, 18))
-				if quote.PayeeHasCode {
-					ui.Printf("%s has code: it must accept the ETH within 100,000 gas, or the payout is credited in the paymaster for zkapi-clientd withdraw --claim-credit (the floor above already deducts that case's surcharge).\n", quote.Destination)
-				}
-			} else {
-				ui.Printf("Fees funded. Maximum network fee: %s ETH.\n", fundingUnits(quote.FeeReserveWei, 18))
-			}
+			ui.Printf("Fees funded. Maximum network fee: %s ETH.\n", fundingUnits(quote.FeeReserveWei, 18))
 			proceed, err := ui.Continue(ctx, "Press Enter to withdraw, or type cancel")
 			if err != nil {
 				return err
@@ -433,6 +539,38 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 		}
 		return finishGuidedWithdrawal(ctx, service, state, ui, wait)
 	}
+}
+
+// payoutRefusal is a payout refusal's reason as shown: the daemon's message,
+// without any advice to fall back to a wallet-paid fee.
+func payoutRefusal(err error) string {
+	var failed *managementError
+	if errors.As(withoutWalletFeeAdviceError(err), &failed) {
+		return failed.message
+	}
+	return withoutWalletFeeAdvice(err.Error())
+}
+
+// guidedPayoutStopped stops a payout withdrawal the payout path refused
+// (bundler unavailable, fee above the paymaster's ceiling, sponsorship
+// paused, ...) with the reason and what can be done; it keeps the refusal
+// code and never offers a wallet-paid fee.
+func guidedPayoutStopped(ui setupPrompter, err error) error {
+	clearSetupProgress(ui)
+	code := managementErrorCode(err)
+	remedy := "try again later from zkapi-clientd config --menu (choose withdraw)"
+	if code == "bundler_unavailable" {
+		remedy += ", or use your own ERC-4337 bundler with zkapi-clientd config --bundler-url URL"
+	}
+	return &managementError{message: fmt.Sprintf("the network fee cannot be paid from the payout now (%s). Nothing further was approved or signed; %s", payoutRefusal(err), remedy), code: code, scope: "withdrawal"}
+}
+
+// sponsoredWithdrawalStopped is the stop of a payout withdrawal whose
+// approval no longer applies (a refusal the daemon does not retry within
+// it): a new quote and approval are needed. It never points at a wallet-paid
+// fee.
+func sponsoredWithdrawalStopped(state zkapi.AddressWithdrawalStatus) error {
+	return fmt.Errorf("the sponsored withdrawal stopped: %s. Its approval no longer applies and nothing further was signed; choose withdraw again in zkapi-clientd config --menu later to review a new quote", withoutWalletFeeAdvice(state.GaslessRefusal))
 }
 
 // confirmUnsettledWithdrawal handles the companion's refusal at a note state
@@ -498,14 +636,19 @@ func readGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService, 
 
 func finishGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService, initial zkapi.AddressWithdrawalStatus, ui setupPrompter, wait func(context.Context) error) error {
 	defer clearSetupProgress(ui)
-	if (!validWithdrawalTransactionHash(initial.TransactionHash) && !validWithdrawalTransactionHash(initial.UserOpHash)) || initial.Destination == "" {
+	if (!validWithdrawalTransactionHash(initial.TransactionHash) && !validWithdrawalTransactionHash(initial.UserOpHash) && !usableAuthorization(initial)) || initial.Destination == "" {
 		return errors.New("saved withdrawal transaction is missing; preserve recovery files")
 	}
-	state, announced := initial, false
+	if usableAuthorization(initial) && initial.AuthorizedMaxFeeWei != "" && initial.AuthorizedMinNetPayoutWei != "" {
+		clearSetupProgress(ui)
+		ui.Printf("Continuing the approved withdrawal to %s within its maximum fee: at most %s ETH may be taken from the payout, and %s receives at least %s ETH. No new approval is needed.\n", initial.Destination, fundingUnits(initial.AuthorizedMaxFeeWei, 18), initial.Destination, fundingUnits(initial.AuthorizedMinNetPayoutWei, 18))
+	}
+	state, announced := initial, ""
 	for {
 		if !sameGuidedWithdrawalWallet(initial, state) || state.Amount != initial.Amount || !strings.EqualFold(state.Destination, initial.Destination) || !sameGuidedWithdrawalOperation(initial, state) {
 			return errors.New("saved withdrawal changed during recovery; preserve recovery files")
 		}
+		progress := ""
 		switch state.Phase {
 		case "complete":
 			clearSetupProgress(ui)
@@ -527,17 +670,28 @@ func finishGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService
 			}
 			return nil
 		case "withdrawal_pending", "confirming":
-			if !announced {
-				setupProgress(ui, "Withdrawal submitted; waiting for Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress.")
-				announced = true
-			}
+			progress = "Withdrawal submitted; waiting for Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress."
 		case "op_built", "op_submitted", "forward_op_built", "forward_op_submitted":
-			if !announced {
-				setupProgress(ui, "Sponsored operation sent to the bundler; waiting for inclusion and Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress.")
-				announced = true
+			progress = "Sponsored operation sent to the bundler; waiting for inclusion and Ethereum finality (usually about 15 minutes). Ctrl+C preserves progress."
+		case "quoted":
+			// Approved, not yet signed: the next resume builds and sends it
+			// within the authorization.
+			if !usableAuthorization(state) {
+				return errors.New("withdrawal needs attention; run zkapi-clientd config --menu to recover it; a reverted transaction is never retried automatically")
 			}
+			progress = "Sending the approved withdrawal within its maximum fee; this can take a few minutes. Ctrl+C preserves progress."
+		case "gasless_refused":
+			if !state.GaslessRetryable {
+				clearSetupProgress(ui)
+				return sponsoredWithdrawalStopped(state)
+			}
+			progress = fmt.Sprintf("The sponsored operation could not be sent yet (%s); waiting; your authorization still holds. Ctrl+C preserves progress.", withoutWalletFeeAdvice(state.GaslessRefusal))
 		default:
 			return errors.New("withdrawal needs attention; run zkapi-clientd config --menu to recover it; a reverted transaction is never retried automatically")
+		}
+		if progress != announced {
+			setupProgress(ui, "%s", progress)
+			announced = progress
 		}
 		if err := wait(ctx); err != nil {
 			return err
@@ -548,7 +702,7 @@ func finishGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService
 			if err != nil {
 				return err
 			}
-			announced = false // Restore the stage after a temporary status message.
+			announced = "" // Restore the stage after a temporary status message.
 		}
 		state = next
 	}

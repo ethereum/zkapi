@@ -84,9 +84,25 @@ impl TryFrom<u8> for WithdrawalKind {
     }
 }
 
+/// `F = note_id·2^192 + deposit_amount·2^64 + expiry_ts` as a big-endian field element:
+/// the withdrawal statement's public input 8 (`noteFields`), which the note leaf binds. Below
+/// 2^224, so injective as an integer and as a field element.
+pub fn pack_note_fields(note_id: u32, deposit_amount: u128, expiry_ts: u64) -> Felt252 {
+    let mut bytes = [0u8; 32];
+    bytes[4..8].copy_from_slice(&note_id.to_be_bytes());
+    bytes[8..24].copy_from_slice(&deposit_amount.to_be_bytes());
+    bytes[24..32].copy_from_slice(&expiry_ts.to_be_bytes());
+    Felt252(bytes)
+}
+
 /// Public statement of a withdrawal proof for circuit
-/// `zkapi-v2-concession-v1`: 16 inputs, in exactly the order of
+/// `zkapi-v2-concession-v2`: 16 inputs, in exactly the order of
 /// [`Self::to_field_elements`] and of Solidity `Types.WithdrawalPublicInputs`.
+///
+/// Input 3 is the note's leaf `note_leaf` (the word the vault stores for the note) and input 8
+/// is `noteFields` = [`pack_note_fields`]`(note_id, deposit_amount, expiry_ts)`, carried here as
+/// its three parts. The proof binds the leaf to the owner's registration and to these fields, and
+/// the vault compares the leaf with its own: an exit needs no Merkle path and no root.
 ///
 /// Canonical values: `next_nullifier` is the successor nullifier for kind 0
 /// and 0 otherwise; `conceded` is 0 unless kind 0; `destination` is all zero
@@ -99,12 +115,16 @@ pub struct WithdrawalPublicInputsV2C {
     pub protocol_version: u16,
     pub chain_id: u64,
     pub contract_address: Felt252,
-    pub active_root: Felt252,
+    pub note_leaf: Felt252,
     pub state_signing_key_x: Felt252,
     pub state_signing_key_y: Felt252,
     pub clearance_signing_key_x: Felt252,
     pub clearance_signing_key_y: Felt252,
     pub note_id: u32,
+    /// The note's deposit `D` (gwei units), packed into input 8.
+    pub deposit_amount: u128,
+    /// The note's bucketed expiry `e`, packed into input 8.
+    pub expiry_ts: u64,
     pub final_balance: u128,
     pub destination: [u8; 20],
     pub withdrawal_nullifier: Felt252,
@@ -126,6 +146,11 @@ impl WithdrawalPublicInputsV2C {
         Felt252(bytes)
     }
 
+    /// Public input 8: `note_id·2^192 + deposit_amount·2^64 + expiry_ts`.
+    pub fn note_fields(&self) -> Felt252 {
+        pack_note_fields(self.note_id, self.deposit_amount, self.expiry_ts)
+    }
+
     /// The decoded `kind`, or `None` for a value outside {0, 1, 2}.
     pub fn withdrawal_kind(&self) -> Option<WithdrawalKind> {
         WithdrawalKind::from_u8(self.kind)
@@ -138,12 +163,12 @@ impl WithdrawalPublicInputsV2C {
             Felt252::from_u64(self.protocol_version as u64),
             Felt252::from_u64(self.chain_id),
             self.contract_address,
-            self.active_root,
+            self.note_leaf,
             self.state_signing_key_x,
             self.state_signing_key_y,
             self.clearance_signing_key_x,
             self.clearance_signing_key_y,
-            Felt252::from_u64(self.note_id as u64),
+            self.note_fields(),
             Felt252::from_u128(self.final_balance),
             self.destination_field(),
             self.withdrawal_nullifier,
@@ -222,12 +247,14 @@ mod tests {
             protocol_version: 2,
             chain_id: 11_155_111,
             contract_address: Felt252::from_u64(1),
-            active_root: Felt252::from_u64(2),
+            note_leaf: Felt252::from_u64(2),
             state_signing_key_x: Felt252::from_u64(3),
             state_signing_key_y: Felt252::from_u64(4),
             clearance_signing_key_x: Felt252::from_u64(5),
             clearance_signing_key_y: Felt252::from_u64(6),
             note_id: 7,
+            deposit_amount: 5_000_000,
+            expiry_ts: 4_000_000_000,
             final_balance: 900,
             destination: [0x11; 20],
             withdrawal_nullifier: Felt252::from_u64(8),
@@ -244,7 +271,13 @@ mod tests {
         let fields = inputs.to_field_elements();
         assert_eq!(fields.len(), WithdrawalPublicInputsV2C::NUM_PUBLIC_INPUTS);
         assert_eq!(fields[0], Felt252::from_u64(2));
-        assert_eq!(fields[8], Felt252::from_u64(7));
+        assert_eq!(fields[3], Felt252::from_u64(2));
+        // The design's packing vector (shared with Solidity, JS and Go).
+        assert_eq!(
+            fields[8],
+            Felt252::from_hex("0x0000000000000007000000000000000000000000004c4b4000000000ee6b2800")
+                .unwrap()
+        );
         assert_eq!(fields[9], Felt252::from_u64(900));
         let mut destination = [0u8; 32];
         destination[12..].fill(0x11);
@@ -261,7 +294,8 @@ mod tests {
         let inputs = sample_withdrawal();
         let value = serde_json::to_value(&inputs).unwrap();
         let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 16);
+        assert_eq!(keys.len(), 18);
+        assert!(keys.contains(&"note_leaf".to_string()));
         assert_eq!(
             serde_json::from_value::<WithdrawalPublicInputsV2C>(value.clone()).unwrap(),
             inputs
@@ -269,9 +303,42 @@ mod tests {
         let mut legacy = value.clone();
         legacy["has_clearance"] = false.into();
         assert!(serde_json::from_value::<WithdrawalPublicInputsV2C>(legacy).is_err());
+        // A zkapi-v2-concession-v1 statement (active_root, no deposit or expiry) is refused.
+        let mut v1 = value.clone();
+        let object = v1.as_object_mut().unwrap();
+        let leaf = object.remove("note_leaf").unwrap();
+        object.insert("active_root".into(), leaf);
+        object.remove("deposit_amount");
+        object.remove("expiry_ts");
+        assert!(serde_json::from_value::<WithdrawalPublicInputsV2C>(v1).is_err());
+        let mut both = value.clone();
+        both["active_root"] = "0x2".into();
+        assert!(serde_json::from_value::<WithdrawalPublicInputsV2C>(both).is_err());
         let mut missing = value;
         missing.as_object_mut().unwrap().remove("valid_until");
         assert!(serde_json::from_value::<WithdrawalPublicInputsV2C>(missing).is_err());
+    }
+
+    #[test]
+    fn note_fields_pack_without_overlap() {
+        let max = pack_note_fields(u32::MAX, u128::MAX, u64::MAX);
+        assert_eq!(max.as_bytes()[..4], [0u8; 4]);
+        assert!(max.as_bytes()[4..].iter().all(|byte| *byte == 0xff));
+        assert_eq!(
+            pack_note_fields(1, 0, 0).as_bytes()[7],
+            1,
+            "note_id starts at bit 192"
+        );
+        assert_eq!(
+            pack_note_fields(0, 1, 0).as_bytes()[23],
+            1,
+            "deposit at bit 64"
+        );
+        assert_eq!(
+            pack_note_fields(0, 0, 1).as_bytes()[31],
+            1,
+            "expiry at bit 0"
+        );
     }
 
     #[test]

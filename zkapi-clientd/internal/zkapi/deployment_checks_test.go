@@ -56,7 +56,8 @@ func deploymentCheckAnswer(network, method string, params []json.RawMessage) (re
 			selectorNoteTTL:                 number(d.NoteTTL),
 			selectorMaxPauseDuration:        number(d.MaxPauseDuration),
 			selectorConcessionEscapeVersion: number(1),
-			selectorRootHistoryWindow:       number(86400),
+			selectorLeafBoundExitVersion:    number(1),
+			selectorMinDeposit:              number(d.MinDepositUnits),
 		}
 		adapter := map[string]string{
 			selectorCircuitIDHash:    crypto.Keccak256Hash([]byte(d.Proof.Circuit)).Hex(),
@@ -74,6 +75,10 @@ func deploymentCheckAnswer(network, method string, params []json.RawMessage) (re
 	}
 	return nil, false
 }
+
+// rpcRevert, as a tamper replacement, answers the call with a revert (a
+// getter the vault does not have).
+type rpcRevert struct{}
 
 // fakeDeploymentRPC serves the deployment checks, with tamper applied to the
 // answers (method, data or address → replacement).
@@ -104,6 +109,10 @@ func fakeDeploymentRPC(t *testing.T, network string, tamper map[string]any) *htt
 				if strings.EqualFold(key, call.Data) || strings.EqualFold(key, address) {
 					result = replacement
 				}
+			}
+			if _, revert := result.(rpcRevert); revert {
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "error": map[string]any{"code": 3, "message": "execution reverted"}})
+				return
 			}
 		} else {
 			t.Errorf("unexpected RPC %s", request.Method)
@@ -138,7 +147,10 @@ func TestDeploymentChecksUseThePinnedAndTheExitRPC(t *testing.T) {
 		"another note ttl":         {selectorNoteTTL: "0x" + uintWord(60)},
 		"another pause bound":      {selectorMaxPauseDuration: "0x" + uintWord(60)},
 		"no concession exit":       {selectorConcessionEscapeVersion: "0x" + uintWord(0)},
-		"another root window":      {selectorRootHistoryWindow: "0x" + uintWord(3600)},
+		"no leaf-bound exit":       {selectorLeafBoundExitVersion: "0x" + uintWord(0)},
+		"a revision-3 vault":       {selectorLeafBoundExitVersion: rpcRevert{}},
+		"another minimum deposit":  {selectorMinDeposit: "0x" + uintWord(d.MinDepositUnits+1)},
+		"no minimum deposit":       {selectorMinDeposit: rpcRevert{}},
 		"another circuit":          {selectorCircuitIDHash: crypto.Keccak256Hash([]byte("zkapi-v2-note-bound-v1")).Hex()},
 		"another request key":      {selectorRequestVKHash: "0x" + uintWord(1)},
 		"another withdrawal key":   {selectorWithdrawalVKHash: "0x" + uintWord(1)},

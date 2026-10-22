@@ -31,7 +31,7 @@ pub(crate) struct Reservation {
     /// Written by earlier builds: the owner acknowledged sending an ownership
     /// proof from an expired note's unsettled state on a legacy vault. Kept
     /// so such a reservation still loads; every clearance request of a
-    /// `zkapi-v2-concession-v1` companion carries the ownership proof.
+    /// concession-exit companion carries the ownership proof.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unsettled_request_risk_accepted: bool,
     /// Whether a clearance request carrying this state's ownership proof may
@@ -80,21 +80,27 @@ impl Reservation {
     }
 }
 
-/// Whether `state`'s note leaf is in the vault's tree at its note id, as the
-/// indexer reports it. Every withdrawal or request proof from the state
-/// proves exactly that membership: without it no ownership proof was ever
-/// built from the state, and no request proof can be built from it either.
-pub(crate) async fn note_leaf_in_tree(
-    indexer: &IndexerClient,
-    state: &NoteState,
-) -> Result<bool, AuthError> {
-    let leaf = v2::note_leaf(
+/// The leaf of `state`'s note: what the vault stored at deposit when the
+/// state's secret, amount and expiry are the deposited ones.
+fn snapshot_leaf(state: &NoteState) -> Felt252 {
+    v2::note_leaf(
         state.note_id,
         &v2::registration_commitment(&state.secret_s),
         state.deposit_amount,
         state.expiry_ts,
-    );
-    Ok(indexer.note_leaf(state.note_id).await? == leaf)
+    )
+}
+
+/// Whether `state`'s note leaf is in the vault's tree at its note id, as the
+/// indexer reports it. A request proves that membership, and the server
+/// accepts an ownership proof only for the leaf the vault holds (vault
+/// revision 4): without it no ownership proof from the state was ever
+/// usable, and no request proof can be built from it either.
+pub(crate) async fn note_leaf_in_tree(
+    indexer: &IndexerClient,
+    state: &NoteState,
+) -> Result<bool, AuthError> {
+    Ok(indexer.note_leaf(state.note_id).await? == snapshot_leaf(state))
 }
 
 /// Recorded, before the request leaves, that a clearance request carrying
@@ -346,7 +352,9 @@ pub(crate) fn validate_plan(record: &Reservation, plan: &WithdrawalPlan) -> Resu
         || inputs.final_balance != record.snapshot.current_balance
         || inputs.destination != record.destination
         || inputs.withdrawal_nullifier != record.nullifier
-        || plan.siblings.len() != 32
+        || inputs.deposit_amount != record.snapshot.deposit_amount
+        || inputs.expiry_ts != record.snapshot.expiry_ts
+        || inputs.note_leaf != snapshot_leaf(&record.snapshot)
     {
         return Err(AuthError::WithdrawalConflict);
     }
@@ -954,17 +962,18 @@ pub(crate) mod tests {
     pub(crate) fn plan(record: &Reservation) -> WithdrawalPlan {
         WithdrawalPlan {
             mode: WithdrawalMode::Mutual,
-            siblings: vec![Felt252::ZERO; 32],
             public_inputs: zkapi_types::WithdrawalPublicInputsV2C {
                 protocol_version: 2,
                 chain_id: record.snapshot.chain_id,
                 contract_address: record.snapshot.contract_address,
-                active_root: Felt252::ONE,
+                note_leaf: snapshot_leaf(&record.snapshot),
                 state_signing_key_x: Felt252::ZERO,
                 state_signing_key_y: Felt252::ONE,
                 clearance_signing_key_x: Felt252::ZERO,
                 clearance_signing_key_y: Felt252::ONE,
                 note_id: record.snapshot.note_id,
+                deposit_amount: record.snapshot.deposit_amount,
+                expiry_ts: record.snapshot.expiry_ts,
                 final_balance: record.snapshot.current_balance,
                 destination: record.destination,
                 withdrawal_nullifier: record.nullifier,
@@ -1254,8 +1263,8 @@ pub(crate) mod tests {
         assert!(validate_close_event(&record, &other_note, &hash).is_err());
         // An initiated or challenged escape has not paid anything.
         for event in [
-            b"EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)".as_slice(),
-            b"EscapeWithdrawalChallenged(uint32,uint256,uint256)".as_slice(),
+            b"EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64)".as_slice(),
+            b"EscapeWithdrawalChallenged(uint32,uint256)".as_slice(),
         ] {
             let mut bad = valid.clone();
             bad["logs"][0]["topics"][0] = json!(format!("0x{:x}", Keccak256::digest(event)));

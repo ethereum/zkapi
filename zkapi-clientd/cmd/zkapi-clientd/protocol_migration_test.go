@@ -25,10 +25,11 @@ func TestProtocolConfigRetainsTorAndExitOptions(t *testing.T) {
 }
 
 func TestUndeployedStartStopsBeforeAttachingOrFunding(t *testing.T) {
-	// Unlike the default deployed fixtures, use the actual shipping manifests.
+	// Unlike the default deployed fixtures, use the actual shipping manifests:
+	// mainnet is still a placeholder (Sepolia ships its staging vault).
 	restore := zkapi.SetPackagedDeploymentsForTesting(os.DirFS("../../internal/zkapi"))
 	defer restore()
-	for _, network := range []string{"mainnet", "sepolia"} {
+	for _, network := range []string{"mainnet"} {
 		c := config.Config{}
 		c.ZKAPI.Network = network
 		// Nil runtime callbacks deliberately fail if startup tries to probe a

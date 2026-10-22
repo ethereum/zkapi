@@ -79,7 +79,7 @@ func configureSepoliaPassword(ctx context.Context, dir string, ui setupPrompter,
 				Secret(context.Context, string) (string, error)
 			})
 			if !ok {
-				return errors.New("Sepolia requires a shared password; run zkapi-clientd config in a terminal")
+				return errors.New("Sepolia requires a shared password; run zkapi-clientd config --setup in a terminal")
 			}
 			ui.Printf("Sepolia access requires the shared testnet password. It is saved only in this private configuration directory.\n")
 			password, err = secret.Secret(ctx, "Sepolia password (hidden)")
@@ -87,7 +87,7 @@ func configureSepoliaPassword(ctx context.Context, dir string, ui setupPrompter,
 				return err
 			}
 			if password == "" {
-				return errors.New("Sepolia password was empty; run zkapi-clientd config again to continue")
+				return errors.New("Sepolia password was empty; run zkapi-clientd config --setup again to continue")
 			}
 		}
 		err = check(ctx, password)

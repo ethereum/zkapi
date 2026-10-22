@@ -1,5 +1,5 @@
 //! In-memory wallet driver for scripts/v2-acceptance.mjs, circuit
-//! `zkapi-v2-concession-v1` (vault revision 3).
+//! `zkapi-v2-concession-v2` (vault revision 4).
 //!
 //! Each stdin line is a JSON command; stdout contains only JSON replies. Wallet
 //! secrets, blindings and pending journals remain in this process. This helper
@@ -21,7 +21,10 @@
 //! request circuit itself is synthesized for it and must be unsatisfied (Q6a,
 //! `is_genesis = (τ == 1)`), so such a successor is never spendable.
 //!
-//! Withdrawal plans carry the vault calldata of the server's own encoder
+//! Exits take no root and no Merkle path: a withdrawal statement binds the
+//! note's leaf (word 3) and its packed fields (word 8), which the wallet
+//! computes from its own note data. Withdrawal plans carry the vault calldata
+//! of the server's own encoder
 //! (`zkapi_serverd::watcher::withdrawal_calldata`), so the harness submits
 //! what the Rust encoder produced; an ownership proof carries the
 //! `POST /v2/withdraw/clearance` body instead.
@@ -42,7 +45,7 @@ use std::{
     path::PathBuf,
 };
 use zkapi_browser::{
-    BrowserNoteState, BrowserWalletConfig, CompleteResponseArgs, ConfirmDepositArgs, NotePathArgs,
+    BrowserNoteState, BrowserWalletConfig, CompleteResponseArgs, ConfirmDepositArgs,
     PendingRequestJournal, PrepareRequestArgs, PrepareWithdrawalArgs, TreeSnapshot,
 };
 use zkapi_proof::compact::{
@@ -540,7 +543,10 @@ impl WalletDriver {
                 Ok(result)
             }
             "note_leaf" => {
-                // The note's leaf, for a path rebuilt from leaves (§6.6).
+                // The note's leaf (vault revision 4: one compression of the
+                // registration and the packed (note ID, deposit, expiry)),
+                // for a path rebuilt from leaves (§6.6) and to compare with
+                // the vault's noteRecord.
                 let state = self.current()?;
                 Ok(json!({
                     "note_id": state.note_id,
@@ -550,14 +556,6 @@ impl WalletDriver {
                         state.deposit_amount,
                         state.expiry_ts,
                     ),
-                }))
-            }
-            "note_path_matches" => {
-                // Whether a saved (deposit-time) path still proves the note:
-                // the vault accepts any root it ever held (Amendment A1).
-                let args: NotePathArgs = serde_json::from_value(command["args"].clone())?;
-                Ok(json!({
-                    "matches": zkapi_browser::note_path_matches(self.current()?, args)?,
                 }))
             }
             "tree_path" => {

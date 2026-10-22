@@ -90,9 +90,9 @@ contract ProbeWithholdingOperator is VaultTestBase {
         vault.raiseEscapeConcession(id, archived[k], PROOF, type(uint128).max);
         vm.stopPrank();
         // Expiry cannot sweep a pending escape.
-        vm.warp(vault.effectiveExpiry(id));
+        vm.warp(_effectiveExpiry(id));
         vm.expectRevert(Errors.NoteNotActive.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         uint256 before = treasury.balance;
         vault.finalizeEscapeWithdrawal(id);
         assertEq(user.balance, 100 ether - uint256(D) * 1 gwei + uint256(balance - bound) * 1 gwei);
@@ -101,8 +101,6 @@ contract ProbeWithholdingOperator is VaultTestBase {
     }
 
     function _depositD() private returns (uint32 id) {
-        id = vault.nextNoteId();
-        vm.prank(user);
-        vault.deposit{value: uint256(D) * 1 gwei}(bytes32(uint256(42)), D);
+        id = _depositAmount(42, D);
     }
 }

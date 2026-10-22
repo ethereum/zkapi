@@ -4,8 +4,8 @@ import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
-    CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, drillTiming, gasLedger, gaslessProfile, localJSON, mockOaOrg,
-    isProfileBundlerUrl, mockProvider, proxyAuthorized, proxyJsonRpc, trustedDeployment,
+    CHAIN_ID, CIRCUIT_ID, INFERENCE_CHARGE, MIN_DEPOSIT, SDK_REQUEST_BOUND, TIMING, challengeFees, defaultFreshSlotGas, drillTiming,
+    gasLedger, gaslessProfile, localJSON, mockOaOrg, isProfileBundlerUrl, mockProvider, noteFields, proxyAuthorized, proxyJsonRpc, trustedDeployment,
 } from './v2-acceptance.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
     accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
@@ -171,12 +171,26 @@ test('drill timing passes serverd\'s and zkapi-challenged\'s startup checks, and
     assert.equal(SDK_REQUEST_BOUND, 400_000);
 });
 
+test('note fields pack (n, D, e) into word 8 as the vault and the circuit do', () => {
+    // The shared packing vector (n = 7, D = 5,000,000, e = 4,000,000,000).
+    assert.equal(noteFields(7, 5_000_000, 4_000_000_000),
+        0x0000000000000007000000000000000000000000004c4b4000000000ee6b2800n);
+    assert.equal(noteFields(0, 0, 0), 0n);
+    const max = noteFields(2 ** 32 - 1, (1n << 128n) - 1n, (1n << 64n) - 1n);
+    assert.equal(max, (1n << 224n) - 1n, 'every packing is below 2^224');
+    assert.throws(() => noteFields(2 ** 32, 0, 0), /out of range/);
+    assert.throws(() => noteFields(0, 1n << 128n, 0), /out of range/);
+    assert.throws(() => noteFields(0, 0, 1n << 64n), /out of range/);
+    assert.equal(CIRCUIT_ID, 'zkapi-v2-concession-v2');
+    assert.ok(Number.isSafeInteger(MIN_DEPOSIT) && MIN_DEPOSIT > 0);
+});
+
 test('profiles come only from a finalized Deploy.s.sol manifest', () => {
     const finalized = {
-        deploymentStatus: 'deployed', deployBlock: 7, chainId: CHAIN_ID, vaultRevision: 3, concessionEscapeVersion: 1,
+        deploymentStatus: 'deployed', deployBlock: 7, chainId: CHAIN_ID, vaultRevision: 4, concessionEscapeVersion: 1, leafBoundExitVersion: 1, minDeposit: 1_000_000,
         vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
         poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
-        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v2', setupId: 'dev', allowDevSetup: true,
         requestVkKeccak256: `0x${'11'.repeat(32)}`, withdrawalVkKeccak256: `0x${'22'.repeat(32)}`,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
         challengePeriod: 3_600, noteTtl: 2_592_000, maxPauseDuration: 7_200,
@@ -193,9 +207,25 @@ test('profiles come only from a finalized Deploy.s.sol manifest', () => {
     assert.equal(profile.contract_address, '0xabcd000000000000000000000000000000000001');
     assert.equal(profile.clearance_signing_key.y, `0x${(2n ** 64n + 1n).toString(16).padStart(64, '0')}`);
     assert.equal(profile.exit_concession, 1);
-    assert.equal(profile.vault_revision, 3);
+    assert.equal(profile.vault_revision, 4);
+    assert.equal(profile.leaf_bound_exit, 1);
+    assert.equal(profile.circuit_id, 'zkapi-v2-concession-v2');
+    assert.equal(profile.min_deposit_units, 1_000_000, 'the profile pins the vault\'s minDeposit');
+    assert.equal(profile.fresh_slot_gas, 110_000, 'Sepolia\'s chain ID prices fresh slots under EIP-8037');
     assert.equal(profile.settlement_window_seconds, 962);
     assert.equal(profile.allow_dev_setup, true);
+    // Fresh-slot gas: mainnet rules on mainnet and local chains, Sepolia's
+    // repricing on Sepolia; any other chain must name it.
+    assert.equal(defaultFreshSlotGas(1), 22_100);
+    assert.equal(defaultFreshSlotGas(31337), 22_100);
+    assert.equal(defaultFreshSlotGas(11155111), 110_000);
+    assert.equal(defaultFreshSlotGas(10), undefined);
+    assert.throws(() => trustedDeployment({ ...finalized, chainId: 10 }, services), /fresh-slot gas/);
+    assert.equal(trustedDeployment({ ...finalized, chainId: 10 }, { ...services, freshSlotGas: 30_000 }).fresh_slot_gas, 30_000);
+    // A revision-3 manifest (root-bound exits) or one without minDeposit is no profile.
+    assert.throws(() => trustedDeployment({ ...finalized, vaultRevision: 3 }, services));
+    assert.throws(() => trustedDeployment({ ...finalized, leafBoundExitVersion: undefined }, services));
+    assert.throws(() => trustedDeployment({ ...finalized, minDeposit: undefined }, services), /minDeposit/);
     for (const status of ['pending', 'simulated']) {
         assert.throws(() => trustedDeployment({ ...finalized, deploymentStatus: status }, services), /finalized manifest/);
     }
@@ -269,10 +299,10 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
     const setupDir = path.join(root, 'protocol/setup/v2-concession-dev');
     const setup = JSON.parse(fs.readFileSync(path.join(setupDir, 'manifest.json'), 'utf8'));
     const finalized = {
-        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 3, concessionEscapeVersion: 1,
+        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 4, concessionEscapeVersion: 1, leafBoundExitVersion: 1, minDeposit: 1_000_000,
         vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
         poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
-        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v2', setupId: 'dev', allowDevSetup: true,
         requestVkKeccak256: setup.vk_keccak256.request, withdrawalVkKeccak256: setup.vk_keccak256.withdrawal,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
         challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800,
@@ -289,15 +319,19 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
     assert.throws(() => deploymentProfile(finalized, services), /new deployment ID/);
     assert.throws(() => deploymentProfile(finalized, { ...services, deploymentId: 'zkapi-native-eth-sepolia-note-bound-v1-fresh-20260930' }),
         /legacy vault/);
-    const profile = deploymentProfile(finalized, { ...services, deploymentId: 'zkapi-native-eth-sepolia-concession-v1' });
+    const profile = deploymentProfile(finalized, { ...services, deploymentId: 'zkapi-native-eth-sepolia-concession-v2' });
     assert.equal(profile.state_signing_key.x, `0x${(2n ** 252n + 7n).toString(16).padStart(64, '0')}`);
     assert.match(profile.clearance_signing_key.y, /^0x0{63}4$/);
     assert.equal(profile.deploy_block, 9_100_000);
     const placeholder = JSON.parse(fs.readFileSync(path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'), 'utf8'));
     const clientd = clientdProfile(placeholder, profile, finalized, keyHashes);
     assert.equal(clientd.deployment_status, 'deployed');
-    assert.equal(clientd.deployment_id, 'zkapi-native-eth-sepolia-concession-v1');
+    assert.equal(clientd.deployment_id, 'zkapi-native-eth-sepolia-concession-v2');
     assert.equal(clientd.challenge_period_seconds, 43_200);
+    assert.equal(clientd.vault_revision, 4);
+    assert.equal(clientd.leaf_bound_exit, 1);
+    assert.equal(clientd.min_deposit_units, 1_000_000);
+    assert.equal(clientd.fresh_slot_gas, 110_000);
     assert.equal(clientd.note_ttl_seconds, 2_592_000);
     assert.equal(clientd.max_pause_duration_seconds, 604_800);
     assert.equal(clientd.deployment_evidence.adapter_runtime_keccak256, finalized.adapterRuntimeCodehash);
@@ -310,14 +344,14 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
     for (const key of GASLESS_EVIDENCE_KEYS) assert.equal(clientd.deployment_evidence[key], null, key);
     assert.ok(clientd.limitations.includes(
         'The gasless withdrawal paymaster (ERC-4337) is not deployed with this vault; a withdrawal pays its own network fee from the signing address.'));
-    assert.throws(() => deploymentProfile(finalized, { ...services, deploymentId: 'zkapi-native-eth-sepolia-concession-v1',
+    assert.throws(() => deploymentProfile(finalized, { ...services, deploymentId: 'zkapi-native-eth-sepolia-concession-v2',
         bundlerUrl: 'https://bundler.example/rpc' }), /without the paymaster/);
     // The command line, in each format.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkapi-profile-'));
     const file = path.join(dir, 'deployment.json');
     fs.writeFileSync(file, JSON.stringify(finalized));
     const run = (...args) => spawnSync(process.execPath, [path.join(root, 'scripts/deployment-profile.mjs'), '--finalized', file,
-        '--deployment-id', 'zkapi-native-eth-sepolia-concession-v1', '--protocol-server-url', services.protocolServerUrl,
+        '--deployment-id', 'zkapi-native-eth-sepolia-concession-v2', '--protocol-server-url', services.protocolServerUrl,
         '--indexer-url', services.indexerUrl, '--verifier-url', services.verifierUrl, ...args], { encoding: 'utf8' });
     const trusted = run('--rpc-url', services.rpcUrl, '--price-feed', services.priceFeed, '--settlement-window-seconds', '14705');
     assert.equal(trusted.status, 0, trusted.stderr);
@@ -343,7 +377,7 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
 const GASLESS_KEYS = ['entry_point_address', 'entry_point_runtime_codehash', 'sender_creator_address', 'sender_creator_runtime_codehash',
     'withdrawal_paymaster_address', 'withdrawal_paymaster_runtime_codehash', 'withdrawal_account_factory_address',
     'withdrawal_account_factory_runtime_codehash', 'withdrawal_account_implementation_address',
-    'withdrawal_account_implementation_runtime_codehash', 'account_creation_code', 'account_creation_code_keccak256', 'bundler_url',
+    'withdrawal_account_implementation_runtime_codehash', 'account_creation_code', 'account_creation_code_keccak256', 'gas_schedule', 'bundler_url',
     'gas_policy', 'policy', 'fee_ceilings', 'uneconomic_fraction_percent'];
 const GASLESS_EVIDENCE_KEYS = ['entry_point_runtime_keccak256', 'sender_creator_runtime_keccak256', 'paymaster_runtime_keccak256',
     'factory_runtime_keccak256', 'account_implementation_runtime_keccak256'];
@@ -366,10 +400,10 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
     const implementation = '0xAbCd000000000000000000000000000000000006';
     const creation = accountCreationCode(implementation);
     const finalized = {
-        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 3, concessionEscapeVersion: 1,
+        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 4, concessionEscapeVersion: 1, leafBoundExitVersion: 1, minDeposit: 1_000_000,
         vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
         poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
-        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v2', setupId: 'dev', allowDevSetup: true,
         requestVkKeccak256: setup.vk_keccak256.request, withdrawalVkKeccak256: setup.vk_keccak256.withdrawal,
         vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
         challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800,
@@ -391,7 +425,7 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
         paymasterGasPolicy: gasPolicy,
     };
     const keyHashes = setupPins(setupDir, finalized);
-    const services = { deploymentId: 'zkapi-native-eth-sepolia-concession-v1', protocolServerUrl: 'https://api.example',
+    const services = { deploymentId: 'zkapi-native-eth-sepolia-concession-v2', protocolServerUrl: 'https://api.example',
         indexerUrl: 'https://indexer.example', rpcUrl: 'https://rpc.example', verifierUrl: 'https://verifier.example',
         priceFeed: '0x694AA1769357215DE4FAC081bf1f309aDC325306', settlementWindowSeconds: 14_705, keyHashes };
     const profile = deploymentProfile(finalized, { ...services, bundlerUrl: 'https://bundler.example/rpc' });
@@ -408,7 +442,7 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
     assert.equal(gasless.withdrawal_account_implementation_address, implementation.toLowerCase());
     assert.equal(gasless.withdrawal_account_implementation_runtime_codehash, finalized.accountImplementationRuntimeCodehash);
     assert.equal(gasless.account_creation_code, creation);
-    assert.match(gasless.account_creation_code, /^0x[0-9a-f]{148}$/);
+    assert.match(gasless.account_creation_code, /^0x[0-9a-f]{154}$/);
     assert.equal(gasless.account_creation_code_keccak256, finalized.accountCreationCodeKeccak256);
     assert.equal(gasless.bundler_url, 'https://bundler.example/rpc');
     const gp = gasless.gas_policy;
@@ -646,8 +680,8 @@ test('mini bundler: v0.7 packing and the user operation hash match the golden ve
         paymasterVerificationGasLimit: undefined, paymasterPostOpGasLimit: undefined };
     assert.equal(packUserOperation(plain).paymasterAndData, '0x');
     assert.equal(packUserOperation(plain).initCode, '0x');
-    assert.equal(bundleGas([op]), 642_500n + 180_000n + 50_000n + 430_000n + 270_000n + 300_000n);
-    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 642_500n + 180_000n + 50_000n);
+    assert.equal(bundleGas([op]), 402_500n + 150_000n + 50_000n + 370_000n + 270_000n + 300_000n);
+    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 402_500n + 150_000n + 50_000n);
 });
 
 test('mini bundler: refuses malformed operations by field', () => {
@@ -751,6 +785,10 @@ test('mini bundler: estimates answer the profile\'s pinned defaults by kind', as
     const finalize = withdraw(`0xff8f5585${word(9)}`);
     assert.equal(sponsoredKind(finalize), 3);
     assert.equal(vaultCallOf(finalize), `0xff8f5585${word(9)}`);
-    assert.equal(sponsoredKind(withdraw(`0xa38d62aa${'00'.repeat(832)}`)), 2);
+    assert.equal(sponsoredKind(withdraw(`0x8cd67c60${'00'.repeat(832)}`)), 2);
+    assert.equal(sponsoredKind(withdraw(`0xbce12a6c${'00'.repeat(832)}`)), 1);
+    // The revision-3 exits' selectors are no sponsored kind.
+    assert.equal(sponsoredKind(withdraw(`0xa38d62aa${'00'.repeat(832)}`)), null);
+    assert.equal(sponsoredKind(withdraw(`0x72cd2e44${'00'.repeat(832)}`)), null);
     assert.equal(vaultCallOf('0x12345678'), null);
 });

@@ -188,7 +188,7 @@ test('clearance, lease issuance and other /v2/ POST routes are limited', () => {
 });
 
 test('tree, health, attestation, static and internal routes are not limited or not proxied', () => {
-    for (const uri of ['/health', '/v1/attestation', '/v1/tree/root', '/v1/tree/notes/1/zero-path',
+    for (const uri of ['/health', '/v1/attestation', '/v1/tree/root', '/v1/tree/notes/1/path',
         '/config.json', '/proofs/request.pk', '/proofs/withdrawal.pk', '/proofs/manifest.json']) {
         assert.equal(all(selectLocation(uri).block, 'limit_req').length, 0, uri);
     }

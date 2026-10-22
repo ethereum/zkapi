@@ -60,3 +60,20 @@ func TestActiveModeStatusRequiresAuthenticationAndRejectsBrowserOrigins(t *testi
 		t.Fatal("network metadata depends on a funding handler", w.Body.String())
 	}
 }
+
+// The daemon reports the deployment its build serves, so a command from a
+// build pinning another deployment can refuse to attach.
+func TestActiveModeStatusReportsTheDeployment(t *testing.T) {
+	api, err := New(&fakeBackend{}, testKey, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.Status = ServiceStatus{Backend: "zkapi", Network: "sepolia", RequestBudgetPolicy: "model", DeploymentID: "zkapi-native-eth-sepolia-leaf-v4-20261020"}
+	r := httptest.NewRequest(http.MethodGet, "/admin/status", nil)
+	r.Header.Set("Authorization", "Bearer "+testKey)
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, r)
+	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"backend":"zkapi","network":"sepolia","request_budget_policy":"model","deployment_id":"zkapi-native-eth-sepolia-leaf-v4-20261020"}` {
+		t.Fatal("status did not report the deployment", w.Body.String())
+	}
+}

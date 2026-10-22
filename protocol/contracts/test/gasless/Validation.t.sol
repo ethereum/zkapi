@@ -11,6 +11,9 @@ import {ZkApiWithdrawalAccount} from "../../src/gasless/ZkApiWithdrawalAccount.s
 import {ZkApiWithdrawalPaymaster} from "../../src/gasless/ZkApiWithdrawalPaymaster.sol";
 import {MockAdapterIdentity} from "../mocks/MockProofAdapters.sol";
 import {GaslessTestBase} from "./GaslessTestBase.sol";
+import {NoteLeafLib} from "../../src/libraries/NoteLeafLib.sol";
+import {ReferenceHashes} from "../helpers/PoseidonRuntime.sol";
+import {VaultStorage} from "../helpers/VaultStorage.sol";
 
 /// @dev An account with code that is not a transit account: validates every operation.
 contract ForeignAccount {
@@ -34,6 +37,27 @@ contract RejectingWithdrawals is MockAdapterIdentity {
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {
         revert Errors.InvalidProof();
     }
+
+    function verifyWithdrawalOnce(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {
+        revert Errors.InvalidProof();
+    }
+}
+
+/// @dev An adapter of the shape before verifyWithdrawalOnce: no ERC-165, so the paymaster refuses it.
+contract AdapterWithoutVerifyOnce {
+    function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata, bytes calldata) external pure {}
+}
+
+/// @dev Answers every call with nothing: a supportsInterface that returns no word is refused too.
+contract SilentFallback {
+    fallback() external {}
+}
+
+/// @dev Reports ERC-165 itself but not IZkApiProofAdapter.
+contract OtherInterfaceAdapter {
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == 0x01ffc9a7;
+    }
 }
 
 /// @dev A vault whose versions and adapter the paymaster's constructor checks: only the getters
@@ -41,6 +65,8 @@ contract RejectingWithdrawals is MockAdapterIdentity {
 contract VersionedVault {
     uint16 public immutable PROTOCOL_VERSION;
     uint16 public immutable CONCESSION_ESCAPE_VERSION;
+    uint16 public immutable LEAF_BOUND_EXIT_VERSION;
+    uint128 public constant MAX_NATIVE_UNITS = 9_007_199_254_740_991;
     address public immutable proofAdapter;
     uint256 public constant nativeAssetWeiPerUnit = 1 gwei;
     uint256 public constant stateSigningKeyX = 11;
@@ -52,8 +78,15 @@ contract VersionedVault {
     constructor(uint16 protocolVersion, uint16 concessionVersion, address adapter_) {
         PROTOCOL_VERSION = protocolVersion;
         CONCESSION_ESCAPE_VERSION = concessionVersion;
+        LEAF_BOUND_EXIT_VERSION = 1;
         proofAdapter = adapter_;
     }
+}
+
+/// @dev A revision-3 vault: the concession exit without the leaf-bound version getter.
+contract RevisionThreeVault {
+    uint16 public constant PROTOCOL_VERSION = 2;
+    uint16 public constant CONCESSION_ESCAPE_VERSION = 1;
 }
 
 /// @dev Every refusal of validatePaymasterUserOp, one test per error selector, each shown to be
@@ -121,7 +154,8 @@ contract ValidationTest is GaslessTestBase {
             address(this),
             _defaultPolicy(),
             MAX_FEE_CEILING,
-            PRIORITY_CEILING
+            PRIORITY_CEILING,
+            ZkApiWithdrawalPaymaster.GasSchedule.Original
         );
     }
 
@@ -138,7 +172,8 @@ contract ValidationTest is GaslessTestBase {
     }
 
     /// The vault must speak protocol version 2 with concession escapes version 1 and name an
-    /// adapter with code, since validation re-runs the vault's checks and the adapter's proof.
+    /// adapter with code that reports IZkApiProofAdapter through ERC-165, since validation re-runs
+    /// the vault's checks and verifies the proof through the adapter's verifyWithdrawalOnce.
     function test_constructorRefusesABadVault() public {
         VersionedVault wrongProtocol = new VersionedVault(3, 1, address(adapter));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
@@ -146,9 +181,21 @@ contract ValidationTest is GaslessTestBase {
         VersionedVault wrongConcession = new VersionedVault(2, 2, address(adapter));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
         _deploy(ENTRY_POINT, address(wrongConcession));
+        // A revision-3 vault has no LEAF_BOUND_EXIT_VERSION: the call itself reverts.
+        RevisionThreeVault revisionThree = new RevisionThreeVault();
+        vm.expectRevert();
+        _deploy(ENTRY_POINT, address(revisionThree));
         VersionedVault codelessAdapter = new VersionedVault(2, 1, address(0x1234));
         vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
         _deploy(ENTRY_POINT, address(codelessAdapter));
+        address[3] memory unsupported = [
+            address(new AdapterWithoutVerifyOnce()), address(new SilentFallback()), address(new OtherInterfaceAdapter())
+        ];
+        for (uint256 i = 0; i < unsupported.length; ++i) {
+            VersionedVault legacy = new VersionedVault(2, 1, unsupported[i]);
+            vm.expectRevert(ZkApiWithdrawalPaymaster.BadVault.selector);
+            _deploy(ENTRY_POINT, address(legacy));
+        }
         // the same mock with the right versions and an adapter with code is accepted
         VersionedVault right = new VersionedVault(2, 1, address(adapter));
         ZkApiWithdrawalPaymaster p = _deploy(ENTRY_POINT, address(right));
@@ -503,19 +550,47 @@ contract ValidationTest is GaslessTestBase {
         assertTrue(ok, "closes resume");
     }
 
-    function test_unknownRoot() public {
+    /// The vault's leaf-bound checks run in validation, before the proof: a leaf that is not the
+    /// note's stored leaf, fields at or above 2^224, and a deposit above MAX_NATIVE_UNITS.
+    function test_noteLeafMismatch() public {
         (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
-        inputs.activeRoot += 1;
-        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.UnknownRoot.selector);
+        inputs.noteLeaf += 1;
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteLeafMismatch.selector);
+        // The fields of another (Active) note with this note's leaf.
+        (, Types.WithdrawalPublicInputs memory other,) = _closeReady();
+        inputs.noteLeaf -= 1;
+        inputs.noteFields = other.noteFields;
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteLeafMismatch.selector);
+    }
+
+    function test_invalidNoteFields() public {
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
+        inputs.noteFields += uint256(1) << 224;
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.InvalidNoteFields.selector);
+    }
+
+    function test_depositAboveTheUnitBound() public {
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
+        // casting to 'uint32' is safe because the fields are below 2^224
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 id = uint32(inputs.noteFields >> 192);
+        uint128 tooMuch = vault.MAX_NATIVE_UNITS() + 1;
+        inputs.noteFields = NoteLeafLib.pack(id, tooMuch, uint64(inputs.noteFields));
+        inputs.noteLeaf = ReferenceHashes.leafOfFields(noteData[id].commitment, inputs.noteFields);
+        VaultStorage.setNote(address(vault), id, inputs.noteLeaf, VaultStorage.ACTIVE);
+        _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.InvalidBalance.selector);
     }
 
     function test_noteNotActive() public {
         (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
+        // casting to 'uint32' is safe because the fields are below 2^224
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 id = uint32(inputs.noteFields >> 192);
         vm.prank(user);
-        vault.mutualClose(_close(inputs.noteId, 9, BIG), PROOF);
+        vault.mutualClose(_close(id, 9, BIG), PROOF);
         _refused(op, ZkApiWithdrawalPaymaster.NoteNotActive.selector);
         // a note that was never deposited
-        inputs.noteId = 7;
+        inputs.noteFields = NoteLeafLib.pack(7, BIG, 1);
         _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.NoteNotActive.selector);
     }
 
@@ -715,12 +790,12 @@ contract ValidationTest is GaslessTestBase {
 
     /// The adapter is consulted last: a refused proof is reported only when every cheap check passed.
     function test_adapterIsCalledLast() public {
+        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs, uint32 id) = _closeReady();
         vm.etch(address(adapter), address(new RejectingWithdrawals()).code);
-        (PackedUserOperation memory op, Types.WithdrawalPublicInputs memory inputs,) = _closeReady();
         _refused(op, Errors.InvalidProof.selector);
         inputs.kind = KIND_ESCAPE;
         _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.WrongKind.selector);
-        inputs = _closeTo(inputs.noteId, 1001, BIG + 1, op.sender);
+        inputs = _closeTo(id, 1001, BIG + 1, op.sender);
         _refused(_withInputs(op, inputs, false), ZkApiWithdrawalPaymaster.InvalidBalance.selector);
     }
 
@@ -801,16 +876,38 @@ contract ValidationTest is GaslessTestBase {
     // ------------------------------------------------------------------ ERC-7562 opcode audit
     // The audit itself (GaslessTestBase._audit) traces handleOps and checks every validation frame
     // but the EntryPoint's and the SenderCreator's; RealAdapter.t.sol runs it with the real adapter.
+    // The mock adapter records a verified exit as the real one does, so the first-use CLOSE and
+    // ESCAPE below audit the record at the sender's associated slot with initCode (STO-022).
 
     function test_opcodeAudit_firstUseClose() public {
         (PackedUserOperation memory op,,) = _closeReady();
-        _audit(op, true, false);
+        assertGt(op.initCode.length, 0, "first use");
+        _audit(op, true, false, true);
     }
 
     function test_opcodeAudit_escape() public {
         uint32 id = _bigNote(42);
         (PackedUserOperation memory op,) = _escapeOp(id, 2001, 2002, BIG - 2_000_000, 1_000_000);
-        _audit(op, true, false);
+        assertGt(op.initCode.length, 0, "first use");
+        _audit(op, true, false, true);
+        assertEq(auditEscapeLocks, 1, "the escape locks its sender in the paymaster's own storage");
+    }
+
+    /// An escape from a transit account that already exists (reused for its payee after an earlier
+    /// escape settled): no initCode, so the adapter's record is admitted by STO-021, and the escape
+    /// lock is the paymaster's own transient storage.
+    function test_opcodeAudit_escapeFromAnExistingAccount() public {
+        uint32 idA = _bigNote(42);
+        (PackedUserOperation memory first,) = _escapeOp(idA, 2001, 2002, BIG - 2_000_000, 1_000_000);
+        _handle(first);
+        vm.prank(challenger);
+        vault.challengeEscapeWithdrawal(idA, _evidence(2002, 100_000), PROOF);
+        uint32 idB = _bigNote(43);
+        (PackedUserOperation memory op,) = _escapeOp(idB, 3001, 3002, BIG - 2_000_000, 1_000_000);
+        assertEq(op.initCode.length, 0, "the account exists");
+        assertEq(op.sender, first.sender, "the same transit account");
+        _audit(op, false, false, true);
+        assertEq(auditEscapeLocks, 1, "the escape locks its sender");
     }
 
     function test_opcodeAudit_finalize() public {
@@ -818,13 +915,14 @@ contract ValidationTest is GaslessTestBase {
         (PackedUserOperation memory op,) = _escapeOp(id, 2001, 2002, BIG - 2_000_000, 1_000_000);
         _handle(op);
         vm.warp(_deadline(id));
-        _audit(_finalizeOp(id), false, false);
+        _audit(_finalizeOp(id), false, false, false);
+        assertEq(auditEscapeLocks, 0, "only an escape takes the lock");
     }
 
     function test_opcodeAudit_forward() public {
         address s = factory.createAccount(ownerAddr, payee);
         vm.deal(s, 0.05 ether);
         paymaster.allowForward(s);
-        _audit(_forwardOp(), false, true);
+        _audit(_forwardOp(), false, true, false);
     }
 }

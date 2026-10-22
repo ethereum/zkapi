@@ -28,8 +28,9 @@ func (p automaticDepositUI) Continue(ctx context.Context, question string) (bool
 	return true, nil
 }
 
-// Return principal in gwei, excluding the additional deposit fee reserve.
-func recommendedDeposit(modelUnits uint64, feeWei string) (uint64, error) {
+// Return principal in gwei, excluding the additional deposit fee reserve,
+// and at least the vault's minimum deposit.
+func recommendedDeposit(modelUnits uint64, feeWei string, minimum uint64) (uint64, error) {
 	fee, ok := new(big.Int).SetString(feeWei, 10)
 	if !ok || fee.Sign() < 0 || fee.BitLen() > 256 || modelUnits == 0 {
 		return 0, errors.New("invalid deposit recommendation inputs")
@@ -39,6 +40,9 @@ func recommendedDeposit(modelUnits uint64, feeWei string) (uint64, error) {
 	model := new(big.Int).Mul(new(big.Int).SetUint64(modelUnits), big.NewInt(3))
 	if model.Cmp(gas) > 0 {
 		gas = model
+	}
+	if floor := new(big.Int).SetUint64(minimum); floor.Cmp(gas) > 0 {
+		gas = floor
 	}
 	if !gas.IsUint64() || gas.Sign() == 0 || gas.Uint64() > 1_000_000_000_000 {
 		return 0, errors.New("recommended deposit exceeds supported limit; stopped without approval")
@@ -62,6 +66,7 @@ func ensureServeFunding(ctx context.Context, c config.Config, _, _ string, ui se
 type fundingBudgetSource interface {
 	ModelRequestBudget(context.Context, string) (uint64, error)
 	NativeUSDQuote(context.Context) (zkapi.NativeUSDQuote, error)
+	MinimumDeposit() (uint64, error)
 }
 
 func serveFunding(ctx context.Context, service guidedFundingService, wallet fundingBudgetSource, ui setupPrompter) error {
@@ -123,12 +128,17 @@ func serveFunding(ctx context.Context, service guidedFundingService, wallet fund
 		if e != nil {
 			return e
 		}
+		// The vault refuses deposits below its minimum (min_deposit_units).
+		minimum, e := wallet.MinimumDeposit()
+		if e != nil {
+			return e
+		}
 		// The first unsigned quote supplies the live gas estimate. No signing occurs.
-		quote, err = service.Quote(ctx, units, 0)
+		quote, err = service.Quote(ctx, max(units, minimum), 0)
 		if err != nil {
 			return err
 		}
-		amount, e := recommendedDeposit(units, quote.ExpectedFeeWei)
+		amount, e := recommendedDeposit(units, quote.ExpectedFeeWei, minimum)
 		if e != nil {
 			return e
 		}
@@ -137,7 +147,7 @@ func serveFunding(ctx context.Context, service guidedFundingService, wallet fund
 			return errors.New("quote changed recommended principal; stopped without approval")
 		}
 		if err == nil {
-			ui.Printf("Recommended minimum: max(3 × $%s query cap converted at the current ETH price, 10 × estimated deposit gas). Minimum spending balance: %s ETH; network fees are extra.\n", setupUSD(budget), fundingUnits(quote.PrincipalWei, 18))
+			ui.Printf("Recommended minimum: max(3 × $%s query cap converted at the current ETH price, 10 × estimated deposit gas, the vault's minimum deposit). Minimum spending balance: %s ETH; network fees are extra.\n", setupUSD(budget), fundingUnits(quote.PrincipalWei, 18))
 		}
 	}
 	if err != nil {

@@ -69,7 +69,7 @@ fn genesis(secret: u64, note_id: u32) -> BrowserNoteState {
 fn tree_for(state: &BrowserNoteState) -> MerkleTree {
     let mut tree = MerkleTree::new();
     tree.set_leaf(state.note_id - 1, Felt252::from_u64(7));
-    tree.set_leaf(state.note_id, state_note_leaf(state));
+    tree.set_leaf(state.note_id, note_leaf(state));
     tree.set_leaf(state.note_id + 1, Felt252::from_u64(8));
     tree
 }
@@ -85,14 +85,12 @@ fn request_args(tree: &MerkleTree, note_id: u32, id: &str) -> PrepareRequestArgs
     }
 }
 
-fn withdrawal_args(tree: &MerkleTree, note_id: u32, mode: &str) -> PrepareWithdrawalArgs {
+fn withdrawal_args(mode: &str) -> PrepareWithdrawalArgs {
     PrepareWithdrawalArgs {
         mode: mode.into(),
         destination: (mode != "ownership").then(|| DESTINATION.to_string()),
         conceded: (mode == "escape").then_some(0),
         valid_until: VALID_UNTIL,
-        active_root: tree.root(),
-        merkle_siblings: tree.get_siblings(note_id).to_vec(),
         clearance: None,
     }
 }
@@ -520,7 +518,7 @@ fn requests_and_exits_follow_the_anchor_chain() {
         &at_genesis,
         PrepareWithdrawalArgs {
             conceded: Some(100),
-            ..withdrawal_args(&tree, NOTE_ID, "escape")
+            ..withdrawal_args("escape")
         },
         withdrawal_prover(),
     )
@@ -539,6 +537,12 @@ fn requests_and_exits_follow_the_anchor_chain() {
     assert_eq!(inputs.withdrawal_nullifier, prepared.journal.nullifier);
     assert_eq!(inputs.next_nullifier, successor_nullifier(&at_genesis));
     assert_eq!(inputs.destination, [0x11; 20]);
+    // The statement binds the note's leaf and fields, not a root.
+    assert_eq!(inputs.note_leaf, note_leaf(&at_genesis));
+    assert_eq!(
+        (inputs.note_id, inputs.deposit_amount, inputs.expiry_ts),
+        (NOTE_ID, DEPOSIT, EXPIRY)
+    );
 
     // The operator signs the successor at next_anchor(N_0); it installs, and
     // its request spends exactly the escape's next_nullifier (the defeat
@@ -588,7 +592,7 @@ fn requests_and_exits_follow_the_anchor_chain() {
     let exit = prepare_withdrawal_with_prover(
         &config(),
         &without_prev,
-        withdrawal_args(&tree, NOTE_ID, "escape"),
+        withdrawal_args("escape"),
         withdrawal_prover(),
     )
     .unwrap();
@@ -605,7 +609,7 @@ fn requests_and_exits_follow_the_anchor_chain() {
     let ownership = prepare_withdrawal_with_prover(
         &config(),
         &signed,
-        withdrawal_args(&tree, NOTE_ID, "ownership"),
+        withdrawal_args("ownership"),
         withdrawal_prover(),
     )
     .unwrap();
@@ -633,7 +637,7 @@ fn requests_and_exits_follow_the_anchor_chain() {
         &signed,
         PrepareWithdrawalArgs {
             clearance: Some(clearance),
-            ..withdrawal_args(&tree, NOTE_ID, "mutual")
+            ..withdrawal_args("mutual")
         },
         withdrawal_prover(),
     )
@@ -654,11 +658,10 @@ fn requests_and_exits_follow_the_anchor_chain() {
 #[test]
 fn withdrawal_arguments_are_checked_before_proving() {
     let state = with_bound(&installed_successor(100, 10), 40);
-    let tree = tree_for(&state);
     let prove = |args: PrepareWithdrawalArgs| {
         prepare_withdrawal_with_prover(&config(), &state, args, withdrawal_prover())
     };
-    let escape = || withdrawal_args(&tree, NOTE_ID, "escape");
+    let escape = || withdrawal_args("escape");
     assert_refused(
         prove(PrepareWithdrawalArgs {
             conceded: Some(41),
@@ -706,13 +709,6 @@ fn withdrawal_arguments_are_checked_before_proving() {
         }),
         codes::WITHDRAWAL_ARGS,
     );
-    assert_refused(
-        prove(PrepareWithdrawalArgs {
-            active_root: Felt252::from_u64(1),
-            ..escape()
-        }),
-        codes::MERKLE_PATH_MISMATCH,
-    );
     // A fresh state (bound 0) may only escape with c = 0.
     let fresh = BrowserNoteState {
         bound_at_state: 0,
@@ -733,7 +729,7 @@ fn withdrawal_arguments_are_checked_before_proving() {
 
     let mutual = || PrepareWithdrawalArgs {
         clearance: Some(clearance.clone()),
-        ..withdrawal_args(&tree, NOTE_ID, "mutual")
+        ..withdrawal_args("mutual")
     };
     assert_refused(
         prove(PrepareWithdrawalArgs {
@@ -778,7 +774,7 @@ fn withdrawal_arguments_are_checked_before_proving() {
         codes::CLEARANCE_INVALID,
     );
 
-    let ownership = || withdrawal_args(&tree, NOTE_ID, "ownership");
+    let ownership = || withdrawal_args("ownership");
     assert_refused(
         prove(PrepareWithdrawalArgs {
             destination: Some(DESTINATION.into()),
@@ -800,14 +796,28 @@ fn withdrawal_arguments_are_checked_before_proving() {
         }),
         codes::WITHDRAWAL_ARGS,
     );
-    // Stale callers that still send the note-bound fields are refused.
-    assert!(
-        serde_json::from_value::<PrepareWithdrawalArgs>(serde_json::json!({
-            "mode": "escape", "destination": DESTINATION, "conceded": 0, "valid_until": 1,
-            "active_root": "0x1", "merkle_siblings": [], "has_clearance": false
-        }))
-        .is_err()
-    );
+    // Stale callers that still send fields of earlier builds are refused:
+    // the path and root (an exit needs neither since vault revision 4) and
+    // the old clearance flag, each on its own.
+    let current = serde_json::json!({
+        "mode": "escape", "destination": DESTINATION, "conceded": 0, "valid_until": 1
+    });
+    assert!(serde_json::from_value::<PrepareWithdrawalArgs>(current.clone()).is_ok());
+    for (field, value) in [
+        ("active_root", serde_json::json!("0x1")),
+        (
+            "merkle_siblings",
+            serde_json::json!(vec!["0x0"; MERKLE_DEPTH]),
+        ),
+        ("has_clearance", serde_json::json!(false)),
+    ] {
+        let mut stale = current.clone();
+        stale[field] = value;
+        let error = serde_json::from_value::<PrepareWithdrawalArgs>(stale)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(field), "{error}");
+    }
 }
 
 #[test]
@@ -930,7 +940,48 @@ fn the_rebuilt_tree_matches_the_vault_tree_after_every_event() {
         tree_path_from_leaves(leaves.clone(), 2),
         codes::TREE_EVENT_INVALID,
     );
-    assert_refused(tree_path_from_leaves(leaves, 6), codes::TREE_EVENT_INVALID);
+    assert_refused(
+        tree_path_from_leaves(leaves.clone(), 6),
+        codes::TREE_EVENT_INVALID,
+    );
+
+    // The state form: the vault's noteLeaves, nextNoteId() and currentRoot()
+    // at one block hash give the same tree, which then follows later logs.
+    let snapshot = TreeSnapshot {
+        root: reference.root(),
+        next_note_id: 6,
+        leaves: leaves.clone(),
+    };
+    let mut from_state = NoteTree::from_state(snapshot.clone()).unwrap();
+    assert_eq!(from_state.root(), rebuilt.root());
+    assert_eq!(from_state.next_note_id(), 6);
+    assert_eq!(from_state.path(4).unwrap(), path);
+    assert_refused(from_state.path(2), codes::TREE_EVENT_INVALID);
+    assert_refused(
+        from_state.apply(&TreeEvent::ClosedLeafRetired { note_id: 2 }),
+        codes::TREE_EVENT_INVALID,
+    );
+    let next = from_state.apply(&deposit(6)).unwrap();
+    assert_eq!(next, rebuilt.apply(&deposit(6)).unwrap());
+    // Leaves of another block (a stale page), a wrong count or a wrong root
+    // are refused.
+    let mut stale = snapshot.clone();
+    stale.leaves[2] = reference.get_leaf(1);
+    assert_refused(NoteTree::from_state(stale), codes::TREE_ROOT_MISMATCH);
+    let mut short = snapshot.clone();
+    short.leaves.pop();
+    assert_refused(NoteTree::from_state(short), codes::TREE_ROOT_MISMATCH);
+    let mut wrong_root = snapshot.clone();
+    wrong_root.root = Felt252::from_u64(5);
+    assert_refused(NoteTree::from_state(wrong_root), codes::TREE_ROOT_MISMATCH);
+    // An empty vault.
+    let empty = NoteTree::from_state(TreeSnapshot {
+        root: MerkleTree::new().root(),
+        next_note_id: 0,
+        leaves: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(empty.next_note_id(), 0);
 
     // Events travel as JSON with string amounts.
     let event: TreeEvent = serde_json::from_value(serde_json::json!({
@@ -1021,39 +1072,234 @@ fn a_lost_journal_response_is_checked_against_s1_s2_s4_and_s6() {
     );
 }
 
+/// The shared exit vectors (`exit_inputs` in zkapi-client's
+/// `tests/vectors/exit-rules.json`), which the SDK and Go clients load too.
+fn exit_inputs() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../zkapi-client/tests/vectors/exit-rules.json");
+    let vectors: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    vectors["exit_inputs"].clone()
+}
+
 #[test]
-fn a_saved_path_is_kept_only_if_it_leads_to_its_root() {
-    let state = genesis(42, NOTE_ID);
-    let tree = tree_for(&state);
-    let path = |root: Felt252| NotePathArgs {
-        active_root: root,
-        siblings: tree.get_siblings(NOTE_ID).to_vec(),
-    };
-    assert!(note_path_matches(&state, path(tree.root())).unwrap());
-    // Another root, another note or another deposit amount does not match.
-    assert!(!note_path_matches(&state, path(Felt252::from_u64(5))).unwrap());
-    assert!(!note_path_matches(&genesis(42, NOTE_ID + 1), path(tree.root())).unwrap());
-    // The deposit-time path stays valid while later deposits append leaves:
-    // the vault keeps every root it held (Amendment A1).
-    let mut later = tree.clone();
-    later.set_leaf(NOTE_ID + 5, Felt252::from_u64(9));
-    assert_ne!(later.root(), tree.root());
-    assert!(note_path_matches(&state, path(tree.root())).unwrap());
-    assert!(note_path_matches(
-        &state,
-        NotePathArgs {
-            active_root: later.root(),
-            siblings: later.get_siblings(NOTE_ID).to_vec(),
-        }
+fn note_leaves_match_the_shared_vectors() {
+    let inputs = exit_inputs();
+    for case in inputs["leaf"].as_array().unwrap() {
+        let text = |field: &str| case[field].as_str().unwrap().to_string();
+        let note_id = case["note_id"].as_u64().unwrap() as u32;
+        let expected = Felt252::from_hex(&text("note_leaf")).unwrap();
+        assert_eq!(
+            note_leaf_from_fields(
+                note_id,
+                &text("registration"),
+                &text("deposit_amount"),
+                &text("expiry_ts"),
+            )
+            .unwrap(),
+            expected,
+            "{}",
+            text("name")
+        );
+        // Hex amounts and expiries are accepted too.
+        let hex = |field: &str| format!("0x{:x}", text(field).parse::<u128>().unwrap());
+        assert_eq!(
+            note_leaf_from_fields(
+                note_id,
+                &text("registration"),
+                &hex("deposit_amount"),
+                &hex("expiry_ts"),
+            )
+            .unwrap(),
+            expected
+        );
+        // The state's leaf: the same formula from the secret.
+        let state = confirm_deposit(
+            &config(),
+            ConfirmDepositArgs {
+                secret: Felt252::from_hex(&text("secret")).unwrap(),
+                note_id,
+                amount: text("deposit_amount").parse().unwrap(),
+                expiry_ts: text("expiry_ts").parse().unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(note_leaf(&state), expected);
+    }
+
+    // The design C vector, spelled out.
+    assert_eq!(
+        note_leaf_from_fields(
+            7,
+            "0x26538304fc53474b13823162f0b9667c1538c7360828d3a1a2e8ffa019a2f8cc",
+            "5000000",
+            "4000000000",
+        )
+        .unwrap()
+        .to_hex(),
+        "0x1698e82280376fc3506cb7ebf7278db1764d0183aea5fd4d3b475c644b61395f"
+    );
+    let commitment = "0x26538304fc53474b13823162f0b9667c1538c7360828d3a1a2e8ffa019a2f8cc";
+    for (commitment, amount, expiry) in [
+        ("0xzz", "1", "1"),
+        ("", "1", "1"),
+        ("0x", "1", "1"),
+        // At or above the field modulus.
+        (
+            "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001",
+            "1",
+            "1",
+        ),
+        (commitment, "-1", "1"),
+        (commitment, "1.5", "1"),
+        (commitment, "340282366920938463463374607431768211456", "1"),
+        (commitment, "1", "18446744073709551616"),
+        (commitment, "1", ""),
+    ] {
+        assert_refused(
+            note_leaf_from_fields(7, commitment, amount, expiry),
+            codes::NOTE_FIELDS_INVALID,
+        );
+    }
+}
+
+/// Vault revision 4: an exit takes no path or root. Its statement binds the
+/// note's leaf, and the arguments of earlier builds are refused.
+#[test]
+fn exits_bind_the_note_leaf_and_need_no_path() {
+    let inputs = exit_inputs();
+    assert_eq!(inputs["needs_merkle_path"], false);
+    let state = confirm_deposit(
+        &config(),
+        ConfirmDepositArgs {
+            secret: Felt252::from_u64(42),
+            note_id: 7,
+            amount: 5_000_000,
+            expiry_ts: 4_000_000_000,
+        },
     )
-    .unwrap());
-    // A path of the wrong depth is an error, not a mismatch.
-    assert!(note_path_matches(
+    .unwrap();
+    let plan = prepare_withdrawal_with_prover(
+        &config(),
         &state,
-        NotePathArgs {
-            active_root: tree.root(),
-            siblings: vec![Felt252::ZERO; 31],
-        }
+        withdrawal_args("ownership"),
+        withdrawal_prover(),
     )
-    .is_err());
+    .unwrap();
+    let public = &plan.public_inputs;
+    assert_eq!(
+        public.note_leaf.to_hex(),
+        inputs["leaf"][0]["note_leaf"].as_str().unwrap()
+    );
+    assert_eq!(public.note_leaf, note_leaf(&state));
+    assert_eq!(
+        (public.note_id, public.deposit_amount, public.expiry_ts),
+        (7, 5_000_000, 4_000_000_000)
+    );
+    assert!(WithdrawalVerifier::load(setup_dir())
+        .unwrap()
+        .verify(public, &plan.proof)
+        .unwrap());
+    let statement = serde_json::to_value(public).unwrap();
+    let fields: Vec<&str> = statement
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut expected: Vec<&str> = inputs["statement_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect();
+    let mut sorted = fields.clone();
+    sorted.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(sorted, expected);
+
+    let args = serde_json::to_value(withdrawal_args("escape")).unwrap();
+    for field in inputs["refused_fields"].as_array().unwrap() {
+        let mut stale = args.clone();
+        stale[field.as_str().unwrap()] = serde_json::json!("0x1");
+        assert!(
+            serde_json::from_value::<PrepareWithdrawalArgs>(stale).is_err(),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn the_bundle_is_for_the_leaf_bound_circuit() {
+    assert_eq!(CIRCUIT_ID, "zkapi-v2-concession-v2");
+}
+
+/// The WebAssembly exports this crate declares (the module only builds for
+/// wasm32), as wasm-bindgen names them: free functions by name, methods as
+/// `<struct lowercased>_<method>`, constructors as `<struct>_new`. The SDK's
+/// export-list test (sdk/test/browser-wallet-artifacts.test.mjs) checks the
+/// built bundle against the same list.
+#[test]
+fn the_wasm_exports_are_the_wallet_operations() {
+    let source = include_str!("lib.rs");
+    let module = &source[source.find("mod wasm {").unwrap()..];
+    let mut exports = Vec::new();
+    // Items of the module are indented by 4 spaces, methods by 8.
+    let mut attribute = "";
+    let mut exported_impl: Option<String> = None;
+    for line in module.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let text = line.trim();
+        if indent == 4 {
+            if text.starts_with("#[") {
+                attribute = text;
+                continue;
+            }
+            if text.starts_with("///") {
+                continue;
+            }
+            if let Some(rest) = text.strip_prefix("impl ") {
+                exported_impl = (attribute == "#[wasm_bindgen]")
+                    .then(|| rest.trim_end_matches(" {").to_lowercase());
+            } else if let Some(rest) = text.strip_prefix("pub fn ") {
+                if attribute == "#[wasm_bindgen]" {
+                    exports.push(rest.split('(').next().unwrap().to_string());
+                }
+                exported_impl = None;
+            }
+            attribute = "";
+        } else if indent == 8 {
+            if let (Some(owner), Some(rest)) = (&exported_impl, text.strip_prefix("pub fn ")) {
+                exports.push(format!("{owner}_{}", rest.split('(').next().unwrap()));
+            }
+        }
+    }
+    exports.sort();
+    let mut expected = vec![
+        "browser_circuit_id",
+        "browser_setup_id",
+        "browser_generate_deposit",
+        "browser_confirm_deposit",
+        "browser_wallet_status",
+        "browser_tree_path",
+        "browser_tree_path_from_leaves",
+        "browser_prepare_request",
+        "browserrequestprover_new",
+        "browserrequestprover_prepare_request",
+        "browser_complete_response",
+        "browser_withdrawal_nullifier",
+        "browser_successor_nullifier",
+        "browser_note_leaf",
+        "browser_note_leaf_from_fields",
+        "browser_prepare_withdrawal",
+        "browser_verify_request",
+        "browser_check_unrecoverable_response",
+        "browsernotetree_new",
+        "browsernotetree_from_state",
+        "browsernotetree_apply",
+        "browsernotetree_root",
+        "browsernotetree_next_note_id",
+        "browsernotetree_path",
+    ];
+    expected.sort_unstable();
+    assert_eq!(exports, expected);
 }

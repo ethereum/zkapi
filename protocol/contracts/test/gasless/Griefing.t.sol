@@ -272,6 +272,79 @@ contract GriefingTest is GaslessTestBase {
         assertEq(uint256(_status(id2)), uint256(Types.NoteStatus.Closed));
     }
 
+    /// FINDING (fixed; the gasless multi-exit review's test_finding_headTwoEscapesOneSender): two
+    /// sponsored escapes of different notes from one transit account in one bundle, which ERC-7562
+    /// lets a bundler include. Both passed the one-open-escape check, since escapeNotePlusOne is
+    /// written in postOp after the whole bundle is validated, both were sponsored, and the second
+    /// record overwrote the first escape's FORWARD evidence. The per-S escape lock now refuses the
+    /// second in validation: the bundle fails (the bundler pays), nothing is counted or recorded,
+    /// either escape alone is sponsored, and the other then waits for it (EscapeEvidencePending).
+    function test_finding_headTwoEscapesOneSender() public {
+        address s = factory.createAccount(ownerAddr, payee);
+        uint32 idA = _bigNote(42);
+        uint32 idB = _bigNote(43);
+        (PackedUserOperation memory a,) = _escapeOp(idA, 2001, 2002, BIG - 2_000_000, 1_000_000);
+        (PackedUserOperation memory b,) = _escapeOp(idB, 3001, 3002, BIG - 2_000_000, 1_000_000);
+        assertEq(a.sender, s, "one transit account");
+        assertEq(b.sender, s, "one transit account");
+        bytes32 escapeLock = keccak256(abi.encode(bytes32("transit-escape"), s));
+        uint256 depositBefore = entryPoint.balanceOf(address(paymaster));
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](2);
+        ops[0] = a;
+        ops[1] = b;
+        (bool ok, bytes memory data) = _tryHandleOps(ops);
+        assertFalse(ok, "the bundle fails validation");
+        assertEq(bytes4(data), IEntryPoint.FailedOpWithRevert.selector);
+        (uint256 opIndex, string memory reason, bytes memory inner) = abi.decode(_body(data), (uint256, string, bytes));
+        assertEq(opIndex, 1, "the second escape is refused");
+        assertEq(reason, "AA33 reverted");
+        assertEq(inner, abi.encodeWithSelector(ZkApiWithdrawalPaymaster.SponsorshipInFlight.selector, escapeLock));
+        assertEq(entryPoint.balanceOf(address(paymaster)), depositBefore, "uncharged");
+        assertEq(paymaster.attempts(_escapeKey(idA)), 0, "nothing counted");
+        assertEq(paymaster.attempts(_escapeKey(idB)), 0, "nothing counted");
+        assertFalse(paymaster.escapeSponsored(idA));
+        assertFalse(paymaster.escapeSponsored(idB));
+        assertEq(paymaster.escapeNotePlusOne(s), 0, "nothing recorded");
+        assertEq(uint256(_status(idA)), uint256(Types.NoteStatus.Active));
+        assertEq(uint256(_status(idB)), uint256(Types.NoteStatus.Active));
+
+        // Alone, the first escape is sponsored and recorded, and the lock is released in postOp:
+        // the second escape is now refused by the record it would overwrite, not by the lock.
+        Vm.Log[] memory logs = _handle(a);
+        (bool success,,) = _userOpEvent(logs);
+        assertTrue(success, "alone, the escape is sponsored");
+        assertEq(paymaster.escapeNotePlusOne(s), uint256(idA) + 1, "the first escape's evidence");
+        (b,) = _escapeOp(idB, 3001, 3002, BIG - 2_000_000, 1_000_000);
+        inner = _refused(b, ZkApiWithdrawalPaymaster.EscapeEvidencePending.selector);
+        assertEq(inner, abi.encodeWithSelector(ZkApiWithdrawalPaymaster.EscapeEvidencePending.selector, idA));
+        assertEq(paymaster.escapeNotePlusOne(s), uint256(idA) + 1, "the evidence stands");
+    }
+
+    /// The escape lock is per transit account: escapes of two notes from two transit accounts share
+    /// a bundle, and an escape and a close from one transit account do too.
+    function test_escapeLockIsPerTransitAccount() public {
+        address payee2 = address(0x9A7EF);
+        uint32 idA = _bigNote(42);
+        uint32 idB = _bigNote(43);
+        uint32 idC = _bigNote(44);
+        factory.createAccount(ownerAddr, payee);
+        (PackedUserOperation memory a,) = _escapeOp(idA, 2001, 2002, BIG - 2_000_000, 1_000_000);
+        (PackedUserOperation memory b,) = _escapeOpFor(payee2, idB, 3001, 3002, BIG - 2_000_000, 1_000_000);
+        (PackedUserOperation memory c,) = _closeOp(idC, 4001, BIG - 1_000_000);
+        assertTrue(a.sender != b.sender, "two transit accounts");
+        assertEq(a.sender, c.sender, "the escape and the close share one");
+        PackedUserOperation[] memory ops = new PackedUserOperation[](3);
+        ops[0] = a;
+        ops[1] = b;
+        ops[2] = c;
+        Vm.Log[] memory logs = _handleOps(ops);
+        assertEq(_count(logs, address(paymaster), ZkApiWithdrawalPaymaster.Settled.selector), 3, "all settled");
+        assertEq(paymaster.escapeNotePlusOne(a.sender), uint256(idA) + 1);
+        assertEq(paymaster.escapeNotePlusOne(b.sender), uint256(idB) + 1);
+        assertEq(uint256(_status(idC)), uint256(Types.NoteStatus.Closed));
+    }
+
     /// Two notes of one transit account, closed in one bundle: each sponsorship is counted for
     /// the sender separately, so both forward, settle and pay the payee.
     function test_twoNotesOfOneAccountInOneBundle() public {
@@ -612,7 +685,13 @@ contract GriefingTest is GaslessTestBase {
         assertEq(info.unstakeDelaySec, UNSTAKE_DELAY / 2);
         // A fresh paymaster and its factory: nobody can pick their delay before the owner does.
         ZkApiWithdrawalPaymaster fresh = new ZkApiWithdrawalPaymaster(
-            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
+            entryPoint,
+            vault,
+            address(this),
+            _defaultPolicy(),
+            MAX_FEE_CEILING,
+            PRIORITY_CEILING,
+            ZkApiWithdrawalPaymaster.GasSchedule.Original
         );
         ZkApiWithdrawalAccountFactory freshFactory = fresh.factory();
         vm.prank(user);

@@ -30,9 +30,10 @@ async function wallet(deposits, runtimeValue = {}) {
         }
         return call(operation, payload);
     };
-    h.runtime.nextDepositPath = async root => {
-        paths.push(root);
-        return { note_id: 3, active_root: `0x${root || 1}`, siblings: Array(32).fill('0x0') };
+    // The vault's nextNoteId(), the note id a deposit sent now expects.
+    h.runtime.nextDepositNoteId = async () => {
+        paths.push('nextNoteId');
+        return 3 + paths.length;
     };
     h.runtime.prewarmRequestProver = async () => {};
     await store.writeBrowserWallet({ deploymentId: DEPLOYMENT, billingAsset: 'native_eth', ...runtimeValue });
@@ -41,12 +42,11 @@ async function wallet(deposits, runtimeValue = {}) {
 }
 
 const preparedDeposit = (changes = {}) => ({ operationId: 'before-cutoff', createdAt: 1, phase: 'prepared', amount: 123,
-    secret: 'secret-before-cutoff', commitment: '0xc0', next_note_id: 3, active_root: '0x1',
-    zero_path: Array(32).fill('0x0'), ...changes });
+    secret: 'secret-before-cutoff', commitment: '0xc0', next_note_id: 3, ...changes });
 
 test('a closed deployment refuses to quote or prepare a new deposit before any note secret exists', async () => {
     const h = await wallet('closed');
-    for (const attempt of [() => h.runtime.prepareDepositQuote(123, 1n), () => h.runtime.prepareDeposit(123)]) {
+    for (const attempt of [() => h.runtime.prepareDepositQuote(123), () => h.runtime.prepareDeposit(123)]) {
         await assert.rejects(attempt(), error => {
             assert.equal(error.code, 'deposits_closed');
             assert.equal(error.status, 409);
@@ -55,14 +55,14 @@ test('a closed deployment refuses to quote or prepare a new deposit before any n
         });
     }
     assert.deepEqual(h.generated, [], 'no note secret is generated');
-    assert.deepEqual(h.paths, [], 'no deposit path is fetched');
+    assert.deepEqual(h.paths, [], 'not even the next note id is read');
     const saved = await store.readBrowserWallet();
     assert.equal(saved.pendingDeposit, null);
     assert.equal(saved.depositQuote, null);
     assert.equal(h.runtime.snapshot().config.deposits, 'closed');
 
     const open = await wallet(undefined);
-    await open.runtime.prepareDepositQuote(123, 1n);
+    await open.runtime.prepareDepositQuote(123);
     assert.equal(open.generated.length, 1);
     assert.equal(open.runtime.snapshot().config.deposits, 'open');
 });
@@ -88,8 +88,8 @@ test('a pending deposit from before the cutoff stays tracked, completable and re
     // Never signed: its secret is durable, so it can still be sent and confirmed.
     const h = await wallet('closed', { pendingDeposit: preparedDeposit() });
     assert.equal((await h.runtime.prepareDeposit(123)).operationId, 'before-cutoff');
-    const refreshed = await h.runtime.refreshPendingDeposit(123, 2n, { expectedOperationId: 'before-cutoff' });
-    assert.equal(refreshed.active_root, '0x2');
+    const refreshed = await h.runtime.refreshPendingDeposit(123, { expectedOperationId: 'before-cutoff' });
+    assert.equal(refreshed.next_note_id, 4, 'rebased onto the vault\'s next note id');
     assert.equal(refreshed.secret, 'secret-before-cutoff');
     const claim = await h.runtime.claimPendingDepositSubmission('before-cutoff');
     assert.equal(claim.status, 'claimed');

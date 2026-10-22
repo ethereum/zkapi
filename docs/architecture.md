@@ -5,7 +5,7 @@ Host app -> browser SDK -> zkAPI server (proof-backed lease authorization)
                    |                  -> OA org/station or direct key management
                    |-> inference provider (prompts/responses)
                    |-> Ethereum native ETH vault
-                   |-> indexer (current Merkle root and paths)
+                   |-> indexer (request-tree Merkle paths; exits need none)
                    |-> ERC-4337 bundler -> EntryPoint v0.7.0 -> transit account -> vault (withdrawals that pay their gas from the payout;
                                                                         the withdrawal paymaster sponsors and settles)
 
@@ -25,8 +25,12 @@ saved quote. Exact retries preserve the original proof and quote. See
 [native billing](native-eth-billing.md) for rounding and recovery rules.
 
 The indexer mirrors deposits and leaf retirements (the tree is append-only
-otherwise), records every root and every published nullifier, and serves only
-a view it has verified against the vault's root and next note ID. The
+otherwise), keeps each note's leaf and deposit preimage and every published
+nullifier, and serves only a view it has verified against the vault's computed
+`currentRoot()` and next note ID. The server admits requests at roots it read
+from the vault itself (within `request_root_grace_seconds` across additions
+only); a changed `retirementEpoch()` discards all historical roots. The indexer's
+root is only a health signal there. The
 challenger defeats an escape with a verified request proof at its successor
 nullifier, raises an under-conceded escape with the request at its nullifier,
 retires a closed note's leaf after a missed defeat, and retries through
@@ -42,9 +46,14 @@ unreadable saved request with the reopen command
 ([settlement terminality](native-eth-billing.md#settlement-terminality)). Owners
 recover signed states from the API server; an exit never needs it. Mutual
 close sends the server a kind-2 ownership proof of the note, which cannot
-start an escape, before it signs a clearance. An escape needs no operator:
-its Merkle path comes from the deposit, the indexer or the vault's logs, and
-it concedes at most the state's request budget. The vault owner can pause
+start an escape, before it signs a clearance; the server checks the proof's
+note leaf against the vault's `noteRecord`. An escape needs no operator, and
+no exit needs a Merkle path, root, indexer or log scan: the withdrawal proof
+names the note's leaf, which the vault stores. An escape concedes at most the
+state's request budget. Because the exit takes the deposit from the
+proof-bound note fields, a broken verifier or setup could drain the vault in
+one transaction
+([Amendment A3](design/concession-exit.md#amendment-a3-leaf-bound-exits)). The vault owner can pause
 exits for at most `maxPauseDuration` and schedule time-locked treasury
 changes; a pause cannot move funds or expire notes. See
 [owner and operator powers](../docs-site/content/docs/protocol.mdx#owner-and-operator-powers)

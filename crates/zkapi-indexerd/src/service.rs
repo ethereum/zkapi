@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use zkapi_types::Felt252;
 
-use crate::tree_mirror::{EscapeClose, PendingEscape, TreeMirror};
+use crate::tree_mirror::{EscapeClose, NotePreimage, NoteStatus, PendingEscape, TreeMirror};
 
 /// Indexer status as reported on `/health` and `/metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,7 +260,7 @@ impl IndexerService {
                 .saturating_add(state.missed_re_escapes_raised),
             missed_re_escape_finalized_count: state.missed_re_escapes_finalized,
             missed_re_escape_raised_count: state.missed_re_escapes_raised,
-            known_root_count: view.map(|view| view.mirror.known_root_count() as u64),
+            state_note_count: view.map(|view| u64::from(view.mirror.state_notes())),
             published_nullifier_count: view.map(|view| view.mirror.published_count() as u64),
         }
     }
@@ -594,9 +594,11 @@ pub struct HealthResponse {
     /// Of those, raises of an escape the pending list never showed.
     #[serde(default)]
     pub missed_re_escape_raised_count: u64,
-    /// Roots the vault ever set, in the served view (Amendment A1).
+    /// Notes of the served view read from the vault's state at a bootstrap:
+    /// their preimages, escapes and published nullifiers from before it are
+    /// absent. Zero for a mirror with complete history.
     #[serde(default)]
-    pub known_root_count: Option<u64>,
+    pub state_note_count: Option<u64>,
     /// Nullifiers vault events made public, in the served view (§5.2).
     #[serde(default)]
     pub published_nullifier_count: Option<u64>,
@@ -615,7 +617,7 @@ pub struct TreeRootResponse {
 }
 
 /// A sibling path. `root` is the view's root: the siblings hash to it with
-/// `leaf` (and, for a zero-path, with the empty leaf of an unused slot).
+/// `leaf`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TreePathResponse {
     pub note_id: u32,
@@ -669,7 +671,9 @@ pub struct PendingEscapesResponse {
 
 /// `GET /v1/nullifiers/{N}/published`: whether a vault event made `N`
 /// public, as a `withdrawalNullifier` or `nextNullifier` (§5.2). serverd
-/// never serves evidence or request data of a published nullifier.
+/// never serves evidence or request data of a published nullifier. A mirror
+/// bootstrapped from state answers only for a nullifier its table holds
+/// (503 otherwise): an event before the bootstrap may have published it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublishedNullifierResponse {
     pub nullifier: Felt252,
@@ -678,14 +682,19 @@ pub struct PublishedNullifierResponse {
     pub block_hash: String,
 }
 
-/// `GET /v1/tree/roots/{root}`: whether the vault ever set `root`, so that
-/// it accepts proofs made at it (`knownRoots`, Amendment A1).
+/// `GET /v1/notes/{note_id}/deposit` (internal): a note's `NoteDeposited`
+/// preimage, which `claimExpired(noteId, commitment, amount, expiryTs)` and
+/// `effectiveExpiry` take (operator sweeps), with its current leaf and
+/// status in the served view. `deposit` is `null` for a note deposited before
+/// a state bootstrap: its preimage is only in the logs. Statuses are hints,
+/// like the pending escapes; `noteRecord(note)` is authoritative.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct KnownRootResponse {
-    pub root: Felt252,
-    pub known: bool,
-    /// The current root of the served view.
-    pub current_root: Felt252,
+pub struct NoteDepositResponse {
+    pub note_id: u32,
+    /// The current leaf (zero once retired).
+    pub leaf: Felt252,
+    pub status: NoteStatus,
+    pub deposit: Option<NotePreimage>,
     pub block_number: u64,
     pub block_hash: String,
 }

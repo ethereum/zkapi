@@ -72,6 +72,11 @@ contract GaslessHandler is GaslessTestBase {
 
     // ------------------------------------------------------------------------------ actions
 
+    /// The deposit of note `id` (the vault keeps only its leaf).
+    function noteAmount(uint32 id) external view returns (uint128) {
+        return noteData[id].amount;
+    }
+
     function deposit() external {
         if (vault.nextNoteId() >= MAX_NOTES || vault.paused()) return;
         _depositUnits(1000 + vault.nextNoteId(), uint128(NOTE_AMOUNT));
@@ -415,7 +420,8 @@ contract GaslessInvariantTest is Test {
         uint256 held;
         uint32 count = vault.nextNoteId();
         for (uint32 id = 0; id < count; ++id) {
-            (, uint128 amount,, Types.NoteStatus status) = vault.notes(id);
+            (, Types.NoteStatus status) = vault.noteRecord(id);
+            uint128 amount = handler.noteAmount(id);
             if (status == Types.NoteStatus.Active || status == Types.NoteStatus.PendingWithdrawal) held += amount;
         }
         held += vault.treasuryArrears();

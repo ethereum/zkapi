@@ -3,7 +3,6 @@ package zkapi
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,13 +21,25 @@ import (
 
 // The packaged payment RPC is a third party. Before a note secret leaves this
 // process, a failed deposit is retired or retried, or a withdrawal closes
-// local state, its claims are checked against the operator indexer's tree
-// snapshot. The snapshot is the same payload for every caller, so the
-// indexer never learns which note is ours; Go recomputes the expected leaf
-// with zkAPI Poseidon. Lag or missing data is pending; disagreement is a
-// non-terminal conflict.
+// local state, its claims are checked against vault state read by block hash
+// and, where it still adds evidence, the operator indexer's tree snapshot.
+// A vault of revision 4 stores one word per note, its leaf and status
+// (noteRecord); the leaf binds the commitment, the note ID, the amount and
+// the expiry, so Go recomputes the expected leaf with zkAPI Poseidon and
+// compares it with the vault's. The snapshot is the same payload for every
+// caller, so the indexer never learns which note is ours. Lag or missing data
+// is pending; disagreement is a non-terminal conflict.
 
-const notesSelector = "0x9f18e4ed" // notes(uint32)
+// Vault revision 4 note reads.
+const (
+	noteRecordSelector = "0xd154f5bf" // noteRecord(uint32) -> (uint256 leaf, uint8 status)
+	nextNoteIDSelector = "0x7a2043a3" // nextNoteId()
+	noteLeavesSelector = "0x31749c58" // noteLeaves(uint32 start, uint32 count) -> uint256[]
+	minDepositSelector = "0x41b3d185" // minDeposit()
+	// noteLeavesPage is the most leaves one noteLeaves call reads (about
+	// 5.2M gas of eth_call at 2,048).
+	noteLeavesPage = 2048
+)
 
 const (
 	noteUninitialized uint8 = iota
@@ -62,19 +73,25 @@ const (
 )
 
 var (
-	errDepositVerificationPending    = errors.New("the deposit is mined; waiting for the zkAPI indexer to confirm it before activation")
+	errDepositVerificationPending    = errors.New("the deposit is mined; waiting for the vault state to confirm it before activation")
 	errDepositVerificationConflict   = errors.New("the payment RPC, the vault state, and the zkAPI indexer disagree about this deposit; its private note was not activated")
 	errRevertVerificationPending     = errors.New("waiting for the zkAPI indexer to confirm the revert")
-	errWithdrawalVerificationPending = errors.New("the withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed")
+	errWithdrawalVerificationPending = errors.New("the withdrawal is final on Ethereum; waiting for the vault state to confirm the note is closed")
 )
 
 const conflictGuidance = " Checking again re-verifies automatically. If this persists, compare the transaction on a block explorer and run zkapi-clientd config --menu, then choose repair."
 
+// vaultNoteState is noteRecord(id): the stored leaf (zero for an unused ID
+// and for a retired, Closed note) and the status.
 type vaultNoteState struct {
-	Commitment string // 0x + 64 lowercase hex
-	Amount     uint64
-	ExpiryTs   uint64
-	Status     uint8
+	Leaf   *big.Int
+	Status uint8
+}
+
+// holds reports whether the stored leaf is exactly this note's: the leaf
+// commits to the note ID, the commitment, the amount and the expiry.
+func (n vaultNoteState) holds(id uint32, commitment *big.Int, amount, expiry uint64) bool {
+	return n.Leaf != nil && n.Leaf.Sign() != 0 && n.Leaf.Cmp(noteLeaf(id, commitment, amount, expiry)) == 0
 }
 
 // blockAtHash is an EIP-1898 block parameter: the read fails, rather than
@@ -85,14 +102,14 @@ func blockAtHash(hash string) map[string]any {
 
 func (h *FundingHandler) vaultNote(ctx context.Context, config fundingConfig, id uint32, block any) (vaultNoteState, error) {
 	var encoded string
-	call := map[string]string{"to": config.Contract, "data": fmt.Sprintf("%s%064x", notesSelector, id)}
+	call := map[string]string{"to": config.Contract, "data": fmt.Sprintf("%s%064x", noteRecordSelector, id)}
 	if err := h.addressRPC(ctx, config, "eth_call", []any{call, block}, &encoded); err != nil {
 		return vaultNoteState{}, err
 	}
 	return decodeVaultNote(encoded)
 }
 
-// vaultNoteAtReceipt reads notes(id) at the receipt's own canonical block.
+// vaultNoteAtReceipt reads noteRecord(id) at the receipt's own canonical block.
 // Full nodes keep state only for recent blocks, so once that block is final
 // the finalized block, also read by hash and canonical only, is used instead.
 func (h *FundingHandler) vaultNoteAtReceipt(ctx context.Context, config fundingConfig, id uint32, receiptBlock uint64, receiptHash string) (vaultNoteState, error) {
@@ -122,30 +139,30 @@ func (h *FundingHandler) finalizedBlock(ctx context.Context, config fundingConfi
 	return number.Uint64(), strings.ToLower(header.Hash), nil
 }
 
-// decodeVaultNote accepts exactly notes(uint32)'s four static words:
-// (bytes32 commitment, uint128 depositAmount, uint64 expiryTs, uint8 status).
+// decodeVaultNote accepts exactly noteRecord(uint32)'s two static words,
+// (uint256 leaf, uint8 status), as a revision-4 vault stores them: a
+// canonical field element as the leaf, a status up to Closed, no leaf for an
+// unused ID and a leaf for an Active or PendingWithdrawal note.
 func decodeVaultNote(encoded string) (vaultNoteState, error) {
 	invalid := errors.New("invalid vault note state")
-	if len(encoded) != 2+4*64 || !strings.HasPrefix(encoded, "0x") {
+	if len(encoded) != 2+2*64 || !strings.HasPrefix(encoded, "0x") {
 		return vaultNoteState{}, invalid
 	}
 	raw, err := hex.DecodeString(encoded[2:])
 	if err != nil {
 		return vaultNoteState{}, invalid
 	}
-	zero := func(bytes []byte) bool {
-		for _, b := range bytes {
-			if b != 0 {
-				return false
-			}
+	leaf := new(big.Int).SetBytes(raw[:32])
+	for _, b := range raw[32:63] {
+		if b != 0 {
+			return vaultNoteState{}, invalid
 		}
-		return true
 	}
-	amount := binary.BigEndian.Uint64(raw[56:64])
-	if !zero(raw[32:56]) || amount > maxSafeNoteAmount || !zero(raw[64:88]) || !zero(raw[96:127]) || raw[127] > noteClosed {
+	status := raw[63]
+	if leaf.Cmp(bn254ScalarModulus) >= 0 || status > noteClosed || (status == noteUninitialized && leaf.Sign() != 0) || ((status == noteActive || status == notePendingWithdrawal) && leaf.Sign() == 0) {
 		return vaultNoteState{}, invalid
 	}
-	return vaultNoteState{Commitment: "0x" + hex.EncodeToString(raw[:32]), Amount: amount, ExpiryTs: binary.BigEndian.Uint64(raw[88:96]), Status: raw[127]}, nil
+	return vaultNoteState{Leaf: leaf, Status: status}, nil
 }
 
 type treeSnapshot struct {
@@ -321,10 +338,101 @@ func (h *FundingHandler) confirmedSnapshot(ctx context.Context, config fundingCo
 	return snapshot, nil
 }
 
+// blockTime is the time of the block number/hash, from a header the payment
+// RPC serves by hash that hashes to hash and carries number.
+func (h *FundingHandler) blockTime(ctx context.Context, config fundingConfig, number uint64, hash string) (int64, error) {
+	var header types.Header
+	if err := h.addressRPC(ctx, config, "eth_getBlockByHash", []any{hash, false}, &header); err != nil {
+		return 0, errors.New("the payment RPC did not serve the block header")
+	}
+	if !strings.EqualFold(header.Hash().Hex(), hash) || header.Number == nil || !header.Number.IsUint64() || header.Number.Uint64() != number || header.Time == 0 || header.Time > math.MaxInt64 {
+		return 0, errors.New("the payment RPC's block header does not match the block it names")
+	}
+	return int64(header.Time), nil
+}
+
+// vaultLeafSnapshot is a tree view read from the vault itself at one block,
+// by hash (EIP-1898): nextNoteId() and noteLeaves(start, count) in pages of
+// noteLeavesPage, every page pinned to that block. Only the leaves from..to
+// are read; the view ends at min(nextNoteId, to), and leaves below from read
+// as empty. It serves the deposit search (findSignedDepositLeaf) without the
+// indexer.
+func (h *FundingHandler) vaultLeafSnapshot(ctx context.Context, config fundingConfig, number uint64, hash string, from, to uint32) (*treeSnapshot, error) {
+	invalid := errors.New("invalid vault note leaves")
+	next, err := h.addressQuantity(ctx, config, "eth_call", []any{map[string]string{"to": config.Contract, "data": nextNoteIDSelector}, blockAtHash(hash)})
+	if err != nil {
+		return nil, err
+	}
+	if !next.IsUint64() || next.Uint64() > math.MaxUint32 {
+		return nil, invalid
+	}
+	end := min(uint32(next.Uint64()), to)
+	start := min(from, end)
+	leaves := make([]string, end)
+	for i := range start {
+		leaves[i] = "0x0"
+	}
+	for page := start; page < end; {
+		count := min(end-page, noteLeavesPage)
+		var encoded string
+		call := map[string]string{"to": config.Contract, "data": fmt.Sprintf("%s%064x%064x", noteLeavesSelector, page, count)}
+		if err := h.addressRPC(ctx, config, "eth_call", []any{call, blockAtHash(hash)}, &encoded); err != nil {
+			return nil, err
+		}
+		words, err := decodeUint256Array(encoded, int(count))
+		if err != nil {
+			return nil, err
+		}
+		for i, word := range words {
+			leaves[page+uint32(i)] = word
+		}
+		page += count
+	}
+	return &treeSnapshot{NextNoteID: end, Leaves: leaves, BlockNumber: number, BlockHash: strings.ToLower(hash)}, nil
+}
+
+// decodeUint256Array accepts exactly an ABI-encoded uint256[] of count
+// canonical field elements, returned as 0x-prefixed words.
+func decodeUint256Array(encoded string, count int) ([]string, error) {
+	invalid := errors.New("invalid vault note leaves")
+	if len(encoded) != 2+(2+count)*64 || !strings.HasPrefix(encoded, "0x") {
+		return nil, invalid
+	}
+	body := strings.ToLower(encoded[2:])
+	if body[:64] != fmt.Sprintf("%064x", 32) || body[64:128] != fmt.Sprintf("%064x", count) {
+		return nil, invalid
+	}
+	words := make([]string, count)
+	for i := range words {
+		word := "0x" + body[128+i*64:128+(i+1)*64]
+		if _, ok := parseFieldElement(word); !ok {
+			return nil, invalid
+		}
+		words[i] = word
+	}
+	return words, nil
+}
+
 // corroborateDeposit binds a validated deposit receipt to a note only when the
-// vault, read at the receipt's own canonical block, and the indexer snapshot
-// (at or after that block) both hold exactly this deposit at the receipt's
-// note ID. Called before the companion receives the note secret.
+// vault, read at the receipt's own canonical block, holds exactly this
+// deposit at the receipt's note ID: an Active note whose stored leaf is
+// noteLeaf(noteID, commitment, amount, expiry), with the expiry the receipt's
+// NoteDeposited names. The leaf commits to every value of the note, but the
+// payment RPC served both the receipt and that read, so a second source must
+// agree before the note is activated:
+//
+//   - the indexer's view, once it has applied the receipt block on the payment
+//     RPC's canonical chain, must show the same leaf there (a different one is
+//     a conflict);
+//   - when the indexer has no such view (down, lagging, forked or malformed),
+//     the owner's exit RPC (--exit-rpc-url), if one is configured, must serve
+//     the receipt's block hash as canonical (EIP-1898 requireCanonical) and
+//     the same Active leaf at it (another leaf there is a conflict; a read it
+//     cannot serve, or a note it does not show yet, is pending);
+//   - with neither, the deposit stays pending (verifying) until the indexer
+//     catches up: one RPC alone never activates a note.
+//
+// Called before the companion receives the note secret.
 func (h *FundingHandler) corroborateDeposit(ctx context.Context, config fundingConfig, record depositRecord, receipt ethReceipt, noteID uint32, expiry uint64) (*depositBinding, error) {
 	pending := func(reason string) error { return fmt.Errorf("%w (%s)", errDepositVerificationPending, reason) }
 	conflict := func(format string, args ...any) error {
@@ -348,76 +456,61 @@ func (h *FundingHandler) corroborateDeposit(ctx context.Context, config fundingC
 	if note.Status == noteUninitialized {
 		return nil, pending("the vault does not show the note yet")
 	}
-	if note.Status != noteActive || !strings.EqualFold(note.Commitment, "0x"+addressABIWord(record.Commitment)) || note.Amount != record.Amount || note.ExpiryTs != expiry {
+	if note.Status != noteActive || !note.holds(noteID, commitment, record.Amount, expiry) {
 		return nil, conflict("vault note %d does not hold this deposit", noteID)
 	}
-	snapshot, err := h.confirmedSnapshot(ctx, config, block.Uint64())
+	binding := &depositBinding{NoteID: noteID, ExpiryTs: expiry, BlockNumber: block.Uint64(), BlockHash: strings.ToLower(receipt.BlockHash)}
+	if snapshot, err := h.confirmedSnapshot(ctx, config, block.Uint64()); err == nil {
+		leaf, present, err := snapshot.leaf(noteID)
+		if err != nil || !present || leaf.Cmp(note.Leaf) != 0 {
+			return nil, conflict("the zkAPI indexer does not show this deposit at note %d", noteID)
+		}
+		binding.IndexerBlock = snapshot.BlockNumber
+		return binding, nil
+	}
+	if config.ExitRPC == "" || config.exitOnly {
+		return nil, pending("the zkAPI indexer has no view of the receipt block yet, and no exit RPC is configured to confirm it")
+	}
+	exit := config.exitConfig()
+	if err := h.assertAddressChain(ctx, exit); err != nil {
+		return nil, pending("the exit RPC network check is unavailable")
+	}
+	second, err := h.vaultNoteAtReceipt(ctx, exit, noteID, block.Uint64(), receipt.BlockHash)
 	if err != nil {
-		return nil, pending(err.Error())
+		return nil, pending("the exit RPC cannot read the vault at the receipt block")
 	}
-	leaf, present, err := snapshot.leaf(noteID)
-	if err != nil {
-		return nil, pending(err.Error())
+	if second.Leaf.Sign() != 0 && second.Leaf.Cmp(note.Leaf) != 0 {
+		return nil, conflict("the exit RPC's vault note %d does not hold this deposit", noteID)
 	}
-	if !present || leaf.Cmp(noteLeaf(noteID, commitment, record.Amount, expiry)) != 0 {
-		return nil, conflict("the zkAPI indexer does not show this deposit at note %d", noteID)
+	if second.Status != noteActive || !second.holds(noteID, commitment, record.Amount, expiry) {
+		return nil, pending("the exit RPC does not show the note active at the receipt block yet")
 	}
-	return &depositBinding{NoteID: noteID, ExpiryTs: expiry, BlockNumber: block.Uint64(), BlockHash: strings.ToLower(receipt.BlockHash), IndexerBlock: snapshot.BlockNumber}, nil
+	binding.ExitRPCConfirmed = true
+	return binding, nil
 }
 
-// bindDepositPath refreshes the companion's empty-leaf witness immediately
-// before signing and binds it to the slot it proves: the siblings must hash
-// an empty leaf at the snapshot's next_note_id to the snapshot root. The slot
-// is saved with the note record before the transaction exists, so a later
+// bindDepositPath binds the deposit about to be signed to the slot it is
+// prepared for, the indexer view's next_note_id, immediately before signing.
+// A deposit of vault revision 3 or 4 carries no Merkle path: the vault
+// appends the leaf itself, at the prepared slot or a later one. The slot is
+// saved with the note record before the transaction exists, so a later
 // reported revert can be checked against what actually happened there.
 //
-// The slot also records the run of empty leaves right below it. The indexer
-// serves a head view, which can be a short fork: calldata built on a fork
-// whose last notes were deposited and closed again can land at a lower slot
-// of the canonical tree once that fork is orphaned, but only inside that run.
+// The slot also records the run of empty leaves right below it, for a
+// revision-2 deposit, whose calldata carried the slot's siblings and could
+// land in that run when the view it was built from was orphaned.
 //
 // A deposit reported as reverted may have been withheld and still land, and
-// a second deposit of this note would share its nullifier. So the same
-// snapshot is searched for our leaf from the slot of every deposit of this
-// note signed before, and nothing is signed when it is found. The new path
-// and that search come from one tree. An earlier deposit missing from it
-// cannot land beside the new one: the vault accepts each only against a
-// tree without the other's leaf. An earlier deposit in it is found unless it
-// lies outside findDepositLeaf's bounds. For a slot that records its run,
-// that happens only in two cases. After it landed,
-// challengeEscapeWithdrawal restored 64 or more leaves between the slot it
-// was built for and the slot it landed in, or, for a deposit that landed in
-// the run below that slot, between the start of the run and its slot. Or it
-// landed about 63 or more days ago. A slot saved by an earlier release
-// records no run and is never searched below, so a deposit signed for it
-// from a view that was then orphaned, which landed below that slot, is
-// missed as well.
+// a second deposit of this note would share its nullifier. So the indexer
+// view is searched for our leaf from the slot of every deposit of this note
+// signed before, and nothing is signed when it is found. An earlier deposit
+// in that view is found unless it lies outside findDepositLeaf's bounds:
+// about 63 or more days ago, or behind 64 or more occupied slots after the
+// slot it was prepared for.
 func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConfig, record *addressFundingRecord, deposit *depositRecord) (string, error) {
-	path, err := h.depositPath(ctx)
-	if err != nil {
-		return "", err
-	}
-	encoded, _ := json.Marshal(path)
-	var refreshed struct {
-		ZeroPath []string `json:"zero_path"`
-	}
-	if json.Unmarshal(encoded, &refreshed) != nil || len(refreshed.ZeroPath) != merkleDepth {
-		return "", errors.New("invalid refreshed deposit path")
-	}
-	siblings := make([]*big.Int, merkleDepth)
-	for i, sibling := range refreshed.ZeroPath {
-		value, ok := parseFieldElement(sibling)
-		if !ok {
-			return "", errors.New("invalid refreshed deposit path")
-		}
-		siblings[i] = value
-	}
 	snapshot, err := h.indexerSnapshot(ctx, config)
 	if err != nil {
 		return "", fmt.Errorf("%v; no deposit was signed", err)
-	}
-	if merkleRoot(snapshot.NextNoteID, new(big.Int), siblings).Cmp(snapshot.Root) != 0 {
-		return "", errors.New("the deposit witness does not match the zkAPI indexer's current tree; no deposit was signed, retry")
 	}
 	if err := h.snapshotChainTime(ctx, config, snapshot); err != nil {
 		return "", fmt.Errorf("%v; no deposit was signed, retry", err)
@@ -434,7 +527,6 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 	if err != nil || len(calldata) != depositCalldataLength {
 		return "", errors.New("invalid deposit call data")
 	}
-	deposit.ZeroPath = refreshed.ZeroPath
 	deposit.SignedSlots = signed
 	deposit.Slot = &depositSlot{NoteID: snapshot.NextNoteID, PathSHA256: depositPathDigest(calldata), PreparedAt: time.Now().Unix(), PreparedChainAt: snapshot.Time, EmptyBefore: snapshot.emptyBeforeNext()}
 	if err := h.save(*deposit); err != nil {
@@ -443,9 +535,9 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 	return data, nil
 }
 
-// depositSelector is deposit(bytes32 commitment, uint128 amount) of vault revision 3: the vault
-// appends the leaf to its tree itself, so the calldata carries no siblings and a signed deposit
-// lands at the prepared slot or any later one, never below it.
+// depositSelector is deposit(bytes32 commitment, uint128 amount) of vault revisions 3 and 4: the
+// vault appends the leaf to its tree itself, so the calldata carries no siblings and a signed
+// deposit lands at the prepared slot or any later one, never below it.
 const depositSelector = "56d2e1ea"
 
 // depositCalldataLength is the selector and the two argument words.
@@ -671,8 +763,9 @@ func priorDepositKey(config fundingConfig, deposit *depositRecord, slots []depos
 
 // signedDepositSlots lists the slot of every deposit of this note that was
 // signed: those kept from earlier attempts and, when a saved deposit
-// transaction of this note carries exactly its zero path, the current one.
-// A path already kept is not added again, so its earliest preparation stays.
+// transaction of this note was signed for it (signedDepositSlot), the current
+// one. A slot already kept is not added again, so its earliest preparation
+// stays.
 func signedDepositSlots(deposit *depositRecord, record *addressFundingRecord) []depositSlot {
 	if deposit == nil {
 		return nil
@@ -764,16 +857,15 @@ func findSignedDepositLeaf(snapshot *treeSnapshot, slots []depositSlot, commitme
 // occupied slots after it, then in the run of slots that were empty right
 // below it (slot.EmptyBefore). Every comparison costs a Poseidon hash per
 // expiry day, so each of the two ranges compares at most
-// depositRevertScanSlots occupied slots. Empty slots are skipped without
-// counting. Calldata built for one slot lands at a later one only while
-// every slot in between is empty, because the vault checks the path against
-// its live root. It lands at an earlier one only inside that run: its
-// siblings fix every leaf below the slot it was built for, and a leaf
-// commits to its note ID, so they fit a lower slot only where every slot in
-// between was empty. So when it lands, its slot is the first occupied one
-// from where its range starts. Afterwards challengeEscapeWithdrawal can
-// restore leaves that escapes removed in between, and a landing behind
-// depositRevertScanSlots restored leaves is not found.
+// depositRevertScanSlots occupied slots. Empty (retired) slots are skipped
+// without counting. A deposit of vault revision 3 or 4 lands at the vault's
+// next note ID when it is mined, so at the prepared slot or after the
+// deposits that landed first; a landing behind depositRevertScanSlots of
+// them is not found. A revision-2 deposit, whose calldata carried the slot's
+// siblings, lands at an earlier slot only inside the empty run: its siblings
+// fix every leaf below the slot it was built for, and a leaf commits to its
+// note ID, so they fit a lower slot only where every slot in between was
+// empty.
 func findDepositLeaf(snapshot *treeSnapshot, slot *depositSlot, commitment *big.Int, amount, ttl uint64, now int64) (uint32, bool) {
 	expiries := plausibleExpiries(slot.searchFrom(), now, ttl)
 	search := func(from, to uint64) (uint32, bool) {
@@ -847,9 +939,13 @@ func (h *FundingHandler) noteTTL() (uint64, error) {
 }
 
 // corroborateWithdrawalClosed requires the vault, read at the payout receipt's
-// canonical block, and the indexer snapshot at or after it to show the
-// reserved note closed before the companion deletes its note state. A forged
-// payout receipt therefore never retires a live note; disagreement waits.
+// canonical block, to show the reserved note Closed before the companion
+// deletes its note state: noteRecord's status, whose leaf stays in the tree
+// (an exit never removes it; only retireClosedLeaf zeroes it, and a retired
+// note is Closed as well). The indexer cannot corroborate a close, because
+// the tree does not change. When the owner configured an exit RPC, the note
+// must read Closed through it too, so the pinned RPC alone, which served the
+// receipt, never decides that the note closed. Disagreement waits.
 func (h *FundingHandler) corroborateWithdrawalClosed(ctx context.Context, config fundingConfig, noteID uint64, receipt *addressReceipt) error {
 	pending := func(reason string) error { return fmt.Errorf("%w (%s)", errWithdrawalVerificationPending, reason) }
 	if noteID > 0xffffffff {
@@ -866,13 +962,15 @@ func (h *FundingHandler) corroborateWithdrawalClosed(ctx context.Context, config
 	if err != nil || note.Status != noteClosed {
 		return pending("the vault does not show the note closed at the payout block")
 	}
-	snapshot, err := h.confirmedSnapshot(ctx, config, block.Uint64())
-	if err != nil {
-		return pending(err.Error())
-	}
-	leaf, present, err := snapshot.leaf(uint32(noteID))
-	if err != nil || !present || leaf.Sign() != 0 {
-		return pending("the zkAPI indexer still shows the note in the tree")
+	if config.ExitRPC != "" && !config.exitOnly {
+		exit := config.exitConfig()
+		if err := h.assertAddressChain(ctx, exit); err != nil {
+			return pending("the exit RPC network check is unavailable")
+		}
+		note, err := h.vaultNoteAtReceipt(ctx, exit, uint32(noteID), block.Uint64(), receipt.BlockHash)
+		if err != nil || note.Status != noteClosed {
+			return pending("the vault does not show the note closed at the payout block through the exit RPC")
+		}
 	}
 	return nil
 }

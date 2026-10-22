@@ -48,6 +48,15 @@ struct Args {
     /// (503); 0 disables the check for chains that mine on demand.
     #[arg(long, default_value_t = 180)]
     max_head_age_secs: u64,
+    /// Without a checkpoint (first start, --resync) and on every rebuild,
+    /// read the tree from the vault's state (noteLeaves pages, nextNoteId()
+    /// and currentRoot() at one block hash --confirmations below the head)
+    /// instead of replaying logs from --from-block, then follow logs.
+    /// Recommended for a new deployment. On a vault with notes, their
+    /// deposit preimages (operator sweeps), escapes and published nullifiers
+    /// from before that block are absent.
+    #[arg(long)]
+    bootstrap_from_state: bool,
 }
 
 #[tokio::main]
@@ -72,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         stale_after_secs: args.stale_after_secs,
         max_block_range: args.max_block_range,
         max_head_age_secs: args.max_head_age_secs,
+        bootstrap_from_state: args.bootstrap_from_state,
     })
     .await
 }
@@ -90,6 +100,7 @@ mod tests {
         assert_eq!(args.stale_after_secs, 120);
         assert_eq!(args.max_block_range, 1_000);
         assert_eq!(args.max_head_age_secs, 180);
+        assert!(!args.bootstrap_from_state);
 
         let args = Args::try_parse_from([
             "zkapi-indexerd",
@@ -106,6 +117,7 @@ mod tests {
             "500",
             "--max-head-age-secs",
             "0",
+            "--bootstrap-from-state",
         ])
         .unwrap();
         assert_eq!(args.confirmations, 3);
@@ -114,5 +126,6 @@ mod tests {
         assert_eq!(args.stale_after_secs, 60);
         assert_eq!(args.max_block_range, 500);
         assert_eq!(args.max_head_age_secs, 0);
+        assert!(args.bootstrap_from_state);
     }
 }

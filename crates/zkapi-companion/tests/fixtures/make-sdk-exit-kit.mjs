@@ -1,6 +1,9 @@
 // Seals tests/fixtures/sdk-exit-kit-v1.json with the browser SDK's own exit
 // kit code (sdk/services/zkapiExitKit.mjs: buildExitKitPayload, sealExitKit),
 // so the companion's `exit-kit escape` is tested against what the SDK writes.
+// Since vault revision 4 a kit carries no Merkle path (an escape is bound to
+// the note's stored leaf); the companion's tests add one to check that a
+// kit sealed before revision 4 still opens and escapes with it ignored.
 //
 //   ZKAPI_KIT_FIXTURE_INPUTS=/tmp/inputs.json cargo test --release \
 //     -p zkapi-companion --lib -- --ignored write_sdk_kit_fixture_inputs
@@ -22,8 +25,7 @@ const payload = buildExitKitPayload({
     trustedDeployment: inputs.trusted_deployment,
     state: inputs.state,
     stateSeq: inputs.state_seq,
-    exportedAt: inputs.exported_at,
-    merklePath: inputs.state.deposit_path
+    exportedAt: inputs.exported_at
 });
 // The SDK's minimum for openExitKit; the shipped count is 600,000.
 const kit = await sealExitKit(payload, 'zkapi exit kit fixture', { crypto: webcrypto, iterations: 100_000 });

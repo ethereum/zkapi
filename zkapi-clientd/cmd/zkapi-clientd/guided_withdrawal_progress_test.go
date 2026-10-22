@@ -34,7 +34,7 @@ func TestGuidedWithdrawalRefreshesFeePaymentInPlace(t *testing.T) {
 			return context.Canceled
 		}
 		return nil
-	}, "")
+	})
 	if !errors.Is(err, context.Canceled) || u.active != "" || f.approveCalls != 0 || u.continues != 0 {
 		t.Fatal("cancelling the fee wait did not stop cleanly")
 	}
@@ -74,7 +74,7 @@ func TestGuidedWithdrawalRestoresStageAfterInterruptedRecovery(t *testing.T) {
 func TestGuidedWithdrawalClearsProgressBeforeConsent(t *testing.T) {
 	f := &withdrawalWizardFixture{}
 	u := &recordingSetupDisplay{fundingWizardUI: fundingWizardUI{answers: []string{withdrawalTestDestination}, confirmations: []bool{false}}}
-	err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, "")
+	err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll)
 	if err == nil || !strings.Contains(err.Error(), "declined") || u.promptDuringWait || u.active != "" || f.approveCalls != 0 {
 		t.Fatalf("progress interfered with explicit consent: %v, %+v", err, u)
 	}
@@ -125,7 +125,7 @@ func TestEarlierCreditedEscapePayoutsArePrinted(t *testing.T) {
 	f := &withdrawalWizardFixture{}
 	f.status = func(int) (zkapi.AddressWithdrawalStatus, error) { return withdrawal, nil }
 	u := &fundingWizardUI{}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(u.String(), want) {

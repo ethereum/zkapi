@@ -32,27 +32,36 @@ seconds() {
 }
 
 require CHAIN_ID VAULT_ADDRESS DEPLOY_BLOCK CIRCUIT_ID
-if [ "$CIRCUIT_ID" != zkapi-v2-concession-v1 ]; then
-    echo "This image requires the zkapi-v2-concession-v1 circuit and a fresh vault" >&2
+if [ "$CIRCUIT_ID" != zkapi-v2-concession-v2 ]; then
+    echo "This image requires the zkapi-v2-concession-v2 circuit and a fresh vault" >&2
     exit 1
 fi
 
 case "${1:-}" in
     server)
         require ZKAPI_STATE_SEED ZKAPI_CLEAR_SEED REQUEST_CHARGE_CAP ZKAPI_NATIVE_BILLING_RPC_URL ZKAPI_NATIVE_PRICE_FEED_ADDRESS
+        # Vault revision 4 dropped the clearance root window. serverd refuses
+        # the setting with this message too; refuse it here, before anything
+        # starts, even when it is set empty.
+        if printenv ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS >/dev/null; then
+            echo "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS was removed in vault revision 4: clearance checks the note leaf; delete this setting" >&2
+            exit 1
+        fi
         # zkapi serverd reads the seeds from this environment and validates them
         # itself: it refuses development keys in any spelling (by derived public
         # key), weak or reused seeds, and keys that differ from the vault's,
         # before it opens /data/server.db. A string match here would be bypassable.
-        # ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS, ZKAPI_ROOT_MAX_STALENESS_SECONDS,
+        # ZKAPI_REQUEST_ROOT_GRACE_SECONDS, ZKAPI_ROOT_MAX_STALENESS_SECONDS,
         # ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS and ZKAPI_ALLOW_LEGACY_CLEARANCE (which
-        # serverd refuses on this circuit) also reach serverd from the environment.
+        # serverd refuses on this circuit) also reach serverd from the environment,
+        # which validates them.
         set -- zkapi --protocol-version 2 --chain-id "$CHAIN_ID" \
             --contract-address "$VAULT_ADDRESS" \
             --request-charge-cap "$REQUEST_CHARGE_CAP" \
             --proof-setup-dir "$ZKAPI_PROOF_SETUP_DIR" \
             serverd --listen 0.0.0.0:3000 \
             --indexer-url http://indexer:3001 \
+            --root-poll-interval-ms "${ROOT_POLL_INTERVAL_MS:-1000}" \
             --native-billing-rpc-url "$ZKAPI_NATIVE_BILLING_RPC_URL" \
             --native-price-feed-address "$ZKAPI_NATIVE_PRICE_FEED_ADDRESS" \
             --native-price-feed-decimals "${ZKAPI_NATIVE_PRICE_FEED_DECIMALS:-8}" \

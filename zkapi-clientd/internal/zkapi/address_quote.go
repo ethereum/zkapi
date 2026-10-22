@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -89,6 +88,18 @@ type AddressPaymentQuote struct {
 	// deducts it, so it is the floor whether the push succeeds or not.
 	PayeeHasCode       bool   `json:"payee_has_code,omitempty"`
 	CreditSurchargeWei string `json:"credit_surcharge_wei,omitempty"`
+	// The bounded authorization a payout close is approved under (authorize
+	// once). MaxTotalFeeWei is the most the payout may lose to every
+	// operation signed under it (maximum cost plus the flat fee cap, plus the
+	// credit surcharge for a contract payee); MinNetPayoutWei is what the
+	// payout address receives at least (payout − MaxTotalFeeWei − owed).
+	// ExpectedFeeWei stays an estimate: FeeMayChange says the actual fee may
+	// differ, and the daemon rebuilds, re-signs and re-proves within the
+	// bound without asking again. FeeCapWei and MinimumReceivedWei describe
+	// only the operation as it would be built now.
+	MaxTotalFeeWei  string `json:"max_total_fee_wei,omitempty"`
+	MinNetPayoutWei string `json:"min_net_payout_wei,omitempty"`
+	FeeMayChange    bool   `json:"fee_may_change,omitempty"`
 }
 
 // quoteID is a fresh 32-byte approval ID.
@@ -109,6 +120,9 @@ type addressQuoteMode struct {
 	// expired note whose current state has an unsettled request: the
 	// companion may then send the ownership proof the server requires.
 	AcceptUnsettledRequestRisk bool
+	// Authorized resumes a payout close under its journaled authorization:
+	// the operation is built, signed and sent within it with no quote.
+	Authorized *gaslessAuthorization
 }
 
 func quoteMode(ctx context.Context) *addressQuoteMode {
@@ -311,31 +325,14 @@ func checkedAddressQuote(record *addressFundingRecord, id, kind string) (*Addres
 	copy := *q
 	return &copy, nil
 }
+
+// refreshAddressDeposit is the deposit's calldata. deposit(bytes32,uint128): the vault appends
+// the leaf itself (vault revisions 3 and 4), so no path is fetched, and the note's exits need none.
 func (h *FundingHandler) refreshAddressDeposit(ctx context.Context, deposit *depositRecord) (string, error) {
-	path, err := h.depositPath(ctx)
-	if err != nil {
+	if err := h.client.Check(ctx); err != nil {
 		return "", err
 	}
-	raw, _ := json.Marshal(path)
-	var refreshed struct {
-		ZeroPath []string `json:"zero_path"`
-	}
-	if json.Unmarshal(raw, &refreshed) != nil || len(refreshed.ZeroPath) != 32 {
-		return "", errors.New("invalid refreshed deposit path")
-	}
-	// deposit(bytes32,uint128): the vault appends the leaf itself (revision 3). The path stays
-	// with the record, for the note's exit proof.
-	data := depositCalldata(deposit.Commitment, deposit.Amount)
-	for _, sibling := range refreshed.ZeroPath {
-		if !isField(sibling) {
-			return "", errors.New("invalid refreshed deposit path")
-		}
-	}
-	deposit.ZeroPath = refreshed.ZeroPath
-	if err = h.save(*deposit); err != nil {
-		return "", err
-	}
-	return data, nil
+	return depositCalldata(deposit.Commitment, deposit.Amount), nil
 }
 func positiveDifference(left, right *big.Int) *big.Int {
 	n := new(big.Int).Sub(left, right)

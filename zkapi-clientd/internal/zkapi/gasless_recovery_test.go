@@ -2,6 +2,7 @@ package zkapi
 
 import (
 	"context"
+	"encoding/json"
 	"math/big"
 	"strings"
 	"testing"
@@ -12,6 +13,27 @@ import (
 func (f *withdrawalFixture) sponsoredCloseWithCap(t *testing.T) string {
 	t.Helper()
 	return f.sponsoredCloseWith(t, addressWithdrawalOptions{Fees: "payout", FeeCapGwei: 4_000_000})
+}
+
+// asLegacyRecord turns the journaled close into one an older build signed:
+// no authorization, and a re-sign bound of the operation's own maximum, so
+// a dropped copy stops as fee_bump_needs_quote (the saved-record recovery
+// these tests follow).
+func (f *withdrawalFixture) asLegacyRecord(t *testing.T, g *gaslessFixture) {
+	t.Helper()
+	f.editJournal(t, func(record *addressFundingRecord) {
+		u := record.Withdrawal.UserOp
+		var encoded gaslessUserOpJSON
+		if json.Unmarshal(u.JSON, &encoded) != nil {
+			t.Fatal("invalid journaled operation")
+		}
+		op, err := gaslessUserOpFromJSON(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.Withdrawal.Authorization = nil
+		u.FeeCapWei = new(big.Int).Add(op.maxCost(), g.flatFee).String()
+	})
 }
 
 // createTransitAccount gives the transit account code, as a third party
@@ -88,10 +110,16 @@ func TestGaslessFeeBumpAfterTheAccountWasCreatedDropsInitCode(t *testing.T) {
 	if u.InitCode || len(bumped.InitCode) != 0 || bumped.MaxFeePerGas.Cmp(old.MaxFeePerGas) <= 0 || g.sends[len(g.sends)-1] != u.Hash {
 		t.Fatalf("the bumped copy kept initCode or was not sent: %+v", u)
 	}
-	// The dry run caught it before anything was journaled or sent: no
-	// copy with the stale initCode reached the bundler.
-	if len(u.Hashes) != 2 || u.Hashes[0] != first || u.Hashes[1] != u.Hash {
-		t.Fatalf("a copy with the stale initCode was signed: %v", u.Hashes)
+	// The stale copy was journaled before its dry run showed its
+	// signature (a copy is never shown unjournaled); the dry run caught it,
+	// so no copy with the stale initCode reached the bundler.
+	if len(u.Hashes) != 3 || u.Hashes[0] != first || u.Hashes[2] != u.Hash {
+		t.Fatalf("the copies were not journaled in order: %v", u.Hashes)
+	}
+	for _, sent := range g.sends {
+		if sent == u.Hashes[1] {
+			t.Fatal("the copy with the stale initCode reached the bundler")
+		}
 	}
 	g.refuseResend = false
 	g.mineUserOp(t, u.Hash, true, fixtureSettlement{Received: gaslessPayoutWei, Charged: big.NewInt(5), PaidOut: new(big.Int).Sub(gaslessPayoutWei, big.NewInt(5))})
@@ -155,6 +183,7 @@ func TestGaslessRefusedBumpedCopyStillFollowsALateEarlierCopy(t *testing.T) {
 func TestGaslessWalletFallbackFollowsALateOperation(t *testing.T) {
 	f, g := newGaslessWithdrawalFixture(t)
 	first := f.sponsoredClose(t)
+	f.asLegacyRecord(t, g)
 	f.editJournal(t, func(record *addressFundingRecord) { record.Withdrawal.UserOp.SubmittedAt -= 400 })
 	g.known[first], g.refuseResend = false, true
 	status, err := f.h.WithdrawAddress(payoutContext(payoutFees), withdrawalTestDestination, f.noteID)
@@ -190,6 +219,7 @@ func TestGaslessEscapeOverARefusedCloseFollowsALateOperation(t *testing.T) {
 		t.Run(map[bool]string{false: "resume", true: "quoted"}[quoted], func(t *testing.T) {
 			f, g := newGaslessEscapeFixture(t)
 			first := f.sponsoredClose(t)
+			f.asLegacyRecord(t, g)
 			f.editJournal(t, func(record *addressFundingRecord) { record.Withdrawal.UserOp.SubmittedAt -= 400 })
 			g.known[first], g.refuseResend = false, true
 			status, err := f.h.WithdrawAddress(payoutContext(payoutFees), withdrawalTestDestination, f.noteID)
@@ -227,6 +257,7 @@ func TestGaslessEscapeOverARefusedCloseFollowsALateOperation(t *testing.T) {
 func TestGaslessWalletFallbackResumeFollowsALateOperation(t *testing.T) {
 	f, g := newGaslessWithdrawalFixture(t)
 	first := f.sponsoredClose(t)
+	f.asLegacyRecord(t, g)
 	f.editJournal(t, func(record *addressFundingRecord) { record.Withdrawal.UserOp.SubmittedAt -= 400 })
 	g.known[first], g.refuseResend = false, true
 	if status, err := f.h.WithdrawAddress(payoutContext(payoutFees), withdrawalTestDestination, f.noteID); err != nil || status.Phase != "gasless_refused" {

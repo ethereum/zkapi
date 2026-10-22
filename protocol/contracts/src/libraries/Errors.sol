@@ -8,11 +8,25 @@ library Errors {
     /// @notice The supplied proof did not verify.
     error InvalidProof();
 
-    /// @notice The Merkle siblings do not reproduce the current root.
+    /// @notice retireClosedLeaf's siblings do not reproduce the frontier node of the retired leaf's
+    ///      subtree, or the leaf was already retired.
     error StaleRoot();
 
-    /// @notice A withdrawal proof's activeRoot is neither current nor retired within ROOT_HISTORY_WINDOW.
-    error UnknownRoot();
+    /// @notice A withdrawal's noteLeaf is not the leaf the vault stored for the note, or
+    ///         claimExpired's (commitment, amount, expiryTs) do not reproduce it.
+    error NoteLeafMismatch();
+
+    /// @notice A withdrawal's noteFields is at or above 2^224: no note packs to it.
+    error InvalidNoteFields();
+
+    /// @notice Every note ID below 2^32 - 1 is taken.
+    error TreeFull();
+
+    /// @notice The deposit is below minDeposit.
+    error DepositTooSmall();
+
+    /// @notice noteLeaves was asked for leaves at or beyond nextNoteId.
+    error InvalidNoteRange();
 
     /// @notice The nullifier has already been consumed.
     error ReplayedNullifier();

@@ -29,7 +29,7 @@ const claim = (noteId = 7, blockNumber = 12) => ({
 });
 const log = (noteId = 7, blockNumber = 12) => ({
     address: VAULT, topics: [EXPIRED_CLAIMED_TOPIC, hash(noteId)],
-    data: `0x${hash(2_000_000).slice(2)}${hash(9).slice(2)}`,
+    data: `0x${hash(2_000_000).slice(2)}`,
     removed: false, blockNumber: hex(blockNumber), blockHash: hash(blockNumber),
     transactionHash: hash(100 + noteId)
 });

@@ -7,11 +7,14 @@ export function parseChainId(value) {
   if (value !== '1' && value !== '11155111') throw new ConfigError('Explicit challenge chain ID must be 1 or 11155111');
   return BigInt(value);
 }
-// The calls of the concession-exit challenger (vault revision 3, circuit
-// zkapi-v2-concession-v1): a defeat by a request proof at an escape's
+// The calls of the concession-exit challenger (vault revision 4, circuit
+// zkapi-v2-concession-v2): a defeat by a request proof at an escape's
 // successor nullifier, a raise by one at its escaped nullifier, and the
-// retirement of a closed note's leaf after a missed defeat. The revision-2
-// challenge with siblings (0x8a43467c) is refused.
+// retirement of a closed note's leaf after a missed defeat. Their ABI is that
+// of revision 3; a retirement reads only siblings[0..l), l = msb(noteId XOR
+// nextNoteId), and the challenger zero-fills the rest. The revision-2
+// challenge with siblings (0x8a43467c) and every other vault call
+// (claimExpired, recordRoot, exits, deposits) are refused.
 const REQUEST_INPUTS = '(uint16 protocolVersion,uint64 chainId,address contractAddress,uint256 activeRoot,uint256 stateSigningKeyX,uint256 stateSigningKeyY,uint64 requestTime,uint128 solvencyBound,uint256 requestNullifier,uint256 authorizationTag,uint256 anonymousCommitmentX,uint256 anonymousCommitmentY) inputs';
 export const CHALLENGE_ABI = `function challengeEscapeWithdrawal(uint32 noteId,${REQUEST_INPUTS},bytes proof)`;
 export const RAISE_ABI = `function raiseEscapeConcession(uint32 noteId,${REQUEST_INPUTS},bytes proof,uint128 amount)`;
@@ -25,13 +28,16 @@ export const ABSOLUTE_FEE_CEILING = 1_000_000n * GWEI;
 // geth's and reth's default --rpc.txfeecap: 1 ether of gas limit x maxFeePerGas.
 export const DEFAULT_TX_FEE_CAP = 10n ** 18n;
 export const UPSTREAM_TIMEOUT_MS = 8_000;
-// Leaf retirements (about 6M gas each) follow only a missed defeat, which is
-// rare and alarmed on, but any closed note simulates successfully, and a
-// copy that mines after the leaf is gone still pays about 5.9M gas before it
-// reverts StaleRoot. Retirement transactions signed per rolling day, one per
-// nonce, are capped so that a compromised caller cannot spend the float
-// meant for defeats and raises on them.
-export const DEFAULT_MAX_RETIREMENTS_PER_DAY = 2n;
+// Leaf retirements (about 37.7k gas at tree level 0 to 0.47M at level 16, at
+// most about 0.92M at level 31) follow only a missed defeat, which is rare and
+// alarmed on, but any closed note simulates successfully, and a retirement
+// that loses a race to another one in the same subtree pays up to its full
+// cost before it reverts StaleRoot. Retirement transactions signed per rolling
+// day, one per nonce, are capped so that a compromised caller cannot spend the
+// float meant for defeats and raises on them. Four a day (at most about 3.7M
+// gas) keep about the daily gas bound of two revision-3 retirements and leave
+// room for the challenger's retry after such a race.
+export const DEFAULT_MAX_RETIREMENTS_PER_DAY = 4n;
 export const MAX_RETIREMENTS_PER_DAY_LIMIT = 1_000n;
 export const RETIREMENT_WINDOW_MS = 86_400_000;
 // The operator's retirement policy (design §5.4): the challenger retires a
@@ -223,13 +229,13 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   // The leaf retirements broadcast (or possibly broadcast) in the last
   // RETIREMENT_WINDOW_MS, one entry per (note, nonce), by first signing time.
   // Each entry is one unit of the budget: a nonce mines at most one
-  // transaction, and every retirement that mines costs about 6M gas, even
-  // one that reverts StaleRoot because the leaf is already gone. A fee
+  // transaction, and every retirement that mines costs gas, up to about 0.92M,
+  // even one that reverts StaleRoot after a concurrent retirement. A fee
   // replacement or re-send on a counted nonce therefore needs no new budget.
   // The same note on another nonce takes a new unit, and only once every
   // earlier counted nonce of that note is mined (retirement_in_flight):
-  // copies cannot queue behind a pending retirement, each to pay about 5.9M
-  // gas to revert once the first lands. A retirement refused for the budget
+  // copies cannot queue behind a pending retirement, each to pay gas to
+  // revert once the first lands. A retirement refused for the budget
   // is counted and reported (status, /health, audit log). Kept in memory: a
   // restart of this sidecar starts a new window.
   const retirements = new Map();

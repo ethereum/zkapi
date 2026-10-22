@@ -1,10 +1,12 @@
-# zkAPI concession exit: final specification (circuit `zkapi-v2-concession-v1`, vault revision 3), red-team revision
+# zkAPI concession exit: final specification (circuit `zkapi-v2-concession-v1`, vault revision 3), red-team revision, with Amendment A3 (leaf-bound exits: circuit `zkapi-v2-concession-v2`, vault revision 4)
 
 > **Status:** design and migration plan for circuit `zkapi-v2-concession-v1` (vault revision 3). Implemented with the `dev` setup in `protocol/setup/v2-concession-dev`; no revision-3 vault is deployed, and the packaged profiles are `not_deployed` placeholders. The multi-party setup, external review, Sepolia drill and mainnet rollout in §10 are operational gates, not yet run. Where the implementation differs from this text, [Implementation status](#implementation-status) records it. The operator runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
 >
 > **Amendment A1 (any known root).** §4.2 step 6 and §4.5 accept any root the vault ever held, not only the current root or one retired within 1 day. The tree is append-only for every note that is not `Closed` (`retireClosedLeaf` only removes a `Closed` note's leaf), so every root recorded since a note's deposit contains that note's leaf, and `initiateEscapeWithdrawal` and `mutualClose` require `Active`. The vault records every root it sets (`knownRoots[root] = true`, one extra SSTORE per deposit and per retirement), and a client can exit with the Merkle path it saved at deposit, with no indexer and no log rebuild. §6.6's rebuild remains the fallback for a client that has no saved path.
 >
 > **Amendment A2 (the 30-day transition).** §10.7 C5 and E2 to E3 are read with this. The deployed legacy vaults give a note a 30-day life (rounded up to a UTC midnight) and a 24-hour challenge period, and the owner never pauses them, so the drain is bounded by the note life. **Day 0** is the moment the legacy deposit routes close, in the same change window as the new vault's go-live. `N_C = nextNoteId()` read then separates transition notes (ID below `N_C`) from late notes (direct deposits after day 0). **`X` is the expiry of note `N_C - 1`**, before day 31, not Phase C + 30 days: every transition note has expired or exited by `X`, so closing legacy admission at `X` costs no owner who acted in time any service. The legacy stack retires about a day after `X` (about day 32), or, with late notes, when they too are closed or swept (before day 63). A legacy server cannot tell the two kinds of note apart, because a request hides its note ID. The runbook's [30-day transition](../migration-concession-vault.md#the-30-day-transition-for-existing-users) is the schedule.
+
+> **Amendment A3 (leaf-bound exits; circuit `zkapi-v2-concession-v2`, vault revision 4).** Supersedes Amendment A1 and, where they conflict, §3.3 W5, §4.1 to §4.5, §4.9, §5.2 O5, §5.3, §5.5, §6.4 E4, §6.6, §7.1 O5, §7.3, §7.4 and §8. Exits no longer prove Merkle membership: the withdrawal statement publishes the note's leaf `L` (input 3, was `activeRoot`) and its packed fields `F = noteId·2^192 + D·2^64 + e` (input 8, was `noteId`), the leaf is one Poseidon permutation `P("zkapi.v2c.leaf", R, F)[1]` in both circuits, and the vault stores one word per note (`leaf | status << 254`) and compares it with `L` before verifying. The vault keeps no root and no root history; the request tree is its frontier and `currentRoot()` is a computed view. The server admits request proofs at vault-read roots replaced by additions within `request_root_grace_seconds`, with no intervening retirement or reorg (O5'), clearance reads `noteRecord` fresh, and a new `minDeposit` makes leaves lock capital. A broken verifier or setup can now drain the vault in **one** forged transaction (§A3.7). The full text is [Amendment A3](#amendment-a3-leaf-bound-exits) below.
 
 
 Baseline: repository at `ac9be63`, circuit `zkapi-v2-note-bound-v1`. Every "today" figure comes from the five maps in `scratchpad/circuit`. I computed the selectors and topics below with Foundry `cast` against the exact signatures given; implementers must re-derive them and pin them in tests. This revision answers the red-team findings. The appendix records what was done with each one.
@@ -320,7 +322,7 @@ mapping(uint32 => Types.PendingConcession) public pendingConcessions;           
 ```
 
 - **Constructor:** 11 arguments, the existing 10 plus `maxPauseDuration_`. It requires `maxPauseDuration_ ≥ 2 · challengePeriod_`. Everything else is unchanged, including `PROTOCOL_VERSION = 2`, `ROOT_HISTORY_WINDOW = 1 days` and the unread `requestChargeCap`.
-- `pendingWithdrawals[n].finalBalance` always holds the **current** payout. Its `activeRoot` word now stores the proof's `activeRoot` and remains informational.
+- `pendingWithdrawals[n].finalBalance` always holds the **current** payout. Its `activeRoot` word now stores the proof's `activeRoot` and remains informational (superseded: the word is zero, see [Implementation status](#implementation-status), "Escape storage").
 - **Invariant for every pending escape:**
 
   ```
@@ -471,7 +473,7 @@ The deadline, nullifiers and grace do not change, and a defeat is still possible
   - The raise, `retireClosedLeaf`, the side mapping, three events, the kind, `validUntil` and pause checks add about 2.5 KB.
   - Net ≈16.3–17.3 KB at the protocol profile, with at least 7 KB of EIP-170 headroom. The adapter grows by about 0.3 KB.
 - **Reproducible bytecode.** The protocol Foundry profile pins the exact solc version, `via_ir`, 10,000 runs, `bytecode_hash = "none"` and `cbor_metadata = false`, so the runtime code depends only on source, settings, immutables and linked addresses (§10.4).
-- **Poseidon.** The library is unchanged. Relink the deployed library if its runtime codehash equals the compiled `Bn254Poseidon`. Only `deposit` and `retireClosedLeaf` call it now.
+- **Poseidon.** The library is unchanged. Relink the deployed library if its runtime codehash equals the compiled `Bn254Poseidon`. Only `deposit` and `retireClosedLeaf` call it now. (Superseded: the vault now takes a separate `Bn254PoseidonRuntime` contract as its last constructor argument and calls it with `STATICCALL`; see [Implementation status](#implementation-status), "Poseidon runtime".)
 
 ---
 
@@ -1039,14 +1041,14 @@ New linkage stays confined to exits, the exiting note and its last request. Clie
 
 ### 10.4 Vault and adapter deployment (Sepolia, then mainnet)
 1. **`Deploy.s.sol`.**
-   - Require a `POSEIDON_ADDRESS` whose runtime codehash equals the compiled library and link it; otherwise deploy a fresh library and record that address.
-   - Deploy the adapter, then the vault with 11 constructor arguments.
+   - Require a `POSEIDON_ADDRESS` whose runtime codehash equals the compiled library and link it; otherwise deploy a fresh library and record that address. (Superseded: a `POSEIDON_ADDRESS` must hold the `Bn254PoseidonRuntime` whose codehash the setup's `poseidon-runtime.json` pins, otherwise a fresh one is deployed; the vault takes its address as a 12th constructor argument and links nothing.)
+   - Deploy the adapter, then the vault with 11 constructor arguments (superseded: the adapter takes the vault's predicted address and its four key coordinates; see [Implementation status](#implementation-status), "Adapter folding and verify-once").
    - Assert `adapter.CIRCUIT_ID_HASH()` and both VK hashes against the manifest.
    - Write the actual linked addresses and the three runtime codehashes.
 2. **Expected codehashes.** `scripts/expected-codehashes.mjs` computes the expected runtime code:
    - from the pinned-compiler `deployedBytecode`;
    - with the library link applied;
-   - with `immutableReferences` filled from the constructor arguments (keys, periods, adapter address, `maxPauseDuration`, `requestChargeCap`, and the derived `treasuryChangeDelay` and `unpauseClaimGrace`).
+   - with `immutableReferences` filled from the constructor arguments (keys, periods, adapter address, `maxPauseDuration`, `requestChargeCap`, and the derived `treasuryChangeDelay` and `unpauseClaimGrace`), and the adapter's from its vault, chain and keys (see [Implementation status](#implementation-status), "Adapter folding and verify-once").
 
    CI publishes the result so third parties can audit any profile against the ceremony transcript.
 3. **Parameters.**
@@ -1379,6 +1381,93 @@ decide S1 + CircomReduction ─► WP-A ──► WP-B ─┐
 | 37 | low | Startup self-test signs with the production key | **Fixed** | The self-test uses an ephemeral in-memory key. The production path asserts anchor derivation before the signing call. §5.1 |
 ---
 
+## Amendment A3: leaf-bound exits
+
+Circuit `zkapi-v2-concession-v2`, vault revision 4, capability `LEAF_BOUND_EXIT_VERSION() == 1`. Adopted before the ceremony; the development setup was regenerated once for it. Where this section and the text above disagree, this section holds.
+
+### A3.1 The leaf and the withdrawal statement (supersedes §3.3 W5 and the leaf of §3.1)
+
+- **Leaf.** `L = P(d_leaf', R, F)[1]`: one width-3 Poseidon permutation of `(d_leaf', R, F)`, output lane 1, the same compression as a tree node with another capacity domain. `d_leaf' = "zkapi.v2c.leaf"` (`0x7a6b6170692e7632632e6c656166`); the retired `"zkapi.v2.leaf"` sponge domain is not reused. `R = H(d_reg, s, 0)` is unchanged, and `F = n·2^192 + D·2^64 + e` packs the note ID (u32), the deposit (u128) and the bucketed expiry (u64), so `F < 2^224 < p` and the packing is injective over integers and field elements. The capacity domains are `{0 (every sponge), d_node, d_leaf'}`. Vectors: `P(d_leaf', 1, 2^64 + 1)[1] = 0x0038…6d42`; `s = 42, n = 7, D = 5,000,000, e = 4,000,000,000` gives `L = 0x1698…395f` (pinned in zkapi-core, the circuits, Solidity, Go and the SDK).
+- **Withdrawal statement.** Still 16 public inputs (17 IC points), same order; input 3 is `noteLeaf`, input 8 is `noteFields`. The circuit range-checks `n`, `D` and `e`, requires `n·2^192 + D·2^64 + e == input 8`, and `P(d_leaf', H(d_reg, s, 0), input 8)[1] == input 3`; the nullifiers use `n` and W4 uses `D`. There is no path and no root. Kind 2 is the same statement.
+- **Request statement.** Unchanged public inputs; only the leaf inside its membership proof changes.
+- **Shapes.** Request 23,990 → 23,507 constraints, withdrawal 28,772 → 20,545 (both in the 2^15 domain); the withdrawal proving key 5.58 → 4.26 MB.
+
+### A3.2 Vault storage and exits (supersedes §4.1 to §4.5 and Amendment A1)
+
+- **One word per note**, `leaf | status << 254` (`noteRecord(noteId)` reads it): the only fresh slot a deposit writes. A retired note is `Closed` with leaf 0.
+- **Exit checks, before the proof:** `noteFields < 2^224` (`InvalidNoteFields`); the note named by `noteFields >> 192` is `Active` (`NoteNotActive`); its stored leaf equals `inputs.noteLeaf` (`NoteLeafMismatch`); `D ≤ MAX_NATIVE_UNITS` (`InvalidBalance`). After verification `D` and `e` are the note's: the proof binds `L` to `(R(s), F)` and the vault computed `L` from the note's own `(R, F)`. Amounts are narrowed with checked casts.
+- **The escape record** keeps `D` (with the deadline, payout and concession, 64 bits each, in one slot) and `N_{k+1}`'s word keeps `e` above the destination, so an initiation still writes four fresh slots. Finalization pays the treasury `D − finalBalance`.
+- **Expiry.** `claimExpired(noteId, commitment, amount, expiryTs)` and `effectiveExpiry(noteId, commitment, amount, expiryTs)` take the note's preimage and recompute the leaf (`effectiveExpiry` returns 0 for an unknown, retired or mismatched note). The pause adjustment comes from **pause epochs** (`{firstNoteId, totalPausedDuration}` per unpause that followed a deposit; `pausedBefore(n)`), and a defeat's grace from `graceUntil[n]`: the active-clock expiry is `max(e − pausedBefore(n), graceUntil[n])`, the same function as revision 3's override. A defeat first compares with `max(e − totalPausedDuration, graceUntil[n])` and reads no epoch when that already covers the grace (the common case).
+- **Deposit floor.** `minDeposit` is a constructor immutable (1 to 2^53 − 1; `Deploy.s.sol` default 1,000,000 gwei); `deposit` reverts `DepositTooSmall` below it.
+- **Removed:** `knownRoots`, `isKnownRoot`, `ROOT_HISTORY_WINDOW`, `notes()`, `UnknownRoot`; the events carry no root word. The old exit, `claimExpired` and `effectiveExpiry` selectors are gone, so stale clients fail closed.
+
+### A3.3 The request tree (supersedes §4.5's tree text and §6.6)
+
+- The vault keeps the frontier only: an append at index `k` hashes `trailing_ones(k)` times (one on average; none for even `k`), and `filled[t]` is first written at `k = 2^t − 1`. `currentRoot()` keeps its selector and is computed (at most 32 compressions, about 0.5M gas in an `eth_call`); a historical root is that call at the block.
+- `noteLeaves(start, count)` and `frontier()` let anyone rebuild the tree from state. A multi-page read, the closing `nextNoteId()` and `currentRoot()` must all be pinned to one block hash (EIP-1898); pages of 2,048 leaves cost about 5.2M gas each. The request-path rebuild (indexer `--bootstrap-from-state`, zkapi-client, the SDK) reads a recent `latest`/`safe` block: it is a state read within the node's recent-state window, not an archive read.
+- `retireClosedLeaf(noteId, siblings)` keeps its ABI but reads only `siblings[0..ℓ)`, `ℓ = msb(noteId XOR nextNoteId)`, and checks them against `filled[ℓ]` (`StaleRoot` otherwise); at `ℓ = 0` it reads none. Callers zero-fill the rest. A retirement elsewhere in the same subtree makes a pending one revert `StaleRoot`: the challenger refreshes the path and retries once at once, then backs off.
+- `recordRoot()` is an optional, permissionless audit trail: it stores the computed root with the note count and block (`recordedRoot(root)`, first record kept) and emits `RootRecorded`. Nothing in exits, requests, clearance, the paymaster, the server or the clients depends on it.
+
+### A3.4 Request admission O5' (supersedes §5.2 O5 and §7.1 O5)
+
+A root change now costs a deposit (about 68k–137k gas for the common indices) or a cheap retirement, so the exact-current-root rule would let one deposit per block starve requests. The server instead:
+
+- polls the latest block every `root_poll_interval_ms`, reads `currentRoot()` and `nextNoteId()` at that block hash, and keeps every distinct vault root with its block and the time it was replaced;
+- admits a request whose `active_root` is the latest vault root, or a vault-read root replaced by additions no more than `request_root_grace_seconds` ago (default 60, range 0 to 600; 0 restores the exact rule); otherwise `StaleRoot` with the latest root;
+- answers `RootUnavailable` when it has had no successful vault read for `root_max_staleness_seconds` (60), the latest block is older than that bound, or the RPC head regresses;
+- admits only roots it read from the vault, reads `retirementEpoch()` at the same canonical block hash, drops every non-current root when that epoch changes or a recorded block hash is no longer canonical, and caps the window at `grace / poll + 1` entries (at most 1,024); a regressing RPC head or an outdated latest-block timestamp makes every root unavailable until recovery;
+- treats the indexer as health only: a disagreement between the indexer's `(root, block_hash)` and `currentRoot()` at that hash is a warning, the `zkapi_indexer_root_disagreement` metric and a degraded `/health`, never a refusal.
+
+Clients still check their path's root against `currentRoot()` through their own provider before proving, so the window absorbs only in-flight lag. The root a request uses reveals the time its path was fetched to within G seconds, which is weaker than the public `requestTime`.
+
+### A3.5 Clearance (supersedes §5.3)
+
+After the Groth16 verification of the kind-2 proof, the server reads `noteRecord(note_id)` fresh on every clearance (one `eth_call`, no cache): the leaf must equal the statement's `note_leaf` (else 409 `note_leaf_mismatch`) and the status must be `Active` (else 409 `note_not_active`). The clearance root window and its flag are gone; the old `--clearance-root-window-seconds` / `ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS` fail startup with a migration message.
+
+### A3.6 Clients (supersedes §6.4 E4 and §6.6)
+
+- An exit needs only `s, n, D, e` (every wallet and exit kit persists them), the newest state and the vault's current flags: no path, root, indexer, log scan or known-root read. Old persisted deposit-time paths are read and ignored.
+- Request paths come from the indexer or from a `noteLeaves` rebuild at a pinned recent block, checked against `currentRoot()`.
+- Deposits refuse amounts below `minDeposit()` and set an explicit gas limit: `E = eth_estimateGas` at the current `nextNoteId = m`, plus `16,500` per extra trailing-ones level within the next 64 indices, `7,500` when `t(m) = 0` and some index in the window has `t ≥ 1`, and `fresh_slot_gas − 5,000` when the window contains a first write (`2^j − 1` in `(m, m+64)`), times 1.2, capped at 1.5M. `fresh_slot_gas` is pinned per network in the deployment profile (22,100 on mainnet rules, 110,000 on Sepolia). Third-party depositors without that policy send at least 650,000 gas on mainnet pricing and 850,000 where a fresh slot costs about 110,000; the deepest index (`2^31 − 1`) measures 566,000 and 741,800 respectively.
+- Recovery without `notes()`: from `(s, n, D)` the client tries each day-bucketed expiry from the plan's creation time to now and accepts the candidate whose leaf equals `noteRecord(n).leaf`; a receipt's `NoteDeposited` gives `e` directly (still checked). A slot whose status is not 0 and whose leaf matches no candidate is a slot conflict.
+
+### A3.7 Security (amends §7.3, §7.4 and §8)
+
+- **Soundness.** If the vault accepts an exit for note `n`, Groth16 knowledge soundness (A1, A2) extracts `L_n = P(d_leaf', reg(s), F')` with `F'` the packing of range-checked `(n', D', e')`; collision resistance of one permutation with a fixed capacity domain gives `reg(s) = R_n` and `F' = F_n`, and injective packing gives `n' = n`, `D' = D_n`, `e' = e_n`. W3/W4, W7 and W8/W10 hold as before. Retirement zeroes only Closed leaves; a zero leaf never matches and deposits revert on a zero leaf.
+- **Withholding.** Exits depend on no operator data. Clearance cannot be refused on root grounds (the operator can still refuse outright, and the user escapes). Request admission no longer depends on the indexer.
+- **Request-root barrier (§7.4).** `retireClosedLeaf` increments `retirementEpoch()`. On the next successful root poll, the server discards every pre-retirement root, with no grace across that removal. The remaining observation delay is the polling interval and RPC latency; lack of a fresh read fails closed at `root_max_staleness_seconds`. A regressing RPC cannot revive pre-removal roots, and a reorg drops all non-current roots.
+- **Blast radius under a broken verifier or setup (A2).** In revision 3 a forged exit paid at most the stored `D_n` of its note, so draining the vault took one forged exit per Active note (about 150 per 60M-gas block), and the owner's pause stopped `mutualClose` and initiations for up to `maxPauseDuration`. **In revision 4, `D` comes from the proof-bound `noteFields`, so one forged `mutualClose` with `D = finalBalance = the vault's balance` drains everything in a single transaction.** Either way a broken verifier also forges request proofs and defeats and the vault has no rescue path, so the eventual loss is total in both; revision 4 removes the rate limit. Mitigations: the ceremony, the VK, codehash and setup pins every client and `Deploy.s.sol` check, `release_policy_check`, the `D ≤ MAX_NATIVE_UNITS` bound and checked casts. A per-note cap can be restored without touching the circuit by passing the commitment `R` to exits and recomputing the leaf on chain (about +17k gas per exit and in paymaster validation; not adopted).
+- **Privacy.** The request inputs are unchanged and the anonymity set is the non-retired leaves at an admitted root. Withdrawals and kind-2 proofs reveal `n, D, e, L`, all public through `NoteDeposited`. With no `knownRoots`, an operator cannot partition users by historical roots.
+- **Liveness and griefing.** Churn no longer starves admission (O5'); each spam leaf locks at least `minDeposit` (0.001 ETH by default), forfeited at expiry or recovered only through an exit. A front-run can push a deposit onto a dearer index, which the gas policy and the static floors cover; an out-of-gas deposit reverts with no state change. Retirement contention is bounded by the number of Closed notes in the subtree, each griefing retirement consuming one; the signer's retirement budget is 4 per day.
+- **History expiry.** Exits need no history given `(s, n, D, e)`. A holder of only `(s, n)` needs `D` from the receipt, the log or the operator (revision 3's `notes(n)` supplied it). Operator sweeps need `(R, D, e)` per note, which the indexer's checkpoint v4 keeps from `NoteDeposited`; a state-only bootstrap cannot recover them for older notes.
+
+### A3.8 Measured (dev setup, EIP-2929 pricing)
+
+Separate cold transactions (`protocol/contracts/test/GasBaseline.t.sol`), revision 3 on the left:
+
+| Operation | Revision 3 | Revision 4 |
+|---|---|---|
+| `deposit` #0 / #2 | 605,598 / 573,516 | 68,327 / 68,327 |
+| `deposit` #255 / #1023 (first writes of `filled[8]`, `filled[10]`) | 605,442 / 609,678 | 213,318 / 243,986 |
+| `deposit`, average of the first 64 | 579,889 | 87,633 |
+| `mutualClose` (relayed) | 307,547 | 312,073 |
+| `initiateEscapeWithdrawal` | 367,002 | 369,651 |
+| `challengeEscapeWithdrawal` (no grace / grace written) | 286,403 | 284,299 / 309,220 |
+| `raiseEscapeConcession` | 276,913 | 277,437 |
+| `finalizeEscapeWithdrawal` (net of refunds) | 56,613 | 56,681 |
+| `claimExpired` (no epoch / 1 / 32 epochs) | 50,503 | 62,361 / 64,862 / 76,642 |
+| `retireClosedLeaf` (the same closed note) | 939,846 | 71,960 (level 1) |
+| `retireClosedLeaf`, levels 0 / 4 / 8 / 16, unused siblings zero-filled | n/a | 37,678 / 151,928 / 258,540 / 471,788 |
+| `recordRoot` | n/a | 465,036 (2 notes) to 542,904 |
+
+The exits above are of the fixture's notes 0 and 1, whose revision-3 statements skipped a scalar multiplication (a `noteId` input of 0 or 1); `noteFields` always takes one (about 6,200 gas), so for any note ID of 3 or more the revision-3 exits were about 6,200 gas dearer than listed and revision 4 is cheaper by the removed `knownRoots` read. The pinned snapshot (`snapshots/concession-exit-gas.json`, deposits inside the measured test) is 366,851 (escape), 282,199 (defeat), 272,137 (raise), 331,773 (close), 80,381 (finalize) and 84,561 (claim). The vault's runtime is 20,810 bytes (18,833 in revision 3).
+
+### A3.9 Migration
+
+Revision 4 is a new vault with a new setup; revision-3 keys, statements and profiles are refused. Revision-3 deposits stay in the revision-3 vault and exit there. The runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
+
+---
+
 ## Implementation status
 
 Work packages A to E are implemented with the `dev` setup (`protocol/setup/v2-concession-dev`). No revision-3 vault is deployed: the SDK and clientd profiles are `deployment_status: "not_deployed"` placeholders, which every build and client refuses. G-SETUP, the external review, the Sepolia drill and soak, and the mainnet rollout (§10.2, §10.7 A step 4 onwards) have not run. The operator runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
@@ -1392,16 +1481,16 @@ The implementation differs from the text above as follows. Each item names the s
 | Request circuit | ≈31,679 constraints | 31,670 constraints, 12 public inputs, 31,378 witnesses, domain 2^15 |
 | Withdrawal circuit | ≈36,458 constraints | 36,452 constraints, 16 public inputs, 36,001 witnesses, domain 2^16 |
 | Native prove (Apple Silicon, release, median of 3) | n/a | request 356 ms, escape 395 ms; verify 1.5 ms |
-| `initiateEscapeWithdrawal` (transaction gas) | 0.55–0.62M | 574,544 |
-| Defeat | 0.33–0.40M | 374,881 |
-| Raise | ≈0.33M | 335,128 |
-| `mutualClose` | 0.40–0.45M | 427,837 |
-| `finalizeEscapeWithdrawal` | 30–206k | 91,898 |
-| `claimExpired` | 0.06–0.15M | 77,509 |
+| `initiateEscapeWithdrawal` (transaction gas) | 0.55–0.62M | 364,202 |
+| Defeat | 0.33–0.40M | 284,281 |
+| Raise | ≈0.33M | 271,591 |
+| `mutualClose` | 0.40–0.45M | 327,247 |
+| `finalizeEscapeWithdrawal` | 30–206k | 80,291 |
+| `claimExpired` | 0.06–0.15M | 72,703 |
 | `retireClosedLeaf` | ≈6.0M | ≈5.95M; a duplicate that reverts `StaleRoot` costs ≈5.9M |
-| Vault runtime size | 16.3–17.3 KB | 17,431 B (7,145 B under EIP-170); adapter 7,343 B, Poseidon 9,723 B |
+| Vault runtime size | 16.3–17.3 KB | 18,651 B (5,925 B under EIP-170); adapter 13,154 B, Poseidon 9,723 B |
 
-The gas figures are pinned in `protocol/contracts/snapshots/concession-exit-gas.json`, with a ceiling of 250k added for `finalizeEscapeWithdrawal`. All are dev-setup figures; G-SETUP replaces the keys, adapter, fixtures and snapshot.
+The gas figures are pinned in `protocol/contracts/snapshots/concession-exit-gas.json`, with a ceiling of 250k added for `finalizeEscapeWithdrawal`. They include the folded adapter and the escape storage below; WP-B first measured 574,544 for the initiation, 374,881 for the defeat, 335,128 for the raise, 427,837 for the close, 91,898 for the finalization and 77,509 for the claim. All are dev-setup figures under EIP-2929 storage pricing; G-SETUP replaces the keys, adapter, fixtures and snapshot.
 
 ### Circuits, setup and key policy (§3, §10.1, §10.2)
 
@@ -1416,9 +1505,13 @@ The gas figures are pinned in `protocol/contracts/snapshots/concession-exit-gas.
 ### Contracts and deployment (§4, §10.4)
 
 - **Amendment A1.** `isKnownRoot` returns `knownRoots[root]`, every root the vault ever set; `rootRetiredAt` is informational. `ROOT_HISTORY_WINDOW()` stays 86400 and is now only a probe value and the default bound of off-chain root windows.
+- **Escape storage (§4.1, §4.2 step 10, §4.3 step 6, §4.6).** The getters keep their selectors, shapes and values, except that `pendingWithdrawals` word 1 (`activeRoot`) is always zero: the vault never read it, and the escape's calldata carries the proof's root. `usedNullifiers` and `challengedNullifiers` are views over one word per nullifier (bit 0 used, bit 1 challenged), and a pending escape keeps the rest of its record in the two words it consumes anyway: `N`'s word holds `N⁺` and `N⁺`'s word the destination, above the flags. The record by note holds only `N`, the deadline and the two amounts (96 bits each; both are at most `depositAmount ≤ MAX_NATIVE_UNITS < 2^53`, checked before the store). An escape therefore writes four fresh slots instead of seven, and a defeat none instead of one (`challengedNullifiers[N]` is a bit of `N`'s word). A defeat rewrites `N`'s word to the challenged flag alone and clears `N⁺`'s; a finalization leaves both words (only the record by note says whether an escape is pending). The §4.6 table and every check order and revert are unchanged. Measured with the committed-state method (every account and slot cold, a funded treasury): `initiateEscapeWithdrawal` 438,009 → 367,002 transaction gas, the defeat 304,490 → 286,381 (net of refunds), the raise 278,855 → 276,891 and the finalization 61,504 → 56,591.
+- **Adapter folding and verify-once (§4, §10.4 items 1 and 2).** The generated `Groth16ProofAdapter` serves one vault. Its constructor `(vault, stateSigningKeyX, stateSigningKeyY, clearanceSigningKeyX, clearanceSigningKeyY)` records `block.chainid`, keeps the vault and the four coordinates as public immutables (`foldedChainId`, `foldedVault`, `folded*SigningKey*`), and folds the seven inputs every proof of that vault shares (protocol version 2, the chain, the vault, the keys) into the first IC point (`foldedRequestIc0X/Y`, `foldedWithdrawalIc0X/Y`), range-checking each constant. A statement whose words all equal them takes the fast path: four of a request's and six of a withdrawal's scalar multiplications fewer. Any other statement takes the generic path over every input, so the adapter accepts exactly the proofs of its keys, whatever it was folded for. A wrong fold only costs gas, and `Deploy.s.sol` refuses one before it writes the manifest. The verifier is one straight-line assembly body that keeps the ABI decoder's narrow-field checks and reverts `InvalidProof()`. `verifyWithdrawalOnce` (the gasless paymaster's call in validation) always verifies in full, then records the exit in transient storage at `keccak256(destination ‖ keccak256(inputs ‖ proof))`, a slot ERC-7562 associates with the sender (STO-021). `assertValidWithdrawal` of byte-identical inputs and proof later in the same transaction (the vault's call in execution) returns after that lookup. `IZkApiProofAdapter` makes the record part of the interface, and the adapter reports it through ERC-165 (`supportsInterface`), which the paymaster's constructor requires. The adapter's runtime code depends on its vault, chain and keys, so `scripts/expected-codehashes.mjs` fills those immutables and sums the folded points on BN254 itself. Measured with the committed-state method: the adapter's frame of a close 276,950 → 217,014 gas and of a request 274,774 → 228,514, and a sponsored close 905,292 → 530,598 and escape 1,080,542 → 643,294 (`handleOpsReal*`).
+- **Gas schedule (§1.5, §4.9, §10.7 B).** Every figure here, and every gas constant of the gasless paymaster, is measured under EIP-2929 storage pricing. EIP-8037 prices a fresh slot at about 110,000 gas instead of 22,100, and Sepolia runs it: an escape, which writes four fresh slots, costs roughly twice as much there. The paymaster's constructor refuses such a chain (`FRESH_SLOT_GAS_BOUND`, 25,000), so the Sepolia vaults deploy without it until its policy is derived under EIP-8037 (`docs/deployment.md`, "Gas schedule").
 - **Two-stage deployment manifest (§10.4 items 1 and 4).** `Deploy.s.sol` writes only a provisional manifest, `$OUTPUT_PATH.pending`, with `deploymentStatus` `"pending"` (or `"simulated"` without `--broadcast`) and `deployBlockLowerBound`. `node scripts/expected-codehashes.mjs --deployment $OUTPUT_PATH.pending --rpc $RPC_URL --finalize $OUTPUT_PATH` then reads the creation receipts from forge's broadcast log, checks each creation, the three runtime codehashes, the owner and the treasury on chain, and only then writes the final manifest with `deploymentStatus: "deployed"`, `deployBlock` (the vault's creation block) and `deployTransactions`. `deploy_block` (§10.3, §10.7 B step 2.1) is that `deployBlock`. serverd, `zkapi db init`, the companion, the SDK build and clientd refuse a `pending` or `simulated` manifest. Finalize needs forge's broadcast log (or `--broadcast-log`), defaults to `--confirmations 1`, and checks owner and treasury only when it runs; `--check --rpc` later audits codehashes only.
 - **Setup policy (§10.2 "no single-party setup").** Enforced by `SetupPolicy` in `Deploy.s.sol`: off local chains a `dev` or `rehearsal` setup needs `ALLOW_DEV_SETUP=1` (recorded as `allowDevSetup`), mainnet included since v0.2 (a single-party vault trusts its setup's generator; see `docs/deployment.md`, "Single-party setup"), and an `mpc-1` setup must have the verifying keys of the committed `protocol/setup/v2-concession/manifest.json`. Local chains (31337, 1337) accept any setup id.
-- **Deployment script.** It links `Bn254Poseidon` itself; requires `OWNER`, `TREASURY`, `SETUP_MANIFEST` and `MAX_PAUSE_DURATION_SECONDS` off local chains; checks the signing keys (prime-order subgroup, distinct, not the published development keys off local chains); and writes key coordinates as decimal strings. The demo Foundry profile uses the protocol profile's compiler settings, so both build the same runtime code.
+- **Poseidon runtime.** The vault's Poseidon is `Bn254PoseidonRuntime` (`protocol/contracts/src/poseidon/`), generated by `zkapi-proof` with the setup and compiled with solc's legacy pipeline: one inline-assembly block with the permutation fully unrolled in the scaled sparse form with lazy reduction, about 12,700 gas per permutation instead of 23,400, so a deposit costs about 584k gas (frame) instead of 981k and `retireClosedLeaf` about 902k instead of 1.64M. The vault takes its address as its last constructor argument (an immutable, `poseidon()`), checks it answers `compress(DOMAIN_NODE, 0, 0)` with the first zero hash, and calls it with `STATICCALL`; nothing is linked, and the hasher cannot touch the vault's state. `protocol/formal` proves in Lean that its `permute` body computes zkAPI's Poseidon for all inputs, and `Deploy.s.sol` requires its runtime codehash to be the setup's `poseidon-runtime.json` pin.
+- **Deployment script.** It deploys the Poseidon runtime (formerly: links `Bn254Poseidon` itself); requires `OWNER`, `TREASURY`, `SETUP_MANIFEST` and `MAX_PAUSE_DURATION_SECONDS` off local chains; checks the signing keys (prime-order subgroup, distinct, not the published development keys off local chains); and writes key coordinates as decimal strings. The demo Foundry profile uses the protocol profile's compiler settings, so both build the same runtime code.
 - **Tests (§11 WP-B).** Besides the listed tests: closed-note re-exit tests (mock, real proofs and invariant), tampered-statement real-proof tests, setup-policy tests, an Anvil broadcast-and-finalize scenario in CI, and a shared golden vector (`protocol/contracts/test/fixtures/withdrawal-golden.json`, a real escape conceding 100,000 and a real close) that the Rust, JS and Go encoders reproduce byte for byte and that `scripts/check-withdrawal-golden.mjs` submits to an Anvil vault. `crates/zkapi-serverd/tests/fixtures/check-calldata-golden.sh` pins every selector, getter layout and event the server, challenger, indexer, SDK and clientd read against the real contracts.
 
 ### Server, challenger and indexer (§5)

@@ -22,11 +22,11 @@ type withdrawalWizardFixture struct {
 	resume                                                           func(int, string, uint64) (zkapi.AddressWithdrawalStatus, error)
 	confirm                                                          func(string, uint64, string) (zkapi.AddressWithdrawalStatus, error)
 	acceptances                                                      []bool
-	// The gasless pre-flight (unavailable unless set) and the fee mode each
+	// The gasless pre-flight (unavailable unless set) and the options each
 	// quote asked for.
 	availability      *zkapi.GaslessAvailability
 	availabilityCalls int
-	fees              []string
+	options           []guidedQuoteOptions
 }
 
 func withdrawalWizardQuote() zkapi.AddressPaymentQuote {
@@ -37,7 +37,7 @@ func withdrawalWizardQuote() zkapi.AddressPaymentQuote {
 
 func withdrawalWizardState(phase string) zkapi.AddressWithdrawalStatus {
 	q := withdrawalWizardQuote()
-	s := zkapi.AddressWithdrawalStatus{Phase: phase, BillingAsset: "native_eth", ChainID: q.ChainID, DeploymentID: q.DeploymentID, Address: q.Address, NoteID: q.NoteID, Amount: q.Amount, PrivateBalance: q.Amount, ETHBalance: q.BalanceWei}
+	s := zkapi.AddressWithdrawalStatus{Phase: phase, BillingAsset: "native_eth", ChainID: q.ChainID, DeploymentID: q.DeploymentID, Address: q.Address, NoteID: q.NoteID, Amount: q.Amount, PrivateBalance: q.Amount, ETHBalance: q.BalanceWei, NewWithdrawalFees: "wallet"}
 	if phase != "ready" && phase != "no_note" {
 		s.Destination = q.Destination
 	}
@@ -68,10 +68,10 @@ func (f *withdrawalWizardFixture) GaslessAvailability(context.Context) (zkapi.Ga
 	}
 	return zkapi.GaslessAvailability{Reason: "gasless_unavailable"}, nil
 }
-func (f *withdrawalWizardFixture) Quote(_ context.Context, destination string, note uint64, retry string, accept bool, fees string) (zkapi.AddressPaymentQuote, error) {
+func (f *withdrawalWizardFixture) Quote(_ context.Context, destination string, note uint64, retry string, o guidedQuoteOptions) (zkapi.AddressPaymentQuote, error) {
 	f.quoteCalls++
-	f.acceptances = append(f.acceptances, accept)
-	f.fees = append(f.fees, fees)
+	f.acceptances = append(f.acceptances, o.acceptUnsettledRequestRisk)
+	f.options = append(f.options, o)
 	if f.quote != nil {
 		return f.quote(f.quoteCalls, destination, note, retry)
 	}
@@ -129,7 +129,7 @@ func TestGuidedWithdrawalWaitsForFeesAndApprovesFreshQuote(t *testing.T) {
 		}
 		return withdrawalWizardState("withdrawal_pending"), nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if u.asks != 1 || u.continues != 1 || u.confirms != 0 || f.quoteCalls != 4 || f.approveCalls != 1 || f.resumeCalls != 1 {
@@ -149,7 +149,7 @@ func TestGuidedWithdrawalWaitsForFeesAndApprovesFreshQuote(t *testing.T) {
 func TestGuidedWithdrawalFundedNeedsNoPaymentQR(t *testing.T) {
 	f := &withdrawalWizardFixture{}
 	u := &fundingWizardUI{answers: []string{withdrawalTestDestination}, confirmations: []bool{true}}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(u.String(), "Payment URI") || strings.Contains(u.String(), "receiving account") || f.quoteCalls != 2 || f.approveCalls != 1 {
@@ -171,7 +171,7 @@ func TestGuidedWithdrawalAsksAgainForTheVaultAddress(t *testing.T) {
 		q.ID = fmt.Sprintf("%064x", call)
 		return q, nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if u.asks != 2 || f.approveCalls != 1 || !strings.Contains(u.String(), "cannot be the zkAPI vault contract") {
@@ -193,7 +193,7 @@ func TestGuidedWithdrawalDeclineOrCancellationCannotApprove(t *testing.T) {
 					return q, nil
 				}
 			}
-			err := guidedWithdrawal(ctx, f, u, func(ctx context.Context) error { stop(); return ctx.Err() }, "")
+			err := guidedWithdrawal(ctx, f, u, func(ctx context.Context) error { stop(); return ctx.Err() })
 			if err == nil || f.approveCalls != 0 || f.resumeCalls != 0 {
 				t.Fatalf("err=%v approvals=%d resumes=%d", err, f.approveCalls, f.resumeCalls)
 			}
@@ -229,7 +229,7 @@ func TestGuidedWithdrawalRejectsQuoteIdentityChangesAfterEnter(t *testing.T) {
 				}
 				return q, nil
 			}
-			if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err == nil || f.approveCalls != 0 {
+			if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err == nil || f.approveCalls != 0 {
 				t.Fatalf("mutation approved: %v", err)
 			}
 		})
@@ -252,7 +252,7 @@ func TestGuidedWithdrawalFeeIncreaseOrBalanceLossRequiresNewEnter(t *testing.T) 
 				}
 				return q, nil
 			}
-			if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+			if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 				t.Fatal(err)
 			}
 			if u.continues != 2 || f.approveCalls != 1 {
@@ -279,7 +279,7 @@ func TestGuidedWithdrawalSettlementWaitUsesOnlyUnsignedQuotes(t *testing.T) {
 		}
 		return withdrawalWizardQuote(), nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Count(u.String(), "Waiting for your previous inference") != 1 || f.quoteCalls != 4 || f.resumeCalls != 1 || f.approveCalls != 1 {
@@ -300,7 +300,7 @@ func TestGuidedWithdrawalZeroBalanceStillClosesNote(t *testing.T) {
 		s.Amount = 0
 		return s, nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if f.approveCalls != 1 {
@@ -320,7 +320,7 @@ func TestGuidedWithdrawalLostApprovalReplyResumesOnlySavedTransaction(t *testing
 	f.approve = func(string) (zkapi.AddressWithdrawalStatus, error) {
 		return zkapi.AddressWithdrawalStatus{}, errors.New("lost reply")
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if f.approveCalls != 1 || f.quoteCalls != 2 || f.resumeCalls != 1 {
@@ -339,7 +339,7 @@ func TestGuidedWithdrawalSignedRecoveryNeverPromptsOrRetriesRevert(t *testing.T)
 			f.resume = func(int, string, uint64) (zkapi.AddressWithdrawalStatus, error) {
 				return withdrawalWizardState(phase), nil
 			}
-			err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, "")
+			err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll)
 			if (err != nil) != (phase == "reverted") || u.asks != 0 || u.continues != 0 || f.quoteCalls != 0 || f.approveCalls != 0 || f.resumeCalls != 1 {
 				t.Fatalf("unexpected recovery: err=%v service=%+v", err, f)
 			}
@@ -365,7 +365,7 @@ func TestGuidedWithdrawalSignedRecoveryRejectsChangedTransactionOrWallet(t *test
 			mutate(&s)
 			return s, nil
 		}
-		if err := guidedWithdrawal(context.Background(), f, &fundingWizardUI{}, immediateWizardPoll, ""); err == nil {
+		if err := guidedWithdrawal(context.Background(), f, &fundingWizardUI{}, immediateWizardPoll); err == nil {
 			t.Fatal("accepted changed saved operation")
 		}
 	}
@@ -383,7 +383,7 @@ func TestGuidedWithdrawalInterruptedUnsignedApprovalStops(t *testing.T) {
 	f.approve = func(string) (zkapi.AddressWithdrawalStatus, error) {
 		return zkapi.AddressWithdrawalStatus{}, errors.New("lost reply")
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err == nil || f.approveCalls != 1 || f.resumeCalls != 0 {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err == nil || f.approveCalls != 1 || f.resumeCalls != 0 {
 		t.Fatalf("unsafe continuation: err=%v %+v", err, f)
 	}
 }
@@ -411,7 +411,7 @@ func TestGuidedWithdrawalRevertedRetryBindsFailedHashAndCannotRetryAgain(t *test
 		s.TransactionHash = "0x" + strings.Repeat("c", 64)
 		return s, nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err == nil || f.approveCalls != 1 || f.quoteCalls != 2 || f.resumeCalls != 1 {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err == nil || f.approveCalls != 1 || f.quoteCalls != 2 || f.resumeCalls != 1 {
 		t.Fatalf("unsafe repeat: err=%v %+v", err, f)
 	}
 }
@@ -433,7 +433,7 @@ func TestGuidedWithdrawalQRRefreshOnlyWhenBufferExhausted(t *testing.T) {
 		}
 		return q, nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Count(u.String(), "Scan with an Ethereum wallet") != 2 || strings.Count(u.String(), "Waiting for ETH:") != 0 {
@@ -449,7 +449,7 @@ func TestGuidedWithdrawalRejectsMalformedFeeQuoteWithoutPaymentInstructions(t *t
 		q.RequiredTotalWei = new(big.Int).Lsh(big.NewInt(1), 257).String()
 		return q, nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err == nil || strings.Contains(u.String(), "Payment URI") || f.approveCalls != 0 {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err == nil || strings.Contains(u.String(), "Payment URI") || f.approveCalls != 0 {
 		t.Fatalf("malformed payment shown: err=%v %s", err, u.String())
 	}
 }
@@ -460,7 +460,7 @@ func TestGuidedWithdrawalSavedUnsignedDestinationNeedsNoInput(t *testing.T) {
 	f.status = func(int) (zkapi.AddressWithdrawalStatus, error) {
 		return withdrawalWizardState("waiting_funds"), nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if u.asks != 0 || u.continues != 1 || f.approveCalls != 1 {
@@ -474,7 +474,7 @@ func TestGuidedWithdrawalEmptyOrCompletedWalletNeverTransacts(t *testing.T) {
 			f := &withdrawalWizardFixture{}
 			u := &fundingWizardUI{}
 			f.status = func(int) (zkapi.AddressWithdrawalStatus, error) { return withdrawalWizardState(phase), nil }
-			if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+			if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 				t.Fatal(err)
 			}
 			if u.asks != 0 || u.continues != 0 || f.quoteCalls != 0 || f.approveCalls != 0 || f.resumeCalls != 0 {
@@ -500,7 +500,7 @@ func TestGuidedWithdrawalBalanceLostDuringApprovalWaitsAndNeedsNewEnter(t *testi
 		}
 		return q, nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if u.continues != 2 || f.approveCalls != 2 || f.resumeCalls != 0 {
@@ -517,7 +517,7 @@ func TestGuidedWithdrawalTransientQuoteFailuresPrintOnce(t *testing.T) {
 		}
 		return withdrawalWizardQuote(), nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Count(u.String(), "Could not refresh withdrawal fees") != 1 || f.approveCalls != 1 || f.resumeCalls != 1 {
@@ -536,7 +536,7 @@ func TestGuidedWithdrawalInterruptedRecoveryReadsRevertBeforeResume(t *testing.T
 	f.resume = func(int, string, uint64) (zkapi.AddressWithdrawalStatus, error) {
 		return zkapi.AddressWithdrawalStatus{}, errors.New("lost reply")
 	}
-	if err := guidedWithdrawal(context.Background(), f, &fundingWizardUI{}, immediateWizardPoll, ""); err == nil || f.resumeCalls != 1 || f.quoteCalls != 0 || f.approveCalls != 0 {
+	if err := guidedWithdrawal(context.Background(), f, &fundingWizardUI{}, immediateWizardPoll); err == nil || f.resumeCalls != 1 || f.quoteCalls != 0 || f.approveCalls != 0 {
 		t.Fatalf("must inspect revert before another recovery call: %v %+v", err, f)
 	}
 }
@@ -556,7 +556,7 @@ func TestGuidedWithdrawalConfirmSeparatePayoutPreservesBinding(t *testing.T) {
 		state.TransactionHash = hash
 		return state, nil
 	}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
 	if f.confirmCalls != 1 || f.quoteCalls != 0 || f.approveCalls != 0 || f.resumeCalls != 0 {
@@ -593,7 +593,7 @@ func TestGuidedWithdrawalStopsWithTheRemedyBeforeTheNoteExpires(t *testing.T) {
 		return zkapi.AddressPaymentQuote{}, unsettledRequestRefusal()
 	}
 	u := &fundingWizardUI{answers: []string{withdrawalTestDestination}}
-	err := guidedWithdrawal(ctx, f, u, immediateWizardPoll, "")
+	err := guidedWithdrawal(ctx, f, u, immediateWizardPoll)
 	if managementErrorCode(err) != "unsettled_request_state" || !strings.Contains(err.Error(), "waits for a settled note state") || !strings.Contains(err.Error(), expiry.UTC().Format(time.RFC3339)) {
 		t.Fatalf("remedy not shown: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestGuidedWithdrawalAsksBeforeSendingTheOwnershipProofForAnExpiredNote(t *t
 			return q, nil
 		}
 		u := &fundingWizardUI{answers: []string{withdrawalTestDestination, answer}, confirmations: []bool{true}}
-		err := guidedWithdrawal(ctx, f, u, immediateWizardPoll, "")
+		err := guidedWithdrawal(ctx, f, u, immediateWizardPoll)
 		cancel()
 		if !strings.Contains(u.String(), "burns the note's nullifier") || u.asks != 2 {
 			t.Fatalf("%q: the risk was not explained before asking: %s", answer, u.String())
@@ -646,7 +646,7 @@ func TestGuidedWithdrawalAsksBeforeSendingTheOwnershipProofForAnExpiredNote(t *t
 		return zkapi.AddressPaymentQuote{}, unsettledRequestRefusal()
 	}
 	u := &fundingWizardUI{answers: []string{withdrawalTestDestination, "send"}}
-	err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, "")
+	err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll)
 	if managementErrorCode(err) != "unsettled_request_state" || f.quoteCalls != 2 || u.asks != 2 {
 		t.Fatalf("a refusal after the acknowledgement: %v %+v", err, f)
 	}
@@ -681,7 +681,7 @@ func TestGuidedWithdrawalAsksForTheAcknowledgementAtAClearanceReservedState(t *t
 			return q, nil
 		}
 		u := &fundingWizardUI{answers: []string{withdrawalTestDestination, answer}, confirmations: []bool{true}}
-		err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, "")
+		err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll)
 		if !strings.Contains(u.String(), "already holds a withdrawal clearance") || !strings.Contains(u.String(), "burns the note's nullifier") || u.asks != 2 {
 			t.Fatalf("%q: %s", answer, u.String())
 		}
@@ -706,7 +706,7 @@ func TestGuidedWithdrawalStopsAtAMissingReceiptJournal(t *testing.T) {
 		return zkapi.AddressPaymentQuote{}, &managementError{message: "zkAPI receipt_journal_missing: ... give them this nullifier: 0x1234ab", code: "receipt_journal_missing"}
 	}
 	u := &fundingWizardUI{answers: []string{withdrawalTestDestination}}
-	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error { return errors.New("waited") }, "")
+	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error { return errors.New("waited") })
 	if managementErrorCode(err) != "receipt_journal_missing" || !strings.Contains(err.Error(), "0x1234ab") || f.quoteCalls != 1 {
 		t.Fatalf("%v %+v", err, f)
 	}
@@ -720,7 +720,7 @@ func TestGuidedWithdrawalPointsAtTheEscapeWhenAMutualCloseIsImpossible(t *testin
 		return zkapi.AddressPaymentQuote{}, &managementError{message: "zkAPI withdrawal needs an escape", code: "escape_required"}
 	}
 	u := &fundingWizardUI{answers: []string{withdrawalTestDestination}}
-	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error { return errors.New("waited") }, "")
+	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error { return errors.New("waited") })
 	if managementErrorCode(err) != "escape_required" || f.quoteCalls != 1 {
 		t.Fatalf("%v %+v", err, f)
 	}

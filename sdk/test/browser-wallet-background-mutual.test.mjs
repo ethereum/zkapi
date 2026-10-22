@@ -96,7 +96,8 @@ const RECORD_ID = `${DEPLOYMENT}:1:${VAULT}:7`;
 
 async function setup(shared = false) {
     indexedDB.clear();
-    const state = { note_id: 7, current_balance: 1850000, chain_id: 1, contract_address: VAULT, secret: 'old-private-state' };
+    const state = { note_id: 7, current_balance: 1850000, deposit_amount: 2000000, expiry_ts: 2000000000, chain_id: 1,
+        contract_address: VAULT, secret: 'old-private-state' };
     await store.writeBrowserWallet({ deploymentId: DEPLOYMENT,
         state: { note_id: 8, current_balance: 5000000, secret: 'new-private-state' },
         journal: { request: 'new-chat-in-flight' }, lease: { api_key: 'new-key', ownerId: 'other-tab' } });
@@ -111,11 +112,10 @@ async function setup(shared = false) {
         config: { funding: { chain_id: 1, contract_address: VAULT, protocol_server_url: 'https://test.invalid' },
             wallet_core: {}, proving_keys: { withdrawal: 'test-key' } },
         activeLease: { api_key: 'new-key', inFlight: 1 }, init: async () => {}, notify() {},
-        treePath: async (note, required, root) => {
-            assert.equal(note, 7); assert.equal(required, true);
-            return { active_root: root, siblings: [] };
-        },
-        // Every clearance carries one kind-2 ownership proof (vault revision 3).
+        // An exit reads no path: neither the indexer nor the vault's state.
+        indexerPath: async () => assert.fail('no indexer for a set-aside close'),
+        rebuildRequestPath: async () => assert.fail('no tree rebuild for a set-aside close'),
+        // Every clearance carries one kind-2 ownership proof.
         generateOwnershipProof: async ({ nullifier }) => {
             assert.equal(nullifier, '0x777');
             return { public_inputs: { kind: 2, withdrawal_nullifier: nullifier }, proof: { proof: 'ownership' } };
@@ -129,10 +129,13 @@ async function setup(shared = false) {
         worker: { async call(method, args) {
             assert.equal(args.state.note_id, 7);
             if (method === 'withdrawalNullifier') return '0x777';
+            if (method === 'noteLeaf') return '0x1eaf7';
             assert.equal(method, 'prepareWithdrawal');
+            assert.equal(args.args.active_root, undefined, 'no root');
+            assert.equal(args.args.merkle_siblings, undefined, 'no path');
             return { mode: 'mutual', proof: 'fresh-proof', public_inputs: {
                 note_id: 7, final_balance: state.current_balance, chain_id: 1,
-                contract_address: VAULT, active_root: args.args.active_root,
+                contract_address: VAULT, note_leaf: '0x1eaf7', deposit_amount: '2000000', expiry_ts: '2000000000',
                 withdrawal_nullifier: '0x777', destination: [...Buffer.from(DESTINATION.slice(2), 'hex')],
                 kind: 1, next_nullifier: '0x0', conceded: 0, valid_until: args.args.valid_until } };
         } }
@@ -141,7 +144,7 @@ async function setup(shared = false) {
     return { runtime, selected: await store.readBrowserWallet(), lease: runtime.activeLease };
 }
 
-const prepare = runtime => runtime.prepareBackgroundWithdrawal(RECORD_ID, { expectedActiveRoot: '0x99' });
+const prepare = runtime => runtime.prepareBackgroundWithdrawal(RECORD_ID);
 const record = async () => (await store.listBrowserWithdrawals(DEPLOYMENT))[0];
 async function assertIndependent(runtime, selected, lease) {
     assert.deepEqual(await store.readBrowserWallet(), selected);
@@ -161,7 +164,7 @@ test('prepare and claim old note without changing the selected chat or live leas
     ]);
     assert.equal(claims.filter(result => result.status === 'fulfilled').length, 1);
     const claim = claims.find(result => result.status === 'fulfilled').value;
-    assert.equal(claim.plan.public_inputs.active_root, '0x99');
+    assert.equal(claim.plan.public_inputs.note_leaf, '0x1eaf7');
     await runtime.rememberBackgroundWithdrawalSubmissionMetadata(claim, { from: DESTINATION, nonce: 12 });
     await runtime.markBackgroundWithdrawalAmbiguous(claim, 'Wallet disconnected');
     await runtime.reload();
@@ -219,9 +222,10 @@ test('display-only polling cannot discard a proof but a competing prepared plan 
     await assertIndependent(runtime, selected, lease);
 });
 
-test('wrong note, vault, root, nullifier, recipient or amount from worker fails closed', async () => {
+test('wrong note, vault, leaf, note fields, nullifier, recipient or amount from worker fails closed', async () => {
     for (const patch of [{ note_id: 8 }, { chain_id: 2 }, { contract_address: DESTINATION },
-        { active_root: '0x98' }, { withdrawal_nullifier: '0x778' }, { destination: VAULT },
+        { note_leaf: '0x98' }, { deposit_amount: '1999999' }, { expiry_ts: '2000086400' }, { active_root: '0x99' },
+        { withdrawal_nullifier: '0x778' }, { destination: VAULT },
         { final_balance: 9000000 }, { kind: 0 }, { kind: 2 }, { conceded: 1 }, { next_nullifier: '0x5' }]) {
         const { runtime, selected, lease } = await setup();
         const call = runtime.worker.call;

@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { deriveExpiryRecords, EXPIRED_CLAIMED_TOPIC, readFinalizedExpiryClaims } from '../services/zkapiExpiryHistory.mjs';
+import { ABI } from '../wallet.js';
+
+test('the expiry topic is vault revision 4\'s ExpiredClaimed(uint32,uint128)', () => {
+    assert.equal(EXPIRED_CLAIMED_TOPIC, ABI.expiredClaimedEvent);
+});
 
 const VAULT = `0x${'12'.repeat(20)}`;
 const OTHER_VAULT = `0x${'34'.repeat(20)}`;
@@ -11,7 +16,7 @@ const deposit = (noteId = 7, extra = {}) => ({ recordId: `test:deposit:${noteId}
     expiryTs: 1000, ...extra });
 const log = (noteId = 7, blockNumber = 12, extra = {}) => ({
     address: VAULT, topics: [EXPIRED_CLAIMED_TOPIC, hash(noteId)],
-    data: `0x${hash(2_000_000).slice(2)}${hash(9).slice(2)}`,
+    data: `0x${hash(2_000_000).slice(2)}`,
     removed: false, blockNumber: hex(blockNumber), blockHash: hash(blockNumber),
     transactionHash: hash(100 + noteId), ...extra
 });
@@ -113,7 +118,7 @@ test('public RPC requests do not reveal owned note IDs through log filters or se
 
 test('unrelated public events and mismatched owned amounts cannot become claims', async () => {
     const logs = [log(7, 12, { address: OTHER_VAULT }), log(7, 12, { topics: [hash(1), hash(7)] }),
-        log(7, 12, { data: `0x${hash(1).slice(2)}${hash(1).slice(2)}` }), log(8, 12)];
+        log(7, 12, { data: `0x${hash(1).slice(2)}` }), log(8, 12)];
     const result = await readFinalizedExpiryClaims({ ...rpc({ logs }), vaultAddress: VAULT,
         chainId: 1, deposits: [deposit()] });
     assert.deepEqual(result.claims, []);
@@ -121,7 +126,7 @@ test('unrelated public events and mismatched owned amounts cannot become claims'
 
 test('large valid public uint128 claims are validated without blocking supported owned deposits', async () => {
     const service = rpc({ logs: [log(8, 11, {
-        data: `0x${hash(2n ** 100n).slice(2)}${hash(9).slice(2)}`
+        data: `0x${hash(2n ** 100n).slice(2)}`
     }), log(7, 12)] });
     const result = await readFinalizedExpiryClaims({ ...service, vaultAddress: VAULT,
         chainId: 1, deposits: [deposit()] });
@@ -136,7 +141,9 @@ test('malformed matching events fail the scan immediately without range retries 
     const malformed = [log(7, 12, { removed: true }), log(7, 12, { removed: undefined }),
         log(7, 12, { topics: [EXPIRED_CLAIMED_TOPIC, hash(7), hash(1)] }),
         log(7, 12, { data: '0x1234' }),
-        log(7, 12, { data: `0x${hash(2n ** 128n).slice(2)}${hash(1).slice(2)}` }),
+        log(7, 12, { data: `0x${hash(2n ** 128n).slice(2)}` }),
+        // A revision-3 ExpiredClaimed carried a root word: another ABI.
+        log(7, 12, { data: `0x${hash(2_000_000).slice(2)}${hash(9).slice(2)}` }),
         log(7, 12, { topics: [EXPIRED_CLAIMED_TOPIC, hash(2n ** 32n)] }),
         log(7, 12, { transactionHash: '0x1234' }), log(7, 12, { blockHash: '0x1234' }),
         log(7, 21), log(7, 12, { blockNumber: 'bad' })];

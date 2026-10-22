@@ -6,8 +6,8 @@ description: Note-bound proof authorization, native ETH billing, leases, and rec
 The server verifies Groth16-authorized direct OpenRouter leases, reserves
 nullifiers durably with an append-only copy of each request proof, and returns
 Schnorr-signed state transitions after usage settlement. Billing uses native
-ETH units of one gwei. It serves circuit `zkapi-v2-concession-v1` for one
-vault, named by its deployment manifest.
+ETH units of one gwei. It serves circuit `zkapi-v2-concession-v2` (vault
+revision 4) for one vault, named by its deployment manifest.
 
 ## Authorize a direct lease
 
@@ -97,10 +97,20 @@ anonymous_commitment_x, anonymous_commitment_y
 
 `protocol_version` is `2`. The server recomputes the payload hash and request
 context from the exact payload bytes and request ID, then checks the
-authorization tag. It admits a request only at the exact current root, and
-only while its indexer's root and the vault's `currentRoot()` agreed within
-`--root-max-staleness-seconds` (default 60); otherwise it answers retriable
-`503 root_unavailable`. With `--request-limit-max-usd-micros`, a request whose
+authorization tag. It polls the vault's `currentRoot()` at the latest block
+hash and admits a request whose `active_root` is that root, or a root it read
+from the vault that the vault replaced no more than
+`--request-root-grace-seconds` (`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`, default
+60, 0 to 600; 0 accepts only the latest root) ago; otherwise it answers
+retriable `409 stale_root` with the latest root in `latest_root`. Only roots
+the server read from the vault enter that window, and a recorded block hash
+that is no longer canonical drops the replaced roots. Without a successful
+vault read within `--root-max-staleness-seconds` (default 60) it answers
+retriable `503 root_unavailable`. The indexer never gates admission: a
+disagreement between its root and `currentRoot()` at its block hash is logged,
+counted in the `zkapi_indexer_root_disagreement` metric and reported as
+degraded `/health`. `stale_root` applies to requests only; clearance has its
+own errors. With `--request-limit-max-usd-micros`, a request whose
 lease budget exceeds that many micro-USD is refused before anything is
 reserved (`400 request_limit_exceeded`). Before issuing or delivering a key,
 it checks that the vault has not consumed the nullifier
@@ -137,8 +147,9 @@ or named as an escape's nullifier or successor nullifier in a vault event),
 recovery returns the status only and omits `request_response` and
 `settlement_deadline`. The server learns publication from the vault's
 `usedNullifiers` and `challengedNullifiers`, then its indexer's
-`/v1/nullifiers/{N}/published`; when that table cannot be read or no indexer
-is configured, it scans the vault's `EscapeConcessionRecorded` logs from an
+`/v1/nullifiers/{N}/published`; when that table cannot be read or answers
+`503` (an indexer bootstrapped from state lacks the earlier events), or no
+indexer is configured, it scans the vault's `EscapeConcessionRecorded` logs from an
 hour before the reservation, over at most 50,000 blocks. When it cannot tell,
 it answers retriable `503 chain_read_unavailable`. Clients treat that answer
 as an unreachable server.
@@ -193,11 +204,13 @@ newer state.
 | Method + path | `POST /v2/withdraw/clearance` |
 | Request | `ClearanceRequestV2C { withdrawal_nullifier: Felt252, ownership_proof: { public_inputs: WithdrawalPublicInputsV2C, proof: { backend: "groth16_bn254", proof: base64 } } }` |
 | Response (200) | `ClearanceResponseV2 { status, withdrawal_nullifier, signature: {r_x,r_y,s} }` |
-| Errors | `400 clearance_ownership_required`, `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`, `409 stale_root`, `409 nullifier_used`, `500 internal_error`, `503 capacity_exhausted` |
+| Errors | `400 clearance_ownership_required`, `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`, `409 note_leaf_mismatch`, `409 note_not_active`, `409 nullifier_used`, `500 internal_error`, `503 capacity_exhausted` |
 
 Both structures refuse unknown fields. `ownership_proof` is a kind-2
 withdrawal proof for the same nullifier. Its `public_inputs` use the JSON
-form of the 16 withdrawal inputs, with `kind: 2`, `next_nullifier: 0`,
+form of the 16 withdrawal inputs (`WithdrawalPublicInputsV2C`, 18 JSON fields:
+`note_leaf` for input 4, and `note_id`, `deposit_amount` and `expiry_ts`,
+which pack into input 9; `active_root` is refused), with `kind: 2`, `next_nullifier: 0`,
 `conceded: 0`, `destination` 20 zero bytes, and `valid_until` no earlier than
 now and at most 3,600 seconds ahead. A kind-2 proof names no destination and
 no successor, and the vault refuses it, so it cannot start an escape.
@@ -205,14 +218,17 @@ no successor, and the vault refuses it, so it cannot start an escape.
 The server first refuses a nullifier it has already used for a request
 (`409 nullifier_used`). It then requires the proof's nullifier, kind, zero
 fields, validity window and both signing keys to match (`invalid_request`),
-and its protocol, chain and vault (`protocol_mismatch`). The proof's root must
-be the server's current root, one it observed within
-`--clearance-root-window-seconds` (default 3600), the vault's `currentRoot()`,
-or any other root the vault ever held (`knownRoots`), so a proof at the root
-of the wallet's deposit-time path is accepted. Otherwise it answers
-`409 stale_root` with the vault's root in `latest_root`; a failed vault read
-returns retriable `500 internal_error`. Groth16 verification failures return
-`400 invalid_proof`. Ownership-proof verification runs under a small
+and its protocol, chain and vault (`protocol_mismatch`). Groth16 verification
+failures return `400 invalid_proof`. After the proof verifies, the server
+reads `noteRecord(note_id)` from the vault at `latest`, fresh for every
+clearance and never cached: the stored leaf must equal the proof's
+`note_leaf` (else `409 note_leaf_mismatch`: a wrong leaf, or an unknown or
+retired note) and the note must be `Active` (else `409 note_not_active`: a
+pending escape or a closed note); neither is retriable. A failed vault read returns retriable `500 internal_error`.
+Clearance depends on no root. The clearance root window of revision 3 is
+gone: `--clearance-root-window-seconds` and
+`ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS` fail startup with "removed in vault
+revision 4: clearance checks the note leaf; delete this setting". Ownership-proof verification runs under a small
 concurrency limit; saturation returns retriable `503 capacity_exhausted`. A
 request without `ownership_proof` returns `400 clearance_ownership_required`,
 which is not retriable, and reserves nothing. The server never logs or stores
@@ -230,7 +246,8 @@ clearance. This circuit has no proof-less clearance:
 
 | Method and path | Purpose |
 |---|---|
-| `GET /health` | Liveness, protocol and deployment identity, current root, `direct_openrouter` request mode, `testnet_password_required`, `clearance_ownership_proof_required`, and the served statement: `circuit_id`, `setup_id`, `exit_concession` and `settlement_window_seconds` |
+| `GET /health` | Liveness, always HTTP 200 (`status` `ok`, or `degraded` while still serving: no vault root read within `--root-max-staleness-seconds`, or an indexer that disagrees with the vault or cannot be read), protocol and deployment identity, current root, `request_root_grace_seconds`, `vault_root_age_seconds`, `indexer_root` (`agrees`, `disagrees`, `unavailable`, `unchecked` or `not_configured`), `direct_openrouter` request mode, `testnet_password_required`, `clearance_ownership_proof_required`, and the served statement: `circuit_id`, `setup_id`, `exit_concession`, `leaf_bound_exit`, `vault_revision` and `settlement_window_seconds` |
+| `GET /metrics` | Prometheus text of the request-root state: `zkapi_indexer_root_disagreement` (1 while the indexer's root differs from `currentRoot()` at its block), `zkapi_indexer_root_disagreements_total`, `zkapi_indexer_root_unavailable`, `zkapi_vault_root_stale` (1 while requests are refused `root_unavailable`), `zkapi_vault_root_age_seconds`, `zkapi_vault_root_block` and `zkapi_request_root_window_roots` (the roots admission accepts now) |
 | `GET /v1/attestation` | Protocol and deployment identity, current root, `state_signing_key: {x,y}`, `clearance_signing_key: {x,y}`, and the same statement fields |
 | `GET /v1/dashboard/summary` | Read-only deployment and usage summary, including settlement counts |
 | `GET /v1/dashboard/settlement` | Pending leases with their deadlines, settlements that need operator review, and the counts of `exit_deferred` and `exited_unsigned` leases |
@@ -256,24 +273,27 @@ The attestation endpoint publishes signer metadata. It does not supply a
 platform-signed enclave attestation. Compare its identity and keys with
 independently pinned deployment values; the endpoint alone is not a trust
 anchor. The server requires both signing seeds and the deployment manifest
-(`--deployment`), refuses the published development keys and a placeholder
-or provisional manifest, and refuses to start unless the derived keys equal
+(`--deployment`), refuses the published development keys, a placeholder
+or provisional manifest, and a manifest whose `vault_revision`,
+`leaf_bound_exit` or `min_deposit_units`, when present, is not 4, 1 and the
+vault's `minDeposit()`, and refuses to start unless the derived keys equal
 the vault's immutable `stateSigningKeyX/Y` and `clearanceSigningKeyX/Y`. It
 reads them, after an `eth_chainId` check, over the native billing RPC, runs
 its startup probes (`CONCESSION_ESCAPE_VERSION() == 1`,
-`ROOT_HISTORY_WINDOW() == 86400`, the adapter's circuit and verifying-key
+`LEAF_BOUND_EXIT_VERSION() == 1`, so a revision-3 vault is refused,
+`minDeposit()` against the manifest's `min_deposit_units`, the adapter's circuit and verifying-key
 hashes, and the runtime code hashes of the vault, adapter and Poseidon
 library against the manifest), and records the verified binding in the
 database that `zkapi db init` created. A restart with a matching record starts
 without the RPC, re-verifies in the background, and exits if the vault
-contradicts the record. The dashboard routes are operator surfaces; the
-reference gateway does not expose them.
+contradicts the record. The dashboard routes and `/metrics` are operator
+surfaces; the reference gateway does not expose them.
 
 Protocol errors include `error_code`, `error_message`, and `retriable`, plus
 optional `latest_root`, `server_time_ms`, and `retry_after_seconds`. Examples
 include `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`,
 `400 clearance_ownership_required`, `400 request_limit_exceeded`, `404 lease_record_unreadable` (not retriable),
-`409 stale_root`, `409 replay`, `409 nullifier_used`, `410 note_expired`,
+`409 stale_root`, `409 note_leaf_mismatch`, `409 note_not_active`, `409 replay`, `409 nullifier_used`, `410 note_expired`,
 `410 published`, `500 database_error` (retriable), `503 capacity_exhausted`,
 `503 root_unavailable` and `503 chain_read_unavailable` (both retriable).
 Throttled responses also carry `Retry-After` when available. A deployment's

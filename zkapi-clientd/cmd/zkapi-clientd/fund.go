@@ -35,7 +35,7 @@ func runFunding(ctx context.Context, c config.Config, args []string, out io.Writ
 	usdText := flags.String("usd", "", "USD amount converted once to a fixed ETH principal; prepare a quote")
 	approval := flags.String("approve", "", "approve the displayed quote ID")
 	resume := flags.Bool("resume", false, "recover the saved signed deposit without authorizing a new transaction")
-	rebind := flags.Bool("rebind", false, "re-derive the saved deposit's note from finalized vault state and the zkAPI indexer")
+	rebind := flags.Bool("rebind", false, "re-derive the saved deposit's note from finalized vault state")
 	noteText := flags.String("note-id", "", "with --rebind: the vault note ID that holds the saved deposit")
 	replaceText := flags.String("replace-note-id", "", "with --rebind: the unspent companion note ID to replace")
 	if err := flags.Parse(args); err != nil {

@@ -168,3 +168,27 @@ func TestWithdrawalResumeOnlyRecoversSignedState(t *testing.T) {
 		})
 	}
 }
+
+// The public return names the command that exists: zkapi-clientd withdraw
+// --public (there is no separate fund return command or return --approve).
+func TestPublicReturnNamesTheRealCommand(t *testing.T) {
+	s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/admin/return/quote" {
+			_ = json.NewEncoder(w).Encode(paymentTestQuote("return"))
+			return
+		}
+		state := returnTestStatus("ready")
+		delete(state, "transaction_hash")
+		_ = json.NewEncoder(w).Encode(state)
+	}))
+	defer s.Close()
+	for _, args := range [][]string{nil, {"--to", withdrawalTestDestination}} {
+		var out bytes.Buffer
+		if err := runPublicReturn(context.Background(), fundingTestConfig(s), args, &out); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out.String(), "zkapi-clientd withdraw --public") || strings.Contains(out.String(), "fund return") || strings.Contains(out.String(), "--approve") {
+			t.Fatalf("%v: %s", args, out.String())
+		}
+	}
+}

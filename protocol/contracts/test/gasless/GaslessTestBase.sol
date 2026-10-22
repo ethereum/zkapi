@@ -5,7 +5,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {console} from "forge-std/console.sol";
 import {ZkApiVault} from "../../src/ZkApiVault.sol";
 import {Types} from "../../src/libraries/Types.sol";
-import {Bn254Poseidon} from "../../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "../reference/Bn254PoseidonReference.sol";
 import {IAccount, IEntryPoint, IPaymaster, PackedUserOperation} from "../../src/gasless/IERC4337.sol";
 import {IZkApiProofAdapter} from "../../src/interfaces/IZkApiProofAdapter.sol";
 import {ZkApiWithdrawalAccount} from "../../src/gasless/ZkApiWithdrawalAccount.sol";
@@ -68,10 +68,13 @@ contract SelfFundedAccount is IAccount {
 }
 
 /// @dev Replays the EntryPoint's sequence for one operation (paymaster validation, the account's
-///      withdraw, the paymaster's postOp) from one call tree at depth 1: Forge clears transient
-///      storage between the test contract's own calls, and the paymaster's in-flight flag must
-///      survive from validation to repay. Measuring from here rather than from the test contract
-///      keeps the test contract's memory-expansion cost out of the numbers.
+///      withdraw, the paymaster's postOp) from one call tree at depth 1, as the EntryPoint runs it
+///      in one transaction: the paymaster's in-flight flag must survive from validation to repay,
+///      what S forwards from repay to postOp, and the adapter's record of the verified proof from
+///      validation to the vault's call. Forge runs setUp and each test as separate transactions,
+///      so a sequence that crossed setUp would lose its transient state. Measuring from here
+///      rather than from the test contract keeps the test contract's memory-expansion cost out of
+///      the numbers.
 contract EntryPointDriver {
     Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
     address private constant ENTRY_POINT = 0x0000000071727De22E5E9d8BAf0edAc6f37da032;
@@ -82,6 +85,8 @@ contract EntryPointDriver {
         uint256 validationData;
         uint256 withdrawGas;
         uint256 measuredGas;
+        /// Wei S forwarded to the paymaster during the withdraw (received(S) before postOp).
+        uint256 received;
         uint256 postOpGas;
     }
 
@@ -129,6 +134,36 @@ contract EntryPointDriver {
         uint256 actualGasCost,
         uint256 feePerGas
     ) external returns (Run memory r) {
+        return _run(
+            paymaster, op, hash, maxCost, vaultCall, actualGasCost, feePerGas, IPaymaster.PostOpMode.opSucceeded
+        );
+    }
+
+    /// Validation and withdraw, then postOp in the reverted-execution mode: the context and what
+    /// arrived are the withdraw's, as when an unsponsored operation earlier in the bundle paid S
+    /// (the withdraw here stands in for it) and the sponsored execution itself reverted.
+    function runReverted(
+        ZkApiWithdrawalPaymaster paymaster,
+        PackedUserOperation calldata op,
+        bytes32 hash,
+        uint256 maxCost,
+        bytes calldata vaultCall,
+        uint256 actualGasCost,
+        uint256 feePerGas
+    ) external returns (Run memory r) {
+        return _run(paymaster, op, hash, maxCost, vaultCall, actualGasCost, feePerGas, IPaymaster.PostOpMode.opReverted);
+    }
+
+    function _run(
+        ZkApiWithdrawalPaymaster paymaster,
+        PackedUserOperation calldata op,
+        bytes32 hash,
+        uint256 maxCost,
+        bytes calldata vaultCall,
+        uint256 actualGasCost,
+        uint256 feePerGas,
+        IPaymaster.PostOpMode mode
+    ) private returns (Run memory r) {
         vm.prank(ENTRY_POINT);
         uint256 g0 = gasleft();
         (r.context, r.validationData) = paymaster.validatePaymasterUserOp(op, hash, maxCost);
@@ -138,11 +173,12 @@ contract EntryPointDriver {
         ZkApiWithdrawalAccount(payable(op.sender)).withdraw(vaultCall);
         r.withdrawGas = g0 - gasleft();
         r.measuredGas = paymaster.receivedGas(op.sender);
+        r.received = paymaster.received(op.sender);
         if (actualGasCost == 0) return r;
         bytes memory context = r.context;
         vm.prank(ENTRY_POINT);
         g0 = gasleft();
-        paymaster.postOp(IPaymaster.PostOpMode.opSucceeded, context, actualGasCost, feePerGas);
+        paymaster.postOp(mode, context, actualGasCost, feePerGas);
         r.postOpGas = g0 - gasleft();
     }
 
@@ -172,6 +208,33 @@ contract EntryPointDriver {
         view
         returns (uint256 gasUsed)
     {
+        uint256 g0 = gasleft();
+        adapter.assertValidWithdrawal(inputs, proof);
+        gasUsed = g0 - gasleft();
+    }
+
+    /// The real adapter's verification of a statement that may not verify, as the paymaster calls
+    /// it: whether it returned, its revert data and its gas either way.
+    function tryVerify(IZkApiProofAdapter adapter, Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof)
+        external
+        view
+        returns (bool ok, bytes memory reason, uint256 gasUsed)
+    {
+        bytes memory call = abi.encodeCall(IZkApiProofAdapter.assertValidWithdrawal, (inputs, proof));
+        uint256 g0 = gasleft();
+        (ok, reason) = address(adapter).staticcall(call);
+        gasUsed = g0 - gasleft();
+    }
+
+    /// The vault's verification of an exit the paymaster's validation recorded: verifyWithdrawalOnce
+    /// (as validation calls it), then assertValidWithdrawal of the same bytes (as the vault calls
+    /// it in execution), whose gas this returns.
+    function verifyRecorded(
+        IZkApiProofAdapter adapter,
+        Types.WithdrawalPublicInputs calldata inputs,
+        bytes calldata proof
+    ) external returns (uint256 gasUsed) {
+        adapter.verifyWithdrawalOnce(inputs, proof);
         uint256 g0 = gasleft();
         adapter.assertValidWithdrawal(inputs, proof);
         gasUsed = g0 - gasleft();
@@ -269,20 +332,24 @@ abstract contract GaslessTestBase is VaultTestBase {
     /// factory is the paymaster's nonce 1 and the account logic the factory's nonce 1), funds and
     /// stakes the paymaster and the factory.
     function _setUpGasless() internal {
+        _setUpGasless(ZkApiWithdrawalPaymaster.GasSchedule.Original);
+    }
+
+    function _setUpGasless(ZkApiWithdrawalPaymaster.GasSchedule schedule) internal {
         vm.warp(1_700_000_000);
         vm.fee(BASEFEE);
         _etchEntryPoint();
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
         vm.setNonce(DEPLOYER, 0);
         vm.startPrank(DEPLOYER);
         adapter = new MockProofAdapter();
         vault = _newVault(CHALLENGE_PERIOD, MAX_PAUSE);
         paymaster = new ZkApiWithdrawalPaymaster(
-            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING
+            entryPoint, vault, address(this), _defaultPolicy(), MAX_FEE_CEILING, PRIORITY_CEILING, schedule
         );
         vm.stopPrank();
         factory = paymaster.factory();
@@ -302,9 +369,7 @@ abstract contract GaslessTestBase is VaultTestBase {
 
     /// Deposits a note of `amount` gwei units at the next slot.
     function _depositUnits(uint256 commitment, uint128 amount) internal returns (uint32 id) {
-        id = vault.nextNoteId();
-        vm.prank(user);
-        vault.deposit{value: uint256(amount) * 1 gwei}(bytes32(commitment), amount);
+        id = _depositAmount(commitment, amount);
     }
 
     function _bigNote(uint256 commitment) internal returns (uint32 id) {
@@ -371,8 +436,10 @@ abstract contract GaslessTestBase is VaultTestBase {
     function _gas(uint8 kind, bool withInit) internal view returns (OpGas memory g) {
         g.pvg = gp.pvgFloor + 10_000;
         g.verification = withInit ? gp.verificationFloorInit + 40_000 : gp.verificationFloor + 20_000;
+        if (g.verification > gp.verificationCap) g.verification = gp.verificationCap;
         g.call = gp.callFloor[kind - 1] + (gp.callHardCap[kind - 1] - gp.callFloor[kind - 1]) / 4;
         g.pmVerification = gp.pmVerificationFloor + 30_000;
+        if (g.pmVerification > gp.pmVerificationCap) g.pmVerification = gp.pmVerificationCap;
         g.postOp = gp.postOpFloor + 20_000;
         g.maxFee = MAX_FEE;
         g.priority = PRIORITY;
@@ -731,6 +798,7 @@ abstract contract GaslessTestBase is VaultTestBase {
 
     // ------------------------------------------------------------------ ERC-7562 opcode audit
 
+    uint8 internal constant OP_KECCAK256 = 0x20;
     uint8 internal constant OP_BALANCE = 0x31;
     uint8 internal constant OP_ORIGIN = 0x32;
     uint8 internal constant OP_GASPRICE = 0x3a;
@@ -773,14 +841,23 @@ abstract contract GaslessTestBase is VaultTestBase {
     /// ERC-7562: OP-011 (no forbidden opcode), OP-061 (no CALL with value), OP-012 (GAS only right
     /// before a call), OP-041/042/062 (every call and EXTCODE* target has code, or is a core
     /// precompile, or is the sender inside the factory frame) in every frame, and the storage rules
-    /// as the design states them: SSTORE, TLOAD and TSTORE only in the paymaster, SLOAD only in the
-    /// paymaster and the vault, BALANCE only in the staked paymaster (OP-080), CREATE2 only in the
-    /// factory (OP-031). Needs the tracer (forge test -vvv, as CI runs it); without it the test is
-    /// reported as skipped, never as passed. An operation whose validUntil has passed is accepted
-    /// too: the EntryPoint applies the window after the paymaster's validation (AA32), so the
-    /// whole validation phase is traced and the execution phase, which the audit does not cover,
-    /// is not (the real Groth16 verification run twice would not fit in the trace).
-    function _audit(PackedUserOperation memory op, bool expectCreate2, bool expectBalance) internal {
+    /// as the design states them: SSTORE, TLOAD and TSTORE only in the paymaster, except the
+    /// adapter's record of the verified proof (verifyWithdrawalOnce): one TSTORE in the adapter's
+    /// frame at a slot associated with the sender (STO-021: keccak256(sender ‖ x), a preimage the
+    /// adapter hashed in that frame), which a first use (initCode) may make only with a staked
+    /// factory (STO-022); SLOAD only in the paymaster and the vault, BALANCE only in
+    /// the staked paymaster (OP-080), CREATE2 only in the factory (OP-031). Needs the tracer (forge
+    /// test -vvv, as CI runs it); without it the test is reported as skipped, never as passed. An
+    /// operation whose validUntil has passed is accepted too: the EntryPoint applies the window
+    /// after the paymaster's validation (AA32), so the whole validation phase is traced and the
+    /// execution phase, which the audit does not cover, is not (the real Groth16 verification run
+    /// twice would not fit in the trace).
+    /// @dev How many times the last _audit saw the paymaster set the sender's escape lock.
+    uint256 internal auditEscapeLocks;
+
+    function _audit(PackedUserOperation memory op, bool expectCreate2, bool expectBalance, bool expectAdapterRecord)
+        internal
+    {
         bool tracer;
         try vm.startDebugTraceRecording() {
             tracer = true;
@@ -819,6 +896,16 @@ abstract contract GaslessTestBase is VaultTestBase {
         uint256 balances;
         uint256 audited;
         uint256 paymasterSteps;
+        uint256 adapterRecords;
+        address proofAdapter = address(vault.proofAdapter());
+        // The paymaster's transient escape lock of the sender (one sponsored escape per transit
+        // account per bundle): its own storage, set once by an ESCAPE's validation.
+        bytes32 escapeLockSlot = keccak256(abi.encode(bytes32("transit-escape"), op.sender));
+        auditEscapeLocks = 0;
+        // The slots keccak256(sender ‖ x) the adapter's frame hashed so far (ERC-7562 associated
+        // storage of the sender).
+        bytes32[] memory associated = new bytes32[](steps.length - start);
+        uint256 associatedCount;
         for (uint256 i = start; i < end; ++i) {
             Vm.DebugStep memory st = steps[i];
             address frame = st.contractAddr;
@@ -857,7 +944,26 @@ abstract contract GaslessTestBase is VaultTestBase {
                     "OP-041/042: EXTCODE* on an address with code (the sender in the factory frame excepted)"
                 );
             }
-            if (o == OP_SSTORE || o == OP_TLOAD || o == OP_TSTORE) {
+            if (
+                o == OP_KECCAK256 && frame == proofAdapter && st.memoryInput.length == 64
+                    && bytes32(st.memoryInput) == bytes32(uint256(uint160(op.sender)))
+            ) {
+                associated[associatedCount++] = keccak256(st.memoryInput);
+            }
+            if (
+                o == OP_TSTORE && frame == address(paymaster) && bytes32(st.stack[0]) == escapeLockSlot
+                    && st.stack[1] == 1
+            ) {
+                ++auditEscapeLocks;
+            }
+            if (o == OP_TSTORE && frame == proofAdapter) {
+                bool senderSlot;
+                for (uint256 k = 0; k < associatedCount; ++k) {
+                    if (bytes32(st.stack[0]) == associated[k]) senderSlot = true;
+                }
+                assertTrue(senderSlot, "STO-021: the adapter's record is storage associated with the sender");
+                ++adapterRecords;
+            } else if (o == OP_SSTORE || o == OP_TLOAD || o == OP_TSTORE) {
                 assertEq(frame, address(paymaster), "STO-031: only the paymaster writes storage here");
             }
             if (o == OP_SLOAD) {
@@ -875,6 +981,13 @@ abstract contract GaslessTestBase is VaultTestBase {
         assertGt(paymasterSteps, 100, "the paymaster's validation was traced");
         assertEq(create2s, expectCreate2 ? 1 : 0, "one CREATE2 in the deployment frame");
         assertEq(balances > 0, expectBalance, "BALANCE only in a forward");
+        assertEq(adapterRecords, expectAdapterRecord ? 1 : 0, "one record of the verified proof");
+        if (adapterRecords != 0 && op.initCode.length != 0) {
+            assertTrue(
+                entryPoint.getDepositInfo(address(factory)).staked,
+                "STO-022: a first use's associated storage in the adapter needs a staked factory"
+            );
+        }
     }
 
     receive() external payable {}

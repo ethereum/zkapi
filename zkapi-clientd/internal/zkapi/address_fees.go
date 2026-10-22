@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"math/big"
+	"math/bits"
 	"sort"
 	"strings"
 	"time"
@@ -136,4 +137,77 @@ func paddedAddressGas(gas *big.Int) (uint64, error) {
 		return 0, errors.New("payment gas limit exceeds Ethereum's transaction cap")
 	}
 	return limit, nil
+}
+
+// The deposit gas-limit policy of vault revision 4 (design C.8). A deposit at
+// note ID n hashes trailing_ones(n) frontier levels, about 16,100 gas each,
+// plus about 7,100 when n has any, and the first deposit to reach a level,
+// at n = 2^t - 1, writes a fresh storage slot. Another deposit can land
+// first and move ours to a costlier ID, so a bare estimate at the current
+// next ID is not enough: the limit covers every ID in the next
+// depositGasWindow.
+const (
+	depositGasWindow      = 64
+	depositGasPerLevel    = 16_500
+	depositGasFirstLevel  = 7_500
+	depositGasWrittenSlot = 5_000
+	depositGasCap         = 1_500_000
+)
+
+// trailingOnes is the number of frontier levels a deposit at note ID n hashes.
+func trailingOnes(n uint32) int {
+	return bits.TrailingZeros32(^n)
+}
+
+// depositGasPolicyLimit is the policy's gas limit for a deposit whose
+// estimate at next note ID next is estimate: with t_now = trailingOnes(next)
+// and t_max the most over [next, next + 64),
+//
+//	extra = 16,500·(t_max − t_now) + (t_now = 0 and t_max > 0 ? 7,500 : 0)
+//	      + (some 2^j − 1, j ≥ 1, in (next, next + 64) ? freshSlotGas − 5,000 : 0)
+//
+// and the limit is min(ceil(1.2·(estimate + extra)), 1,500,000). freshSlotGas
+// is the network's fresh-slot cost from the deployment profile.
+func depositGasPolicyLimit(estimate, next, freshSlotGas uint64) uint64 {
+	if next > math.MaxUint32 {
+		return depositGasCap
+	}
+	end := min(next+depositGasWindow, uint64(math.MaxUint32)+1)
+	now := trailingOnes(uint32(next))
+	most := now
+	for k := next; k < end; k++ {
+		most = max(most, trailingOnes(uint32(k)))
+	}
+	extra := uint64(depositGasPerLevel * (most - now))
+	if now == 0 && most > 0 {
+		extra += depositGasFirstLevel
+	}
+	for j := 1; j <= 32; j++ {
+		if first := uint64(1)<<j - 1; first > next && first < next+depositGasWindow {
+			extra += freshSlotGas - min(freshSlotGas, depositGasWrittenSlot)
+			break
+		}
+	}
+	if estimate > depositGasCap {
+		return depositGasCap
+	}
+	return min(((estimate+extra)*12+9)/10, depositGasCap)
+}
+
+// depositGasLimit is the gas limit of a deposit whose padded estimate is
+// padded and raw estimate estimate: the larger of padded and the policy's
+// limit at the vault's next note ID, read at the latest block.
+func (h *FundingHandler) depositGasLimit(ctx context.Context, config fundingConfig, estimate *big.Int, padded uint64) (uint64, error) {
+	deployment, _, err := deployedDeployment(h.client.config.Network)
+	if err != nil {
+		return 0, err
+	}
+	next, err := h.addressUintCall(ctx, config, config.Contract, nextNoteIDSelector, "latest")
+	if err != nil || !next.IsUint64() || next.Uint64() > math.MaxUint32 {
+		return 0, errors.New("the vault's next note ID is unavailable; no deposit was signed")
+	}
+	if next.Uint64() == math.MaxUint32 {
+		return 0, errors.New("the vault's note tree is full; no deposit was signed")
+	}
+	return max(padded, depositGasPolicyLimit(estimate.Uint64(), next.Uint64(), deployment.FreshSlotGas)), nil
 }

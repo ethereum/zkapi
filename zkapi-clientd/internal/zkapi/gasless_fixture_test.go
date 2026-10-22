@@ -1,6 +1,7 @@
 package zkapi
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,7 @@ type gaslessFixture struct {
 	flatFee, minEscapeNet, maxSponsoredCost, maxFeeCeiling, priorityCeiling, deposit *big.Int
 	escapesEnabled, sponsorshipPaused, vaultPaused                                   bool
 	pausedAt                                                                         uint64
+	gasSchedule                                                                      uint64
 	attempts                                                                         map[string]uint64
 	owed, credits, balances                                                          map[string]*big.Int
 	stranded                                                                         map[string]bool
@@ -50,6 +52,20 @@ type gaslessFixture struct {
 	// dryRunRevert, when set, is the revert data every handleOps dry run
 	// answers.
 	dryRunRevert []byte
+	// dryRunRevertOnce is answered by the next dry run only.
+	dryRunRevertOnce []byte
+	// dryRunHook, when set, sees each dry run's operation as it arrives;
+	// dropDryRunOnce loses the next dry run's answer.
+	dryRunHook     func(*gaslessUserOp)
+	dropDryRunOnce bool
+	// estimatesDeclined counts the estimates declined for an unusable
+	// proof.
+	estimatesDeclined int
+	// logsDown makes the chain RPC refuse every eth_getLogs, as an RPC that
+	// serves no multi-block log search does; logSearches counts the
+	// searches it refused or answered.
+	logsDown    bool
+	logSearches int
 	// The bundler.
 	url                     string
 	down, forgeHash, refuse bool
@@ -68,6 +84,8 @@ type gaslessFixture struct {
 	wrongChain               bool
 	forgedReceiptTransaction string
 	estimate                 map[string]string
+	pimlicoFees              any
+	rundlerTip               any
 	ops                      map[string]gaslessUserOpJSON
 	sends                    []string
 	known                    map[string]bool
@@ -88,10 +106,12 @@ const gaslessFixturePaymasterCode = "0x600460045b"
 const gaslessFixtureFactoryCode = "0x600560055b"
 const gaslessFixtureImplementationCode = "0x600660065b"
 
-// enableGasless attaches the gasless fixture and points the handler's
-// bundler at it.
+// enableGasless publishes the reviewed gasless profile for the test
+// deployment (which makes new withdrawals payout-only), attaches the gasless
+// fixture and points the handler's bundler at it.
 func (f *addressFixture) enableGasless(t *testing.T) *gaslessFixture {
 	t.Helper()
+	publishGasless(t)
 	vectors := loadTransitVectors(t)
 	deployment, _, err := deployedDeployment("mainnet")
 	if err != nil {
@@ -172,6 +192,10 @@ func (g *gaslessFixture) answer(t *testing.T, method string, params []json.RawMe
 		}
 		return "0x" + balance.Text(16), nil, true
 	case "eth_getLogs":
+		g.logSearches++
+		if g.logsDown {
+			return nil, map[string]any{"code": -32701, "message": "Please specify an address in your request or, to remove restrictions, order a dedicated full node"}, true
+		}
 		var filter struct {
 			Address string `json:"address"`
 			Topics  []any  `json:"topics"`
@@ -205,6 +229,24 @@ func (g *gaslessFixture) answer(t *testing.T, method string, params []json.RawMe
 		if call.From != "" {
 			if !strings.EqualFold(call.To, g.entryPoint.Hex()) {
 				return nil, nil, false
+			}
+			if raw := common.FromHex(call.Data); len(raw) > 4+4*32 {
+				if op, err := decodeUserOpTuple(raw[4+4*32:]); err == nil {
+					if g.dryRunHook != nil {
+						g.dryRunHook(op)
+					}
+					// The paymaster verifies the exit proof during
+					// validation (verifyWithdrawalOnce), before the
+					// EntryPoint checks any signature: an unusable proof
+					// fails as AA33.
+					if fixtureProofUnusable(op) {
+						return nil, map[string]any{"code": 3, "message": "execution reverted", "data": "0x" + fixtureFailedOp("AA33 reverted")}, true
+					}
+				}
+			}
+			if once := g.dryRunRevertOnce; once != nil {
+				g.dryRunRevertOnce = nil
+				return nil, map[string]any{"code": 3, "message": "execution reverted", "data": "0x" + hex.EncodeToString(once)}, true
 			}
 			if g.dryRunRevert != nil {
 				return nil, map[string]any{"code": 3, "message": "execution reverted", "data": "0x" + hex.EncodeToString(g.dryRunRevert)}, true
@@ -302,6 +344,8 @@ func (g *gaslessFixture) view(t *testing.T, to, data string) (any, map[string]an
 				out += uintWord(value)
 			}
 			return out, nil, true
+		case selectorGasSchedule:
+			return "0x" + uintWord(g.gasSchedule), nil, true
 		case selectorPaymasterVault:
 			return "0x" + addressWord(g.vault), nil, true
 		case selectorPaymasterFactory:
@@ -429,6 +473,9 @@ func (g *gaslessFixture) serveBundler(t *testing.T, w http.ResponseWriter, r *ht
 		return
 	}
 	g.bundlerCalls = append(g.bundlerCalls, request.Method)
+	if params, err := json.Marshal(request.Params); err == nil {
+		g.f.outbound = append(g.f.outbound, "bundler "+request.Method+" "+string(params))
+	}
 	reply := func(result any) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
 	}
@@ -448,14 +495,33 @@ func (g *gaslessFixture) serveBundler(t *testing.T, w http.ResponseWriter, r *ht
 			return
 		}
 		reply([]string{g.entryPoint.Hex()})
+	case "pimlico_getUserOperationGasPrice":
+		if g.pimlicoFees == nil {
+			fail(-32601, "unknown method")
+			return
+		}
+		reply(g.pimlicoFees)
+	case "rundler_maxPriorityFeePerGas":
+		if g.rundlerTip == nil {
+			fail(-32601, "unknown method")
+			return
+		}
+		reply(g.rundlerTip)
 	case "eth_estimateUserOperationGas":
+		// The estimate of the operation's kind: its call floor. Like a real
+		// bundler's simulation, it runs the paymaster's validation, which
+		// verifies the exit proof: an unusable one is declined (AA33).
+		var encoded gaslessUserOpJSON
+		_ = json.Unmarshal(request.Params[0], &encoded)
+		if op, err := gaslessUserOpFromJSON(encoded); err == nil && fixtureProofUnusable(op) {
+			g.estimatesDeclined++
+			fail(-32500, "AA33 reverted: InvalidProof")
+			return
+		}
 		if g.estimate != nil {
 			reply(g.estimate)
 			return
 		}
-		// The estimate of the operation's kind: its call floor.
-		var encoded gaslessUserOpJSON
-		_ = json.Unmarshal(request.Params[0], &encoded)
 		kind := gaslessKindForward
 		if op, err := gaslessUserOpFromJSON(encoded); err == nil {
 			if vaultCall, err := vaultCallOfTransitCallData(op.CallData); err == nil {
@@ -596,7 +662,8 @@ func (g *gaslessFixture) mineUserOp(t *testing.T, hash string, success bool, set
 	}
 	switch len(vaultCall) {
 	case withdrawalCalldataLength:
-		noteID = uint32(new(big.Int).SetBytes(vaultCall[4+8*32 : 4+9*32]).Uint64())
+		// Word 8 is the packed note fields; the note ID is its bits 192-223.
+		noteID = uint32(new(big.Int).Rsh(new(big.Int).SetBytes(vaultCall[4+8*32:4+9*32]), 192).Uint64())
 		finalBalance = new(big.Int).SetBytes(vaultCall[4+9*32 : 4+10*32]).Uint64()
 		nullifier.SetBytes(vaultCall[4+11*32 : 4+12*32])
 		kind = gaslessKindClose
@@ -685,6 +752,16 @@ func (g *gaslessFixture) mineUserOp(t *testing.T, hash string, success bool, set
 }
 
 // fixtureFailedOp is the hex of FailedOp(0, reason).
+// fixtureProofUnusable reports an exit whose proof no verifier accepts
+// (the client's probe).
+func fixtureProofUnusable(op *gaslessUserOp) bool {
+	vaultCall, err := vaultCallOfTransitCallData(op.CallData)
+	if err != nil || len(vaultCall) != withdrawalCalldataLength {
+		return false
+	}
+	return bytes.Equal(vaultCall[len(vaultCall)-256:], bytes.Repeat([]byte{0xff}, 256))
+}
+
 func fixtureFailedOp(reason string) string {
 	return selectorFailedOp + uintWord(0) + addressABIWord("40") + uintWord(uint64(len(reason))) + hex.EncodeToString(common.RightPadBytes([]byte(reason), (len(reason)+31)/32*32))
 }

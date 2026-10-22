@@ -24,7 +24,7 @@ CLIENT=$HOME/zkapi/zkapi-clientd/bin/zkapi-clientd-concession-tor
 # Existing old-vault profile: old stack's automatic funding and inference flow.
 $CLIENT --vault-protocol legacy --config-dir /absolute/path/to/legacy-profile serve
 
-# New-vault profile: new stack. Currently refuses undeployed networks.
+# New-vault profile: new stack (Sepolia: zkAPI v0.2; Mainnet is not deployed yet).
 $CLIENT --vault-protocol concession --config-dir /absolute/path/to/concession-profile serve
 
 # Withdrawal must use the same protocol/profile that owns the note.
@@ -43,12 +43,52 @@ atomic rename and fsync pattern as model configuration. Stop serve before edits.
 copying. `version`/top-level `help` report the dispatcher; command-specific help
 in legacy mode requires its valid profile.
 
+`concession-v1` is a value only the local CLI bundle built from git branch
+`origin/v0.2` accepts: it selected that bundle's Sepolia revision-3 stack
+(deployment `zkapi-native-eth-sepolia-concession-v1-r3`). This build cannot
+open that wallet. A saved `concession-v1` preference, `--vault-protocol
+concession-v1` or `ZKAPI_VAULT_PROTOCOL=concession-v1` is refused with that
+guidance (run the `origin/v0.2` bundle with the same `--config-dir`), and the
+`vault-protocol` file is never rewritten, not even by `config --vault-protocol
+default`.
+
 ## This selects a stack, not an address
 
-Concession uses circuit `zkapi-v2-concession-v1`, vault revision 3, and its current
-compiled manifests. Legacy uses `zkapi-v2-note-bound-v1` and the historical
+Concession uses circuit `zkapi-v2-concession-v2`, vault revision 4, and its current
+compiled manifests: on Sepolia the leaf-bound staging deployment
+`zkapi-native-eth-sepolia-leaf-v4-20261020` (vault
+`0x67eb750d9c0d63a99684ac3f3e65f0c610276993`, protocol server
+`https://zkapi-sepolia.openanonymity.ai/v0.4`, shown as zkAPI v0.2); on
+Mainnet a `not_deployed` placeholder. Its wallets live in per-deployment
+directories, so wallets of earlier concession deployments in the same profile
+are left alone and named in a warning; see
+[deployment origins](CLI_ZKAPI.md#deployment-origins). Legacy uses `zkapi-v2-note-bound-v1` and the historical
 compiled manifests, client, companion and verified proving setup. A new prover
-cannot operate an old vault by replacing a contract address.
+cannot operate an old vault by replacing a contract address; this release also
+refuses a revision-3 concession profile (circuit `zkapi-v2-concession-v1`) and a
+vault without `LEAF_BOUND_EXIT_VERSION() == 1`.
+
+Vault revision 4 binds every exit to the note's leaf. The vault stores one word
+per note, its leaf and status (`noteRecord`); the leaf commits to the
+registration commitment, the note ID, the deposit amount `D` and the expiry `e`.
+A mutual close or an escape publishes that leaf and `noteFields = n·2^192 +
+D·2^64 + e` as public inputs, and the vault compares the leaf with the stored
+one, so an exit needs no Merkle path, root, indexer or log scan: only the note
+itself, which the wallet keeps. Deposits must carry at least the vault's
+`minDeposit()` (the profile's `min_deposit_units`), and the client signs each
+deposit with a gas limit that covers the next 64 note IDs (the deposit's cost
+grows with the trailing ones of its note ID, plus the network's
+`fresh_slot_gas` when a frontier level is first written).
+
+**Risk under a broken verifier or setup.** The vault takes `D` from the proof's
+public inputs. With a working Groth16 verifier and an honest setup, the leaf
+binding makes `D` the note's real deposit. If the verifier or the proving setup
+were compromised, one forged mutual close naming `D` equal to the vault's whole
+balance would drain every note's funds in a single transaction. Revision 3
+capped a forged exit at the stored deposit of one note; under either revision the
+eventual loss after such a break is total, but revision 4 removes the rate
+limit. The client's code-hash, verifying-key and setup pins (checked before
+every deposit) are the mitigation on this side.
 
 Legacy dispatch verifies SHA-256 pins for the local historical executables:
 
@@ -92,8 +132,13 @@ by itself, add approval flags, call raw contracts, or modify transaction journal
 
 ## Important current limits
 
-- **Concession remains `not_deployed`** on both shipping networks, with missing
-  production proving keys. Selection does not make it available.
+- **Concession on Mainnet remains `not_deployed`**, with missing production
+  proving keys; selection does not make it available. Sepolia runs the
+  leaf-bound staging deployment with the development proving setup.
+- Earlier Sepolia concession deployments (`concession-v1-r3`,
+  `concession-v2-r4-20261017`) cannot load in this build; their wallets are
+  recovered with the `origin/v0.2` local CLI bundle and the same
+  `--config-dir`.
 - The new legacy engine implements native rewriting and cover traffic, with the
   same default 5/s when cover is enabled. New concession exit/bundler settings
   are still incompatible with the old on-chain exit protocol and are refused;

@@ -38,7 +38,7 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.StringVar(&o.proofs, "proof-setup-dir", "", "path to the installed proving assets")
 	f.StringVar(&o.exitRPC, "exit-rpc-url", "", "your own Ethereum RPC for exits: deployment checks also use it and exit transactions are sent through it (HTTPS, or http:// to this machine; 'none' clears it)")
 	f.StringVar(&o.bundlerURL, "bundler-url", "", "your own ERC-4337 bundler for gasless withdrawals (--fees payout): HTTPS, or http:// to this machine; 'none' clears it and the deployment's published bundler is used")
-	f.StringVar(&o.withdrawalFees, "withdrawal-fees", "", "how withdrawals pay the network fee by default: wallet (the local signing address) or payout (a sponsored operation paid from the payout, no ETH needed)")
+	f.StringVar(&o.withdrawalFees, "withdrawal-fees", "", "deployments without sponsorship only: how withdrawals pay the network fee by default, wallet or payout; where a deployment sponsors withdrawals the payout always pays")
 	f.StringVar(&o.usd, "usd", "", "skip the new-deposit USD amount prompt (prompt default: 20; network fees are extra)")
 	f.BoolVar(&o.status, "status", false, "show saved configuration status without setup")
 	f.BoolVar(&o.apiKey, "api-key", false, "print the local inference API key explicitly")
@@ -48,14 +48,17 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.BoolVar(&o.webSearch, "web-search", true, "automatically enable OpenRouter web search for chat completions; use --web-search=false to disable (search charges apply)")
 	f.BoolVar(&o.edit, "edit", false, "edit network, listener, transport, and web search interactively")
 	f.BoolVar(&o.menu, "menu", false, "open configuration and wallet management actions")
-	f.Bool("setup", false, "explicitly prepare/fund wallet (bare config only displays JSON)")
+	setup := f.Bool("setup", false, "explicitly prepare/fund wallet (bare config only displays JSON)")
 	if err := f.Parse(args); err != nil {
 		return o, err
 	}
 	o.fields = make(map[string]bool)
 	invalid := false
 	f.Visit(func(field *flag.Flag) {
-		if field.Name == "setup" || field.Name == "status" || field.Name == "api-key" || field.Name == "edit" || field.Name == "menu" {
+		if field.Name == "setup" {
+			return
+		}
+		if field.Name == "status" || field.Name == "api-key" || field.Name == "edit" || field.Name == "menu" {
 			return
 		}
 		if field.Name != "usd" {
@@ -65,6 +68,10 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	})
 	if invalid || f.NArg() != 0 {
 		return o, errors.New("config flags require nonempty values except --relay-url; unexpected arguments are not accepted")
+	}
+	if flagSet(f, "setup") && !*setup {
+		// --setup=false must not prepare or fund a wallet by accident.
+		return o, errors.New("use --setup without =false; settings-only edits omit it; nothing saved")
 	}
 	selectors := 0
 	for _, selected := range []bool{o.status, o.apiKey, o.edit, o.menu} {
@@ -97,6 +104,12 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	return o, nil
 }
 
+func flagSet(f *flag.FlagSet, name string) bool {
+	set := false
+	f.Visit(func(field *flag.Flag) { set = set || field.Name == name })
+	return set
+}
+
 func runConfigure(ctx context.Context, dir string, args []string, ui setupPrompter, out io.Writer) error {
 	err := configure(ctx, dir, args, ui, out, nil)
 	if errors.Is(err, errSetupSelectionCanceled) {
@@ -104,7 +117,7 @@ func runConfigure(ctx context.Context, dir string, args []string, ui setupPrompt
 		return nil
 	}
 	if ctx.Err() != nil {
-		ui.Printf("\nStopped. Your saved configuration and wallet state are preserved; run zkapi-clientd config to continue.\n")
+		ui.Printf("\nStopped. Your saved configuration and wallet state are preserved; run zkapi-clientd config --setup to continue.\n")
 		return nil
 	}
 	return err
@@ -134,7 +147,7 @@ func configure(ctx context.Context, dir string, args []string, ui setupPrompter,
 	_, err = os.Lstat(filepath.Join(dir, "config.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		if o.apiKey || o.menu {
-			return errors.New("configuration is missing; run zkapi-clientd config to create it")
+			return errors.New("configuration is missing; run zkapi-clientd config --setup to create it")
 		}
 		ui.Printf("Configuration: not configured.\n")
 		if o.status {
@@ -183,13 +196,15 @@ func configure(ctx context.Context, dir string, args []string, ui setupPrompter,
 		return err
 	}
 	if o.menu {
-		ui.Printf("Wallet menu (zkAPI network: %s).\n", c.ZKAPI.Network)
+		ui.Printf("Wallet menu for zkAPI network %s.\n", deploymentSummary(c.ZKAPI.Network))
 	} else {
 		showConfigureSummary(c, ui)
 	}
 	if o.status {
 		return nil
 	}
+	// Informational only: no question, so scripted setup is unchanged.
+	printEarlierDeployments(setupUIWriter{ui}, dir, c.ZKAPI.Network)
 	if len(o.fields) != 0 {
 		return saveConfiguredSettings(ctx, dir, c, applyConfigureOptions(c, o), ui, out, action)
 	}
@@ -310,7 +325,7 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 	} else if c.RelayURL != "" {
 		transport = "Wisp relay enabled"
 	}
-	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", c.ZKAPI.Network, transport)
+	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", deploymentSummary(c.ZKAPI.Network), transport)
 	if c.LeCoreContextRecall {
 		ui.Printf("leCore context recall: enabled locally; the processed request still uses paid provider inference.\n")
 	} else {

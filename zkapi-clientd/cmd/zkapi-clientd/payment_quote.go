@@ -48,10 +48,16 @@ func fundingNetwork(chain uint64) string {
 
 // managementError is the daemon's message for a failed management request,
 // with the machine-readable code it forwards for refusals a guided flow acts
-// on (for example unsettled_request_state).
-type managementError struct{ message, code string }
+// on (for example unsettled_request_state or quote_changed). scope prefixes
+// the message ("wallet" unless set).
+type managementError struct{ message, code, scope string }
 
-func (e *managementError) Error() string { return "wallet: " + e.message }
+func (e *managementError) Error() string {
+	if e.scope != "" {
+		return e.scope + ": " + e.message
+	}
+	return "wallet: " + e.message
+}
 
 func managementErrorCode(err error) string {
 	var failed *managementError
@@ -139,10 +145,13 @@ func requestPaymentQuote(ctx context.Context, c config.Config, method, path, kin
 				return q, errors.New("invalid payout quote quantity")
 			}
 		}
-		for _, quantity := range []string{q.FinalizeEstimateWei, q.EstimatedReceivedWei, q.FeeBumpCapWei} {
+		for _, quantity := range []string{q.FinalizeEstimateWei, q.EstimatedReceivedWei, q.FeeBumpCapWei, q.MaxTotalFeeWei, q.MinNetPayoutWei} {
 			if quantity != "" && !fundingBalance(quantity) {
 				return q, errors.New("invalid payout quote quantity")
 			}
+		}
+		if !validPayoutAuthorization(q) {
+			return q, errors.New("invalid payout quote authorization")
 		}
 	}
 	if !zkapi.MatchesDeployment(c.ZKAPI.Network, q.DeploymentID, q.Contract) {
@@ -189,6 +198,10 @@ func printPaymentQuote(out io.Writer, q zkapi.AddressPaymentQuote, command strin
 			fmt.Fprintf(out, "Quote expires: %s\nQuoting does not sign or send.\n", time.UnixMilli(q.ExpiresAt).Format(time.RFC3339))
 			return
 		}
+		if authorizedPayoutQuote(q) {
+			fmt.Fprintf(out, "Quote expires: %s (afterwards rerun --to for a new quote)\nTo approve this withdrawal once, within this maximum: %s --approve %s\nKeep the same --config-dir if used. Quoting does not sign or send.\n", time.UnixMilli(q.ExpiresAt).Format(time.RFC3339), command, q.ID)
+			return
+		}
 		fmt.Fprintf(out, "Quote expires: %s\nTo authorize this exact operation: %s --approve %s\nKeep the same --config-dir if used. Quoting does not sign or send.\n", time.UnixMilli(q.ExpiresAt).Format(time.RFC3339), command, q.ID)
 		return
 	}
@@ -209,9 +222,19 @@ func printPaymentQuote(out io.Writer, q zkapi.AddressPaymentQuote, command strin
 
 // printPayoutQuote prints the figures of a payout quote (design 3.3): the
 // fee is taken from the payout by a sponsored operation, so no ETH is needed
-// and only "at least this much reaches the payout address" is promised.
+// and only "at least this much reaches the payout address" is promised. A
+// quote with a bounded authorization (authorize once) prints its terms; a
+// legacy quote binds only the operation as built now.
 func printPayoutQuote(out io.Writer, q zkapi.AddressPaymentQuote) {
 	fmt.Fprintf(out, "Fee paid from the payout by a sponsored %s operation; no ETH is needed from the local signing address.\nTransit account: %s\nBundler: %s\n", q.UserOpKind, q.TransitAccount, q.BundlerURL)
+	if authorizedPayoutQuote(q) {
+		fmt.Fprintf(out, "Payout: %s ETH\n", fundingUnits(q.PayoutWei, 18))
+		printPayoutTerms(out, q)
+		if q.UserOpGas != nil {
+			fmt.Fprintf(out, "The operation as built now (rebuilt within the maximum when fees change): gas limits call %d, verification %d, pre-verification %d, paymaster verification %d, postOp %d; max fee %s wei/gas, priority %s wei/gas\n", q.UserOpGas.CallGasLimit, q.UserOpGas.VerificationGasLimit, q.UserOpGas.PreVerificationGas, q.UserOpGas.PaymasterVerificationGasLimit, q.UserOpGas.PaymasterPostOpGasLimit, q.MaxFeePerGas, q.MaxPriorityFeePerGas)
+		}
+		return
+	}
 	fmt.Fprintf(out, "Payout: %s ETH\nMaximum fee taken from it: %s ETH (expected charge at today's base fee: about %s ETH, an estimate; paymaster flat fee %s ETH)\n", fundingUnits(q.PayoutWei, 18), fundingUnits(q.FeeCapWei, 18), fundingUnits(q.ExpectedFeeWei, 18), fundingUnits(q.FlatFeeWei, 18))
 	if strings.TrimLeft(q.OwedWei, "0") != "" {
 		fmt.Fprintf(out, "Owed from an earlier sponsored escape, deducted first: %s ETH\n", fundingUnits(q.OwedWei, 18))
@@ -224,9 +247,7 @@ func printPayoutQuote(out io.Writer, q zkapi.AddressPaymentQuote) {
 	} else {
 		fmt.Fprintf(out, "The payout address receives at least: %s ETH\n", fundingUnits(q.MinimumReceivedWei, 18))
 	}
-	if q.PayeeHasCode {
-		fmt.Fprintf(out, "The payout address has code: it must accept the ETH within 100,000 gas, or the payout is credited in the paymaster (less a surcharge of up to %s ETH, which the floor above already deducts) for zkapi-clientd withdraw --claim-credit --to %s.\n", fundingUnits(zeroIfEmpty(q.CreditSurchargeWei), 18), q.Destination)
-	}
+	printPayeeHasCode(out, q)
 	if q.FeeBumpCapWei != "" && q.FeeBumpCapWei != q.FeeCapWei {
 		fmt.Fprintf(out, "If the bundler drops the operation it is re-signed with higher fees, taking at most %s ETH from the payout (your --fee-cap-gwei); the approval binds that bound.\n", fundingUnits(q.FeeBumpCapWei, 18))
 	} else {
@@ -235,4 +256,87 @@ func printPayoutQuote(out io.Writer, q zkapi.AddressPaymentQuote) {
 	if q.UserOpGas != nil {
 		fmt.Fprintf(out, "Signed gas limits: call %d, verification %d, pre-verification %d, paymaster verification %d, postOp %d; max fee %s wei/gas, priority %s wei/gas\n", q.UserOpGas.CallGasLimit, q.UserOpGas.VerificationGasLimit, q.UserOpGas.PreVerificationGas, q.UserOpGas.PaymasterVerificationGasLimit, q.UserOpGas.PaymasterPostOpGasLimit, q.MaxFeePerGas, q.MaxPriorityFeePerGas)
 	}
+}
+
+// printPayoutTerms prints what one approval of a payout withdrawal
+// authorizes (the CLI quote and the guided withdrawal print the same): the
+// fee is an estimate that may change, the bound on what the payout may lose
+// and the floor the destination receives hold whatever it becomes, and the
+// approval covers only this destination, note and transit account.
+func printPayoutTerms(out io.Writer, q zkapi.AddressPaymentQuote) {
+	maxFee, minNet := payoutBound(q)
+	fmt.Fprintf(out, "Estimated network fee: about %s ETH (an estimate; the actual fee may change)\n", fundingUnits(q.ExpectedFeeWei, 18))
+	fmt.Fprintf(out, "At most %s ETH may be taken from the payout (the network fee and the paymaster's fee together)\n", fundingUnits(maxFee, 18))
+	if strings.TrimLeft(q.OwedWei, "0") != "" {
+		fmt.Fprintf(out, "Owed from an earlier sponsored escape, deducted first: %s ETH\n", fundingUnits(q.OwedWei, 18))
+	}
+	fmt.Fprintf(out, "%s receives at least %s ETH\n", q.Destination, fundingUnits(minNet, 18))
+	printPayeeHasCode(out, q)
+	if authorizedPayoutQuote(q) {
+		fmt.Fprintln(out, "This one approval covers this destination, note and transit account; fee changes within this maximum are handled without asking again; a new destination or note needs a new approval.")
+	}
+}
+
+func printPayeeHasCode(out io.Writer, q zkapi.AddressPaymentQuote) {
+	if q.PayeeHasCode {
+		fmt.Fprintf(out, "The payout address has code: it must accept the ETH within 100,000 gas, or the payout is credited in the paymaster (less a surcharge of up to %s ETH, which the floor above already deducts) for zkapi-clientd withdraw --claim-credit --to %s.\n", fundingUnits(zeroIfEmpty(q.CreditSurchargeWei), 18), q.Destination)
+	}
+}
+
+// authorizedPayoutQuote reports a payout quote approved once under a
+// bounded authorization: the daemon rebuilds, re-signs and re-proves within
+// MaxTotalFeeWei without another approval.
+func authorizedPayoutQuote(q zkapi.AddressPaymentQuote) bool {
+	return q.FeePolicy == "payout" && q.MaxTotalFeeWei != "" && q.MinNetPayoutWei != ""
+}
+
+// validPayoutAuthorization checks a payout quote's bounded authorization:
+// both figures or neither, a bound no lower than the operation as built now,
+// and a floor that is exactly the payout less the bound and the debt.
+func validPayoutAuthorization(q zkapi.AddressPaymentQuote) bool {
+	if q.MaxTotalFeeWei == "" && q.MinNetPayoutWei == "" {
+		return true
+	}
+	if q.MaxTotalFeeWei == "" || q.MinNetPayoutWei == "" {
+		return false
+	}
+	bound, ok := new(big.Int).SetString(q.MaxTotalFeeWei, 10)
+	floor, floorOK := new(big.Int).SetString(q.MinNetPayoutWei, 10)
+	payout, payoutOK := new(big.Int).SetString(q.PayoutWei, 10)
+	owed, owedOK := new(big.Int).SetString(q.OwedWei, 10)
+	if !ok || !floorOK || !payoutOK || !owedOK {
+		return false
+	}
+	if q.FeeCapWei != "" {
+		cap, capOK := new(big.Int).SetString(q.FeeCapWei, 10)
+		if !capOK || bound.Cmp(cap) < 0 {
+			return false
+		}
+	}
+	expected := new(big.Int).Sub(payout, bound)
+	expected.Sub(expected, owed)
+	return expected.Sign() >= 0 && expected.Cmp(floor) == 0
+}
+
+// payoutBound is what a payout approval binds: the most the payout may lose
+// and the least the payout address receives. A legacy quote without the
+// bounded authorization binds its operation as built now.
+func payoutBound(q zkapi.AddressPaymentQuote) (maxFee, minNet string) {
+	if authorizedPayoutQuote(q) {
+		return q.MaxTotalFeeWei, q.MinNetPayoutWei
+	}
+	return q.FeeCapWei, q.MinimumReceivedWei
+}
+
+// payoutWithinBound reports a payout quote whose bound is no looser than
+// the accepted one's: no higher maximum fee and no lower floor, so the
+// owner's approval of the accepted terms covers it.
+func payoutWithinBound(q, accepted zkapi.AddressPaymentQuote) bool {
+	maxFee, minNet := payoutBound(q)
+	acceptedFee, acceptedNet := payoutBound(accepted)
+	fee, feeOK := new(big.Int).SetString(maxFee, 10)
+	net, netOK := new(big.Int).SetString(minNet, 10)
+	limit, limitOK := new(big.Int).SetString(acceptedFee, 10)
+	floor, floorOK := new(big.Int).SetString(acceptedNet, 10)
+	return feeOK && netOK && limitOK && floorOK && fee.Cmp(limit) <= 0 && net.Cmp(floor) >= 0
 }

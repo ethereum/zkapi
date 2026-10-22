@@ -49,19 +49,10 @@ pub struct NoteState {
     /// state it was exported at.
     #[serde(default)]
     pub state_seq: u64,
-    /// Amendment A1: the note's Merkle path at the root its own deposit set.
-    /// The vault accepts any root it ever held, and the tree is append-only
-    /// for every note that is not closed, so this path proves membership for
-    /// every exit, with no indexer and no log rebuild.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deposit_path: Option<DepositPath>,
-}
-
-/// A note's Merkle path at the root of its deposit (Amendment A1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DepositPath {
-    pub root: Felt252,
-    pub siblings: Vec<Felt252>,
+    // A `deposit_path` (the note's Merkle path at its deposit root, kept by
+    // builds before vault revision 4) is read and ignored: exits are bound to
+    // the note's stored leaf and need no path. `deposit_amount` and
+    // `expiry_ts` reproduce that leaf, so both stay required.
 }
 
 impl NoteState {
@@ -100,7 +91,6 @@ impl NoteState {
             state_signature: None,
             bound_at_state: 0,
             state_seq: 0,
-            deposit_path: None,
         }
     }
 
@@ -198,9 +188,8 @@ mod tests {
         assert!(state.state_signature.is_none());
     }
 
-    /// A state file written before `bound_at_state`, `state_seq` and
-    /// `deposit_path` existed loads with no bound, sequence 0 and no saved
-    /// path.
+    /// A state file written before `bound_at_state` and `state_seq` existed
+    /// loads with no bound and sequence 0.
     #[test]
     fn a_state_file_without_the_concession_fields_loads_with_defaults() {
         let dir = test_dir("no_concession_fields");
@@ -218,14 +207,55 @@ mod tests {
             Felt252::from_u64(20),
         );
         let mut value = serde_json::to_value(&state).unwrap();
-        for field in ["bound_at_state", "state_seq", "deposit_path"] {
+        for field in ["bound_at_state", "state_seq"] {
             value.as_object_mut().unwrap().remove(field);
         }
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let loaded = NoteState::load(&path).unwrap();
         assert_eq!(loaded.bound_at_state, 0);
         assert_eq!(loaded.state_seq, 0);
-        assert!(loaded.deposit_path.is_none());
+    }
+
+    /// A state file of a build before vault revision 4 carries the note's
+    /// deposit-time Merkle path; it loads with the path ignored, and saving
+    /// it again drops the path. The deposit and expiry stay required: they
+    /// are part of the note's leaf, which every exit proves.
+    #[test]
+    fn a_saved_deposit_path_is_read_and_ignored() {
+        let dir = test_dir("legacy_deposit_path");
+        let path = dir.join("note_state.json");
+        let state = NoteState::new_from_deposit(
+            2,
+            1,
+            Felt252::from_u64(0xdead),
+            7,
+            Felt252::from_u64(42),
+            5000,
+            1700000000,
+            "0xff".to_string(),
+            Felt252::from_u64(10),
+            Felt252::from_u64(20),
+        );
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["deposit_path"] = serde_json::json!({
+            "root": "0x5",
+            "siblings": vec!["0x0"; zkapi_types::MERKLE_DEPTH],
+        });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = NoteState::load(&path).unwrap();
+        assert_eq!(loaded.note_id, 7);
+        assert_eq!(loaded.deposit_amount, 5000);
+        assert_eq!(loaded.expiry_ts, 1700000000);
+        loaded.save(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("deposit_path").is_none());
+
+        for required in ["deposit_amount", "expiry_ts"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(required);
+            fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
+            assert!(NoteState::load(&path).is_err(), "{required}");
+        }
     }
 
     /// A state file written before `prev_anchor` existed still loads; its

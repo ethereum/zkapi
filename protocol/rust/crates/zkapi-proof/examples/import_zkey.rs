@@ -44,10 +44,11 @@
 //! reviewer runs on their own export (README step 5).
 //!
 //! Then it writes the setup directory (keys with
-//! `zkapi-v2-concession-v1/<setup_id>/<kind>` headers, `manifest.json` with
+//! `zkapi-v2-concession-v2/<setup_id>/<kind>` headers, `manifest.json` with
 //! the SHA-256 of the powers of tau, transcript, R1CS exports and zkeys,
-//! `Bn254Poseidon.sol` and the regenerated `Groth16ProofAdapter.sol` with the
-//! VK hashes). It refuses to overwrite any of those files.
+//! `Bn254PoseidonRuntime.sol` with its `poseidon-runtime.json`, and the
+//! regenerated `Groth16ProofAdapter.sol` with the VK hashes). It refuses to
+//! overwrite any of those files.
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -61,9 +62,9 @@ use zkapi_proof::ceremony::{
 use zkapi_proof::compact::{
     circuit_shape, request_circuit, sha256, withdrawal_circuit, write_setup_directory, KeyKind,
     KindHashes, Prover, SetupManifest, SetupProvenance, CEREMONY_SETUP_ID,
-    REQUEST_PROVING_KEY_FILE, REQUEST_VERIFYING_KEY_FILE, SETUP_MANIFEST_FILE,
-    SOLIDITY_POSEIDON_FILE, SOLIDITY_VERIFIER_FILE, WITHDRAWAL_PROVING_KEY_FILE,
-    WITHDRAWAL_VERIFYING_KEY_FILE,
+    POSEIDON_RUNTIME_MANIFEST_FILE, REQUEST_PROVING_KEY_FILE, REQUEST_VERIFYING_KEY_FILE,
+    SETUP_MANIFEST_FILE, SOLIDITY_POSEIDON_FILE, SOLIDITY_VERIFIER_FILE,
+    WITHDRAWAL_PROVING_KEY_FILE, WITHDRAWAL_VERIFYING_KEY_FILE,
 };
 use zkapi_proof::dev::{tree_with, DevDeployment, DevNote, DevRequest, DevWithdrawal};
 use zkapi_proof::groth16::verify_field_elements;
@@ -230,7 +231,6 @@ pub fn check_proving(pk: &ProvingKey<Bn254>, kind: KeyKind) -> Result<()> {
         KeyKind::Withdrawal => {
             let (public, witness) = state.withdrawal(
                 &deployment,
-                &tree,
                 &DevWithdrawal {
                     kind: WithdrawalKind::Escape,
                     destination: [0xff; 20],
@@ -304,6 +304,7 @@ pub fn import(args: &ImportArgs) -> Result<SetupManifest> {
         WITHDRAWAL_VERIFYING_KEY_FILE,
         SETUP_MANIFEST_FILE,
         SOLIDITY_POSEIDON_FILE,
+        POSEIDON_RUNTIME_MANIFEST_FILE,
         SOLIDITY_VERIFIER_FILE,
     ] {
         ensure!(

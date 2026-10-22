@@ -75,17 +75,26 @@ test('host configuration resolves explicit paths and retains trusted same-origin
     }
 });
 
-test('the shipped network profiles are placeholders that no host build accepts', async () => {
+test('the shipped sepolia profile builds and the mainnet placeholder is refused', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'zkapi-sdk-assets-'));
     try {
         const pinned = await verifyBrowserSdkAssets();
         assert.equal(pinned.schema, 2);
-        assert.equal(pinned.circuitId, 'zkapi-v2-concession-v1');
-        for (const network of ['sepolia', 'mainnet']) {
-            await assert.rejects(buildBrowserSdkAssets({ outDir: path.join(temp, network), network, build }),
-                { code: 'deployment_not_deployed' });
-            await assert.rejects(fs.access(path.join(temp, network)), 'nothing was written');
+        assert.equal(pinned.circuitId, 'zkapi-v2-concession-v2');
+        // Sepolia pins its staging deployment: a host build accepts it with the pinned keys.
+        const shipped = JSON.parse(await fs.readFile(new URL('../assets/config/sepolia.json', import.meta.url), 'utf8'));
+        const sepolia = await buildBrowserSdkAssets({ outDir: path.join(temp, 'sepolia'), network: 'sepolia', build });
+        assert.equal(sepolia.config.trusted_deployment.deployment_status, 'deployed');
+        assert.equal(sepolia.config.trusted_deployment.deployment_id, shipped.trusted_deployment.deployment_id);
+        assert.equal(sepolia.config.trusted_deployment.chain_id, 11155111);
+        assert.equal(sepolia.config.trusted_deployment.setup_id, pinned.setupId);
+        for (const file of ['request.pk', 'withdrawal.pk', 'request.vk']) {
+            assert.equal(sepolia.files[`proofs/${file}`], pinned.files[`assets/proofs/${file}`], file);
         }
+        // Mainnet is still a placeholder: no host build accepts it, and nothing is written.
+        await assert.rejects(buildBrowserSdkAssets({ outDir: path.join(temp, 'mainnet'), network: 'mainnet', build }),
+            { code: 'deployment_not_deployed' });
+        await assert.rejects(fs.access(path.join(temp, 'mainnet')), 'nothing was written');
         await assert.rejects(buildBrowserSdkAssets({outDir: temp, network: 'invalid', build}), /Network/);
         await assert.rejects(buildBrowserSdkAssets({outDir: temp, publicPath: '//other.example/', build}), /same-origin/);
     } finally { await fs.rm(temp, { recursive: true, force: true }); }
@@ -132,7 +141,7 @@ test('a deployed profile builds under the new publicPath with its pinned keys, r
         const sdkAssets = JSON.parse(await fs.readFile(path.join(temp, 'out/sdk-assets.json'), 'utf8'));
         assert.deepEqual({ schema: sdkAssets.schema, circuitId: sdkAssets.circuitId, setupId: sdkAssets.setupId,
             publicPath: sdkAssets.publicPath, sourceRevision: sdkAssets.sourceRevision },
-        { schema: 2, circuitId: 'zkapi-v2-concession-v1', setupId: pinned.setupId, publicPath: '/zkapi/v2c/',
+        { schema: 2, circuitId: 'zkapi-v2-concession-v2', setupId: pinned.setupId, publicPath: '/zkapi/v2c/',
             sourceRevision: pinned.sourceRevision });
         const worker = await fs.readFile(path.join(result.directory, 'assets/zkapiWasmWorker.js'), 'utf8');
         assert.match(worker, /\.\.\/wasm\/zkapi_browser_bg\.wasm/);
@@ -158,6 +167,14 @@ test('host builds refuse a profile of another setup and unpinned keys, and build
             { code: 'incompatible_proof_circuit' });
         await assert.rejects(attempt('sepolia', sepolia({ exit_concession: undefined }), 'revision'),
             { code: 'exit_concession_required' });
+        // A revision-3 profile (root-bound exits), or one without the deposit pins.
+        for (const [name, changes, code] of [['revision3', { vault_revision: 3 }, 'vault_revision_unsupported'],
+            ['leafbound', { leaf_bound_exit: undefined }, 'vault_revision_unsupported'],
+            ['mindeposit', { min_deposit_units: null }, 'deposit_pins_missing'],
+            ['freshslot', { fresh_slot_gas: 0 }, 'deposit_pins_missing']]) {
+            await assert.rejects(attempt('sepolia', sepolia(changes), name), { code }, name);
+            await assert.rejects(fs.access(out(name)), `${name}: nothing was written`);
+        }
         await assert.rejects(attempt('sepolia', sepolia({ request_verifying_key_sha256: '0'.repeat(64) }), 'vk'),
             /request\.vk does not match/);
         await assert.rejects(attempt('sepolia', sepolia({ withdrawal_proving_key_sha256: '0'.repeat(64) }), 'pk'),

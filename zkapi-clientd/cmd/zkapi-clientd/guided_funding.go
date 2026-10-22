@@ -65,18 +65,18 @@ func runGuidedFunding(ctx context.Context, c config.Config, usdText, _ string, u
 }
 
 // A fixed label: the daemon's detailed status stays out of the guided output.
-var errGuidedDepositConflict = errors.New("deposit needs attention: the payment RPC, the vault state, and the zkAPI indexer disagree about this mined deposit, so its private note was not activated; the funds stay on chain. Run zkapi-clientd config again to re-check. If this persists, compare the transaction on a block explorer and run zkapi-clientd config --menu, then choose repair")
+var errGuidedDepositConflict = errors.New("deposit needs attention: the payment RPC, the vault state, and the zkAPI indexer disagree about this mined deposit, so its private note was not activated; the funds stay on chain. Run zkapi-clientd config --setup again to re-check. If this persists, compare the transaction on a block explorer and run zkapi-clientd config --menu, then choose repair")
 
 // A conflict about an earlier, retired deposit can clear on re-check; no
 // deposit is saved then, so there is nothing to resume.
 var errGuidedDepositRechecked = errors.New("the zkAPI indexer no longer shows the earlier deposit and no deposit is saved; run zkapi-clientd config again to review a new deposit quote")
 
-// runGuidedRepair binds the saved deposit to the vault note that finalized
-// vault state and the zkAPI indexer agree holds it, through the
-// owner-authenticated rebind endpoint. The daemon verifies everything itself
+// runGuidedRepair binds the saved deposit to the vault note whose finalized
+// vault leaf is this deposit's (the zkAPI indexer, when it answers, must
+// agree), through the owner-authenticated rebind endpoint. The daemon verifies everything itself
 // and never changes the deposit's secret, commitment, or amount.
 func runGuidedRepair(ctx context.Context, c config.Config, ui setupPrompter) error {
-	ui.Printf("Repair binds the saved deposit to the vault note that finalized vault state and the zkAPI indexer agree holds it. It never changes the deposit's secret, commitment, or amount.\n")
+	ui.Printf("Repair binds the saved deposit to the vault note whose finalized vault state holds exactly this deposit (the zkAPI indexer, when it answers, must agree). It never changes the deposit's secret, commitment, or amount.\n")
 	noteText, err := ui.Ask(ctx, "Vault note ID that holds the deposit (blank to find it from the saved transaction)", "")
 	if err != nil {
 		return err
@@ -138,6 +138,10 @@ func chooseSetupDepositUSD(ctx context.Context, usdText string, ui setupPrompter
 	}
 }
 
+// earlierDeploymentsKey carries guidedStart's earlier-deployment warnings
+// for its profile ([]string) to guided funding.
+type earlierDeploymentsKey struct{}
+
 func guidedFunding(ctx context.Context, service guidedFundingService, usdText string, ui setupPrompter, wait func(context.Context) error) error {
 	defer clearSetupProgress(ui)
 	setupProgress(ui, "Checking wallet status...")
@@ -164,7 +168,8 @@ func guidedFunding(ctx context.Context, service guidedFundingService, usdText st
 		}
 	case "verification_conflict":
 		// A saved conflict is never terminal: resuming re-reads the receipt
-		// and verifies it again against the vault and the zkAPI indexer.
+		// and verifies it again against the vault (and the zkAPI indexer,
+		// when it answers).
 		ui.Printf("Re-verifying your saved deposit; no new deposit will be created.\n")
 		next, err := service.Resume(ctx, state.Amount)
 		if err != nil {
@@ -188,6 +193,13 @@ func guidedFunding(ctx context.Context, service guidedFundingService, usdText st
 		}
 		var usd uint64
 		if state.Amount == 0 {
+			// A new deposit gets a new funding address. Say again, without a
+			// question, that an earlier deployment's wallet in this profile
+			// may still hold funds this build never sees.
+			warnings, _ := ctx.Value(earlierDeploymentsKey{}).([]string)
+			for _, warning := range warnings {
+				ui.Printf("WARNING: %s\n", warning)
+			}
 			usd, err = chooseSetupDepositUSD(ctx, usdText, ui)
 			if err != nil {
 				return err
@@ -568,7 +580,7 @@ func finishGuidedDeposit(ctx context.Context, service guidedFundingService, init
 				ui.Printf("Deposit confirmed. Private inference balance activated.\n")
 			case "confirming":
 				if state.DepositStage == "verifying" {
-					setupProgress(ui, "Deposit mined; waiting for the zkAPI indexer to confirm it before activation.")
+					setupProgress(ui, "Deposit mined; waiting for the vault state to confirm it before activation.")
 				} else {
 					setupProgress(ui, "Deposit confirmed; activating your private balance.")
 				}

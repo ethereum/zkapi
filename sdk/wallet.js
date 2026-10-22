@@ -1,16 +1,18 @@
-// Vault revision 3 (circuit zkapi-v2-concession-v1). Selectors and topics are
-// derived from the signatures beside them (sdk/test/wallet.test.mjs recomputes
-// every one). WITHDRAWAL_TUPLE is Types.WithdrawalPublicInputs: 16 static
-// words in public-input order; REQUEST_TUPLE is Types.RequestPublicInputs.
-const WITHDRAWAL_TUPLE = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)";
+// Vault revision 4 (circuit zkapi-v2-concession-v2, leaf-bound exits).
+// Selectors and topics are derived from the signatures beside them
+// (sdk/test/wallet.test.mjs recomputes every one). WITHDRAWAL_TUPLE is
+// Types.WithdrawalPublicInputs: 16 static words in public-input order, word 3
+// the note's leaf (noteLeaf) and word 8 its packed fields (noteFields);
+// REQUEST_TUPLE is Types.RequestPublicInputs.
+const WITHDRAWAL_TUPLE = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64)";
 const REQUEST_TUPLE = "(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256)";
 
 const ABI = Object.freeze({
   deposit: "56d2e1ea",
   // mutualClose(WITHDRAWAL_TUPLE,bytes)
-  mutualClose: "72cd2e44",
+  mutualClose: "bce12a6c",
   // initiateEscapeWithdrawal(WITHDRAWAL_TUPLE,bytes)
-  initiateEscapeWithdrawal: "a38d62aa",
+  initiateEscapeWithdrawal: "8cd67c60",
   // finalizeEscapeWithdrawal(uint32)
   finalizeEscapeWithdrawal: "ff8f5585",
   // raiseEscapeConcession(uint32,REQUEST_TUPLE,bytes,uint128): decoded only
@@ -19,20 +21,29 @@ const ABI = Object.freeze({
   challengeEscapeWithdrawal: "da0ce43d",
   challengePeriod: "f3f480d9",
   legacyChallengePeriod: "c3a079ed",
+  // currentRoot(): computed from the vault's frontier (a view of about 0.5M gas)
   currentRoot: "fdab463d",
   nextNoteId: "7a2043a3",
-  notes: "9f18e4ed",
+  // noteRecord(uint32): 2 words (uint256 leaf, uint8 status)
+  noteRecord: "d154f5bf",
+  // noteLeaves(uint32 start, uint32 count): uint256[]; reverts past nextNoteId
+  noteLeaves: "31749c58",
+  minDeposit: "41b3d185",
   // pendingWithdrawals(uint32): 6 words
   pendingWithdrawals: "a2f9f1ce",
   // pendingConcessions(uint32): 3 words (nextNullifier, stateBalance, conceded)
   pendingConcessions: "f8ffe6e0",
   challengedNullifiers: "6cda756a",
   usedNullifiers: "aad24061",
-  effectiveExpiry: "7cb4a03c",
+  // effectiveExpiry(uint32 noteId, bytes32 commitment, uint128 amount, uint64 expiryTs):
+  // 0 for an unknown or retired note, or a preimage that is not its leaf's
+  effectiveExpiry: "5a747a98",
+  // claimExpired(uint32,bytes32,uint128,uint64): the treasury's; decoded only
+  claimExpired: "ad610550",
   // Deployment pins (design §6.5): vault getters and adapter constants.
   CONCESSION_ESCAPE_VERSION: "5e00b426",
+  LEAF_BOUND_EXIT_VERSION: "c0baafb1",
   maxPauseDuration: "64433d27",
-  ROOT_HISTORY_WINDOW: "1fe72de0",
   noteTtl: "225af2e7",
   proofAdapter: "efc91e58",
   stateSigningKeyX: "15fa2a9a",
@@ -42,26 +53,27 @@ const ABI = Object.freeze({
   CIRCUIT_ID_HASH: "da0e8385",
   REQUEST_VK_HASH: "fe351488",
   WITHDRAWAL_VK_HASH: "7fcd0926",
-  noteDeposited: "0x7c83dba8534bea9e30d6444f9ca6462dc906897f9938d220dbbe4358c1f7a063",
+  // NoteDeposited(uint32 indexed noteId, bytes32 indexed commitment, uint128 amount,
+  // uint64 expiryTs): no event carries a root since revision 4.
+  noteDeposited: "0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36",
   mutualCloseEvent: "0x1f43fa4711ca18e1d26398f26bf598bd3a62992cdd0e84f055f2bb506e9d7031",
   // EscapeWithdrawalInitiated(uint32 indexed noteId, uint256 nullifier, uint128 finalBalance,
-  // address destination, uint64 challengeDeadline, uint256 root): unchanged, 5 data words.
-  escapeInitiatedEvent: "0xb0d1eb7131bcf3c6dd53517f6fa90bf7cc94178eb0eb5e0a1f204abe3b839cdf",
+  // address destination, uint64 challengeDeadline): 4 data words.
+  escapeInitiatedEvent: "0x5ad24b4d5235cdf161caf23bb21550824a1be902576056f666b56ac6c424f4b1",
   escapeFinalizedEvent: "0x163f2e46c4004f0ed9682e2db8c84efac31310720266b17ea9904ba348c26504",
-  // EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier, uint256 root):
-  // a defeat by successor evidence.
-  escapeChallengedEvent: "0x5cc5343b84cd949969f3ccc4ea44315630280857b9e591cc1ab48dbb9e6a3581",
+  // EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier): a defeat by
+  // successor evidence.
+  escapeChallengedEvent: "0x4bffb77581f1706ad6afe03cd651fb25b1b485f7eaef1826e2cc6f420f532161",
   // EscapeConcessionRecorded(uint32 indexed noteId, uint256 nextNullifier, uint128 stateBalance,
   // uint128 conceded): follows EscapeWithdrawalInitiated in the same receipt.
   escapeConcessionRecordedEvent: "0x2254ee827bce198564720fe77733ebfab1a49361cd4f050f107445241b560b4d",
   // EscapeConcessionRaised(uint32 indexed noteId, uint256 nullifier, uint128 conceded,
   // uint128 finalBalance)
   escapeConcessionRaisedEvent: "0x3faf5608f821061643ff6fdfe6dd0f6d7fb074bb565f35e3537a86ac08f0897c",
-  // ClosedLeafRetired(uint32 indexed noteId, uint256 newRoot)
-  closedLeafRetiredEvent: "0x64572cec8ef079a5baa4f2860f8b65efb52a96f64ee679d315fd2a0541ea28b3",
-  // ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount, uint256 newRoot): the
-  // root word carries the unchanged currentRoot (no leaf removal).
-  expiredClaimedEvent: "0x5534ce4a9fb7fe545375064cc186660ac10ba2152cb1592b29b244d2fe169ae4",
+  // ClosedLeafRetired(uint32 indexed noteId): no data
+  closedLeafRetiredEvent: "0x733841afe92a19d5b309b7732cf095a30edfae784b7cc5f0a97dec7140fb8e13",
+  // ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount)
+  expiredClaimedEvent: "0xe5962fdd811b0b8d9b9cdaf37e396f36dd238f127d52ef65ae07d96edb32fd96",
   // A finalized escape whose push to the destination failed credits it instead:
   // EscapePayoutDeferred(uint32 indexed noteId, address indexed destination, uint128 amount)
   // precedes EscapeWithdrawalFinalized in the same receipt.
@@ -130,6 +142,7 @@ const GASLESS_ABI = Object.freeze({
   quote: "e948303d",
   // gasPolicy(): 30 words (two uint256[4] then 22 scalars)
   gasPolicy: "3a5dbdc2",
+  gasSchedule: "61ed0660", // gasSchedule()
   // chargeFor(uint8,uint256,uint256,uint256,uint256,bool,bool,uint256)
   chargeFor: "64452fce",
   // keyFor(uint8,uint256,uint32,address)
@@ -271,8 +284,11 @@ function escapePeriodBadge(seconds) {
   return `${value}s`;
 }
 
-/** deposit(bytes32 commitment, uint128 amount): the vault appends the leaf itself (revision 3), so
- *  the plan's zero_path (the note's siblings at deposit time) stays local, for the exit path. */
+/**
+ * deposit(bytes32 commitment, uint128 amount): the vault appends the note's
+ * leaf at nextNoteId and stores it with the note (revision 4); no path or
+ * root is sent or kept, and no exit ever needs one.
+ */
 function encodeDeposit(plan, amount) {
   return callData(ABI.deposit, [abiWord(toBytes32(plan.commitment)), abiWord(amount)]);
 }
@@ -306,10 +322,10 @@ function destinationHex(value) {
 
 const SCALAR_MODULUS = 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001n;
 
-// One static ABI word for an unsigned integer of `bits` bits. Accepts a safe
-// JavaScript integer, a bigint, or a decimal or 0x-hex string; refuses a value
-// that lost precision or does not fit, instead of encoding a different one.
-function uintWord(value, bits, label) {
+// An unsigned integer of `bits` bits as a bigint. Accepts a safe JavaScript
+// integer, a bigint, or a decimal or 0x-hex string; refuses a value that lost
+// precision or does not fit, instead of encoding a different one.
+function uintValue(value, bits, label) {
   let number;
   if (typeof value === "bigint") number = value;
   else if (typeof value === "number" && Number.isSafeInteger(value)) number = BigInt(value);
@@ -318,7 +334,33 @@ function uintWord(value, bits, label) {
   if (number < 0n || number >= (1n << BigInt(bits))) {
     throw new Error(`The withdrawal proof's ${label} does not fit in uint${bits}.`);
   }
-  return number.toString(16).padStart(64, "0");
+  return number;
+}
+
+// One static ABI word for an unsigned integer of `bits` bits (uintValue).
+function uintWord(value, bits, label) {
+  return uintValue(value, bits, label).toString(16).padStart(64, "0");
+}
+
+/**
+ * A note's packed fields, public input 8 (noteFields):
+ * noteId·2^192 + depositAmount·2^64 + expiryTs, below 2^224. The vault reads
+ * the deposit and expiry of an exit from this word, and its leaf binds it.
+ */
+function packNoteFields(noteId, depositAmount, expiryTs) {
+  return (uintValue(noteId, 32, "note id") << 192n)
+    | (uintValue(depositAmount, 128, "deposit amount") << 64n)
+    | uintValue(expiryTs, 64, "expiry");
+}
+
+/** The inverse of packNoteFields; refuses a word of 2^224 or more. */
+function unpackNoteFields(fields) {
+  const value = uintValue(fields, 224, "note fields");
+  return {
+    noteId: Number(value >> 192n),
+    depositAmount: (value >> 64n) & ((1n << 128n) - 1n),
+    expiryTs: value & ((1n << 64n) - 1n),
+  };
 }
 
 // One static ABI word for a canonical BN254 field element given as 0x-hex.
@@ -335,10 +377,14 @@ const ZERO_WORD = "0".repeat(64);
  * Calldata for initiateEscapeWithdrawal (mode "escape", kind 0) or
  * mutualClose (mode "mutual", kind 1): the 16-word statement tuple, the
  * bytes offset 17 * 32, the length 256 and the 8 proof words (836 bytes).
- * Exits do no Merkle work, so no path is sent. The proof must be of the
- * mode's kind, pay `expectedDestination` and name `expectedVault`; an escape
- * must name its successor nullifier, a close must concede nothing.
- * `expected.conceded`, when given, is the amount the user confirmed.
+ * Word 3 is the note's leaf (`note_leaf`), which the vault compares with the
+ * leaf it stored at deposit, and word 8 its packed fields (`note_id`,
+ * `deposit_amount`, `expiry_ts`): an exit carries no Merkle path or root. A
+ * statement that names a root (`active_root`, an earlier revision's) is
+ * refused. The proof must be of the mode's kind, pay `expectedDestination`
+ * and name `expectedVault`; an escape must name its successor nullifier, a
+ * close must concede nothing. `expected.conceded`, when given, is the amount
+ * the user confirmed.
  */
 function encodeWithdrawal(plan, expectedMode, expectedDestination, expectedVault, expected = {}) {
   const mode = String(expectedMode || "").toLowerCase();
@@ -384,6 +430,13 @@ function encodeWithdrawal(plan, expectedMode, expectedDestination, expectedVault
   }
   const validUntil = uintWord(inputs.valid_until, 64, "valid_until");
   if (validUntil === ZERO_WORD) throw new Error("The withdrawal proof has no valid_until.");
+  if ("active_root" in inputs || "merkle_siblings" in inputs) {
+    throw new Error("The withdrawal proof names a Merkle root: it was made for an earlier vault revision.");
+  }
+  const noteLeaf = feltWord(inputs.note_leaf, "note leaf");
+  if (noteLeaf === ZERO_WORD) throw new Error("The withdrawal proof has no note leaf.");
+  const noteFields = packNoteFields(inputs.note_id, inputs.deposit_amount, inputs.expiry_ts)
+    .toString(16).padStart(64, "0");
   const proof = decodeBase64(plan.proof.proof);
   if (proof.length !== 256) {
     throw new Error("The Groth16 withdrawal proof must contain exactly 256 bytes.");
@@ -392,12 +445,12 @@ function encodeWithdrawal(plan, expectedMode, expectedDestination, expectedVault
     uintWord(inputs.protocol_version, 16, "protocol version"),
     uintWord(inputs.chain_id, 64, "chain id"),
     contract,
-    feltWord(inputs.active_root, "active root"),
+    noteLeaf,
     feltWord(inputs.state_signing_key_x, "state signing key"),
     feltWord(inputs.state_signing_key_y, "state signing key"),
     feltWord(inputs.clearance_signing_key_x, "clearance signing key"),
     feltWord(inputs.clearance_signing_key_y, "clearance signing key"),
-    uintWord(inputs.note_id, 32, "note id"),
+    noteFields,
     uintWord(inputs.final_balance, 128, "final balance"),
     uintWord(destination, 160, "destination"),
     nullifier,
@@ -546,7 +599,7 @@ function parseWithdrawalReceipt(receipt, vaultAddress, mode, { noteId = null } =
     if (log.address?.toLowerCase() !== vaultAddress.toLowerCase()
         || log.topics?.[0]?.toLowerCase() !== expectedTopic) continue;
     const data = String(log.data || "").replace(/^0x/, "");
-    const minimumWords = mode === "escape" ? 5 : 3;
+    const minimumWords = mode === "escape" ? 4 : 3;
     if (log.topics.length < 2 || data.length < minimumWords * 64) continue;
     if (expectedNoteId != null && BigInt(log.topics[1]) !== expectedNoteId) continue;
     const result = {
@@ -556,8 +609,8 @@ function parseWithdrawalReceipt(receipt, vaultAddress, mode, { noteId = null } =
     };
     if (mode === "escape") {
       result.challengeDeadline = BigInt(`0x${data.slice(192, 256)}`);
-      // Vault revision 3 records the escape's successor nullifier, state
-      // balance and initial concession in the same receipt.
+      // The vault records the escape's successor nullifier, state balance
+      // and initial concession in the same receipt.
       const concession = escapeConcessionRecorded(receipt, vaultAddress, result.noteId);
       if (concession) result.concession = concession;
     }
@@ -573,25 +626,29 @@ function parseWithdrawalReceipt(receipt, vaultAddress, mode, { noteId = null } =
   return null;
 }
 
+/**
+ * The NoteDeposited log of a deposit receipt: the note id the vault assigned,
+ * the commitment, the amount and the expiry e (2 data words; no root). The
+ * caller still checks noteRecord(noteId).leaf against the leaf of these.
+ */
 function parseNoteDeposited(receipt, vaultAddress) {
   for (const log of receipt?.logs || []) {
-    if (log.address?.toLowerCase() !== vaultAddress.toLowerCase()
+    if (log.removed === true || log.address?.toLowerCase() !== vaultAddress.toLowerCase()
         || log.topics?.[0]?.toLowerCase() !== ABI.noteDeposited) continue;
     const data = String(log.data || "").replace(/^0x/, "");
-    if (log.topics.length >= 3 && data.length >= 192) {
+    if (log.topics.length >= 3 && /^[0-9a-fA-F]{128}$/.test(data)) {
       return {
         noteId: BigInt(log.topics[1]),
         commitment: log.topics[2],
         amount: BigInt(`0x${data.slice(0, 64)}`),
         expiryTs: BigInt(`0x${data.slice(64, 128)}`),
-        newRoot: BigInt(`0x${data.slice(128, 192)}`),
       };
     }
   }
   return null;
 }
 
-// ---- Strict decoders for vault revision 3 reads, logs and calldata ----
+// ---- Strict decoders for vault revision 4 reads, logs and calldata ----
 
 const UINT128_LIMIT = 1n << 128n;
 
@@ -624,7 +681,10 @@ function encodePendingConcessions(noteId) {
   return callData(ABI.pendingConcessions, [uintWord(noteId, 32, "note id")]);
 }
 
-/** pendingWithdrawals(noteId): exactly 6 words (unchanged from revision 2). */
+/**
+ * pendingWithdrawals(noteId): exactly 6 words (the shape of revision 2). Word
+ * 1 (the old activeRoot) is always zero: no escape is bound to a root.
+ */
 function decodePendingWithdrawals(result) {
   const [exists, activeRoot, withdrawalNullifier, finalBalance, destination, challengeDeadline] =
     dataWords(result, 6, "pendingWithdrawals");
@@ -652,14 +712,55 @@ function decodePendingConcessions(result) {
   };
 }
 
+// noteRecord status values (Types.NoteStatus).
+const NOTE_STATUS = Object.freeze({ uninitialized: 0, active: 1, pendingWithdrawal: 2, closed: 3 });
+const NOTE_STATUS_NAMES = Object.freeze(["uninitialized", "active", "pending_withdrawal", "closed"]);
+
+function encodeNoteRecord(noteId) {
+  return callData(ABI.noteRecord, [uintWord(noteId, 32, "note id")]);
+}
+
+/**
+ * noteRecord(noteId): exactly 2 words, the stored leaf and the status. A
+ * retired note is Closed with a zero leaf; a slot never deposited is
+ * Uninitialized with a zero leaf.
+ */
+function decodeNoteRecord(result) {
+  const [leaf, status] = dataWords(result, 2, "noteRecord");
+  if (leaf >= SCALAR_MODULUS) throw new Error("noteRecord.leaf is not a field element.");
+  if (status > 3n) throw new Error("noteRecord.status is not a note status.");
+  return { leaf, status: Number(status), statusName: NOTE_STATUS_NAMES[Number(status)] };
+}
+
+/** effectiveExpiry(noteId, commitment, amount, expiryTs): the preimage of the note's leaf. */
+function encodeEffectiveExpiry(noteId, commitment, amount, expiryTs) {
+  return callData(ABI.effectiveExpiry, [uintWord(noteId, 32, "note id"), feltWord(toBytes32(commitment), "commitment"),
+    uintWord(amount, 128, "deposit amount"), uintWord(expiryTs, 64, "expiry")]);
+}
+
+/** noteLeaves(start, count): the vault reverts unless start + count <= nextNoteId. */
+function encodeNoteLeaves(start, count) {
+  return callData(ABI.noteLeaves, [uintWord(start, 32, "first note id"), uintWord(count, 32, "leaf count")]);
+}
+
+/** A noteLeaves(start, count) answer: exactly `count` field elements (0 for a retired note). */
+function decodeNoteLeaves(result, count) {
+  const expected = Number(count);
+  const words = dataWords(result, 2 + expected, "noteLeaves");
+  if (words[0] !== 32n || words[1] !== BigInt(expected)) throw new Error("noteLeaves is not one array of the requested length.");
+  const leaves = words.slice(2);
+  if (leaves.some(leaf => leaf >= SCALAR_MODULUS)) throw new Error("noteLeaves holds a value that is not a field element.");
+  return leaves;
+}
+
 const VAULT_EVENTS = Object.freeze({
-  [ABI.noteDeposited]: { name: "NoteDeposited", topics: 3, words: 3 },
-  [ABI.escapeInitiatedEvent]: { name: "EscapeWithdrawalInitiated", topics: 2, words: 5 },
+  [ABI.noteDeposited]: { name: "NoteDeposited", topics: 3, words: 2 },
+  [ABI.escapeInitiatedEvent]: { name: "EscapeWithdrawalInitiated", topics: 2, words: 4 },
   [ABI.escapeConcessionRecordedEvent]: { name: "EscapeConcessionRecorded", topics: 2, words: 3 },
   [ABI.escapeConcessionRaisedEvent]: { name: "EscapeConcessionRaised", topics: 2, words: 3 },
-  [ABI.escapeChallengedEvent]: { name: "EscapeWithdrawalChallenged", topics: 2, words: 2 },
-  [ABI.closedLeafRetiredEvent]: { name: "ClosedLeafRetired", topics: 2, words: 1 },
-  [ABI.expiredClaimedEvent]: { name: "ExpiredClaimed", topics: 2, words: 2 },
+  [ABI.escapeChallengedEvent]: { name: "EscapeWithdrawalChallenged", topics: 2, words: 1 },
+  [ABI.closedLeafRetiredEvent]: { name: "ClosedLeafRetired", topics: 2, words: 0 },
+  [ABI.expiredClaimedEvent]: { name: "ExpiredClaimed", topics: 2, words: 1 },
 });
 
 /**
@@ -683,13 +784,13 @@ function decodeVaultEvent(log, vaultAddress) {
       return {
         ...base, commitment: String(log.topics[2]).toLowerCase(),
         amount: boundedWord(words[0], 128, "NoteDeposited.amount"),
-        expiryTs: boundedWord(words[1], 64, "NoteDeposited.expiryTs"), newRoot: words[2],
+        expiryTs: boundedWord(words[1], 64, "NoteDeposited.expiryTs"),
       };
     case "EscapeWithdrawalInitiated":
       return {
         ...base, nullifier: words[0], finalBalance: boundedWord(words[1], 128, "finalBalance"),
         destination: wordAddress(words[2], "destination"),
-        challengeDeadline: boundedWord(words[3], 64, "challengeDeadline"), root: words[4],
+        challengeDeadline: boundedWord(words[3], 64, "challengeDeadline"),
       };
     case "EscapeConcessionRecorded":
       return {
@@ -702,11 +803,11 @@ function decodeVaultEvent(log, vaultAddress) {
         finalBalance: boundedWord(words[2], 128, "finalBalance"),
       };
     case "EscapeWithdrawalChallenged":
-      return { ...base, nullifier: words[0], root: words[1] };
+      return { ...base, nullifier: words[0] };
     case "ExpiredClaimed":
-      return { ...base, depositAmount: boundedWord(words[0], 128, "ExpiredClaimed.depositAmount"), root: words[1] };
+      return { ...base, depositAmount: boundedWord(words[0], 128, "ExpiredClaimed.depositAmount") };
     default:
-      return { ...base, newRoot: words[0] };
+      return base;
   }
 }
 
@@ -791,13 +892,21 @@ const walletCodec = Object.freeze({
   WITHDRAWAL_CALLDATA_BYTES,
   WITHDRAWAL_KIND,
   WITHDRAWAL_TUPLE,
+  NOTE_STATUS,
   decodeChallengeEscapeWithdrawal,
+  decodeNoteLeaves,
+  decodeNoteRecord,
   decodePendingConcessions,
   decodePendingWithdrawals,
   decodeRaiseEscapeConcession,
   decodeVaultEvent,
+  encodeEffectiveExpiry,
+  encodeNoteLeaves,
+  encodeNoteRecord,
   encodePendingConcessions,
   encodePendingWithdrawals,
+  packNoteFields,
+  unpackNoteFields,
   escapeConcessionRaises,
   escapeConcessionRecorded,
   abiWord,
@@ -823,9 +932,10 @@ const walletCodec = Object.freeze({
 export default walletCodec;
 export {
   ABI, ESCAPE_PAYOUT_GAS, GASLESS_ABI, PACKED_USER_OPERATION_TUPLE, REQUEST_TUPLE, WITHDRAWAL_CALLDATA_BYTES, WITHDRAWAL_KIND,
-  WITHDRAWAL_TUPLE,
-  decodeChallengeEscapeWithdrawal, decodePendingConcessions, decodePendingWithdrawals, decodeRaiseEscapeConcession,
-  decodeVaultEvent, encodePendingConcessions, encodePendingWithdrawals, escapeConcessionRaises,
+  WITHDRAWAL_TUPLE, NOTE_STATUS,
+  decodeChallengeEscapeWithdrawal, decodeNoteLeaves, decodeNoteRecord, decodePendingConcessions, decodePendingWithdrawals,
+  decodeRaiseEscapeConcession, decodeVaultEvent, encodeEffectiveExpiry, encodeNoteLeaves, encodeNoteRecord,
+  encodePendingConcessions, encodePendingWithdrawals, packNoteFields, unpackNoteFields, escapeConcessionRaises,
   escapeConcessionRecorded, abiWord, addressWord, callData, encodeClaimCredit, encodeClaimEscapePayout, encodeCreateAccount,
   encodeDeposit, encodeEscapePayoutCredits, encodeFinalizeEscape, encodeSweep, encodeTransitWithdraw, encodeWithdrawal,
   escapePeriodBadge, escapePeriodLabel, escapePeriodPhrase, parseEscapePayoutClaim, parseNoteDeposited, parseWithdrawalReceipt };

@@ -34,7 +34,7 @@
     "./request-compat": "./sdk/services/zkapiRequestCompat.mjs",
     "./withdrawal-recovery": "./sdk/services/zkapiWithdrawalRecovery.mjs",
     "./expiry-history": "./sdk/services/zkapiExpiryHistory.mjs",
-    "./withdrawal-root": "./sdk/services/zkapiWithdrawalRoot.mjs",
+    "./tree-rebuild": "./sdk/services/zkapiTreeRebuild.mjs",
     "./request-archive": "./sdk/services/zkapiRequestArchive.mjs",
     "./exit-kit": "./sdk/services/zkapiExitKit.mjs",
     "./gas": "./sdk/services/zkapiGas.mjs",

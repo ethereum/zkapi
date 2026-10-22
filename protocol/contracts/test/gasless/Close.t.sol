@@ -68,7 +68,7 @@ contract CloseTest is GaslessTestBase {
 
         assertEq(payee.balance, e.paidOut, "the payee received P - charged");
         assertEq(s.balance, 0, "nothing stays in S");
-        assertEq(s.code.length, 221, "S exists");
+        assertEq(s.code.length, 93, "S exists");
         assertEq(paymaster.received(s), 0);
         assertEq(paymaster.receivedGas(s), 0);
         assertEq(address(paymaster).balance, 0, "the paymaster holds only credits");

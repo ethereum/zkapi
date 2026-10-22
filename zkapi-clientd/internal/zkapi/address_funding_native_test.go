@@ -25,7 +25,7 @@ func TestNativeFundingExactPayableDepositAndMinedRecovery(t *testing.T) {
 	f.ambiguous = true
 	const amount = 747268
 	deposit, err := f.fundNative(t, amount)
-	if err != nil || deposit.Phase != "deposit_pending" || f.prepared != 1 || f.paths != 2 || len(f.accepted) != 1 {
+	if err != nil || deposit.Phase != "deposit_pending" || f.prepared != 1 || f.paths != 0 || len(f.accepted) != 1 {
 		t.Fatalf("native deposit failed: %+v %v", deposit, err)
 	}
 	tx := f.accepted[deposit.TransactionHash]

@@ -26,8 +26,12 @@
 //! A missed defeat (verified successor evidence before the deadline, and the
 //! escape finalized) or missed raise (more owed than conceded at
 //! finalization) is recorded; after a missed defeat, `retire_on_miss` retires
-//! the closed note's leaf (`retireClosedLeaf`, with the indexer's path at the
-//! live root).
+//! the closed note's leaf (`retireClosedLeaf`, with the indexer's path,
+//! checked against the vault's `currentRoot()` at the path's block, and
+//! `siblings[ℓ..32)` zero-filled for ℓ = msb(n XOR nextNoteId) at that
+//! block). A retirement whose simulation reverts StaleRoot (a concurrent
+//! retirement in the same subtree, or a new level ℓ) refreshes the path and
+//! is retried once at once, then at the usual pace.
 //!
 //! The configured RPC must expose an operator-controlled transaction signer.
 //! Keys are never loaded by this service; the sender must be dedicated to it.
@@ -65,13 +69,14 @@ use std::{
 use zkapi_proof::compact::RequestVerifier;
 use zkapi_types::{Felt252, MERKLE_DEPTH};
 
-const ESCAPE_EVENT: &str =
-    "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)";
+/// Vault revision 4: no event carries a root.
+const ESCAPE_EVENT: &str = "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64)";
 const CONCESSION_RECORDED_EVENT: &str = "EscapeConcessionRecorded(uint32,uint256,uint128,uint128)";
 const CONCESSION_RAISED_EVENT: &str = "EscapeConcessionRaised(uint32,uint256,uint128,uint128)";
-const CHALLENGED_EVENT: &str = "EscapeWithdrawalChallenged(uint32,uint256,uint256)";
+const CHALLENGED_EVENT: &str = "EscapeWithdrawalChallenged(uint32,uint256)";
 const FINALIZED_EVENT: &str = "EscapeWithdrawalFinalized(uint32,uint256,uint128,address)";
-/// `notes(noteId).status` of a note whose escape was finalized.
+/// `noteRecord(noteId)` word 1 (the status) of a note whose escape was
+/// finalized.
 const NOTE_STATUS_CLOSED: u64 = 3;
 /// Blocks per `eth_getLogs` request, as the event scan.
 const LOG_RANGE_BLOCKS: u64 = 1_000;
@@ -340,7 +345,9 @@ struct NonceAttempts {
     /// replacements may change only siblings, gas and fees.
     #[serde(default)]
     evidence_digest: Option<String>,
-    /// The vault root the latest attempt's siblings hash to.
+    /// A retirement's level-ℓ subtree node, which the latest attempt's leaf
+    /// and siblings[0..ℓ) hash to (vault revision 4; an earlier release
+    /// recorded the full root here, which then reads as changed once).
     #[serde(default)]
     submitted_root: Option<Felt252>,
     /// An attempt may hold the nonce without a known hash, so a re-send must
@@ -1101,7 +1108,7 @@ impl ChallengeService {
 
     /// The startup checks (§5.4, §5.5): the database binding (as
     /// `verify_deployment_binding`) must be the deployment manifest's; the
-    /// vault and adapter must pass the startup probes (revision 3, the
+    /// vault and adapter must pass the startup probes (revision 4, the
     /// adapter's circuit and verifying-key hashes equal to the loaded keys,
     /// and the three runtime codehashes the manifest pins); and the vault's
     /// challenge period must be the manifest's and pass the G5 and raise
@@ -2594,15 +2601,24 @@ impl ChallengeService {
         Ok(())
     }
 
-    /// Whether `notes(note).status` is Closed at the `confirmed` block.
+    /// Whether `noteRecord(note).status` is Closed at the `confirmed` block.
     async fn note_closed_at(&self, note: u32, confirmed: u64) -> anyhow::Result<bool> {
-        let mut query = selector("notes(uint32)");
+        Ok(self
+            .note_status_at(note, json!(format!("0x{confirmed:x}")))
+            .await?
+            == NOTE_STATUS_CLOSED)
+    }
+
+    /// `noteRecord(note)` at `block`: (uint256 leaf, uint8 status), strictly
+    /// two words; the status.
+    async fn note_status_at(&self, note: u32, block: Value) -> anyhow::Result<u64> {
+        let mut query = selector("noteRecord(uint32)");
         query.extend_from_slice(Felt252::from_u64(note as u64).as_bytes());
-        let state = self
-            .call_at(query, json!(format!("0x{confirmed:x}")))
-            .await?;
-        ensure!(state.len() == 4, "malformed note response");
-        Ok(felt_u64(&state[3])? == NOTE_STATUS_CLOSED)
+        let record = self.call_at(query, block).await?;
+        ensure!(record.len() == 2, "malformed noteRecord response");
+        let status = felt_u64(&record[1])?;
+        ensure!(status <= NOTE_STATUS_CLOSED, "malformed noteRecord status");
+        Ok(status)
     }
 
     /// The confirmed block (the latest less the confirmations) when the
@@ -2772,11 +2788,7 @@ impl ChallengeService {
         confirmed: u64,
     ) -> anyhow::Result<Option<EscapeOutcome>> {
         let block = json!(format!("0x{confirmed:x}"));
-        let mut query = selector("notes(uint32)");
-        query.extend_from_slice(Felt252::from_u64(note as u64).as_bytes());
-        let state = self.call_at(query, block.clone()).await?;
-        ensure!(state.len() == 4, "malformed note response");
-        if felt_u64(&state[3])? != NOTE_STATUS_CLOSED {
+        if self.note_status_at(note, block.clone()).await? != NOTE_STATUS_CLOSED {
             return Ok(Some(EscapeOutcome::NotPaidOut));
         }
         let mut query = selector("challengedNullifiers(uint256)");
@@ -3125,9 +3137,33 @@ impl ChallengeService {
     }
 
     /// After a missed defeat was paid out: retire the closed note's leaf
-    /// with the indexer's path at the live root, then retire the obligation
-    /// once the leaf is zero there.
+    /// with the indexer's path (checked against the vault's root at the
+    /// path's block, `siblings[ℓ..32)` zero-filled), then retire the
+    /// obligation once the leaf is zero there. A simulation that reverts
+    /// StaleRoot (a concurrent retirement in the same subtree, or a deposit
+    /// that raised ℓ) refreshes the path and is retried once at once; after
+    /// that the next poll retries.
     async fn reconcile_retirement(
+        &mut self,
+        note: u32,
+        nonce_state: NonceState,
+        head: &HeadInfo,
+    ) -> anyhow::Result<()> {
+        let result = self.retirement_attempt(note, nonce_state, head).await;
+        match result {
+            Err(error) if vault_revert(&error) == Some("StaleRoot()") => {
+                tracing::warn!(
+                    note_id = note,
+                    "the retirement simulation reverted StaleRoot (a concurrent retirement or a \
+                     new level); refreshing the path and retrying once"
+                );
+                self.retirement_attempt(note, nonce_state, head).await
+            }
+            result => result,
+        }
+    }
+
+    async fn retirement_attempt(
         &mut self,
         note: u32,
         nonce_state: NonceState,
@@ -3170,31 +3206,66 @@ impl ChallengeService {
                 anyhow!("indexer path must have 32 siblings")
             );
         };
-        let root = match self.live_root().await {
-            Ok(root) => root,
-            Err(error) => blocked!(BlockedReason::RpcError, error),
+        let path_root = zkapi_core::v2::merkle_root(note, &response.leaf, &siblings);
+        // The vault's root and next note ID at the path's block (EIP-1898),
+        // or at latest for an indexer that does not name its block.
+        let block = match response
+            .block_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+        {
+            Some(hash) => {
+                let root = match self.root_at_block_hash(hash).await {
+                    Ok(root) => root,
+                    Err(error) => blocked!(
+                        BlockedReason::IndexerPathBehind,
+                        error.context(format!(
+                            "the vault root at the indexer path's block {hash} is unavailable"
+                        ))
+                    ),
+                };
+                if path_root != root {
+                    blocked!(
+                        BlockedReason::IndexerDiverged,
+                        anyhow!(
+                            "indexer path of note {note} does not hash to the vault's root at its \
+                             block {hash}"
+                        )
+                    );
+                }
+                json!({ "blockHash": hash })
+            }
+            None => {
+                let root = match self.live_root().await {
+                    Ok(root) => root,
+                    Err(error) => blocked!(BlockedReason::RpcError, error),
+                };
+                if path_root != root {
+                    let state = self
+                        .classify_root_mismatch(
+                            response.root.unwrap_or(Felt252::ZERO),
+                            None,
+                            response.block_number,
+                            head,
+                        )
+                        .await;
+                    let reason = if state == IndexerState::Diverged {
+                        BlockedReason::IndexerDiverged
+                    } else {
+                        BlockedReason::IndexerPathBehind
+                    };
+                    blocked!(
+                        reason,
+                        anyhow!(
+                            "indexer path of note {note} does not hash to the vault's current root"
+                        )
+                    );
+                }
+                json!("latest")
+            }
         };
-        if zkapi_core::v2::merkle_root(note, &response.leaf, &siblings) != root {
-            let state = self
-                .classify_root_mismatch(
-                    response.root.unwrap_or(Felt252::ZERO),
-                    response.block_hash.as_deref(),
-                    response.block_number,
-                    head,
-                )
-                .await;
-            let reason = if state == IndexerState::Diverged {
-                BlockedReason::IndexerDiverged
-            } else {
-                BlockedReason::IndexerPathBehind
-            };
-            blocked!(
-                reason,
-                anyhow!("indexer path of note {note} does not hash to the vault's current root")
-            );
-        }
         if response.leaf.is_zero() {
-            // The leaf is retired at the live root.
+            // The leaf is retired at the path's (vault-checked) root.
             self.release_if_never_broadcast(note).await;
             self.detach_nonce(note);
             self.checkpoint.pending.remove(&note);
@@ -3208,6 +3279,18 @@ impl ChallengeService {
             );
             return Ok(());
         }
+        let next_note_id = match self.next_note_id_at(block).await {
+            Ok(next) => next,
+            Err(error) => blocked!(BlockedReason::RpcError, error),
+        };
+        let Some((siblings, subtree)) =
+            retirement_siblings(note, &response.leaf, &siblings, next_note_id)
+        else {
+            blocked!(
+                BlockedReason::IndexerInvalidResponse,
+                anyhow!("note {note} is not below the vault's nextNoteId {next_note_id}")
+            );
+        };
         let call = VaultCall::Retire {
             note_id: note,
             siblings: Box::new(siblings),
@@ -3215,7 +3298,7 @@ impl ChallengeService {
         let context = SendContext {
             evidence: EvidenceKind::Leaf,
             evidence_row: None,
-            root: Some(root),
+            root: Some(subtree),
             owed: None,
             raise_due_at: None,
         };
@@ -3242,7 +3325,8 @@ impl ChallengeService {
 
     /// Replace the queue-head attempt on its nonce when it has waited
     /// `bump_after_blocks`, the base fee rose above its fee cap, the queue is
-    /// critical, or the vault root moved so it would revert. The attempt is
+    /// critical, or (a retirement) the sub-path it proves changed, so it
+    /// would revert. A deposit alone does not invalidate a retirement. The attempt is
     /// either a known pending transaction (`visible`) or one without a known
     /// hash that may hold the nonce, which is outbid at the same pace.
     async fn maybe_replace(
@@ -3319,10 +3403,11 @@ impl ChallengeService {
         let below_critical = critical
             && (old.max_fee < headroom(max_fee_cap)
                 || old.tip < headroom(policy.max_priority_fee_per_gas));
-        let stale_root = match pending.attempt.submitted_root {
-            Some(root) => self.live_root().await.is_ok_and(|live| live != root),
-            None => false,
-        };
+        let stale_root = pending
+            .attempt
+            .submitted_root
+            .zip(context.root)
+            .is_some_and(|(submitted, fresh)| submitted != fresh);
         if !(waited || base_above || below_critical || stale_root) {
             self.record(note, hold(submitted, waiting));
             return Ok(());
@@ -4438,6 +4523,14 @@ impl ChallengeService {
         Ok(root[0])
     }
 
+    /// The vault's nextNoteId() at `block` (a tag, a number or an EIP-1898
+    /// block hash).
+    async fn next_note_id_at(&self, block: Value) -> anyhow::Result<u32> {
+        let next = self.call_at(selector("nextNoteId()"), block).await?;
+        ensure!(next.len() == 1, "malformed nextNoteId response");
+        u32::try_from(felt_u64(&next[0])?).context("nextNoteId exceeds uint32")
+    }
+
     async fn call(&self, data: Vec<u8>) -> anyhow::Result<Vec<Felt252>> {
         self.call_at(data, json!("latest")).await
     }
@@ -4553,7 +4646,8 @@ struct SendContext {
     evidence: EvidenceKind,
     /// The `request_evidence` row of a defeat or raise.
     evidence_row: Option<i64>,
-    /// The root a retirement's siblings hash to.
+    /// The level-ℓ subtree node a retirement's leaf and siblings[0..ℓ)
+    /// hash to: a different one replaces a pending attempt.
     root: Option<Felt252>,
     owed: Option<u128>,
     raise_due_at: Option<u64>,
@@ -5167,8 +5261,38 @@ enum ScanEvent {
     },
 }
 
-/// Decode an `EscapeWithdrawalInitiated` (5 words), `EscapeConcessionRecorded`
-/// (3), `EscapeConcessionRaised` (3) or `EscapeWithdrawalChallenged` (2) log,
+/// The siblings a `retireClosedLeaf(note, ·)` sends while the vault's next
+/// note ID is `next_note_id`: `siblings[0..ℓ)` as given and `siblings[ℓ..32)`
+/// zero, ℓ = msb(note XOR next_note_id), since the vault reads only the
+/// first ℓ (≤ 42.6k + 28.3k·ℓ gas; measured ≈ 37.7k at ℓ = 0, 152k at ℓ = 4,
+/// 259k at ℓ = 8, 472k at ℓ = 16). Also the level-ℓ node `leaf` hashes to
+/// with them, which the vault compares with its frontier. None unless
+/// `note < next_note_id`.
+fn retirement_siblings(
+    note: u32,
+    leaf: &Felt252,
+    siblings: &[Felt252; MERKLE_DEPTH],
+    next_note_id: u32,
+) -> Option<([Felt252; MERKLE_DEPTH], Felt252)> {
+    if note >= next_note_id {
+        return None;
+    }
+    let level = zkapi_core::merkle::retire_level(note, next_note_id);
+    let mut zero_filled = [Felt252::ZERO; MERKLE_DEPTH];
+    zero_filled[..level].copy_from_slice(&siblings[..level]);
+    let mut node = *leaf;
+    for (height, sibling) in zero_filled.iter().enumerate().take(level) {
+        node = if (note >> height) & 1 == 0 {
+            zkapi_core::v2::merkle_node(&node, sibling)
+        } else {
+            zkapi_core::v2::merkle_node(sibling, &node)
+        };
+    }
+    Some((zero_filled, node))
+}
+
+/// Decode an `EscapeWithdrawalInitiated` (4 words), `EscapeConcessionRecorded`
+/// (3), `EscapeConcessionRaised` (3) or `EscapeWithdrawalChallenged` (1) log,
 /// with exactly two topics and canonical uint widths; anything else is an
 /// error that fails the scan of the range.
 fn decode_scan_event(log: &Value) -> anyhow::Result<ScanEvent> {
@@ -5192,7 +5316,7 @@ fn decode_scan_event(log: &Value) -> anyhow::Result<ScanEvent> {
         Ok(())
     };
     if is(ESCAPE_EVENT) {
-        count(5, "EscapeWithdrawalInitiated")?;
+        count(4, "EscapeWithdrawalInitiated")?;
         felt_u128(&words[1])?;
         ensure!(
             words[2].as_bytes()[..12].iter().all(|byte| *byte == 0),
@@ -5223,7 +5347,7 @@ fn decode_scan_event(log: &Value) -> anyhow::Result<ScanEvent> {
         });
     }
     if is(CHALLENGED_EVENT) {
-        count(2, "EscapeWithdrawalChallenged")?;
+        count(1, "EscapeWithdrawalChallenged")?;
         return Ok(ScanEvent::Challenged {
             note,
             nullifier: words[0],
@@ -5377,6 +5501,14 @@ mod tests {
         raise_simulation_error: Option<Value>,
         /// The indexer's path of a note's slot: (leaf, siblings).
         leaf_paths: BTreeMap<u32, (Felt252, [Felt252; MERKLE_DEPTH])>,
+        /// The block hash the indexer serves paths at (None: it names none).
+        path_block_hash: Option<String>,
+        /// The vault's nextNoteId(), and the block parameter of each read.
+        next_note_id: u32,
+        next_note_id_reads: Vec<Value>,
+        /// Retirement simulations that revert StaleRoot() before the others
+        /// succeed.
+        stale_retirements: u32,
         /// Words of no-argument getters (the startup probes), by calldata.
         probe_words: BTreeMap<String, Felt252>,
         /// Runtime code by lowercase address.
@@ -5401,7 +5533,6 @@ mod tests {
         sends: Vec<Value>,
         fail_first_send: bool,
         root: Felt252,
-        siblings: [Felt252; MERKLE_DEPTH],
         head_number: u64,
         head_timestamp: u64,
         /// Deadline of note 0 (and of notes without an explicit withdrawal).
@@ -5421,7 +5552,6 @@ mod tests {
         indexer_health: &'static str,
         roots_by_hash: BTreeMap<String, Felt252>,
         path_unavailable: u32,
-        path_meta: Option<Value>,
         simulation_error: Option<Value>,
         legacy_gas_price: Option<u128>,
         /// eth_estimateGas answer; the default 10M gas gives a 12M gas limit.
@@ -5438,7 +5568,7 @@ mod tests {
         signer_status: Option<Value>,
         /// pendingWithdrawals reads per note.
         withdrawal_reads: BTreeMap<u32, usize>,
-        /// notes(noteId).status; by default PendingWithdrawal while the
+        /// noteRecord(noteId).status; by default PendingWithdrawal while the
         /// escape is active at the latest block, else Active.
         note_status: BTreeMap<u32, u64>,
         /// challengedNullifiers of a hardened vault.
@@ -5474,6 +5604,10 @@ mod tests {
                 receipts: BTreeMap::new(),
                 raise_simulation_error: None,
                 leaf_paths: BTreeMap::new(),
+                path_block_hash: None,
+                next_note_id: 1,
+                next_note_id_reads: Vec::new(),
+                stale_retirements: 0,
                 probe_words: BTreeMap::new(),
                 code: BTreeMap::new(),
                 escape_reads: Vec::new(),
@@ -5493,7 +5627,6 @@ mod tests {
                 sends: vec![],
                 fail_first_send: false,
                 root: zkapi_core::v2::merkle_root(0, &Felt252::ZERO, &siblings),
-                siblings,
                 head_number: 5,
                 head_timestamp: now,
                 deadline: now + 100,
@@ -5510,7 +5643,6 @@ mod tests {
                 indexer_health: "ok",
                 roots_by_hash: BTreeMap::new(),
                 path_unavailable: 0,
-                path_meta: None,
                 simulation_error: None,
                 legacy_gas_price: None,
                 estimate: 10_000_000,
@@ -5627,7 +5759,7 @@ mod tests {
                             let (signature, data) = if *finalized {
                                 ("EscapeWithdrawalFinalized(uint32,uint256,uint128,address)", encoded(&[*nullifier, Felt252::from_u64(100), Felt252::from_u64(5)]))
                             } else {
-                                ("EscapeWithdrawalChallenged(uint32,uint256,uint256)", encoded(&[*nullifier, state.root]))
+                                ("EscapeWithdrawalChallenged(uint32,uint256)", encoded(&[*nullifier]))
                             };
                             json!({ "topics": [topic(signature), format!("0x{log_note:064x}")], "data": data, "blockNumber": hex_quantity(*block as u128) })
                         })
@@ -5661,7 +5793,7 @@ mod tests {
                         "blockNumber": hex_quantity(from as u128), "logIndex": "0x1"
                     }, {
                         "topics": [topic(ESCAPE_EVENT), format!("0x{:064x}", state.event_note)],
-                        "data": encoded(&[state.nullifier, Felt252::from_u64(100), Felt252::from_u64(5), Felt252::from_u64(state.deadline), state.root]),
+                        "data": encoded(&[state.nullifier, Felt252::from_u64(100), Felt252::from_u64(5), Felt252::from_u64(state.deadline)]),
                         "blockNumber": hex_quantity(from as u128), "logIndex": "0x0"
                     }])
                 }
@@ -5767,7 +5899,7 @@ mod tests {
                             Felt252::from_u64(state.deadline),
                         ])
                     }
-                } else if data.starts_with(&call_data("notes(uint32)")) {
+                } else if data.starts_with(&call_data("noteRecord(uint32)")) {
                     let note = u32::from_str_radix(&data[data.len() - 8..], 16).unwrap();
                     let pending = if *block == "latest" {
                         state.active
@@ -5779,12 +5911,11 @@ mod tests {
                     } else {
                         NOTE_ACTIVE
                     });
-                    encoded(&[
-                        Felt252::from_u64(0xc0),
-                        Felt252::from_u64(100),
-                        Felt252::from_u64(state.deadline + 86_400),
-                        Felt252::from_u64(status),
-                    ])
+                    // (leaf, status): a retired note is Closed with leaf 0.
+                    encoded(&[Felt252::from_u64(0x1eaf), Felt252::from_u64(status)])
+                } else if data == call_data("nextNoteId()") {
+                    state.next_note_id_reads.push(block.clone());
+                    encoded(&[Felt252::from_u64(u64::from(state.next_note_id))])
                 } else if data.starts_with(&call_data("challengedNullifiers(uint256)")) {
                     if state.legacy_vault {
                         // The bundled signer relays any upstream error so.
@@ -5816,6 +5947,13 @@ mod tests {
                     .any(|selector| data.starts_with(&format!("0x{}", hex::encode(selector))))
                 {
                     let raise = data.starts_with(&format!("0x{}", hex::encode(RAISE_SELECTOR)));
+                    let retire = data.starts_with(&format!("0x{}", hex::encode(RETIRE_SELECTOR)));
+                    if retire && state.stale_retirements > 0 {
+                        state.stale_retirements -= 1;
+                        return Json(json!({ "jsonrpc": "2.0", "id": 1, "error": {
+                            "code": 3, "message": "execution reverted", "data": "0x607447de" } }))
+                        .into_response();
+                    }
                     if let Some(error) = state
                         .raise_simulation_error
                         .as_ref()
@@ -5955,22 +6093,6 @@ mod tests {
             .into_response()
     }
 
-    async fn path(State(state): State<Arc<Mutex<MockChain>>>, Path(note): Path<u32>) -> Response {
-        let mut state = state.lock().unwrap();
-        if state.path_unavailable > 0 {
-            state.path_unavailable -= 1;
-            return unavailable();
-        }
-        let mut body =
-            json!({"note_id": note, "leaf": Felt252::ZERO, "siblings": state.siblings.to_vec()});
-        if let Some(meta) = state.path_meta.as_ref().and_then(Value::as_object) {
-            for (key, value) in meta {
-                body[key] = value.clone();
-            }
-        }
-        Json(body).into_response()
-    }
-
     /// `/v1/tree/notes/{note}/path`: a configured leaf path of the note.
     async fn leaf_path(
         State(state): State<Arc<Mutex<MockChain>>>,
@@ -5982,11 +6104,17 @@ mod tests {
             return unavailable();
         }
         match state.leaf_paths.get(&note) {
-            Some((leaf, siblings)) => Json(json!({
-                "note_id": note, "leaf": leaf, "siblings": siblings.to_vec(),
-                "root": zkapi_core::v2::merkle_root(note, leaf, siblings),
-            }))
-            .into_response(),
+            Some((leaf, siblings)) => {
+                let mut body = json!({
+                    "note_id": note, "leaf": leaf, "siblings": siblings.to_vec(),
+                    "root": zkapi_core::v2::merkle_root(note, leaf, siblings),
+                });
+                if let Some(hash) = &state.path_block_hash {
+                    body["block_hash"] = json!(hash);
+                    body["block_number"] = json!(state.head_number);
+                }
+                Json(body).into_response()
+            }
             None => unavailable(),
         }
     }
@@ -6073,7 +6201,6 @@ mod tests {
             )));
             let app = Router::new()
                 .route("/", post(rpc))
-                .route("/v1/tree/notes/{note}/zero-path", get(path))
                 .route("/v1/tree/notes/{note}/path", get(leaf_path))
                 .route("/v1/tree/root", get(tree_root))
                 .route("/v1/escapes/pending", get(pending_escapes))
@@ -8160,7 +8287,11 @@ mod tests {
             None
         );
         // Withdrawal-only errors are never named for a challenge.
-        for signature in ["UnknownRoot()", "ChallengedNullifier()"] {
+        for signature in [
+            "NoteLeafMismatch()",
+            "InvalidNoteFields()",
+            "ChallengedNullifier()",
+        ] {
             let data = format!("0x{}", hex::encode(selector(signature)));
             assert_eq!(
                 revert(json!({ "code": 3, "message": "execution reverted", "data": data })),
@@ -11254,13 +11385,15 @@ mod tests {
         }
         service.poll_once().await.unwrap();
         assert!(service.checkpoint.pending[&0].retire_leaf);
-        // The retirement goes with the indexer's path at the live root.
+        // The retirement goes with the indexer's path at the live root. Note
+        // 0 is the vault's last note (nextNoteId 1): ℓ = 0, so every
+        // sibling is zero-filled.
         service.poll_once().await.unwrap();
         let sends = fixture.sends();
         assert_eq!(kinds(&sends), [CallKind::Retire]);
         let expected = VaultCall::Retire {
             note_id: 0,
-            siblings: Box::new(siblings),
+            siblings: Box::new([Felt252::ZERO; MERKLE_DEPTH]),
         };
         assert_eq!(
             sends[0]["data"],
@@ -11285,6 +11418,158 @@ mod tests {
         assert!(service.checkpoint.pending.is_empty());
         assert_eq!(service.checkpoint.retired_leaves_total, 1);
         assert_eq!(kinds(&fixture.sends()), [CallKind::Retire]);
+    }
+
+    /// `retireClosedLeaf` reads only siblings[0..ℓ), ℓ = msb(n XOR
+    /// nextNoteId): the challenger sends the rest as zeros, and the vault's
+    /// own retirement model accepts exactly that call. The level-ℓ node is
+    /// the frontier entry the vault compares.
+    #[test]
+    fn retirement_siblings_are_zero_filled_beyond_the_retire_level() {
+        use zkapi_core::merkle::{retire_level, Frontier};
+        let leaves: Vec<Felt252> = (1..=21)
+            .map(|leaf| Felt252::from_u64(leaf * 0x101))
+            .collect();
+        let tree = zkapi_core::MerkleTree::from_leaves(&leaves);
+        let frontier = Frontier::from_leaves(&leaves).unwrap();
+        for (note, level) in [(0, 4), (5, 4), (16, 2), (19, 2), (20, 0)] {
+            assert_eq!(retire_level(note, 21), level);
+            let siblings = tree.get_siblings(note);
+            let leaf = leaves[note as usize];
+            let (sent, node) = retirement_siblings(note, &leaf, &siblings, 21).unwrap();
+            assert_eq!(sent[..level], siblings[..level], "{note}");
+            assert!(sent[level..].iter().all(Felt252::is_zero), "{note}");
+            let expected = if level == 0 {
+                leaf
+            } else {
+                frontier.filled()[level]
+            };
+            assert_eq!(node, expected, "{note}");
+            let mut retired = frontier.clone();
+            retired.retire(note, &sent).unwrap();
+            // The retirement calldata keeps its 32-word ABI.
+            let call = VaultCall::Retire {
+                note_id: note,
+                siblings: Box::new(sent),
+            };
+            assert_eq!(
+                call.calldata().unwrap().len(),
+                crate::watcher::RETIRE_CALLDATA_LEN
+            );
+        }
+        // A note at or above nextNoteId has no retirement.
+        assert!(retirement_siblings(21, &leaves[0], &tree.get_siblings(0), 21).is_none());
+    }
+
+    /// A retirement whose path was read at a block hash is checked against
+    /// the vault's currentRoot() at that hash, with nextNoteId read there
+    /// too, so deposits since then do not block it. A StaleRoot simulation
+    /// (a concurrent retirement in the same subtree) refreshes the path and
+    /// retries at once, once; a second StaleRoot waits for the next poll.
+    #[tokio::test]
+    async fn a_retirement_refreshes_its_path_and_retries_a_stale_root_once() {
+        let siblings: [Felt252; MERKLE_DEPTH] =
+            std::array::from_fn(|level| Felt252::from_u64(0x5100 + level as u64));
+        let leaf = Felt252::from_u64(0x1eaf);
+        let retiring = |fixture: &Fixture, stale: u32| {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.leaf_paths.insert(0, (leaf, siblings));
+            chain.path_block_hash = Some("0xpathblock".into());
+            chain.roots_by_hash.insert(
+                "0xpathblock".into(),
+                zkapi_core::v2::merkle_root(0, &leaf, &siblings),
+            );
+            // The vault took deposits since the indexer's block: its live
+            // root moved, which does not matter.
+            chain.root = Felt252::from_u64(0x5ca1e);
+            // ℓ = msb(0 XOR 21) = 4.
+            chain.next_note_id = 21;
+            chain.stale_retirements = stale;
+        };
+        let pending = PendingChallenge {
+            nullifier: ESCAPED,
+            retire_leaf: true,
+            ..Default::default()
+        };
+        let mut expected = [Felt252::ZERO; MERKLE_DEPTH];
+        expected[..4].copy_from_slice(&siblings[..4]);
+        let expected = format!(
+            "0x{}",
+            hex::encode(
+                VaultCall::Retire {
+                    note_id: 0,
+                    siblings: Box::new(expected),
+                }
+                .calldata()
+                .unwrap()
+            )
+        );
+
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service_with(|config| config.retire_on_miss = true);
+        retiring(&fixture, 1);
+        service.checkpoint.pending.insert(0, pending.clone());
+        service.persist().unwrap();
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Retire]);
+        assert_eq!(sends[0]["data"], expected);
+        {
+            let chain = fixture.chain.lock().unwrap();
+            assert_eq!(chain.stale_retirements, 0);
+            // Read twice (the retry refreshed the path), each at its block.
+            assert_eq!(
+                chain.next_note_id_reads,
+                [
+                    json!({"blockHash": "0xpathblock"}),
+                    json!({"blockHash": "0xpathblock"})
+                ]
+            );
+        }
+        // The attempt records the level-4 node its siblings prove: only a
+        // different one (a changed sibling below ℓ, or another ℓ) replaces
+        // it, not a root moved by deposits.
+        assert_eq!(
+            service.checkpoint.pending[&0].attempt.submitted_root,
+            Some(retirement_siblings(0, &leaf, &siblings, 21).unwrap().1)
+        );
+
+        // StaleRoot twice: no send this poll, blocked as a path behind.
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service_with(|config| config.retire_on_miss = true);
+        retiring(&fixture, 2);
+        service.checkpoint.pending.insert(0, pending.clone());
+        service.persist().unwrap();
+        assert!(service.poll_once().await.is_err());
+        assert!(fixture.sends().is_empty());
+        assert_eq!(fixture.chain.lock().unwrap().stale_retirements, 0);
+        assert_eq!(
+            obligation(&service.status(), 0).blocked_reason,
+            Some(BlockedReason::IndexerPathBehind)
+        );
+        // The next poll retries and sends.
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends()[0]["data"], expected);
+
+        // A path that does not hash to the vault's root at its own block is
+        // the indexer's divergence: nothing is sent.
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service_with(|config| config.retire_on_miss = true);
+        retiring(&fixture, 0);
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .roots_by_hash
+            .insert("0xpathblock".into(), Felt252::from_u64(0xbad));
+        service.checkpoint.pending.insert(0, pending);
+        service.persist().unwrap();
+        assert!(service.poll_once().await.is_err());
+        assert!(fixture.sends().is_empty());
+        assert_eq!(
+            obligation(&service.status(), 0).blocked_reason,
+            Some(BlockedReason::IndexerDiverged)
+        );
     }
 
     #[tokio::test]
@@ -11432,7 +11717,8 @@ mod tests {
         for (name, signature) in [
             ("pendingWithdrawals", "pendingWithdrawals(uint32)"),
             ("pendingConcessions", "pendingConcessions(uint32)"),
-            ("notes", "notes(uint32)"),
+            ("noteRecord", "noteRecord(uint32)"),
+            ("nextNoteId", "nextNoteId()"),
             ("challengedNullifiers", "challengedNullifiers(uint256)"),
             ("currentRoot", "currentRoot()"),
             ("challengePeriod", "challengePeriod()"),
@@ -11446,7 +11732,7 @@ mod tests {
         // escape_state's and note_closed_at's strict word counts.
         assert_eq!(real_getter_words("pendingWithdrawals"), 6);
         assert_eq!(real_getter_words("pendingConcessions"), 3);
-        assert_eq!(real_getter_words("notes"), 4);
+        assert_eq!(real_getter_words("noteRecord"), 2);
         let log = |name: &str| {
             let (topics, data) = real_event(name);
             json!({ "topics": topics, "data": data })
@@ -11527,7 +11813,8 @@ mod tests {
         let mut chain = fixture.chain.lock().unwrap();
         for (selector, value) in [
             (CONCESSION_ESCAPE_VERSION_SELECTOR, Felt252::from_u64(1)),
-            (ROOT_HISTORY_WINDOW_SELECTOR, Felt252::from_u64(86_400)),
+            (LEAF_BOUND_EXIT_VERSION_SELECTOR, Felt252::from_u64(1)),
+            (MIN_DEPOSIT_SELECTOR, Felt252::from_u64(1_000_000)),
             (
                 PROOF_ADAPTER_SELECTOR,
                 word(&manifest.proof_adapter_address),
@@ -11592,7 +11879,7 @@ mod tests {
         let mut late = fixture.service_with(|config| config.raise_lead_seconds = 70_000);
         assert!(mismatch(late.verify_deployment(&manifest, timing).await)
             .contains("--raise-lead-seconds"));
-        // A vault before revision 3, another adapter verifying key, or other
+        // A vault before revision 4, another adapter verifying key, or other
         // runtime code is refused, each before anything is polled.
         for (change, message) in [
             (
@@ -11603,6 +11890,25 @@ mod tests {
                     );
                 }) as fn(&mut MockChain),
                 "CONCESSION_ESCAPE_VERSION",
+            ),
+            // Not a leaf-bound vault.
+            (
+                |chain| {
+                    chain.probe_words.insert(
+                        crate::deployment::LEAF_BOUND_EXIT_VERSION_SELECTOR.into(),
+                        Felt252::ZERO,
+                    );
+                },
+                "LEAF_BOUND_EXIT_VERSION",
+            ),
+            (
+                |chain| {
+                    chain.probe_words.insert(
+                        crate::deployment::MIN_DEPOSIT_SELECTOR.into(),
+                        Felt252::from_u64(7),
+                    );
+                },
+                "minDeposit",
             ),
             (
                 |chain| {

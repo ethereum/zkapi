@@ -8,7 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Interface, Transaction, Wallet, keccak256 } from 'ethers';
 import {
-  ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_TX_FEE_CAP, ESCAPE_FINALIZED_TOPIC, GWEI, RpcError, UPSTREAM_TIMEOUT_MS,
+  ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_MAX_RETIREMENTS_PER_DAY, DEFAULT_TX_FEE_CAP, ESCAPE_FINALIZED_TOPIC, GWEI, RpcError, UPSTREAM_TIMEOUT_MS,
   createSigner, createUpstream, parseChainId, parseSignerConfig, vaultInterface,
 } from './signer.mjs';
 import { createHttpServer } from './server.mjs';
@@ -32,6 +32,11 @@ const ONE_ETH = '0xde0b6b3a7640000';
 const wei = value => `0x${value.toString(16)}`;
 const fees = (maxFee, tip) => ({ maxFeePerGas: wei(maxFee), maxPriorityFeePerGas: wei(tip) });
 const configError = message => error => error instanceof ConfigError && error.message === message;
+// Vault calls the signer never signs: the revision-4 expiry claim, the
+// permissionless root record (about 0.5M gas) and the revision-3 expiry claim.
+const claimExpired = new Interface(['function claimExpired(uint32 noteId,bytes32 commitment,uint128 amount,uint64 expiryTs)']);
+const recordRoot = new Interface(['function recordRoot()']);
+const legacyClaimExpired = new Interface(['function claimExpired(uint32)']);
 
 function fixture(overrides = {}, options = {}) {
   const calls = [];
@@ -118,8 +123,13 @@ test('rejects unauthorized transaction changes before any RPC or signature', asy
     // The revision-2 challenge with siblings, and other vault calls.
     { data: legacyChallenge },
     { data: new Interface(['function finalizeEscapeWithdrawal(uint32)']).encodeFunctionData('finalizeEscapeWithdrawal', [0]) },
-    { data: new Interface(['function claimExpired(uint32)']).encodeFunctionData('claimExpired', [0]) },
+    { data: claimExpired.encodeFunctionData('claimExpired', [0, `0x${'11'.repeat(32)}`, 5_000_000, 4_000_000_000]) },
+    { data: recordRoot.encodeFunctionData('recordRoot', []) },
+    { data: legacyClaimExpired.encodeFunctionData('claimExpired', [0]) },
   ];
+  // Selectors of vault revision 4 (claimExpired, recordRoot) and revision 3 (claimExpired).
+  assert.deepEqual([claimExpired.getFunction('claimExpired').selector, recordRoot.getFunction('recordRoot').selector,
+    legacyClaimExpired.getFunction('claimExpired').selector], ['0xad610550', '0x7a47cfac', '0xa940507e']);
   for (const modification of modifications) {
     const { signer, calls } = fixture();
     await assert.rejects(signer.handle('eth_sendTransaction', [{ ...validTx, ...modification }]), error => error instanceof RpcError && error.code === -32602, JSON.stringify(modification));
@@ -139,7 +149,16 @@ test('signs the three concession-exit calls by their pinned selectors', async ()
   const siblings = Array.from({ length: 32 }, (_, index) => index + 1);
   const retire = vaultInterface.encodeFunctionData('retireClosedLeaf', [9, siblings]);
   assert.equal((retire.length - 2) / 2, 1060);
-  for (const call of [raise, retire]) {
+  // Revision 4 reads only siblings[0..l), l = msb(noteId XOR nextNoteId); the
+  // challenger zero-fills the rest. Note 9 with next note ID 12: l = 2. Note 10
+  // with next note ID 11: l = 0, no sibling at all. Same ABI and length.
+  const level = (note, next) => 31 - Math.clz32(note ^ next);
+  assert.deepEqual([level(9, 12), level(10, 11)], [2, 0]);
+  const zeroFilled = vaultInterface.encodeFunctionData('retireClosedLeaf', [9, siblings.map((value, index) => (index < level(9, 12) ? value : 0))]);
+  const levelZero = vaultInterface.encodeFunctionData('retireClosedLeaf', [10, Array(32).fill(0)]);
+  assert.equal((zeroFilled.length - 2) / 2, 1060);
+  assert.deepEqual(vaultInterface.decodeFunctionData('retireClosedLeaf', zeroFilled).siblings.toArray(), [1n, 2n, ...Array(30).fill(0n)]);
+  for (const call of [raise, retire, zeroFilled, levelZero]) {
     const { signer, calls } = fixture();
     const hash = await signer.handle('eth_sendTransaction', [{ ...validTx, data: call }]);
     const signed = Transaction.from(broadcasts(calls)[0].params[0]);
@@ -157,39 +176,43 @@ test('signs the three concession-exit calls by their pinned selectors', async ()
 const retire = (note, nonce = 4n) => ({ ...validTx, nonce: wei(nonce), data: vaultInterface.encodeFunctionData('retireClosedLeaf', [note, Array(32).fill(0)]) });
 
 test('leaf retirements are capped per rolling day by nonce, reported, and never block defeats or raises', async t => {
+  // Four a day by default (two in vault revision 3, whose retirements cost up to about 1.7M gas).
+  assert.equal(DEFAULT_MAX_RETIREMENTS_PER_DAY, 4n);
   let clock = 1_700_000_000_000;
-  const raise = { ...validTx, nonce: '0x8', data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 5]) };
+  const raise = { ...validTx, nonce: '0xc', data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 5]) };
   const { signer, calls, logs } = fixture({}, { now: () => clock });
   await signer.handle('eth_sendTransaction', [retire(9, 4n)]);
   // A replacement of a counted retirement on its nonce needs no new budget.
   await signer.handle('eth_sendTransaction', [{ ...retire(9, 4n), ...fees(5n * GWEI, 2n * GWEI) }]);
   await signer.handle('eth_sendTransaction', [retire(10, 5n)]);
-  assert.equal(broadcasts(calls).length, 3);
+  await signer.handle('eth_sendTransaction', [retire(11, 6n)]);
+  await signer.handle('eth_sendTransaction', [retire(12, 7n)]);
+  assert.equal(broadcasts(calls).length, 5);
   const before = calls.length;
-  const spent = { code: -32003, message: 'Leaf retirement budget for the last 24 hours is spent', data: { reason: 'retirement_budget_exhausted', max_retirements_per_day: '0x2' } };
-  await assert.rejects(signer.handle('eth_sendTransaction', [retire(11, 6n)]), spent);
-  await assert.rejects(signer.handle('eth_sendTransaction', [retire(11, 7n)]), spent);
+  const spent = { code: -32003, message: 'Leaf retirement budget for the last 24 hours is spent', data: { reason: 'retirement_budget_exhausted', max_retirements_per_day: '0x4' } };
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(13, 8n)]), spent);
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(13, 9n)]), spent);
   assert.equal(calls.length, before, 'refused before any upstream call');
   assert.deepEqual(logs.filter(line => line.event === 'challenge_refused'), [
-    { event: 'challenge_refused', nonce: 6, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '2' },
-    { event: 'challenge_refused', nonce: 7, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '2' },
+    { event: 'challenge_refused', nonce: 8, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '4' },
+    { event: 'challenge_refused', nonce: 9, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '4' },
   ]);
   // Defeats and raises still sign.
-  await signer.handle('eth_sendTransaction', [{ ...validTx, nonce: '0x8' }]);
+  await signer.handle('eth_sendTransaction', [{ ...validTx, nonce: '0xb' }]);
   await signer.handle('eth_sendTransaction', [raise]);
-  assert.equal(broadcasts(calls).length, 5);
+  assert.equal(broadcasts(calls).length, 7);
   const status = await signer.handle('zkapi_signerStatus', []);
-  assert.deepEqual([status.retirements_last_24h, status.retirement_refusals, status.last_retirement_refusal_at], [2, 2, clock / 1000]);
+  assert.deepEqual([status.retirements_last_24h, status.retirement_refusals, status.last_retirement_refusal_at], [4, 2, clock / 1000]);
   assert.deepEqual(status.warnings, ['retirement_budget_exhausted']);
   const server = createHttpServer(signer).listen(0, '127.0.0.1');
   await once(server, 'listening'); t.after(() => server.close());
   const health = await fetch(`http://127.0.0.1:${server.address().port}/health`).then(r => r.json());
   assert.equal(health.status, 'ok');
-  assert.deepEqual([health.max_retirements_per_day, health.retirements_last_24h, health.retirement_refusals], [2, 2, 2]);
+  assert.deepEqual([health.max_retirements_per_day, health.retirements_last_24h, health.retirement_refusals], [4, 4, 2]);
   // A day after the first signing, the window frees its slot.
   clock += 86_400_000;
-  await signer.handle('eth_sendTransaction', [retire(11, 6n)]);
-  assert.equal(broadcasts(calls).length, 6);
+  await signer.handle('eth_sendTransaction', [retire(13, 8n)]);
+  assert.equal(broadcasts(calls).length, 8);
   clock += 86_400_000;
   assert.deepEqual((await signer.handle('zkapi_signerStatus', [])).warnings, []);
 });
@@ -661,7 +684,7 @@ test('signer status reports policy, base fee, balance coverage and warnings', as
     chain_id: '0xaa36a7', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
-    max_retirements_per_day: 2, retire_on_miss: true, retirement_lookback_blocks: 50400,
+    max_retirements_per_day: 4, retire_on_miss: true, retirement_lookback_blocks: 50400,
     retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
     block_number: '0x10', base_fee_per_gas: '0x3b9aca00', balance: ONE_ETH, warnings: [],
   });
@@ -757,7 +780,7 @@ test('HTTP errors suppress provider details, carry structured refusal reasons, a
     status: 'ok', chain_id: Number(CHAIN_ID), sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
-    max_retirements_per_day: 2, retire_on_miss: true, retirement_lookback_blocks: 50400,
+    max_retirements_per_day: 4, retire_on_miss: true, retirement_lookback_blocks: 50400,
     retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
   });
   const failed = await post({ jsonrpc: '2.0', id: 8, method: 'eth_blockNumber', params: [] });
@@ -1029,7 +1052,7 @@ test('server process starts from strict configuration and prints its fee policy 
     max_fee_per_gas_wei: '10000000000', priority_fee_per_gas_wei: '1000000000', max_priority_fee_per_gas_wei: '10000000000',
     // 0.1 ETH over 12M gas leaves 8.33 gwei per gas, below the 10 gwei fee cap.
     fee_ceiling_wei: '10000000000000', tx_fee_cap_wei: '100000000000000000', max_fee_per_gas_allowed_at_max_gas_wei: '8333333333',
-    max_gas: '12000000', required_balance_wei: '120000000000000000', balance_wei: '1', max_retirements_per_day: 2,
+    max_gas: '12000000', required_balance_wei: '120000000000000000', balance_wei: '1', max_retirements_per_day: 4,
     retire_on_miss: true, retirement_lookback_blocks: 50400,
     base_fee_per_gas_wei: '9000000000', warnings: ['base_fee_near_cap', 'balance_below_required', 'tx_fee_cap_below_fee_cap'],
   });

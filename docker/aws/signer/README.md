@@ -2,7 +2,7 @@
 
 This internal JSON-RPC sidecar supplies `eth_sendTransaction` to
 `zkapi-challenged`. It signs only the three calls the concession-exit
-challenger makes (vault revision 3, circuit `zkapi-v2-concession-v1`), in their
+challenger makes (vault revision 4, circuit `zkapi-v2-concession-v2`), in their
 canonical ABI encoding, for one configured vault and explicitly configured chain
 (Mainnet 1 or Sepolia 11155111), from its dedicated key, with zero ETH value:
 
@@ -12,12 +12,19 @@ canonical ABI encoding, for one configured vault and explicitly configured chain
 | `raiseEscapeConcession(uint32, RequestPublicInputs, bytes, uint128)` | `0xdd0064ba` | Raise an escape's concession with a request proof at its escaped nullifier. |
 | `retireClosedLeaf(uint32, uint256[32])` | `0xe41f4c31` | Retire a closed note's leaf after a missed defeat. |
 
-The revision-2 challenge with a Merkle path (`0x8a43467c`) and every other
-vault call are refused, so this signer cannot serve an earlier challenger or
-vault: run it only in the stack of a concession-exit vault. It decodes the
-complete ABI, checks that a defeat's or raise's proof names this deployment and
-carries a 256-byte Groth16 proof, simulates the call again, and checks the gas,
-fee, transaction fee and balance bounds before signing an EIP-1559 (type 2)
+The three ABIs are those of vault revision 3. A revision-4 retirement reads
+only `siblings[0..ℓ)`, where ℓ = msb(noteId XOR nextNoteId) is the level at
+which the note's path meets the tree's frontier; the challenger zero-fills the
+rest (at ℓ = 0 the vault reads none). The signer signs any canonical encoding
+of these calls and leaves the sibling check to the vault's simulation. The
+revision-2 challenge with a Merkle path (`0x8a43467c`) and every other vault
+call are refused, among them `claimExpired` (revision 4:
+`claimExpired(uint32, bytes32, uint128, uint64)`, `0xad610550`) and the
+permissionless `recordRoot()` (`0x7a47cfac`), so this signer cannot serve an earlier challenger or vault: run
+it only in the stack of a concession-exit vault. It decodes the complete ABI,
+checks that a defeat's or raise's proof names this deployment and carries a
+256-byte Groth16 proof, simulates the call again, and checks the gas, fee,
+transaction fee and balance bounds before signing an EIP-1559 (type 2)
 transaction with ethers. Leaf retirements follow the operator's policy of
 design §5.4: only with `ZKAPI_CHALLENGE_RETIRE_ON_MISS` on, only for a note an
 escape finalized (a missed defeat is an escape that finalized), at most
@@ -47,7 +54,7 @@ leading zeros are refused, and an empty value means the default.
 | `ZKAPI_CHALLENGE_MAX_GAS` | 12,000,000; at most 16,777,216 | Gas limit cap. |
 | `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | `true`; `true` or `false` | The operator's retire-on-miss policy (design §5.4). Keep it equal to the challenger's `ZKAPI_CHALLENGE_RETIRE_ON_MISS` in `deployment.env`; `false` refuses every leaf retirement with `retirement_disabled`. |
 | `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` | 50,400 (about 7 days of 12 s blocks); 1 to 5,000,000 | How far back a leaf retirement's note must show an `EscapeWithdrawalFinalized` log. See [Retirement policy and budget](#retirement-policy-and-budget). |
-| `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` | 2; 0 to 1,000 | Nonces on which the signer signs a leaf retirement (`retireClosedLeaf`) per rolling 24 hours; fee replacements on a counted nonce are free, and 0 refuses every retirement. See [Retirement policy and budget](#retirement-policy-and-budget). |
+| `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` | 4; 0 to 1,000 | Nonces on which the signer signs a leaf retirement (`retireClosedLeaf`) per rolling 24 hours; fee replacements on a counted nonce are free, and 0 refuses every retirement. See [Retirement policy and budget](#retirement-policy-and-budget). |
 | `ZKAPI_CHALLENGE_LISTEN_HOST`, `ZKAPI_CHALLENGE_PORT` | `127.0.0.1`, `8547` | Bind address. Compose sets the host to `0.0.0.0` on its private backend network and publishes no signer port. |
 | `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` | removed | Startup refuses while it is present, even when empty, because its meaning changed. |
 
@@ -111,12 +118,16 @@ below rather than far beyond it.
 A defeat or raise needs a pending escape and a request proof the vault
 accepts, so a caller can spend gas on them only as fast as real escapes need
 them. A leaf retirement needs only a `Closed` note and the current siblings:
-every closed note simulates successfully, each retirement costs about 6M gas,
-and each changes the vault root, so every request proof in flight must be made
-again at the new root. A compromised challenger host could otherwise spend the
-float meant for defeats and raises on the ever-growing set of closed notes.
-The challenger retires a leaf only after a missed defeat, which is rare and
-already a critical alarm, and only with `--retire-on-miss` (design §5.4).
+every closed note simulates successfully, and each retirement costs about 37.7k
+gas at tree level ℓ = 0, about 0.47M at level 16 and at most about 0.92M at
+level 31 (with zero-filled siblings beyond ℓ). Each changes the vault root: the
+server still admits requests at the replaced root for its request-root grace
+(`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`, 60 by default), after which every request
+proof in flight must be made again at the new root. A compromised challenger
+host could otherwise spend the float meant for defeats and raises on the
+ever-growing set of closed notes. The challenger retires a leaf only after a
+missed defeat, which is rare and already a critical alarm, and only with
+`--retire-on-miss` (design §5.4).
 
 The signer applies the same policy before it counts a retirement:
 
@@ -135,12 +146,17 @@ The signer applies the same policy before it counts a retirement:
   when a retirement waited longer, for example after a long outage. Fee
   replacements on a counted nonce are not checked again.
 
-The budget counts nonces, not notes. A nonce mines at most one transaction,
-and every retirement that mines pays about 6M gas, including a copy that
-mines after the leaf is gone: `verifyAndUpdate` hashes both paths before it
-reverts `StaleRoot`. The signer therefore signs retirements on at most
-`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` nonces (default 2) per rolling 24
-hours, each counted from its first signing:
+The budget counts nonces, not notes. A nonce mines at most one transaction, and
+every retirement that mines pays gas, including one that reverts: a copy that
+mines after the leaf is gone reverts `StaleRoot` early, but a retirement that
+mines after another retirement in the same level-ℓ subtree (retirement
+contention, for example a front-run), or after a deposit that completed that
+subtree and so raised ℓ, hashes its whole sub-path, up to about 0.92M gas,
+before it reverts `StaleRoot`. The signer therefore signs retirements on at
+most `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` nonces (default 4) per rolling
+24 hours, each counted from its first signing. Four retirements are at most
+about 3.7M gas a day, about the bound of the two that revision 3 allowed at up
+to about 1.7M each, and leave room for the challenger's retry after contention:
 
 - A fee replacement or a re-send on a nonce already counted needs no new
   budget: only one of them can mine.
@@ -149,23 +165,25 @@ hours, each counted from its first signing:
   nonce of that note) until the sender's `latest` nonce count is past every
   nonce that note was counted on. Copies therefore cannot queue behind a
   pending retirement. The challenger itself re-sends on a new nonce only after
-  the earlier one mined and reverted (a root race), so it never meets this
-  refusal; a `challenge_refused` line with this reason means the caller
-  misbehaves.
+  the earlier one mined and reverted `StaleRoot` (contention: it refreshes the
+  path at the new latest block and retries once at once, then backs off), so
+  it never meets this refusal; a `challenge_refused` line with this reason
+  means the caller misbehaves.
 - A retirement refused before broadcast (the policy above, simulation, fees,
   balance, the node's fee-cap refusal, an unreadable nonce count or log range)
   takes no budget; one whose broadcast is ambiguous counts.
 
 The retirement gas any caller can spend is thus at most the budget x
 `MAX_GAS` x fee cap per rolling day. One missed defeat needs one unit, and
-one more for each re-send after a root race. Once the budget is spent, a
+one more for each re-send after contention. Once the budget is spent, a
 retirement on a new nonce is refused with `retirement_budget_exhausted` before
 any upstream call: the challenger reports `signer_refused` (critical) and
 retries each poll, and it signs once the window frees a slot. Defeats and
 raises are never affected. The window lives in memory: a restart of this
 sidecar starts a new one. Raise the budget in `signer.env` and recreate the
-signer when several real misses, or repeated root races, must be retired at
-once; 0 refuses every retirement.
+signer when several real misses, or repeated contention, must be retired at
+once; 0 refuses every retirement. Operators facing repeated front-running may
+also route the signer's upstream RPC through a private-orderflow relay.
 
 ### Node transaction fee cap
 
@@ -178,19 +196,18 @@ that default, are:
 | --- | --- | --- |
 | Defeat | 600,000, or the estimate plus 20% when higher (estimated 0.33-0.40M) | about 1,666 gwei |
 | Raise | 450,000, or the estimate plus 20% when higher (estimated about 0.33M) | about 2,222 gwei |
-| Leaf retirement | the estimate plus 20%, about 7.2M (estimated about 6.0M) | about 138.9 gwei |
+| Leaf retirement | the estimate plus 20%: about 45,000 at level 0, 0.57M at level 16, at most about 1.1M at level 31 (measured 37,678 and 471,788; about 0.92M at level 31) | about 900 gwei at 1.1M (about 1,766 gwei at level 16) |
 
-The gas figures are the design estimates; re-measure them on the deployed
-vault. Defeats and raises are deadline-bound and fit any realistic fee cap. A
-leaf retirement follows a missed defeat, has no deadline, and is the only call
-the node's default cap constrains. To let it bid a higher fee cap, either:
+The defeat and raise figures are the design estimates; re-measure them on the
+deployed vault. Defeats, raises and leaf retirements all fit any realistic fee
+cap at the default 1 ETH. To let a call bid a higher fee cap, either:
 
 - raise the node's `--rpc.txfeecap` and `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`
   together, in `signer.env` and in `deployment.env`, for example to 3.6 ETH for
   a 300 gwei fee cap at the default 12M `ZKAPI_CHALLENGE_MAX_GAS`; or
 - keep the fee cap within the transaction fee cap divided by its gas limit:
-  about 138.9 gwei at 1 ETH for 7.2M gas, or 125 gwei to leave room up to 8M.
-  A hosted provider's cap usually cannot be raised.
+  about 900 gwei at 1 ETH for a 1.1M-gas retirement, or 500 gwei to leave room
+  up to 2M. A hosted provider's cap usually cannot be raised.
 
 The signer checks every bid, proposed or default, against
 `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` before any upstream call and refuses a larger
@@ -200,10 +217,10 @@ limit allows. Status warns `tx_fee_cap_below_fee_cap` while
 gas limit the signer accepts, so it is conservative: at the default 12M gas and
 1 ETH it appears above a fee cap of about 83.3 gwei, while defeats and raises
 still sign at the full fee cap up to about 1,666 gwei. Lowering
-`ZKAPI_CHALLENGE_MAX_GAS` clears it: 8M keeps room above a leaf retirement and
-allows 125 gwei; with `ZKAPI_CHALLENGE_RETIRE_ON_MISS=false` in the
-challenger's environment, 1M allows 1,000 gwei. A call whose gas limit exceeds
-`ZKAPI_CHALLENGE_MAX_GAS` is refused with `gas_limit_exceeds_cap` (the
+`ZKAPI_CHALLENGE_MAX_GAS` clears it: 2M keeps room above the largest leaf
+retirement and allows 500 gwei; with `ZKAPI_CHALLENGE_RETIRE_ON_MISS=false` in
+the challenger's environment, 1M allows 1,000 gwei. A call whose gas limit
+exceeds `ZKAPI_CHALLENGE_MAX_GAS` is refused with `gas_limit_exceeds_cap` (the
 challenger reports `signer_refused`, critical at once), so keep a margin above
 the measured gas limits.
 
@@ -232,7 +249,7 @@ transactions. The signer checks each transaction against gas limit x its
 `N` is the number of transactions that may be pending at once, and `K` a budget
 of reverted attempts. A transaction that reverts still pays for its gas, and
 the daemon then retries. At a 100 gwei cap a defeat reserves 0.06 ETH and a
-leaf retirement about 0.72 ETH. The challenger sizes its own float for
+leaf retirement at most about 0.11 ETH. The challenger sizes its own float for
 `ceil(m/2)` defeats per note, at most 64 concurrent escapes and a 20% margin.
 Re-measure after deploying the vault. `zkapi_signerStatus.required_balance`
 is `MAX_GAS` x fee cap, a conservative figure for one leaf retirement. Multiply
@@ -354,10 +371,11 @@ sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --no-dep
 
 A container reads its environment files only when it is created, so
 `docker compose restart` keeps the old values. The daemon never bids above the
-transaction fee cap / gas limit (about 1,666 gwei for a defeat and 138.9 gwei
-for a leaf retirement at 1 ETH), so when it reports `tx_fee_cap_reached`,
-raising the fee caps changes nothing: raise the node's `--rpc.txfeecap` first,
-then `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` in `signer.env` (recreate the signer) and
+transaction fee cap / gas limit (about 1,666 gwei for a defeat and about 900
+gwei for the largest leaf retirement at 1 ETH), so when it reports
+`tx_fee_cap_reached`, raising the fee caps changes nothing: raise the node's
+`--rpc.txfeecap` first, then `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` in `signer.env`
+(recreate the signer) and
 in `deployment.env` (recreate the challenger, with the same commands;
 `--no-deps` leaves the server and indexer, which also read `deployment.env`,
 running). A `tx_fee_above_cap` or `upstream_tx_fee_cap` refusal means these
@@ -387,7 +405,9 @@ signer and a fresh sender key. Never repoint a signer or challenger away from a
 vault that still has active notes or pending escapes. A legacy vault (circuit
 `zkapi-v2-note-bound-v1`) keeps the signer image of its own release line,
 `release/v2-note-bound`: this signer refuses its challenge calls
-(`0x8a43467c`).
+(`0x8a43467c`). A revision-3 vault (circuit `zkapi-v2-concession-v1`) also
+keeps the images it was deployed with: this release's challenger and server
+refuse it at startup, because it has no `LEAF_BOUND_EXIT_VERSION()`.
 
 1. Copy [`../signer.env.example`](../signer.env.example), set the new vault,
    chain, upstream RPC and fresh key, the fee cap (required on Mainnet), and
@@ -411,9 +431,9 @@ vault that still has active notes or pending escapes. A legacy vault (circuit
    one other exception is `tx_fee_cap_below_fee_cap` with a fee cap above the
    transaction fee cap / `ZKAPI_CHALLENGE_MAX_GAS` (about 83.3 gwei at 1 ETH
    and the default 12M gas): defeats and raises still sign there, and a leaf
-   retirement up to about 138.9 gwei. Prefer to clear it by lowering
+   retirement up to about 900 gwei. Prefer to clear it by lowering
    `ZKAPI_CHALLENGE_MAX_GAS` with a margin above the largest call the
-   challenger makes, for example 8M (see
+   challenger makes, for example 2M (see
    [Node transaction fee cap](#node-transaction-fee-cap)), which also lowers
    `required_balance`.
 
@@ -444,8 +464,10 @@ environments and deployment manifests.
 
 Run `npm ci --ignore-scripts && npm test` here. The unit tests use a public
 fixture key and mock RPC responses. They decode the actual ethers signatures and
-cover the three allowed calls by their pinned selectors and calldata sizes, the
-refusal of the revision-2 challenge, other vault calls and non-canonical
+cover the three allowed calls by their pinned selectors and calldata sizes
+(including retirements with siblings zero-filled beyond ℓ, and ℓ = 0), the
+refusal of the revision-2 challenge, other vault calls (`claimExpired` of
+revisions 3 and 4, `recordRoot`, `finalizeEscapeWithdrawal`) and non-canonical
 encodings, the fee bounds, the Mainnet cap rule, strict configuration, refusal
 reasons, the transaction fee cap and a node's fee-cap refusal, the retirement
 budget (nonces per rolling day, free same-nonce replacements, one pending nonce

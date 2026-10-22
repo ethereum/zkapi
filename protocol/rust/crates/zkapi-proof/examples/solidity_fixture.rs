@@ -111,7 +111,6 @@ fn main() -> Result<()> {
      -> Result<Fixture<_>> {
         let (public, witness) = state.withdrawal(
             &deployment,
-            &tree,
             &DevWithdrawal {
                 kind,
                 destination,

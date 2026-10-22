@@ -214,7 +214,7 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 			next.DepositStage = depositStage
 		}
 		if depositStage == "verifying" {
-			next.Message = "The deposit is mined; waiting for the zkAPI indexer to confirm it before activating the private note."
+			next.Message = "The deposit is mined; waiting for the vault state to confirm it before activating the private note."
 		}
 		return next
 	}
@@ -552,8 +552,9 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 			kind, data = "approval_reset", "0x095ea7b3"+addressABIWord(config.Contract)+strings.Repeat("0", 64)
 		}
 	} else {
-		// Approval may take minutes. Obtain the current empty-leaf witness,
-		// bound to its indexer slot, immediately before simulating/signing.
+		// Approval may take minutes. Bind the deposit to its indexer slot,
+		// after searching for earlier deposits of this note, immediately
+		// before simulating/signing.
 		bound, bindErr := h.bindDepositPath(ctx, config, record, deposit)
 		if errors.Is(bindErr, errDepositVerificationConflict) {
 			return landed(bindErr)
@@ -875,6 +876,13 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 		gasLimit, err = paddedAddressGas(gas)
 		if err != nil {
 			return err
+		}
+		// A deposit's gas depends on the note ID it lands at, which another
+		// deposit can move (design C.8): the policy limit covers the next 64.
+		if kind == "deposit" {
+			if gasLimit, err = h.depositGasLimit(ctx, config, gas, gasLimit); err != nil {
+				return err
+			}
 		}
 		// An escape transaction is never signed below its entry point's
 		// measured cost, whatever the estimate: one that runs out of gas

@@ -1,0 +1,62 @@
+{
+  "entry_point_address": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+  "entry_point_runtime_codehash": "0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58",
+  "sender_creator_address": "0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C",
+  "sender_creator_runtime_codehash": "0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689",
+  "withdrawal_paymaster_address": "0xd4022d308CD9d3E35437f86E059749c46c41Fd72",
+  "withdrawal_paymaster_runtime_codehash": "0x6df2edb0bf978e91127079182cd7063fceaeb4cede191dca48e7d1418830063a",
+  "withdrawal_account_factory_address": "0xbFE3BaDC37F216a782D75CbA4B66BA9f699D64b1",
+  "withdrawal_account_factory_runtime_codehash": "0x3b631ddb1be7b5edecd5fcca1dc36dafb95cf242b840d1482e1630a9c1e68049",
+  "withdrawal_account_implementation_address": "0xdE9EA737A17442966C486E6627728e743E536971",
+  "withdrawal_account_implementation_runtime_codehash": "0x11a558625a379ae5178eb3106859de37a0bb36239b0dd915661059bf9aa0a61d",
+  "account_creation_code": "0x600d80380380916000396000f336600060003760a0603d36396000600060a03601600073de9ea737a17442966c486e6627728e743e5369715af43d600060003e3d600082603b57fd5bf3",
+  "account_creation_code_keccak256": "0x4a6378352b0162013eabb74f6f1a8c7286483b4aa096af41ea2db7821d99af9e",
+  "bundler_url": null,
+  "gas_policy": {
+    "account_call_overhead_escape_gas": "28900",
+    "account_call_overhead_gas": "55500",
+    "call_floor": [
+      "600000",
+      "650000",
+      "260000",
+      "80000"
+    ],
+    "call_cap": [
+      "950000",
+      "1100000",
+      "400000",
+      "150000"
+    ],
+    "credit_gas": "46000",
+    "eoa_push_gas": "9100",
+    "finalize_reserve_gas": "1020000",
+    "margin_gas": "15000",
+    "max_attempts": "3",
+    "new_account_gas": "25000",
+    "payout_push_gas": "100000",
+    "pm_verification_cap": "496000",
+    "pm_verification_floor": "420000",
+    "postop_base_gas": "17000",
+    "postop_cap": "350000",
+    "postop_escape_forward_gas": "30000",
+    "postop_escape_gas": "71200",
+    "postop_finalize_extra_gas": "5000",
+    "postop_floor": "250000",
+    "pvg_cap": "150000",
+    "pvg_floor": "40000",
+    "verification_cap": "400000",
+    "verification_floor": "50000",
+    "verification_floor_init": "140000"
+  },
+  "policy": {
+    "max_sponsored_cost_wei": "250000000000000000",
+    "flat_fee_wei": "10000000000000",
+    "min_escape_net_wei": "100000000000000",
+    "escapes_enabled": true
+  },
+  "fee_ceilings": {
+    "max_fee_wei": "100000000000",
+    "priority_fee_wei": "5000000000"
+  },
+  "uneconomic_fraction_percent": 25
+}

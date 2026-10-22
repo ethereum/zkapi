@@ -63,6 +63,9 @@ type ServiceStatus struct {
 	Backend             string `json:"backend"`
 	Network             string `json:"network,omitempty"`
 	RequestBudgetPolicy string `json:"request_budget_policy,omitempty"`
+	// DeploymentID is the zkAPI deployment the daemon's build serves, so a
+	// command from a build pinning another deployment refuses to attach.
+	DeploymentID string `json:"deployment_id,omitempty"`
 }
 
 func New(backend Backend, key string, concurrency int) (*API, error) {

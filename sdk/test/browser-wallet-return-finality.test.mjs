@@ -175,9 +175,9 @@ async function scenario({ finalitySupported = true, selected = false, parked = f
             }
             if (method === 'eth_call') {
                 assert.equal(params[0].to, VAULT);
-                assert.equal(params[0].data, `0x9f18e4ed${zkapiWallet.abiWord(state.note_id)}`);
+                assert.equal(params[0].data, `0xd154f5bf${zkapiWallet.abiWord(state.note_id)}`);
                 chain.historicalReads.push(params[1]);
-                return `0x${[0, 0, 0, chain.status].map(zkapiWallet.abiWord).join('')}`;
+                return `0x${[0x1eaf, chain.status].map(zkapiWallet.abiWord).join('')}`;
             }
             throw new Error(`Recovery must not open MetaMask: ${method}`);
         }

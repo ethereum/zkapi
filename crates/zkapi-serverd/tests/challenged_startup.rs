@@ -17,7 +17,7 @@ fn write_manifest(path: &Path) {
         "state_signing_key": { "x": "0x1", "y": "0x2" },
         "clearance_signing_key": { "x": "0x3", "y": "0x4" },
         "challenge_period": 172_800,
-        "circuit_id": "zkapi-v2-concession-v1",
+        "circuit_id": "zkapi-v2-concession-v2",
         "setup_id": "dev",
         "request_vk_keccak256": hash("11"),
         "withdrawal_vk_keccak256": hash("22"),

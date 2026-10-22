@@ -1,25 +1,25 @@
 {
   "schema": 2,
-  "circuitId": "zkapi-v2-concession-v1",
+  "circuitId": "zkapi-v2-concession-v2",
   "setupId": "dev",
-  "sourceRevision": "a3f4a0f2508611cb1fd910a1e22bfc36ecfca559",
+  "sourceRevision": "4dfdd9d19618de055808e303128f024ee579a3d4",
   "toolchain": {
     "rustc": "1.99.0",
     "wasmBindgen": "0.2.117"
   },
   "vkKeccak256": {
-    "request": "0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790",
-    "withdrawal": "0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1"
+    "request": "0x38348b670fd21c8c622075f84f5c4a246f54081e09886b0a3c86c89edc01e1c8",
+    "withdrawal": "0xc14844d3af2b29303852e7e47e642830552e0c73df3ebbed8f0d27c316be9ffa"
   },
   "files": {
-    "wasm/zkapi_browser.js": "2b2f102cddf32302c87bbc38d650dff9294e904c6a248bb9372ab293667c6bb0",
-    "wasm/zkapi_browser_bg.wasm": "cb140028b5aeb00389e8b240524178a8fcb42a3ade8bda91e042b278002d982f",
-    "wasm/zkapi_browser.d.ts": "ad916e76886df32058db4cf401e97ff184c1fe7149bbffb17712156bc0bb5949",
-    "wasm/zkapi_browser_bg.wasm.d.ts": "6a982a8f8b5d57bbb2697b3627d518d6e168b00f66363c5fa7334bf16db82b53",
-    "assets/proofs/request.pk": "7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba",
-    "assets/proofs/withdrawal.pk": "43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1",
-    "assets/proofs/request.vk": "11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf",
-    "assets/config/sepolia.json": "5fc67d5d29c819e4e5a7c4a955673754d254a77e8dae068882db9dd09f9cbc41",
-    "assets/config/mainnet.json": "f3d220ead5696b282c84217435fa2c98d5ea071c171264009ae45a5dc28a906e"
+    "wasm/zkapi_browser.js": "57df7f37795517c5ead23647241afd811d6f27c31abe407f85d97f521ea07871",
+    "wasm/zkapi_browser_bg.wasm": "41031c1632c45018fd01dccaa883f5cbcb26df6616df5a8e0939620a3a3e4fff",
+    "wasm/zkapi_browser.d.ts": "d6f1bff11a642c0e7121f40003c90a8ce9bf806a451c640679f93c0a34cea01f",
+    "wasm/zkapi_browser_bg.wasm.d.ts": "2f545577a81368941bceb6b3121d20e52449f8522020629e630bfafd81537219",
+    "assets/proofs/request.pk": "fb5f0ec0908b29aa5a3ba75c5cefda70ca0bc1d68da031c4a21ef63c0806af87",
+    "assets/proofs/withdrawal.pk": "c04e0368a85378c268b68c9c18764b0d1f86bac98fb21d69e6e80918ce2e486f",
+    "assets/proofs/request.vk": "95ea85413634f40b44314b8d9a0c2a79281c7a868eec13308fbe07dc1d0a8bd3",
+    "assets/config/sepolia.json": "803f176e327713d51112388f350f4e011f5606a1dd5068a0124eca2b74fa9fa6",
+    "assets/config/mainnet.json": "de8399b1fe4248569083d013f40b00bce5316c75979ef88097664475dfeac003"
   }
 }

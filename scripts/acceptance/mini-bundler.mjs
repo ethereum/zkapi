@@ -268,8 +268,8 @@ export function sponsoredKind(callData) {
     if (call === '0x') return 4;
     const selector = call.slice(0, 10);
     if (selector === '0xff8f5585') return 3;
-    if (selector === '0xa38d62aa') return 2;
-    if (selector === '0x72cd2e44') return 1;
+    if (selector === '0x8cd67c60') return 2;
+    if (selector === '0xbce12a6c') return 1;
     return null;
 }
 

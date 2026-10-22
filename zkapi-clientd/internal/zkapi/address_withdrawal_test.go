@@ -226,28 +226,27 @@ func (f *withdrawalFixture) bridgeStatus() map[string]any {
 	return status
 }
 
+// withdrawalTestDeposit is the deposit of the withdrawal fixtures' note,
+// which covers every balance they prove.
+const withdrawalTestDeposit = 1_000_000_000
+
 func withdrawalTestPlan(destination string) map[string]any {
 	decoded, _ := hex.DecodeString(strings.TrimPrefix(destination, "0x"))
 	address := make([]int, len(decoded))
 	for i, b := range decoded {
 		address[i] = int(b)
 	}
-	siblings := make([]string, 32)
-	for i := range siblings {
-		siblings[i] = "0xa"
-	}
 	return map[string]any{
 		"mode": "mutual",
 		"public_inputs": map[string]any{
 			"protocol_version": 2, "chain_id": 1, "contract_address": addressTestVault,
-			"active_root": "0x9", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
+			"note_leaf": "0x9", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
 			"clearance_signing_key_x": "0x3", "clearance_signing_key_y": "0x4",
-			"note_id": 12, "final_balance": 99999, "destination": address,
+			"note_id": 12, "deposit_amount": withdrawalTestDeposit, "expiry_ts": 1_786_060_800, "final_balance": 99999, "destination": address,
 			"withdrawal_nullifier": "0x123", "kind": 1, "next_nullifier": "0x0", "conceded": 0,
 			"valid_until": time.Now().Unix() + exitProofValidity,
 		},
-		"siblings": siblings,
-		"proof":    map[string]any{"backend": "groth16_bn254", "proof": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 256))},
+		"proof": map[string]any{"backend": "groth16_bn254", "proof": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 256))},
 	}
 }
 
@@ -316,15 +315,18 @@ func TestAddressWithdrawalSignsExactBoundCallAndPreservesDepositHistory(t *testi
 	if tx.Nonce() != 2 || tx.Value().Sign() != 0 || !strings.EqualFold(tx.To().Hex(), addressTestVault) {
 		t.Fatal("withdrawal escaped local signer nonce, zero value, or configured vault")
 	}
-	// mutualClose((16-field tuple),bytes): 16 words, the bytes offset 17*32,
-	// the length 256 and the proof, 836 bytes. Selector 0x72cd2e44.
-	signature := "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)"
+	// mutualClose((16-field tuple),bytes) of vault revision 4: 16 words, word 3
+	// the note leaf and word 8 the uint256 note fields (note 12, deposit
+	// 1,000,000,000, expiry 1,786,060,800), the bytes offset 17*32, the length 256
+	// and the proof, 836 bytes. Selector 0xbce12a6c.
+	signature := "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)"
 	expected := hex.EncodeToString(crypto.Keccak256([]byte(signature))[:4])
-	if expected != "72cd2e44" {
+	if expected != "bce12a6c" || withdrawalSelector != expected {
 		t.Fatalf("the mutualClose selector is %s", expected)
 	}
 	validUntil := new(big.Int).SetBytes(tx.Data()[4+15*32 : 4+16*32]).Uint64()
-	for _, value := range []string{"0x2", "0x1", addressTestVault, "0x9", "0x1", "0x2", "0x3", "0x4", "0xc", "0x1869f", withdrawalTestDestination, "0x123", "0x1", "0x0", "0x0", fmt.Sprintf("0x%x", validUntil), "0x220", "0x100"} {
+	fields := "0x000000000000000c0000000000000000000000003b9aca00000000006a752000"
+	for _, value := range []string{"0x2", "0x1", addressTestVault, "0x9", "0x1", "0x2", "0x3", "0x4", fields, "0x1869f", withdrawalTestDestination, "0x123", "0x1", "0x0", "0x0", fmt.Sprintf("0x%x", validUntil), "0x220", "0x100"} {
 		expected += addressABIWord(value)
 	}
 	expected += strings.Repeat("5a", 256)
@@ -366,9 +368,37 @@ func checkSignedCloseWords(t *testing.T, data []byte, saved *addressWithdrawalRe
 		tampered[4+index*32+31] ^= 1
 		return tampered
 	}
-	for _, index := range []int{0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17} {
+	for _, index := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17} {
 		if validateSignedWithdrawal(tamper(index), config, saved, now) == nil {
 			t.Errorf("close word %d tampering accepted", index)
+		}
+	}
+	// The note words are refused, even under their own binding, as the vault
+	// refuses them before verifying: no leaf, fields of 2^224 or more, another
+	// note, a deposit above 2^53 - 1 units or below the payout.
+	id, amount, expiry, ok := parseNoteFieldsWord(words(data)[8])
+	if !ok || uint64(id) != saved.NoteID {
+		t.Fatalf("the signed note fields are not the saved note's: %s", words(data)[8])
+	}
+	for name, replace := range map[string]struct {
+		index int
+		word  string
+	}{
+		"zero leaf":            {3, strings.Repeat("0", 64)},
+		"leaf not a field":     {3, fmt.Sprintf("%064x", bn254ScalarModulus)},
+		"fields of 2^224":      {8, fmt.Sprintf("%064x", new(big.Int).Or(noteFields(id, amount, expiry), new(big.Int).Lsh(big.NewInt(1), 224)))},
+		"another note":         {8, noteFieldsWord(id+1, amount, expiry)},
+		"deposit above 2^53-1": {8, noteFieldsWord(id, maxSafeNoteAmount+1, expiry)},
+		"deposit below payout": {8, noteFieldsWord(id, saved.Amount-1, expiry)},
+		"no expiry":            {8, noteFieldsWord(id, amount, 0)},
+	} {
+		changed := append([]byte(nil), data...)
+		raw, _ := hex.DecodeString(replace.word)
+		copy(changed[4+replace.index*32:4+(replace.index+1)*32], raw)
+		rebound := *saved
+		rebound.Binding = withdrawalBinding(words(changed))
+		if validateSignedWithdrawal(changed, config, &rebound, now) == nil {
+			t.Errorf("close with %s accepted under its own binding", name)
 		}
 	}
 	// An escape's kind, a successor nullifier or a concession is refused even
@@ -380,9 +410,6 @@ func checkSignedCloseWords(t *testing.T, data []byte, saved *addressWithdrawalRe
 		if validateSignedWithdrawal(tampered, config, &rebound, now) == nil {
 			t.Errorf("close word %d accepted under its own binding", index)
 		}
-	}
-	if validateSignedWithdrawal(tamper(3), config, saved, now) != nil {
-		t.Error("a re-proof at another root refused")
 	}
 	for name, validUntil := range map[string]int64{"expired": now.Unix() - 1, "too late": now.Unix() + exitProofValidity + exitProofClockAllowance + 1} {
 		changed := append([]byte(nil), data...)
@@ -598,8 +625,9 @@ func TestAddressWithdrawalRefreshesOnlyAfterExplicitFinalizedRevertRetry(t *test
 	if err != nil || status.Phase != "reverted" || f.prepareCalls != 1 || len(f.accepted) != 3 {
 		t.Fatalf("finalized revert did not stop for explicit retry: %+v %v", status, err)
 	}
+	validUntil := time.Now().Unix() + exitProofValidity - 7
 	f.planMutation = func(plan map[string]any) {
-		plan["public_inputs"].(map[string]any)["active_root"] = "0xb"
+		plan["public_inputs"].(map[string]any)["valid_until"] = validUntil
 	}
 	for range 2 {
 		status, err = f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
@@ -612,8 +640,8 @@ func TestAddressWithdrawalRefreshesOnlyAfterExplicitFinalizedRevertRetry(t *test
 	if again == hash || f.accepted[again].Nonce() != 3 || f.prepareCalls != 2 || len(record.History) != 3 || !record.History[2].FinalizedRevert {
 		t.Fatal("explicit retry did not preserve failed transaction history and use a fresh proof/nonce")
 	}
-	if got := hex.EncodeToString(f.accepted[again].Data()[4+3*32 : 4+4*32]); got != addressABIWord("0xb") {
-		t.Fatal("stale-root retry did not refresh the root")
+	if got := hex.EncodeToString(f.accepted[again].Data()[4+15*32 : 4+16*32]); got != fmt.Sprintf("%064x", validUntil) {
+		t.Fatal("the retry did not use the fresh proof")
 	}
 }
 

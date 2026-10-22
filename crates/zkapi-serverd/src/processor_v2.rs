@@ -30,7 +30,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -56,7 +56,7 @@ use crate::dashboard::{
     SettlementOverview, SettlementReviewView,
 };
 use crate::error::ServerError;
-use crate::native_billing::{NativeBillingOracle, NativeBillingQuote};
+use crate::native_billing::{NativeBillingOracle, NativeBillingQuote, NoteStatus, VaultNoteRecord};
 use crate::nullifier_store::{
     api_request_binding, lease_binding_mismatch, saved_request_mismatch, FinalizeGuard, KeyCleanup,
     LeaseFinalization, NewOpenRouterLease, NullifierStatus, NullifierStore, OaProvisioningOutcome,
@@ -79,9 +79,9 @@ const OA_LEASE_EXPIRY_SAFETY_SECONDS: u64 = 30;
 /// Concurrent clearance ownership-proof verifications.
 const CLEARANCE_VERIFY_PERMITS: usize = 4;
 const CLEARANCE_PERMIT_TIMEOUT: Duration = Duration::from_secs(2);
-const RECENT_ROOTS_CAPACITY: usize = 1024;
-const REJECTED_CLEARANCE_CAPACITY: usize = 4096;
-const KNOWN_ROOTS_CAPACITY: usize = 4096;
+/// O5': the hard cap on the vault-root window (it otherwise holds at most
+/// `request_root_grace_seconds / root_poll_interval + 1` roots).
+const VAULT_ROOTS_HARD_CAP: usize = 1024;
 const KEY_CLEANUP_BATCH: usize = 50;
 const KEY_CLEANUP_MAX_BACKOFF_SECONDS: u64 = 3_600;
 /// Longest wait honoured from an org's retry-after for a pending receipt, or
@@ -123,8 +123,6 @@ struct SettlementTiming {
     /// Background provider-key cleanup per tick and per key.
     cleanup_budget: Duration,
     cleanup_attempt_timeout: Duration,
-    /// Single-flight cache of the vault's currentRoot() for clearance.
-    vault_root_ttl: Duration,
 }
 
 impl Default for SettlementTiming {
@@ -142,76 +140,160 @@ impl Default for SettlementTiming {
             issue_lock_timeout: Duration::from_secs(30),
             cleanup_budget: Duration::from_secs(30),
             cleanup_attempt_timeout: Duration::from_secs(30),
-            vault_root_ttl: Duration::from_secs(3),
         }
     }
 }
 
-/// Roots the server observed (indexer polls and vault reads), each with the
-/// time it was last seen.
-#[derive(Default)]
-struct RecentRoots {
-    entries: VecDeque<(Felt252, u64)>,
+/// One root of the O5' window: a `currentRoot()` the server read from the
+/// vault, the block it was last read at, and when the vault replaced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VaultRootEntry {
+    root: Felt252,
+    /// (number, hash) of the block the root was last read at; None for a
+    /// root set with `update_root` (embedders and tests).
+    block: Option<(u64, String)>,
+    /// Server time of the first read that found another root; None while
+    /// this is the latest root.
+    replaced_at: Option<u64>,
 }
 
-impl RecentRoots {
-    fn observe(&mut self, root: Felt252, now: u64, window: u64) {
-        match self.entries.iter_mut().find(|(seen, _)| *seen == root) {
-            Some(entry) => entry.1 = entry.1.max(now),
-            None => {
-                self.entries.push_back((root, now));
-                if self.entries.len() > RECENT_ROOTS_CAPACITY {
-                    self.entries.pop_front();
+/// O5': the roots the server read from the vault, oldest first, the latest
+/// last. Only vault reads enter it, never an indexer root.
+#[derive(Debug, Default)]
+struct VaultRoots {
+    entries: VecDeque<VaultRootEntry>,
+    /// Server time of the last successful vault read.
+    last_read_at: Option<u64>,
+    /// The removal fence read at the same block as the latest root.
+    retirement_epoch: Option<[u8; 32]>,
+    latest_block_timestamp: Option<u64>,
+}
+
+impl VaultRoots {
+    fn is_fresh(&self, now: u64, max_age: u64) -> bool {
+        self.last_read_at
+            .is_some_and(|at| now.saturating_sub(at) <= max_age)
+            && self
+                .latest_block_timestamp
+                .is_none_or(|at| now.saturating_sub(at) <= max_age)
+    }
+
+    fn latest(&self) -> Option<&VaultRootEntry> {
+        self.entries.back()
+    }
+
+    /// Record a successful vault read of `root` (at `block`) at `now`. A new
+    /// root replaces the latest one, which then stays acceptable for `grace`
+    /// seconds. After a reorg only the new latest root is kept. At most
+    /// `capacity` roots are kept, the newest.
+    fn record(
+        &mut self,
+        root: Felt252,
+        block: Option<(u64, String)>,
+        now: u64,
+        grace: u64,
+        capacity: usize,
+        reorg: bool,
+    ) {
+        match self.entries.back_mut() {
+            Some(latest) if latest.root == root => latest.block = block,
+            _ => {
+                if let Some(latest) = self.entries.back_mut() {
+                    latest.replaced_at = Some(now);
                 }
+                // A root the vault returns to (after a reorg, or a lagging
+                // RPC node) is the latest again, never twice in the window.
+                self.entries.retain(|entry| entry.root != root);
+                self.entries.push_back(VaultRootEntry {
+                    root,
+                    block,
+                    replaced_at: None,
+                });
             }
         }
-        self.entries
-            .retain(|(_, seen)| seen.saturating_add(window) >= now);
+        if reorg {
+            let latest = self.entries.pop_back();
+            self.entries.clear();
+            self.entries.extend(latest);
+        }
+        self.entries.retain(|entry| {
+            entry
+                .replaced_at
+                .is_none_or(|replaced| replaced.saturating_add(grace) >= now)
+        });
+        while self.entries.len() > capacity.max(1) {
+            self.entries.pop_front();
+        }
+        self.last_read_at = Some(self.last_read_at.map_or(now, |last| last.max(now)));
     }
 
-    fn contains(&self, root: &Felt252, now: u64, window: u64) -> bool {
-        self.entries
-            .iter()
-            .any(|(seen, at)| seen == root && at.saturating_add(window) >= now)
+    /// Whether `root` is the latest root, or one replaced at most `grace`
+    /// seconds before `now`.
+    fn admits(&self, root: &Felt252, now: u64, grace: u64) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.root == *root
+                && entry
+                    .replaced_at
+                    .is_none_or(|replaced| replaced.saturating_add(grace) >= now)
+        })
     }
 }
 
-/// The vault's answers to `knownRoots(root)` (Amendment A1). A root it set
-/// stays known; one it never set is cached as unknown only while the vault's
-/// current root is the one read with the answer, since a root becomes known
-/// only by becoming the current root.
-#[derive(Default)]
-struct KnownRoots {
-    known: std::collections::HashSet<Felt252>,
-    /// The vault root under which `unknown` was read.
-    unknown_under: Felt252,
-    unknown: std::collections::HashSet<Felt252>,
+/// What the root poller last found when it compared the indexer's root with
+/// the vault's `currentRoot()` at the indexer's block hash. A health signal
+/// only: admission never depends on the indexer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexerRootStatus {
+    /// No indexer configured.
+    #[default]
+    NotConfigured,
+    /// Not compared yet.
+    Unchecked,
+    Agrees,
+    /// The indexer's root is not the vault's root at the indexer's block.
+    Disagrees,
+    /// The indexer (or the vault read at its block) could not be read.
+    Unavailable,
 }
 
-impl KnownRoots {
-    fn lookup(&self, root: &Felt252, vault_root: &Felt252) -> Option<bool> {
-        if self.known.contains(root) {
-            Some(true)
-        } else if self.unknown_under == *vault_root && self.unknown.contains(root) {
-            Some(false)
-        } else {
-            None
+impl IndexerRootStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::Unchecked => "unchecked",
+            Self::Agrees => "agrees",
+            Self::Disagrees => "disagrees",
+            Self::Unavailable => "unavailable",
         }
     }
+}
 
-    fn record(&mut self, root: Felt252, vault_root: Felt252, known: bool) {
-        if known {
-            if self.known.len() >= KNOWN_ROOTS_CAPACITY {
-                self.known.clear();
-            }
-            self.known.insert(root);
-            return;
-        }
-        if self.unknown_under != vault_root || self.unknown.len() >= KNOWN_ROOTS_CAPACITY {
-            self.unknown.clear();
-            self.unknown_under = vault_root;
-        }
-        self.unknown.insert(root);
+/// The root state `/health` and `/metrics` report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootHealth {
+    /// The latest root read from the vault, if any.
+    pub vault_root: Option<Felt252>,
+    pub vault_root_block: Option<u64>,
+    /// Seconds since the last successful vault read.
+    pub vault_root_age_seconds: Option<u64>,
+    /// Admission is refused (`root_unavailable`) until the next vault read.
+    pub vault_root_stale: bool,
+    /// Roots admission accepts now.
+    pub window_roots: usize,
+    pub indexer: IndexerRootStatus,
+    /// Disagreements found since startup.
+    pub indexer_disagreements: u64,
+}
+
+impl RootHealth {
+    /// Serving, but something an operator should look at: no recent vault
+    /// read, or an indexer that disagrees with the vault or cannot be read.
+    pub fn degraded(&self) -> bool {
+        self.vault_root_stale
+            || matches!(
+                self.indexer,
+                IndexerRootStatus::Disagrees | IndexerRootStatus::Unavailable
+            )
     }
 }
 
@@ -266,17 +348,6 @@ impl LeaseLocks {
     async fn lock(&self, client_request_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         self.lock_of(client_request_id).lock_owned().await
     }
-}
-
-/// O5: the Merkle root admission accepts, and when the indexer and the
-/// vault last agreed on it.
-#[derive(Debug, Default, Clone, Copy)]
-struct RootAgreement {
-    /// The last refresh at which the indexer root equalled the vault's
-    /// currentRoot() (or a root an embedder set with `update_root`).
-    agreed_at: Option<u64>,
-    /// The last refresh found the two roots different.
-    disagreeing: bool,
 }
 
 /// Nullifiers found published (consumed or challenged on chain, or in a vault
@@ -344,34 +415,6 @@ pub(crate) fn lease_terminal(status: &str) -> bool {
     )
 }
 
-/// (root, nullifier) pairs whose verified ownership proof used a root the
-/// vault did not have, with the vault root read and an expiry. While the
-/// (cached, single-flight) vault root is unchanged, replays are answered from
-/// here without a pairing check.
-#[derive(Default)]
-struct RejectedClearances {
-    entries: VecDeque<(Felt252, Felt252, Felt252, u64)>,
-}
-
-impl RejectedClearances {
-    fn lookup(&self, root: &Felt252, nullifier: &Felt252, now: u64) -> Option<Felt252> {
-        self.entries
-            .iter()
-            .find(|(r, n, _, expires)| r == root && n == nullifier && *expires > now)
-            .map(|(_, _, vault_root, _)| *vault_root)
-    }
-
-    fn insert(&mut self, root: Felt252, nullifier: Felt252, vault_root: Felt252, expires: u64) {
-        self.entries
-            .retain(|(r, n, _, _)| !(*r == root && *n == nullifier));
-        self.entries
-            .push_back((root, nullifier, vault_root, expires));
-        if self.entries.len() > REJECTED_CLEARANCE_CAPACITY {
-            self.entries.pop_front();
-        }
-    }
-}
-
 /// Why a possibly delivered lease is finalized without measured usage.
 #[derive(Debug, Clone)]
 enum FallbackCause {
@@ -392,16 +435,17 @@ pub struct RequestProcessor {
     signer: Arc<ServerSigner>,
     verifier: RequestVerifier,
     withdrawal_verifier: WithdrawalVerifier,
-    current_root: Arc<RwLock<Felt252>>,
-    recent_roots: Mutex<RecentRoots>,
-    rejected_clearances: Mutex<RejectedClearances>,
+    /// The root reported before the first vault read (`--initial-root`);
+    /// never admitted.
+    initial_root: Felt252,
+    /// O5': the roots read from the vault that admission accepts.
+    vault_roots: Mutex<VaultRoots>,
+    /// A slower earlier poll must not overwrite a newer removal fence.
+    root_refresh_lock: tokio::sync::Mutex<()>,
+    /// The root poller's last comparison of the indexer with the vault, and
+    /// the number of disagreements found.
+    indexer_root: Mutex<(IndexerRootStatus, u64)>,
     clearance_permits: tokio::sync::Semaphore,
-    /// The last vault currentRoot() read (or its failure) and when.
-    vault_root_cache: tokio::sync::Mutex<Option<(Result<Felt252, String>, Instant)>>,
-    /// The vault's knownRoots answers; held across a read (single flight).
-    vault_known_roots: tokio::sync::Mutex<KnownRoots>,
-    /// O5: when the indexer and the vault last agreed on `current_root`.
-    root_agreement: Mutex<RootAgreement>,
     /// Which nullifiers are published on chain (`nullifier_published`).
     publication: Mutex<PublicationCache>,
     /// Where the signing pass's next pages start, for requests never found
@@ -434,7 +478,7 @@ impl RequestProcessor {
         config: ServerConfig,
         store: Arc<NullifierStore>,
         signer: Arc<ServerSigner>,
-        current_root: Felt252,
+        initial_root: Felt252,
     ) -> anyhow::Result<Self> {
         config.validate_native_mode()?;
         // Library embeddings can bypass run_server's full seed policy; never
@@ -510,12 +554,11 @@ impl RequestProcessor {
                 OpenRouterLeaseSourceConfig::OpenRouter { .. } => None,
             })
             .transpose()?;
-        let mut recent_roots = RecentRoots::default();
-        recent_roots.observe(
-            current_root,
-            current_timestamp(),
-            config.clearance_root_window_seconds,
-        );
+        let indexer_root = if config.indexer_url.is_some() {
+            IndexerRootStatus::Unchecked
+        } else {
+            IndexerRootStatus::NotConfigured
+        };
         Ok(Self {
             native_oracle,
             config,
@@ -523,13 +566,11 @@ impl RequestProcessor {
             signer,
             verifier,
             withdrawal_verifier,
-            current_root: Arc::new(RwLock::new(current_root)),
-            recent_roots: Mutex::new(recent_roots),
-            rejected_clearances: Mutex::new(RejectedClearances::default()),
+            initial_root,
+            vault_roots: Mutex::new(VaultRoots::default()),
+            root_refresh_lock: tokio::sync::Mutex::new(()),
+            indexer_root: Mutex::new((indexer_root, 0)),
             clearance_permits: tokio::sync::Semaphore::new(CLEARANCE_VERIFY_PERMITS),
-            vault_root_cache: tokio::sync::Mutex::new(None),
-            vault_known_roots: tokio::sync::Mutex::new(KnownRoots::default()),
-            root_agreement: Mutex::new(RootAgreement::default()),
             publication: Mutex::new(PublicationCache::default()),
             signing_cursors: Mutex::new([None, None]),
             timing: SettlementTiming::default(),
@@ -614,102 +655,257 @@ impl RequestProcessor {
         self.dashboard.as_ref()
     }
 
-    /// Set the root admission accepts, as one the indexer and the vault
-    /// agree on now. For embedders and tests: run_server's root poller
-    /// (`refresh_roots`) only accepts a root the vault confirms.
+    /// Record `new_root` as the vault's latest root, read now. For embedders
+    /// and tests: run_server's root poller (`refresh_roots`) records only
+    /// roots it read from the vault at a block hash it fetched.
     pub fn update_root(&self, new_root: Felt252) {
-        self.agree_on_root(new_root, current_timestamp());
+        self.record_vault_root(new_root, None, current_timestamp(), false);
     }
 
-    fn agree_on_root(&self, root: Felt252, now: u64) {
-        if let Ok(mut current) = self.current_root.write() {
-            *current = root;
-        }
-        if let Ok(mut agreement) = self.root_agreement.lock() {
-            *agreement = RootAgreement {
-                agreed_at: Some(now),
-                disagreeing: false,
-            };
-        }
-        self.observe_root(root, now);
+    /// How many roots the O5' window holds at most: one per poll over the
+    /// grace period, plus the latest, and never more than 1,024.
+    fn vault_roots_capacity(&self) -> usize {
+        let grace_ms = self.config.request_root_grace_seconds.saturating_mul(1_000);
+        let polls = grace_ms / self.config.root_poll_interval_ms.max(1);
+        usize::try_from(polls)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+            .min(VAULT_ROOTS_HARD_CAP)
     }
 
-    /// One refresh of the root poller (O5): the indexer's root (None without
-    /// an indexer) and the vault's currentRoot() at latest. Admission accepts
-    /// a root only while the two agree, and only for
-    /// `root_max_staleness_seconds` after they last did. A failed read
-    /// changes nothing: the last agreement ages out.
-    pub fn record_root_refresh(
+    fn record_vault_root(
         &self,
-        indexer_root: Option<Felt252>,
-        vault_root: Felt252,
+        root: Felt252,
+        block: Option<(u64, String)>,
         now: u64,
+        reorg: bool,
     ) {
-        match indexer_root {
-            Some(indexer_root) if indexer_root != vault_root => {
-                if let Ok(mut agreement) = self.root_agreement.lock() {
-                    if !agreement.disagreeing {
-                        tracing::warn!(
-                            indexer_root = %indexer_root,
-                            vault_root = %vault_root,
-                            "the indexer root and the vault's currentRoot() disagree; admission refuses requests until they agree"
-                        );
-                    }
-                    agreement.disagreeing = true;
-                }
-                // The vault's root is real: clearance may still use it.
-                self.observe_root(vault_root, now);
-            }
-            _ => self.agree_on_root(vault_root, now),
+        let capacity = self.vault_roots_capacity();
+        if let Ok(mut roots) = self.vault_roots.lock() {
+            roots.record(
+                root,
+                block,
+                now,
+                self.config.request_root_grace_seconds,
+                capacity,
+                reorg,
+            );
         }
     }
 
-    /// Read the indexer root (when configured) and the vault's currentRoot()
-    /// and record the refresh. Errors leave the last agreement to age out.
+    /// Refresh the vault root and its retirement fence at one canonical block.
+    /// Historical roots receive grace only across additions. A retirement or
+    /// reorg drops all earlier roots. A regressing RPC head fails closed until
+    /// it catches up: it cannot revive a leaf from before an observed removal.
     pub async fn refresh_roots(&self, indexer_url: Option<&str>) -> anyhow::Result<()> {
-        let indexer_root = match indexer_url {
-            Some(url) => Some(fetch_indexer_root(url).await?),
-            None => None,
+        let _refresh = self.root_refresh_lock.lock().await;
+        let read = self.native_oracle.vault_root_read().await?;
+        let now = current_timestamp();
+        if now.saturating_sub(read.block_timestamp) > self.config.root_max_staleness_seconds {
+            if let Ok(mut roots) = self.vault_roots.lock() {
+                roots.last_read_at = None;
+            }
+            anyhow::bail!("vault RPC latest block is too old for request admission");
+        }
+        let (previous, retirement) = {
+            let mut roots = self
+                .vault_roots
+                .lock()
+                .map_err(|_| anyhow::anyhow!("root state lock poisoned"))?;
+            let previous = roots.latest().and_then(|latest| latest.block.clone());
+            let retirement = roots
+                .retirement_epoch
+                .is_some_and(|epoch| epoch != read.retirement_epoch);
+            // Invalidate before another awaited RPC: once a removal is known,
+            // no concurrent admission may keep using a cached earlier root.
+            if retirement
+                || previous
+                    .as_ref()
+                    .is_some_and(|(number, _)| *number > read.block_number)
+            {
+                roots.last_read_at = None;
+            }
+            (previous, retirement)
         };
-        let vault_root = self.native_oracle.vault_current_root().await?;
-        *self.vault_root_cache.lock().await = Some((Ok(vault_root), Instant::now()));
-        self.record_root_refresh(indexer_root, vault_root, current_timestamp());
+        let reorg = match previous {
+            None => false,
+            Some((number, hash)) if number == read.block_number => hash != read.block_hash,
+            Some((number, _)) if number > read.block_number => {
+                anyhow::bail!("vault RPC head regressed from block {number} to {}; request roots unavailable until it catches up", read.block_number);
+            }
+            // The pinned new root is canonical and all historical roots are
+            // already fenced. No previous-block lookup is needed for removal.
+            Some(_) if retirement => false,
+            Some((number, hash)) => {
+                self.native_oracle.canonical_block_hash(number).await? != Some(hash)
+            }
+        };
+        if reorg || retirement {
+            tracing::warn!(
+                block = read.block_number,
+                reorg,
+                retirement,
+                "dropping historical request roots after a retirement or reorg"
+            );
+        }
+        {
+            let mut roots = self
+                .vault_roots
+                .lock()
+                .map_err(|_| anyhow::anyhow!("root state lock poisoned"))?;
+            roots.record(
+                read.root,
+                Some((read.block_number, read.block_hash.clone())),
+                current_timestamp(),
+                self.config.request_root_grace_seconds,
+                self.vault_roots_capacity(),
+                reorg || retirement,
+            );
+            roots.retirement_epoch = Some(read.retirement_epoch);
+            roots.latest_block_timestamp = Some(read.block_timestamp);
+        }
+        if let Some(url) = indexer_url {
+            let status = self.check_indexer_root(url, &read).await;
+            if let Ok(mut indexer) = self.indexer_root.lock() {
+                if status == IndexerRootStatus::Disagrees {
+                    indexer.1 = indexer.1.saturating_add(1);
+                }
+                indexer.0 = status;
+            }
+        }
         Ok(())
     }
 
-    /// O5: the root admission accepts now, if the indexer and the vault
-    /// agreed on it recently enough.
-    fn fresh_root(&self, now: u64) -> Result<Felt252, ServerError> {
-        let agreement = self
-            .root_agreement
+    /// Compare the indexer's root with the vault's currentRoot() at the
+    /// indexer's block hash (the read just made, when it is the same block).
+    async fn check_indexer_root(
+        &self,
+        indexer_url: &str,
+        read: &crate::native_billing::VaultRootRead,
+    ) -> IndexerRootStatus {
+        let indexer = match fetch_indexer_root(indexer_url).await {
+            Ok(indexer) => indexer,
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot read the indexer root (health only)");
+                return IndexerRootStatus::Unavailable;
+            }
+        };
+        let vault_root = if indexer.block_hash.eq_ignore_ascii_case(&read.block_hash) {
+            read.root
+        } else {
+            match self
+                .native_oracle
+                .vault_current_root_at(&indexer.block_hash)
+                .await
+            {
+                Ok(root) => root,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        block_hash = %indexer.block_hash,
+                        "cannot read the vault root at the indexer's block (health only)"
+                    );
+                    return IndexerRootStatus::Unavailable;
+                }
+            }
+        };
+        if vault_root == indexer.root {
+            IndexerRootStatus::Agrees
+        } else {
+            tracing::warn!(
+                indexer_root = %indexer.root,
+                vault_root = %vault_root,
+                block_hash = %indexer.block_hash,
+                "the indexer root is not the vault's currentRoot() at the indexer's block; \
+                 admission is unaffected (it uses vault reads only)"
+            );
+            IndexerRootStatus::Disagrees
+        }
+    }
+
+    /// O5': admit `root` if the server read the vault within
+    /// `root_max_staleness_seconds` and `root` is the latest vault root, or
+    /// a vault root replaced by additions at most `request_root_grace_seconds`
+    /// ago, with no intervening retirement or reorg.
+    fn admissible_root(&self, root: &Felt252, now: u64) -> Result<(), ServerError> {
+        let roots = self
+            .vault_roots
             .lock()
-            .map(|agreement| *agreement)
             .map_err(|_| ServerError::Internal("root state lock poisoned".into()))?;
-        if agreement.disagreeing {
-            return Err(ServerError::RootUnavailable(
-                "the indexer root and the vault's currentRoot() disagree".into(),
-            ));
-        }
+        self.admissible_root_locked(&roots, root, now)
+    }
+
+    fn admissible_root_locked(
+        &self,
+        roots: &VaultRoots,
+        root: &Felt252,
+        now: u64,
+    ) -> Result<(), ServerError> {
         let max = self.config.root_max_staleness_seconds;
-        match agreement.agreed_at {
-            Some(at) if now.saturating_sub(at) <= max => Ok(self.current_root()),
-            _ => Err(ServerError::RootUnavailable(format!(
-                "no root confirmed by the vault in the last {max} s"
-            ))),
+        let latest = match roots.latest() {
+            Some(latest) if roots.is_fresh(now, max) => latest.root,
+            _ => {
+                return Err(ServerError::RootUnavailable(format!(
+                    "no currentRoot() read from a fresh vault block in the last {max} s"
+                )))
+            }
+        };
+        if roots.admits(root, now, self.config.request_root_grace_seconds) {
+            return Ok(());
         }
+        Err(ServerError::StaleRoot {
+            latest_root: latest.to_hex(),
+        })
     }
 
-    fn observe_root(&self, root: Felt252, now: u64) {
-        if let Ok(mut roots) = self.recent_roots.lock() {
-            roots.observe(root, now, self.config.clearance_root_window_seconds);
-        }
-    }
-
+    /// The latest root read from the vault (before the first read, the
+    /// configured initial root).
     pub fn current_root(&self) -> Felt252 {
-        self.current_root
-            .read()
-            .map(|value| *value)
-            .unwrap_or(Felt252::ZERO)
+        self.vault_roots
+            .lock()
+            .ok()
+            .and_then(|roots| roots.latest().map(|latest| latest.root))
+            .unwrap_or(self.initial_root)
+    }
+
+    /// The root state for `/health` and `/metrics`.
+    pub fn root_health(&self) -> RootHealth {
+        let now = current_timestamp();
+        let (vault_root, vault_root_block, last_read_at, window_roots, fresh) = self
+            .vault_roots
+            .lock()
+            .map(|roots| {
+                let grace = self.config.request_root_grace_seconds;
+                (
+                    roots.latest().map(|latest| latest.root),
+                    roots
+                        .latest()
+                        .and_then(|latest| latest.block.as_ref().map(|block| block.0)),
+                    roots.last_read_at,
+                    roots
+                        .entries
+                        .iter()
+                        .filter(|entry| roots.admits(&entry.root, now, grace))
+                        .count(),
+                    roots.is_fresh(now, self.config.root_max_staleness_seconds),
+                )
+            })
+            .unwrap_or_default();
+        let vault_root_age_seconds = last_read_at.map(|at| now.saturating_sub(at));
+        let (indexer, indexer_disagreements) = self
+            .indexer_root
+            .lock()
+            .map(|indexer| *indexer)
+            .unwrap_or_default();
+        RootHealth {
+            vault_root,
+            vault_root_block,
+            vault_root_age_seconds,
+            vault_root_stale: !fresh,
+            window_roots,
+            indexer,
+            indexer_disagreements,
+        }
     }
 
     pub fn state_signing_key(&self) -> CurvePointWire {
@@ -2921,6 +3117,19 @@ impl RequestProcessor {
         request: &ApiRequestV2,
         issuance: Option<&IssuanceLease<'_>>,
     ) -> Result<Option<RequestResponseV2>, ServerError> {
+        self.validate_and_reserve_verifying(request, issuance, || {
+            self.verifier
+                .verify(&request.public_inputs, &request.proof)
+                .map_err(|error| ServerError::InvalidProof(error.to_string()))
+        })
+    }
+
+    fn validate_and_reserve_verifying(
+        &self,
+        request: &ApiRequestV2,
+        issuance: Option<&IssuanceLease<'_>>,
+        verify: impl FnOnce() -> Result<bool, ServerError>,
+    ) -> Result<Option<RequestResponseV2>, ServerError> {
         let public = &request.public_inputs;
         let payload_hash = canonical_payload_hash(request.payload.as_bytes());
         if payload_hash != request.payload_hash {
@@ -2962,13 +3171,9 @@ impl RequestProcessor {
                 NullifierStatus::ExitedUnsigned => Err(ServerError::NullifierUsed),
             };
         }
-        // O5: only the exact current root, confirmed by the vault recently.
-        let root = self.fresh_root(current_timestamp())?;
-        if public.active_root != root {
-            return Err(ServerError::StaleRoot {
-                latest_root: root.to_hex(),
-            });
-        }
+        // O5': the latest root read from the vault, or one the vault
+        // replaced within the grace period; never an indexer root.
+        self.admissible_root(&public.active_root, current_timestamp())?;
         let state_key = self.state_signing_key();
         if public.state_signing_key_x != state_key.x || public.state_signing_key_y != state_key.y {
             return Err(ServerError::InvalidRequest(
@@ -2997,11 +3202,7 @@ impl RequestProcessor {
                 "proof authorization tag does not bind this request id and payload".to_string(),
             ));
         }
-        if !self
-            .verifier
-            .verify(public, &request.proof)
-            .map_err(|error| ServerError::InvalidProof(error.to_string()))?
-        {
+        if !verify()? {
             return Err(ServerError::InvalidProof(
                 "Groth16 verification returned false".to_string(),
             ));
@@ -3011,10 +3212,19 @@ impl RequestProcessor {
         // actual reservation boundary, while issue_openrouter_lease retains
         // its serialization lock. A matching existing reservation returned
         // above and keeps its original quote even after expiration.
-        self.native_oracle
-            .assert_fresh(&self.lease_authorization(request)?.1, current_timestamp())?;
+        let quote = self.lease_authorization(request)?.1;
         let lease = issuance
             .map(|issuance| self.issuance_lease_row(request, issuance, current_timestamp()));
+        // A retirement can land while Groth16 verification runs. Recheck and
+        // hold the same lock the root poller uses through the synchronous DB
+        // transaction: invalidated roots cannot become resumable reservations.
+        let roots = self
+            .vault_roots
+            .lock()
+            .map_err(|_| ServerError::Internal("root state lock poisoned".into()))?;
+        let now = current_timestamp();
+        self.admissible_root_locked(&roots, &public.active_root, now)?;
+        self.native_oracle.assert_fresh(&quote, now)?;
         self.store
             .reserve_openrouter_lease_with(request, lease.as_ref())?;
         Ok(None)
@@ -3495,11 +3705,12 @@ impl RequestProcessor {
 
     /// Verify a kind-2 ownership proof for exactly this nullifier and
     /// deployment, fresh (`now <= valid_until <= now + 3600`), with its zero
-    /// fields zero (`next_nullifier`, `conceded`, `destination`), at a root
-    /// the server or the vault knows. Cheap checks come first; the
-    /// verification permit is released before any I/O; the vault root read
-    /// is single-flight and cached; rejected (root, nullifier) pairs are
-    /// answered from a negative cache.
+    /// fields zero (`next_nullifier`, `conceded`, `destination`), for a note
+    /// the vault holds Active with exactly the proof's leaf. Cheap checks
+    /// come first; the verification permit is released before the vault
+    /// read. Only a verified proof reaches the vault: one fresh
+    /// `noteRecord(note_id)` at latest per clearance, never cached, so a note
+    /// that escapes or closes is refused from its next clearance on.
     async fn verify_clearance_ownership(
         &self,
         nullifier: &Felt252,
@@ -3555,33 +3766,6 @@ impl RequestProcessor {
                 "ownership proof signing keys do not match this deployment".into(),
             ));
         }
-        let root = inputs.active_root;
-        let window = self.config.clearance_root_window_seconds;
-        let known_root = root == self.current_root()
-            || self
-                .recent_roots
-                .lock()
-                .map(|roots| roots.contains(&root, now, window))
-                .unwrap_or(false);
-        let mut vault_root_read = None;
-        if !known_root {
-            let rejected = self
-                .rejected_clearances
-                .lock()
-                .ok()
-                .and_then(|rejected| rejected.lookup(&root, nullifier, now));
-            // A replay is answered without a pairing check while the vault
-            // root it was rejected against is still current (a cached read).
-            if let Some(rejected_against) = rejected {
-                let vault_root = self.cached_vault_root().await?;
-                if vault_root == rejected_against {
-                    return Err(ServerError::StaleRoot {
-                        latest_root: vault_root.to_hex(),
-                    });
-                }
-                vault_root_read = Some(vault_root);
-            }
-        }
         {
             let _permit =
                 tokio::time::timeout(CLEARANCE_PERMIT_TIMEOUT, self.clearance_permits.acquire())
@@ -3599,71 +3783,34 @@ impl RequestProcessor {
                 ));
             }
         }
-        if known_root {
-            return Ok(());
+        // The proof binds its leaf to the note's registration, ID, deposit
+        // and expiry; the vault's stored leaf binds them to a real deposit.
+        let note_id = inputs.note_id;
+        let record = self.note_record(note_id).await?;
+        if record.leaf != inputs.note_leaf {
+            return Err(ServerError::NoteLeafMismatch { note_id });
         }
-        // Only a verified proof reaches the vault, and the reads are cached.
-        let vault_root = match vault_root_read {
-            Some(vault_root) => vault_root,
-            None => self.cached_vault_root().await?,
-        };
-        if vault_root == root {
-            self.observe_root(root, now);
-            return Ok(());
+        if record.status != NoteStatus::Active {
+            return Err(ServerError::NoteNotActive { note_id });
         }
-        // Amendment A1: any root the vault ever held, such as the one a
-        // client saved with its deposit-time path, proves the note exists
-        // (the tree is append-only for every note that is not Closed, and a
-        // close of a Closed note reverts).
-        if self.vault_knows_root(&root, &vault_root).await? {
-            return Ok(());
-        }
-        if let Ok(mut rejected) = self.rejected_clearances.lock() {
-            rejected.insert(root, *nullifier, vault_root, now.saturating_add(window));
-        }
-        Err(ServerError::StaleRoot {
-            latest_root: vault_root.to_hex(),
-        })
+        Ok(())
     }
 
-    /// Whether the vault ever set `root` (`knownRoots`), its current root
-    /// being `vault_root`. Concurrent callers wait for the one in-flight read;
-    /// a failed read is not cached.
-    async fn vault_knows_root(
-        &self,
-        root: &Felt252,
-        vault_root: &Felt252,
-    ) -> Result<bool, ServerError> {
-        let mut cache = self.vault_known_roots.lock().await;
-        if let Some(known) = cache.lookup(root, vault_root) {
-            return Ok(known);
-        }
-        let known = self.native_oracle.vault_known_root(root).await?;
-        cache.record(*root, *vault_root, known);
-        Ok(known)
-    }
-
-    /// The vault's currentRoot(), read at most once per TTL; concurrent
-    /// callers wait for the one in-flight read.
-    async fn cached_vault_root(&self) -> Result<Felt252, ServerError> {
-        let mut cached = self.vault_root_cache.lock().await;
-        if let Some((read, read_at)) = cached.as_ref() {
-            if read_at.elapsed() < self.timing.vault_root_ttl {
-                // A failed read is cached too: an RPC outage costs at most one
-                // read per TTL instead of a queue of slow reads.
-                return read.clone().map_err(ServerError::Internal);
+    /// The vault's `noteRecord(note_id)` at latest, read fresh (no cache).
+    async fn note_record(&self, note_id: u32) -> Result<VaultNoteRecord, ServerError> {
+        #[cfg(test)]
+        if let Some(chain) = &self.test_chain {
+            let mut chain = chain.lock().unwrap();
+            if let Some(notes) = chain.notes.as_ref() {
+                let record = notes.get(&note_id).copied();
+                chain.note_reads += 1;
+                return Ok(record.unwrap_or(VaultNoteRecord {
+                    leaf: Felt252::ZERO,
+                    status: NoteStatus::Uninitialized,
+                }));
             }
         }
-        let read = self
-            .native_oracle
-            .vault_current_root()
-            .await
-            .map_err(|error| match error {
-                ServerError::Internal(message) => message,
-                other => other.to_string(),
-            });
-        *cached = Some((read.clone(), Instant::now()));
-        read.map_err(ServerError::Internal)
+        self.native_oracle.vault_note_record(note_id).await
     }
 
     /// Recovery by client request ID. `not_found` (nullifier_status
@@ -4021,18 +4168,25 @@ pub struct RequestEvidenceResponse {
     pub proof: Groth16ProofWire,
 }
 
-/// The tree root the indexer serves.
-pub(crate) async fn fetch_indexer_root(indexer_url: &str) -> anyhow::Result<Felt252> {
-    #[derive(serde::Deserialize)]
-    struct RootResponse {
-        root: Felt252,
-    }
+/// The tree root the indexer serves, with the block it is the root at.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct IndexerRoot {
+    pub(crate) root: Felt252,
+    pub(crate) block_hash: String,
+}
 
+/// The indexer's root and its block hash (`GET /v1/tree/root`).
+pub(crate) async fn fetch_indexer_root(indexer_url: &str) -> anyhow::Result<IndexerRoot> {
     let base = indexer_url.trim_end_matches('/');
     let url = format!("{base}/v1/tree/root");
-    let response = reqwest::get(&url).await?;
-    let response = response.error_for_status()?;
-    Ok(response.json::<RootResponse>().await?.root)
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.json::<IndexerRoot>().await?)
 }
 
 /// Whether the indexer's published-nullifier table holds `nullifier`: the
@@ -4127,6 +4281,10 @@ pub(crate) struct TestChain {
     pub(crate) reads: usize,
     /// The `since` of every log scan.
     pub(crate) scans: Vec<u64>,
+    /// `noteRecord(n)` answers, instead of the vault RPC, when set (an
+    /// absent note is uninitialized); `note_reads` counts the reads.
+    pub(crate) notes: Option<std::collections::HashMap<u32, VaultNoteRecord>>,
+    pub(crate) note_reads: usize,
 }
 
 #[cfg(test)]
@@ -4143,6 +4301,16 @@ impl RequestProcessor {
         if let Ok(mut cache) = self.publication.lock() {
             *cache = PublicationCache::default();
         }
+    }
+
+    /// Store note `note_id` on the test chain with `leaf` and `status`
+    /// (`noteRecord` reads then use the test chain).
+    pub(crate) fn set_test_note(&self, note_id: u32, leaf: Felt252, status: NoteStatus) {
+        let mut chain = self.test_chain.as_ref().unwrap().lock().unwrap();
+        chain
+            .notes
+            .get_or_insert_with(Default::default)
+            .insert(note_id, VaultNoteRecord { leaf, status });
     }
 
     /// The test chain; the caller may change it, so cached publication
@@ -6167,6 +6335,9 @@ mod tests {
                 now,
                 1_000,
             );
+            // This in-memory fixture has no background root poller. Proving
+            // the signed chain can exceed its normal freshness window.
+            processor.update_root(prepared.request.public_inputs.active_root);
             let nullifier = prepared.request.public_inputs.request_nullifier;
             let response = processor
                 .finalize_test_lease(&prepared.request, 100 + step)
@@ -6187,6 +6358,7 @@ mod tests {
             now,
             1_000,
         );
+        processor.update_root(prepared.request.public_inputs.active_root);
         let mut response = processor.finalize_test_lease(&prepared.request, 1).unwrap();
         response.next_anchor = random_field_for_test();
         assert!(note.clone().complete(&prepared, &response).is_err());
@@ -7046,120 +7218,539 @@ mod tests {
             .unwrap());
     }
 
-    // ---- Admission: root freshness (O5) and the lease ceiling (§5.2) -------
-
-    /// O5: admission requires the exact root the indexer and the vault's
-    /// currentRoot() agreed on within `root_max_staleness_seconds`: none
-    /// yet, a disagreement or a stale agreement refuse with a retriable
-    /// root_unavailable; an exact retry of a reserved request is unaffected.
+    /// Root observation and reservation are atomic even when verification
+    /// overlaps a removal, reorg or loss of freshness. Additions retain grace.
     #[test]
-    fn admission_refuses_without_a_fresh_vault_confirmed_root() {
+    fn a_root_invalidated_during_verification_cannot_be_reserved() {
+        for change in ["retirement_or_reorg", "unavailable", "addition"] {
+            let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+            let mut request = unverified_lease_request(&processor);
+            let context =
+                canonical_request_context(&request.client_request_id, &request.payload_hash);
+            request.public_inputs.authorization_tag =
+                core::authorization_tag(&request.public_inputs.request_nullifier, &context);
+            processor.update_root(request.public_inputs.active_root);
+            let lease_config = processor.config.openrouter_leases.clone().unwrap();
+            let issuance = IssuanceLease {
+                lease_config: &lease_config,
+                spending_limit_usd: 3.0,
+                oa_request_id: Some("root-race-issuance"),
+            };
+            let result =
+                processor.validate_and_reserve_verifying(&request, Some(&issuance), || {
+                    match change {
+                        "unavailable" => processor.vault_roots.lock().unwrap().last_read_at = None,
+                        _ => processor.record_vault_root(
+                            Felt252::from_u64(0xabc),
+                            None,
+                            current_timestamp(),
+                            change != "addition",
+                        ),
+                    }
+                    Ok(true)
+                });
+            let nullifier = &request.public_inputs.request_nullifier;
+            if change == "addition" {
+                assert!(result.unwrap().is_none());
+                assert!(processor.store.lookup_by_nullifier(nullifier).is_some());
+                assert!(processor
+                    .store
+                    .lookup_openrouter_lease(&request.client_request_id)
+                    .is_some());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ServerError::StaleRoot { .. }) | Err(ServerError::RootUnavailable(_))
+                    ),
+                    "{change}: {result:?}"
+                );
+                assert!(processor.store.lookup_by_nullifier(nullifier).is_none());
+                assert!(processor
+                    .store
+                    .lookup_openrouter_lease(&request.client_request_id)
+                    .is_none());
+                assert!(processor
+                    .store
+                    .request_evidence(nullifier)
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    }
+
+    // ---- Admission: the request root (O5') and the lease ceiling (§5.2) ----
+
+    fn block(number: u64) -> Option<(u64, String)> {
+        Some((number, format!("0x{number:064x}")))
+    }
+
+    /// O5': the latest vault root, and a root the vault replaced at most
+    /// `request_root_grace_seconds` (60) ago, are admitted; one replaced
+    /// G + 1 s ago is stale, reporting the latest root; without a vault read
+    /// for `root_max_staleness_seconds` (60) every root is unavailable.
+    #[test]
+    fn admission_accepts_vault_roots_replaced_within_the_grace_period() {
+        let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        assert_eq!(processor.config.request_root_grace_seconds, 60);
+        let (a, b, other) = (
+            Felt252::from_u64(0xa),
+            Felt252::from_u64(0xb),
+            Felt252::from_u64(0xc),
+        );
+        let unavailable = |result: Result<(), ServerError>| {
+            matches!(result, Err(ServerError::RootUnavailable(_)))
+        };
+        let stale_against = |result: Result<(), ServerError>, latest: Felt252| match result {
+            Err(ServerError::StaleRoot { latest_root }) => latest_root == latest.to_hex(),
+            _ => false,
+        };
+        let t0 = 1_000_000;
+        // Never read: refused, retriably, whatever the root.
+        assert!(unavailable(processor.admissible_root(&a, t0)));
+        processor.record_vault_root(a, block(1), t0, false);
+        processor.admissible_root(&a, t0).unwrap();
+        assert!(stale_against(processor.admissible_root(&other, t0), a));
+        // The vault replaces A by B at t0 + 10.
+        processor.record_vault_root(b, block(2), t0 + 10, false);
+        processor.admissible_root(&b, t0 + 10).unwrap();
+        processor.admissible_root(&a, t0 + 10).unwrap();
+        // Polls keep reading B: A stays admitted until replaced_at + G...
+        processor.record_vault_root(b, block(3), t0 + 70, false);
+        processor.admissible_root(&a, t0 + 70).unwrap();
+        // ...and is stale from G + 1 s, reporting the latest root.
+        processor.record_vault_root(b, block(4), t0 + 71, false);
+        assert!(stale_against(processor.admissible_root(&a, t0 + 71), b));
+        processor.admissible_root(&b, t0 + 71).unwrap();
+        // No vault read for more than 60 s: even the latest root is refused.
+        processor.admissible_root(&b, t0 + 131).unwrap();
+        assert!(unavailable(processor.admissible_root(&b, t0 + 132)));
+        let error = processor.admissible_root(&b, t0 + 132).unwrap_err();
+        assert!(error.is_retriable());
+        assert_eq!(error.error_code(), "root_unavailable");
+
+        // G = 0 is the exact rule: only the latest vault root.
+        let mut exact = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        exact.config.request_root_grace_seconds = 0;
+        assert_eq!(exact.vault_roots_capacity(), 1);
+        exact.record_vault_root(a, block(1), t0, false);
+        exact.record_vault_root(b, block(2), t0, false);
+        assert!(stale_against(exact.admissible_root(&a, t0), b));
+        exact.admissible_root(&b, t0).unwrap();
+    }
+
+    /// Through admission itself: a fresh vault root passes the root check
+    /// (the fixture's proof does not verify, so admission stops there), any
+    /// other root is stale, and a reserved request's exact retry precedes
+    /// every root check.
+    #[test]
+    fn admission_checks_the_request_root_against_the_vault_window() {
         let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
         let root = Felt252::from_u64(0x5005);
         let mut request = unverified_lease_request(&processor);
         request.public_inputs.active_root = root;
-        let refused = |processor: &RequestProcessor| {
-            let error = processor.validate_and_reserve(&request).unwrap_err();
-            assert!(matches!(error, ServerError::RootUnavailable(_)), "{error}");
-            assert!(error.is_retriable());
-            assert_eq!(error.error_code(), "root_unavailable");
-        };
-        // Never refreshed.
-        refused(&processor);
-        let now = current_timestamp();
-        // The indexer and the vault disagree.
-        processor.record_root_refresh(Some(Felt252::from_u64(0x6006)), root, now);
-        refused(&processor);
-        // They agreed, but longer ago than the staleness bound.
-        processor.record_root_refresh(Some(root), root, now - 61);
-        refused(&processor);
-        // Fresh agreement: the root check passes (the fixture's proof does
-        // not verify, so admission stops there).
-        processor.record_root_refresh(Some(root), root, now);
+        let error = processor.validate_and_reserve(&request).unwrap_err();
+        assert!(matches!(error, ServerError::RootUnavailable(_)), "{error}");
+        processor.update_root(root);
         assert!(matches!(
             processor.validate_and_reserve(&request),
             Err(ServerError::InvalidProof(_))
         ));
-        // A disagreement refuses at once, however fresh the last agreement.
-        processor.record_root_refresh(Some(Felt252::from_u64(0x6006)), root, now);
-        refused(&processor);
-        processor.record_root_refresh(Some(root), root, now);
+        // A newer vault root: the old one stays admitted within the grace.
+        processor.update_root(Felt252::from_u64(0x7007));
         assert!(matches!(
             processor.validate_and_reserve(&request),
             Err(ServerError::InvalidProof(_))
         ));
-        // Without an indexer, the vault's root alone counts.
-        processor.record_root_refresh(None, Felt252::from_u64(0x7007), now);
-        assert!(matches!(
-            processor.validate_and_reserve(&request),
-            Err(ServerError::StaleRoot { .. })
-        ));
-        // A reserved request's exact retry precedes every root check.
-        processor.record_root_refresh(Some(root), Felt252::from_u64(0x8008), now);
+        request.public_inputs.active_root = Felt252::from_u64(0x6006);
+        match processor.validate_and_reserve(&request) {
+            Err(ServerError::StaleRoot { latest_root }) => {
+                assert_eq!(latest_root, Felt252::from_u64(0x7007).to_hex())
+            }
+            other => panic!("expected stale_root, got {other:?}"),
+        }
         let reserved = reserved_request(&processor);
+        if let Ok(mut roots) = processor.vault_roots.lock() {
+            *roots = VaultRoots::default();
+        }
         assert!(processor.validate_and_reserve(&reserved).unwrap().is_none());
     }
 
-    /// The root poller reads the indexer and the vault: a lagging indexer
-    /// makes admission refuse until both report the same root.
-    #[tokio::test]
-    async fn the_root_poller_requires_the_indexer_to_match_the_vault() {
-        use axum::{routing::get, routing::post, Json, Router};
+    /// The window holds at most grace / poll + 1 roots (the latest
+    /// included), and never more than 1,024.
+    #[test]
+    fn the_vault_root_window_is_bounded() {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        assert_eq!(processor.vault_roots_capacity(), 61);
+        let now = 1_000_000;
+        for root in 1..=100 {
+            processor.record_vault_root(Felt252::from_u64(root), block(root), now, false);
+        }
+        {
+            let roots = processor.vault_roots.lock().unwrap();
+            assert_eq!(roots.entries.len(), 61);
+            assert_eq!(roots.entries.front().unwrap().root, Felt252::from_u64(40));
+            assert_eq!(roots.latest().unwrap().root, Felt252::from_u64(100));
+        }
+        // The oldest roots left first; the newest ones are still admitted.
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(39), now),
+            Err(ServerError::StaleRoot { .. })
+        ));
+        processor
+            .admissible_root(&Felt252::from_u64(40), now)
+            .unwrap();
+        processor.config.request_root_grace_seconds = 600;
+        processor.config.root_poll_interval_ms = 100;
+        assert_eq!(processor.vault_roots_capacity(), VAULT_ROOTS_HARD_CAP);
+        for root in 1..=1_100 {
+            processor.record_vault_root(Felt252::from_u64(root), block(root), now, false);
+        }
+        assert_eq!(processor.vault_roots.lock().unwrap().entries.len(), 1_024);
+        processor.config.root_poll_interval_ms = 5_000;
+        assert_eq!(processor.vault_roots_capacity(), 121);
+    }
+
+    /// A chain the root poller reads: blocks by number (the canonical hash
+    /// of each), the vault root at each block hash, and an indexer root.
+    #[derive(Default)]
+    struct RootChain {
+        canonical: std::collections::BTreeMap<u64, String>,
+        roots: std::collections::HashMap<String, Felt252>,
+        epochs: std::collections::HashMap<String, u64>,
+        /// The indexer's (root, block hash); None answers 503.
+        indexer: Option<(Felt252, String)>,
+        vault_down: bool,
+        head_timestamp: Option<u64>,
+        /// The `{"blockHash"}` of every pinned currentRoot() read.
+        pinned_reads: Vec<String>,
+    }
+
+    impl RootChain {
+        fn mine(&mut self, number: u64, hash: &str, root: u64) {
+            let hash = format!("0x{hash:0>64}");
+            self.canonical.insert(number, hash.clone());
+            self.roots.insert(hash, Felt252::from_u64(root));
+        }
+
+        fn hash(&self, number: u64) -> String {
+            self.canonical[&number].clone()
+        }
+    }
+
+    /// One server for both the vault RPC and the indexer's /v1/tree/root.
+    async fn root_chain_server(
+        chain: Arc<std::sync::Mutex<RootChain>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::StatusCode, routing::get, routing::post, Json, Router};
         use serde_json::{json, Value};
-        let vault_root = Felt252::from_u64(0xa11);
-        let indexer_root = Arc::new(std::sync::Mutex::new(Felt252::from_u64(0xa10)));
-        let served = indexer_root.clone();
+        let rpc = chain.clone();
         let app = Router::new()
             .route(
                 "/",
-                post(move |Json(request): Json<Value>| async move {
-                    let result = if request["method"] == "eth_chainId" {
-                        "0x1".to_string()
-                    } else {
-                        assert_eq!(request["params"][0]["data"], CURRENT_ROOT_SELECTOR_FOR_TEST);
-                        format!("0x{}", hex::encode(vault_root.as_bytes()))
-                    };
-                    Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
+                post(move |Json(request): Json<Value>| {
+                    let chain = rpc.clone();
+                    async move {
+                        let mut chain = chain.lock().unwrap();
+                        if chain.vault_down {
+                            return Err(StatusCode::SERVICE_UNAVAILABLE);
+                        }
+                        let params = &request["params"];
+                        let result = match request["method"].as_str().unwrap() {
+                            "eth_chainId" => json!("0x1"),
+                            "eth_getBlockByNumber" => {
+                                let number = match params[0].as_str().unwrap() {
+                                    "latest" => chain.canonical.keys().next_back().copied(),
+                                    quantity => u64::from_str_radix(&quantity[2..], 16).ok(),
+                                };
+                                match number.and_then(|n| chain.canonical.get(&n).map(|h| (n, h))) {
+                                    Some((n, hash)) => {
+                                        json!({"number": format!("0x{n:x}"), "hash": hash,
+                                            "timestamp": format!("0x{:x}", chain.head_timestamp.unwrap_or_else(current_timestamp))})
+                                    }
+                                    None => Value::Null,
+                                }
+                            }
+                            "eth_call" => {
+                                // Every vault read is pinned to a block hash.
+                                let hash = params[1]["blockHash"].as_str().unwrap().to_string();
+                                let data = params[0]["data"].as_str().unwrap();
+                                if data == crate::native_billing::CURRENT_ROOT_SELECTOR {
+                                    chain.pinned_reads.push(hash.clone());
+                                    let root = chain.roots[&hash];
+                                    json!(format!("0x{}", hex::encode(root.as_bytes())))
+                                } else if data == crate::native_billing::RETIREMENT_EPOCH_SELECTOR {
+                                    json!(format!(
+                                        "0x{:064x}",
+                                        chain.epochs.get(&hash).copied().unwrap_or(0)
+                                    ))
+                                } else {
+                                    assert_eq!(data, crate::native_billing::NEXT_NOTE_ID_SELECTOR);
+                                    json!(format!("0x{:064x}", 3))
+                                }
+                            }
+                            method => panic!("unexpected {method}"),
+                        };
+                        Ok(Json(json!({"jsonrpc":"2.0","id":1,"result":result})))
+                    }
                 }),
             )
             .route(
                 "/v1/tree/root",
                 get(move || {
-                    let served = served.clone();
-                    async move { Json(json!({"root": *served.lock().unwrap()})) }
+                    let chain = chain.clone();
+                    async move {
+                        match chain.lock().unwrap().indexer.clone() {
+                            Some((root, hash)) => {
+                                Ok(Json(json!({"root": root, "block_hash": hash})))
+                            }
+                            None => Err(StatusCode::SERVICE_UNAVAILABLE),
+                        }
+                    }
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, server)
+    }
+
+    fn window_roots(processor: &RequestProcessor) -> Vec<Felt252> {
+        processor
+            .vault_roots
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.root)
+            .collect()
+    }
+
+    /// O5': only roots read from the vault at a block hash the poller
+    /// fetched enter the window. The indexer is compared with the vault's
+    /// root at the indexer's block hash for health and metrics only: its
+    /// disagreement or downtime never refuses a request, and its root is
+    /// never admitted.
+    #[tokio::test]
+    async fn the_root_poller_admits_vault_roots_only_and_reports_the_indexer() {
+        let chain = Arc::new(std::sync::Mutex::new(RootChain::default()));
+        chain.lock().unwrap().mine(10, "a10", 0xa);
+        let (url, server) = root_chain_server(chain.clone()).await;
         let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
         configure_issuance_rpc(&mut processor, url.clone());
-        let mut request = unverified_lease_request(&processor);
-        request.public_inputs.active_root = vault_root;
+        processor.config.indexer_url = Some(url.clone());
+        let admitted = |processor: &RequestProcessor, root: u64| {
+            let mut request = unverified_lease_request(processor);
+            request.public_inputs.active_root = Felt252::from_u64(root);
+            matches!(
+                processor.validate_and_reserve(&request),
+                Err(ServerError::InvalidProof(_))
+            )
+        };
+        // The indexer serves a root the vault never had, at block 10.
+        let h10 = chain.lock().unwrap().hash(10);
+        chain.lock().unwrap().indexer = Some((Felt252::from_u64(0xbad), h10.clone()));
         processor.refresh_roots(Some(&url)).await.unwrap();
-        assert!(matches!(
-            processor.validate_and_reserve(&request),
-            Err(ServerError::RootUnavailable(_))
-        ));
-        *indexer_root.lock().unwrap() = vault_root;
+        assert_eq!(window_roots(&processor), [Felt252::from_u64(0xa)]);
+        assert!(admitted(&processor, 0xa));
+        assert!(!admitted(&processor, 0xbad));
+        let health = processor.root_health();
+        assert_eq!(health.indexer, IndexerRootStatus::Disagrees);
+        assert_eq!(health.indexer_disagreements, 1);
+        assert!(health.degraded());
+        assert_eq!(health.vault_root_block, Some(10));
+        // Same block as the vault read: no second currentRoot() read.
+        assert_eq!(
+            chain.lock().unwrap().pinned_reads,
+            std::slice::from_ref(&h10)
+        );
+        // The indexer lags a block behind and agrees with the vault there:
+        // its root is checked at its own block hash.
+        chain.lock().unwrap().mine(11, "a11", 0xb);
+        chain.lock().unwrap().indexer = Some((Felt252::from_u64(0xa), h10.clone()));
         processor.refresh_roots(Some(&url)).await.unwrap();
-        assert_eq!(processor.current_root(), vault_root);
-        assert!(matches!(
-            processor.validate_and_reserve(&request),
-            Err(ServerError::InvalidProof(_))
-        ));
-        // The indexer diverges again: admission refuses from the next
-        // refresh, within the staleness bound of the last agreement.
-        *indexer_root.lock().unwrap() = Felt252::from_u64(0xa12);
+        let h11 = chain.lock().unwrap().hash(11);
+        assert_eq!(
+            chain.lock().unwrap().pinned_reads,
+            [h10.clone(), h11.clone(), h10.clone()]
+        );
+        let health = processor.root_health();
+        assert_eq!(health.indexer, IndexerRootStatus::Agrees);
+        assert!(!health.degraded());
+        assert_eq!(health.window_roots, 2);
+        assert!(admitted(&processor, 0xa) && admitted(&processor, 0xb));
+        // The indexer goes down: admission is unaffected, health degrades.
+        chain.lock().unwrap().indexer = None;
         processor.refresh_roots(Some(&url)).await.unwrap();
+        assert_eq!(
+            processor.root_health().indexer,
+            IndexerRootStatus::Unavailable
+        );
+        assert!(processor.root_health().degraded());
+        assert!(admitted(&processor, 0xb));
+        // The vault cannot be read: nothing is recorded and the refresh
+        // fails; admission continues until the last read is 60 s old.
+        chain.lock().unwrap().vault_down = true;
+        assert!(processor.refresh_roots(Some(&url)).await.is_err());
+        assert!(admitted(&processor, 0xb));
+        let last_read = processor.vault_roots.lock().unwrap().last_read_at.unwrap();
         assert!(matches!(
-            processor.validate_and_reserve(&request),
+            processor.admissible_root(&Felt252::from_u64(0xb), last_read + 61),
             Err(ServerError::RootUnavailable(_))
         ));
         server.abort();
     }
 
-    const CURRENT_ROOT_SELECTOR_FOR_TEST: &str = crate::native_billing::CURRENT_ROOT_SELECTOR;
+    /// A responsive but frozen RPC cannot refresh the age of an obsolete root.
+    #[tokio::test]
+    async fn a_stale_chain_head_makes_all_roots_unavailable_until_recovery() {
+        let chain = Arc::new(std::sync::Mutex::new(RootChain::default()));
+        chain.lock().unwrap().mine(10, "a10", 0xa);
+        let (url, server) = root_chain_server(chain.clone()).await;
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        configure_issuance_rpc(&mut processor, url);
+        processor.refresh_roots(None).await.unwrap();
+        chain.lock().unwrap().head_timestamp = Some(current_timestamp() - 61);
+        assert!(processor.refresh_roots(None).await.is_err());
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xa), current_timestamp()),
+            Err(ServerError::RootUnavailable(_))
+        ));
+        chain.lock().unwrap().head_timestamp = None;
+        processor.refresh_roots(None).await.unwrap();
+        processor
+            .admissible_root(&Felt252::from_u64(0xa), current_timestamp())
+            .unwrap();
+        // A successful read of a nearly stale block must not buy another
+        // full freshness window while the next RPC attempt is stalled.
+        let now = current_timestamp();
+        chain.lock().unwrap().head_timestamp = Some(now - 59);
+        processor.refresh_roots(None).await.unwrap();
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xa), now + 2),
+            Err(ServerError::RootUnavailable(_))
+        ));
+        processor.vault_roots.lock().unwrap().latest_block_timestamp = Some(now - 61);
+        assert!(processor.root_health().vault_root_stale);
+        server.abort();
+    }
+
+    /// A removal is a hard barrier even when the same block also adds notes.
+    /// Later additions can receive grace, but no pre-removal root comes back.
+    #[tokio::test]
+    async fn retirement_discards_old_roots_immediately_and_lagging_rpc_cannot_revive_them() {
+        let chain = Arc::new(std::sync::Mutex::new(RootChain::default()));
+        chain.lock().unwrap().mine(10, "a10", 0xa);
+        let (url, server) = root_chain_server(chain.clone()).await;
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        configure_issuance_rpc(&mut processor, url);
+        processor.refresh_roots(None).await.unwrap();
+        chain.lock().unwrap().mine(11, "a11", 0xb);
+        processor.refresh_roots(None).await.unwrap();
+        processor
+            .admissible_root(&Felt252::from_u64(0xa), current_timestamp())
+            .unwrap();
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.mine(12, "a12", 0xc);
+            let hash = chain.hash(12);
+            chain.epochs.insert(hash, 1);
+        }
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(window_roots(&processor), [Felt252::from_u64(0xc)]);
+        for old in [0xa, 0xb] {
+            assert!(matches!(
+                processor.admissible_root(&Felt252::from_u64(old), current_timestamp()),
+                Err(ServerError::StaleRoot { .. })
+            ));
+        }
+        // A load-balanced RPC might now answer from before that retirement.
+        chain.lock().unwrap().canonical.remove(&12);
+        assert!(processor.refresh_roots(None).await.is_err());
+        for root in [0xb, 0xc] {
+            assert!(matches!(
+                processor.admissible_root(&Felt252::from_u64(root), current_timestamp()),
+                Err(ServerError::RootUnavailable(_))
+            ));
+        }
+        // Recover at the observed height, then allow grace across additions.
+        chain.lock().unwrap().mine(12, "a12", 0xc);
+        processor.refresh_roots(None).await.unwrap();
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.mine(13, "a13", 0xd);
+            let hash = chain.hash(13);
+            chain.epochs.insert(hash, 1);
+        }
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(
+            window_roots(&processor),
+            [Felt252::from_u64(0xc), Felt252::from_u64(0xd)]
+        );
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xb), current_timestamp()),
+            Err(ServerError::StaleRoot { .. })
+        ));
+        server.abort();
+    }
+
+    /// A recorded block that is no longer canonical at its height is a
+    /// reorg: every root but the new latest leaves the window.
+    #[tokio::test]
+    async fn a_reorg_drops_every_root_but_the_latest() {
+        let chain = Arc::new(std::sync::Mutex::new(RootChain::default()));
+        chain.lock().unwrap().mine(10, "a10", 0xa);
+        let (url, server) = root_chain_server(chain.clone()).await;
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        configure_issuance_rpc(&mut processor, url.clone());
+        processor.refresh_roots(None).await.unwrap();
+        chain.lock().unwrap().mine(11, "a11", 0xb);
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(
+            window_roots(&processor),
+            [Felt252::from_u64(0xa), Felt252::from_u64(0xb)]
+        );
+        // Block 11 is replaced at the same height.
+        chain.lock().unwrap().mine(11, "b11", 0xc);
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(window_roots(&processor), [Felt252::from_u64(0xc)]);
+        let now = current_timestamp();
+        for orphaned in [0xa, 0xb] {
+            assert!(matches!(
+                processor.admissible_root(&Felt252::from_u64(orphaned), now),
+                Err(ServerError::StaleRoot { .. })
+            ));
+        }
+        // An ordinary new block keeps the window.
+        chain.lock().unwrap().mine(12, "b12", 0xd);
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(
+            window_roots(&processor),
+            [Felt252::from_u64(0xc), Felt252::from_u64(0xd)]
+        );
+        // Blocks 12 and 13 arrive on another branch: the block the last read
+        // found is no longer canonical at its height.
+        chain.lock().unwrap().mine(12, "c12", 0xe);
+        chain.lock().unwrap().mine(13, "c13", 0xf);
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(window_roots(&processor), [Felt252::from_u64(0xf)]);
+        // A lagging provider must not revive an older root after a removal.
+        chain.lock().unwrap().canonical.remove(&13);
+        assert!(processor.refresh_roots(None).await.is_err());
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xf), current_timestamp()),
+            Err(ServerError::RootUnavailable(_))
+        ));
+        assert!(matches!(
+            processor.admissible_root(&Felt252::from_u64(0xe), current_timestamp()),
+            Err(ServerError::RootUnavailable(_))
+        ));
+        // A true chain rollback resumes once its head reaches the last height.
+        chain.lock().unwrap().mine(13, "d13", 0x10);
+        processor.refresh_roots(None).await.unwrap();
+        assert_eq!(window_roots(&processor), [Felt252::from_u64(0x10)]);
+        server.abort();
+    }
 
     /// §5.2: a request whose lease budget exceeds the operator's ceiling is
     /// refused before anything is reserved or read from the chain; at or
@@ -10825,53 +11416,51 @@ mod tests {
         fixture.request.clone()
     }
 
-    /// A vault RPC whose currentRoot() is `root`; counts every call.
-    async fn vault_root_rpc(
+    /// A vault RPC answering `noteRecord(note_id)` with `record` (which the
+    /// test may change), at latest; records every call's method and data.
+    async fn note_record_rpc(
         processor: &mut RequestProcessor,
-        root: Felt252,
+        note_id: u32,
+        record: VaultNoteRecord,
     ) -> (
-        Arc<std::sync::Mutex<Felt252>>,
-        Arc<std::sync::Mutex<usize>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        vault_root_rpc_with_history(processor, root, &[]).await
-    }
-
-    /// A vault RPC serving currentRoot() (`root`, changeable) and
-    /// knownRoots(r): true for its current root and every root of `history`.
-    async fn vault_root_rpc_with_history(
-        processor: &mut RequestProcessor,
-        root: Felt252,
-        history: &[Felt252],
-    ) -> (
-        Arc<std::sync::Mutex<Felt252>>,
-        Arc<std::sync::Mutex<usize>>,
+        Arc<std::sync::Mutex<VaultNoteRecord>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
     ) {
         use axum::{routing::post, Json, Router};
         use serde_json::{json, Value};
-        let current = Arc::new(std::sync::Mutex::new(root));
-        let calls = Arc::new(std::sync::Mutex::new(0usize));
-        let history: Arc<Vec<Felt252>> = Arc::new(history.to_vec());
-        let (served, counted) = (current.clone(), calls.clone());
+        let served = Arc::new(std::sync::Mutex::new(record));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (answer, counted) = (served.clone(), calls.clone());
         let app = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
-                let (served, counted, history) = (served.clone(), counted.clone(), history.clone());
+                let (answer, counted) = (answer.clone(), counted.clone());
                 async move {
-                    *counted.lock().unwrap() += 1;
                     let data = request["params"][0]["data"].as_str().unwrap_or_default();
+                    counted
+                        .lock()
+                        .unwrap()
+                        .push(format!("{} {data}", request["method"].as_str().unwrap()));
                     let result = if request["method"] == "eth_chainId" {
                         "0x1".to_string()
-                    } else if let Some(word) = data.strip_prefix("0x12ad7381") {
-                        assert_eq!(request["params"][1], "latest");
-                        let asked = Felt252::from_hex(word).unwrap();
-                        let known = asked == *served.lock().unwrap() || history.contains(&asked);
-                        format!("0x{:064x}", known as u8)
                     } else {
-                        assert_eq!(data, "0xfdab463d");
+                        assert_eq!(
+                            data,
+                            format!(
+                                "{}{note_id:064x}",
+                                crate::native_billing::NOTE_RECORD_SELECTOR
+                            )
+                        );
                         assert_eq!(request["params"][1], "latest");
-                        format!("0x{}", hex::encode(served.lock().unwrap().as_bytes()))
+                        let record = *answer.lock().unwrap();
+                        let status = match record.status {
+                            NoteStatus::Uninitialized => 0,
+                            NoteStatus::Active => 1,
+                            NoteStatus::PendingWithdrawal => 2,
+                            NoteStatus::Closed => 3,
+                        };
+                        format!("0x{}{status:064x}", hex::encode(record.leaf.as_bytes()))
                     };
                     Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
                 }
@@ -10883,14 +11472,14 @@ mod tests {
             format!("http://{}", listener.local_addr().unwrap()),
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (current, calls, server)
+        (served, calls, server)
     }
 
     #[tokio::test]
     async fn clearance_accepts_a_real_kind_2_ownership_proof() {
         let fixture = crate::test_support::ownership_fixture().await;
         let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
-        processor.update_root(fixture.root);
+        fixture.deposit_on(&processor);
         let request = clearance(fixture);
         let nullifier = request.withdrawal_nullifier;
         assert_eq!(request.ownership_proof.public_inputs.kind, 2);
@@ -10935,7 +11524,6 @@ mod tests {
             .state
             .withdrawal(
                 &note.deployment,
-                &note.tree,
                 &zkapi_proof::dev::DevWithdrawal {
                     kind: WithdrawalKind::MutualClose,
                     destination: [0x11; 20],
@@ -10967,7 +11555,7 @@ mod tests {
     async fn clearance_rejects_wrong_kind_stale_nonzero_foreign_or_tampered_proofs() {
         let fixture = crate::test_support::ownership_fixture().await;
         let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
-        processor.update_root(fixture.root);
+        fixture.deposit_on(&processor);
         let valid = clearance(fixture);
         let now = current_timestamp();
         let mutate = |change: &dyn Fn(&mut ClearanceRequestV2C)| {
@@ -11016,6 +11604,11 @@ mod tests {
                 mutate(&|r| inputs(r).clearance_signing_key_y = Felt252::from_u64(4)),
             ),
             ("balance", mutate(&|r| inputs(r).final_balance += 1)),
+            (
+                "note leaf",
+                mutate(&|r| inputs(r).note_leaf = Felt252::from_u64(0x1eaf)),
+            ),
+            ("deposit", mutate(&|r| inputs(r).deposit_amount += 1)),
             ("validity bound", mutate(&|r| inputs(r).valid_until -= 1)),
             (
                 "flipped proof byte",
@@ -11044,6 +11637,8 @@ mod tests {
                 .lookup_by_nullifier(&request.withdrawal_nullifier)
                 .is_none());
         }
+        // Only a verified proof reaches the vault.
+        assert_eq!(processor.test_chain().note_reads, 0);
         // A request proof is not an ownership proof, even on the wire.
         let request_proof = serde_json::json!({
             "withdrawal_nullifier": valid.withdrawal_nullifier,
@@ -11058,171 +11653,130 @@ mod tests {
         processor.process_clearance(&valid).await.unwrap();
     }
 
+    /// Clearance signs only for a note the vault holds Active with exactly
+    /// the proof's leaf: an unknown note (leaf 0), another leaf, a retired
+    /// note, a pending escape or a closed note is refused with a 409 code,
+    /// after one noteRecord read each, and nothing is reserved.
     #[tokio::test]
-    async fn clearance_root_window_and_vault_fallback() {
+    async fn clearance_requires_the_vaults_active_leaf() {
         let fixture = crate::test_support::ownership_fixture().await;
-        let fake = crate::test_support::fake_tree_ownership_fixture().await;
-        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
-        processor.timing.vault_root_ttl = std::time::Duration::ZERO;
-        let vault_root = Felt252::from_u64(0x7007);
-        let (served, calls, server) = vault_root_rpc(&mut processor, vault_root).await;
-        // An unknown root the vault does not have: stale, reporting the
-        // vault's root, and nothing reserved.
-        let request = clearance(fake);
-        match processor.process_clearance(&request).await {
-            Err(ServerError::StaleRoot { latest_root }) => {
-                assert_eq!(latest_root, vault_root.to_hex())
-            }
-            other => panic!("expected stale root, got {other:?}"),
-        }
-        assert!(processor.store.get_all_nullifiers().is_empty());
-        // currentRoot(), then knownRoots(root), each after eth_chainId.
-        assert_eq!(*calls.lock().unwrap(), 4);
-        // The indexer lags, but the vault already has the proof's root.
-        *served.lock().unwrap() = fixture.root;
+        let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
         let request = clearance(fixture);
-        processor.process_clearance(&request).await.unwrap();
-        assert_eq!(*calls.lock().unwrap(), 6);
-        assert!(processor.recent_roots.lock().unwrap().contains(
-            &fixture.root,
-            current_timestamp(),
-            processor.config.clearance_root_window_seconds
-        ));
-        // A root last seen longer ago than the window, or never seen, needs
-        // the vault: refused unless the vault ever held it.
-        let window = processor.config.clearance_root_window_seconds;
-        processor.recent_roots.lock().unwrap().entries =
-            VecDeque::from([(fixture.root, current_timestamp() - window - 1)]);
-        assert_eq!(
-            processor
-                .store
-                .lookup_by_nullifier(&request.withdrawal_nullifier)
-                .unwrap()
-                .status,
-            NullifierStatus::ClearanceReserved
-        );
-        let other = Arc::new(NullifierStore::in_memory().unwrap());
-        let mut fresh = oa_lease_processor(other);
-        fresh.timing.vault_root_ttl = std::time::Duration::ZERO;
-        let (_, _, fresh_server) = vault_root_rpc(&mut fresh, vault_root).await;
-        fresh.recent_roots.lock().unwrap().entries =
-            VecDeque::from([(fixture.root, current_timestamp() - window - 1)]);
-        assert!(matches!(
-            fresh.process_clearance(&request).await,
-            Err(ServerError::StaleRoot { .. })
-        ));
-        assert!(fresh.store.get_all_nullifiers().is_empty());
-        server.abort();
-        fresh_server.abort();
-    }
-
-    /// Review regression (Amendment A1): an ownership proof at a root the
-    /// vault held long ago, such as the deposit-time root a client saved its
-    /// path at, is accepted once the vault's knownRoots(root) holds it, and
-    /// the answer is cached. The current root and the recent window are
-    /// unchanged.
-    #[tokio::test]
-    async fn clearance_accepts_any_root_the_vault_ever_held() {
-        let fixture = crate::test_support::ownership_fixture().await;
-        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
-        processor.timing.vault_root_ttl = std::time::Duration::ZERO;
-        let vault_root = Felt252::from_u64(0x7010);
-        let (_, calls, server) =
-            vault_root_rpc_with_history(&mut processor, vault_root, &[fixture.root]).await;
-        assert!(!processor.recent_roots.lock().unwrap().contains(
-            &fixture.root,
-            current_timestamp(),
-            processor.config.clearance_root_window_seconds
-        ));
-        let request = clearance(fixture);
-        processor.process_clearance(&request).await.unwrap();
-        assert_eq!(
-            processor
-                .store
-                .lookup_by_nullifier(&request.withdrawal_nullifier)
-                .unwrap()
-                .status,
-            NullifierStatus::ClearanceReserved
-        );
-        assert_eq!(*calls.lock().unwrap(), 4);
-        // Known once, known for good: a second check of the root reads only
-        // the current root.
-        assert!(processor
-            .vault_knows_root(&fixture.root, &vault_root)
-            .await
-            .unwrap());
-        assert_eq!(*calls.lock().unwrap(), 4);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn ownership_proof_replay_hits_the_negative_cache_not_the_rpc() {
-        let fake = crate::test_support::fake_tree_ownership_fixture().await;
-        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
-        let vault_root = Felt252::from_u64(0x7008);
-        let (served, calls, server) = vault_root_rpc(&mut processor, vault_root).await;
-        let request = clearance(fake);
-        for _ in 0..6 {
-            match processor.process_clearance(&request).await {
-                Err(ServerError::StaleRoot { latest_root }) => {
-                    assert_eq!(latest_root, vault_root.to_hex())
+        let note_id = fixture.note_id();
+        // The test chain holds no such note: noteRecord answers leaf 0.
+        processor.test_chain().notes = Some(Default::default());
+        let cases = [
+            (None, "note_leaf_mismatch"),
+            (
+                Some((Felt252::from_u64(0x1eaf), NoteStatus::Active)),
+                "note_leaf_mismatch",
+            ),
+            // Retired: Closed with its leaf zeroed.
+            (
+                Some((Felt252::ZERO, NoteStatus::Closed)),
+                "note_leaf_mismatch",
+            ),
+            (
+                Some((fixture.leaf(), NoteStatus::PendingWithdrawal)),
+                "note_not_active",
+            ),
+            (
+                Some((fixture.leaf(), NoteStatus::Closed)),
+                "note_not_active",
+            ),
+            (
+                Some((fixture.leaf(), NoteStatus::Uninitialized)),
+                "note_not_active",
+            ),
+        ];
+        for (reads, (record, code)) in cases.into_iter().enumerate() {
+            match record {
+                Some((leaf, status)) => processor.set_test_note(note_id, leaf, status),
+                None => {
+                    processor.test_chain().notes = Some(Default::default());
                 }
-                other => panic!("expected stale root, got {other:?}"),
             }
+            let error = processor.process_clearance(&request).await.unwrap_err();
+            assert_eq!(error.error_code(), code, "{record:?}: {error}");
+            assert!(!error.is_retriable());
+            assert!(matches!(
+                error,
+                ServerError::NoteLeafMismatch { note_id: n } | ServerError::NoteNotActive { note_id: n }
+                    if n == note_id
+            ));
+            assert_eq!(processor.test_chain().note_reads, reads + 1);
+            assert!(processor.store.get_all_nullifiers().is_empty());
         }
-        // One currentRoot() and one knownRoots(), each after eth_chainId, for
-        // all six attempts.
-        assert_eq!(*calls.lock().unwrap(), 4);
-        assert!(processor.store.get_all_nullifiers().is_empty());
-        // Once the cached vault read expires, a replay costs one shared read
-        // (still no pairing check) while the vault root is unchanged.
-        processor.timing.vault_root_ttl = std::time::Duration::ZERO;
+        fixture.deposit_on(&processor);
+        processor.process_clearance(&request).await.unwrap();
+        assert_eq!(
+            processor
+                .store
+                .lookup_by_nullifier(&request.withdrawal_nullifier)
+                .unwrap()
+                .status,
+            NullifierStatus::ClearanceReserved
+        );
+    }
+
+    /// Warm path, over the vault RPC: a clearance for note n succeeds, then
+    /// n's escape makes the vault report it PendingWithdrawal, and the next
+    /// clearance for n (here the owner's retry) is refused with
+    /// note_not_active. Each clearance reads noteRecord(n) at latest once:
+    /// nothing is cached.
+    #[tokio::test]
+    async fn clearance_reads_the_note_fresh_every_time() {
+        let fixture = crate::test_support::ownership_fixture().await;
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        let note_id = fixture.note_id();
+        let (served, calls, server) = note_record_rpc(
+            &mut processor,
+            note_id,
+            VaultNoteRecord {
+                leaf: fixture.leaf(),
+                status: NoteStatus::Active,
+            },
+        )
+        .await;
+        let request = clearance(fixture);
+        processor.process_clearance(&request).await.unwrap();
+        let note_record = format!(
+            "eth_call {}{note_id:064x}",
+            crate::native_billing::NOTE_RECORD_SELECTOR
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["eth_chainId ".to_string(), note_record.clone()]
+        );
+        // The same clearance again: read again, still Active.
+        processor.process_clearance(&request).await.unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        // The note escapes.
+        served.lock().unwrap().status = NoteStatus::PendingWithdrawal;
+        let error = processor.process_clearance(&request).await.unwrap_err();
+        assert!(
+            matches!(error, ServerError::NoteNotActive { note_id: n } if n == note_id),
+            "{error}"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 6);
+        assert_eq!(calls.lock().unwrap()[5], note_record);
+        // A retired leaf is a mismatch.
+        *served.lock().unwrap() = VaultNoteRecord {
+            leaf: Felt252::ZERO,
+            status: NoteStatus::Closed,
+        };
         assert!(matches!(
             processor.process_clearance(&request).await,
-            Err(ServerError::StaleRoot { .. })
+            Err(ServerError::NoteLeafMismatch { .. })
         ));
-        assert_eq!(*calls.lock().unwrap(), 6);
-        // A vault that moves re-evaluates the pair rather than trusting it.
-        *served.lock().unwrap() = Felt252::from_u64(0x7009);
-        match processor.process_clearance(&request).await {
-            Err(ServerError::StaleRoot { latest_root }) => {
-                assert_eq!(latest_root, Felt252::from_u64(0x7009).to_hex())
-            }
-            other => panic!("expected stale root, got {other:?}"),
-        }
-        assert_eq!(*calls.lock().unwrap(), 10);
-        // Without the negative cache, concurrent readers still share one read,
-        // and the root is still unknown under the same vault root.
-        processor
-            .rejected_clearances
-            .lock()
-            .unwrap()
-            .entries
-            .clear();
-        processor.timing.vault_root_ttl = std::time::Duration::from_secs(5);
-        *processor.vault_root_cache.try_lock().unwrap() = None;
-        let processor = Arc::new(processor);
-        let attempts: Vec<_> = (0..4)
-            .map(|_| {
-                let processor = processor.clone();
-                let request = request.clone();
-                tokio::spawn(async move { processor.process_clearance(&request).await })
-            })
-            .collect();
-        for attempt in attempts {
-            assert!(matches!(
-                attempt.await.unwrap(),
-                Err(ServerError::StaleRoot { .. })
-            ));
-        }
-        // Four concurrent requests: one more eth_chainId + currentRoot().
-        assert_eq!(*calls.lock().unwrap(), 10 + 2);
         server.abort();
     }
 
+    /// A failed noteRecord read refuses the clearance retriably and
+    /// reserves nothing; every attempt reads again.
     #[tokio::test]
-    async fn vault_root_read_failures_are_cached_briefly() {
-        let fake = crate::test_support::fake_tree_ownership_fixture().await;
+    async fn clearance_refuses_retriably_when_the_vault_cannot_be_read() {
+        let fixture = crate::test_support::ownership_fixture().await;
         let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
         let calls = Arc::new(std::sync::Mutex::new(0usize));
         let counted = calls.clone();
@@ -11242,17 +11796,17 @@ mod tests {
             format!("http://{}", listener.local_addr().unwrap()),
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let request = clearance(fake);
-        for _ in 0..3 {
+        let request = clearance(fixture);
+        for attempt in 1..=3 {
             let error = processor.process_clearance(&request).await.unwrap_err();
             assert!(
                 matches!(&error, ServerError::Internal(message) if message.starts_with("vault read failed")),
                 "{error}"
             );
             assert!(error.is_retriable());
+            // Four bounded read retries of the failed eth_chainId per attempt.
+            assert_eq!(*calls.lock().unwrap(), attempt * 4);
         }
-        // One failed eth_chainId for all three attempts.
-        assert_eq!(*calls.lock().unwrap(), 1);
         assert!(processor.store.get_all_nullifiers().is_empty());
         server.abort();
     }
@@ -11261,7 +11815,7 @@ mod tests {
     async fn clearance_never_reserves_lease_reserved_nullifier() {
         let fixture = crate::test_support::ownership_fixture().await;
         let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
-        processor.update_root(fixture.root);
+        fixture.deposit_on(&processor);
         let mut lease = lease_request_for(&processor, "spent-by-request", 1, None);
         lease.public_inputs.request_nullifier = fixture.request.withdrawal_nullifier;
         processor.store.reserve_openrouter_lease(&lease).unwrap();
@@ -11283,7 +11837,7 @@ mod tests {
     async fn clearance_verification_capacity_is_bounded() {
         let fixture = crate::test_support::ownership_fixture().await;
         let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
-        processor.update_root(fixture.root);
+        fixture.deposit_on(&processor);
         let permits = processor
             .clearance_permits
             .acquire_many(CLEARANCE_VERIFY_PERMITS as u32)

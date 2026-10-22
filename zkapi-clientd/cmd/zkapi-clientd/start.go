@@ -73,7 +73,7 @@ func (p *terminalSetupPrompter) openTerminal() error {
 	if p.input == nil {
 		fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 		if err != nil {
-			return errors.New("setup needs an interactive terminal; run zkapi-clientd config in a terminal to answer the setup questions")
+			return errors.New("setup needs an interactive terminal; run zkapi-clientd config --setup in a terminal to answer the setup questions")
 		}
 		device := &setupTerminal{fd: fd}
 		p.device, p.input = device, bufio.NewReader(device)
@@ -146,7 +146,7 @@ func (p *terminalSetupPrompter) Ask(ctx context.Context, question, fallback stri
 			}
 		}
 		if err != nil {
-			return "", errors.New("setup input ended; run zkapi-clientd config again to continue")
+			return "", errors.New("setup input ended; run zkapi-clientd config --setup again to continue")
 		}
 		if b == '\n' {
 			if err := ctx.Err(); err != nil {
@@ -196,7 +196,7 @@ func (p *terminalSetupPrompter) Continue(ctx context.Context, question string) (
 		if p.device != nil {
 			p.input.Reset(p.device)
 			if err := flushTerminalInput(p.device.fd); err != nil {
-				return false, errors.New("could not clear pending setup input; run zkapi-clientd config again to continue")
+				return false, errors.New("could not clear pending setup input; run zkapi-clientd config --setup again to continue")
 			}
 		}
 		answer, err := p.Ask(ctx, question, "")
@@ -394,6 +394,10 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 		checkCtx, checkCancel := context.WithTimeout(ctx, 3*time.Second)
 		active, activeErr := runtime.active(checkCtx, c)
 		checkCancel()
+		var mismatch *daemonDeploymentError
+		if errors.As(activeErr, &mismatch) {
+			return activeErr
+		}
 		if activeErr == nil {
 			if active.Backend != "zkapi" || active.ZKAPI.Network != c.ZKAPI.Network {
 				return errors.New("the running daemon's network differs from this configuration; preserve the wallet and stop the conflicting service yourself")
@@ -407,8 +411,10 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 		ui.Printf("The legacy --model option does not affect funding; select a model on each inference request.\n")
 	}
 	if !options.quietStartup {
-		ui.Printf("Network: %s.\n", c.ZKAPI.Network)
+		ui.Printf("Network: %s.\n", deploymentSummary(c.ZKAPI.Network))
 	}
+	// Guided funding repeats these before it shows a new funding address.
+	ctx = context.WithValue(ctx, earlierDeploymentsKey{}, zkapi.EarlierDeploymentWarnings(dir, c.ZKAPI.Network))
 	attached, err := runtime.probe(ctx, c)
 	if err != nil {
 		return err
@@ -476,7 +482,7 @@ func guidedStart(ctx context.Context, dir string, options startOptions, ui setup
 			if life.Err() != nil {
 				return life.Err()
 			}
-			return errors.New("setup timed out waiting for the local API and companion; check that zkapi-clientd, zkapi-walletd, and proving assets are installed together, then run zkapi-clientd config")
+			return errors.New("setup timed out waiting for the local API and companion; check that zkapi-clientd, zkapi-walletd, and proving assets are installed together, then run zkapi-clientd config --setup")
 		case <-timer.C:
 		}
 	}
@@ -539,6 +545,10 @@ func probeSetupService(ctx context.Context, c config.Config) (bool, error) {
 	if err != nil {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
+		}
+		var mismatch *daemonDeploymentError
+		if errors.As(err, &mismatch) {
+			return false, err
 		}
 		return false, errors.New("the configured API port is occupied but its daemon could not be authenticated; stop the conflicting service yourself or choose a separate configuration and listen address")
 	}

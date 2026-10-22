@@ -7,8 +7,9 @@ nullifier. The vault settles the remaining balance when the note closes, and
 its concession exit lets an owner leave without the operator.
 
 The current circuit binds signed balances to the private membership leaf and
-the nullifier chain to the note. Its circuit ID is `zkapi-v2-concession-v1`
-(vault revision 3). Read the [ceremony setup and trust assumptions](setup/v2-concession/README.md)
+the nullifier chain to the note, and binds an exit to the note's leaf, which
+the vault stores, rather than to a Merkle root. Its circuit ID is
+`zkapi-v2-concession-v2` (vault revision 4, leaf-bound exits). Read the [ceremony setup and trust assumptions](setup/v2-concession/README.md)
 and the [development setup](setup/v2-concession-dev/README.md) before using
 its keys.
 
@@ -21,7 +22,7 @@ setup/v2-concession-dev/ Development keys for tests and the drill vault
 setup/v2/                Keys of the legacy circuit zkapi-v2-note-bound-v1
 rust/crates/
   zkapi-types   Canonical BN254 field encoding and v2 wire statements
-  zkapi-core    BN254 Poseidon, note/nullifier helpers, and Merkle trees
+  zkapi-core    BN254 Poseidon, note/nullifier helpers, Merkle trees, and the vault's frontier model
   zkapi-proof   Groth16 circuits, proving, verification, and curve operations
   zkapi-browser Storage- and transport-independent WASM wallet core
   zkapi-client  Native wallet, note persistence, and request recovery

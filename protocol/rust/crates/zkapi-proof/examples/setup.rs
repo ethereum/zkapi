@@ -5,8 +5,9 @@
 //! cargo run --release -p zkapi-proof --example setup -- ../setup/v2-concession-dev
 //! ```
 //!
-//! Writes the four keys, `manifest.json`, `Bn254Poseidon.sol` and
-//! `Groth16ProofAdapter.sol`. Release builds refuse `dev` keys.
+//! Writes the four keys, `manifest.json`, `Bn254PoseidonRuntime.sol` with
+//! `poseidon-runtime.json`, and `Groth16ProofAdapter.sol`. Release builds
+//! refuse `dev` keys.
 fn main() -> anyhow::Result<()> {
     let directory = std::env::args()
         .nth(1)

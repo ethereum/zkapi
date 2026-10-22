@@ -39,6 +39,20 @@ func parseReturnAmount(value string) (string, error) {
 	return n.String(), nil
 }
 
+// publicReturnCommand is the command that returns public ETH: the guided
+// return asks for the recipient and amount and approves in the session (no
+// separate --approve command exists for it).
+const publicReturnCommand = "zkapi-clientd withdraw --public"
+
+// printPublicReturnQuote prints a return quote. Outside the guided flows,
+// which approve in the session, it names the command that does.
+func printPublicReturnQuote(out io.Writer, q zkapi.AddressPaymentQuote) {
+	printPaymentQuote(out, q, "")
+	if _, guided := out.(setupUIWriter); !guided {
+		fmt.Fprintf(out, "Review and approve a public return with %s.\n", publicReturnCommand)
+	}
+}
+
 func runPublicReturn(ctx context.Context, c config.Config, args []string, out io.Writer) (result error) {
 	submitted := false
 	defer func() {
@@ -46,7 +60,7 @@ func runPublicReturn(ctx context.Context, c config.Config, args []string, out io
 			result = fmt.Errorf("%w; recover saved progress with zkapi-clientd config --menu, choose return, and use the same --config-dir", result)
 		}
 	}()
-	flags := flag.NewFlagSet("fund return", flag.ContinueOnError)
+	flags := flag.NewFlagSet("withdraw --public", flag.ContinueOnError)
 	to := flags.String("to", "", "explicit recipient for public ETH")
 	amountText := flags.String("amount", "", "exact ETH amount (up to 18 decimals); omit to sweep an EOA after reserving fees")
 	approve := flags.String("approve", "", "approve the displayed return quote ID")
@@ -95,7 +109,7 @@ func runPublicReturn(ctx context.Context, c config.Config, args []string, out io
 		if !strings.EqualFold(q.Destination, destination) || (amount != "" && q.PrincipalWei != amount) {
 			return errors.New("return quote changed the destination or amount")
 		}
-		printPaymentQuote(out, q, "zkapi-clientd fund return")
+		printPublicReturnQuote(out, q)
 		return nil
 	}
 	path, method := "/admin/return", http.MethodGet
@@ -108,7 +122,7 @@ func runPublicReturn(ctx context.Context, c config.Config, args []string, out io
 		if q.ID != *approve {
 			return errors.New("the saved return quote changed; review a fresh quote")
 		}
-		printPaymentQuote(out, q, "zkapi-clientd fund return")
+		printPublicReturnQuote(out, q)
 		destination, amount = q.Destination, q.PrincipalWei
 		path, method, body = "/admin/return/approve", http.MethodPost, map[string]string{"quote_id": *approve}
 	}
@@ -151,7 +165,7 @@ func runPublicReturn(ctx context.Context, c config.Config, args []string, out io
 				method, path, body = http.MethodPost, "/admin/return", nil
 				continue
 			}
-			fmt.Fprintln(out, "Prepare a quote: zkapi-clientd fund return --to ADDRESS [--amount ETH]. Close any private balance before returning its fee funds.")
+			fmt.Fprintf(out, "Return public ETH with %s: it asks for the recipient and amount, shows the quote and asks for approval. Close any private balance before returning its fee funds.\n", publicReturnCommand)
 			return nil
 		}
 		switch state.Phase {

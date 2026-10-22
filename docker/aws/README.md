@@ -1,16 +1,18 @@
 # Native ETH operator deployment
 
 This image runs the native ETH API, indexer and escape challenger of circuit
-`zkapi-v2-concession-v1` (vault revision 3) with the exact
+`zkapi-v2-concession-v2` (vault revision 4, leaf-bound exits) with the exact
 `protocol/setup/v2-concession` artifacts, the multi-party ceremony setup
 `mpc-1`. A release build loads only the pinned ceremony keys, so the daemons
 refuse to start until G-SETUP has committed them, unless the image is built for
 a [single-party setup](#single-party-setup); a vault of circuit
 `zkapi-v2-note-bound-v1` keeps its own stack from the
-`release/v2-note-bound` branch. Supply the matching vault/signing keys, the
-deployment manifest and pinned native oracle configuration. A revision-3
-vault is a new deployment beside the legacy one; the order of the move, the
-daemon order and the legacy drain are in
+`release/v2-note-bound` branch, and a revision-3 vault (circuit
+`zkapi-v2-concession-v1`) the images it was deployed with: this release refuses
+both. Supply the matching vault/signing keys, the deployment manifest and
+pinned native oracle configuration. A revision-4 vault is a new deployment
+beside the earlier one; the order of the move, the daemon order and the drain
+of the earlier vault are in
 [the concession-vault migration runbook](../../docs/migration-concession-vault.md).
 
 Build on a Linux VM with Docker Engine and Compose, from the complete source
@@ -27,7 +29,7 @@ Create these root-owned, mode `0600` files without printing their contents:
 | File | Contents |
 | --- | --- |
 | `/etc/zkapi/deployment.env` | Copy `deployment.env.example`, then supply vault address, chain, deployment block, gwei request cap, `ZKAPI_NATIVE_BILLING_RPC_URL`, `ZKAPI_NATIVE_PRICE_FEED_ADDRESS`, feed decimals and freshness policy. It also sets the lease settlement deadline, the indexer's confirmation depth and head-age limit, and the challenger's transaction fee cap (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, below). |
-| `/etc/zkapi/deployment.json` | Mode `0644`. The deployment manifest: the `trusted_deployment` profile (chain, vault, signing keys, `challenge_period`, `circuit_id`, `setup_id`, both verifying-key hashes, the adapter and Poseidon library addresses, the three runtime codehashes, `settlement_window_seconds`), written from the manifest that `scripts/expected-codehashes.mjs --finalize` produced from `Deploy.s.sol`'s provisional one, never from the `.pending` file (see [Contracts](../../docs/deployment.md#contracts)). Compose mounts it read-only into `db-init`, `server` and `challenger`. A `"deployment_status"` other than absent or `"deployed"` (a `not_deployed` placeholder, or a provisional `pending` or `simulated` manifest) is refused. |
+| `/etc/zkapi/deployment.json` | Mode `0644`. The deployment manifest: the `trusted_deployment` profile (chain, vault, signing keys, `challenge_period`, `circuit_id`, `setup_id`, both verifying-key hashes, the adapter and Poseidon library addresses, the three runtime codehashes, `settlement_window_seconds`, and for vault revision 4 `vault_revision` 4, `leaf_bound_exit` 1 and `min_deposit_units`, the vault's `minDeposit()`), written from the manifest that `scripts/expected-codehashes.mjs --finalize` produced from `Deploy.s.sol`'s provisional one, never from the `.pending` file (see [Contracts](../../docs/deployment.md#contracts)). Compose mounts it read-only into `db-init`, `server` and `challenger`. A `"deployment_status"` other than absent or `"deployed"` (a `not_deployed` placeholder, or a provisional `pending` or `simulated` manifest) is refused. |
 | `/etc/zkapi/indexer.env` | `RPC_URL`, the chain's read RPC endpoint (requirements below). |
 | `/etc/zkapi/server.env` | `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` (required, below), and `ZKAPI_OPENROUTER_MANAGEMENT_KEY` for direct leases; alternatively set `OA_ORG_URL` in deployment metadata and `ZKAPI_OA_ORG_SHARED_SECRET` here. To switch an existing database between these key sources, follow [Changing the key source](../../docs/native-eth-billing.md#changing-the-key-source): the server refuses to start while leases or key deletions of the other source still need its credential (`ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true` starts anyway and strands them). For private Sepolia access, also set `ZKAPI_TESTNET_PASSWORD` here only. |
 | `/etc/zkapi/challenge.env` | `ZKAPI_CHALLENGE_RPC_URL=http://signer:8547`, `ZKAPI_CHALLENGE_SENDER` (the exclusive funded sender managed by the private sidecar), and the daemon's fee caps (below). |
@@ -54,7 +56,11 @@ default, and so does the launcher for the settings it passes on, but the
 daemons refuse an empty value for others at startup, for example
 `ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS` and `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI`.
 `ZKAPI_ALLOW_LEGACY_CLEARANCE=true` is refused: this circuit signs a clearance
-only against a kind-2 ownership proof.
+only against a kind-2 ownership proof. `ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS` was
+removed in vault revision 4, because clearance checks the note's stored leaf
+instead of a root (see [Request roots and clearance](#request-roots-and-clearance)):
+the launcher and the server refuse to start while it is set, even empty, so
+delete it from `deployment.env`.
 
 ### Single-party setup
 
@@ -111,11 +117,14 @@ and a `deployment_binding` row from `deployment.json` (chain, vault, both public
 keys, `challenge_period`, circuit, setup and both verifying-key hashes, which
 must equal the keys in the proof setup directory), marked unverified. On its
 first start the server checks that binding against the vault as above and runs
-the startup probes: the vault's `CONCESSION_ESCAPE_VERSION()` is 1 and its
-`ROOT_HISTORY_WINDOW()` 86400, its `proofAdapter()` is the manifest's adapter,
-the adapter's `CIRCUIT_ID_HASH()`, `REQUEST_VK_HASH()` and `WITHDRAWAL_VK_HASH()`
-equal this build's circuit and loaded keys, and the runtime codehashes of the
-vault, the adapter and the Poseidon library equal the manifest's. Each fails
+the startup probes: the vault's `CONCESSION_ESCAPE_VERSION()` is 1, its
+`LEAF_BOUND_EXIT_VERSION()` is 1 (a revision-3 vault has no such getter and is
+refused), its `minDeposit()` is between 1 and 2^53 − 1 gwei and equals the
+manifest's `min_deposit_units` when it has one, its `proofAdapter()` is the
+manifest's adapter, the adapter's `CIRCUIT_ID_HASH()`, `REQUEST_VK_HASH()` and
+`WITHDRAWAL_VK_HASH()` equal this build's circuit and loaded keys, and the
+runtime codehashes of the vault, the adapter and the Poseidon library equal
+the manifest's. Each fails
 closed. It also refuses a lease TTL + grace + settlement deadline longer than
 the manifest's `settlement_window_seconds`.
 
@@ -132,17 +141,25 @@ one data directory per deployment. After a crash that leaves an unfinished
 SQLite transaction, the server cannot read the binding read-only and runs the
 RPC check again. The challenger refuses to start until this row exists.
 
-Allow these calls on `ZKAPI_NATIVE_BILLING_RPC_URL`; it must also support the
-`finalized` block tag:
+Allow these calls on `ZKAPI_NATIVE_BILLING_RPC_URL`. It must also support the
+`finalized` block tag, `eth_call` at a canonical block hash (EIP-1898
+`{"blockHash": ..., "requireCanonical": true}`),
+and an `eth_call` gas cap of at least 0.6M gas: `currentRoot()` is a computed
+view of up to about 0.5M gas, which the server calls at a block hash about once
+per root poll interval (1 second), so a provider with a lower cap (or without
+EIP-1898) leaves the server without a vault root and every request is refused
+`root_unavailable`.
 
 | Call | Target | Block | Purpose |
 | --- | --- | --- | --- |
 | `eth_chainId` | | | Chain check before every vault read |
+| `eth_getBlockByNumber` | | `latest`, and the heights of recorded roots | The block hash each root poll reads at; reorganization checks of the recorded roots |
 | `eth_call` `0x15fa2a9a`, `0x230e2a24` | vault | `latest` | `stateSigningKeyX()`, `stateSigningKeyY()` |
 | `eth_call` `0xdc41d636`, `0x112cd6bc` | vault | `latest` | `clearanceSigningKeyX()`, `clearanceSigningKeyY()` |
 | `eth_call` `0xf3f480d9` | vault | `latest` | `challengePeriod()` |
-| `eth_call` `0xfdab463d` | vault | `latest` | `currentRoot()`: polled with the indexer root (admission accepts only a root both report, refreshed within `ZKAPI_ROOT_MAX_STALENESS_SECONDS`, default 60), for clearance ownership proofs, and the starting root |
-| `eth_call` `0x5e00b426`, `0x1fe72de0`, `0xefc91e58` | vault | `latest` | Startup probes: `CONCESSION_ESCAPE_VERSION()`, `ROOT_HISTORY_WINDOW()`, `proofAdapter()` |
+| `eth_call` `0xfdab463d`, `0x7a2043a3`, `0xe442740e` | vault | same canonical block hash | `currentRoot()` (about 0.5M gas), `nextNoteId()`, and `retirementEpoch()`: the request-root poll; the indexer comparison reads the root at the indexer's block hash |
+| `eth_call` `0xd154f5bf` | vault | `latest` | `noteRecord(uint32)`: one fresh read per clearance, after the ownership proof verifies |
+| `eth_call` `0x5e00b426`, `0xc0baafb1`, `0x41b3d185`, `0xefc91e58` | vault | `latest` | Startup probes: `CONCESSION_ESCAPE_VERSION()`, `LEAF_BOUND_EXIT_VERSION()`, `minDeposit()`, `proofAdapter()` |
 | `eth_call` `0xda0e8385`, `0xfe351488`, `0x7fcd0926` | adapter | `latest` | Startup probes: `CIRCUIT_ID_HASH()`, `REQUEST_VK_HASH()`, `WITHDRAWAL_VK_HASH()` |
 | `eth_getCode` | vault, adapter, Poseidon library | `latest` | Startup probes: runtime codehashes |
 | `eth_call` `0x6cda756a` | vault | `latest` | `challengedNullifiers(uint256)`, before serving request evidence or a recovered response |
@@ -150,6 +167,37 @@ Allow these calls on `ZKAPI_NATIVE_BILLING_RPC_URL`; it must also support the
 | `eth_call` `0xaad24061` | vault | `latest` | `usedNullifiers(uint256)` before key issuance, before signing a settled request's successor (an exit consuming it defers the signature), and before serving request evidence or a recovered response |
 | `eth_call` `0x313ce567` | feed | `latest` | `decimals()` |
 | `eth_call` `0xfeaf968c`, `0x9a6fc8f5` | feed | `finalized` | `latestRoundData()`, `getRoundData(uint80)` |
+
+### Request roots and clearance
+
+Request admission accepts only roots the server itself read from the vault's
+`currentRoot()` at a block hash it fetched: the latest one, or an earlier one
+until `ZKAPI_REQUEST_ROOT_GRACE_SECONDS` (in `deployment.env`; default 60, 0 to
+600, 0 accepting only the latest) after the vault replaced it. Any other root
+is refused `stale_root` with the latest root. Grace applies only across
+deposits: a changed `retirementEpoch()` or an observed reorganization discards
+all earlier roots. The epoch and root are read at the same canonical block
+hash, so requests cannot reuse a pre-retirement root after the server observes
+the retirement. This boundary takes effect on the next successful root poll;
+it does not eliminate the delay between a chain update and the poll. Indexer
+roots never enter the window.
+
+Requests are refused `root_unavailable` (retriable) if either the last
+successful vault read or its chain block timestamp is older than
+`ZKAPI_ROOT_MAX_STALENESS_SECONDS` (default 60). A regressing RPC head also
+invalidates admission until the provider catches up; a successful read of a
+stale block does not extend freshness. Admission rechecks root validity and
+freshness after proof verification, while reserving the request. The indexer's
+root is compared with `currentRoot()` at the indexer's block hash as a health
+signal only: a disagreement is logged as a warning, counted in the
+`zkapi_indexer_root_disagreement` metric and reported as degraded health, and
+never refuses a request.
+
+Clearance (`POST /v2/withdraw/clearance`) no longer depends on a root. After
+the ownership proof verifies, the server reads `noteRecord(note_id)` from the
+vault at `latest`, fresh for every clearance and never cached: the stored leaf
+must equal the proof's `note_leaf` (else 409 `note_leaf_mismatch`) and the note
+must be `Active` (else 409 `note_not_active`).
 
 ### Lease settlement deadline
 
@@ -169,6 +217,8 @@ seconds. See [native ETH billing](../../docs/native-eth-billing.md).
 `eth_getBlockByHash`, `eth_getLogs` (logs carry `blockHash` and `logIndex`) and
 `eth_call` by block hash with `requireCanonical` (EIP-1898), with state for at
 least the last `INDEXER_CONFIRMATIONS` blocks; archive state is not required.
+Its `eth_call` gas cap must allow at least 0.6M gas: the indexer verifies its
+view against the computed `currentRoot()` view (up to about 0.5M gas).
 An RPC without EIP-1898 support keeps the indexer in `syncing` and logs
 `RPC rejected block-hash eth_call (EIP-1898); indexer cannot verify vault state`.
 Use one consistent endpoint rather than a load balancer whose replicas disagree
@@ -183,10 +233,9 @@ head and serves a head view verified against the vault's `currentRoot()` and
 `nextNoteId()` at the head block. Its tree routes answer 503 with
 `{"status":"unavailable","error_code":"indexer_unavailable",...}` and
 `Retry-After: 5` until a view verifies, and again whenever it is stale, diverged
-or rebuilding. The server and the challenger start without waiting for it.
-When the indexer has no verified root at the server's start, the server starts
-from the vault's `currentRoot()`, read over the native billing RPC, until the
-indexer serves one.
+or rebuilding. The server and the challenger start without waiting for it, and
+request admission never waits for it: the server reads its roots from the vault
+over the native billing RPC.
 
 ### Challenge signer and daemon
 
@@ -198,7 +247,7 @@ defaults to 10 gwei. The tip cap `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI`
 defaults to the lower of the fee cap and 10 times the default tip (10 gwei with
 the 1 gwei default tip). `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` is no longer
 supported, and the signer refuses to start while it is present, even empty.
-`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` (default 2) caps the nonces on which
+`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` (default 4) caps the nonces on which
 it signs a leaf retirement per rolling 24 hours, and a note's retirement on a
 new nonce waits until its earlier nonce is mined (`retirement_in_flight`). A
 compromised challenger host can therefore spend at most that many retirements
@@ -206,13 +255,18 @@ compromised challenger host can therefore spend at most that many retirements
 they retire a leaf or revert. Fee replacements on a counted nonce are free; a
 further retirement is refused with `retirement_budget_exhausted` (the
 challenger reports `signer_refused`), and defeats and raises are never
-affected. One missed defeat takes one unit, plus one for each re-send after a
-root race. The signer also follows the operator's retire-on-miss policy
-(design §5.4): `ZKAPI_CHALLENGE_RETIRE_ON_MISS=false` in `signer.env` refuses
-every retirement (`retirement_disabled`), and a retirement is signed only for a
-note whose escape finalized within `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS`
-(default 50,400; `retirement_not_after_escape` otherwise), never for one closed
-by a mutual close or an expiry claim.
+affected. One missed defeat takes one unit, plus one for each re-send after
+contention: another retirement in the same subtree (or a deposit that
+completes it) that mines first makes the challenger's retirement revert
+`StaleRoot`, and the challenger then refreshes the path, retries once at once,
+then backs off. Four a day are at most about 3.7M gas, about the daily bound of
+the two that revision 3 allowed. The signer also follows the operator's
+retire-on-miss policy (design §5.4): `ZKAPI_CHALLENGE_RETIRE_ON_MISS=false` in
+`signer.env` refuses every retirement (`retirement_disabled`), and a retirement
+is signed only for a note whose escape finalized within
+`ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` (default 50,400;
+`retirement_not_after_escape` otherwise), never for one closed by a mutual
+close or an expiry claim.
 
 The node behind the signer refuses to relay a transaction whose gas limit x
 `maxFeePerGas` exceeds its RPC fee cap, `--rpc.txfeecap`, which is 1 ETH by
@@ -231,17 +285,21 @@ allows at the default 1 ETH are:
 | --- | --- | --- |
 | Defeat (`challengeEscapeWithdrawal`) | 600,000, or the estimate plus 20% when higher | about 1,666 gwei |
 | Raise (`raiseEscapeConcession`) | 450,000, or the estimate plus 20% when higher | about 2,222 gwei |
-| Leaf retirement (`retireClosedLeaf`, after a missed defeat) | the estimate plus 20%, about 7.2M | about 138.9 gwei |
+| Leaf retirement (`retireClosedLeaf`, after a missed defeat) | the estimate plus 20%: at most about 1.1M | about 900 gwei |
 
-Defeats and raises are deadline-bound and fit any realistic fee cap at 1 ETH.
-A leaf retirement has no deadline; to let it bid a fee cap above about 138.9
-gwei, raise the node's `--rpc.txfeecap` and `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`
-together in `signer.env` and `deployment.env` (2.4 ETH for a 300 gwei fee cap
-at 8M gas), then recreate the signer and the challenger (above). A hosted
-provider's cap usually cannot be raised. A value above the node's cap makes the
-signer report `upstream_tx_fee_cap`, which the daemon treats as critical at
-once. It then bids within 10/11 of the lowest refused fee until it restarts,
-and its `/status` warns with that fee
+A revision-4 retirement reads only the siblings below ℓ = msb(noteId XOR
+nextNoteId), the level at which the note's path meets the frontier, and the
+challenger zero-fills the others. It costs about 37.7k gas at ℓ = 0, about
+0.47M at ℓ = 16 and at most about 0.92M at ℓ = 31 (revision 3: up to about
+1.7M). Defeats, raises and leaf retirements all fit any realistic fee cap at
+1 ETH. To let a call bid a higher fee cap, raise the node's `--rpc.txfeecap`
+and `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` together in `signer.env` and
+`deployment.env` (0.6 ETH covers a 300 gwei fee cap at 2M gas), then recreate
+the signer and the challenger (above). A hosted provider's cap usually cannot
+be raised. A value above the node's cap makes the signer report
+`upstream_tx_fee_cap`, which the daemon treats as critical at once. It then
+bids within 10/11 of the lowest refused fee until it restarts, and its
+`/status` warns with that fee
 ([details](../../docs/challenge-service.md#when-no-valid-bid-remains)). The
 signer also warns `tx_fee_cap_below_fee_cap` while `ZKAPI_CHALLENGE_MAX_GAS` x
 its fee cap exceeds the ceiling; see
@@ -250,14 +308,14 @@ its fee cap exceeds the ceiling; see
 Fund the sender with at least (N + K) x gas limit x the highest bid, that is the
 fee cap or, when lower, the ceiling / gas limit. N is the number of
 transactions that may be pending at once and K a budget of reverted attempts.
-At a 100 gwei cap that is 0.06 ETH per defeat and about 0.72 ETH per leaf
-retirement; size N for `ceil(m/2)` defeats per note (a user holding `m`
+At a 100 gwei cap that is 0.06 ETH per defeat and at most about 0.11 ETH per
+leaf retirement; size N for `ceil(m/2)` defeats per note (a user holding `m`
 archived states can force that many), at most 64 concurrent escapes and a 20%
 margin. The signer's status warns `balance_below_required` below its
 `required_balance`, `ZKAPI_CHALLENGE_MAX_GAS` x its fee cap (1.2 ETH at 100
 gwei and the default 12M gas): fund up to it, or lower
 `ZKAPI_CHALLENGE_MAX_GAS` while keeping a margin above a leaf retirement, for
-example 8M (0.8 ETH at 100 gwei). The signer refuses a larger gas limit with
+example 2M (0.2 ETH at 100 gwei). The signer refuses a larger gas limit with
 `gas_limit_exceeds_cap`, which the challenger reports as `signer_refused`,
 critical at once, until `ZKAPI_CHALLENGE_MAX_GAS` is raised.
 
@@ -277,14 +335,15 @@ The challenger also reads from `deployment.env` (see
 | --- | --- |
 | `ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS` | Default 21600 (Mainnet and Sepolia); 1800 for the drill. An escape whose charge is still unsettled is raised to its proof's solvency bound at its deadline minus this. Startup refuses unless `LEASE_TTL_SECONDS + SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS` + this + 4 x 2 + 1200 is at most `challengePeriod()`. |
 | `ZKAPI_CHALLENGE_RAISE_MIN_UNITS` | Optional; default 0. The smallest raise, in gwei, worth its gas. |
-| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 7.2M gas), within the signer's `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`. Set the same value in `signer.env`: the signer refuses retirements when it is `false`, and signs one only for a note an escape finalized within its `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS`. |
+| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 37.7k to 0.92M gas, by tree level), within the signer's `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`. Set the same value in `signer.env`: the signer refuses retirements when it is `false`, and signs one only for a note an escape finalized within its `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS`. |
 
 The launcher passes the server's settlement window (`LEASE_TTL_SECONDS +
 SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS`, which
 may not exceed the manifest's `settlement_window_seconds`) and the mounted
 manifest to the challenger. At startup it checks the manifest against the vault:
-`CONCESSION_ESCAPE_VERSION() == 1`, `ROOT_HISTORY_WINDOW() == 86400`, the
-adapter's circuit and verifying-key hashes, the three runtime codehashes and
+`CONCESSION_ESCAPE_VERSION() == 1`, `LEAF_BOUND_EXIT_VERSION() == 1`,
+`minDeposit()` (against the manifest's `min_deposit_units`), the adapter's
+circuit and verifying-key hashes, the three runtime codehashes and
 `challengePeriod()`, and the timing checks above. It retries a failed RPC read
 and exits on a mismatch.
 
@@ -470,7 +529,9 @@ Alert on:
   `missed_total`, `escapes_finalized_with_successor_evidence_total` or
   `missed_raises_total` in `/status`. A `retiring_leaf` obligation is a warning
   until its `retireClosedLeaf` mines; it needs the indexer's path for the
-  note;
+  note, whose siblings at and above ℓ it zero-fills, and a `StaleRoot` revert
+  (another retirement in the same subtree, or a deposit that completed it,
+  mined first) makes it refresh the path and retry;
 - indexer `/health` not 200 for more than two minutes (outside a planned replay),
   an increase in its `divergence_count`, `rebuild_count` or
   `missed_re_escape_count` (`zkapi_indexer_divergences_total`,
@@ -523,9 +584,15 @@ Alert on:
   `"event":"challenge_refused"` with reason `base_fee_above_max_fee`,
   `insufficient_balance`, `tx_fee_above_cap`, `upstream_tx_fee_cap` or
   `broadcast_ambiguous`;
-- sustained `root_unavailable` refusals, or the server log line `the indexer
-  root and the vault's currentRoot() disagree`: the indexer lags or diverges, or
-  the RPC fails, and no request is admitted;
+- sustained `root_unavailable` refusals: the server has read no
+  `currentRoot()` from the vault for `ZKAPI_ROOT_MAX_STALENESS_SECONDS`, so no
+  request is admitted; check the native billing RPC, its `eth_call` gas cap and
+  its EIP-1898 support ([above](#request-roots-and-clearance));
+- a rising `zkapi_indexer_root_disagreement` metric or degraded server health
+  for an indexer root that differs from `currentRoot()` at the indexer's block
+  hash: requests are still admitted, but the indexer lags or diverges, and
+  clients and the challenger that read paths from it are affected (resync it,
+  below);
 - a growing `counts.exit_deferred` or `counts.exited_unsigned` on the settlement
   dashboard, or the server log lines `exit_deferred` and `ExitedUnsigned`: exits
   consumed requests' nullifiers before their successors were signed;
@@ -696,15 +763,17 @@ checkpoint`).
 Upgrade a deployment in place by rebuilding from the new release with a new
 `ZKAPI_IMAGE_TAG`, so the previous images stay available for rollback. Back up
 `/var/lib/zkapi` while the services are stopped. The move from a legacy
-vault to a revision-3 vault is not an in-place upgrade: it is a new
-deployment, as below, run in the order of
+or revision-3 vault to a revision-4 vault is not an in-place upgrade: it is a
+new deployment, as below, run in the order of
 [the concession-vault migration runbook](../../docs/migration-concession-vault.md).
 To roll the indexer back to an earlier image, move `indexer.cursor` aside first
 so that the earlier indexer replays from `DEPLOY_BLOCK`; that replay is the
 only rollback path. An indexer of this release archives a checkpoint of an
 earlier format (`indexer.cursor.v1-<unix_ms>.bak` or `.v2-<unix_ms>.bak`) and
 replays; such a file may be a diverged mirror and nothing here can check it
-against the vault: keep it for forensics and never restore it.
+against the vault: keep it for forensics and never restore it. A checkpoint of
+a revision-3 vault is refused: that vault is another deployment with its own
+data directory.
 
 A redeployed vault is a new deployment: new public manifest and hostname, a new
 signer key and exclusive sender, and a fresh data directory (database, indexer
@@ -751,7 +820,7 @@ sudo docker compose -f docker/aws/compose.yml logs --tail=50 server challenger
 ```
 
 Verify that health and attestation report protocol 2, the selected chain, the
-configured vault, `circuit_id` `zkapi-v2-concession-v1`, `setup_id` `mpc-1`
+configured vault, `circuit_id` `zkapi-v2-concession-v2`, `setup_id` `mpc-1`
 (`dev` for a [single-party](#single-party-setup) image),
 `exit_concession` 1 and the deployment's `settlement_window_seconds`. Confirm
 the server log lines `server signing keys match the vault's immutable keys` and
@@ -801,7 +870,7 @@ checks the launcher and the gateway configuration; with an `nginx` binary on
 `PATH` (or `NGINX_BIN`) the gateway test also runs the configuration against a
 stub API, and `ZKAPI_REQUIRE_NGINX=1` makes a missing binary a failure. Check the
 built gateway image with
-`sudo docker run --rm --user 101:101 --read-only --tmpfs /tmp --entrypoint nginx zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v1} -t`.
+`sudo docker run --rm --user 101:101 --read-only --tmpfs /tmp --entrypoint nginx zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v2} -t`.
 Use a separately authorized native ETH lifecycle check for the intended network;
 read-only health/quote checks alone do not establish paid inference, withdrawal
 or live escape-challenge success. Preserve server data, checkpoints and signer

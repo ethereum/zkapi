@@ -9,4 +9,6 @@ interface IZkApiProofAdapter {
     function WITHDRAWAL_VK_HASH() external view returns (bytes32);
     function assertValidRequest(Types.RequestPublicInputs calldata inputs, bytes calldata proof) external view;
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof) external view;
+    function verifyWithdrawalOnce(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proof) external;
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
 }

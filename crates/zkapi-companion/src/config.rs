@@ -42,9 +42,14 @@ pub struct AuthConfig {
     pub native_price_feed_address: String,
     pub native_price_feed_decimals: u8,
     pub native_price_max_age_seconds: u64,
-    /// The manifest's `vault_revision` (3 for circuit
-    /// `zkapi-v2-concession-v1`); reported, not branched on.
+    /// The manifest's `vault_revision` (4 for circuit
+    /// `zkapi-v2-concession-v2`, leaf-bound exits); reported, not branched
+    /// on.
     pub vault_revision: u32,
+    /// The manifest's `min_deposit_units`, the vault's `minDeposit()`: the
+    /// deployment check compares the two, and a deposit plan below it is
+    /// refused (the companion sends no deposits itself).
+    pub min_deposit_units: Option<u128>,
     /// The manifest's `proof_setup.setup_id` (`mpc-1`, or `dev` for drills
     /// and tests): reported on `/oa/v1/status`.
     pub setup_id: String,
@@ -52,10 +57,11 @@ pub struct AuthConfig {
     pub settlement_window_seconds: u64,
     /// E3's `unsettled_request_escape_after_seconds`; `None` is 43,200 s.
     pub unsettled_request_escape_after_seconds: Option<u64>,
-    /// The vault's deployment block: where a log rebuild starts (§6.6).
+    /// The vault's deployment block: where a log rebuild of the request
+    /// tree starts (§6.6).
     pub deploy_block: u64,
-    /// The user's own RPC for exits (`--exit-rpc-url`): `E_low`, rebuilds
-    /// and advisory reads also go through it.
+    /// The user's own RPC for exits (`--exit-rpc-url`): `E_low` and
+    /// advisory reads also go through it.
     pub exit_rpc_url: Option<String>,
 
     pub protocol_version: u16,
@@ -78,7 +84,7 @@ pub struct AuthConfig {
     pub demo_billing_token_address: Option<String>,
     pub demo_mint_enabled: bool,
     pub demo_note_ttl_seconds: Option<u64>,
-    /// Circuit-specific Groth16 key directory (`zkapi-v2-concession-v1`).
+    /// Circuit-specific Groth16 key directory (`zkapi-v2-concession-v2`).
     pub proof_setup_dir: String,
     /// Deployment-pinned proof-friendly signing keys.
     pub state_signing_key: CurvePointWire,
@@ -112,7 +118,8 @@ impl Default for AuthConfig {
             native_price_feed_address: String::new(),
             native_price_feed_decimals: 8,
             native_price_max_age_seconds: 3600,
-            vault_revision: 3,
+            vault_revision: 4,
+            min_deposit_units: None,
             setup_id: "dev".into(),
             settlement_window_seconds: 21_905,
             unsettled_request_escape_after_seconds: None,

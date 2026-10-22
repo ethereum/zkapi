@@ -3,7 +3,7 @@ import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateN
 import { beginBrowserSdkInitialization } from '../configure.js';
 import browserWalletRuntime from './browserWalletRuntime.js';
 import { ENTRY_POINT_ERRORS, contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
-import { EXIT_FALLBACK_GAS_LIMIT, bufferedGasLimit } from './zkapiGas.mjs';
+import { EXIT_FALLBACK_GAS_LIMIT, MAX_TRANSACTION_GAS_LIMIT, bufferedGasLimit, depositGasLimit } from './zkapiGas.mjs';
 import { normalizeWalletError, walletErrorMessage } from './zkapiWalletError.mjs';
 import { backgroundWithdrawalClaims, isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHistory.mjs';
@@ -61,6 +61,7 @@ const {
     abiWord,
     addressWord,
     callData,
+    decodeNoteRecord,
     decodePendingConcessions,
     decodeVaultEvent,
     encodeClaimCredit,
@@ -69,6 +70,7 @@ const {
     encodeDeposit,
     encodeEscapePayoutCredits,
     encodeFinalizeEscape,
+    encodeNoteRecord,
     encodeSweep,
     encodeTransitWithdraw,
     encodeWithdrawal,
@@ -257,7 +259,9 @@ const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
     challenged_nullifier: 'The vault already defeated an escape at this balance state: another device spent its next state. Restore the newest backup or exit kit.',
     superseded_state: 'The vault already defeated an escape from this balance’s next state: another device holds a newer state. Restore the newest backup or exit kit.',
     proof_expired: 'The withdrawal proof expired before it was included. Prepare the withdrawal again.',
-    unknown_root: 'The vault does not know this withdrawal proof’s Merkle root. Prepare the withdrawal again.',
+    note_leaf_mismatch: 'The vault holds another leaf for this balance: the saved note does not match its deposit. Restore the newest backup or exit kit of this balance.',
+    note_not_active: 'This balance is no longer active in the vault. Check its withdrawal status.',
+    deposit_too_small: 'The vault accepts deposits of at least its minimum amount. Choose a larger deposit.',
     invalid_destination: 'The vault rejected the withdrawal address. Choose a valid nonzero address.',
     vault_paused: 'The vault is paused by its owner. Withdrawals reopen at the latest when its pause limit ends.',
     testnet_password_required: 'Enter the Sepolia password to check this balance’s private request status.',
@@ -337,9 +341,26 @@ function startFinalBalance(record) {
     return BigInt(record.finalBalance);
 }
 
-// Refusals of an exit that a new proof can cure: valid_until passed (E4.7) or
-// the vault does not know the proof's root (E4.1).
-const REPROVABLE_EXIT_ERRORS = Object.freeze(['proof_expired', 'unknown_root']);
+/**
+ * Whether a NoteDeposited event is this plan's deposit: its commitment and
+ * amount, at the note id the plan expected or a later one. The vault assigns
+ * the id when the deposit executes, after any deposits that landed first;
+ * the commitment is unique to the plan's secret.
+ */
+function depositEventMatches(deposited, plan) {
+    try {
+        return Boolean(deposited) && deposited.amount === BigInt(plan.amount)
+            && BigInt(deposited.commitment) === BigInt(plan.commitment)
+            && deposited.noteId >= BigInt(plan.next_note_id);
+    } catch {
+        return false;
+    }
+}
+
+// Refusals of an exit that a new proof can cure: valid_until passed (E4.7).
+// An exit is bound to the note's leaf, not to a root, so no root refusal
+// exists; a NoteLeafMismatch means the saved note is not the deposited one.
+const REPROVABLE_EXIT_ERRORS = Object.freeze(['proof_expired']);
 
 /** The G1 warning (design §2.3) as a status message; amounts are gwei ledger units. */
 function exitCostMessage({ floor, cost }) {
@@ -852,8 +873,7 @@ class ZkapiClient extends EventTarget {
             throw new Error('Choose a smaller positive deposit amount.');
         }
         await assertNativeVault(funding);
-        const root = await this.readContractUint(funding.contract_address, `0x${ABI.currentRoot}`);
-        const plan = await browserWalletRuntime.prepareDepositQuote(Number(amount), root);
+        const plan = await browserWalletRuntime.prepareDepositQuote(Number(amount));
         await this.assertFundingChain();
         const value = nativeDepositValue(amount, funding);
         // Never return the durable secret, note witness, or runtime object.
@@ -1191,6 +1211,15 @@ class ZkapiClient extends EventTarget {
         return this.walletAddress;
     }
 
+    /** The vault's nextNoteId() at latest, through the wallet provider (the deposit gas policy's m). */
+    async walletNextNoteId(vault = this.config.funding.contract_address) {
+        const value = await this.ethereum.request({ method: 'eth_call', params: [{ to: vault, data: `0x${ABI.nextNoteId}` }, 'latest'] });
+        if (!/^0x[0-9a-fA-F]{64}$/.test(String(value || '')) || BigInt(value) >= 1n << 32n) {
+            throw Object.assign(new Error('The vault returned an invalid nextNoteId.'), { code: 'deposit_gas_invalid' });
+        }
+        return Number(BigInt(value));
+    }
+
     async readContractUint(to, data, blockTag = 'latest') {
         const value = await this.ethereum.request({
             method: 'eth_call',
@@ -1363,8 +1392,8 @@ class ZkapiClient extends EventTarget {
                 const receipt = await this.ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
                 const event = receipt?.status === '0x1' && parseNoteDeposited(receipt, funding.contract_address);
                 known = Boolean(String(receipt?.transactionHash).toLowerCase() === hash.toLowerCase()
-                    && event?.noteId === BigInt(context.noteId) && event.amount === BigInt(context.amount)
-                    && BigInt(event.commitment) === BigInt(context.commitment));
+                    && depositEventMatches(event, { amount: context.amount, commitment: context.commitment, next_note_id: context.noteId })
+                    && event.noteId === BigInt(recovered.noteId));
             }
         }
         if (!known) {
@@ -1471,7 +1500,7 @@ class ZkapiClient extends EventTarget {
         preparedNonce = null,
         externalRecovery = null,
         value = 0n,
-        { exitEstimate = null } = {}
+        { exitEstimate = null, depositGas = null } = {}
     ) {
         const normalizedPreparedNonce = preparedNonce == null
             ? null
@@ -1506,10 +1535,17 @@ class ZkapiClient extends EventTarget {
                 method: 'eth_estimateGas',
                 params: [transaction]
             });
-            transaction.gas = bufferedGasLimit(estimate);
+            // A deposit's limit covers the costlier frontier indices it may
+            // land at behind other deposits (design C.8), from the vault's
+            // nextNoteId() at the estimate's block tag.
+            transaction.gas = depositGas
+                ? `0x${depositGasLimit({ estimate, nextNoteId: await this.walletNextNoteId(to),
+                    freshSlotGas: depositGas.freshSlotGas }).toString(16)}`
+                : bufferedGasLimit(estimate);
         } catch (error) {
             if (error?.code === 'wrong_network'
-                || error?.code === 'transaction_gas_limit_exceeded') {
+                || error?.code === 'transaction_gas_limit_exceeded'
+                || error?.code === 'deposit_gas_unpinned' || error?.code === 'deposit_gas_invalid') {
                 throw tagTransactionError(error, 'estimate', false);
             }
             const estimateError = contractEstimateError(error);
@@ -1608,9 +1644,7 @@ class ZkapiClient extends EventTarget {
             const funding = this.config.funding;
             await this.assertFundingChain();
             const deposited = parseNoteDeposited(receipt, funding.contract_address);
-            if (!deposited || deposited.noteId !== BigInt(plan.next_note_id)
-                || deposited.amount !== BigInt(plan.amount)
-                || BigInt(deposited.commitment) !== BigInt(plan.commitment)) return null;
+            if (!depositEventMatches(deposited, plan)) return null;
             const transaction = await this.ethereum.request({ method: 'eth_getTransactionByHash',
                 params: [receipt.transactionHash] });
             const hash = receipt.transactionHash.toLowerCase();
@@ -1660,11 +1694,13 @@ class ZkapiClient extends EventTarget {
         if (!deposited) {
             throw new Error('The transaction succeeded, but its NoteDeposited event was not found.');
         }
-        if (deposited.noteId !== BigInt(plan.next_note_id)
-            || deposited.amount !== BigInt(plan.amount)
-            || BigInt(deposited.commitment) !== BigInt(plan.commitment)) {
+        if (!depositEventMatches(deposited, plan)) {
             throw new Error('The mined deposit did not match this browser’s durable private note.');
         }
+        // The event names the note id the vault assigned and the expiry e;
+        // the vault's stored leaf must be the leaf of exactly these fields.
+        await this.assertDepositLeaf(plan, { noteId: deposited.noteId, expiryTs: deposited.expiryTs,
+            blockTag: /^0x[0-9a-fA-F]+$/.test(String(receipt?.blockNumber || '')) ? receipt.blockNumber : 'latest' });
         const receiptMetadata = await this.readDepositReceiptMetadata(plan, receipt);
         onStatus('Saving the private note securely in this browser…');
         await browserWalletRuntime.confirmDeposit({
@@ -1675,13 +1711,7 @@ class ZkapiClient extends EventTarget {
             commitment: plan.commitment,
             transactionHash: receipt.transactionHash,
             receiptMetadata,
-            expiry_ts: Number(deposited.expiryTs),
-            // The root this deposit set: with its path, the note's exit path
-            // for life (Amendment A1). The plan's siblings come along for a
-            // note the background recovery committed first, whose pending
-            // deposit (and its zero_path) is gone by then.
-            deposit_root: `0x${deposited.newRoot.toString(16)}`,
-            zero_path: Array.isArray(plan.zero_path) ? plan.zero_path : null
+            expiry_ts: Number(deposited.expiryTs)
         });
         const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
         onStatus(balanceRefreshPending
@@ -1702,6 +1732,12 @@ class ZkapiClient extends EventTarget {
         };
     }
 
+    /**
+     * noteRecord(noteId) through the wallet provider at `requestedBlock`:
+     * { noteId, leaf, status, observedBlock }. The vault keeps one word per
+     * note (its leaf and status); the commitment, amount and expiry are the
+     * leaf's preimage, which only the depositor and the NoteDeposited log know.
+     */
     async readBrowserNote(noteId, requestedBlock = 'latest') {
         await this.assertFundingChain();
         const blockTag = requestedBlock || 'latest';
@@ -1709,21 +1745,69 @@ class ZkapiClient extends EventTarget {
             method: 'eth_call',
             params: [{
                 to: this.config.funding.contract_address,
-                data: callData(ABI.notes, [abiWord(noteId)])
+                data: encodeNoteRecord(noteId)
             }, blockTag]
         });
-        const words = String(encoded || '').replace(/^0x/, '').match(/.{64}/g) || [];
-        if (words.length < 4) throw new Error('The vault returned a truncated note record.');
+        let record;
+        try {
+            record = decodeNoteRecord(encoded);
+        } catch (error) {
+            throw new Error(`The vault returned a malformed note record: ${error.message}`);
+        }
         return {
             noteId: Number(noteId),
-            commitment: `0x${words[0]}`,
-            amount: BigInt(`0x${words[1]}`),
-            expiryTs: Number(BigInt(`0x${words[2]}`)),
-            status: Number(BigInt(`0x${words[3]}`)),
+            leaf: record.leaf,
+            status: record.status,
             observedBlock: /^0x[0-9a-fA-F]+$/.test(String(blockTag))
                 ? Number(BigInt(blockTag))
                 : null
         };
+    }
+
+    /**
+     * Require the vault's stored leaf of `noteId` (at `blockTag`) to be the
+     * leaf of this plan's deposit with expiry `expiryTs`. Returns the record.
+     */
+    async assertDepositLeaf(plan, { noteId, expiryTs, blockTag = 'latest' }) {
+        const [record, leaf] = await Promise.all([this.readBrowserNote(Number(noteId), blockTag),
+            browserWalletRuntime.noteLeafFromFields({ noteId: Number(noteId), commitment: plan.commitment, amount: plan.amount, expiryTs })]);
+        if (record.status === 0 || BigInt(leaf) !== record.leaf) {
+            throw Object.assign(new Error('The vault’s record of this deposit does not hold this note’s leaf. The deposit is kept for recovery.'),
+                { code: 'deposit_leaf_mismatch', data: { note_id: Number(noteId) } });
+        }
+        return record;
+    }
+
+    /**
+     * The plan's deposit as the chain shows it, or null when its slot is
+     * empty: first from a successful receipt of one of its transactions (its
+     * NoteDeposited names the note id and expiry), else at the plan's
+     * expected slot with the expiry found by the day-bucket search over its
+     * stored leaf (design C.9). { noteId, expiryTs, record, receipt } when it
+     * is found; { conflict: record } when the slot holds another leaf.
+     */
+    async findBrowserDeposit(plan) {
+        const vault = this.config.funding.contract_address;
+        const hashes = plan.transactionHashes || (plan.transactionHash ? [plan.transactionHash] : []);
+        for (const hash of hashes) {
+            let receipt;
+            try {
+                receipt = await this.ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
+            } catch {
+                continue;
+            }
+            if (String(receipt?.transactionHash).toLowerCase() !== String(hash).toLowerCase()
+                || BigInt(receipt?.status || '0x0') !== 1n) continue;
+            const deposited = parseNoteDeposited(receipt, vault);
+            if (!depositEventMatches(deposited, plan)) continue;
+            const record = await this.assertDepositLeaf(plan, { noteId: deposited.noteId, expiryTs: deposited.expiryTs });
+            return { noteId: Number(deposited.noteId), expiryTs: Number(deposited.expiryTs), record, receipt };
+        }
+        const record = await this.readBrowserNote(plan.next_note_id);
+        if (record.status === 0) return null;
+        const expiryTs = await browserWalletRuntime.findDepositExpiry(plan, { noteId: Number(plan.next_note_id), leaf: record.leaf,
+            now: Math.floor(Date.now() / 1_000) });
+        return expiryTs == null ? { conflict: record } : { noteId: Number(plan.next_note_id), expiryTs, record, receipt: null };
     }
 
     async recoverBrowserDeposit(onStatus = () => {}) {
@@ -1731,41 +1815,21 @@ class ZkapiClient extends EventTarget {
         const plan = await browserWalletRuntime.pendingDeposit();
         if (!plan) return null;
         onStatus('Checking the private-vault deposit…');
-        const note = await this.readBrowserNote(plan.next_note_id);
-        const matches = note.status !== 0
-            && note.amount === BigInt(plan.amount)
-            && BigInt(note.commitment) === BigInt(plan.commitment);
-        if (matches) {
-            if (note.status !== 1) {
+        const found = await this.findBrowserDeposit(plan);
+        if (found && !found.conflict) {
+            if (found.record.status !== 1) {
                 throw new Error('The recovered deposit exists, but its private note is no longer active.');
             }
-            // Wait for the privacy-preserving whole-tree mirror before making
-            // the recovered note available to chat requests.
-            await browserWalletRuntime.treePath(Number(plan.next_note_id), true);
-            let receiptMetadata = null;
-            let confirmedReceipt = null;
-            const hashes = plan.transactionHashes || (plan.transactionHash ? [plan.transactionHash] : []);
-            for (const hash of hashes) {
-                try {
-                    const candidate = await this.ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
-                    if (String(candidate?.transactionHash).toLowerCase() !== String(hash).toLowerCase()) continue;
-                    receiptMetadata = await this.readDepositReceiptMetadata(plan, candidate);
-                    if (receiptMetadata) { confirmedReceipt = candidate; break; }
-                } catch { /* Vault recovery remains available when fee evidence is temporarily unavailable. */ }
-            }
-            const recoveredDeposit = confirmedReceipt
-                ? parseNoteDeposited(confirmedReceipt, this.config.funding.contract_address) : null;
+            const receiptMetadata = found.receipt ? await this.readDepositReceiptMetadata(plan, found.receipt) : null;
             await browserWalletRuntime.confirmDeposit({
                 operationId: plan.operationId,
                 secret: plan.secret,
-                note_id: Number(plan.next_note_id),
+                note_id: found.noteId,
                 amount: Number(plan.amount),
                 commitment: plan.commitment,
                 transactionHash: receiptMetadata?.transactionHash || null,
                 receiptMetadata,
-                expiry_ts: note.expiryTs,
-                ...(recoveredDeposit && recoveredDeposit.noteId === BigInt(plan.next_note_id)
-                    ? { deposit_root: `0x${recoveredDeposit.newRoot.toString(16)}` } : {})
+                expiry_ts: found.expiryTs
             });
             const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
             onStatus(balanceRefreshPending
@@ -1774,13 +1838,15 @@ class ZkapiClient extends EventTarget {
             return {
                 status: 'confirmed',
                 balanceRefreshPending,
-                noteId: Number(plan.next_note_id),
+                noteId: found.noteId,
                 amount: Number(plan.amount),
-                receipt: confirmedReceipt,
+                receipt: found.receipt,
                 ...(receiptMetadata || {})
             };
         }
-        if (note.status !== 0) {
+        // A slot that holds a leaf no expiry candidate reproduces belongs to
+        // another deposit: a slot conflict.
+        if (found?.conflict) {
             const conflictFinality = await this.browserDepositSlotConflictFinality(plan);
             if (!conflictFinality.finalized) {
                 await this.refresh({ quiet: true });
@@ -2104,31 +2170,20 @@ class ZkapiClient extends EventTarget {
         let receipt;
         let submission = null;
         let submissionMetadata = null;
-        const attempts = 3;
-        for (let attempt = 0; attempt < attempts; attempt += 1) {
-            if (plan.phase !== 'retry_exact') {
-                onStatus(attempt === 0
-                    ? 'Checking the latest private-vault state…'
-                    : 'The vault changed. Refreshing the deposit before retrying…');
-                const expectedActiveRoot = await this.readContractUint(
-                    vaultAddress,
-                    `0x${ABI.currentRoot}`
-                );
-                plan = await browserWalletRuntime.refreshPendingDeposit(
-                    Number(amount),
-                    expectedActiveRoot,
-                    { expectedOperationId: plan.operationId }
-                );
-            }
-            submission = await browserWalletRuntime.claimPendingDepositSubmission(plan.operationId);
-            // Another read-only preparation can refresh the append path;
-            // send exactly the plan frozen by the atomic submission claim.
-            if (submission.plan) plan = submission.plan;
-            if (submission.transactionHash) {
-                onStatus(`Checking submitted deposit ${this.compact(submission.transactionHash)}…`);
-                receipt = await this.waitForReceipt(submission.transactionHash);
-                break;
-            }
+        if (plan.phase !== 'retry_exact') {
+            // Rebase an unsent plan onto the vault's next note id: the id the
+            // deposit is expected to take, and the m of its gas limit.
+            onStatus('Checking the latest private-vault state…');
+            plan = await browserWalletRuntime.refreshPendingDeposit(Number(amount), { expectedOperationId: plan.operationId });
+        }
+        submission = await browserWalletRuntime.claimPendingDepositSubmission(plan.operationId);
+        // Another read-only preparation can refresh the plan; send exactly
+        // the plan frozen by the atomic submission claim.
+        if (submission.plan) plan = submission.plan;
+        if (submission.transactionHash) {
+            onStatus(`Checking submitted deposit ${this.compact(submission.transactionHash)}…`);
+            receipt = await this.waitForReceipt(submission.transactionHash);
+        } else {
             onStatus('Depositing into the private-note vault… confirm in MetaMask.');
             try {
                 receipt = await this.sendContractTransaction(
@@ -2136,25 +2191,25 @@ class ZkapiClient extends EventTarget {
                     vaultAddress,
                     encodeDeposit(plan, amount),
                     async hash => {
-                            await browserWalletRuntime.rememberPendingDepositTransaction(
-                                hash,
-                                submission,
-                                submissionMetadata
-                            );
-                            onStatus(`Deposit submitted ${this.compact(hash)} · waiting for confirmation…`);
-                        },
+                        await browserWalletRuntime.rememberPendingDepositTransaction(
+                            hash,
+                            submission,
+                            submissionMetadata
+                        );
+                        onStatus(`Deposit submitted ${this.compact(hash)} · waiting for confirmation…`);
+                    },
                     async metadata => {
-                            submissionMetadata = metadata;
-                            await browserWalletRuntime.rememberPendingDepositSubmissionMetadata(
-                                submission,
-                                metadata
-                            );
-                        },
+                        submissionMetadata = metadata;
+                        await browserWalletRuntime.rememberPendingDepositSubmissionMetadata(
+                            submission,
+                            metadata
+                        );
+                    },
                     null,
                     { kind: 'deposit', submission },
-                    nativeDepositValue(amount, funding)
+                    nativeDepositValue(amount, funding),
+                    { depositGas: { freshSlotGas: browserWalletRuntime.browserConfig?.trusted_deployment?.fresh_slot_gas } }
                 );
-                break;
             } catch (error) {
                 if (!error?.transactionHash && submission) {
                     if (error?.broadcastPossible === false || isWalletRejection(error)) {
@@ -2178,15 +2233,54 @@ class ZkapiClient extends EventTarget {
                     }
                 }
                 await this.refresh({ quiet: true });
-                if (error?.code !== 'stale_root' || attempt + 1 >= attempts) throw error;
-                const recovery = await this.recoverBrowserDeposit(onStatus);
-                if (recovery?.status === 'confirmed') return recovery;
-                plan = await browserWalletRuntime.pendingDeposit();
-                submission = null;
-                submissionMetadata = null;
+                throw error;
             }
         }
         return this.confirmBrowserDepositReceipt(plan, receipt, vaultAddress, onStatus);
+    }
+
+    /**
+     * What a wallet-paid withdrawal can cost, before any clearance exists.
+     * Calldata is unknown then, so the supported transaction gas ceiling is
+     * reserved at twice the current gas price (an escape needs a second,
+     * later transaction). Read-only: it never closes or prepares a note, and
+     * MetaMask still reviews the real fee. `shortfallWei` is what the connected
+     * account lacks, and the page shows it as a top-up rather than an error.
+     */
+    async getWithdrawalFeeBudget(mode = 'mutual') {
+        if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a withdrawal method.');
+        if (!this.config?.funding || !this.ethereum?.request) {
+            throw Object.assign(new Error('Connect MetaMask to check the network fee.'), { code: 'withdrawal_wallet_disconnected' });
+        }
+        const quantity = value => {
+            if (typeof value !== 'string' || !/^0x(?:0|[1-9a-f][0-9a-f]{0,63})$/i.test(value)) throw new Error('Invalid wallet fee data.');
+            return BigInt(value);
+        };
+        const accounts = await this.ethereum.request({ method: 'eth_accounts' });
+        const address = accounts?.[0]?.toLowerCase();
+        if (!/^0x[0-9a-f]{40}$/.test(address || '') || /^0x0{40}$/.test(address)) {
+            throw Object.assign(new Error('Connect MetaMask to check the network fee.'), { code: 'withdrawal_wallet_disconnected' });
+        }
+        await this.assertFundingChain();
+        const gasPrice = quantity(await this.ethereum.request({ method: 'eth_gasPrice' }));
+        if (gasPrice <= 0n) throw new Error('Invalid wallet fee data.');
+        const transactionFee = MAX_TRANSACTION_GAS_LIMIT * gasPrice * 2n;
+        const reserve = transactionFee * (mode === 'escape' ? 2n : 1n);
+        if (reserve >= 1n << 256n) throw new Error('Invalid wallet fee data.');
+        const balance = quantity(await this.ethereum.request({ method: 'eth_getBalance', params: [address, 'pending'] }));
+        await this.assertFundingChain();
+        const current = await this.ethereum.request({ method: 'eth_accounts' });
+        if (current?.[0]?.toLowerCase() !== address) throw new Error('MetaMask account changed. Check the fee again.');
+        return {
+            address,
+            chainId: Number(this.config.funding.chain_id),
+            mode,
+            balanceWei: balance.toString(),
+            feeReserveWei: reserve.toString(),
+            transactionFeeWei: transactionFee.toString(),
+            shortfallWei: (reserve > balance ? reserve - balance : 0n).toString(),
+            expiresAt: Date.now() + 30_000
+        };
     }
 
     /**
@@ -2201,9 +2295,12 @@ class ZkapiClient extends EventTarget {
         concede = 'zero',
         fees = 'wallet',
         feeCapWei = null,
+        maxCostWei: approvedMaxCostWei = null,
+        maxTotalFeeWei = null,
         bundlerUrl = null,
         allowExpensiveGas = false,
-        selfBundle = false
+        selfBundle = false,
+        expectedWithdrawalOperationId = null
     } = {}) {
         // The password dialog must not transfer an earlier withdrawal click
         // to a successor note installed by another tab while it was open.
@@ -2224,7 +2321,8 @@ class ZkapiClient extends EventTarget {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const options = { destination, concede, fees, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle };
+        const options = { destination, concede, fees, feeCapWei, maxCostWei: approvedMaxCostWei, maxTotalFeeWei, bundlerUrl, allowExpensiveGas, selfBundle,
+            expectedWithdrawalOperationId };
         const operation = (async () => {
             try {
                 return await this.performWithdrawal(mode, onStatus, options);
@@ -2263,9 +2361,12 @@ class ZkapiClient extends EventTarget {
         concede = 'zero',
         fees = 'wallet',
         feeCapWei = null,
+        maxCostWei: approvedMaxCostWei = null,
+        maxTotalFeeWei = null,
         bundlerUrl = null,
         allowExpensiveGas = false,
-        selfBundle = false
+        selfBundle = false,
+        expectedWithdrawalOperationId = null
     } = {}) {
         const requestedDestination = normalizeWithdrawalDestination(requested, this.config?.funding);
         const note = this.note;
@@ -2281,7 +2382,8 @@ class ZkapiClient extends EventTarget {
             // bound to a transit account, every read goes to the read RPC and
             // no transaction is ever sent from the wallet.
             return this.performGaslessWithdrawal(mode, onStatus, {
-                requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from, note,
+                requestedDestination, concede, feeCapWei, approvedMaxCostWei, maxTotalFeeWei, bundlerUrl, allowExpensiveGas, selfBundle, from, note,
+                expectedWithdrawalOperationId,
                 durablePrepared: await browserWalletRuntime.currentPreparedWithdrawal()
             });
         }
@@ -2339,16 +2441,12 @@ class ZkapiClient extends EventTarget {
         let submittedHash = prepared?.transaction_hash || null;
         let submission = null;
         let submissionMetadata = null;
-        // The vault accepts any root it ever held and exits carry no Merkle
-        // path, so a saved proof is reused until its valid_until (E4.7). An
-        // expired proof or UnknownRoot() re-proves.
+        // An exit is bound to the note's leaf (no path, no root), so a saved
+        // proof is reused until its valid_until (E4.7); an expired proof
+        // re-proves. The wallet provider is read before the pinned RPC for
+        // the note's status when no exit RPC is set.
         const withdrawalAttempts = 4;
         let reprove = false;
-        // After UnknownRoot the next proof takes its path at any other root:
-        // the indexer checked against the vault, or the vault's logs (E4.1,
-        // §6.6), never the refused one. The wallet provider is read before
-        // the pinned RPC when no exit RPC is set.
-        let refusedRoot = null;
         const walletRequest = request => this.ethereum.request(request);
         // A simulation refusal re-proves once per reason; after that it only
         // warns (E4.5).
@@ -2387,30 +2485,15 @@ class ZkapiClient extends EventTarget {
                     ? (mode === 'mutual'
                         ? 'Checking this balance and requesting a cooperative close…'
                         : 'Preparing a unilateral escape locally…')
-                    : 'The withdrawal proof expired or the vault refused its root. Proving again…');
-                const expectedActiveRoot = mode === 'mutual'
-                    ? await this.readContractUint(this.config.funding.contract_address, `0x${ABI.currentRoot}`)
-                    : null;
-                try {
-                    plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
-                        expectedActiveRoot,
-                        reprove,
-                        earlyConcession: concede,
-                        walletRequest,
-                        ...(refusedRoot != null ? { refusedRoot } : {}),
-                        onProgress: (_phase, message) => onStatus(message)
-                    });
-                } catch (error) {
-                    // E4.5 is advisory: when no path at another root can be
-                    // found after UnknownRoot, the proof that exists is
-                    // submitted anyway (its refusal then only warns).
-                    if (refusedRoot == null || error?.data?.exit_path_unavailable !== true
-                        || attempt + 1 >= withdrawalAttempts) throw error;
-                    onStatus(`No Merkle path at another root was found (${error.message}). The existing proof is submitted anyway; if the vault does not know its root, the transaction reverts and costs only gas.`);
-                    refusedRoot = null;
-                    reprove = false;
-                    continue;
-                }
+                    : 'The withdrawal proof expired. Proving again…');
+                plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
+                    reprove,
+                    earlyConcession: concede,
+                    walletRequest,
+                    expectedNoteId: note.note_id,
+                    expectedWithdrawalOperationId: attempt === 0 ? expectedWithdrawalOperationId : null,
+                    onProgress: (_phase, message) => onStatus(message)
+                });
                 for (const warning of plan.warnings || []) {
                     if (warning?.message) onStatus(`${warning.message} It can still be submitted.`);
                 }
@@ -2450,7 +2533,12 @@ class ZkapiClient extends EventTarget {
                     this.config.funding.contract_address,
                     { conceded: plan.public_inputs.conceded }
                 );
-                const claim = await browserWalletRuntime.claimPreparedWithdrawalSubmission();
+                const claim = await browserWalletRuntime.claimPreparedWithdrawalSubmission({
+                    operationId: plan.operationId ?? null,
+                    noteId: plan.noteId ?? plan.public_inputs?.note_id ?? null,
+                    mode: plan.mode,
+                    destination
+                });
                 submission = claim;
                 submittedHash = claim.transactionHash || submittedHash;
                 if (submittedHash) {
@@ -2518,12 +2606,11 @@ class ZkapiClient extends EventTarget {
                     );
                     break;
                 } catch (error) {
-                    // A proof past its valid_until (E4.7) or a root the vault
-                    // does not know is proved again: another release.
+                    // A proof past its valid_until (E4.7) is proved again:
+                    // another release.
                     const reprovable = REPROVABLE_EXIT_ERRORS.includes(error?.code);
                     if (!reprovable || attempt + 1 >= withdrawalAttempts) throw error;
                     reproved.add(error.code);
-                    if (error.code === 'unknown_root') refusedRoot = plan.public_inputs.active_root;
                     await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
                     submission = null;
                     submissionMetadata = null;
@@ -2618,10 +2705,6 @@ class ZkapiClient extends EventTarget {
             recordId: record.recordId,
             conceded: BigInt(plan.public_inputs.conceded),
             decision: plan.decision || null,
-            // Where the proof's Merkle path came from (E4.1): the saved
-            // deposit-time path, the indexer or the rebuild from the vault's
-            // logs.
-            pathSource: plan.pathSource || null,
             ...(destinationWarning ? { destinationWarning } : {})
         };
     }
@@ -3155,6 +3238,7 @@ class ZkapiClient extends EventTarget {
             op: sizedOp });
         const op = draft(gas);
         const maxCost = maxCostWei(gas, selectedFees.maxFeePerGas);
+        this.assertGaslessCostApproved(context, maxCost);
         if (maxCost > state.policy.maxSponsoredCostWei) {
             throw gaslessError('max_cost_above_policy', { maxCost, cap: state.policy.maxSponsoredCostWei });
         }
@@ -3163,8 +3247,17 @@ class ZkapiClient extends EventTarget {
             throw gaslessError('paymaster_underfunded', { depositWei: state.depositWei, maxCost });
         }
         const finalizeReserveWei = kind === KIND.escape ? pins.gasPolicy.finalizeReserveGas * selectedFees.maxFeePerGas : 0n;
+        // A failed contract payout costs credit bookkeeping beyond the normal
+        // gas+flat-fee cap. Include that contingency in the disclosed net.
+        const payoutCode = await reader({ method: 'eth_getCode', params: [transit.payee, 'latest'] });
+        const payoutHasCode = Boolean(payoutCode && payoutCode !== '0x');
+        const creditSurchargeWei = payoutHasCode ? pins.gasPolicy.creditGas * selectedFees.maxFeePerGas : 0n;
+        if (context.approvedTotalFeeWei != null && maxCost + flatFee + creditSurchargeWei > context.approvedTotalFeeWei) {
+            throw gaslessError('gasless_cost_above_cap', { maxCost: maxCost + flatFee + creditSurchargeWei, cap: context.approvedTotalFeeWei },
+                'Network fees changed above the amount you approved. Check the fee again before continuing.');
+        }
         const amounts = gaslessAmounts({
-            kind, payoutWei, maxCost, flatFee, owed: state.owed, finalizeReserveWei, minEscapeNetWei: state.policy.minEscapeNetWei,
+            kind, payoutWei, maxCost, flatFee, owed: state.owed, finalizeReserveWei, creditSurchargeWei, minEscapeNetWei: state.policy.minEscapeNetWei,
             uneconomicFractionPercent: pins.uneconomicFractionPercent, allowExpensiveGas
         });
         const quote = decodeQuote(await this.gaslessCall(reader, pins.paymaster, encodeQuote({
@@ -3184,7 +3277,24 @@ class ZkapiClient extends EventTarget {
         if (String(onChainHash || '').toLowerCase() !== hash) {
             throw gaslessError('entry_point_hash_mismatch', { local: hash, entryPoint: onChainHash || null });
         }
-        return { op, hash, key, sequence, withInitCode: created, gas, fees: selectedFees, maxCost, amounts, quote, payoutWei };
+        return { op, hash, key, sequence, withInitCode: created, gas, fees: selectedFees, maxCost, amounts, quote, payoutWei, payoutHasCode };
+    }
+
+    /** The person approved this maximum gas reservation, not merely the flat fee. */
+    assertGaslessCostApproved(context, maxCost) {
+        if (context.approvedMaxCostWei != null && maxCost > context.approvedMaxCostWei) {
+            throw gaslessError('gasless_cost_above_cap', { maxCost, cap: context.approvedMaxCostWei },
+                'Network fees changed above the amount you approved. Check the fee again before continuing.');
+        }
+    }
+
+    async assertGaslessTotalFeeApproved(context, maxCost, maxFeePerGas) {
+        if (context.approvedTotalFeeWei == null) return;
+        const code = await context.reader({ method: 'eth_getCode', params: [context.transit.payee, 'latest'] });
+        const credit = code && code !== '0x' ? context.pins.gasPolicy.creditGas * maxFeePerGas : 0n;
+        const total = maxCost + context.state.policy.flatFeeWei + credit;
+        if (total > context.approvedTotalFeeWei) throw gaslessError('gasless_cost_above_cap', { maxCost: total, cap: context.approvedTotalFeeWei },
+            'Network fees changed above the amount you approved. Check the fee again before continuing.');
     }
 
     /** A bundler's estimate is a cross-check only: above a cap it is refused, below the defaults ignored (§3.1). */
@@ -3551,6 +3661,8 @@ class ZkapiClient extends EventTarget {
             // must not lose a settlement the bundle already carries.
             const found = await this.findUserOperationInclusion(context, lookupHashes(), fromBlock) || await inclusionByNonce();
             if (found) return settleInclusion(found);
+            this.assertGaslessCostApproved(context, maxCostWei(built.op, built.op.maxFeePerGas));
+            await this.assertGaslessTotalFeeApproved(context, maxCostWei(built.op, built.op.maxFeePerGas), built.op.maxFeePerGas);
         } else {
             // An operation released earlier (an expiry stop before this
             // re-proof) may have landed meanwhile: it is looked for (by its
@@ -3798,7 +3910,8 @@ class ZkapiClient extends EventTarget {
             return `The escape is sponsored: nothing is paid now. Its finalization deducts at most ${eth(amounts.initiationDebtMax)} ETH for this start (its network fee and the paymaster’s flat fee), plus the finalization’s own fee and flat fee, measured when the finalization is sent; at current fees the payout address would receive about ${eth(amounts.estimatedReceived)} ETH. The guaranteed minimum is shown when the finalization is signed.`;
         }
         return `The payout address receives at least ${eth(amounts.minimumReceived)} ETH: the sponsored network fee is at most ${eth(amounts.maxCost)} ETH`
-            + `${amounts.flatFee ? ` plus a ${eth(amounts.flatFee)} ETH flat fee` : ''}${amounts.owed ? ` and ${eth(amounts.owed)} ETH of earlier debt` : ''}; the exact charge is measured on chain.`;
+            + `${amounts.flatFee ? ` plus a ${eth(amounts.flatFee)} ETH flat fee` : ''}${amounts.owed ? ` and ${eth(amounts.owed)} ETH of earlier debt` : ''}`
+            + `${amounts.creditSurchargeWei ? `, allowing ${eth(amounts.creditSurchargeWei)} ETH extra if the receiving contract refuses payment` : ''}; the exact charge is measured on chain.`;
     }
 
     gaslessSettledMessage(amounts, credited) {
@@ -3813,6 +3926,8 @@ class ZkapiClient extends EventTarget {
         return {
             rememberBuilt: async built => browserWalletRuntime.rememberPreparedWithdrawalUserOp(submission, {
                 userOp: userOperationJson(built.op), userOpHash: built.hash, userOpNonce: built.op.nonce.toString(),
+                gaslessMaxCostWei: context.approvedMaxCostWei?.toString() ?? null,
+                gaslessMaxTotalFeeWei: context.approvedTotalFeeWei?.toString() ?? null,
                 userOpInitCode: built.withInitCode === true, bundlerUrl: context.bundlerUrl, submittedAtBlock: await this.gaslessBlockNumber(context)
             }),
             rememberSubmission: details => browserWalletRuntime.rememberPreparedWithdrawalUserOpSubmission(submission, details),
@@ -3900,8 +4015,12 @@ class ZkapiClient extends EventTarget {
         }
     }
 
-    async followGaslessWithdrawal(mode, onStatus, { requestedDestination, concede, feeCapWei, bundlerUrl, allowExpensiveGas, selfBundle, from,
-        durablePrepared, note, claimed }) {
+    async followGaslessWithdrawal(mode, onStatus, { requestedDestination, concede, feeCapWei, approvedMaxCostWei = null, maxTotalFeeWei = null, bundlerUrl, allowExpensiveGas, selfBundle, from,
+        durablePrepared, note, claimed, expectedWithdrawalOperationId = null }) {
+        const changed = () => Object.assign(new Error('This withdrawal was replaced in another tab. Review it again before continuing.'), { code: 'withdrawal_note_changed' });
+        if (expectedWithdrawalOperationId != null && durablePrepared?.operationId !== expectedWithdrawalOperationId) throw changed();
+        const reviewedPlan = durablePrepared ? { operationId: durablePrepared.operationId, statement: JSON.stringify(durablePrepared.public_inputs),
+            userOpHash: durablePrepared.userOpHash ?? null } : null;
         if (durablePrepared && !isGaslessWithdrawal(durablePrepared)) throw gaslessError('gasless_plan_mismatch');
         if (requestedDestination && durablePrepared?.payout && durablePrepared.payout.toLowerCase() !== requestedDestination) {
             throw new Error('This withdrawal is already bound to a different destination. Resume it with its saved address.');
@@ -3917,6 +4036,16 @@ class ZkapiClient extends EventTarget {
             from, payout, owner, expectedAccount: durablePrepared?.transit?.account || null,
             bundlerUrl: bundlerUrl || durablePrepared?.bundlerUrl || null, kind, record: durablePrepared || null
         });
+        // A resumed plan keeps its earlier approval unless the caller passes
+        // a newly reviewed cap explicitly. Fee replacement never changes it.
+        const savedCap = durablePrepared?.gaslessMaxCostWei;
+        const cap = approvedMaxCostWei ?? savedCap;
+        feeCapWei ??= durablePrepared?.gaslessFlatFeeCapWei ?? null;
+        context.approvedMaxCostWei = cap == null ? null : toBigInt(cap, 'maxCostWei');
+        if (context.approvedMaxCostWei != null && context.approvedMaxCostWei < 0n) throw new TypeError('maxCostWei must be non-negative.');
+        const totalCap = maxTotalFeeWei ?? durablePrepared?.gaslessMaxTotalFeeWei;
+        context.approvedTotalFeeWei = totalCap == null ? null : toBigInt(totalCap, 'maxTotalFeeWei');
+        if (context.approvedTotalFeeWei != null && context.approvedTotalFeeWei < 0n) throw new TypeError('maxTotalFeeWei must be non-negative.');
         const S = context.transit.account;
         if (!durablePrepared) {
             onStatus(owner === payout ? GASLESS_PRIVACY_NOTE : GASLESS_PRIVACY_NOTE_SEPARATE_PAYOUT);
@@ -3933,7 +4062,11 @@ class ZkapiClient extends EventTarget {
             kind, key: kind === KIND.close ? attemptsKey(KIND.close, { nullifier: nullifierHint }) : attemptsKey(KIND.escape, { noteId })
         });
         if (!preflight.verdict.available) throw gaslessError(preflight.verdict.reason, preflight.verdict.data);
+        // Reject changed fees before reserving a cooperative close.
+        // Resumes may already have a cheaper signed operation to follow.
+        if (!durablePrepared?.userOp) this.assertGaslessCostApproved(context, preflight.maxCost);
         context.state = preflight.state;
+        if (!durablePrepared?.userOp) await this.assertGaslessTotalFeeApproved(context, preflight.maxCost, preflight.fees.maxFeePerGas);
 
         const withdrawal = { phase: 'prepared', mode, noteId, destination: S, payout, feePayer: 'payout', transit: context.transit };
         let plan;
@@ -3951,26 +4084,30 @@ class ZkapiClient extends EventTarget {
                     ? (mode === 'mutual'
                         ? 'Checking this balance and requesting a cooperative close…'
                         : 'Preparing a unilateral escape locally…')
-                    : 'The withdrawal proof expired or the vault refused its root. Proving again…');
+                    : 'The withdrawal proof expired. Proving again…');
                 // A journaled operation whose proof is still valid is resumed
                 // as it is (identical bytes, no new proof); its claim, held by
                 // this or a crashed tab, is taken over below.
                 const journaled = attempt === 0 ? await browserWalletRuntime.currentPreparedWithdrawal() : null;
+                if (attempt === 0 && reviewedPlan && (journaled?.operationId !== reviewedPlan.operationId
+                    || JSON.stringify(journaled?.public_inputs) !== reviewedPlan.statement
+                    || (journaled?.userOpHash ?? null) !== reviewedPlan.userOpHash)) throw changed();
                 const resumable = isGaslessWithdrawal(journaled) && journaled.userOp && !journaled.transactionHash
                     && journaled.mode === mode && journaled.transit.account === S
                     && Number(journaled.public_inputs?.valid_until || 0) - this.gaslessTiming.stopBeforeValidUntilSeconds > Date.now() / 1_000;
                 if (resumable) {
+                    if (!reviewedPlan) throw changed();
                     plan = journaled;
                 } else {
-                    const expectedActiveRoot = mode === 'mutual'
-                        ? decodeWord(await this.gaslessCall(context.reader, vault, `0x${ABI.currentRoot}`), 'currentRoot')
-                        : null;
                     plan = await browserWalletRuntime.prepareWithdrawal(mode, S, {
-                        expectedActiveRoot,
                         reprove,
                         earlyConcession: concede,
                         walletRequest,
-                        gasless: { payout, transit: context.transit },
+                        expectedNoteId: note.note_id,
+                        expectedWithdrawalOperationId: attempt === 0 ? (expectedWithdrawalOperationId ?? reviewedPlan?.operationId ?? null) : null,
+                        gasless: { payout, transit: context.transit, maxCostWei: context.approvedMaxCostWei?.toString() ?? null,
+                            maxTotalFeeWei: context.approvedTotalFeeWei?.toString() ?? null,
+                            flatFeeCapWei: feeCapWei == null ? null : String(feeCapWei) },
                         onProgress: (_phase, message) => onStatus(message)
                     });
                 }
@@ -3998,13 +4135,18 @@ class ZkapiClient extends EventTarget {
                     clearanceReserved: plan.clearanceReserved === true || mode === 'mutual' });
                 if (this.config) {
                     this.config.prepared_withdrawal = {
+                        operation_id: plan.operationId || null,
                         mode, phase: knownHash ? 'submitted' : 'prepared', note_id: noteId, destination: S, payout, fee_payer: 'payout',
                         transaction_hash: knownHash, clearance_reserved: plan.clearanceReserved === true || mode === 'mutual',
+                        max_cost_wei: plan.gaslessMaxCostWei ?? null, flat_fee_cap_wei: plan.gaslessFlatFeeCapWei ?? null,
+                        max_total_fee_wei: plan.gaslessMaxTotalFeeWei ?? null,
                         clearance_granted: mode === 'mutual' && Boolean(plan.clearance?.signature), user_op_hash: plan.userOpHash || null
                     };
                 }
                 const vaultCall = encodeWithdrawal(plan, mode, S, vault, { conceded: plan.public_inputs.conceded });
-                const claim = await browserWalletRuntime.claimPreparedWithdrawalUserOp({ liveWindowMs: this.gaslessTiming.resendAfterMs });
+                const claim = await browserWalletRuntime.claimPreparedWithdrawalUserOp({ liveWindowMs: this.gaslessTiming.resendAfterMs,
+                    expected: { operationId: plan.operationId, noteId, mode: plan.mode, destination: plan.destination,
+                        statement: JSON.stringify(plan.public_inputs), userOpHash: plan.userOpHash ?? null } });
                 if (claim?.submissionId) claimed.add(claim.submissionId);
                 submission = claim;
                 if (claim.transactionHash) {
@@ -4207,7 +4349,7 @@ class ZkapiClient extends EventTarget {
             { amounts: journalValue({ ...amounts, initiationDebtWei }) });
         return {
             status: 'pending_withdrawal', deadline, event, receipt, recordId: record.recordId, conceded: BigInt(plan.public_inputs.conceded),
-            decision: plan.decision || null, pathSource: plan.pathSource || null, userOpHash: hash, transactionHash, transitAccount: S,
+            decision: plan.decision || null, userOpHash: hash, transactionHash, transitAccount: S,
             payout: transit.payee, initiationDebtWei: initiationDebtWei == null ? null : initiationDebtWei.toString()
         };
     }
@@ -4804,14 +4946,14 @@ class ZkapiClient extends EventTarget {
             const built = await this.buildGaslessOperation(context, {
                 kind, vaultCall: WORST_CASE_EXIT_CALL, nullifier: nullifier ?? 0n, noteId, payoutWei, feeCapWei, allowExpensiveGas, state: preflight.state
             });
-            const code = await context.reader({ method: 'eth_getCode', params: [payout, 'latest'] }).catch(() => '0x');
             return {
                 ...base, available: true, reason: null, message: null, transitExists: !built.withInitCode,
                 amounts: journalValue(built.amounts), fees: journalValue(built.fees), gas: journalValue(built.gas), maxCost: built.maxCost.toString(),
                 flatFeeWei: built.amounts.flatFee.toString(), owedWei: built.amounts.owed.toString(), minimumReceivedWei: weiString(built.amounts.minimumReceived),
+                creditSurchargeWei: built.amounts.creditSurchargeWei.toString(),
                 estimatedReceivedWei: weiString(built.amounts.estimatedReceived),
-                uneconomic: built.amounts.uneconomic, payoutHasCode: Boolean(code && code !== '0x'),
-                ...(code && code !== '0x' ? { payoutWarning: GASLESS_PAYOUT_CONTRACT_WARNING } : {})
+                uneconomic: built.amounts.uneconomic, payoutHasCode: built.payoutHasCode,
+                ...(built.payoutHasCode ? { payoutWarning: GASLESS_PAYOUT_CONTRACT_WARNING } : {})
             };
         } catch (error) {
             return { ...base, available: false, reason: error?.code || 'gasless_unavailable', message: error?.shortMessage || error?.message,
@@ -4869,58 +5011,75 @@ class ZkapiClient extends EventTarget {
             if (!context) throw error;
             unpinned = true;
         }
+        context.approvedMaxCostWei = prepared.gaslessMaxCostWei == null ? null : toBigInt(prepared.gaslessMaxCostWei, 'maxCostWei');
+        context.approvedTotalFeeWei = prepared.gaslessMaxTotalFeeWei == null ? null : toBigInt(prepared.gaslessMaxTotalFeeWei, 'maxTotalFeeWei');
         // From the earliest block any of the plan's operations was tracked from.
         const fromBlock = earliestBlock(prepared.submittedAtBlock, prepared.staleSubmittedAtBlock);
         let found = await this.findUserOperationInclusion(context, hashes, fromBlock);
         // Without an operation to re-send there is nothing to claim unless an inclusion was found.
         if (!found && !prepared.userOp) return null;
-        const submission = prepared.submissionId ? {
+        let submission = prepared.submissionId ? {
             operationId: prepared.operationId, submissionId: prepared.submissionId, noteId: Number(prepared.noteId ?? prepared.public_inputs?.note_id),
             mode: prepared.mode, destination: prepared.destination, deploymentId: browserWalletRuntime.manifest.deployment_id,
             chainId: Number(this.config.funding.chain_id), contractAddress: this.config.funding.contract_address
-        } : (await browserWalletRuntime.claimPreparedWithdrawalUserOp({ liveWindowMs: timing.resendAfterMs }));
-        // The background pass follows the claim only for these few calls.
-        if (!prepared.submissionId) browserWalletRuntime.endGaslessClaim(submission?.submissionId);
-        if (!found && prepared.userOp) {
-            const op = userOperationFromJson(prepared.userOp);
-            const { key, sequence } = unpackNonce(op.nonce);
-            const current = unpackNonce(decodeWord(await this.gaslessCall(context.reader, context.pins.entryPoint,
-                encodeGetNonce(context.transit.account, key)), 'getNonce')).sequence;
-            if (current > sequence) {
-                found = await this.findUserOperationInclusion(context, null, fromBlock, { sender: context.transit.account, nonce: op.nonce });
-            } else if (context.bundler && Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds > Date.now() / 1_000) {
-                try {
-                    const bundlerHash = await context.bundler.sendUserOperation(userOperationJson(op), context.pins.entryPoint);
-                    await browserWalletRuntime.rememberPreparedWithdrawalUserOpSubmission(submission, { hash: bundlerHash, ambiguous: bundlerHash !== prepared.userOpHash });
-                    onStatus(`The sponsored operation ${this.compact(prepared.userOpHash)} was sent to the bundler again.`);
-                } catch (error) {
-                    if (!this.gaslessAlreadyKnown(error)) onStatus(`The bundler did not take the sponsored operation again (${error?.shortMessage || error?.message}).`);
+        } : null;
+        // Before any replay take a fresh claim for precisely the plan read
+        // above, including when an earlier crashed tab left a submission ID.
+        if ((!found && prepared.userOp) || !submission) submission = await browserWalletRuntime.claimPreparedWithdrawalUserOp({
+            liveWindowMs: timing.resendAfterMs,
+            expected: { operationId: prepared.operationId, noteId: Number(prepared.noteId ?? prepared.public_inputs?.note_id),
+                mode: prepared.mode, destination: prepared.destination, statement: JSON.stringify(prepared.public_inputs),
+                userOpHash: prepared.userOpHash ?? null }
+        });
+        try {
+            if (!found && prepared.userOp) {
+                const op = userOperationFromJson(prepared.userOp);
+                const { key, sequence } = unpackNonce(op.nonce);
+                const current = unpackNonce(decodeWord(await this.gaslessCall(context.reader, context.pins.entryPoint,
+                    encodeGetNonce(context.transit.account, key)), 'getNonce')).sequence;
+                if (current > sequence) {
+                    found = await this.findUserOperationInclusion(context, null, fromBlock, { sender: context.transit.account, nonce: op.nonce });
+                } else if (context.bundler && Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds > Date.now() / 1_000) {
+                    try {
+                        this.assertGaslessCostApproved(context, maxCostWei(op, op.maxFeePerGas));
+                        if (context.approvedTotalFeeWei != null) {
+                            context.state = await this.readPaymasterState(context.pins, context.reader, { kind, account: context.transit.account });
+                            await this.assertGaslessTotalFeeApproved(context, maxCostWei(op, op.maxFeePerGas), op.maxFeePerGas);
+                        }
+                        const bundlerHash = await context.bundler.sendUserOperation(userOperationJson(op), context.pins.entryPoint);
+                        await browserWalletRuntime.rememberPreparedWithdrawalUserOpSubmission(submission, { hash: bundlerHash, ambiguous: bundlerHash !== prepared.userOpHash });
+                        onStatus(`The sponsored operation ${this.compact(prepared.userOpHash)} was sent to the bundler again.`);
+                    } catch (error) {
+                        if (!this.gaslessAlreadyKnown(error)) onStatus(`The bundler did not take the sponsored operation again (${error?.shortMessage || error?.message}).`);
+                    }
                 }
             }
-        }
-        if (!found && unpinned) {
-            // Not re-sent under a profile that no longer pins its paymaster:
-            // once a bundler would have included it (the re-send window from
-            // its last activity), or its proof is about to expire, it is
-            // released with the plan's claim, so the wallet-paid close or
-            // escape (fees: 'wallet') can proceed. Its hashes stay in
-            // staleUserOpHashes: a late inclusion is still settled.
-            const lastActiveAt = Math.max(Number(prepared.submissionStartedAt || 0), Number(prepared.userOpBuiltAt || 0),
-                Number(prepared.userOpSubmittedAt || 0), Number(prepared.userOpFollowedAt || 0));
-            const expiring = Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds <= Date.now() / 1_000;
-            if (expiring || Date.now() - lastActiveAt >= timing.resendAfterMs) {
-                await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission);
-                if (submission?.operationId && submission.submissionId) {
-                    await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
+            if (!found && unpinned) {
+                // Not re-sent under a profile that no longer pins its paymaster:
+                // once a bundler would have included it (the re-send window from
+                // its last activity), or its proof is about to expire, it is
+                // released with the plan's claim, so the wallet-paid close or
+                // escape (fees: 'wallet') can proceed. Its hashes stay in
+                // staleUserOpHashes: a late inclusion is still settled.
+                const lastActiveAt = Math.max(Number(prepared.submissionStartedAt || 0), Number(prepared.userOpBuiltAt || 0),
+                    Number(prepared.userOpSubmittedAt || 0), Number(prepared.userOpFollowedAt || 0));
+                const expiring = Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds <= Date.now() / 1_000;
+                if (expiring || Date.now() - lastActiveAt >= timing.resendAfterMs) {
+                    await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission);
+                    if (submission?.operationId && submission.submissionId) {
+                        await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
+                    }
+                    onStatus('The sponsored operation sent earlier was not included and is no longer sponsored; it was released. Pay the fee from a wallet to finish this withdrawal.');
                 }
-                onStatus('The sponsored operation sent earlier was not included and is no longer sponsored; it was released. Pay the fee from a wallet to finish this withdrawal.');
+                return null;
             }
-            return null;
+            if (!found) return null;
+            await browserWalletRuntime.rememberPreparedWithdrawalTransaction(found.transactionHash, submission, null);
+            onStatus(`The sponsored operation was included in ${this.compact(found.transactionHash)}.`);
+            return found.transactionHash;
+        } finally {
+            browserWalletRuntime.endGaslessClaim(submission?.submissionId);
         }
-        if (!found) return null;
-        await browserWalletRuntime.rememberPreparedWithdrawalTransaction(found.transactionHash, submission, null);
-        onStatus(`The sponsored operation was included in ${this.compact(found.transactionHash)}.`);
-        return found.transactionHash;
     }
 
     /**
@@ -5248,11 +5407,6 @@ class ZkapiClient extends EventTarget {
         let receipt;
         let plan;
         let submittedHash = null;
-        // After UnknownRoot the next close proof takes a path at another root
-        // (E4.1); a path failure then falls back to the saved one, whose
-        // simulation refusal only warns on the last attempt (E4.5).
-        let refusedRoot = null;
-        const walletRequest = request => this.ethereum.request(request);
         for (let attempt = 0; attempt < 3; attempt += 1) {
             let submission = null;
             let metadata = null;
@@ -5266,18 +5420,7 @@ class ZkapiClient extends EventTarget {
                 onStatus(attempt === 0
                     ? 'Preparing the old balance’s withdrawal proof…'
                     : 'The vault changed. Updating the old balance’s proof…', 'preparing');
-                const expectedActiveRoot = await this.readContractUint(
-                    this.config.funding.contract_address, `0x${ABI.currentRoot}`
-                );
-                try {
-                    plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot,
-                        walletRequest, ...(refusedRoot != null ? { refusedRoot } : {}) });
-                } catch (error) {
-                    if (refusedRoot == null || error?.data?.exit_path_unavailable !== true) throw error;
-                    onStatus(`No Merkle path at another root was found (${error.message}). The saved path is used again.`, 'preparing');
-                    refusedRoot = null;
-                    plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot, walletRequest });
-                }
+                plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId);
                 if (plan.mode !== 'mutual' || Number(plan.public_inputs?.note_id) !== noteId
                     || plan.destination?.toLowerCase() !== destination?.toLowerCase()
                     || Number(plan.public_inputs?.final_balance) !== Number(record.finalBalance)) {
@@ -5301,10 +5444,10 @@ class ZkapiClient extends EventTarget {
                     { kind: 'background-withdrawal', submission },
                     0n,
                     {
-                        // A root refusal re-proves while attempts remain;
+                        // An expired proof re-proves while attempts remain;
                         // otherwise the simulation only warns (E4.5).
                         exitEstimate: {
-                            blocking: error => ['stale_root', 'unknown_root'].includes(error?.code) && attempt < 2,
+                            blocking: error => REPROVABLE_EXIT_ERRORS.includes(error?.code) && attempt < 2,
                             alternative: transaction => browserWalletRuntime.exitRpcEstimateGas(transaction),
                             onAdvisory: error => onStatus(`Your wallet’s simulation refused this withdrawal (${error.message}). It can still be submitted, with a fixed gas limit.`, 'wallet')
                         }
@@ -5327,12 +5470,8 @@ class ZkapiClient extends EventTarget {
                 } else if (submission && (error.broadcastPossible === false || isWalletRejection(error))) {
                     await browserWalletRuntime.releaseBackgroundWithdrawalSubmission(submission);
                     // The background flow always re-proves (reusing its
-                    // persisted clearance), so either root rejection retries,
-                    // and an UnknownRoot one at another root.
-                    if (['stale_root', 'unknown_root'].includes(error.code) && attempt < 2) {
-                        if (error.code === 'unknown_root') refusedRoot = plan?.public_inputs?.active_root ?? null;
-                        continue;
-                    }
+                    // persisted clearance), so an expired proof retries.
+                    if (REPROVABLE_EXIT_ERRORS.includes(error.code) && attempt < 2) continue;
                     if (isWalletRejection(error)) {
                         error.shortMessage = 'Canceled. The old balance is still set aside and can be withdrawn later.';
                     }
@@ -6525,7 +6664,8 @@ class ZkapiClient extends EventTarget {
                     || String(log?.topics?.[0] || '').toLowerCase() !== ABI.escapeChallengedEvent
                     || BigInt(log.topics[1]) !== BigInt(record.noteId)
                     || blockNumber < startBlock || blockNumber > finalizedBlock
-                    || !/^[0-9a-fA-F]{128,}$/.test(data)
+                    // EscapeWithdrawalChallenged(noteId, nullifier): one data word.
+                    || !/^[0-9a-fA-F]{64}$/.test(data)
                     || BigInt(`0x${data.slice(0, 64)}`) !== BigInt(record.withdrawalNullifier)) continue;
                 return {
                     noteId: Number(record.noteId),
@@ -6792,11 +6932,12 @@ class ZkapiClient extends EventTarget {
         if (!blockTag) return { finalized: false, checkedBlock: 0, source };
         try {
             const note = await this.readBrowserNote(Number(plan.next_note_id), blockTag);
-            const sameCommitment = note.status !== 0
-                && note.amount === BigInt(plan.amount)
-                && BigInt(note.commitment) === BigInt(plan.commitment);
+            // The slot is this plan's when one expiry candidate reproduces
+            // its leaf; any other occupied slot is another deposit's.
+            const ours = note.status !== 0 && await browserWalletRuntime.findDepositExpiry(plan,
+                { noteId: Number(plan.next_note_id), leaf: note.leaf, now: Math.floor(Date.now() / 1_000) }) != null;
             return {
-                finalized: note.status !== 0 && !sameCommitment,
+                finalized: note.status !== 0 && !ours,
                 checkedBlock: Number(BigInt(blockTag)),
                 source,
                 note
@@ -8539,12 +8680,15 @@ class ZkapiClient extends EventTarget {
             method: 'eth_call',
             params: [{
                 to: this.config.funding.contract_address,
-                data: `0x9f18e4ed${abiWord(noteId)}`
+                data: encodeNoteRecord(noteId)
             }, blockTag]
         });
-        const words = String(encodedNote || '').replace(/^0x/, '').match(/.{64}/g) || [];
-        if (words.length < 4) throw new Error('The vault returned a truncated note record.');
-        const status = Number(BigInt(`0x${words[3]}`));
+        let status;
+        try {
+            ({ status } = decodeNoteRecord(encodedNote));
+        } catch (error) {
+            throw new Error(`The vault returned a malformed note record: ${error.message}`);
+        }
         if (status === 3) return { status: 'closed', note_id: Number(noteId), challenge_deadline: null, observed_block: observedBlock };
         if (status === 1) return { status: 'active', note_id: Number(noteId), challenge_deadline: null, observed_block: observedBlock };
         if (status !== 2) throw new Error(`The vault returned unknown note status ${status}.`);
@@ -8560,7 +8704,7 @@ class ZkapiClient extends EventTarget {
         if (pendingWords.length < 6 || BigInt(`0x${pendingWords[0]}`) !== 1n) {
             throw new Error('The vault pending-withdrawal record is missing.');
         }
-        // Vault revision 3: the escape's concession at the same block
+        // The escape's concession at the same block
         // (pendingWithdrawals.finalBalance + conceded == stateBalance).
         let concession = null;
         try {
@@ -8573,10 +8717,11 @@ class ZkapiClient extends EventTarget {
         } catch {
             concession = null;
         }
+        // Word 1 (activeRoot) is always zero: the vault keeps no escape's root, which only
+        // the escape's own calldata carries. It is not reported.
         return {
             status: 'pending_withdrawal',
             note_id: Number(noteId),
-            active_root: `0x${pendingWords[1]}`,
             withdrawal_nullifier: `0x${pendingWords[2]}`,
             final_balance: Number(BigInt(`0x${pendingWords[3]}`)),
             destination: `0x${pendingWords[4].slice(-40)}`,

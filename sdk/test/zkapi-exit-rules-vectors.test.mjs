@@ -19,14 +19,16 @@ import {
     unsettledEscapeAfterSeconds
 } from '../services/zkapiExitPolicy.mjs';
 import { REQUEST_JOURNAL_TYPE } from '../services/zkapiRequestArchive.mjs';
-import { openExitKit } from '../services/zkapiExitKit.mjs';
+import { buildExitKitPayload, openExitKit } from '../services/zkapiExitKit.mjs';
+import wallet from '../wallet.js';
 
 const sdk = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const root = path.resolve(sdk, '..');
 const vectors = JSON.parse(fs.readFileSync(path.join(root, 'protocol/rust/crates/zkapi-client/tests/vectors/exit-rules.json'), 'utf8'));
 
 const SECTIONS = ['schema', 'description', 'constants', 'e_low', 'must_initiate_by', 'near_expiry', 'unsettled_escape_after',
-    'classify', 'decide', 'lock_releasable', 'payout', 'concession_allowed', 'ownership_proof', 'successor_checks', 'exit_kit'];
+    'classify', 'decide', 'lock_releasable', 'payout', 'concession_allowed', 'ownership_proof', 'successor_checks', 'exit_inputs',
+    'exit_kit'];
 
 test('the vector file has exactly the sections this test reproduces', () => {
     assert.equal(vectors.schema, 2);
@@ -230,6 +232,67 @@ test('E7: the shared exit kit opens with its passphrase only and holds the expec
     assert.equal(String(payload.bound_at_state), expected.bound_at_state);
     assert.equal(payload.state_seq, expected.state_seq);
     assert.equal(payload.exported_at, expected.exported_at);
-    assert.equal(BigInt(payload.merkle_path.active_root), BigInt(expected.merkle_path_root));
-    assert.equal(payload.merkle_path.siblings.length, expected.merkle_path_siblings);
+    // A kit sealed before vault revision 4 may carry a merkle_path: it is
+    // read and ignored, so nothing about it is expected any more.
+    assert.equal('merkle_path_root' in expected, false);
+    assert.equal('merkle_path_siblings' in expected, false);
+});
+
+test('exit inputs: an exit needs no path; the leaf and note fields of the shared vectors, refused and ignored fields', async () => {
+    const inputs = vectors.exit_inputs;
+    assert.equal(inputs.needs_merkle_path, false);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async input => {
+        const url = new URL(String(input));
+        if (url.protocol === 'file:') {
+            return new Response(fs.readFileSync(fileURLToPath(url)), { headers: { 'content-type': 'application/wasm' } });
+        }
+        return new Response('', { status: 404 });
+    };
+    try {
+        const { execute } = await import('../services/zkapiWasmWorker.js');
+        const config = {
+            protocol_version: 2, chain_id: 31337, contract_address: '0x1234', request_charge_cap: 1_000, policy_charge_cap: 1_000,
+            policy_enabled: false, state_signing_key: vectors.successor_checks.state_signing_key,
+            clearance_signing_key: vectors.successor_checks.state_signing_key
+        };
+        assert.ok(inputs.leaf.length >= 2);
+        for (const vector of inputs.leaf) {
+            // noteFields (public input 8), the leaf from the public fields
+            // (what recovery matches against noteRecord), and from the state.
+            assert.equal(wallet.packNoteFields(vector.note_id, vector.deposit_amount, vector.expiry_ts), BigInt(vector.note_fields), vector.name);
+            assert.deepEqual(wallet.unpackNoteFields(BigInt(vector.note_fields)), { noteId: vector.note_id,
+                depositAmount: BigInt(vector.deposit_amount), expiryTs: BigInt(vector.expiry_ts) }, vector.name);
+            const fromFields = await execute('noteLeafFromFields', { noteId: vector.note_id, commitment: vector.registration,
+                amount: vector.deposit_amount, expiryTs: vector.expiry_ts });
+            assert.equal(BigInt(fromFields), BigInt(vector.note_leaf), `${vector.name}: from the fields`);
+            if (BigInt(vector.deposit_amount) <= BigInt(Number.MAX_SAFE_INTEGER) && BigInt(vector.expiry_ts) <= BigInt(Number.MAX_SAFE_INTEGER)) {
+                const state = await execute('confirmDeposit', { config, args: { secret: vector.secret, note_id: vector.note_id,
+                    amount: Number(vector.deposit_amount), expiry_ts: Number(vector.expiry_ts) } });
+                assert.equal(BigInt(await execute('noteLeaf', { state })), BigInt(vector.note_leaf), `${vector.name}: from the state`);
+            }
+        }
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+    // The statement the vault encoder consumes (the real proofs of the
+    // shared withdrawal golden carry exactly these fields).
+    const golden = JSON.parse(fs.readFileSync(path.join(root, 'protocol/contracts/test/fixtures/withdrawal-golden.json'), 'utf8'));
+    assert.deepEqual(Object.keys(golden.escape.public_inputs).sort(), [...inputs.statement_fields].sort());
+    assert.equal(inputs.statement_fields.length, 18);
+    // A statement with a refused field is not encoded for the vault.
+    const plan = { mode: 'escape', public_inputs: golden.escape.public_inputs, proof: { backend: 'groth16_bn254', proof: golden.escape.proof } };
+    const destination = `0x${Buffer.from(golden.escape.public_inputs.destination).toString('hex')}`;
+    for (const field of inputs.refused_fields) {
+        assert.throws(() => wallet.encodeWithdrawal({ ...plan, public_inputs: { ...plan.public_inputs, [field]: '0x1' } }, 'escape',
+            destination, golden.deployment.vault, { conceded: plan.public_inputs.conceded }), /earlier vault revision/, field);
+    }
+    // A saved state's ignored fields never reach an exit kit.
+    const state = { note_id: 1, secret_s: '0x2a', deposit_amount: 1, expiry_ts: 1 };
+    for (const field of inputs.ignored_state_fields) {
+        const kit = buildExitKitPayload({ trustedDeployment: {}, state: { ...state, [field]: { active_root: '0x1', siblings: [] } },
+            stateSeq: 1, exportedAt: 1 });
+        assert.equal(kit.note[field], undefined, field);
+        assert.equal('merkle_path' in kit, false);
+    }
 });

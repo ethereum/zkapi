@@ -19,9 +19,12 @@ import (
 )
 
 // installGaslessProfile replaces the packaged mainnet profile, for the rest
-// of the test, with one whose gasless object is edit's answer: nil publishes
-// gasless: null (the paymaster's retirement), an edited copy pins other
-// contracts.
+// of the test, with one whose gasless object is edit's answer, given the
+// reviewed test profile (testdata/gasless-profile.json): returned as is, the
+// deployment publishes gasless support (payout-only withdrawals); nil
+// publishes gasless: null (the paymaster's retirement); an edited copy pins
+// other contracts. The packaged test manifest itself publishes none, so the
+// wallet-paid fixtures model a deployment without gasless support.
 func installGaslessProfile(t *testing.T, edit func(gasless map[string]any) any) {
 	t.Helper()
 	files := fstest.MapFS{}
@@ -37,8 +40,7 @@ func installGaslessProfile(t *testing.T, edit func(gasless map[string]any) any) 
 			if err := decoder.Decode(&manifest); err != nil {
 				t.Fatal(err)
 			}
-			gasless, _ := manifest["gasless"].(map[string]any)
-			manifest["gasless"] = edit(gasless)
+			manifest["gasless"] = edit(testGaslessProfile(t))
 			if raw, err = json.Marshal(manifest); err != nil {
 				t.Fatal(err)
 			}
@@ -46,6 +48,28 @@ func installGaslessProfile(t *testing.T, edit func(gasless map[string]any) any) 
 		files["deployments/"+network+".json"] = &fstest.MapFile{Data: raw}
 	}
 	t.Cleanup(SetPackagedDeploymentsForTesting(files))
+}
+
+// testGaslessProfile is the reviewed gasless object of the test deployment.
+func testGaslessProfile(t *testing.T) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "gasless-profile.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var gasless map[string]any
+	if err := decoder.Decode(&gasless); err != nil {
+		t.Fatal(err)
+	}
+	return gasless
+}
+
+// publishGasless installs the reviewed gasless profile unchanged.
+func publishGasless(t *testing.T) {
+	t.Helper()
+	installGaslessProfile(t, func(gasless map[string]any) any { return gasless })
 }
 
 // retireGasless publishes gasless: null.
@@ -178,6 +202,9 @@ func TestGaslessRetiredProfileSweepChecksTheJournaledFactory(t *testing.T) {
 	// the journaled factory derives the real one for its owner and payee.
 	forged := common.HexToAddress("0x" + strings.Repeat("5d", 20)).Hex()
 	record.Withdrawal.Transit.Account, record.Withdrawal.ProofDestination, record.Withdrawal.UserOp = forged, forged, nil
+	if a := record.Withdrawal.Authorization; a != nil {
+		a.TransitAccount = forged
+	}
 	if err := f.h.saveAddress(&record); err != nil {
 		t.Fatal(err)
 	}

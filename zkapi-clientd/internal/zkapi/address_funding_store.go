@@ -464,6 +464,26 @@ func validateGaslessRecord(config fundingConfig, w *addressWithdrawalRecord) err
 	if w.FeePayer != "payout" && w.FeePayer != "wallet" {
 		return invalid
 	}
+	if a := w.Authorization; a != nil {
+		// The authorization names this record's own close; its bounds are
+		// consistent (the floor is the payout less the maximum and the debt).
+		maximum, minimum, payout, flat, owed := a.wei(a.MaxTotalFeeWei), a.wei(a.MinNetPayoutWei), a.wei(a.PayoutWei), a.wei(a.FlatFeeCapWei), a.wei(a.OwedWei)
+		if w.Mode != "" || a.NoteID != w.NoteID || a.Binding != w.Binding || a.Amount != w.Amount || !strings.EqualFold(a.Destination, w.Destination) || !strings.EqualFold(a.TransitAccount, t.Account) || a.ChainID != config.ChainID || !strings.EqualFold(a.Contract, config.Contract) || a.DeploymentID != config.DeploymentID || ValidateBundlerURL(a.BundlerURL) != nil || a.Rebuilds < 0 {
+			return invalid
+		}
+		if maximum == nil || minimum == nil || payout == nil || flat == nil || owed == nil || maximum.Sign() <= 0 || minimum.Sign() <= 0 || new(big.Int).Sub(new(big.Int).Sub(payout, maximum), owed).Cmp(minimum) != 0 {
+			return invalid
+		}
+		for _, hash := range a.SignedHashes {
+			if !isHex(hash, 32) {
+				return invalid
+			}
+		}
+		// Every copy signed under it shares the first one's nonce.
+		if a.Nonce != "" && w.UserOp != nil && w.UserOp.Nonce != a.Nonce && gaslessKindOf(w.UserOp.Kind) == gaslessKindClose {
+			return invalid
+		}
+	}
 	// A funding key never owns a transit account.
 	if w.UserOp == nil {
 		return nil

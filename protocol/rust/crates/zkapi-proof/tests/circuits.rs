@@ -166,7 +166,6 @@ fn explicit_withdrawal_rules() {
         protocol_version: 2,
         chain_id: CHAIN_ID,
         contract_address: c.deployment.contract_address,
-        active_root: c.tree.root(),
         state_signing_key: c.deployment.state_key(),
         clearance_signing_key: c.deployment.clearance_key(),
         note_id: c.note.note_id,

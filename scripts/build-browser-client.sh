@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the browser WebAssembly of circuit zkapi-v2-concession-v1 reproducibly.
+# Build the browser WebAssembly of circuit zkapi-v2-concession-v2 reproducibly.
 #
 #   scripts/build-browser-client.sh --setup dev|mpc-1
 #       Build into sdk/wasm/, copy the setup's keys into sdk/assets/proofs/ and

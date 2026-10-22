@@ -6,7 +6,8 @@ The protocol workspace contains five crates:
   v2 public statements (`RequestPublicInputsV2`, `WithdrawalPublicInputsV2C`),
   HTTP messages, and Schnorr signatures.
 - [zkapi-core](../../rust/crates/zkapi-core): BN254 Poseidon, registration,
-  note, nullifier, successor-anchor and state helpers, and Merkle trees.
+  note, nullifier, successor-anchor and state helpers, Merkle trees, and the
+  vault's frontier model (`Frontier`).
 - [zkapi-proof](../../rust/crates/zkapi-proof): Groth16 circuits, the
   `CircomReduction` prover, commitments, signing, key headers and setup policy,
   R1CS export and ceremony import, proving, and verification.

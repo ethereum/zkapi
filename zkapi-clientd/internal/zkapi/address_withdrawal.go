@@ -3,6 +3,7 @@ package zkapi
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -86,6 +87,20 @@ type AddressWithdrawalStatus struct {
 	// fail and the payout be credited).
 	PayeeHasCode    bool   `json:"payee_has_code,omitempty"`
 	GaslessAdvisory string `json:"gasless_advisory,omitempty"`
+	// NewWithdrawalFees is how a new withdrawal on this deployment pays its
+	// network fee: "payout" where the deployment publishes reviewed gasless
+	// support (the only option offered), else "wallet".
+	NewWithdrawalFees string `json:"new_withdrawal_fees,omitempty"`
+	// The bounded authorization of a payout withdrawal, while it can still
+	// be used: the most the payout may lose to the fee and the least the
+	// payout address receives. EstimatedFeeWei is the latest estimate.
+	AuthorizedMaxFeeWei       string `json:"authorized_max_fee_wei,omitempty"`
+	AuthorizedMinNetPayoutWei string `json:"authorized_min_net_payout_wei,omitempty"`
+	EstimatedFeeWei           string `json:"estimated_fee_wei,omitempty"`
+	// GaslessRetryable marks a gasless_refused withdrawal whose authorization
+	// still holds: the next POST /admin/withdrawal retries it (rebuilding,
+	// re-signing or re-proving within the bound) without a new approval.
+	GaslessRetryable bool `json:"gasless_retryable,omitempty"`
 }
 
 type addressWithdrawalRecord struct {
@@ -156,6 +171,10 @@ type addressWithdrawalRecord struct {
 	// PayeeHasCode records that the payout address had code when the
 	// withdrawal was prepared (design 3.1's advisory).
 	PayeeHasCode bool `json:"payee_has_code,omitempty"`
+	// Authorization is the owner's bounded approval of a payout close
+	// (gasless_authorization.go): signed copies are built within it, at the
+	// fees of their moment, without asking again.
+	Authorization *gaslessAuthorization `json:"authorization,omitempty"`
 }
 
 // proofDestination is the address the proof and the vault's logs name: the
@@ -204,6 +223,11 @@ func setGaslessStatus(status *AddressWithdrawalStatus, w *addressWithdrawalRecor
 	if w.PaymasterCredited {
 		status.PaymasterCredited, status.PaymasterAddress = true, w.Transit.Paymaster
 	}
+	status.AuthorizedMaxFeeWei, status.AuthorizedMinNetPayoutWei, status.EstimatedFeeWei, status.GaslessRetryable = "", "", "", false
+	if a := usableAuthorization(w); a != nil && w.Phase != "complete" {
+		status.AuthorizedMaxFeeWei, status.AuthorizedMinNetPayoutWei, status.EstimatedFeeWei = a.MaxTotalFeeWei, a.MinNetPayoutWei, a.EstimatedFeeWei
+		status.GaslessRetryable = retryableUnderAuthorization(w)
+	}
 }
 
 type withdrawalWallet struct {
@@ -228,18 +252,23 @@ type withdrawalBridgeStatus struct {
 	EscapePayoutCredited bool `json:"escape_payout_credited"`
 }
 
-// withdrawalInputs is the 16-field statement of circuit
-// zkapi-v2-concession-v1 (WithdrawalPublicInputsV2C), in public-input order.
+// withdrawalInputs is the statement of circuit zkapi-v2-concession-v2
+// (WithdrawalPublicInputsV2C), in public-input order. Its 16 public inputs
+// are these fields with NoteID, DepositAmount and ExpiryTs packed into input
+// 8 (noteFields). Input 3 is the note's leaf, which the vault compares with
+// the leaf it stored at deposit: an exit needs no Merkle path or root.
 type withdrawalInputs struct {
 	ProtocolVersion uint64  `json:"protocol_version"`
 	ChainID         uint64  `json:"chain_id"`
 	Contract        string  `json:"contract_address"`
-	ActiveRoot      string  `json:"active_root"`
+	NoteLeaf        string  `json:"note_leaf"`
 	StateKeyX       string  `json:"state_signing_key_x"`
 	StateKeyY       string  `json:"state_signing_key_y"`
 	ClearanceKeyX   string  `json:"clearance_signing_key_x"`
 	ClearanceKeyY   string  `json:"clearance_signing_key_y"`
 	NoteID          uint64  `json:"note_id"`
+	DepositAmount   uint64  `json:"deposit_amount"`
+	ExpiryTs        uint64  `json:"expiry_ts"`
 	FinalBalance    uint64  `json:"final_balance"`
 	Destination     []uint8 `json:"destination"`
 	Nullifier       string  `json:"withdrawal_nullifier"`
@@ -249,8 +278,9 @@ type withdrawalInputs struct {
 	ValidUntil      uint64  `json:"valid_until"`
 }
 
-// withdrawalTuple is the vault's WithdrawalPublicInputs tuple.
-const withdrawalTuple = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)"
+// withdrawalTuple is the vault's WithdrawalPublicInputs tuple (vault revision
+// 4): word 3 is noteLeaf and word 8 the uint256 noteFields.
+const withdrawalTuple = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64)"
 
 // exitProofValidity is how long the vault accepts an escape or close proof;
 // a proof is signed only while its valid_until is within this (plus a small
@@ -265,7 +295,6 @@ const withdrawalCalldataLength = 4 + 26*32
 type withdrawalPlan struct {
 	Mode         string           `json:"mode"`
 	PublicInputs withdrawalInputs `json:"public_inputs"`
-	Siblings     []string         `json:"siblings"`
 	Proof        struct {
 		Backend string `json:"backend"`
 		Proof   string `json:"proof"`
@@ -370,7 +399,7 @@ func (h *FundingHandler) escapePayoutCredits(ctx context.Context, config funding
 	return credits, nil
 }
 
-const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed before finishing local bookkeeping."
+const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state to confirm the note is closed before finishing local bookkeeping."
 
 // requireClearanceOwnershipCapability runs only before a companion reserves a
 // note for a new withdrawal. Where the pinned deployment's server may require
@@ -466,7 +495,7 @@ func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig,
 // (exitConfig).
 func (h *FundingHandler) withdrawalSnapshotFor(ctx context.Context, exit bool) (fundingConfig, *addressFundingRecord, withdrawalWallet, AddressWithdrawalStatus, error) {
 	config, record, payment, err := h.addressSnapshotFor(ctx, exit)
-	status := AddressWithdrawalStatus{Address: payment.Address, ChainID: payment.ChainID, TokenAddress: payment.TokenAddress, TokenDecimals: payment.TokenDecimals, DeploymentID: payment.DeploymentID, BillingAsset: payment.BillingAsset, BillingUnit: payment.BillingUnit, WeiPerUnit: payment.WeiPerUnit, ETHBalance: payment.ETHBalance, EscapePayoutCredits: payment.EscapePayoutCredits}
+	status := AddressWithdrawalStatus{Address: payment.Address, ChainID: payment.ChainID, TokenAddress: payment.TokenAddress, TokenDecimals: payment.TokenDecimals, DeploymentID: payment.DeploymentID, BillingAsset: payment.BillingAsset, BillingUnit: payment.BillingUnit, WeiPerUnit: payment.WeiPerUnit, ETHBalance: payment.ETHBalance, EscapePayoutCredits: payment.EscapePayoutCredits, NewWithdrawalFees: h.newWithdrawalFees()}
 	var wallet withdrawalWallet
 	if err != nil {
 		return config, record, wallet, status, err
@@ -605,6 +634,9 @@ func setWithdrawalMessage(status *AddressWithdrawalStatus) {
 	switch status.Phase {
 	case "ready":
 		status.Message = "Withdraw the entire remaining private balance to an explicit Ethereum address. The local payment address pays network fees."
+		if status.NewWithdrawalFees == "payout" {
+			status.Message = "Withdraw the entire remaining private balance to an explicit Ethereum address. The network fee is paid from the payout by a sponsored operation; this wallet needs no ETH."
+		}
 	case "no_note":
 		status.Message = "There is no active private balance to withdraw."
 	case "waiting_settlement":
@@ -650,7 +682,17 @@ func setGaslessMessage(status *AddressWithdrawalStatus) bool {
 	case "op_reverted":
 		status.Message = fmt.Sprintf("The sponsored operation (%s) was included in %s but reverted (%s). If another transaction closed the note first, the payout sits in the transit account %s: deliver it with zkapi-clientd withdraw --collect --to %s (sponsored) or --sweep --to %s (paid by the local signing address). Otherwise rerun %s to prove again.", status.UserOpHash, status.TransactionHash, status.GaslessRefusal, status.TransitAccount, status.Destination, status.Destination, command)
 	case "gasless_refused":
-		status.Message = fmt.Sprintf("The gasless path stopped: %s. Rerun %s to try again, or add --fees wallet to pay the fee from the local signing address; the payout then reaches the transit account %s and zkapi-clientd withdraw --sweep --to %s delivers it.", status.GaslessRefusal, command, status.TransitAccount, status.Destination)
+		switch {
+		case escape:
+			status.Message = fmt.Sprintf("The gasless path stopped: %s. Rerun %s to try again, or add --fees wallet to pay the fee from the local signing address; the payout then reaches the transit account %s and zkapi-clientd withdraw --sweep --to %s delivers it.", status.GaslessRefusal, command, status.TransitAccount, status.Destination)
+		case status.GaslessRetryable:
+			status.Message = fmt.Sprintf("The sponsored withdrawal is waiting: %s. Your authorization (at most %s wei from the payout; %s receives at least %s wei) still holds: it is retried without a new approval while the withdraw command keeps running, or resume with zkapi-clientd withdraw --resume.", status.GaslessRefusal, status.AuthorizedMaxFeeWei, status.Destination, status.AuthorizedMinNetPayoutWei)
+		default:
+			// A saved record the sponsored path can no longer carry (its
+			// attempts used up, a payout below the fee) keeps the explicit
+			// wallet-paid recovery; it is never taken without the owner.
+			status.Message = fmt.Sprintf("The sponsored withdrawal stopped: %s. Rerun %s to review a new quote; nothing more is signed without your approval. If the sponsored path cannot carry this note any more, the explicit recovery is %s --fees wallet, paid from the local signing address; the payout then reaches the transit account %s and zkapi-clientd withdraw --sweep --to %s delivers it.", status.GaslessRefusal, command, command, status.TransitAccount, status.Destination)
+		}
 		if status.FundsWaitingInTransit {
 			status.Message = fmt.Sprintf("The gasless path stopped: %s. The payout waits in the transit account %s: deliver it with zkapi-clientd withdraw --collect --to %s (sponsored) or --sweep --to %s (paid by the local signing address).", status.GaslessRefusal, status.TransitAccount, status.Destination, status.Destination)
 		}
@@ -770,6 +812,16 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		if transitAction {
 			return status, errors.New("there is no saved gasless withdrawal with a transit account to collect, sweep or claim from")
 		}
+		if h.newWithdrawalFees() == "payout" {
+			// A deployment with reviewed gasless support offers one new
+			// withdrawal: the fee is paid from the payout, as in the web
+			// app. Nothing is reserved for a wallet-paid one, and nothing at
+			// all without a quote to approve.
+			if options.Fees == "wallet" {
+				return status, refuse(CodeWalletFeesUnavailable, "new withdrawals on this deployment pay the network fee from the payout by a sponsored operation; the local signing address needs no ETH, and a wallet-paid fee is not offered")
+			}
+			options.Fees = "payout"
+		}
 		if err := h.requireClearanceOwnershipCapability(ctx); err != nil {
 			return status, err
 		}
@@ -784,6 +836,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		if options.Fees == "payout" {
 			if payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindClose, wallet.Note.Balance, destination); err != nil {
 				return status, err
+			}
+			if quoteMode(ctx) == nil {
+				return status, errors.New("quote the withdrawal and approve that quote first (zkapi-clientd withdraw --to ADDRESS); nothing was reserved")
 			}
 			profile, _, err := h.gaslessProfile()
 			if err != nil {
@@ -817,6 +872,14 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	// the payout) while no operation is in flight; --fees payout cannot be
 	// added to a reservation made for the payout address.
 	if w.Transit != nil && options.Fees == "wallet" && w.FeePayer == "payout" {
+		// Where the deployment still sponsors this record, paying from the
+		// wallet is a recovery only once the sponsored path stopped for good
+		// (refused with no retry under an approval, or reverted); while it
+		// is quoted, waiting or retried under its approval it stays
+		// sponsored. A record the profile no longer pins keeps the wallet.
+		if _, _, pinned := h.recordProfile(w); pinned == nil && h.newWithdrawalFees() == "payout" && (w.Phase == "quoted" || w.Phase == "waiting_settlement" || retryableUnderAuthorization(w)) {
+			return update(), refuse(CodeWalletFeesUnavailable, "this withdrawal pays its network fee from the payout; a wallet-paid fee is only a recovery after the sponsored path stopped for good. Resume it with zkapi-clientd withdraw --resume")
+		}
 		switch w.Phase {
 		case "quoted", "waiting_settlement", "gasless_refused", "op_reverted":
 			// A dropped operation the bundler included after all closed the
@@ -830,6 +893,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			// The bundle transaction of a reverted operation is not this
 			// wallet-paid close's: the record starts clean, as a retry does.
 			w.FeePayer, w.UserOp, w.GaslessRefusal, w.TransactionHash = "wallet", nil, "", ""
+			w.Authorization.revoke("wallet_recovery: the owner paid the fee from the wallet")
 			w.Phase = "quoted"
 			if err := h.saveAddress(record); err != nil {
 				return update(), err
@@ -867,6 +931,17 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	if transitAction {
 		return h.transitAction(ctx, config, record, options, update)
 	}
+	// A close approved under an authorization is carried on by any resume
+	// (the CLI's poll, --resume, the guided flow, a restarted daemon): no
+	// quote, no new approval, while it is retried within its maximum.
+	if a := usableAuthorization(w); a != nil && quoteMode(ctx) == nil && record.Pending == nil && (w.Phase == "quoted" || retryableUnderAuthorization(w)) {
+		if w.Phase == "gasless_refused" && refusalCode(w.GaslessRefusal) == "op_expired" && w.UserOp != nil && w.UserOp.ValidUntil != 0 && time.Now().Before(time.Unix(int64(w.UserOp.ValidUntil), 0).Add(authorizedReproveWait)) {
+			// The expired copy can still be included until its lifetime
+			// ends; the proof is renewed once it no longer can.
+			return update(), nil
+		}
+		ctx = context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Authorized: a})
+	}
 	if record.Pending != nil && transitKinds[record.Pending.Kind] {
 		if err := h.followTransitTransaction(ctx, config, record); err != nil {
 			return update(), err
@@ -898,11 +973,15 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			w.UserOp, w.Phase, w.TransactionHash, w.GaslessRefusal = nil, "quoted", "", ""
 		case "gasless_refused":
 			// A dropped operation the bundler included after all is
-			// followed; otherwise the close is proved again.
+			// followed; otherwise the close is proved again. Under an
+			// authorization its copies stay journaled with the next one.
 			if late, err := h.lateUserOperation(ctx, config, record); err != nil {
 				return update(), err
 			} else if late {
 				return h.resumeGaslessClose(ctx, config, record, update)
+			}
+			if a := usableAuthorization(w); a != nil {
+				a.remember(w.UserOp)
 			}
 			w.UserOp, w.Phase, w.TransactionHash, w.GaslessRefusal = nil, "quoted", "", ""
 		}
@@ -1092,8 +1171,16 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		if err := h.submitUserOperation(ctx, config, record, gaslessKindClose, vaultCall); err != nil {
 			if code := GaslessRefusalCode(err); code != "" {
 				w.Phase, w.GaslessRefusal = "gasless_refused", err.Error()
+				if !retryableRefusal(err.Error()) {
+					w.Authorization.revoke(err.Error())
+				}
 				if saveErr := h.saveAddress(record); saveErr != nil {
 					return update(), saveErr
+				}
+				// Under an approval a refusal for now is a state, not a
+				// failure: the status says it is retried within it.
+				if mode := quoteMode(ctx); mode != nil && mode.Capture == nil && retryableUnderAuthorization(w) {
+					return update(), nil
 				}
 			}
 			return update(), err
@@ -1189,7 +1276,7 @@ func withdrawalStatusMatches(status withdrawalBridgeStatus, record *addressWithd
 func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addressWithdrawalRecord, previousBalance uint64, now time.Time) (string, string, error) {
 	p := plan.PublicInputs
 	invalid := errors.New("withdrawal proof does not match the authorized note, destination, balance, or deployment")
-	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.proofDestination()) || p.FinalBalance > previousBalance || plan.Proof.Backend != "groth16_bn254" {
+	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.proofDestination()) || p.FinalBalance > previousBalance || p.FinalBalance > p.DepositAmount || plan.Proof.Backend != "groth16_bn254" {
 		return "", "", invalid
 	}
 	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.proofDestination())
@@ -1211,30 +1298,74 @@ func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addres
 }
 
 // withdrawalWords is the 16 tuple words of p, with destination as the
-// payout address, and the 256 proof bytes.
+// payout address, and the 256 proof bytes. Word 3 is the note leaf and word
+// 8 the packed note fields (noteFieldsWord).
 func withdrawalWords(p withdrawalInputs, encodedProof, destination string) ([]string, []byte, error) {
 	proof, err := base64.StdEncoding.DecodeString(encodedProof)
 	if err != nil || len(proof) != 256 {
 		return nil, nil, errors.New("invalid proof")
 	}
-	for _, field := range []string{p.ActiveRoot, p.StateKeyX, p.StateKeyY, p.ClearanceKeyX, p.ClearanceKeyY, p.Nullifier, p.NextNullifier} {
+	for _, field := range []string{p.NoteLeaf, p.StateKeyX, p.StateKeyY, p.ClearanceKeyX, p.ClearanceKeyY, p.Nullifier, p.NextNullifier} {
 		if !isField(field) {
 			return nil, nil, errors.New("invalid field")
 		}
 	}
-	words := []string{fmt.Sprintf("%064x", p.ProtocolVersion), fmt.Sprintf("%064x", p.ChainID), addressABIWord(p.Contract), addressABIWord(p.ActiveRoot), addressABIWord(p.StateKeyX), addressABIWord(p.StateKeyY), addressABIWord(p.ClearanceKeyX), addressABIWord(p.ClearanceKeyY), fmt.Sprintf("%064x", p.NoteID), fmt.Sprintf("%064x", p.FinalBalance), addressABIWord(destination), addressABIWord(p.Nullifier), fmt.Sprintf("%064x", p.Kind), addressABIWord(p.NextNullifier), fmt.Sprintf("%064x", p.Conceded), fmt.Sprintf("%064x", p.ValidUntil)}
+	// A leaf is a nonzero field element: zero is the retired (and empty)
+	// leaf, which no exit can match.
+	if leaf, ok := parseFieldElement(p.NoteLeaf); !ok || leaf.Sign() == 0 {
+		return nil, nil, errors.New("invalid note leaf")
+	}
+	if p.NoteID > 0xffffffff || p.DepositAmount == 0 || p.DepositAmount > maxSafeNoteAmount || p.ExpiryTs == 0 {
+		return nil, nil, errors.New("invalid note fields")
+	}
+	words := []string{fmt.Sprintf("%064x", p.ProtocolVersion), fmt.Sprintf("%064x", p.ChainID), addressABIWord(p.Contract), addressABIWord(p.NoteLeaf), addressABIWord(p.StateKeyX), addressABIWord(p.StateKeyY), addressABIWord(p.ClearanceKeyX), addressABIWord(p.ClearanceKeyY), noteFieldsWord(uint32(p.NoteID), p.DepositAmount, p.ExpiryTs), fmt.Sprintf("%064x", p.FinalBalance), addressABIWord(destination), addressABIWord(p.Nullifier), fmt.Sprintf("%064x", p.Kind), addressABIWord(p.NextNullifier), fmt.Sprintf("%064x", p.Conceded), fmt.Sprintf("%064x", p.ValidUntil)}
 	for i := range words {
 		words[i] = strings.ToLower(words[i])
 	}
 	return words, proof, nil
 }
 
-// withdrawalBinding is the keccak of the 16 tuple words with the root (word
-// 3) and valid_until (word 15) blanked: a re-proof at another root or with a
-// fresh lifetime keeps every other public input of the authorized exit.
+// noteFieldsWord is tuple word 8, noteFields = noteID·2^192 + amount·2^64 +
+// expiry, as 64 lowercase hex digits.
+func noteFieldsWord(noteID uint32, amount, expiry uint64) string {
+	return fmt.Sprintf("%064x", noteFields(noteID, amount, expiry))
+}
+
+// parseNoteFieldsWord unpacks tuple word 8. It refuses what the vault
+// refuses before verifying a proof (InvalidNoteFields: fields of 2^224 or
+// more; InvalidBalance: an amount above 2^53 - 1) and a zero amount or
+// expiry, which no deposit records.
+func parseNoteFieldsWord(word string) (noteID uint32, amount, expiry uint64, ok bool) {
+	raw, err := hex.DecodeString(word)
+	if err != nil || len(raw) != 32 {
+		return 0, 0, 0, false
+	}
+	for _, b := range raw[:4] {
+		if b != 0 {
+			return 0, 0, 0, false
+		}
+	}
+	for _, b := range raw[8:16] {
+		if b != 0 {
+			return 0, 0, 0, false
+		}
+	}
+	noteID = binary.BigEndian.Uint32(raw[4:8])
+	amount = binary.BigEndian.Uint64(raw[16:24])
+	expiry = binary.BigEndian.Uint64(raw[24:32])
+	if amount == 0 || amount > maxSafeNoteAmount || expiry == 0 {
+		return 0, 0, 0, false
+	}
+	return noteID, amount, expiry, true
+}
+
+// withdrawalBinding is the keccak of the 16 tuple words with valid_until
+// (word 15) blanked: a re-proof with a fresh lifetime keeps every other
+// public input of the authorized exit. The note leaf (word 3) and the note
+// fields (word 8) never change while the note is Active, so they are bound.
 func withdrawalBinding(words []string) string {
 	bound := append([]string{}, words[:16]...)
-	bound[3], bound[15] = "", ""
+	bound[15] = ""
 	return crypto.Keccak256Hash([]byte(strings.Join(bound, ""))).Hex()
 }
 
@@ -1352,11 +1483,13 @@ func (h *FundingHandler) checkRelayedEscapePayout(ctx context.Context, config fu
 }
 
 // validateSignedWithdrawal checks signed mutualClose calldata against the
-// saved authorization: 836 bytes; the fixed words 0, 1, 2, 8, 9, 10 and 11;
+// saved authorization: 836 bytes; the fixed words 0, 1, 2, 9, 10 and 11; a
+// nonzero note leaf (word 3); note fields (word 8) of the saved note, below
+// 2^224, with a deposit of at most 2^53 - 1 units that covers the payout;
 // kind 1 with no successor nullifier and no concession; the bytes offset and
-// length; and the binding over the 16 tuple words with words 3 and 15
-// blanked. With a nonzero now (before signing), valid_until (word 15) must
-// also lie in [now, now + 10,800 + 300].
+// length; and the binding over the 16 tuple words with word 15 blanked. With
+// a nonzero now (before signing), valid_until (word 15) must also lie in
+// [now, now + 10,800 + 300].
 func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressWithdrawalRecord, now time.Time) error {
 	invalid := errors.New("signed withdrawal does not match its saved authorization; preserve recovery files")
 	if saved == nil || len(data) != withdrawalCalldataLength || hex.EncodeToString(data[:4]) != withdrawalSelector || saved.Binding == "" || !isHex(saved.Nullifier, 32) {
@@ -1367,11 +1500,14 @@ func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressW
 		words[i] = hex.EncodeToString(data[4+i*32 : 4+(i+1)*32])
 	}
 	zero := strings.Repeat("0", 64)
-	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
+	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
 	for index, value := range expected {
 		if !strings.EqualFold(words[index], value) {
 			return invalid
 		}
+	}
+	if !validNoteWords(words, saved.NoteID, saved.Amount) {
+		return invalid
 	}
 	if !now.IsZero() && !validUntilInWindow(words[15], now) {
 		return invalid
@@ -1380,6 +1516,16 @@ func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressW
 		return invalid
 	}
 	return nil
+}
+
+// validNoteWords checks an exit's note words: a nonzero canonical leaf (word
+// 3) and note fields (word 8) naming noteID, whose deposit covers payout.
+func validNoteWords(words []string, noteID, payout uint64) bool {
+	if leaf, ok := parseFieldElement("0x" + words[3]); !ok || leaf.Sign() == 0 {
+		return false
+	}
+	id, amount, _, ok := parseNoteFieldsWord(words[8])
+	return ok && uint64(id) == noteID && payout <= amount
 }
 
 // validUntilInWindow reports whether the valid_until word lies in

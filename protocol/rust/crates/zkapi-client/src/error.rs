@@ -12,6 +12,8 @@ pub enum ClientError {
     NoteAlreadyExists,
     #[error("insufficient balance: need {needed}, have {available}")]
     InsufficientBalance { needed: u128, available: u128 },
+    /// A request's `active_root` is no longer admissible at the server.
+    /// Requests only: exits carry no root.
     #[error("stale root")]
     StaleRoot,
     #[error("server error: {0}")]
@@ -34,8 +36,10 @@ pub enum ClientError {
     #[error("verification failed: {0}")]
     VerificationFailed(String),
     /// The server refused a clearance with a code that reserves nothing:
-    /// `clearance_ownership_required`, `legacy_clearance_capacity`, or
-    /// `nullifier_used` (a request already owns the nullifier).
+    /// `clearance_ownership_required`, `legacy_clearance_capacity`,
+    /// `nullifier_used` (a request already owns the nullifier), or, from vault
+    /// revision 4, `note_leaf_mismatch` / `note_not_active` (the vault's
+    /// stored leaf or status, read fresh, does not admit the note).
     #[error("clearance refused: {0}")]
     ClearanceRefused(String),
     /// C2: a request proof at this state already carries another bound.
