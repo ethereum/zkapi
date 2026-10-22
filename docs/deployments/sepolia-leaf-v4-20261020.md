@@ -10,7 +10,8 @@ explicit Sepolia gas schedule for sponsored withdrawals.
 - Vault: `0x67EB750d9C0D63A99684AC3F3e65f0C610276993`.
 - Vault creation block: 11958523.
 - Service prefix: `https://zkapi-sepolia.openanonymity.ai/v0.4`.
-- Browser: `https://staging.openanonymity.ai`, version v4.
+- Browser: `https://staging.openanonymity.ai`, displayed as zkAPI v0.2
+  (deployment registry entry and API prefix remain v4 and `/v0.4`).
 - Minimum deposit: 0.001 test ETH; note lifetime: 30 days.
 - First-version and earlier staging services remain available for existing balances.
 - Mainnet and production configuration are unchanged.
@@ -63,3 +64,54 @@ manifest was unchanged, the SDK profile reproduced from it, and the served
 This was a confirmation-depth check: the RPC's finalized head was 11958505 at
 that observation, so the check did not yet establish consensus finality for the
 deployment or the later smoke transactions.
+
+## Staging UI release, 2026-10-21
+
+The UI release uses commercial commit
+`c5a110ecf99638c71e3acd5e46313bd63ed480b5` and oa-chat commit
+`4db19ab0f8b3a5c60375c857ea93b8d7c8dcf986`. Both feature branches are
+`codex/pr31-sepolia-staging`. They preserve the previously deployed Sepolia
+password-memory changes (`f42c310` / `369334f6`) through normal merges.
+
+The balance now displays **zkAPI v0.2**, its version help button opens an
+accessible explanation, and wallet copy consistently says **Ethereum wallet**.
+For supported balances, Send to address asks for the recipient and uses the
+existing sponsored ERC-4337 flow, followed by fee review and explicit
+confirmation. Legacy balances retain their compatible withdrawal route.
+Prepared withdrawals retain their original signer and fee authorization, and
+changing the destination discards an obsolete quote. Internal protocol version
+identifiers, trusted deployment profiles and contract addresses are unchanged.
+
+The complete release gate passed on these exact merged commits: 1,906
+application tests, 2,739 payment tests (10 existing skips), 89 Chromium fault
+scenarios, 708 commercial unit tests, and all four build/artifact suites.
+Independent review passed 133 focused tests. Browser checks covered version
+help with mouse and keyboard, narrow-screen layout, destination validation,
+sponsored fee review, legacy withdrawal behavior and relay failure. These UI
+withdrawal checks used synthetic balances; they did not submit a new funded
+withdrawal. The live staging wallet entry and Sepolia access dialog also loaded.
+
+Vercel deployment `dpl_BVRMXXjbfDde2Lw3r9E2y3zXG167` was promoted to the
+dedicated `oa-staging-main` project. Canonical staging checks passed for the
+frontend/oa-chat commit identities, all four balance profiles and asset hashes,
+the public deployment manifest, protocol health, supported EntryPoint and
+legacy protocol route. Production app manifests and configuration bytes matched
+the pre-release snapshot.
+
+An existing Tenderly public RPC outage had left the revision-4 indexer and
+signer unhealthy before promotion. Only their RPC URLs were changed to the free
+public `https://rpc.sepolia.ethpandaops.io` endpoint. Validation checked Sepolia
+chain identity, matching block hashes, EIP-1898 vault reads, deployed bytecode,
+1,000- and 10,000-block log queries, and known deposit/closure events. Protected
+backups were saved on the staging host. Existing cursors, confirmation depths,
+freshness checks, keys and fee policies were retained. Only the two affected
+containers were recreated; all 42 other container identities and start times
+were unchanged. The indexer caught up, the server reported `indexer_root:
+agrees`, both containers became healthy, and challenger health reported no
+alarms or outstanding obligations. The free public provider remains a shared
+service without a dedicated capacity guarantee.
+
+The protocol main update includes PR #30 and PR #31 by fast-forward. Its final
+validation commit includes `[preserve-deployments]` so the tracked docs-site
+Vercel ignore command skips the automatic production documentation deployment.
+No production app or mainnet deployment is part of this release.
