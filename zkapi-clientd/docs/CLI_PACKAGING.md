@@ -40,7 +40,8 @@ OpenSSL 3, libgcc and CA certificates.
 Each client release includes generated platform package metadata pinned to its
 native bundles. Each bundle contains the client, wallet companion, and
 deployment-pinned proof assets, with SHA-256 checks for every supported archive.
-The checked-in package pins are promoted after publication verifies all artifacts.
+The checked-in manifests are a snapshot for source-checkout installs; public
+package repositories are updated independently by the publication workflow.
 
 | Platform | Package | Background service |
 | --- | --- | --- |
@@ -56,9 +57,16 @@ before starting its service so they do not compete for the same wallet or port.
 Package installation does not fund or initialize a wallet. An unconfigured
 service either remains stopped (Nix modules) or exits with configuration guidance.
 
-The AUR handoff and Homebrew formula are ready to copy into their respective
-package repositories; adding them here does not publish an AUR entry or a public
-Homebrew tap. The Nix flake can be used directly from this checkout.
+The [publication workflow](../../.github/workflows/zkapi-clientd-publish.yml)
+updates AUR, a configured Homebrew tap, and the `clientd-packages` Nix branch
+when a client release is published. Initial credentials and the tap repository
+must be configured as described under [Publishing packages](#publishing-packages).
+The standalone Nix flake is also published as a release asset and can be used
+without a package-registry submission.
+
+Publishing makes an upgrade available; it does not change installations or
+restart users' wallets. Stop the daemon, upgrade with the package manager,
+then start it again. On NixOS, update the flake input and rebuild the system.
 
 ## Wallet storage and updates
 
@@ -132,8 +140,8 @@ libgcc and CA certificates. Local source builds use the host platform's ABI.
 The client release namespace is `clientd-vMAJOR.MINOR.PATCH`, separate from
 operator/SDK releases. The client release workflow assembles checksum-pinned
 installers and native archives, Homebrew/AUR/Nix metadata, and Linux packages,
-then creates a draft release for publication. Homebrew taps and AUR packages
-are not automatically published. Publish a client prerelease only after the
+then creates a draft release for publication. Publishing that draft triggers
+the separate package-publication workflow. Publish a client prerelease only after the
 native, installer and package validation jobs succeed.
 
 This release line serves the concession-exit vault. Its warnings send owners
@@ -144,7 +152,7 @@ any other version until that release is published and its checksum record,
 `zkapi-clientd/packaging/releases/clientd-0.1.7.json`, is checked in here;
 `--fixture` skips the check for test fixtures only.
 
-After publishing a release, add its tag and four native archive hashes to
+To refresh the source-checkout snapshot after a release, add its tag and four native archive hashes to
 `zkapi-clientd/packaging/releases/clientd-VERSION.json`, then refresh the
 installable manifests from the templates and pinned hashes:
 
@@ -153,8 +161,12 @@ python3 zkapi-clientd/scripts/sync-packages.py 0.1.6
 python3 zkapi-clientd/scripts/sync-packages.py 0.1.6 --check
 ```
 
-Run these commands from the repository root. Update the version in the package
-check workflow when promoting a new release. Release assembly independently
+The publication helper's verified `release.json` already contains this record
+and can be copied to that path. Refreshing the source snapshot is optional for
+live AUR, Homebrew, and Nix distribution-branch updates.
+
+Run these commands from the repository root. The package check workflow reads
+the version from the checked-in PKGBUILD. Release assembly independently
 hashes the native archives; the checked-in Nix package never overrides the new
 release's generated package.
 
@@ -175,6 +187,136 @@ fetches the pinned commit from there, and rebuilds and reviews of a release
 must be able to fetch exactly it. A local, unpushed pin serves development and
 CI from a checkout that holds it, never a release. Proving assets remain
 deployment-pinned; never regenerate them for installation.
+
+## Publishing packages
+
+The tag workflow builds and validates all four native bundles and the platform
+packages before creating a draft. Publish the draft in GitHub Releases to
+promote those exact artifacts. `zkapi-clientd-publish.yml` listens for the
+`release: published` event, including numeric client tags marked prerelease.
+Other release namespaces are ignored. It downloads the exact tag's native
+archives, packaging tarball, standalone Nix flake, and checksums; verifies their
+hashes, payloads, versions, and package metadata; then publishes each platform
+independently. It neither rebuilds a published binary nor edits a release asset.
+
+The workflow and scripts must first be merged into the default branch. Add the
+following GitHub Actions configuration in `ethereum/zkapi`:
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `CLIENTD_AUR_SSH_KEY` | Secret | Unencrypted dedicated Ed25519 private key registered with the AUR maintainer account |
+| `CLIENTD_HOMEBREW_TAP` | Variable | Initialized public repository such as `ethereum/homebrew-zkapi` |
+| `CLIENTD_HOMEBREW_TOKEN` | Secret | Fine-grained token with Contents read/write on that tap repository only |
+
+The Nix publisher uses the workflow's repository-scoped `GITHUB_TOKEN` with
+Contents write permission to maintain `clientd-packages`. Allow that branch to
+receive automation commits; rules requiring pull requests or signed commits on
+it need an appropriate exception. No default-branch commits are required.
+The AUR host key is pinned in `packaging/arch/aur_known_hosts`; verify a host-key
+rotation with Arch Linux before updating that file.
+
+For initial publication or a retry after configuring credentials:
+
+```sh
+gh workflow run zkapi-clientd-publish.yml --repo ethereum/zkapi \
+  -f release_tag=clientd-v0.1.6
+```
+
+Successful publishers are safe to retry. Each refuses to replace a newer
+package with an older release or overwrite different content at the same
+version. To repair packaging for an existing version, first review and publish
+an explicit packaging revision; do not use this release promoter to replace it.
+Different releases are serialized. Missing AUR or Homebrew configuration makes
+that platform fail visibly while the independent platforms can still publish.
+
+The same operations are available locally:
+
+```sh
+python3 zkapi-clientd/scripts/publish-packages.py prepare clientd-v0.1.6 /tmp/clientd-release
+git -c init.defaultBranch=master clone \
+  ssh://aur@aur.archlinux.org/zkapi-clientd-bin.git /tmp/clientd-aur
+python3 zkapi-clientd/scripts/publish-packages.py publish aur /tmp/clientd-release /tmp/clientd-aur
+```
+
+`publish homebrew` expects a checkout of the tap's default branch; `publish nix`
+expects a checkout of `clientd-packages` (an initially empty orphan branch).
+`publish ... --dry-run` stages the concrete files for inspection without
+committing or pushing. Use a clean, disposable checkout for this operation.
+
+### Arch Linux / AUR
+
+Register the dedicated public SSH key in the AUR account settings. Browser
+sign-in alone does not authorize Git pushes. Test it with
+`ssh -i /path/to/key -o IdentitiesOnly=yes aur@aur.archlinux.org list-repos`.
+Then store the private key without printing it:
+
+```sh
+gh secret set CLIENTD_AUR_SSH_KEY --repo ethereum/zkapi < /path/to/key
+```
+
+The first push of `PKGBUILD`, `.SRCINFO`, and the packaging license to
+`ssh://aur@aur.archlinux.org/zkapi-clientd-bin.git` on `master` creates the AUR
+entry. The account must own the package or be a co-maintainer if it exists.
+Subsequent release pushes update its version and hashes. The `-bin` suffix
+identifies installation from upstream native binaries. Users can then install
+with an AUR helper such as `yay -S zkapi-clientd-bin` and use the included
+systemd user unit. AUR contains build recipes; users' helpers build the Arch
+package locally. See the [AUR submission guidelines](https://wiki.archlinux.org/title/AUR_submission_guidelines).
+
+### Homebrew
+
+Create an initialized public tap repository in the chosen owner namespace:
+
+```sh
+gh repo create OWNER/homebrew-zkapi --public --add-readme
+gh variable set CLIENTD_HOMEBREW_TAP --repo ethereum/zkapi --body OWNER/homebrew-zkapi
+# Read the tap-scoped token from a private file or the interactive prompt.
+gh secret set CLIENTD_HOMEBREW_TOKEN --repo ethereum/zkapi
+```
+
+The organization may require an owner to create the repository or approve the
+token. Run the publication workflow once, then users can install and start it:
+
+```sh
+brew install OWNER/zkapi/zkapi-clientd
+zkapi-clientd config
+brew services start OWNER/zkapi/zkapi-clientd
+```
+
+`brew update` fetches new formula versions; `brew upgrade zkapi-clientd` installs
+them. The formula uses the native bundles built in the release pipeline, so a
+separate Homebrew bottle build is unnecessary. This is a third-party tap; a
+`homebrew/core` listing is a separate reviewed submission, and this binary
+formula needs a source-build implementation for core's acceptance rules.
+See [tap publication](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap)
+and [acceptable formulae](https://docs.brew.sh/Acceptable-Formulae).
+
+### Nix and NixOS
+
+No account or registry submission is required for the public flake. After the
+first publication run, install from the maintained distribution branch:
+
+```sh
+nix profile install github:ethereum/zkapi/clientd-packages#zkapi-clientd
+```
+
+For NixOS or Home Manager, set
+`inputs.zkapi-clientd.url = "github:ethereum/zkapi/clientd-packages";` and import
+the appropriate service module as described in [the Nix guide](../packaging/nix/README.md).
+Run `nix flake update zkapi-clientd`, then `nixos-rebuild switch --flake .` or
+`home-manager switch --flake .` to adopt a new release. For a profile install,
+use the entry's name from `nix profile list` with `nix profile upgrade NAME`.
+An exact release asset remains available for reproducible version pinning:
+
+```sh
+nix profile install 'https://github.com/ethereum/zkapi/releases/download/clientd-v0.1.6/zkapi-clientd-nix.tar.gz#zkapi-clientd'
+```
+
+Adding the package and service to Nixpkgs/NixOS's built-in catalog requires a
+separate upstream pull request, a maintainer entry, package and module review,
+and NixOS service tests. The flake supports installation and release updates
+without waiting for that review. See [contributing to Nixpkgs](https://github.com/NixOS/nixpkgs/blob/master/CONTRIBUTING.md)
+and [Nix profile upgrades](https://nix.dev/manual/nix/stable/command-ref/new-cli/nix3-profile-upgrade).
 
 ## Checks
 

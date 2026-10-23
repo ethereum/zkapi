@@ -1,0 +1,131 @@
+name: zkAPI client daemon package publication
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Already published clientd-vMAJOR.MINOR.PATCH release to publish or retry'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Serialize different versions as well as retries. Each publisher also rejects
+# downgrades, since GitHub does not guarantee the order of queued runs.
+concurrency:
+  group: zkapi-clientd-package-publication
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'clientd-v')
+    runs-on: ubuntu-24.04
+    outputs:
+      harness_commit: ${{ steps.harness.outputs.commit }}
+    steps:
+      # The publication harness lives on the default branch so a retry can use
+      # fixes without rebuilding or modifying the immutable tagged release.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Pin the publication harness for every publisher
+        id: harness
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Download and verify the published package payloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        run: python3 zkapi-clientd/scripts/publish-packages.py prepare "$RELEASE_TAG" release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-clientd-packages
+          path: release/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  nix:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.harness_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-clientd-packages
+          path: release
+      - name: Publish the Nix flake to the clientd-packages branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh auth setup-git
+          git init -b clientd-packages nix-repo
+          git -C nix-repo remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          if git -C nix-repo ls-remote --exit-code origin refs/heads/clientd-packages; then
+            git -C nix-repo fetch --depth=1 origin clientd-packages
+            git -C nix-repo checkout -B clientd-packages FETCH_HEAD
+          fi
+          python3 zkapi-clientd/scripts/publish-packages.py publish nix release nix-repo
+
+  aur:
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.harness_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-clientd-packages
+          path: release
+      - name: Publish zkapi-clientd-bin to the AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.CLIENTD_AUR_SSH_KEY }}
+        shell: bash
+        run: |
+          if [[ -z "$AUR_SSH_KEY" ]]; then
+            echo '::error::Set CLIENTD_AUR_SSH_KEY and register its public key in the AUR account first.'
+            exit 1
+          fi
+          key="$RUNNER_TEMP/clientd-aur-key"
+          trap 'rm -f "$key"' EXIT
+          umask 077
+          printf '%s\n' "$AUR_SSH_KEY" > "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$GITHUB_WORKSPACE/zkapi-clientd/packaging/arch/aur_known_hosts"
+          git -c init.defaultBranch=master clone ssh://aur@aur.archlinux.org/zkapi-clientd-bin.git aur-repo
+          python3 zkapi-clientd/scripts/publish-packages.py publish aur release aur-repo
+
+  homebrew:
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.harness_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-clientd-packages
+          path: release
+      - name: Publish the Homebrew tap formula
+        env:
+          GH_TOKEN: ${{ secrets.CLIENTD_HOMEBREW_TOKEN }}
+          TAP_REPOSITORY: ${{ vars.CLIENTD_HOMEBREW_TAP }}
+        shell: bash
+        run: |
+          if [[ -z "$GH_TOKEN" || ! "$TAP_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/homebrew-[A-Za-z0-9_.-]+$ ]]; then
+            echo '::error::Set CLIENTD_HOMEBREW_TAP to OWNER/homebrew-zkapi and CLIENTD_HOMEBREW_TOKEN to a token with Contents write access to that tap.'
+            exit 1
+          fi
+          gh auth setup-git
+          git clone "https://github.com/$TAP_REPOSITORY.git" homebrew-repo
+          python3 zkapi-clientd/scripts/publish-packages.py publish homebrew release homebrew-repo
