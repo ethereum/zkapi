@@ -26,6 +26,23 @@ requests. Stop `serve`, run `zkapi-clientd config --web-search=false`, then
 restart `serve` to disable automatic search. Explicit `:online` model requests
 still enable search. The saved preference is preserved across updates.
 
+Optional leCore context recall is disabled by default. When explicitly enabled
+with `zkapi-clientd config --lecore-context-recall`, it selects context locally
+from messages already present in the current completion request. For long,
+plain-text chats, it may omit less relevant older messages while preserving
+recent turns. It leaves requests unchanged when conservative matching criteria are not met,
+including tool or multimodal requests and detected whole-history questions.
+Lexical matching can miss relevant older content, so an enabled result may differ
+from full-context inference.
+Recall makes no additional network request and does not create prompt or
+response logs. The final request still goes to the inference provider; the
+provider sees the retained content and bills its token usage under the normal
+zkAPI lease. The option does not change key verification, lease settlement, or
+wallet recovery. It cannot recall messages the client omitted, and its selection
+may alter model output and token usage. Stop `serve`, run
+`zkapi-clientd config --lecore-context-recall=false`, and restart to disable it;
+keep the same `--config-dir` if one was set.
+
 Direct HTTPS is the default. It exposes the source IP to destination services
 and uses local DNS, so network timing/IP can correlate activity even though
 credential issuance is unlinkable. Optional Wisp carries destination TLS with

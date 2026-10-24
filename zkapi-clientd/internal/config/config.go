@@ -88,10 +88,11 @@ type Config struct {
 	Listen                string `json:"listen"`
 	APIKey                string `json:"api_key"`
 	KeyReuseWindowSeconds int    `json:"key_reuse_window_seconds"`
-	WebSearch             bool   `json:"web_search"`        // automatically enable OpenRouter web search for chat completions
-	RequireAPIKey         bool   `json:"require_api_key"`   // opt in to bearer authentication for loopback inference
-	Backend               string `json:"backend"`           // fixed to zkapi; retained for existing profile compatibility
-	OrgURL                string `json:"org_url,omitempty"` // legacy profile field; unused
+	LeCoreContextRecall   bool   `json:"lecore_context_recall"` // opt in to local context retrieval before paid inference
+	WebSearch             bool   `json:"web_search"`            // automatically enable OpenRouter web search for chat completions
+	RequireAPIKey         bool   `json:"require_api_key"`       // opt in to bearer authentication for loopback inference
+	Backend               string `json:"backend"`               // fixed to zkapi; retained for existing profile compatibility
+	OrgURL                string `json:"org_url,omitempty"`     // legacy profile field; unused
 	VerifierURL           string `json:"verifier_url"`
 	RelayURL              string `json:"relay_url"` // empty: direct; wss: Wisp; socks5: proxy; tor: conversation isolation
 	Concurrency           int    `json:"concurrency"`

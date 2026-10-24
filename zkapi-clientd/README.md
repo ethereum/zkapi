@@ -138,6 +138,31 @@ For a fresh key per inference request, stop `serve`, run
 With reuse disabled, settlement starts after each response. Fresh keys may wait
 for the previous key's settlement.
 
+## Optional local context recall
+
+Context recall is off by default. To let leCore select relevant context from
+the conversation already sent to the local API, stop `serve`, run
+`zkapi-clientd config --lecore-context-recall`, then restart `serve`. Run
+`zkapi-clientd config --lecore-context-recall=false` and restart to turn it off.
+Use the same `--config-dir` for each command if you selected one.
+
+The recall step runs locally and adds no network request of its own. For long,
+plain-text chats, it can keep relevant older messages and the recent turns while
+omitting other older messages. The final prompt still goes to the inference
+provider under the usual paid zkAPI lease. Provider usage and settlement still
+apply; token usage and cost can differ. The daemon does not add prompt or
+response logging for this option. Recall uses only content included in the
+current API request, so it cannot recover messages a client omitted. It leaves
+requests unchanged when the conservative matching criteria are not met, including
+tool or multimodal requests and detected whole-conversation questions. Recall
+can miss relevant context, so an enabled result may differ from full-context inference.
+
+Project links: [OpenZoo](https://openzoo.fun/), the
+[pinned leCore revision](https://github.com/AnOversizedMooseWithSocks/leCore/commit/5cef1aec),
+and the [historical DHH demo](https://ttfx-three.vercel.app/). These are
+background references. This integration has no controlled counterfactual
+benchmark and makes no performance, cost-saving, or answer-quality claim.
+
 To update this branch, stop `serve`, rebuild both engines as documented, and
 restart using the same profile. Do not replace a live wallet or proving setup.
 See [wallet storage and updates](docs/CLI_PACKAGING.md#wallet-storage-and-updates).
