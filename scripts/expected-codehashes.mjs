@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Expected runtime codehashes of a zkAPI deployment (vault revision 3), computed from the
+// Expected runtime codehashes of a zkAPI deployment (vault revision 4), computed from the
 // pinned-compiler Forge artifacts alone: the vault's deployedBytecode with its immutableReferences
 // filled from the constructor arguments (the Poseidon runtime's address among them; the vault links
 // no library), the adapter's deployedBytecode with its immutables filled from the vault, the chain
@@ -10,8 +10,8 @@
 // the paymaster's, the transit-account factory's and the account logic's deployedBytecode with
 // their immutables filled the same way, and the two canonical ERC-4337 v0.7.0 runtimes (the
 // EntryPoint and its SenderCreator), which are pinned constants. Anyone can rebuild the artifacts
-// from source (protocol/contracts/foundry.toml pins solc, via_ir (off for the Poseidon runtime),
-// 10,000 runs, bytecode_hash "none" and cbor_metadata false) and audit a deployment. The manifest
+// from source (demo/contracts/foundry.toml pins solc, via_ir (off for the Poseidon runtime),
+// the optimizer profiles, bytecode_hash "none" and cbor_metadata false) and audit a deployment. The manifest
 // keeps the field names poseidonLibrary, poseidonLibraryReused and poseidonRuntimeCodehash: they
 // name the Poseidon runtime contract now.
 //
@@ -25,8 +25,10 @@
 //      --wei-per-unit 1000000000 --creation-code-keccak 0x..]
 //
 // --deployment reads Deploy.s.sol's manifest; flags override its fields. --artifacts DIR selects
-// the Forge out directory (default protocol/contracts/out). --check compares the result with the
-// manifest's recorded codehashes, and --rpc URL with eth_getCode at the manifest's addresses (the
+// the Forge out directory (default demo/contracts/out, the Deploy.s.sol build). The standalone
+// protocol artifacts use different optimizer profiles and need an explicit --artifacts override.
+// --check compares the result with the manifest's recorded codehashes, and --rpc URL with
+// eth_getCode at the manifest's addresses (the
 // EntryPoint's and SenderCreator's included); any mismatch exits 1. Prints JSON; integers wider
 // than 2^53 - 1 print as decimal strings.
 //
@@ -922,7 +924,7 @@ const FLAGS = {
 };
 
 function parseArgs(argv) {
-    const args = { artifacts: join(ROOT, 'protocol/contracts/out'), inputs: {}, check: false, confirmations: 1 };
+    const args = { artifacts: join(ROOT, 'demo/contracts/out'), inputs: {}, check: false, confirmations: 1 };
     for (let i = 0; i < argv.length; i++) {
         const flag = argv[i];
         const next = () => argv[++i] ?? fail(`${flag} needs a value`);

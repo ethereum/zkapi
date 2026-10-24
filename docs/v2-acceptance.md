@@ -123,12 +123,13 @@ with `evm_increaseTime`. Both daemons' startup checks hold for them
 
 A time skip moves only block time. The daemons and clients keep the wall
 clock, and clients bound exit proofs by it (valid for 3 hours). The chain
-therefore starts two challenge periods behind the wall clock, so that block
-time meets it when the bounded pause ends. That is just before the
-missed-defeat drill: the challenger counts a miss only for evidence written
-(wall clock) before the escape's deadline (block time).
+starts 3,540 seconds behind the wall clock, within the drill server's
+explicit 3,600-second root staleness limit. The bounded pause moves block
+time past the wall clock before the missed-defeat drill: the challenger
+counts a miss only for evidence written (wall clock) before the escape's
+deadline (block time).
 
-From then on block time runs at most one period ahead, and two at the end. An
+Later skips keep block time less than three periods ahead. An
 SDK that must judge a chain deadline (to finalize) gets its device clock moved
 to block time. The SDK whose operator withholds gets its clock moved to the
 settlement time `T` it reports. In the late-successor drill, the last before

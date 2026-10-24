@@ -72,16 +72,15 @@ export const TIMING = Object.freeze({
     raiseLead: 1_200,
 });
 // Skipping a challenge period moves only block time; the daemons' and
-// clients' clocks stay on the wall clock. The chain starts this far behind
-// it, so that block time and the wall clock meet when the bounded pause ends
-// (two skipped periods), before the missed-defeat drill: the challenger
-// counts a miss only for server evidence written (wall clock) before the
-// escape's deadline (block time). From there block time runs at most one
-// challenge period ahead, well within the 3 h validity of every exit proof
-// (which clients bound by the wall clock); an SDK judging a deadline then
-// gets its device clock moved to block time.
-const CHAIN_LAG_SECONDS = 2 * TIMING.challengePeriod;
-const MAX_CHAIN_LEAD_SECONDS = 2 * TIMING.challengePeriod;
+// clients' clocks stay on the wall clock. Start less than an hour behind,
+// within serverd's maximum root staleness (3,600 s), with 60 s of slack.
+// The bounded pause advances block time past the wall clock before the
+// missed-defeat drill, so its evidence predates the escape's deadline.
+// Later skips still fit within the 3 h validity of exit proofs; an SDK
+// judging a deadline gets its device clock moved to block time.
+export const ROOT_MAX_STALENESS_SECONDS = 3_600;
+export const CHAIN_LAG_SECONDS = ROOT_MAX_STALENESS_SECONDS - 60;
+const MAX_CHAIN_LEAD_SECONDS = 3 * TIMING.challengePeriod;
 const INDEXER_CONFIRMATIONS = 2;
 // Challenger fee policy: the daemon proposes both EIP-1559 fees within these
 // caps; the signer enforces its own copy of them.
@@ -1138,7 +1137,8 @@ async function main() {
             '--openrouter-settlement-poll-seconds', String(TIMING.settlementPoll),
             '--openrouter-settlement-deadline-seconds', String(TIMING.settlementDeadline),
             '--deployment', manifest, '--native-billing-rpc-url', pinnedRpcUrl, '--native-price-feed-address', feed,
-            '--db-path', db, '--indexer-url', indexerUrl, '--root-poll-interval-ms', '100'];
+            '--db-path', db, '--indexer-url', indexerUrl, '--root-poll-interval-ms', '100',
+            '--root-max-staleness-seconds', String(ROOT_MAX_STALENESS_SECONDS)];
         // Each refused start uses its own database path and must exit non-zero.
         async function refusedStart(label, env, refusal, argsFor = (port, db) => serverArgs(port, db)) {
             const db = path.join(runDir, `refused-${label}.db`);

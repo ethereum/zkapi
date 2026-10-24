@@ -4,7 +4,7 @@
 // without the gasless-withdrawal paymaster, whose runtime code (and the factory's and the account
 // logic's) it derives from the artifacts the same way as the vault's, and the adapter's, whose
 // folded points it sums on BN254 as the EVM's precompiles do.
-// Run with: node --test demo/contracts/test/*.test.mjs (after forge build in protocol/contracts
+// Run with: node --test demo/contracts/test/*.test.mjs (after forge build in demo/contracts
 // for the codehash cases).
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -42,7 +42,7 @@ import {
 } from '../../../scripts/expected-codehashes.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const ARTIFACTS = join(ROOT, 'protocol/contracts/out');
+const ARTIFACTS = join(ROOT, 'demo/contracts/out');
 const FIXTURES = join(ROOT, 'protocol/contracts/test/fixtures');
 
 // A Baby-JubJub subgroup point whose y lies between 2^63 and 2^64 and is odd, so no double holds it.
@@ -102,7 +102,7 @@ test('the vault immutables include minDeposit (revision 4), bounded as the const
     assert.throws(() => vaultImmutables({ ...inputs, minDeposit: 9007199254740992n }), /minDeposit must be 1 to 2\^53 - 1/);
 });
 
-test('a bare wide key and its decimal string give the same codehashes', { skip: !existsSync(ARTIFACTS) && 'run forge build in protocol/contracts first' }, () => {
+test('a bare wide key and its decimal string give the same codehashes', { skip: !existsSync(ARTIFACTS) && 'run forge build in demo/contracts first' }, () => {
     const bare = expectedCodehashes(ARTIFACTS, parseDeployment(manifest(WIDE_Y_Y)));
     const quoted = expectedCodehashes(ARTIFACTS, parseDeployment(manifest(`"${WIDE_Y_Y}"`)));
     assert.deepEqual(bare, quoted);
@@ -113,7 +113,7 @@ test('a bare wide key and its decimal string give the same codehashes', { skip: 
 
 // ------------------------------------------------------------------ finalizing a broadcast
 
-const NO_ARTIFACTS = !existsSync(ARTIFACTS) && 'run forge build in protocol/contracts first';
+const NO_ARTIFACTS = !existsSync(ARTIFACTS) && 'run forge build in demo/contracts first';
 const POSEIDON = '0x5fbdb2315678afecb367f032d93f642f64180aa3';
 const ADAPTER = '0xe7f1725e7734ce288f8367e1bb143e90bb3f0512';
 const VAULT = '0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0';
@@ -648,9 +648,12 @@ test('--check re-audits every recorded codehash, the gasless ones included', { s
         const script = join(ROOT, 'scripts/expected-codehashes.mjs');
         writeFileSync(join(dir, 'clean.json'), JSON.stringify(deployment));
         writeFileSync(join(dir, 'wrong.json'), JSON.stringify(recorded));
-        const ok = spawnSync(process.execPath, [script, '--artifacts', ARTIFACTS, '--deployment', join(dir, 'clean.json'), '--check'], { encoding: 'utf8' });
+        // The CLI must default to the deployment build, whose optimizer profiles differ from
+        // protocol/contracts/out. Run outside the repository to check path resolution too.
+        const ok = spawnSync(process.execPath, [script, '--deployment', join(dir, 'clean.json'), '--check'], { cwd: dir, encoding: 'utf8' });
         assert.equal(ok.status, 0, ok.stderr);
         const report = JSON.parse(ok.stdout);
+        assert.equal(report.artifacts, ARTIFACTS);
         assert.deepEqual(report.mismatches, []);
         assert.equal(report.paymaster_runtime_codehash, deployment.paymasterRuntimeCodehash);
         assert.equal(report.sender_creator_runtime_codehash, SENDER_CREATOR_V070_CODEHASH);

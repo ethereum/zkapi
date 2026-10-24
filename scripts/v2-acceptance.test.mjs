@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
-    CHAIN_ID, CIRCUIT_ID, INFERENCE_CHARGE, MIN_DEPOSIT, SDK_REQUEST_BOUND, TIMING, challengeFees, defaultFreshSlotGas, drillTiming,
+    CHAIN_ID, CHAIN_LAG_SECONDS, CIRCUIT_ID, INFERENCE_CHARGE, MIN_DEPOSIT, ROOT_MAX_STALENESS_SECONDS, SDK_REQUEST_BOUND, TIMING, challengeFees, defaultFreshSlotGas, drillTiming,
     gasLedger, gaslessProfile, localJSON, mockOaOrg, isProfileBundlerUrl, mockProvider, noteFields, proxyAuthorized, proxyJsonRpc, trustedDeployment,
 } from './v2-acceptance.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
@@ -169,6 +169,15 @@ test('drill timing passes serverd\'s and zkapi-challenged\'s startup checks, and
     // SDK request ($1 limit) fixes a bound of 400,000 gwei.
     assert.equal(INFERENCE_CHARGE, 400);
     assert.equal(SDK_REQUEST_BOUND, 400_000);
+});
+
+test('the drill chain stays within root freshness at startup and proof validity after its time skips', () => {
+    assert.ok(CHAIN_LAG_SECONDS + 60 <= ROOT_MAX_STALENESS_SECONDS);
+    assert.ok(ROOT_MAX_STALENESS_SECONDS <= 3_600, 'serverd caps the root staleness setting at one hour');
+    const leadAfterPause = TIMING.maxPauseDuration - CHAIN_LAG_SECONDS;
+    assert.ok(leadAfterPause >= 0, 'missed-defeat evidence must predate the escape deadline');
+    assert.ok(leadAfterPause + TIMING.challengePeriod + 1_530 < 10_800,
+        'the pause, finalization and late-successor skips fit within the exit proof validity');
 });
 
 test('note fields pack (n, D, e) into word 8 as the vault and the circuit do', () => {

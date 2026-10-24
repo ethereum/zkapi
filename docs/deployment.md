@@ -453,8 +453,9 @@ creation code followed by the same five ABI-encoded addresses.
 The paymaster uses 200 optimizer runs to fit EIP-170. Foundry applies that
 profile to its importers and dependencies, so the demo deployment compilation
 unit also produces the vault, adapter, factory and account with 200 runs.
-Always finalize and audit this deployment with `--artifacts demo/contracts/out`;
-the standalone protocol artifacts can contain different compiler profiles.
+Finalization and audits default to `demo/contracts/out`, the deployment build;
+`--artifacts DIR` selects another build explicitly. The standalone protocol
+artifacts can contain different compiler profiles.
 Poseidon's separately verified compiler profile is unchanged. Live measurements
 use the actual demo artifacts, with conditions recorded in
 `protocol/contracts/snapshots/sepolia-gasless-gas.json`.
