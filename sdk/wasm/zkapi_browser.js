@@ -1,10 +1,19 @@
 /* @ts-self-types="./zkapi_browser.d.ts" */
 
 /**
- * The note tree rebuilt from vault logs (§6.6): `apply` one event, in log
- * order, and compare the returned root with the event's.
+ * The vault's note tree for request paths: `from_state` with the
+ * vault's leaves, `nextNoteId()` and `currentRoot()` read at one block
+ * hash, or `new` and `apply` one event at a time in log order, then
+ * compare `root` with `currentRoot()` at the last event's block.
  */
 export class BrowserNoteTree {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(BrowserNoteTree.prototype);
+        obj.__wbg_ptr = ptr;
+        BrowserNoteTreeFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
@@ -39,6 +48,22 @@ export class BrowserNoteTree {
         } finally {
             wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
         }
+    }
+    /**
+     * The tree of a `TreeSnapshot` (JSON `{root, next_note_id, leaves}`)
+     * read from the vault at one block hash; refused with
+     * `tree_root_mismatch` unless the leaves reproduce the root.
+     * @param {string} snapshot_json
+     * @returns {BrowserNoteTree}
+     */
+    static from_state(snapshot_json) {
+        const ptr0 = passStringToWasm0(snapshot_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.browsernotetree_from_state(ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return BrowserNoteTree.__wrap(ret[0]);
     }
     constructor() {
         const ret = wasm.browsernotetree_new();
@@ -285,21 +310,66 @@ export function browser_generate_deposit() {
 }
 
 /**
- * Whether `{active_root, siblings}` (JSON) is a path of the state's note.
+ * The state's note leaf (JSON felt): the vault's stored leaf for the
+ * note, which every exit statement binds.
  * @param {string} state_json
- * @param {string} path_json
- * @returns {boolean}
+ * @returns {string}
  */
-export function browser_note_path_matches(state_json, path_json) {
-    const ptr0 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(path_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.browser_note_path_matches(ptr0, len0, ptr1, len1);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
+export function browser_note_leaf(state_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.browser_note_leaf(ptr0, len0);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
     }
-    return ret[0] !== 0;
+}
+
+/**
+ * The leaf of a deposit from its public fields (JSON felt), for
+ * recovery against `noteRecord(note_id).leaf`: `commitment` is the
+ * registration commitment in hex, `amount` and `expiry_ts` decimal or
+ * 0x-hex strings.
+ * @param {number} note_id
+ * @param {string} commitment
+ * @param {string} amount
+ * @param {string} expiry_ts
+ * @returns {string}
+ */
+export function browser_note_leaf_from_fields(note_id, commitment, amount, expiry_ts) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(commitment, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(amount, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(expiry_ts, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.browser_note_leaf_from_fields(note_id, ptr0, len0, ptr1, len1, ptr2, len2);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
 }
 
 /**

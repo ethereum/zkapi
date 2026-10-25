@@ -42,15 +42,21 @@ pub const DEFEAT_SELECTOR: [u8; 4] = [0xda, 0x0c, 0xe4, 0x3d];
 /// nullifier.
 pub const RAISE_SIGNATURE: &str = "raiseEscapeConcession(uint32,(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256),bytes,uint128)";
 pub const RAISE_SELECTOR: [u8; 4] = [0xdd, 0x00, 0x64, 0xba];
-/// `retireClosedLeaf(uint32 noteId, uint256[32] siblings)`.
+/// `retireClosedLeaf(uint32 noteId, uint256[32] siblings)`. The vault reads
+/// only `siblings[0..ℓ)`, ℓ = msb(noteId XOR nextNoteId); callers zero-fill
+/// the rest, which keeps the calldata cost of a low-level retirement down
+/// (≤ 42.6k + 28.3k·ℓ gas; measured ≈ 37.7k at ℓ = 0, 152k at ℓ = 4, 259k
+/// at ℓ = 8, 472k at ℓ = 16).
 pub const RETIRE_SIGNATURE: &str = "retireClosedLeaf(uint32,uint256[32])";
 pub const RETIRE_SELECTOR: [u8; 4] = [0xe4, 0x1f, 0x4c, 0x31];
-/// `initiateEscapeWithdrawal(WithdrawalPublicInputs inputs, bytes proof)`.
-pub const ESCAPE_SIGNATURE: &str = "initiateEscapeWithdrawal((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)";
-pub const ESCAPE_SELECTOR: [u8; 4] = [0xa3, 0x8d, 0x62, 0xaa];
+/// `initiateEscapeWithdrawal(WithdrawalPublicInputs inputs, bytes proof)`
+/// (vault revision 4: tuple word 3 is `noteLeaf`, word 8 the uint256
+/// `noteFields`).
+pub const ESCAPE_SIGNATURE: &str = "initiateEscapeWithdrawal((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)";
+pub const ESCAPE_SELECTOR: [u8; 4] = [0x8c, 0xd6, 0x7c, 0x60];
 /// `mutualClose(WithdrawalPublicInputs inputs, bytes proof)`.
-pub const MUTUAL_CLOSE_SIGNATURE: &str = "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)";
-pub const MUTUAL_CLOSE_SELECTOR: [u8; 4] = [0x72, 0xcd, 0x2e, 0x44];
+pub const MUTUAL_CLOSE_SIGNATURE: &str = "mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint256,uint128,address,uint256,uint8,uint256,uint128,uint64),bytes)";
+pub const MUTUAL_CLOSE_SELECTOR: [u8; 4] = [0xbc, 0xe1, 0x2a, 0x6c];
 /// Calldata lengths of the vault calls (§4.2-§4.5).
 pub const DEFEAT_CALLDATA_LEN: usize = 740;
 pub const RAISE_CALLDATA_LEN: usize = 772;
@@ -444,7 +450,7 @@ pub fn withdrawal_calldata(
     }
     address_word(&inputs.contract_address, "withdrawal contract address")?;
     for (value, name) in [
-        (&inputs.active_root, "active root"),
+        (&inputs.note_leaf, "note leaf"),
         (&inputs.state_signing_key_x, "state signing key x"),
         (&inputs.state_signing_key_y, "state signing key y"),
         (&inputs.clearance_signing_key_x, "clearance signing key x"),
@@ -857,7 +863,7 @@ pub(crate) mod tests {
             protocol_version: 2,
             chain_id: 1,
             contract_address: felt("0x00112233445566778899aabbccddeeff00112233"),
-            active_root: felt("0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"),
+            note_leaf: felt("0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"),
             state_signing_key_x: felt(
                 "0x1111111111111111111111111111111111111111111111111111111111111111",
             ),
@@ -870,7 +876,10 @@ pub(crate) mod tests {
             clearance_signing_key_y: felt(
                 "0x0666666666666666666666666666666666666666666666666666666666666666",
             ),
+            // noteFields = pack(2^32 - 1, 2^53 - 1, 2^64 - 1): tuple word 8.
             note_id: u32::MAX,
+            deposit_amount: 9_007_199_254_740_991,
+            expiry_ts: u64::MAX,
             final_balance: 1_000_000_000_000_000_000,
             destination: [0xff; 20],
             withdrawal_nullifier: felt(

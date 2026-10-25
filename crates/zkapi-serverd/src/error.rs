@@ -18,8 +18,22 @@ pub enum ServerError {
     #[error("invalid proof: {0}")]
     InvalidProof(String),
 
+    /// O5': a request's `active_root` is neither the vault's latest root
+    /// nor one the vault replaced within `request_root_grace_seconds`.
+    /// Requests only: clearance checks the note leaf, never a root.
     #[error("stale root: latest is {latest_root}")]
     StaleRoot { latest_root: String },
+
+    /// A clearance ownership proof's `note_leaf` is not the leaf the vault
+    /// stores for its note (`noteRecord(note_id)`; 0 for an unknown or
+    /// retired note).
+    #[error("the ownership proof's note leaf is not the vault's leaf for note {note_id}")]
+    NoteLeafMismatch { note_id: u32 },
+
+    /// The vault's note is not Active (an escape is pending, or it is
+    /// closed): no clearance is signed.
+    #[error("note {note_id} is not active in the vault")]
+    NoteNotActive { note_id: u32 },
 
     #[error("replayed nullifier")]
     Replay,
@@ -77,9 +91,9 @@ pub enum ServerError {
     #[error("OA org rejected the key allowance or duration; recover the saved request")]
     OaKeyPolicyRejected,
 
-    /// O5: the server has no Merkle root on which the indexer and the
-    /// vault's currentRoot() agreed recently enough (or they disagree), so
-    /// it admits no request. Nothing was reserved.
+    /// O5': the server has not read the vault's currentRoot() within
+    /// `root_max_staleness_seconds`, so it admits no request. Nothing was
+    /// reserved. The indexer never causes it.
     #[error("the current Merkle root is unavailable: {0}; retry shortly")]
     RootUnavailable(String),
 
@@ -121,6 +135,8 @@ impl ServerError {
             ServerError::NativeQuoteSuperseded => "native_quote_superseded",
             ServerError::InvalidProof(_) => "invalid_proof",
             ServerError::StaleRoot { .. } => "stale_root",
+            ServerError::NoteLeafMismatch { .. } => "note_leaf_mismatch",
+            ServerError::NoteNotActive { .. } => "note_not_active",
             ServerError::Replay => "replay",
             ServerError::NoteExpired => "note_expired",
             ServerError::Internal(_) => "internal_error",
@@ -149,6 +165,10 @@ impl ServerError {
             ServerError::NativeQuoteExpired => true,
             ServerError::NativeQuoteSuperseded => false,
             ServerError::StaleRoot { .. } => true,
+            // The stored leaf of a note never changes while it is Active.
+            ServerError::NoteLeafMismatch { .. } => false,
+            // A pending escape or a closed note does not become Active again.
+            ServerError::NoteNotActive { .. } => false,
             ServerError::Internal(_) => true,
             ServerError::Database(_) => true,
             // Only an operator's repair of the row changes the answer.

@@ -6,7 +6,8 @@ import init, {
     browser_complete_response,
     browser_confirm_deposit,
     browser_generate_deposit,
-    browser_note_path_matches,
+    browser_note_leaf,
+    browser_note_leaf_from_fields,
     browser_prepare_withdrawal,
     browser_setup_id,
     browser_successor_nullifier,
@@ -20,7 +21,7 @@ import init, {
 // The statement this worker proves; the setup comes from the bundle and must
 // equal the build-pinned profile's setup_id (checked by the runtime through
 // the 'identity' operation).
-export const WORKER_CIRCUIT_ID = 'zkapi-v2-concession-v1';
+export const WORKER_CIRCUIT_ID = 'zkapi-v2-concession-v2';
 const KNOWN_SETUP_IDS = ['dev', 'mpc-1'];
 
 let initialized = null;
@@ -107,37 +108,43 @@ function parse(result) {
     return JSON.parse(result);
 }
 
-function sameFelt(left, right) {
-    try {
-        return BigInt(left) === BigInt(right);
-    } catch {
-        return false;
-    }
-}
-
 /**
- * Rebuild the vault's note tree from its logs (design §6.6): apply each
- * leaf-changing event in log order and require the computed root to equal
- * the event's own root; every other root-bearing event ('root_check') must
- * report the current computed root. Returns the note's path at the last root.
+ * A request path from the vault's logs (the fallback of the state rebuild):
+ * apply each leaf-changing event in log order and return the note's path at
+ * the rebuilt root, which the caller compares with the vault's currentRoot()
+ * at the logs' last block (no event carries a root since vault revision 4).
  */
-function rebuildTreePath(events, noteId) {
+function treePathFromEvents(events, noteId) {
     if (!Array.isArray(events) || !events.length) throw new Error('The tree rebuild needs the vault logs.');
     const tree = new BrowserNoteTree();
     try {
-        events.forEach((entry, index) => {
-            const { root, name: _name, ...event } = entry || {};
-            const computed = event.event === 'root_check'
-                ? parse(tree.root())
-                : parse(tree.apply(JSON.stringify(event)));
-            if (!sameFelt(computed, root)) {
-                throw new Error(`tree_root_mismatch: the vault log ${index} reports root ${root}; the rebuilt tree has ${computed}.`);
-            }
-        });
+        for (const event of events) tree.apply(JSON.stringify(event));
         return parse(tree.path(Number(noteId)));
     } finally {
         tree.free();
     }
+}
+
+/**
+ * A request path from the vault's state at one block hash: `snapshot` is
+ * { root, next_note_id, leaves } (noteLeaves, nextNoteId() and currentRoot());
+ * refused with tree_root_mismatch unless the leaves reproduce the root.
+ */
+function treePathFromState(snapshot, noteId) {
+    const tree = BrowserNoteTree.from_state(JSON.stringify(snapshot));
+    try {
+        return parse(tree.path(Number(noteId)));
+    } finally {
+        tree.free();
+    }
+}
+
+/** A JSON-safe decimal or 0x-hex text of an amount or a time. */
+function integerText(value, label) {
+    if (typeof value === 'bigint') return value.toString();
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return String(value);
+    if (typeof value === 'string' && /^(?:0|[1-9][0-9]*|0x[0-9a-fA-F]+)$/.test(value)) return value;
+    throw new Error(`note_fields_invalid: the ${label} is not an exact unsigned integer`);
 }
 
 export async function execute(operation, payload) {
@@ -162,8 +169,10 @@ export async function execute(operation, payload) {
             ));
         case 'treePathFromLeaves':
             return parse(browser_tree_path_from_leaves(JSON.stringify(payload.leaves), Number(payload.noteId)));
-        case 'rebuildTreePath':
-            return rebuildTreePath(payload.events, payload.noteId);
+        case 'treePathFromState':
+            return treePathFromState(payload.snapshot, payload.noteId);
+        case 'treePathFromEvents':
+            return treePathFromEvents(payload.events, payload.noteId);
         case 'preloadRequestProver':
             await loadRequestProver(payload.provingKey);
             return { status: 'ready' };
@@ -190,12 +199,15 @@ export async function execute(operation, payload) {
                 JSON.stringify(payload.state),
                 JSON.stringify(payload.response)
             ));
-        case 'notePathMatches':
-            // A saved deposit-time path is kept only if it reaches its root.
-            return browser_note_path_matches(JSON.stringify(payload.state), JSON.stringify({
-                active_root: payload.path?.active_root,
-                siblings: payload.path?.siblings
-            }));
+        case 'noteLeaf':
+            // The state's note leaf: the word the vault stored at deposit and
+            // every exit statement binds.
+            return parse(browser_note_leaf(JSON.stringify(payload.state)));
+        case 'noteLeafFromFields':
+            // The leaf of a deposit from its public fields, for recovery
+            // against noteRecord(note_id).leaf: commitment R = H_reg(s, 0).
+            return parse(browser_note_leaf_from_fields(Number(payload.noteId), String(payload.commitment),
+                integerText(payload.amount, 'amount'), integerText(payload.expiryTs, 'expiry')));
         case 'withdrawalNullifier':
             return parse(browser_withdrawal_nullifier(JSON.stringify(payload.state)));
         case 'successorNullifier':

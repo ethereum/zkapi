@@ -118,7 +118,6 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
             let (public, witness) = a
                 .withdrawal(
                     &deployment,
-                    &tree,
                     &DevWithdrawal {
                         kind,
                         destination,
@@ -127,6 +126,9 @@ async fn sequential_signed_state_cannot_branch_across_equal_or_unequal_notes() {
                     },
                 )
                 .unwrap();
+            // Bound to A's stored leaf, never to B's.
+            assert_eq!(public.note_leaf, a_note.leaf());
+            assert_ne!(public.note_leaf, b_note.leaf());
             let proof = withdrawal_prover().prove(&public, witness).unwrap();
             assert!(withdrawal_verifier.verify(&public, &proof).unwrap());
         }

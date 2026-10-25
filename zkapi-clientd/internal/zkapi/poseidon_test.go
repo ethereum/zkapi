@@ -26,6 +26,7 @@ type poseidonVectors struct {
 		Commitment string `json:"commitment"`
 		Amount     string `json:"amount"`
 		Expiry     string `json:"expiry_ts"`
+		Fields     string `json:"fields"`
 		Leaf       string `json:"leaf"`
 	} `json:"note_leaf"`
 	Nodes []struct {
@@ -100,16 +101,44 @@ func TestPoseidonPortMatchesZkapiCoreVectors(t *testing.T) {
 	for _, vector := range vectors.Leaves {
 		amount, ok := new(big.Int).SetString(vector.Amount, 10)
 		expiry, err := strconv.ParseUint(vector.Expiry, 10, 64)
-		if !ok || err != nil {
+		if !ok || err != nil || vector.Fields == "" {
 			t.Fatal("invalid leaf vector")
 		}
+		// The packing of input 8 over the full uint128 amount range:
+		// noteID·2^192 + amount·2^64 + expiry.
+		fields := new(big.Int).Lsh(new(big.Int).SetUint64(uint64(vector.NoteID)), 192)
+		fields.Or(fields, new(big.Int).Lsh(amount, 64)).Or(fields, new(big.Int).SetUint64(expiry))
+		if fieldWord(fields) != vector.Fields {
+			t.Errorf("fields %d = %s, want %s", vector.NoteID, fieldWord(fields), vector.Fields)
+		}
 		commitment := vectorInt(t, vector.Commitment)
-		got := poseidonHash(domainLeaf, new(big.Int).SetUint64(uint64(vector.NoteID)), commitment, amount, new(big.Int).SetUint64(expiry))
-		if fieldWord(got) != vector.Leaf {
+		if got := noteLeafFromFields(commitment, vectorInt(t, vector.Fields)); fieldWord(got) != vector.Leaf {
 			t.Errorf("leaf %d = %s, want %s", vector.NoteID, fieldWord(got), vector.Leaf)
 		}
-		if amount.IsUint64() && fieldWord(noteLeaf(vector.NoteID, commitment, amount.Uint64(), expiry)) != vector.Leaf {
-			t.Errorf("noteLeaf %d differs from the protocol leaf", vector.NoteID)
+		if amount.IsUint64() {
+			if fieldWord(noteFields(vector.NoteID, amount.Uint64(), expiry)) != vector.Fields {
+				t.Errorf("noteFields %d differs from the protocol packing", vector.NoteID)
+			}
+			if fieldWord(noteLeaf(vector.NoteID, commitment, amount.Uint64(), expiry)) != vector.Leaf {
+				t.Errorf("noteLeaf %d differs from the protocol leaf", vector.NoteID)
+			}
+		}
+	}
+	// The leaf is the node's compression under another capacity domain, and
+	// the shared vectors of design C pin it (the vault's NoteLeafLib, the
+	// circuit and zkapi-core agree on them).
+	if fieldWord(domainLeaf) != vectors.Domains["zkapi.v2c.leaf"] || fieldWord(domainLeaf) != "0x0000000000000000000000000000000000007a6b6170692e7632632e6c656166" {
+		t.Fatal("the leaf domain is not zkapi.v2c.leaf")
+	}
+	for _, pinned := range []struct{ got, want string }{
+		{fieldWord(poseidonCompress(domainLeaf, big.NewInt(1), new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(1)))), "0x00381941483a5233ff52ff1e1a0b79464c7316b7b4f609468ba5de81d2686d42"},
+		{fieldWord(noteFields(7, 5_000_000, 4_000_000_000)), "0x0000000000000007000000000000000000000000004c4b4000000000ee6b2800"},
+		{fieldWord(noteLeaf(7, vectorInt(t, "0x26538304fc53474b13823162f0b9667c1538c7360828d3a1a2e8ffa019a2f8cc"), 5_000_000, 4_000_000_000)), "0x1698e82280376fc3506cb7ebf7278db1764d0183aea5fd4d3b475c644b61395f"},
+		{fieldWord(poseidonHash(poseidonDomain("zkapi.v2.reg"), big.NewInt(42), new(big.Int))), "0x26538304fc53474b13823162f0b9667c1538c7360828d3a1a2e8ffa019a2f8cc"},
+		{fieldWord(merkleNode(big.NewInt(1), big.NewInt(2))), "0x178f4ab3e9e68f4c3459db1c927c9abd074ba5079d8d972e6594b07a5ab1c3b1"},
+	} {
+		if pinned.got != pinned.want {
+			t.Errorf("design C vector = %s, want %s", pinned.got, pinned.want)
 		}
 	}
 	for _, vector := range vectors.Nodes {

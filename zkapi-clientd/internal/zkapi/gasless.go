@@ -101,6 +101,7 @@ var (
 	selectorPaymasterFactory    = selectorOf("factory()")
 	selectorWeiPerUnit          = selectorOf("WEI_PER_UNIT()")
 	selectorGasPolicy           = selectorOf("gasPolicy()")
+	selectorGasSchedule         = selectorOf("gasSchedule()")
 	selectorPaymasterPolicy     = selectorOf("policy()")
 	selectorMaxFeeCeiling       = selectorOf("maxFeeCeiling()")
 	selectorPriorityFeeCeiling  = selectorOf("priorityFeeCeiling()")
@@ -144,7 +145,7 @@ var gaslessErrorNames = func() map[string]string {
 		// ZkApiWithdrawalPaymaster
 		"NotEntryPoint()", "SponsorshipPaused()", "SponsorshipInFlight(bytes32)", "BadPaymasterData()", "FeeAboveCap(uint256,uint256)", "FeeAboveCeiling()",
 		"GasLimitOutOfRange(uint8,uint256,uint256,uint256)", "MaxCostAbovePolicy(uint256,uint256)", "NotTransitAccount()", "UnsupportedCall()", "WrongNonceKey()",
-		"AttemptsExhausted(bytes32)", "BindingMismatch()", "DestinationNotSender()", "InvalidValidUntil()", "UnknownRoot()", "NoteNotActive()", "NullifierUsed()",
+		"AttemptsExhausted(bytes32)", "BindingMismatch()", "DestinationNotSender()", "InvalidValidUntil()", "NoteLeafMismatch()", "InvalidNoteFields()", "NoteNotActive()", "NullifierUsed()",
 		"InvalidFelt()", "WrongKind()", "InvalidBalance()", "BadSuccessor()", "ChallengedNullifier()", "SupersededState()", "EscapesDisabled()",
 		"EscapeAlreadySponsored(uint32)", "EscapeEvidencePending(uint32)", "PayoutBelowCost(uint256,uint256)", "ExitsPaused(uint64)", "NotPendingEscape()",
 		"NotStranded()", "NotRepayable()", "ZeroAmount()", "NativeTransferFailed()", "CreditsReserved()", "InvalidKind()",
@@ -154,7 +155,7 @@ var gaslessErrorNames = func() map[string]string {
 		"InvalidProof()", "InvalidNativeValue()", "StaleRoot()", "ReplayedNullifier()", "InvalidDestination()", "NotePendingWithdrawal()", "NoteExpired()",
 		"NoteNotExpired()", "InsufficientDeposit()", "InvalidCommitment()", "ChallengeExpired()", "ChallengeNotExpired()", "NotPendingWithdrawal()",
 		"InvalidDeploymentBinding()", "InvalidSiblings()", "Paused()", "NotPaused()", "Unauthorized()", "WrongWithdrawalKind()", "NotSuccessorEvidence()",
-		"NotStateEvidence()", "NotARaise()", "ProofExpired()", "PauseCooldown()", "NoteNotClosed()",
+		"NotStateEvidence()", "NotARaise()", "ProofExpired()", "PauseCooldown()", "NoteNotClosed()", "TreeFull()", "DepositTooSmall()", "InvalidNoteRange()",
 	} {
 		names[selectorOf(signature)] = signature[:strings.Index(signature, "(")]
 	}
@@ -187,12 +188,15 @@ type gaslessProfile struct {
 	// delegatecalls it, so its code decides where the account's balance
 	// goes. The factory's constructor creates it; nothing but its runtime
 	// codehash pins it.
-	Implementation            string                `json:"withdrawal_account_implementation_address"`
-	ImplementationCode        string                `json:"withdrawal_account_implementation_runtime_codehash"`
-	AccountCreationCode       string                `json:"account_creation_code"`
-	AccountCreationCodeHash   string                `json:"account_creation_code_keccak256"`
-	BundlerURL                string                `json:"bundler_url"`
-	GasPolicy                 gaslessGasPolicy      `json:"gas_policy"`
+	Implementation          string           `json:"withdrawal_account_implementation_address"`
+	ImplementationCode      string           `json:"withdrawal_account_implementation_runtime_codehash"`
+	AccountCreationCode     string           `json:"account_creation_code"`
+	AccountCreationCodeHash string           `json:"account_creation_code_keccak256"`
+	BundlerURL              string           `json:"bundler_url"`
+	GasPolicy               gaslessGasPolicy `json:"gas_policy"`
+	// Older paymasters have no schedule getter; only profiles that publish
+	// the explicit immutable schedule require that additional on-chain pin.
+	GasSchedule               *profileUint          `json:"gas_schedule,omitempty"`
 	Policy                    gaslessPolicySnapshot `json:"policy"`
 	FeeCeilings               gaslessFeeCeilings    `json:"fee_ceilings"`
 	UneconomicFractionPercent profileUint           `json:"uneconomic_fraction_percent"`
@@ -439,6 +443,9 @@ func (g *gaslessProfile) validate() (gaslessProfile, error) {
 		return gaslessProfile{}, fmt.Errorf("%w: this deployment publishes no gasless paymaster", errGaslessUnavailable)
 	}
 	profile := *g
+	if profile.GasSchedule != nil && *profile.GasSchedule > 1 {
+		return profile, invalid("names an unsupported gas schedule")
+	}
 	for _, address := range []string{profile.EntryPoint, profile.SenderCreator, profile.Paymaster, profile.Factory, profile.Implementation} {
 		if !isHex(address, 20) || common.HexToAddress(address) == (common.Address{}) {
 			return profile, invalid("names an invalid contract address")
@@ -1262,6 +1269,15 @@ func verifyGaslessCode(ctx context.Context, client *http.Client, rpcURL string, 
 		}
 		if got != strings.ToLower(getter.want) {
 			return mismatch(getter.label)
+		}
+	}
+	if profile.GasSchedule != nil {
+		got, err := rpc.word(ctx, profile.Paymaster, "0x"+selectorGasSchedule)
+		if err != nil {
+			return err
+		}
+		if got != uintWord(uint64(*profile.GasSchedule)) {
+			return mismatch("the paymaster's gasSchedule()")
 		}
 	}
 	policy, err := rpc.callData(ctx, profile.Paymaster, "0x"+selectorGasPolicy)

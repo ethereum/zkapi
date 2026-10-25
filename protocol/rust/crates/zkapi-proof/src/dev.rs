@@ -98,7 +98,7 @@ impl DevNote {
         core::registration_commitment(&self.secret)
     }
 
-    /// The note's tree leaf.
+    /// The note's leaf `P(d_leaf', R, F)[1]`: its request-tree leaf and the vault's stored word.
     pub fn leaf(&self) -> Felt252 {
         core::note_leaf(
             self.note_id,
@@ -240,19 +240,17 @@ impl DevState {
         Ok((public, witness))
     }
 
-    /// A withdrawal statement and witness from this state at `tree`'s root.
-    /// A mutual close is signed by `deployment`'s clearance key.
+    /// A withdrawal statement and witness from this state: the note's leaf and fields, no
+    /// path. A mutual close is signed by `deployment`'s clearance key.
     pub fn withdrawal(
         &self,
         deployment: &DevDeployment,
-        tree: &MerkleTree,
         withdrawal: &DevWithdrawal,
     ) -> Result<(WithdrawalPublicInputsV2C, WithdrawalWitnessData)> {
         let witness = WithdrawalWitnessData {
             secret: self.note.secret,
             deposit_amount: self.note.deposit_amount,
             expiry: self.note.expiry,
-            merkle_siblings: tree.get_siblings(self.note.note_id),
             state_balance: self.balance,
             state_blinding: self.blinding,
             current_anchor: self.anchor,
@@ -267,7 +265,6 @@ impl DevState {
             protocol_version: deployment.protocol_version,
             chain_id: deployment.chain_id,
             contract_address: deployment.contract_address,
-            active_root: tree.root(),
             state_signing_key: deployment.state_key(),
             clearance_signing_key: deployment.clearance_key(),
             note_id: self.note.note_id,

@@ -1,28 +1,64 @@
 # Solidity Contracts
 
-[ZkApiVault](../../contracts/src/ZkApiVault.sol) (revision 3,
-`CONCESSION_ESCAPE_VERSION` 1) accepts native ETH deposits in whole gwei,
-maintains the depth-32 note tree, and pins the server's state and clearance
-signing keys, the proof adapter, the challenge period, the note lifetime and
-the maximum pause. Amounts are bounded by `2^53 - 1` gwei.
+[ZkApiVault](../../contracts/src/ZkApiVault.sol) (revision 4,
+`CONCESSION_ESCAPE_VERSION` 1, `LEAF_BOUND_EXIT_VERSION` 1) accepts native ETH
+deposits in whole gwei of at least `minDeposit` (a constructor immutable,
+default 1,000,000 gwei), stores one word per note (its leaf and status,
+`noteRecord`), maintains the frontier of the depth-32 request tree, and pins
+the server's state and clearance signing keys, the proof adapter, the
+challenge period, the note lifetime and the maximum pause. Amounts are bounded
+by `2^53 - 1` gwei.
 
 [NoteLeafLib](../../contracts/src/libraries/NoteLeafLib.sol) and
-[MerkleUpdateLib](../../contracts/src/libraries/MerkleUpdateLib.sol) use the
-[BN254 Poseidon implementation](../../contracts/src/libraries/Bn254Poseidon.sol)
-shared with the circuit parameters (a leaf is the sponge over its five fields;
-a node is one permutation with the domain in the capacity lane, `compress`).
-The library is generated with the setup (`zkapi-proof`'s `refresh_setup_sources`
-example rewrites it) in the optimized form of the Poseidon reference
-implementation. Only `deposit` and `retireClosedLeaf` update the tree:
+[MerkleUpdateLib](../../contracts/src/libraries/MerkleUpdateLib.sol) hash
+with the vault's
+[BN254 Poseidon runtime](../../contracts/src/poseidon/Bn254PoseidonRuntime.sol)
+(the circuit's parameters; a leaf and a node are each one permutation with
+the domain in the capacity lane, `compress`, the leaf over the registration
+commitment and the packed note fields). It is a
+separate contract whose address the vault takes in its constructor and calls
+with `STATICCALL` ([IBn254Poseidon](../../contracts/src/interfaces/IBn254Poseidon.sol)),
+so it can never change the vault's state. It is generated with the setup
+(`zkapi-proof`'s `refresh_setup_sources` example rewrites it and its
+`poseidon-runtime.json`, which pins its source hash and runtime codehash) and
+compiled with solc's legacy pipeline: one inline-assembly block, the
+permutation fully unrolled in the scaled sparse form with lazy modular
+reduction (about 12,700 gas per permutation, against 23,400 for the looped
+library it replaced, which the tests keep as their reference implementation;
+solc's stack shuffling costs about 1,260 gas per permutation more than the
+hand-scheduled bytecode prototype's 11,468, about 2,500 gas for an average
+deposit, the price of a source that the proof checks).
+[protocol/formal](../../formal/README.md) proves in Lean that the body of its
+`permute` computes zkAPI's Poseidon for all inputs. Only `deposit` and
+`retireClosedLeaf` update the tree:
 `MerkleUpdateLib` keeps the tree's frontier, so a deposit appends its leaf
-without a Merkle proof (32 compressions) and deposits never invalidate each
-other, while a retirement proves the leaf's siblings at the live root and
-refreshes the one frontier entry it can reach. Every root the vault sets is
-recorded in `knownRoots`, and a withdrawal proof may use any of them.
+without a Merkle proof (one compression per trailing one of its note ID, one
+on average) and deposits never invalidate each other, while a retirement of
+note `n` proves only the siblings below level `ℓ = msb(n XOR nextNoteId)`
+against the frontier entry of that level and rewrites it (callers zero-fill
+the rest; at `ℓ = 0` no sibling is read). The vault keeps no root and no root
+history: `currentRoot()` computes the root from the frontier (at most 32
+compressions, about 0.5M gas in an `eth_call`), and `noteLeaves` and
+`frontier` let anyone rebuild the tree at a pinned block. The tree serves
+request proofs only. An exit names the note's leaf and packed fields
+(`noteFields = noteId·2^192 + depositAmount·2^64 + expiryTs`), and the vault
+checks that the note is active and its stored leaf equals the statement's
+before verifying, then takes the deposit and expiry from the fields. A broken
+verifier or setup can therefore drain the vault in one forged transaction
+([Amendment A3](../../../docs/design/concession-exit.md#amendment-a3-leaf-bound-exits)).
+`recordRoot()` is an optional audit trail that nothing depends on.
 
 [Groth16ProofAdapter](../../contracts/src/adapters/Groth16ProofAdapter.sol)
 verifies the request and withdrawal statements directly and exposes
-`CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`. Public
+`CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`. One is deployed
+per vault: its constructor takes the vault's address and signing keys, records
+the chain ID (`folded*` immutables) and folds the inputs every proof of that
+vault shares into the first IC point, so those proofs skip their scalar
+multiplications while any other statement is still verified over every input.
+`verifyWithdrawalOnce`, the gasless paymaster's call in validation, records a
+verified withdrawal in transient storage, and the vault's
+`assertValidWithdrawal` of the same bytes later in the transaction is then a
+lookup. Public
 deployment fields and pinned signing keys are checked by the vault before
 settlement.
 
@@ -38,8 +74,11 @@ escape from a challenged state reverts `ChallengedNullifier()`, and one from
 the state below it `SupersededState()`. Every withdrawal reverts after its
 `validUntil` (`ProofExpired()`), and kind 2 is refused everywhere
 (`WrongWithdrawalKind()`). Active notes can be claimed for the treasury after
-`effectiveExpiry`, which adds paused time, a post-defeat grace, and a grace
-after each unpause. `retireClosedLeaf` removes a closed note's leaf.
+`effectiveExpiry`, which adds paused time (pause epochs, `pausedBefore`), a
+post-defeat grace (`graceUntil`), and a grace after each unpause;
+`claimExpired` and `effectiveExpiry` take the note's commitment, amount and
+expiry, which must reproduce its stored leaf. `retireClosedLeaf` removes a
+closed note's leaf.
 [Types.sol](../../contracts/src/libraries/Types.sol) defines the note state,
 the pending records and the proof statements.
 

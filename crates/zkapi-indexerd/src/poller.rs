@@ -17,6 +17,14 @@
 //! unchanged and rebuilds from the deployment block otherwise. A persistent
 //! mismatch takes the indexer out of service (503) instead of serving a root
 //! the vault never had.
+//!
+//! With `bootstrap_from_state`, a fresh start (and every rebuild) reads the
+//! tree from the vault instead of replaying logs from the deployment block:
+//! `nextNoteId()`, the `noteLeaves(start, count)` pages and `currentRoot()`,
+//! all by `eth_call` pinned to one block hash `confirmations` below the head.
+//! The rebuilt tree must reproduce that root; logs are then followed from the
+//! next block. The notes deposited before that block have no history in the
+//! mirror (see `TreeMirror::from_state`).
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -37,18 +45,26 @@ use crate::events::VaultEvent;
 use crate::service::{unix_ms, IndexerService, SyncStatus, TreeView};
 use crate::tree_mirror::{EscapeClose, MissedReEscape, TreeMirror, TreeMirrorSnapshot};
 
-/// Version 3: the append-only tree of vault revision 3, with note statuses,
-/// known roots and the published-nullifier table. Earlier checkpoints mirror
-/// a tree whose exits removed leaves; they are archived and replayed.
-const CHECKPOINT_VERSION: u32 = 3;
+/// Version 4: the leaf-bound tree of vault revision 4, with each note's leaf
+/// and `NoteDeposited` preimage, note statuses, the published-nullifier
+/// table and the count of notes read from state at a bootstrap. Version 3
+/// mirrors a revision-3 vault and lacks the preimages: it is refused.
+/// Versions 1 and 2 are archived and replayed.
+const CHECKPOINT_VERSION: u32 = 4;
 /// The statement of the vaults this indexer mirrors. A checkpoint records it.
-pub const CIRCUIT_ID: &str = "zkapi-v2-concession-v1";
-/// `currentRoot()`
+pub const CIRCUIT_ID: &str = "zkapi-v2-concession-v2";
+/// `currentRoot()`, computed by the vault from its frontier.
 const CURRENT_ROOT: &str = "0xfdab463d";
 /// `nextNoteId()`
 const NEXT_NOTE_ID: &str = "0x7a2043a3";
-/// `CONCESSION_ESCAPE_VERSION()`, 1 on a revision-3 vault and absent before.
+/// `noteLeaves(uint32 start, uint32 count)`
+const NOTE_LEAVES: &str = "0x31749c58";
+/// `CONCESSION_ESCAPE_VERSION()`, 1 from vault revision 3 on and absent before.
 const CONCESSION_ESCAPE_VERSION: &str = "0x5e00b426";
+/// `LEAF_BOUND_EXIT_VERSION()`, 1 on a revision-4 vault and absent before.
+const LEAF_BOUND_EXIT_VERSION: &str = "0xc0baafb1";
+/// Leaves per `noteLeaves` page of a state bootstrap (about 5.2M gas each).
+pub const STATE_PAGE_SIZE: u32 = 2_048;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest parent-hash walk used to confirm that a reorganized checkpoint
 /// block is an ancestor of the head. Beyond it two sightings suffice.
@@ -86,6 +102,11 @@ pub struct PollerConfig {
     /// Polls whose reorganized checkpoint state cannot be read before the
     /// indexer falls back to a rebuild.
     pub anchor_unavailable_limit: u32,
+    /// Start (and rebuild) from the vault's state at a recent block instead
+    /// of replaying logs from `from_block`. A restored checkpoint is kept.
+    pub bootstrap_from_state: bool,
+    /// Leaves per `noteLeaves` page (`STATE_PAGE_SIZE`).
+    pub state_page_size: u32,
 }
 
 impl Default for PollerConfig {
@@ -104,6 +125,8 @@ impl Default for PollerConfig {
             resync: false,
             catch_up_interval: Duration::from_millis(100),
             anchor_unavailable_limit: 5,
+            bootstrap_from_state: false,
+            state_page_size: STATE_PAGE_SIZE,
         }
     }
 }
@@ -197,7 +220,8 @@ pub struct JsonRpcLogPoller {
     chain_id: Option<u64>,
     chain_verified: bool,
     chain_mismatch_reported: bool,
-    /// The vault reported `CONCESSION_ESCAPE_VERSION() == 1` in this process.
+    /// The vault reported `CONCESSION_ESCAPE_VERSION() == 1` and
+    /// `LEAF_BOUND_EXIT_VERSION() == 1` in this process.
     vault_verified: bool,
     vault_mismatch_reported: bool,
     published: Option<BlockRef>,
@@ -231,6 +255,10 @@ impl JsonRpcLogPoller {
         anyhow::ensure!(
             config.max_block_range > 0,
             "max block range must be positive"
+        );
+        anyhow::ensure!(
+            config.state_page_size > 0,
+            "state page size must be positive"
         );
         let client = Client::builder()
             .timeout(RPC_TIMEOUT)
@@ -386,7 +414,8 @@ impl JsonRpcLogPoller {
             return Ok(PollOutcome::Idle);
         }
         // S2b. The vault's revision, once per process: this mirror's rules
-        // (an append-only tree, concession events) are revision 3's.
+        // (a leaf-bound append-only tree, concession events without roots)
+        // are revision 4's.
         if !self.vault_verified && !self.verify_vault_revision(service, &head_ref).await? {
             return Ok(PollOutcome::Idle);
         }
@@ -417,9 +446,16 @@ impl JsonRpcLogPoller {
             }
         }
 
-        // S4. Commit tier, one chunk per call.
+        // S4. Commit tier: a state bootstrap, or one chunk per call.
         let target = head.number.saturating_sub(self.cfg.confirmations);
-        if self.next_block <= target {
+        if self.needs_bootstrap() && target >= self.cfg.from_block {
+            if let Some(outcome) = self
+                .bootstrap_from_state(service, &head_ref, target)
+                .await?
+            {
+                return Ok(outcome);
+            }
+        } else if self.next_block <= target {
             if let Some(outcome) = self.commit_chunk(service, &head_ref, target).await? {
                 return Ok(outcome);
             }
@@ -459,42 +495,59 @@ impl JsonRpcLogPoller {
         Ok(true)
     }
 
-    /// Fail closed on a vault that is not revision 3 (`CONCESSION_ESCAPE_VERSION()`
-    /// is not 1, or the getter does not exist): its exits remove leaves, which
-    /// this mirror never does, so every view would be wrong.
+    /// Fail closed on a vault that is not revision 4: `CONCESSION_ESCAPE_VERSION()`
+    /// and `LEAF_BOUND_EXIT_VERSION()` must both be 1. Before revision 3 exits
+    /// removed leaves; a revision-3 vault has another leaf formula and events
+    /// that carry roots. Either way every view would be wrong.
     async fn verify_vault_revision(
         &mut self,
         service: &IndexerService,
         head: &BlockRef,
     ) -> anyhow::Result<bool> {
-        let version = match self.call_word(CONCESSION_ESCAPE_VERSION, head).await {
-            Ok(Some(word)) => Some(word),
-            Ok(None) => bail!(
-                "vault has no code at head block {} {}; waiting",
-                head.number,
-                head.hash
-            ),
-            Err(err) if is_revert(&err) => None,
-            Err(err) => return Err(err.context("cannot read CONCESSION_ESCAPE_VERSION()")),
-        };
         let one = {
             let mut word = [0u8; 32];
             word[31] = 1;
             word
         };
-        if version == Some(one) {
+        let mut reason = None;
+        for (getter, selector, before) in [
+            (
+                "CONCESSION_ESCAPE_VERSION()",
+                CONCESSION_ESCAPE_VERSION,
+                "a vault before revision 3",
+            ),
+            (
+                "LEAF_BOUND_EXIT_VERSION()",
+                LEAF_BOUND_EXIT_VERSION,
+                "a revision-3 vault, whose leaves and events differ",
+            ),
+        ] {
+            let version = match self.call_word(selector, head).await {
+                Ok(Some(word)) => Some(word),
+                Ok(None) => bail!(
+                    "vault has no code at head block {} {}; waiting",
+                    head.number,
+                    head.hash
+                ),
+                Err(err) if is_revert(&err) => None,
+                Err(err) => return Err(err.context(format!("cannot read {getter}"))),
+            };
+            reason = match version {
+                Some(word) if word == one => continue,
+                Some(word) => Some(format!(
+                    "vault {getter} is 0x{}, not 1: not a revision-4 vault ({CIRCUIT_ID})",
+                    hex::encode(word)
+                )),
+                None => Some(format!(
+                    "vault has no {getter}: {before}, which this indexer ({CIRCUIT_ID}) cannot mirror; it needs vault revision 4"
+                )),
+            };
+            break;
+        }
+        let Some(reason) = reason else {
             self.vault_verified = true;
             self.vault_mismatch_reported = false;
             return Ok(true);
-        }
-        let reason = match version {
-            Some(word) => format!(
-                "vault CONCESSION_ESCAPE_VERSION() is 0x{}, not 1: not a revision-3 vault ({CIRCUIT_ID})",
-                hex::encode(word)
-            ),
-            None => format!(
-                "vault has no CONCESSION_ESCAPE_VERSION(): a vault before revision 3, which this indexer ({CIRCUIT_ID}) cannot mirror"
-            ),
         };
         if !self.vault_mismatch_reported {
             self.vault_mismatch_reported = true;
@@ -704,6 +757,88 @@ impl JsonRpcLogPoller {
             cursor = parent;
         }
         Ok(cursor.parent_hash == block.hash)
+    }
+
+    /// No committed state to continue from, and the operator asked for a
+    /// state bootstrap.
+    fn needs_bootstrap(&self) -> bool {
+        self.cfg.bootstrap_from_state
+            && self.committed.anchor.is_none()
+            && self.provisional.is_none()
+    }
+
+    /// Commit the vault's state at block `target` (`confirmations` below the
+    /// head) as the checkpoint: `nextNoteId()`, every `noteLeaves` page and
+    /// `currentRoot()`, each read at that block's hash. The tree rebuilt from
+    /// the pages must have that root and note count; a page that does not
+    /// (a provider answering from another block) is refused like any
+    /// mismatch.
+    async fn bootstrap_from_state(
+        &mut self,
+        service: &IndexerService,
+        head: &BlockRef,
+        target: u64,
+    ) -> anyhow::Result<Option<PollOutcome>> {
+        let at = self
+            .header_by_number(&hex_quantity(target))
+            .await?
+            .ok_or_else(|| anyhow!("rpc has no block {target}"))?
+            .block_ref();
+        let leaves = self
+            .read_note_leaves(&at)
+            .await
+            .with_context(|| format!("cannot read the vault's leaves at block {target}"))?;
+        let mirror = TreeMirror::from_state(leaves).map_err(|err| anyhow!(err))?;
+        match self.verify_state(&mirror, &at, false).await {
+            Verdict::Match => {
+                tracing::info!(
+                    block = at.number,
+                    hash = %at.hash,
+                    root = %mirror.root(),
+                    next_note_id = mirror.next_note_id(),
+                    "indexer bootstrapped from the vault state; the notes before this block have no preimages, escapes or published nullifiers in the mirror"
+                );
+                self.commit(service, Arc::new(mirror), at, None);
+                // Read by number under this head; verified as canonical by
+                // the block-hash reads.
+                self.anchor_checked_at = Some(head.clone());
+                service.set_sync_block(self.next_block);
+                Ok(None)
+            }
+            Verdict::Mismatch(detail) => {
+                self.on_mismatch(service, format!("state bootstrap: {detail}"))
+                    .await;
+                Ok(Some(PollOutcome::Idle))
+            }
+            Verdict::Unavailable(err) => Err(err.context(format!(
+                "cannot verify the vault state at bootstrap block {target}"
+            ))),
+        }
+    }
+
+    /// `noteLeaves(0, nextNoteId())` at `at`, in pages of `state_page_size`;
+    /// empty when the vault has no code there.
+    async fn read_note_leaves(&mut self, at: &BlockRef) -> anyhow::Result<Vec<Felt252>> {
+        let Some(word) = self.call_word(NEXT_NOTE_ID, at).await? else {
+            return Ok(Vec::new());
+        };
+        let next_note_id = word_to_u32(&word).context("invalid nextNoteId result")?;
+        let mut leaves = Vec::with_capacity(next_note_id as usize);
+        let mut start = 0u32;
+        while start < next_note_id {
+            let count = self.cfg.state_page_size.min(next_note_id - start);
+            let data = format!("{NOTE_LEAVES}{start:064x}{count:064x}");
+            let page = self
+                .eth_call(&data, at)
+                .await?
+                .ok_or_else(|| anyhow!("vault has no code at block {} {}", at.number, at.hash))?;
+            leaves.extend(
+                decode_leaf_page(&page, count)
+                    .with_context(|| format!("invalid noteLeaves({start}, {count}) result"))?,
+            );
+            start += count;
+        }
+        Ok(leaves)
     }
 
     async fn commit_chunk(
@@ -1044,15 +1179,22 @@ impl JsonRpcLogPoller {
         PollOutcome::Idle
     }
 
-    /// Replay from the deployment block in memory. Partial state is never
-    /// published; the checkpoint on disk is replaced by the first verified
-    /// commit.
+    /// Replay from the deployment block in memory, or bootstrap again from
+    /// the vault's state. Partial state is never published; the checkpoint on
+    /// disk is replaced by the first verified commit.
     fn start_rebuild(&mut self, service: &IndexerService, reason: &str) {
-        tracing::error!(
-            reason = %reason,
-            from_block = self.cfg.from_block,
-            "indexer rebuilding mirror from deployment block; tree endpoints return 503 until verified"
-        );
+        if self.cfg.bootstrap_from_state {
+            tracing::error!(
+                reason = %reason,
+                "indexer rebuilding mirror from the vault state; tree endpoints return 503 until verified"
+            );
+        } else {
+            tracing::error!(
+                reason = %reason,
+                from_block = self.cfg.from_block,
+                "indexer rebuilding mirror from deployment block; tree endpoints return 503 until verified"
+            );
+        }
         service.begin_rebuild(reason.to_string());
         self.committed = Committed::genesis();
         self.provisional = None;
@@ -1108,10 +1250,11 @@ impl JsonRpcLogPoller {
             Err(err) => return Verdict::Unavailable(anyhow!("invalid currentRoot word: {err}")),
         };
         let next_note_id = match self.call_word(NEXT_NOTE_ID, at).await {
-            Ok(Some(word)) if word[..28].iter().all(|byte| *byte == 0) => {
-                u32::from_be_bytes([word[28], word[29], word[30], word[31]])
-            }
-            Ok(_) => return Verdict::Unavailable(anyhow!("invalid nextNoteId result")),
+            Ok(Some(word)) => match word_to_u32(&word) {
+                Ok(next_note_id) => next_note_id,
+                Err(_) => return Verdict::Unavailable(anyhow!("invalid nextNoteId result")),
+            },
+            Ok(None) => return Verdict::Unavailable(anyhow!("invalid nextNoteId result")),
             Err(err) => return Verdict::Unavailable(err),
         };
         if root == mirror.root() && next_note_id == mirror.next_note_id() {
@@ -1128,14 +1271,29 @@ impl JsonRpcLogPoller {
         ))
     }
 
-    /// `eth_call` by EIP-1898 block hash. `None` when the vault has no code.
+    /// A one-word `eth_call` by EIP-1898 block hash. `None` when the vault
+    /// has no code.
     async fn call_word(
         &mut self,
         selector: &str,
         at: &BlockRef,
     ) -> anyhow::Result<Option<[u8; 32]>> {
+        let Some(raw) = self.eth_call(selector, at).await? else {
+            return Ok(None);
+        };
+        if raw.len() != 32 {
+            bail!("eth_call returned {} bytes, expected one word", raw.len());
+        }
+        let mut word = [0u8; 32];
+        word.copy_from_slice(&raw);
+        Ok(Some(word))
+    }
+
+    /// `eth_call` of `data` by EIP-1898 block hash. `None` when the vault
+    /// has no code (an empty result).
+    async fn eth_call(&mut self, data: &str, at: &BlockRef) -> anyhow::Result<Option<Vec<u8>>> {
         let params = json!([
-            { "to": &self.contract_address, "data": selector },
+            { "to": &self.contract_address, "data": data },
             { "blockHash": &at.hash, "requireCanonical": true },
         ]);
         let result = match self.rpc("eth_call", params).await {
@@ -1162,15 +1320,9 @@ impl JsonRpcLogPoller {
         if raw.is_empty() {
             return Ok(None);
         }
-        if raw.len() != 64 {
-            bail!(
-                "eth_call returned {} bytes, expected one word",
-                raw.len() / 2
-            );
-        }
-        let mut word = [0u8; 32];
-        hex::decode_to_slice(raw, &mut word).context("eth_call returned invalid hex")?;
-        Ok(Some(word))
+        hex::decode(raw)
+            .map(Some)
+            .context("eth_call returned invalid hex")
     }
 
     async fn header_by_number(&self, tag: &str) -> anyhow::Result<Option<Header>> {
@@ -1690,6 +1842,9 @@ fn load_checkpoint(
         Err(err) => return corrupt(format!("unparseable checkpoint: {err}")),
     };
     match version {
+        3 => bail!(
+            "indexer checkpoint version 3 mirrors a revision-3 vault (circuit zkapi-v2-concession-v1) and lacks the note preimages of version {CHECKPOINT_VERSION}; it cannot be migrated: restart with --resync to archive it and rebuild (from logs, or from state with --bootstrap-from-state)"
+        ),
         1 => {
             let archived = archive(path, "v1")?;
             tracing::warn!(
@@ -1717,7 +1872,7 @@ fn load_checkpoint(
 
     let checkpoint: IndexerCheckpoint = match serde_json::from_slice(&raw) {
         Ok(checkpoint) => checkpoint,
-        Err(err) => return corrupt(format!("invalid v3 checkpoint: {err}")),
+        Err(err) => return corrupt(format!("invalid v{CHECKPOINT_VERSION} checkpoint: {err}")),
     };
     let bound_address = normalize_address(&checkpoint.contract_address).ok();
     if checkpoint.circuit_id != CIRCUIT_ID {
@@ -1788,19 +1943,19 @@ fn hex_quantity(value: u64) -> String {
     format!("0x{value:x}")
 }
 
-/// Event signatures of vault revision 3 (topic0 is their keccak256).
-pub(crate) const NOTE_DEPOSITED: &str = "NoteDeposited(uint32,bytes32,uint128,uint64,uint256)";
+/// Event signatures of vault revision 4 (topic0 is their keccak256).
+pub(crate) const NOTE_DEPOSITED: &str = "NoteDeposited(uint32,bytes32,uint128,uint64)";
 pub(crate) const MUTUAL_CLOSE: &str = "MutualClose(uint32,uint256,uint128,address)";
 pub(crate) const ESCAPE_INITIATED: &str =
-    "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)";
+    "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64)";
 pub(crate) const CONCESSION_RECORDED: &str =
     "EscapeConcessionRecorded(uint32,uint256,uint128,uint128)";
 pub(crate) const CONCESSION_RAISED: &str = "EscapeConcessionRaised(uint32,uint256,uint128,uint128)";
-pub(crate) const ESCAPE_CHALLENGED: &str = "EscapeWithdrawalChallenged(uint32,uint256,uint256)";
+pub(crate) const ESCAPE_CHALLENGED: &str = "EscapeWithdrawalChallenged(uint32,uint256)";
 pub(crate) const ESCAPE_FINALIZED: &str =
     "EscapeWithdrawalFinalized(uint32,uint256,uint128,address)";
-pub(crate) const EXPIRED_CLAIMED: &str = "ExpiredClaimed(uint32,uint128,uint256)";
-pub(crate) const CLOSED_LEAF_RETIRED: &str = "ClosedLeafRetired(uint32,uint256)";
+pub(crate) const EXPIRED_CLAIMED: &str = "ExpiredClaimed(uint32,uint128)";
+pub(crate) const CLOSED_LEAF_RETIRED: &str = "ClosedLeafRetired(uint32)";
 
 struct EventTopics {
     note_deposited: String,
@@ -1860,13 +2015,12 @@ fn decode_log(log: &RpcLog) -> anyhow::Result<Option<VaultEvent>> {
     let is = |topic: &String| topic0.eq_ignore_ascii_case(topic);
 
     let event = if is(&topics.note_deposited) {
-        let (note_id, words) = event_words(log, "NoteDeposited", 3, 3)?;
+        let (note_id, words) = event_words(log, "NoteDeposited", 3, 2)?;
         VaultEvent::NoteDeposited {
             note_id,
             commitment: topic_to_felt(&log.topics[2])?,
             amount: word_to_u128(&words[0])?,
             expiry_ts: word_to_u64(&words[1])?,
-            new_root: word_to_felt(&words[2])?,
         }
     } else if is(&topics.mutual_close) {
         let (note_id, words) = event_words(log, "MutualClose", 2, 3)?;
@@ -1877,14 +2031,13 @@ fn decode_log(log: &RpcLog) -> anyhow::Result<Option<VaultEvent>> {
             final_balance: word_to_u128(&words[1])?,
         }
     } else if is(&topics.escape_initiated) {
-        let (note_id, words) = event_words(log, "EscapeWithdrawalInitiated", 2, 5)?;
+        let (note_id, words) = event_words(log, "EscapeWithdrawalInitiated", 2, 4)?;
         word_to_address(&words[2])?;
         VaultEvent::EscapeWithdrawalInitiated {
             note_id,
             nullifier: word_to_felt(&words[0])?,
             final_balance: word_to_u128(&words[1])?,
             challenge_deadline: word_to_u64(&words[3])?,
-            current_root: word_to_felt(&words[4])?,
         }
     } else if is(&topics.concession_recorded) {
         let (note_id, words) = event_words(log, "EscapeConcessionRecorded", 2, 3)?;
@@ -1903,11 +2056,10 @@ fn decode_log(log: &RpcLog) -> anyhow::Result<Option<VaultEvent>> {
             final_balance: word_to_u128(&words[2])?,
         }
     } else if is(&topics.escape_challenged) {
-        let (note_id, words) = event_words(log, "EscapeWithdrawalChallenged", 2, 2)?;
+        let (note_id, words) = event_words(log, "EscapeWithdrawalChallenged", 2, 1)?;
         VaultEvent::EscapeWithdrawalChallenged {
             note_id,
             nullifier: word_to_felt(&words[0])?,
-            current_root: word_to_felt(&words[1])?,
         }
     } else if is(&topics.escape_finalized) {
         let (note_id, words) = event_words(log, "EscapeWithdrawalFinalized", 2, 3)?;
@@ -1918,18 +2070,14 @@ fn decode_log(log: &RpcLog) -> anyhow::Result<Option<VaultEvent>> {
             final_balance: word_to_u128(&words[1])?,
         }
     } else if is(&topics.expired_claimed) {
-        let (note_id, words) = event_words(log, "ExpiredClaimed", 2, 2)?;
+        let (note_id, words) = event_words(log, "ExpiredClaimed", 2, 1)?;
         VaultEvent::ExpiredClaimed {
             note_id,
             deposit_amount: word_to_u128(&words[0])?,
-            current_root: word_to_felt(&words[1])?,
         }
     } else if is(&topics.closed_leaf_retired) {
-        let (note_id, words) = event_words(log, "ClosedLeafRetired", 2, 1)?;
-        VaultEvent::ClosedLeafRetired {
-            note_id,
-            new_root: word_to_felt(&words[0])?,
-        }
+        let (note_id, _) = event_words(log, "ClosedLeafRetired", 2, 0)?;
+        VaultEvent::ClosedLeafRetired { note_id }
     } else {
         return Ok(None);
     };
@@ -1993,6 +2141,10 @@ fn narrow<const N: usize>(word: &[u8; 32], kind: &str) -> anyhow::Result<[u8; N]
     Ok(word[32 - N..].try_into().expect("N bytes"))
 }
 
+fn word_to_u32(word: &[u8; 32]) -> anyhow::Result<u32> {
+    Ok(u32::from_be_bytes(narrow::<4>(word, "uint32")?))
+}
+
 fn word_to_u64(word: &[u8; 32]) -> anyhow::Result<u64> {
     Ok(u64::from_be_bytes(narrow::<8>(word, "uint64")?))
 }
@@ -2005,10 +2157,37 @@ fn word_to_address(word: &[u8; 32]) -> anyhow::Result<[u8; 20]> {
     narrow::<20>(word, "address")
 }
 
-/// A uint256 the vault emits as a BN254 field element (a nullifier or root).
+/// A uint256 the vault emits as a BN254 field element (a nullifier).
 fn word_to_felt(word: &[u8; 32]) -> anyhow::Result<Felt252> {
     Felt252::try_from_bytes_be(*word)
         .map_err(|err| anyhow!("log word is not a field element: {err}"))
+}
+
+/// The ABI encoding of a `uint256[]` return of exactly `count` leaves:
+/// offset 32, the length, then each leaf, a field element.
+fn decode_leaf_page(data: &[u8], count: u32) -> anyhow::Result<Vec<Felt252>> {
+    let expected = 64 + 32 * count as usize;
+    if data.len() != expected {
+        bail!("{} bytes, expected {expected}", data.len());
+    }
+    let word = |index: usize| -> [u8; 32] {
+        data[index * 32..(index + 1) * 32]
+            .try_into()
+            .expect("32 bytes")
+    };
+    let offset = word(0);
+    if offset[..31].iter().any(|byte| *byte != 0) || offset[31] != 32 {
+        bail!("array offset is not 32");
+    }
+    if word_to_u32(&word(1)).ok() != Some(count) {
+        bail!("array length is not {count}");
+    }
+    (0..count as usize)
+        .map(|index| {
+            Felt252::try_from_bytes_be(word(2 + index))
+                .map_err(|err| anyhow!("leaf {index} is not a field element: {err}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2052,7 +2231,6 @@ mod tests {
 
     #[test]
     fn test_decode_note_deposited_log() {
-        let new_root = Felt252::from_u64(999);
         let log = RpcLog {
             block_number: "0x1".to_string(),
             block_hash: format!("0x{}", "ab".repeat(32)),
@@ -2060,34 +2238,36 @@ mod tests {
             address: None,
             removed: None,
             topics: vec![
-                event_topic("NoteDeposited(uint32,bytes32,uint128,uint64,uint256)"),
+                event_topic("NoteDeposited(uint32,bytes32,uint128,uint64)"),
                 Felt252::from_u64(7).to_hex(),
                 Felt252::from_u64(1234).to_hex(),
             ],
-            data: format!(
-                "0x{}{}{}",
-                encode_u128(55),
-                encode_u64(1_700_000_000),
-                encode_word(new_root),
-            ),
+            data: format!("0x{}{}", encode_u128(55), encode_u64(1_700_000_000)),
         };
 
-        match decode_log(&log).unwrap().unwrap() {
-            VaultEvent::NoteDeposited {
-                note_id,
-                commitment,
-                amount,
-                expiry_ts,
-                new_root: event_root,
-            } => {
-                assert_eq!(note_id, 7);
-                assert_eq!(commitment, Felt252::from_u64(1234));
-                assert_eq!(amount, 55);
-                assert_eq!(expiry_ts, 1_700_000_000);
-                assert_eq!(event_root, new_root);
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
+        assert_eq!(
+            decode_log(&log).unwrap(),
+            Some(VaultEvent::NoteDeposited {
+                note_id: 7,
+                commitment: Felt252::from_u64(1234),
+                amount: 55,
+                expiry_ts: 1_700_000_000,
+            })
+        );
+        // The revision-3 layout, with a trailing root word, is refused.
+        let mut with_root = log.clone();
+        with_root
+            .data
+            .push_str(&encode_word(Felt252::from_u64(999)));
+        assert!(decode_log(&with_root).is_err());
+        // An expiry wider than uint64 is refused.
+        let mut wide = log;
+        wide.data = format!(
+            "0x{}{}",
+            encode_u128(55),
+            encode_u128(u128::from(u64::MAX) + 1)
+        );
+        assert!(decode_log(&wide).is_err());
     }
 
     #[test]
@@ -2102,7 +2282,7 @@ mod tests {
             data: data.to_string(),
         };
         assert!(decode_log(&log(
-            event_topic("ExpiredClaimed(uint32,uint128,uint256)"),
+            event_topic("ExpiredClaimed(uint32,uint128)"),
             "0x1234"
         ))
         .is_err());
@@ -2173,7 +2353,7 @@ mod tests {
         assert!(path.exists());
     }
 
-    pub(super) fn write_v3_checkpoint(
+    pub(super) fn write_v4_checkpoint(
         path: &Path,
         contract_address: &str,
         chain_id: u64,
@@ -2203,25 +2383,19 @@ mod tests {
     fn checkpoint_round_trip_restores_tree_and_cursor_together() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint.json");
-        let mut reference = TreeMirror::new();
-        let mut deposit = VaultEvent::NoteDeposited {
+        let deposit = VaultEvent::NoteDeposited {
             note_id: 0,
             commitment: Felt252::from_u64(1234),
             amount: 55,
             expiry_ts: 1_700_000_000,
-            new_root: Felt252::ZERO,
         };
-        reference.process_event(&deposit);
-        if let VaultEvent::NoteDeposited { new_root, .. } = &mut deposit {
-            *new_root = reference.root();
-        }
         let mut mirror = TreeMirror::new();
         mirror.apply_event(&deposit).unwrap();
         let anchor = BlockRef {
             number: 17,
             hash: format!("0x{}", "17".repeat(32)),
         };
-        write_v3_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &mirror);
+        write_v4_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &mirror);
 
         let restored = service();
         let poller = JsonRpcLogPoller::new(
@@ -2238,6 +2412,26 @@ mod tests {
         assert_eq!(poller.next_block(), 18);
         assert_eq!(poller.committed.mirror.root(), mirror.root());
         assert_eq!(poller.committed.anchor, Some(anchor.clone()));
+        // The deposit's preimage survives for operator sweeps.
+        assert_eq!(
+            poller.committed.mirror.preimage(0),
+            Some(crate::tree_mirror::NotePreimage {
+                commitment: Felt252::from_u64(1234),
+                amount: 55,
+                expiry_ts: 1_700_000_000,
+            })
+        );
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], 4);
+        assert_eq!(stored["circuit_id"], "zkapi-v2-concession-v2");
+        assert_eq!(
+            stored["mirror"]["preimages"],
+            serde_json::json!([{ "commitment": "0x4d2", "amount": 55, "expiry_ts": 1_700_000_000u64 }])
+        );
+        assert_eq!(
+            stored["mirror"]["leaves"][0],
+            serde_json::to_value(mirror.get_leaf(0)).unwrap()
+        );
         let health = restored.health();
         assert_eq!(health.confirmed_block, Some(17));
         assert_eq!(health.confirmed_block_hash, Some(anchor.hash));
@@ -2418,7 +2612,6 @@ mod tests {
                     commitment: n(0x0c0c),
                     amount: 1_000_000,
                     expiry_ts: 2_000_000_000,
-                    new_root: n(0x0a0a),
                 },
             ),
             (
@@ -2436,7 +2629,6 @@ mod tests {
                     nullifier: n(0x0101),
                     final_balance: 900_000,
                     challenge_deadline: 2_000_086_400,
-                    current_root: n(0x0a0a),
                 },
             ),
             (
@@ -2462,7 +2654,6 @@ mod tests {
                 VaultEvent::EscapeWithdrawalChallenged {
                     note_id: 7,
                     nullifier: n(0x0101),
-                    current_root: n(0x0a0a),
                 },
             ),
             (
@@ -2478,42 +2669,107 @@ mod tests {
                 VaultEvent::ExpiredClaimed {
                     note_id: 7,
                     deposit_amount: 1_000_000,
-                    current_root: n(0x0a0a),
                 },
             ),
             (
                 "ClosedLeafRetired",
-                VaultEvent::ClosedLeafRetired {
-                    note_id: 7,
-                    new_root: n(0x0b0b),
-                },
+                VaultEvent::ClosedLeafRetired { note_id: 7 },
             ),
         ] {
             assert_eq!(decode_log(&log(name)).unwrap(), Some(expected), "{name}");
         }
-        // Payout-credit events are not tree events: ignored, not parsed.
-        for name in ["EscapePayoutDeferred", "EscapePayoutClaimed"] {
+        // Payout-credit events and the optional root record are not tree
+        // events: ignored, not parsed. Nothing depends on RootRecorded.
+        for name in [
+            "EscapePayoutDeferred",
+            "EscapePayoutClaimed",
+            "RootRecorded",
+        ] {
             assert_eq!(decode_log(&log(name)).unwrap(), None, "{name}");
         }
     }
 
     #[test]
-    fn revision_three_event_topics_are_pinned() {
-        // topic0 values pinned in the concession-exit spec (section 4.1).
+    fn revision_four_event_topics_are_pinned() {
+        // topic0 values pinned in the leaf-bound spec (contract_changes 7);
+        // the concession events are revision 3's.
+        for (signature, topic0) in [
+            (
+                NOTE_DEPOSITED,
+                "0x3d5756e39e88718c2260db175f4f454d73fbd02468313b9406bf5c0733481c36",
+            ),
+            (
+                ESCAPE_INITIATED,
+                "0x5ad24b4d5235cdf161caf23bb21550824a1be902576056f666b56ac6c424f4b1",
+            ),
+            (
+                ESCAPE_CHALLENGED,
+                "0x4bffb77581f1706ad6afe03cd651fb25b1b485f7eaef1826e2cc6f420f532161",
+            ),
+            (
+                EXPIRED_CLAIMED,
+                "0xe5962fdd811b0b8d9b9cdaf37e396f36dd238f127d52ef65ae07d96edb32fd96",
+            ),
+            (
+                CLOSED_LEAF_RETIRED,
+                "0x733841afe92a19d5b309b7732cf095a30edfae784b7cc5f0a97dec7140fb8e13",
+            ),
+            (
+                CONCESSION_RECORDED,
+                "0x2254ee827bce198564720fe77733ebfab1a49361cd4f050f107445241b560b4d",
+            ),
+            (
+                CONCESSION_RAISED,
+                "0x3faf5608f821061643ff6fdfe6dd0f6d7fb074bb565f35e3537a86ac08f0897c",
+            ),
+        ] {
+            assert_eq!(event_topic(signature), topic0, "{signature}");
+        }
+    }
+
+    /// The getter selectors the poller calls are the compiled vault's.
+    #[test]
+    fn vault_getter_selectors_are_pinned() {
+        let layout: serde_json::Value = serde_json::from_str(include_str!(
+            "../../zkapi-serverd/tests/fixtures/vault_calldata_golden.json"
+        ))
+        .unwrap();
+        for (name, selector) in [
+            ("currentRoot", CURRENT_ROOT),
+            ("nextNoteId", NEXT_NOTE_ID),
+            ("noteLeaves", NOTE_LEAVES),
+            ("CONCESSION_ESCAPE_VERSION", CONCESSION_ESCAPE_VERSION),
+            ("LEAF_BOUND_EXIT_VERSION", LEAF_BOUND_EXIT_VERSION),
+        ] {
+            assert_eq!(layout["selectors"][name], selector, "{name}");
+        }
+    }
+
+    #[test]
+    fn leaf_pages_decode_strictly() {
+        let leaf = |value: u64| format!("{value:064x}");
+        let page = |words: &[String]| hex::decode(words.concat()).unwrap();
+        let good = page(&[leaf(32), leaf(2), leaf(7), leaf(0)]);
         assert_eq!(
-            event_topic(CONCESSION_RECORDED),
-            "0x2254ee827bce198564720fe77733ebfab1a49361cd4f050f107445241b560b4d"
+            decode_leaf_page(&good, 2).unwrap(),
+            vec![Felt252::from_u64(7), Felt252::ZERO]
         );
         assert_eq!(
-            event_topic(CONCESSION_RAISED),
-            "0x3faf5608f821061643ff6fdfe6dd0f6d7fb074bb565f35e3537a86ac08f0897c"
+            decode_leaf_page(&page(&[leaf(32), leaf(0)]), 0).unwrap(),
+            Vec::new()
         );
-        assert_eq!(
-            event_topic(CLOSED_LEAF_RETIRED),
-            "0x64572cec8ef079a5baa4f2860f8b65efb52a96f64ee679d315fd2a0541ea28b3"
-        );
-        assert!(event_topic(ESCAPE_INITIATED).starts_with("0xb0d1eb71"));
-        assert!(event_topic(ESCAPE_CHALLENGED).starts_with("0x5cc5343b"));
+        for (bad, count) in [
+            // Fewer leaves than asked for, or more.
+            (page(&[leaf(32), leaf(1), leaf(7)]), 2),
+            (good.clone(), 1),
+            // Another offset or length word.
+            (page(&[leaf(64), leaf(2), leaf(7), leaf(0)]), 2),
+            (page(&[leaf(32), leaf(3), leaf(7), leaf(0)]), 2),
+            // A leaf outside the field.
+            (page(&[leaf(32), leaf(1), "f".repeat(64)]), 1),
+        ] {
+            assert!(decode_leaf_page(&bad, count).is_err());
+        }
     }
 
     #[test]
@@ -2553,24 +2809,22 @@ mod tests {
                 final_balance: 6,
             })
         );
-        let retired = log_of(
-            vec![event_topic(CLOSED_LEAF_RETIRED), note.clone()],
-            &[encode_word(Felt252::from_u64(77))],
-        );
+        let retired = log_of(vec![event_topic(CLOSED_LEAF_RETIRED), note.clone()], &[]);
         assert_eq!(
             decode_log(&retired).unwrap(),
-            Some(VaultEvent::ClosedLeafRetired {
-                note_id: 4,
-                new_root: Felt252::from_u64(77),
-            })
+            Some(VaultEvent::ClosedLeafRetired { note_id: 4 })
         );
 
         // A word too many or too few, an extra topic, a uint128 with high
         // bytes, and a nullifier outside the field are refused.
         let mut extra_word = recorded.clone();
         extra_word.data.push_str(&encode_u128(0));
-        let mut missing_word = retired.clone();
-        missing_word.data = "0x".to_string();
+        let mut retired_with_root = retired.clone();
+        retired_with_root
+            .data
+            .push_str(&encode_word(Felt252::from_u64(77)));
+        let mut missing_word = raised.clone();
+        missing_word.data.truncate(missing_word.data.len() - 64);
         let mut extra_topic = raised.clone();
         extra_topic.topics.push(note.clone());
         let wide = log_of(
@@ -2585,7 +2839,14 @@ mod tests {
             vec![event_topic(CONCESSION_RECORDED), note],
             &["f".repeat(64), encode_u128(15), encode_u128(5)],
         );
-        for log in [extra_word, missing_word, extra_topic, wide, outside_field] {
+        for log in [
+            extra_word,
+            retired_with_root,
+            missing_word,
+            extra_topic,
+            wide,
+            outside_field,
+        ] {
             assert!(decode_log(&log).is_err(), "{log:?}");
         }
     }
@@ -2623,13 +2884,58 @@ mod tests {
             number: 3,
             hash: format!("0x{}", "03".repeat(32)),
         };
-        write_v3_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+        write_v4_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
         let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         raw["circuit_id"] = "zkapi-v2-note-bound-v1".into();
         fs::write(&path, raw.to_string()).unwrap();
         let error = load_checkpoint(&path, VAULT, None).err().unwrap();
         assert!(format!("{error:#}").contains("zkapi-v2-note-bound-v1"));
         assert!(path.exists(), "a refused checkpoint is left in place");
+    }
+
+    #[test]
+    fn v3_checkpoint_of_a_revision_three_vault_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.json");
+        let v3 = serde_json::json!({
+            "version": 3,
+            "circuit_id": "zkapi-v2-concession-v1",
+            "chain_id": CHAIN_ID,
+            "contract_address": VAULT,
+            "from_block": 0,
+            "last_processed_block": 9,
+            "last_processed_block_hash": format!("0x{}", "09".repeat(32)),
+            "root": TreeMirror::empty_root(),
+            "next_note_id": 0,
+            "mirror": {
+                "next_note_id": 0,
+                "deposited_leaves": [],
+                "statuses": [],
+                "retired": [],
+                "pending_escapes": [],
+                "published_nullifiers": [],
+                "known_roots": [TreeMirror::empty_root()],
+            },
+        });
+        fs::write(&path, v3.to_string()).unwrap();
+        let error = format!("{:#}", load_checkpoint(&path, VAULT, None).err().unwrap());
+        assert!(error.contains("version 3"), "{error}");
+        assert!(error.contains("preimages"), "{error}");
+        assert!(error.contains("--resync"), "{error}");
+        assert!(path.exists(), "a refused checkpoint is left in place");
+        // The binary refuses to start on it.
+        let service = service();
+        assert!(JsonRpcLogPoller::new(
+            PollerConfig {
+                rpc_url: "http://127.0.0.1:1".to_string(),
+                contract_address: VAULT.to_string(),
+                cursor_path: Some(path.display().to_string()),
+                ..PollerConfig::default()
+            },
+            &service,
+        )
+        .is_err());
+        assert!(path.exists());
     }
 
     #[tokio::test]
@@ -2663,6 +2969,54 @@ mod tests {
             // Once the vault reports version 1 (a misread corrected), it is
             // mirrored.
             chain.set_escape_version(Some(1));
+            assert_eq!(poller.poll_once(&service).await.unwrap(), PollOutcome::Idle);
+            assert!(service.is_ready());
+        }
+    }
+
+    /// A revision-3 vault (CONCESSION_ESCAPE_VERSION() is 1, but
+    /// LEAF_BOUND_EXIT_VERSION() reverts or is not 1) has another leaf
+    /// formula and events with roots: refused before any log is read.
+    #[tokio::test]
+    async fn a_revision_three_vault_is_refused_by_the_leaf_bound_probe() {
+        for version in [None, Some(0), Some(2)] {
+            let chain = MockChain::start().await;
+            chain.mine(vec![crate::test_chain::Tx::Deposit { commitment: 0xa }]);
+            chain.set_leaf_bound_version(version);
+            let service = service();
+            let mut poller = JsonRpcLogPoller::new(
+                PollerConfig {
+                    rpc_url: chain.url(),
+                    contract_address: VAULT.to_string(),
+                    cursor_path: None,
+                    confirmations: 0,
+                    chain_id: Some(CHAIN_ID),
+                    catch_up_interval: Duration::ZERO,
+                    bootstrap_from_state: true,
+                    ..PollerConfig::default()
+                },
+                &service,
+            )
+            .unwrap();
+            for _ in 0..3 {
+                assert_eq!(poller.poll_once(&service).await.unwrap(), PollOutcome::Idle);
+                assert_eq!(service.status(), SyncStatus::Diverged, "{version:?}");
+                assert!(service.view().is_err());
+            }
+            let reason = service.health().reason.unwrap();
+            assert!(reason.contains("LEAF_BOUND_EXIT_VERSION()"), "{reason}");
+            assert!(reason.contains("revision"), "{reason}");
+            if version.is_none() {
+                assert!(reason.contains("revision-3 vault"), "{reason}");
+            }
+            assert!(chain.calls("eth_getLogs").is_empty());
+            // Neither a log nor a state read: no noteLeaves call either.
+            assert!(chain
+                .calls("eth_call")
+                .iter()
+                .all(|params| { !params[0]["data"].as_str().unwrap().starts_with(NOTE_LEAVES) }));
+
+            chain.set_leaf_bound_version(Some(1));
             assert_eq!(poller.poll_once(&service).await.unwrap(), PollOutcome::Idle);
             assert!(service.is_ready());
         }

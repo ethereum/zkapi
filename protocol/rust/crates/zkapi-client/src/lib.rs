@@ -1,5 +1,5 @@
 //! Client SDK for zkAPI: wallet state, note lifecycle, proof generation,
-//! persistence, and recovery for circuit `zkapi-v2-concession-v1`.
+//! persistence, and recovery for circuit `zkapi-v2-concession-v2`.
 
 pub mod config;
 pub mod error;

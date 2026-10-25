@@ -8,12 +8,21 @@ optimizer_runs = 10000
 ffi = false
 via_ir = true
 # Reproducible runtime code (expected codehashes, scripts/expected-codehashes.mjs): no metadata
-# hash and no CBOR trailer, so the code depends only on source, settings, immutables and links.
+# hash and no CBOR trailer, so the code depends only on source, settings and immutables.
 bytecode_hash = "none"
 cbor_metadata = false
 # Artifacts carry the AST, which expected-codehashes.mjs reads to name immutableReferences.
 ast = true
 fs_permissions = [{ access = "read", path = "./" }, { access = "read", path = "../setup" }]
+# The vault's Poseidon (src/poseidon/Bn254PoseidonRuntime.sol) is compiled with the legacy
+# pipeline: its unrolled assembly is the one protocol/formal verifies, and the setup's
+# poseidon-runtime.json pins the runtime codehash these settings produce. Nothing imports it (the
+# vault takes its address; tests deploy it from its artifact), so no other file joins the profile.
+# The dual-schedule paymaster uses 200 optimizer runs to remain below EIP-170.
+# Importers and dependencies join that compilation unit. The demo Deploy script therefore
+# produces its core contracts at 200 runs; use demo/contracts/out for deployed codehash pins.
+additional_compiler_profiles = [{ name = "legacy", via_ir = false }, { name = "gasless", optimizer_runs = 200 }]
+compilation_restrictions = [{ paths = "src/poseidon/Bn254PoseidonRuntime.sol", via_ir = false }, { paths = "src/gasless/ZkApiWithdrawalPaymaster.sol", optimizer_runs = 200 }]
 
 [profile.default.fuzz]
 runs = 256
@@ -21,3 +30,7 @@ runs = 256
 [profile.default.invariant]
 runs = 256
 depth = 50
+
+# The runtime is the generator's output byte for byte (CI diffs it with the setup's copy).
+[fmt]
+ignore = ["src/poseidon/Bn254PoseidonRuntime.sol"]

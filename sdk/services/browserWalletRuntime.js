@@ -2,7 +2,7 @@ import { browserSdkOptions, beginBrowserSdkInitialization, browserSdkTransport }
 import { assertNativeVault, exitRpcUrl, pinnedRpcRequest, urlRpcRequest, validateNativeFunding, validateNativeQuote, validateProofBoundQuote, readNativeQuote, readVaultWord, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote } from './zkapiNativeEth.mjs';
 import { CHAT_SPENDING_TIER_USD } from './zkapiRequestCompat.mjs';
 import { TestnetPasswordAuth, testnetPasswordRequired } from './testnetPasswordAuth.mjs';
-import { sameFelt, waitForExpectedActiveRoot } from './zkapiWithdrawalRoot.mjs';
+import { ABI, decodeNoteRecord, encodeEffectiveExpiry, encodeNoteRecord } from '../wallet.js';
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import {
     INVALID_SUCCESSOR_DISPOSITION,
@@ -25,7 +25,7 @@ import {
     ownershipProofAction,
     recordClearanceOutcome, recordReleasedProof, releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
 } from './zkapiExitPolicy.mjs';
-import { rebuildNotePath } from './zkapiTreeRebuild.mjs';
+import { rebuildRequestPath, sameFelt, workerRefusalCode } from './zkapiTreeRebuild.mjs';
 import { buildExitKitPayload, sealExitKit } from './zkapiExitKit.mjs';
 import { canaryLimits, canaryRefusal, deploymentMismatchError, verifyDeployment } from './zkapiDeploymentCheck.mjs';
 import { GASLESS_TIMING, bundlerClient, bundlerUrl as validBundlerUrl, gaslessError, gaslessPins } from './zkapiGasless.mjs';
@@ -101,18 +101,26 @@ const STALE_ROOT_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000]);
 const SETTLEMENT_RETRY_MIN_MS = 2_000;
 const SETTLEMENT_RETRY_MAX_MS = 60_000;
 const VAULT_SELECTORS = Object.freeze({
-    currentRoot: '0xfdab463d',
-    challengePeriod: '0xf3f480d9',
-    effectiveExpiry: '0x7cb4a03c',
-    challengedNullifiers: '0x6cda756a'
+    currentRoot: `0x${ABI.currentRoot}`,
+    nextNoteId: `0x${ABI.nextNoteId}`,
+    minDeposit: `0x${ABI.minDeposit}`,
+    challengePeriod: `0x${ABI.challengePeriod}`,
+    challengedNullifiers: `0x${ABI.challengedNullifiers}`
 });
 const WITHDRAWAL_RESTART = Symbol('withdrawal-restart');
-// E4.1's path sources in order: the deposit-time path (Amendment A1), the
-// operator's indexer checked against the vault, the vault's own logs (§6.6).
-const EXIT_PATH_SOURCES = Object.freeze(['deposit', 'indexer', 'rebuild']);
-// After the vault refused a proof's root: any source but the saved one, and
-// never the refused root itself.
-const AFTER_UNKNOWN_ROOT_SOURCES = Object.freeze(['indexer', 'rebuild']);
+// A request's path from the operator's indexer is used only at the vault's
+// current root; while the indexer lags it is asked again this many times
+// (INDEXER_ROOT_RETRY_MS apart), then the path is rebuilt from the vault's
+// state instead.
+const INDEXER_ROOT_ATTEMPTS = 3;
+const INDEXER_ROOT_RETRY_MS = 500;
+// The time a request's tree rebuild from the vault's state (or logs) may take.
+const REQUEST_REBUILD_BUDGET_MS = 60_000;
+// Recovery of a deposit's expiry without its receipt (design C.9): the
+// candidate expiries are the day buckets ceil((t + noteTtl) / day) · day for
+// t from the plan's creation, less this margin, to now.
+const DEPOSIT_EXPIRY_SEARCH_MARGIN_SECONDS = 300;
+const DAY_SECONDS = 86_400;
 const REQUEST_PUBLIC_INPUT_FIELDS = Object.freeze([
     'request_nullifier', 'authorization_tag', 'anonymous_commitment_x', 'anonymous_commitment_y',
     'solvency_bound', 'request_time'
@@ -155,7 +163,7 @@ function browserConfigUrl() {
     if (!configured) throw new Error('Configure a trusted configUrl before initializing the zkAPI browser SDK.');
     return configured;
 }
-const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v1';
+const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v2';
 // Setups a bundle can be built for; the build-pinned profile names one, and
 // the proof worker must run a bundle of exactly that setup.
 const BUNDLE_SETUP_IDS = Object.freeze(['dev', 'mpc-1']);
@@ -490,11 +498,19 @@ function sameStateExceptBound(next, current) {
     return STATE_IDENTITY_FIELDS.every(field => JSON.stringify(next[field] ?? null) === JSON.stringify(current[field] ?? null));
 }
 
-/** A note state from the WebAssembly, with the deposit-time path the previous one saved. */
-function withDepositPath(next, previous) {
-    return previous?.deposit_path && next && Number(next.note_id) === Number(previous.note_id)
-        ? { ...next, deposit_path: previous.deposit_path }
-        : next;
+/**
+ * A note state from the WebAssembly, with the note's registration commitment
+ * R the previous one carried (the WebAssembly keeps only the secret; R is the
+ * preimage effectiveExpiry takes). A state saved before vault revision 4 may
+ * hold a deposit-time `deposit_path`: it is dropped, since no exit needs one.
+ */
+function withNoteContext(next, previous) {
+    if (!next) return next;
+    const { deposit_path: _ignored, ...state } = next;
+    return previous?.registration_commitment != null && Number(state.note_id) === Number(previous.note_id)
+        && state.registration_commitment == null
+        ? { ...state, registration_commitment: previous.registration_commitment }
+        : state;
 }
 
 function nowSeconds() {
@@ -563,6 +579,8 @@ class BrowserWalletRuntime extends EventTarget {
         // Transmitted-request archive cache. Decisions use it only after
         // reload() under the global wallet lock.
         this.requestArchive = [];
+        // Where the last request's Merkle path came from (requestPath).
+        this.lastRequestPathSource = null;
         this.settlementFailures = 0;
         this.activeLease = null;
         this.initialized = false;
@@ -987,8 +1005,8 @@ class BrowserWalletRuntime extends EventTarget {
             throw new BrowserWalletHttpError('This application pins a placeholder profile: no vault for this proof setup is deployed on this network yet.',
                 409, 'deployment_not_deployed');
         }
-        // Vault revision 3 only: the concession exit is not a monotone
-        // upgrade of revision 2, so its own capability must be pinned.
+        // The concession exit is not a monotone upgrade of revision 2, so its
+        // own capability must be pinned.
         if (trusted.exit_concession !== 1) {
             throw new BrowserWalletHttpError('This application build supports only vaults with the concession exit (exit_concession 1).',
                 409, 'exit_concession_required');
@@ -997,9 +1015,23 @@ class BrowserWalletRuntime extends EventTarget {
             throw new Error('browser-config.json contains an invalid trusted setup_id.');
         }
         // Capabilities come only from the build-pinned trust anchor, never
-        // from the served manifest. This build supports vault revision 3 only.
-        if (trusted.vault_revision !== 3) {
-            throw new Error('browser-config.json contains an invalid trusted vault_revision (this build needs 3).');
+        // from the served manifest. This build supports vault revision 4
+        // only: its exits are bound to the note's leaf (leaf_bound_exit 1), a
+        // statement a revision-3 vault refuses, and the reverse.
+        if (trusted.vault_revision !== 4) {
+            throw new BrowserWalletHttpError('This application build supports only vault revision 4 (leaf-bound exits); the pinned profile names another revision.',
+                409, 'vault_revision_unsupported', { vault_revision: trusted.vault_revision ?? null });
+        }
+        if (trusted.leaf_bound_exit !== 1) {
+            throw new BrowserWalletHttpError('This application build supports only vaults with leaf-bound exits (leaf_bound_exit 1).',
+                409, 'leaf_bound_exit_required');
+        }
+        // The deposit pins: the vault's minDeposit() and the gas of a fresh
+        // storage slot on this network (the deposit gas limit, zkapiGas).
+        for (const field of ['min_deposit_units', 'fresh_slot_gas']) {
+            if (!Number.isSafeInteger(trusted[field]) || trusted[field] <= 0) {
+                throw new Error(`browser-config.json contains an invalid trusted ${field}.`);
+            }
         }
         if (trusted.clearance_ownership_proof !== 'required') {
             throw new Error('browser-config.json contains an invalid trusted clearance_ownership_proof (this build needs "required").');
@@ -1104,13 +1136,13 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * Deployment capabilities. This build supports only vault revision 3
-     * (capability exit_concession 1): escape payouts that the destination
-     * rejects are credited, and every clearance carries a kind-2 ownership
-     * proof.
+     * Deployment capabilities. This build supports only vault revision 4
+     * (capabilities exit_concession 1 and leaf_bound_exit 1): exits are bound
+     * to the note's leaf, escape payouts that the destination rejects are
+     * credited, and every clearance carries a kind-2 ownership proof.
      */
     vaultCapabilities() {
-        return { vaultRevision: 3, exitConcession: true, payoutCredits: true, sendOwnershipProof: true };
+        return { vaultRevision: 4, exitConcession: true, leafBoundExit: true, payoutCredits: true, sendOwnershipProof: true };
     }
 
     /**
@@ -1294,6 +1326,7 @@ class BrowserWalletRuntime extends EventTarget {
                     && depositReplacementIdentities.size === 1
             } : null,
             prepared_withdrawal: prepared ? {
+                operation_id: prepared.operationId || null,
                 mode: prepared.mode,
                 phase: prepared.phase || (prepared.transactionHash ? 'submitted' : 'prepared'),
                 note_id: prepared.public_inputs?.note_id ?? prepared.noteId ?? prepared.note_id,
@@ -1311,6 +1344,9 @@ class BrowserWalletRuntime extends EventTarget {
                 // transit identity and the operation's hash and phase.
                 fee_payer: prepared.feePayer === 'payout' ? 'payout' : 'wallet',
                 payout: prepared.feePayer === 'payout' ? prepared.payout || null : null,
+                max_cost_wei: prepared.feePayer === 'payout' ? prepared.gaslessMaxCostWei ?? null : null,
+                max_total_fee_wei: prepared.feePayer === 'payout' ? prepared.gaslessMaxTotalFeeWei ?? null : null,
+                flat_fee_cap_wei: prepared.feePayer === 'payout' ? prepared.gaslessFlatFeeCapWei ?? null : null,
                 transit: prepared.feePayer === 'payout' && prepared.transit ? structuredClone(prepared.transit) : null,
                 user_op_hash: prepared.feePayer === 'payout' ? prepared.userOpHash || null : null,
                 user_op_phase: prepared.feePayer === 'payout' ? prepared.userOpPhase || null : null
@@ -1448,18 +1484,12 @@ class BrowserWalletRuntime extends EventTarget {
                 releasable_after: exits.length ? exitLockDeadAfter(lock) * 1_000 : null
             } : null,
             exit_kit: { state_seq: stateSeq, exported_seq: exported ?? null, out_of_date: exported == null || exported < stateSeq },
-            deposit_path_saved: Boolean(state.deposit_path),
             exit_cost_warning: this.exitCostWarningAt(state),
             exit_rpc_url: exitRpcUrlValue,
             // The exit RPC answered on another chain than the vault's, so
             // exits read the wallet provider and the pinned RPC instead.
             exit_rpc_wrong_chain: Boolean(exitRpcUrlValue) && this.exitRpcChainCheck?.url === exitRpcUrlValue
-                && this.exitRpcChainCheck.matches === false,
-            // Without a saved deposit path an escape's path comes from the
-            // operator's indexer or a log rebuild; the user's own exit RPC
-            // (or an exit kit made on the depositing device) removes that
-            // dependence on the operator.
-            exit_rpc_recommended: !state.deposit_path && !exitRpcUrlValue
+                && this.exitRpcChainCheck.matches === false
         };
     }
 
@@ -1717,22 +1747,107 @@ class BrowserWalletRuntime extends EventTarget {
         return payload;
     }
 
-    async treePath(noteId, requireExisting = true, expectedActiveRoot = null, signal = null) {
-        return waitForExpectedActiveRoot(async () => {
-            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`, { signal });
-            return this.worker.call('treePath', { snapshot, noteId, requireExisting });
-        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds, signal) });
+    /** The note's path in the operator's indexer snapshot, at the snapshot's own root. */
+    async indexerPath(noteId, signal = null) {
+        const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`, { signal });
+        return this.worker.call('treePath', { snapshot, noteId: Number(noteId), requireExisting: true });
     }
 
-    async nextDepositPath(expectedActiveRoot = null) {
-        return waitForExpectedActiveRoot(async () => {
-            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`);
-            return this.worker.call('treePath', {
-                snapshot,
-                noteId: Number(snapshot.next_note_id),
-                requireExisting: false
+    /**
+     * A private request's Merkle path, at a root the vault holds now. Only
+     * requests need one: exits are bound to the note's leaf. The operator's
+     * indexer is used only when its root is the vault's currentRoot() read
+     * through the pinned RPC at the same time (it is asked again while it
+     * lags); otherwise, or when the indexer is down, the path is rebuilt from
+     * the vault's state (noteLeaves, nextNoteId() and currentRoot() at one
+     * block hash, its logs as the fallback). The server admits a root it read
+     * from the vault within its grace window (about a minute), so a root read
+     * now is accepted. Returns { active_root, note_id, siblings, source }.
+     */
+    async requestPath(noteId, signal = null) {
+        if (this.config.funding.indexer_url) {
+            for (let attempt = 0; attempt < INDEXER_ROOT_ATTEMPTS; attempt += 1) {
+                let root;
+                let path;
+                try {
+                    [root, path] = await Promise.all([this.vaultWord(VAULT_SELECTORS.currentRoot, signal),
+                        this.indexerPath(noteId, signal)]);
+                } catch (error) {
+                    if (isAbortError(error, signal)) throw error;
+                    break;
+                }
+                if (sameFelt(path.active_root, root)) {
+                    this.lastRequestPathSource = 'indexer';
+                    return { ...path, source: 'indexer' };
+                }
+                if (attempt + 1 < INDEXER_ROOT_ATTEMPTS) await delay(INDEXER_ROOT_RETRY_MS, signal);
+            }
+        }
+        const path = await this.rebuildRequestPath(noteId, signal);
+        this.lastRequestPathSource = path.source;
+        return path;
+    }
+
+    /** A request's path rebuilt from the vault through the pinned RPC (zkapiTreeRebuild). */
+    async rebuildRequestPath(noteId, signal = null) {
+        const trusted = this.browserConfig?.trusted_deployment || {};
+        try {
+            const path = await rebuildRequestPath({
+                request: this.pinnedRpc(),
+                vault: this.config.funding.contract_address,
+                deployBlock: trusted.deploy_block,
+                noteId: Number(noteId),
+                chainId: Number(this.config.funding.chain_id),
+                worker: this.worker,
+                signal,
+                deadline: Date.now() + REQUEST_REBUILD_BUDGET_MS
             });
-        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds) });
+            return { active_root: path.active_root, note_id: path.note_id, siblings: path.siblings, source: path.source };
+        } catch (error) {
+            if (isAbortError(error, signal)) throw error;
+            throw new BrowserWalletHttpError(error?.message || 'The request’s Merkle path could not be rebuilt from the vault.',
+                503, workerRefusalCode(error) || 'tree_rebuild_failed', { request_path_unavailable: true });
+        }
+    }
+
+    /**
+     * The note id a deposit sent now is expected to take: the vault's
+     * nextNoteId() at latest, through the pinned RPC. The vault assigns the
+     * id when the deposit executes, so other deposits may land first; the
+     * receipt's NoteDeposited names the id it took.
+     */
+    async nextDepositNoteId() {
+        const next = await this.vaultWord(VAULT_SELECTORS.nextNoteId);
+        if (next >= 1n << 32n) throw new Error('The vault returned an invalid nextNoteId.');
+        return Number(next);
+    }
+
+    /**
+     * Refuse a deposit below the vault's minimum: the build-pinned profile's
+     * min_deposit_units, which must equal the vault's minDeposit() (read
+     * through the pinned RPC when `readVault`). The vault would revert the
+     * deposit with DepositTooSmall.
+     */
+    async assertDepositAmount(amount, { readVault = true } = {}) {
+        const pinned = this.browserConfig?.trusted_deployment?.min_deposit_units;
+        if (!Number.isSafeInteger(pinned) || pinned <= 0) {
+            throw new BrowserWalletHttpError('This application’s deployment profile does not pin the vault’s minimum deposit.',
+                409, 'min_deposit_unpinned');
+        }
+        if (readVault) {
+            const onChain = await this.vaultWord(VAULT_SELECTORS.minDeposit);
+            if (onChain !== BigInt(pinned)) {
+                throw new BrowserWalletHttpError('The vault’s minimum deposit differs from the one this application pins. Deposits are refused; existing balances can still exit.',
+                    409, 'deployment_mismatch', { mismatches: [{ field: 'minDeposit', expected: String(pinned), actual: onChain.toString() }] });
+            }
+        }
+        if (BigInt(amount) < BigInt(pinned)) {
+            const error = new BrowserWalletHttpError(`The vault accepts deposits of at least ${pinned} units (gwei).`, 400,
+                'deposit_too_small', { min_deposit_units: pinned });
+            error.min_deposit_units = pinned;
+            throw error;
+        }
+        return pinned;
     }
 
     canQuotePendingDeposit(pending = this.runtime?.pendingDeposit) {
@@ -1752,7 +1867,7 @@ class BrowserWalletRuntime extends EventTarget {
                 !(pending.resolvedAmbiguousSubmissionIds || []).includes(attempt.submissionId));
     }
 
-    async prepareDepositQuote(amount, expectedActiveRoot) {
+    async prepareDepositQuote(amount) {
         await this.init();
         // Exit-only mode refuses new deposits (initialize()).
         await this.assertServiceAvailable();
@@ -1768,6 +1883,7 @@ class BrowserWalletRuntime extends EventTarget {
                 throw new Error('Recover the existing private balance or deposit before preparing another quote.');
             }
             if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Invalid deposit amount.');
+            await this.assertDepositAmount(amount);
             if (pending && pending.amount !== amount) {
                 throw new Error('The prepared deposit amount is fixed. Refresh its existing funding quote.');
             }
@@ -1780,17 +1896,16 @@ class BrowserWalletRuntime extends EventTarget {
             const previous = pending || this.runtime.depositQuote;
             const params = previous?.amount === amount ? previous
                 : await this.worker.call('generateDeposit');
-            const path = await this.nextDepositPath(expectedActiveRoot);
+            const nextNoteId = await this.nextDepositNoteId();
+            const { active_root: _root, zero_path: _path, ...kept } = pending || {};
             const draft = {
-                ...(pending || {}),
+                ...kept,
                 operationId: previous?.amount === amount ? previous.operationId : uuid(),
                 createdAt: previous?.amount === amount ? previous.createdAt : Date.now(),
                 amount,
                 secret: params.secret,
                 commitment: params.commitment || params.registration_commitment,
-                next_note_id: path.note_id,
-                active_root: path.active_root,
-                zero_path: path.siblings
+                next_note_id: nextNoteId
             };
             // A new quote is only a draft. A rejected-before-broadcast pending
             // plan can be requoted, but only for its original amount and identity.
@@ -1858,8 +1973,8 @@ class BrowserWalletRuntime extends EventTarget {
                 await this.discardClosedDepositDraftLocked();
                 throw this.depositsClosedError();
             }
+            await this.assertDepositAmount(Number(amount));
             const params = await this.worker.call('generateDeposit');
-            const path = await this.nextDepositPath();
             const plan = {
                 operationId: uuid(),
                 createdAt: Date.now(),
@@ -1867,9 +1982,7 @@ class BrowserWalletRuntime extends EventTarget {
                 amount: Number(amount),
                 secret: params.secret,
                 commitment: params.registration_commitment,
-                next_note_id: path.note_id,
-                active_root: path.active_root,
-                zero_path: path.siblings
+                next_note_id: await this.nextDepositNoteId()
             };
             // Persist the note secret before MetaMask is opened. If the tab is
             // closed after the transaction is submitted, the deposit can still
@@ -1884,7 +1997,7 @@ class BrowserWalletRuntime extends EventTarget {
         return plan;
     }
 
-    async refreshPendingDeposit(amount, expectedActiveRoot = null, { expectedOperationId = null } = {}) {
+    async refreshPendingDeposit(amount, { expectedOperationId = null } = {}) {
         await this.init();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
@@ -1901,15 +2014,10 @@ class BrowserWalletRuntime extends EventTarget {
                 ? pending.transactionHashes
                 : pending.transactionHash ? [pending.transactionHash] : [];
             if (pending.phase !== 'prepared' || pending.submissionId || hashes.length) {
-                throw new Error('This deposit already has a wallet attempt. Check it before refreshing the vault path.');
+                throw new Error('This deposit already has a wallet attempt. Check it before refreshing its note id.');
             }
-            const path = await this.nextDepositPath(expectedActiveRoot);
-            const refreshed = {
-                ...pending,
-                next_note_id: path.note_id,
-                active_root: path.active_root,
-                zero_path: path.siblings
-            };
+            const { active_root: _root, zero_path: _path, ...kept } = pending;
+            const refreshed = { ...kept, next_note_id: await this.nextDepositNoteId() };
             // Keep the durable secret and commitment, but rebase their unused
             // note onto the latest append position before the wallet prompt.
             await this.commit({ ...this.runtime, pendingDeposit: refreshed });
@@ -2462,28 +2570,34 @@ class BrowserWalletRuntime extends EventTarget {
                 return this.completeConfirmedDeposit(confirmed, args);
             }
             const pending = this.runtime.pendingDeposit;
+            // The vault assigns the note id when the deposit executes: one
+            // that landed behind other deposits takes a later id than the
+            // plan expected. Only the receipt's NoteDeposited of this very
+            // commitment (args.commitment, which the caller matched and whose
+            // leaf it checked against noteRecord) may name a later id.
+            const noteId = Number(args.note_id);
+            const expectedId = Number(pending?.next_note_id);
             if (!pending || pending.secret !== args.secret
                 || (args.operationId && pending.operationId !== args.operationId)
-                || Number(pending.next_note_id) !== Number(args.note_id)
+                || !Number.isSafeInteger(noteId)
+                || (noteId !== expectedId && !(noteId > expectedId && args.commitment != null))
                 || Number(pending.amount) !== Number(args.amount)
                 || (args.commitment && !sameFelt(pending.commitment, args.commitment))) {
                 throw new Error('The deposit secret does not match this browser’s durable pending deposit.');
             }
-            let state = await this.worker.call('confirmDeposit', {
+            const confirmed = await this.worker.call('confirmDeposit', {
                 config: this.config.wallet_core,
                 args: {
                     secret: args.secret,
-                    note_id: Number(args.note_id),
+                    note_id: noteId,
                     amount: Number(args.amount),
                     expiry_ts: Number(args.expiry_ts)
                 }
             });
-            // Amendment A1: the path the deposit used, at the root it set (the
-            // NoteDeposited newRoot), proves exits for the note's whole life:
-            // the vault accepts any root it ever held. Kept only if it leads
-            // from this note's leaf to that root.
-            const depositPath = await this.verifiedDepositPath(state, args.deposit_root, pending.zero_path);
-            if (depositPath) state = { ...state, deposit_path: depositPath };
+            // The registration commitment R travels with the state: with the
+            // note id, amount and expiry it is the preimage of the note's leaf
+            // that effectiveExpiry takes (exitLowExpiry).
+            const state = { ...confirmed, registration_commitment: pending.commitment };
             await this.commit({
                 ...this.runtime,
                 state,
@@ -2510,7 +2624,7 @@ class BrowserWalletRuntime extends EventTarget {
             return {
                 status: 'confirmed',
                 operationId: pending.operationId,
-                noteId: Number(args.note_id),
+                noteId,
                 amount: Number(args.amount),
                 transactionHash: args.transactionHash || null
             };
@@ -2541,12 +2655,9 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * Finish a confirmation whose note another path (the background vault
      * recovery) already committed: fill in the receipt-only fields that path
-     * could not know (the transaction hash and fee on the deposit record, and
-     * the note's deposit path of Amendment A1 from the receipt's
-     * NoteDeposited root and `args.zero_path`, the plan's siblings, since the
-     * pending deposit that held them is gone), then return what a fresh
-     * confirmation returns, so both orders of the race end in the same
-     * durable state. Called under the wallet lock.
+     * could not know (the transaction hash and fee on the deposit record),
+     * then return what a fresh confirmation returns, so both orders of the
+     * race end in the same durable state. Called under the wallet lock.
      */
     async completeConfirmedDeposit(record, args) {
         const metadata = args.receiptMetadata || {};
@@ -2555,21 +2666,16 @@ class BrowserWalletRuntime extends EventTarget {
         const missingFee = record.feeWei == null && metadata.feeWei != null
             && (!record.transactionHash || !transactionHash
                 || record.transactionHash === String(transactionHash).toLowerCase());
-        const state = this.runtime.state;
-        const depositPath = !state.deposit_path && args.deposit_root != null
-            ? await this.verifiedDepositPath(state, args.deposit_root, args.zero_path)
-            : null;
-        if (missingHash || missingFee || depositPath) {
-            await this.commit({ ...this.runtime, ...(depositPath ? { state: { ...state, deposit_path: depositPath } } : {}) },
-                missingHash || missingFee ? {
-                    depositConfirmation: {
-                        operationId: record.operationId,
-                        createdAt: record.createdAt,
-                        confirmedAt: record.confirmedAt,
-                        transactionHash,
-                        ...metadata
-                    }
-                } : undefined);
+        if (missingHash || missingFee) {
+            await this.commit({ ...this.runtime }, {
+                depositConfirmation: {
+                    operationId: record.operationId,
+                    createdAt: record.createdAt,
+                    confirmedAt: record.confirmedAt,
+                    transactionHash,
+                    ...metadata
+                }
+            });
         }
         return {
             status: 'confirmed',
@@ -2580,21 +2686,47 @@ class BrowserWalletRuntime extends EventTarget {
         };
     }
 
-    /** The deposit-time Merkle path, when it leads from the note's leaf to `root`. */
-    async verifiedDepositPath(state, root, siblings) {
-        if (root == null || !Array.isArray(siblings) || siblings.length !== 32) return null;
-        let activeRoot;
-        try {
-            activeRoot = `0x${BigInt(root).toString(16).padStart(64, '0')}`;
-        } catch {
-            return null;
+    /**
+     * The leaf the vault stores for a deposit of `amount` with registration
+     * commitment `commitment` at `noteId`, expiring at `expiryTs` (hex felt):
+     * what noteRecord(noteId).leaf must equal.
+     */
+    async noteLeafFromFields({ noteId, commitment, amount, expiryTs }) {
+        await this.init();
+        return this.worker.call('noteLeafFromFields', { noteId: Number(noteId), commitment: String(commitment),
+            amount: BigInt(amount).toString(), expiryTs: BigInt(expiryTs).toString() });
+    }
+
+    /**
+     * The deposit expiries to try for a plan whose receipt is unknown
+     * (design C.9): every day bucket ceil((t + noteTtl) / day) · day for t
+     * from the plan's creation, less DEPOSIT_EXPIRY_SEARCH_MARGIN_SECONDS, to
+     * `nowSeconds`: normally one or two, at most ⌈Δt / day⌉ + 2.
+     */
+    depositExpiryCandidates(plan, nowSecondsValue = nowSeconds()) {
+        const noteTtl = Number(this.browserConfig?.trusted_deployment?.note_ttl ?? this.config?.note_ttl);
+        const createdAt = Math.floor(Number(plan?.createdAt || plan?.submissionStartedAt || 0) / 1_000);
+        if (!Number.isSafeInteger(noteTtl) || noteTtl <= 0 || !Number.isSafeInteger(createdAt) || createdAt <= 0) return [];
+        const bucket = seconds => Math.ceil((seconds + noteTtl) / DAY_SECONDS) * DAY_SECONDS;
+        const first = bucket(createdAt - DEPOSIT_EXPIRY_SEARCH_MARGIN_SECONDS);
+        const last = bucket(Math.max(nowSecondsValue, createdAt));
+        const candidates = [];
+        for (let expiry = first; expiry <= last; expiry += DAY_SECONDS) candidates.push(expiry);
+        return candidates;
+    }
+
+    /**
+     * The expiry e of a deposit whose receipt is unknown: the candidate of
+     * depositExpiryCandidates whose leaf noteLeafFromFields(noteId, R, D, e)
+     * equals `leaf` (noteRecord(noteId).leaf), or null when none does.
+     */
+    async findDepositExpiry(plan, { noteId, leaf, now = nowSeconds() }) {
+        if (leaf == null || BigInt(leaf) === 0n) return null;
+        for (const expiryTs of this.depositExpiryCandidates(plan, now)) {
+            const candidate = await this.noteLeafFromFields({ noteId, commitment: plan.commitment, amount: plan.amount, expiryTs });
+            if (sameFelt(candidate, leaf)) return expiryTs;
         }
-        const path = { active_root: activeRoot, siblings: siblings.map(String) };
-        try {
-            return await this.worker.call('notePathMatches', { state, path }) === true ? path : null;
-        } catch {
-            return null;
-        }
+        return null;
     }
 
     async nativeBillingQuote(signal) {
@@ -2662,7 +2794,7 @@ class BrowserWalletRuntime extends EventTarget {
         }
         this.assertAnchorAcceptsRequest(this.runtime.state);
         onProgress('syncing', 'Checking your private balance…');
-        const path = await this.treePath(this.runtime.state.note_id, true, null, signal);
+        const path = await this.requestPath(this.runtime.state.note_id, signal);
         throwIfAborted(signal);
         const now = Date.now();
         const quote = await this.nativeBillingQuote(signal);
@@ -2704,7 +2836,7 @@ class BrowserWalletRuntime extends EventTarget {
         // The state with its bound, the journal and its append-only archive
         // record land in ONE durable write before any POST can carry the
         // proof off this device (design §6.2).
-        await this.commit({ ...this.runtime, state: withDepositPath(prepared.state, this.runtime.state),
+        await this.commit({ ...this.runtime, state: withNoteContext(prepared.state, this.runtime.state),
             journal: prepared.journal }, { requestArchive: [record] });
         return prepared.request;
     }
@@ -3503,7 +3635,7 @@ class BrowserWalletRuntime extends EventTarget {
             : lock || null;
         await this.commit({
             ...this.runtime,
-            state: withDepositPath(next, state),
+            state: withNoteContext(next, state),
             stateSeq: Number(this.runtime.stateSeq || 0) + 1,
             exitLock,
             journal: null,
@@ -4054,10 +4186,11 @@ class BrowserWalletRuntime extends EventTarget {
      * instead of waiting for a wallet window that no longer exists. Without
      * one the ordinary claim applies.
      */
-    async claimPreparedWithdrawalUserOp({ liveWindowMs = GASLESS_TIMING.resendAfterMs } = {}) {
+    async claimPreparedWithdrawalUserOp({ liveWindowMs = GASLESS_TIMING.resendAfterMs, expected = null } = {}) {
         const takeover = await withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const prepared = this.runtime.preparedWithdrawal;
+            this.assertPreparedWithdrawalIdentity(prepared, expected);
             if (!prepared || !isGaslessWithdrawal(prepared) || !prepared.userOp || preparedWithdrawalHashes(prepared).length) return null;
             // A claim another client is still following is refused like the
             // wallet path's (409 withdrawal_wallet_pending); only a claim no
@@ -4106,7 +4239,7 @@ class BrowserWalletRuntime extends EventTarget {
                 bundlerUrl: next.bundlerUrl || null
             };
         });
-        const claim = takeover || await this.claimPreparedWithdrawalSubmission();
+        const claim = takeover || await this.claimPreparedWithdrawalSubmission(expected);
         if (claim?.submissionId && !claim.transactionHash) this.liveGaslessClaims.add(claim.submissionId);
         return claim;
     }
@@ -4135,6 +4268,8 @@ class BrowserWalletRuntime extends EventTarget {
                 userOpHash: hash,
                 userOpHashes: [...new Set([...(prepared.userOpHashes || []), hash])],
                 userOpNonce: String(details.userOpNonce ?? details.userOp.nonce ?? ''),
+                ...(details.gaslessMaxCostWei != null ? { gaslessMaxCostWei: String(details.gaslessMaxCostWei) } : {}),
+                ...(details.gaslessMaxTotalFeeWei != null ? { gaslessMaxTotalFeeWei: String(details.gaslessMaxTotalFeeWei) } : {}),
                 userOpInitCode: Boolean(details.userOpInitCode),
                 bundlerUrl: details.bundlerUrl || null,
                 userOpBuiltAt: Number(details.userOpBuiltAt || Date.now()),
@@ -4236,15 +4371,24 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * E_low: the note's own expiry_ts, raised only when the user's exit RPC
      * (on the vault's chain) and the pinned RPC both report a later
-     * effectiveExpiry (E0).
+     * effectiveExpiry (E0). effectiveExpiry takes the leaf's preimage (note
+     * id, registration commitment R, deposit and expiry) and answers 0 for
+     * any other; a state that does not carry R keeps its own expiry_ts.
      */
     async exitLowExpiry(state) {
         const exit = this.exitRpcOnVaultChain();
-        if (!exit) return lowExpiry(state.expiry_ts);
+        if (!exit || state?.registration_commitment == null) return lowExpiry(state.expiry_ts);
+        let data;
+        try {
+            data = encodeEffectiveExpiry(state.note_id, state.registration_commitment, BigInt(state.deposit_amount),
+                BigInt(state.expiry_ts));
+        } catch {
+            return lowExpiry(state.expiry_ts);
+        }
         const read = async request => {
             try {
                 const word = await request({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
-                    data: `${VAULT_SELECTORS.effectiveExpiry}${abiWordHex(state.note_id)}` }, 'latest'] });
+                    data }, 'latest'] });
                 return /^0x[0-9a-fA-F]{64}$/.test(word || '') ? Number(BigInt(word)) : null;
             } catch {
                 return null;
@@ -4362,115 +4506,6 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * The vault's currentRoot for the indexer check of E4.1: through the
-     * user's exit RPC when one is set and on the vault's chain; when it is
-     * not, or fails, through the wallet provider when it is on the vault's
-     * chain, then the pinned RPC.
-     */
-    async exitCurrentRoot(signal = null, walletRequest = null) {
-        const call = { method: 'eth_call', params: [{ to: this.config.funding.contract_address,
-            data: VAULT_SELECTORS.currentRoot }, 'latest'] };
-        const sources = [['exit RPC', this.exitRpcOnVaultChain()], ['wallet provider', this.walletOnVaultChain(walletRequest)]];
-        for (const [source, request] of sources) {
-            if (!request) continue;
-            try {
-                const word = await abortable(request(call), signal);
-                if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) throw new Error(`The ${source} returned an invalid vault root.`);
-                return BigInt(word);
-            } catch (error) {
-                if (signal?.aborted) throw error;
-            }
-        }
-        return this.vaultWord(VAULT_SELECTORS.currentRoot, signal);
-    }
-
-    /**
-     * §6.6: the note's path rebuilt from the vault's logs, through the
-     * user's exit RPC when one is set and on the vault's chain, then (when
-     * it is not, or fails) through the wallet provider and the pinned RPC,
-     * all within one rebuild budget.
-     */
-    async rebuildExitPath(state, { signal = null, walletRequest = null } = {}) {
-        // The wallet provider's calls get E0's per-call bound too (the exit
-        // and pinned RPCs have their own), so a silent wallet leaves the
-        // pinned RPC time to answer.
-        const requests = [this.exitRpcOnVaultChain(), this.walletOnVaultChain(walletRequest), this.pinnedRpc()].filter(Boolean);
-        const deadline = Date.now() + this.exitTiming().rebuildBudgetMs;
-        const trusted = this.browserConfig?.trusted_deployment || {};
-        let failure = null;
-        for (const request of requests) {
-            try {
-                return await rebuildNotePath({
-                    request,
-                    vault: this.config.funding.contract_address,
-                    deployBlock: trusted.deploy_block,
-                    noteId: Number(state.note_id),
-                    chainId: Number(this.config.funding.chain_id),
-                    worker: this.worker,
-                    signal,
-                    deadline
-                });
-            } catch (error) {
-                if (signal?.aborted || error?.name === 'AbortError') throw error;
-                failure = error;
-                if (error?.code === 'tree_rebuild_timeout') break;
-            }
-        }
-        throw failure;
-    }
-
-    /**
-     * E4.1: a path at a root the vault holds. The deposit-time path first
-     * (Amendment A1), then the operator's indexer with its root checked
-     * against the vault's currentRoot (exitCurrentRoot), then the vault's
-     * own logs (§6.6). `sources` narrows the order; after an UnknownRoot
-     * refusal no source may return `refusedRoot`.
-     */
-    async exitPathLocked(state, { signal = null, sources = EXIT_PATH_SOURCES, refusedRoot = null, walletRequest = null,
-        currentRoot = null } = {}) {
-        const refused = root => refusedRoot != null && sameFelt(root, refusedRoot);
-        const saved = state?.deposit_path;
-        if (sources.includes('deposit') && saved?.active_root != null && Array.isArray(saved.siblings)
-            && saved.siblings.length === 32 && !refused(saved.active_root)) {
-            return { active_root: saved.active_root, note_id: Number(state.note_id), siblings: saved.siblings, source: 'deposit' };
-        }
-        if (sources.includes('indexer')) {
-            const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
-            const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-            try {
-                // A current root the caller read through the wallet provider,
-                // or the vault's currentRoot read here.
-                const root = currentRoot != null ? currentRoot
-                    : await abortable(this.exitCurrentRoot(callSignal, walletRequest), callSignal);
-                if (!refused(root)) {
-                    const path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
-                    if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
-                }
-            } catch (error) {
-                if (signal?.aborted) throw error;
-            }
-        }
-        let rebuilt;
-        try {
-            rebuilt = await this.rebuildExitPath(state, { signal, walletRequest });
-        } catch (error) {
-            if (signal?.aborted || error?.name === 'AbortError') throw error;
-            // The code of the rebuild's failure (tree_logs_unavailable,
-            // tree_rebuild_timeout, a worker's tree_root_mismatch, …), marked
-            // as a path failure: the caller decides whether a proof that
-            // already exists is submitted anyway.
-            const code = error?.code || /^(?:Error: )?([a-z_]+):/.exec(String(error?.message || ''))?.[1] || 'tree_rebuild_failed';
-            throw new BrowserWalletHttpError(error?.message || 'The Merkle path could not be rebuilt.', 503, code,
-                { exit_path_unavailable: true });
-        }
-        if (refused(rebuilt.active_root)) {
-            throw new BrowserWalletHttpError('The vault’s own logs end at the root its simulation refused.', 409,
-                'tree_root_refused', { exit_path_unavailable: true });
-        }
-        return { active_root: rebuilt.active_root, note_id: rebuilt.note_id, siblings: rebuilt.siblings, source: 'rebuild' };
-    }
-
-    /**
      * E4.2: the stale-device pre-check. Evidence the operator holds at N⁺
      * that verifies under the pinned request VK means another device spent
      * this state's successor: refuse with device_not_newest. Errors and
@@ -4562,10 +4597,8 @@ class BrowserWalletRuntime extends EventTarget {
             throw new Error('The RPC returned no finalized block.');
         }
         const encoded = await abortable(request({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
-            data: `0x9f18e4ed${abiWordHex(noteId)}` }, block.number] }), signal);
-        const words = String(encoded || '').replace(/^0x/, '').match(/.{64}/g) || [];
-        if (words.length < 4) throw new Error('The vault returned a truncated note record.');
-        const status = Number(BigInt(`0x${words[3]}`));
+            data: encodeNoteRecord(noteId) }, block.number] }), signal);
+        const { status } = decodeNoteRecord(encoded);
         return {
             noteStatus: status === 1 ? 'active' : status === 2 ? 'pending_withdrawal' : status === 3 ? 'closed' : 'unknown',
             finalizedTimestamp: Number(BigInt(block.timestamp))
@@ -4693,21 +4726,22 @@ class BrowserWalletRuntime extends EventTarget {
      * request_settlement_pending (with escape_at) when a mutual request must
      * wait for T, and device_not_newest when another device spent this state.
      *
-     * `refusedRoot` is the root of a proof the vault (or the wallet's
-     * simulation) refused with UnknownRoot: the next proof takes its path
-     * from the indexer or the vault's logs at any other root (E4.1, §6.6).
+     * No exit needs a Merkle path, a root or the indexer: the proof binds
+     * the note's leaf, which the vault stored at deposit (vault revision 4).
      * `walletRequest` is the user's wallet provider (an EIP-1193 request
      * function); without an exit RPC it is read before the pinned RPC for
-     * the vault's root and logs.
+     * the note's status (E6).
      */
     async prepareWithdrawal(mode, destination, {
-        expectedActiveRoot = null,
         reprove = false,
         earlyConcession = 'zero',
-        refusedRoot = null,
         walletRequest = null,
         signal = null,
         gasless = null,
+        // The note and the prepared operation the person was shown. Compared
+        // inside the wallet lock, before any reservation or proof.
+        expectedNoteId = null,
+        expectedWithdrawalOperationId = null,
         onProgress = () => {}
     } = {}) {
         await this.init();
@@ -4719,13 +4753,6 @@ class BrowserWalletRuntime extends EventTarget {
             || !/^0x[0-9a-fA-F]{40}$/.test(gasless.transit?.account || '')
             || gasless.transit.account.toLowerCase() !== String(destination || '').toLowerCase())) {
             throw new Error('A sponsored withdrawal names its payout address and its transit account as the destination.');
-        }
-        if (refusedRoot != null) {
-            try {
-                BigInt(refusedRoot);
-            } catch {
-                throw new Error('Choose a valid refused Merkle root.');
-            }
         }
         if (walletRequest != null && typeof walletRequest !== 'function') throw new Error('The wallet provider must be a request function.');
         if (!['zero', 'bound'].includes(earlyConcession)) {
@@ -4745,7 +4772,8 @@ class BrowserWalletRuntime extends EventTarget {
                 // there (E1, E3.2, E4.3, E6).
                 for (let pass = 0; pass < 4; pass += 1) {
                     const plan = await this.prepareExitLocked(mode, destination, {
-                        expectedActiveRoot, reprove, earlyConcession, refusedRoot, walletRequest, signal, gasless, onProgress
+                        reprove, earlyConcession, walletRequest, signal, gasless, onProgress,
+                        expectedNoteId, expectedWithdrawalOperationId
                     });
                     if (plan !== WITHDRAWAL_RESTART) return plan;
                 }
@@ -4776,12 +4804,30 @@ class BrowserWalletRuntime extends EventTarget {
             && withdrawalProofStillValid(inputs));
     }
 
-    async prepareExitLocked(requested, destination, { expectedActiveRoot, reprove, earlyConcession, refusedRoot = null,
-        walletRequest = null, signal, gasless = null,
+    async prepareExitLocked(requested, destination, { reprove, earlyConcession, walletRequest = null, signal, gasless = null,
+        expectedNoteId = null, expectedWithdrawalOperationId = null,
         onProgress }) {
         await this.reload();
         const state = this.runtime.state;
         if (!state) throw new Error('There is no active private note to withdraw.');
+        // The person confirmed one note and one prepared operation; another
+        // tab may have replaced either since. Refuse before any network
+        // read, reservation or proof (the lock is held by the caller).
+        if (expectedNoteId != null && Number(state.note_id) !== Number(expectedNoteId)) {
+            throw new BrowserWalletHttpError(
+                'The private balance changed after this withdrawal was shown. Review the current balance before continuing.',
+                409,
+                'withdrawal_note_changed'
+            );
+        }
+        if (expectedWithdrawalOperationId != null
+            && this.runtime.preparedWithdrawal?.operationId !== expectedWithdrawalOperationId) {
+            throw new BrowserWalletHttpError(
+                'This withdrawal was replaced in another tab after it was shown. Review it again before continuing.',
+                409,
+                'withdrawal_note_changed'
+            );
+        }
         if (unresolvedLateWithdrawalForNote(this.runtime, state.note_id)) {
             throw new BrowserWalletHttpError(
                 'A withdrawal from another tab may already be on-chain. Check its status before starting another withdrawal.',
@@ -4911,8 +4957,7 @@ class BrowserWalletRuntime extends EventTarget {
                 // Nothing was released yet (else the request is an escape).
                 await this.commit({ ...this.runtime, exitLock: switchExitLock(this.runtime.exitLock, 'mutual') });
             }
-            const outcome = await this.prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot,
-                refusedRoot, walletRequest, signal, gasless });
+            const outcome = await this.prepareMutualCloseLocked({ state, destination, nullifier, existing, signal, gasless });
             if (outcome === WITHDRAWAL_RESTART) return outcome;
             if (outcome.plan) return outcome.plan;
             const next = afterClearanceFailure(outcome.error);
@@ -4934,8 +4979,7 @@ class BrowserWalletRuntime extends EventTarget {
                 decision = { ...next, clearanceError: outcome.error?.code || null };
             }
         }
-        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, refusedRoot,
-            walletRequest,
+        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove,
             signal, gasless, onProgress });
     }
 
@@ -4979,32 +5023,14 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * E2: a mutual close at a fresh state: the kind-2 ownership proof (at most
      * one per lock, journaled before it leaves), the server clearance, then
-     * the kind-1 close proof, journaled with its plan. Returns { plan },
-     * WITHDRAWAL_RESTART, or { error } when the clearance failed.
+     * the kind-1 close proof, journaled with its plan. Neither proof needs a
+     * path or a chain read. Returns { plan }, WITHDRAWAL_RESTART, or { error }
+     * when the clearance failed.
      */
-    async prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, refusedRoot = null,
-        walletRequest = null, signal, gasless = null }) {
+    async prepareMutualCloseLocked({ state, destination, nullifier, existing, signal, gasless = null }) {
         let clearance = validClearance(existing, nullifier) ? existing.clearance : null;
-        let path;
-        // After UnknownRoot (with the clearance kept), the close proof takes
-        // a path at another root; a failure reaches the caller, which may
-        // still submit the existing proof (E4.5 is advisory).
-        if (refusedRoot != null && clearance) {
-            path = await this.exitPathLocked(state, { signal, sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot, walletRequest });
-        }
-        if (!path) {
-            try {
-                const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
-                const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-                const root = expectedActiveRoot ?? await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
-                path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
-            } catch (error) {
-                if (signal?.aborted) throw error;
-                return { error: { code: 'indexer_unavailable', message: error?.message || null } };
-            }
-        }
         if (!clearance) {
-            const result = await this.requestClearanceLocked({ state, destination, nullifier, path, existing, signal });
+            const result = await this.requestClearanceLocked({ state, destination, nullifier, existing, signal });
             if (result === WITHDRAWAL_RESTART || result.error) return result;
             clearance = result.clearance;
         }
@@ -5015,15 +5041,17 @@ class BrowserWalletRuntime extends EventTarget {
         const plan = await this.worker.call('prepareWithdrawal', {
             config: this.config.wallet_core,
             state,
-            args: { mode: 'mutual', destination, valid_until: validUntil, active_root: path.active_root,
-                merkle_siblings: path.siblings, clearance },
+            args: { mode: 'mutual', destination, valid_until: validUntil, clearance },
             provingKey: this.withdrawalProvingKey()
         });
         if (Number(plan?.public_inputs?.kind) !== WITHDRAWAL_KIND.mutual || Number(plan.public_inputs.conceded) !== 0) {
             throw new Error('The generated withdrawal proof is of another kind.');
         }
+        if (!this.exitStatementMatches(plan.public_inputs, state, await this.stateNoteLeaf(state))) {
+            throw new Error('The generated withdrawal proof is bound to another note.');
+        }
         const decorated = this.decoratePlan(plan, { mode: 'mutual', destination, state, nullifier, existing,
-            decision: { rule: 'E2', conceded: 0n }, clearance, validUntil, pathSource: path.source || 'indexer', gasless });
+            decision: { rule: 'E2', conceded: 0n }, clearance, validUntil, gasless });
         await this.commit({ ...this.runtime, preparedWithdrawal: decorated,
             exitLock: recordReleasedProof(this.runtime.exitLock, { kind: WITHDRAWAL_KIND.mutual, validUntil, nullifier, at: nowSeconds() }) });
         return { plan: decorated };
@@ -5040,7 +5068,7 @@ class BrowserWalletRuntime extends EventTarget {
      * made only once it expired (ownershipProofAction, pinned by the shared
      * vectors).
      */
-    async requestClearanceLocked({ state, destination, nullifier, path, existing, signal }) {
+    async requestClearanceLocked({ state, destination, nullifier, existing, signal }) {
         const lock = this.runtime.exitLock;
         const refusal = exitLockRefusal(lock, { noteId: state.note_id, anchor: state.current_anchor, proof: 'ownership' });
         if (refusal) return { error: { code: refusal } };
@@ -5052,10 +5080,10 @@ class BrowserWalletRuntime extends EventTarget {
         }
         let ownership;
         if (action === 'resend') {
-            this.assertOwnershipProof({ mode: 'ownership', ...kept }, { state, nullifier, activeRoot: kept.public_inputs.active_root });
+            this.assertOwnershipProof({ mode: 'ownership', ...kept }, { state, nullifier, noteLeaf: await this.stateNoteLeaf(state) });
             ownership = kept;
         } else {
-            ownership = await this.generateOwnershipProof({ state, nullifier, path });
+            ownership = await this.generateOwnershipProof({ state, nullifier });
         }
         await this.commit({
             ...this.runtime,
@@ -5117,14 +5145,15 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * E4: an escape conceding `decision.conceded` (at most bound_at_state):
-     * a path at a known root, the stale-device pre-check, E1 again, advisory
-     * reads, then the kind-0 proof, journaled in the exit lock with its plan
-     * before the plan leaves this function. A live request journal moves to
-     * the archive (abandoned_for_escape), where a later receipt can still
-     * install once the lock is released.
+     * the stale-device pre-check, E1 again, advisory reads, then the kind-0
+     * proof, journaled in the exit lock with its plan before the plan leaves
+     * this function. The proof is bound to the note's leaf: no path, root,
+     * indexer or log read is needed. A live request journal moves to the
+     * archive (abandoned_for_escape), where a later receipt can still install
+     * once the lock is released.
      */
-    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, refusedRoot = null,
-        walletRequest = null, signal, gasless = null, onProgress }) {
+    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, signal, gasless = null,
+        onProgress }) {
         let lock = this.runtime.exitLock;
         if (lock.mode !== 'escape') {
             lock = switchExitLock(lock, 'escape');
@@ -5136,9 +5165,6 @@ class BrowserWalletRuntime extends EventTarget {
             conceded, boundAtState: bound });
         if (refusal) throw new BrowserWalletHttpError('This escape is not allowed at this balance state.', 409, refusal);
         if (!reprove && this.reusablePlan(existing, { mode: 'escape', destination, state, nullifier, conceded })) return existing;
-        onProgress('path', 'Finding this balance’s Merkle path…');
-        const path = await this.exitPathLocked(state, { signal, walletRequest,
-            ...(refusedRoot != null ? { sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot } : {}) });
         onProgress('checking', 'Checking that this device holds the newest balance state…');
         const { successor } = await this.staleDeviceCheckLocked(state, { signal });
         if (nowSeconds() < deadline) {
@@ -5152,13 +5178,13 @@ class BrowserWalletRuntime extends EventTarget {
         const plan = await this.worker.call('prepareWithdrawal', {
             config: this.config.wallet_core,
             state,
-            args: { mode: 'escape', destination, conceded: Number(conceded), valid_until: validUntil,
-                active_root: path.active_root, merkle_siblings: path.siblings },
+            args: { mode: 'escape', destination, conceded: Number(conceded), valid_until: validUntil },
             provingKey: this.withdrawalProvingKey()
         });
         const inputs = plan?.public_inputs;
         if (Number(inputs?.kind) !== WITHDRAWAL_KIND.escape || BigInt(inputs.conceded ?? 0) !== conceded
-            || BigInt(inputs.final_balance) + conceded !== BigInt(state.current_balance)) {
+            || BigInt(inputs.final_balance) + conceded !== BigInt(state.current_balance)
+            || !this.exitStatementMatches(inputs, state, await this.stateNoteLeaf(state))) {
             throw new Error('The generated escape proof does not match its decision.');
         }
         await this.reload();
@@ -5167,7 +5193,7 @@ class BrowserWalletRuntime extends EventTarget {
         const marker = this.runtime.preparedWithdrawal;
         const base = marker && sameFelt(preparedWithdrawalNullifier(marker) ?? nullifier, nullifier) ? marker : existing;
         const decorated = this.decoratePlan(plan, { mode: 'escape', destination, state, nullifier, existing: base, decision,
-            validUntil, pathSource: path.source, warnings, gasless });
+            validUntil, warnings, gasless });
         const journal = this.runtime.journal;
         const abandoned = journal ? this.tryRequestJournalRecord(journal, state, { disposition: 'abandoned_for_escape' }) : null;
         if (journal && !abandoned) throw new Error('The unsettled private request journal is incomplete.');
@@ -5199,15 +5225,20 @@ class BrowserWalletRuntime extends EventTarget {
 
     /** A proof plan with the record fields the payout matchers need (E5). */
     decoratePlan(plan, { mode, destination, state, nullifier, existing, decision, clearance = null, validUntil,
-        pathSource = null, warnings = [], gasless = null }) {
+        warnings = [], gasless = null }) {
         const conceded = BigInt(decision.conceded ?? 0);
         // A sponsored plan (§3.2) carries its fee payer, payout address and
         // transit identity through every re-proof; a wallet-paid one none.
-        const sponsored = gasless || (isGaslessWithdrawal(existing) ? { payout: existing.payout, transit: existing.transit } : null);
+        const sponsored = gasless || (isGaslessWithdrawal(existing) ? { payout: existing.payout, transit: existing.transit,
+            maxCostWei: existing.gaslessMaxCostWei, maxTotalFeeWei: existing.gaslessMaxTotalFeeWei,
+            flatFeeCapWei: existing.gaslessFlatFeeCapWei } : null);
         const staleUserOpHashes = [...new Set([...(existing?.staleUserOpHashes || []), ...(existing?.userOpHashes || [])])];
         const staleBlocks = [existing?.staleSubmittedAtBlock, existing?.submittedAtBlock].filter(value => value != null).map(Number);
         const decorated = {
             ...(sponsored ? { feePayer: 'payout', payout: sponsored.payout.toLowerCase(), transit: structuredClone(sponsored.transit) } : {}),
+            ...(sponsored?.maxCostWei != null ? { gaslessMaxCostWei: String(sponsored.maxCostWei) } : {}),
+            ...(sponsored?.maxTotalFeeWei != null ? { gaslessMaxTotalFeeWei: String(sponsored.maxTotalFeeWei) } : {}),
+            ...(sponsored?.flatFeeCapWei != null ? { gaslessFlatFeeCapWei: String(sponsored.flatFeeCapWei) } : {}),
             // The hashes of this plan's earlier sponsored operations stay
             // recognizable after a re-proof (a late inclusion lands on them),
             // with the earliest block their inclusion is searched from.
@@ -5228,7 +5259,6 @@ class BrowserWalletRuntime extends EventTarget {
             concededAtInit: conceded.toString(),
             boundAtState: String(state.bound_at_state || 0),
             validUntil,
-            ...(pathSource ? { pathSource } : {}),
             ...(warnings.length ? { warnings } : {}),
             ...(existing?.clearanceOutcome ? { clearanceOutcome: existing.clearanceOutcome } : {})
         };
@@ -5254,13 +5284,35 @@ class BrowserWalletRuntime extends EventTarget {
         }
     }
 
+    /** The state's note leaf (hex felt): the word the vault stored at deposit. */
+    async stateNoteLeaf(state) {
+        return this.worker.call('noteLeaf', { state });
+    }
+
     /**
-     * A kind-2 ownership proof of exactly this state, vault, keys, root and
-     * balance: no destination, no concession, no successor nullifier, and a
-     * fresh valid_until. Every vault entry point rejects kind 2, so it can
+     * Whether an exit statement is bound to exactly this state's note: its
+     * leaf `noteLeaf` and the fields the leaf binds (note id, deposit, expiry).
+     * A statement of an earlier revision (with a root) never matches.
+     */
+    exitStatementMatches(inputs, state, noteLeaf) {
+        try {
+            return Boolean(inputs) && !('active_root' in inputs) && !('merkle_siblings' in inputs)
+                && inputs.note_leaf != null && sameFelt(inputs.note_leaf, noteLeaf)
+                && Number(inputs.note_id) === Number(state.note_id)
+                && BigInt(inputs.deposit_amount) === BigInt(state.deposit_amount)
+                && BigInt(inputs.expiry_ts) === BigInt(state.expiry_ts);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * A kind-2 ownership proof of exactly this state, vault, keys, note leaf
+     * and balance: no destination, no concession, no successor nullifier, and
+     * a fresh valid_until. Every vault entry point rejects kind 2, so it can
      * never be submitted as an exit. Never a request proof.
      */
-    assertOwnershipProof(plan, { state, nullifier, activeRoot }) {
+    assertOwnershipProof(plan, { state, nullifier, noteLeaf }) {
         const inputs = plan?.public_inputs;
         const core = this.config.wallet_core || {};
         const funding = this.config.funding || {};
@@ -5281,29 +5333,26 @@ class BrowserWalletRuntime extends EventTarget {
             && sameFelt(inputs.state_signing_key_y, core.state_signing_key?.y)
             && sameFelt(inputs.clearance_signing_key_x, core.clearance_signing_key?.x)
             && sameFelt(inputs.clearance_signing_key_y, core.clearance_signing_key?.y)
-            && Number(inputs.note_id) === Number(state.note_id)
+            && this.exitStatementMatches(inputs, state, noteLeaf)
             && sameFelt(inputs.withdrawal_nullifier, nullifier)
-            && sameFelt(inputs.active_root, activeRoot)
             && sameFelt(inputs.final_balance, state.current_balance)
             && withdrawalDestinationHex(inputs.destination) === `0x${'0'.repeat(40)}`
             && !REQUEST_PUBLIC_INPUT_FIELDS.some(field => field in inputs);
         if (!valid) throw new Error('The generated ownership proof does not match its saved balance and vault.');
     }
 
-    async generateOwnershipProof({ state, nullifier, path }) {
+    async generateOwnershipProof({ state, nullifier }) {
         const ownership = await this.worker.call('prepareWithdrawal', {
             config: this.config.wallet_core,
             state,
             args: {
                 mode: 'ownership',
                 valid_until: nowSeconds() + this.exitTiming().ownershipProofValiditySeconds
-                    - this.exitTiming().ownershipProofSkewMarginSeconds,
-                active_root: path.active_root,
-                merkle_siblings: path.siblings
+                    - this.exitTiming().ownershipProofSkewMarginSeconds
             },
             provingKey: this.withdrawalProvingKey()
         });
-        this.assertOwnershipProof(ownership, { state, nullifier, activeRoot: path.active_root });
+        this.assertOwnershipProof(ownership, { state, nullifier, noteLeaf: await this.stateNoteLeaf(state) });
         // Only the public inputs and proof travel; nothing is persisted.
         return { public_inputs: ownership.public_inputs, proof: ownership.proof };
     }
@@ -5312,8 +5361,8 @@ class BrowserWalletRuntime extends EventTarget {
      * The clearance of a set-aside (background) mutual close: one ownership
      * proof and one bounded POST. Its record is withdrawal-only already.
      */
-    async backgroundClearance({ state, nullifier, path, signal = null }) {
-        const ownership = await this.generateOwnershipProof({ state, nullifier, path });
+    async backgroundClearance({ state, nullifier, signal = null }) {
+        const ownership = await this.generateOwnershipProof({ state, nullifier });
         const answer = await this.exitCall(`${this.config.funding.protocol_server_url}/v2/withdraw/clearance`, {
             method: 'POST', body: { withdrawal_nullifier: nullifier, ownership_proof: ownership }, signal
         });
@@ -5332,8 +5381,8 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * E7: an encrypted exit kit of the selected balance (zkapi-exit-kit-v1):
-     * the build-pinned deployment profile, the state an escape needs, its
-     * bound and its deposit-time Merkle path. Returns the kit as JSON for the
+     * the build-pinned deployment profile, the state an escape needs and its
+     * bound (an escape needs no Merkle path). Returns the kit as JSON for the
      * host to save; it is never uploaded.
      */
     async exportExitKit({ passphrase } = {}) {
@@ -5345,7 +5394,7 @@ class BrowserWalletRuntime extends EventTarget {
             if (!state) throw new Error('There is no private balance to export.');
             const stateSeq = Number(this.runtime.stateSeq || 0);
             const payload = buildExitKitPayload({ trustedDeployment: this.browserConfig?.trusted_deployment,
-                state, stateSeq, exportedAt: nowSeconds(), merklePath: state.deposit_path || null });
+                state, stateSeq, exportedAt: nowSeconds() });
             const kit = await sealExitKit(payload, passphrase);
             await this.commit({ ...this.runtime, exitKitExportedSeq: stateSeq });
             return JSON.stringify(kit);
@@ -5384,11 +5433,26 @@ class BrowserWalletRuntime extends EventTarget {
         return this.deploymentVerification;
     }
 
-    async claimPreparedWithdrawalSubmission() {
+    assertPreparedWithdrawalIdentity(prepared, expected) {
+        if (expected == null) return;
+        const mismatch = !prepared || (expected.operationId != null && prepared.operationId !== expected.operationId)
+            || (expected.noteId != null && Number(prepared.noteId ?? prepared.public_inputs?.note_id) !== Number(expected.noteId))
+            || (expected.mode != null && prepared.mode !== expected.mode)
+            || (expected.destination != null && String(prepared.destination || '').toLowerCase() !== String(expected.destination).toLowerCase())
+            || (expected.statement != null && JSON.stringify(prepared.public_inputs) !== expected.statement)
+            || (Object.hasOwn(expected, 'userOpHash') && (prepared.userOpHash ?? null) !== expected.userOpHash);
+        if (mismatch) throw new BrowserWalletHttpError(
+            'This withdrawal was replaced in another tab. Review it again before continuing.', 409, 'withdrawal_note_changed');
+    }
+
+    async claimPreparedWithdrawalSubmission(expected = null) {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             let prepared = this.runtime.preparedWithdrawal;
             if (!prepared) throw new Error('The durable prepared withdrawal is missing.');
+            // The caller names the plan it just prepared (after any
+            // mutual-to-escape conversion). Another tab may have replaced it.
+            this.assertPreparedWithdrawalIdentity(prepared, expected);
             if (!prepared.operationId) {
                 prepared = { ...prepared, operationId: uuid() };
                 await this.commit({ ...this.runtime, preparedWithdrawal: prepared });
@@ -6303,13 +6367,12 @@ class BrowserWalletRuntime extends EventTarget {
         return result;
     }
 
-    async prepareBackgroundWithdrawal(recordId, { expectedActiveRoot, refusedRoot = null, walletRequest = null } = {}) {
+    async prepareBackgroundWithdrawal(recordId) {
         await this.init();
         await this.reload();
         const record = structuredClone(this.withdrawals.find(entry => entry.recordId === recordId));
         const identity = this.backgroundWithdrawalIdentity(record);
         assertBrowserBackgroundWithdrawalAvailable(record, this.runtime, identity);
-        if (expectedActiveRoot == null) throw new Error('A current vault root is required to prepare this withdrawal.');
         const state = record.state;
         const config = this.config;
         if (Number(state.chain_id) !== identity.chainId || !sameFelt(state.contract_address, identity.contractAddress)) {
@@ -6321,31 +6384,22 @@ class BrowserWalletRuntime extends EventTarget {
         if (savedNullifiers.some(value => !sameFelt(value, nullifier))) {
             throw new Error('The saved withdrawal authorization does not match its private balance.');
         }
-        // Deliberately outside the global wallet lock: a proof or indexer wait
-        // must not stall unrelated deposits, requests, or settlement in another tab.
-        // A persisted clearance for this exact nullifier needs no second
-        // ownership proof or server request when only the root moved.
+        // Deliberately outside the global wallet lock: a proof must not stall
+        // unrelated deposits, requests, or settlement in another tab. A
+        // persisted clearance for this exact nullifier needs no second
+        // ownership proof or server request; neither proof needs a path.
         let clearance = validClearance(record.preparedWithdrawal, nullifier)
             ? record.preparedWithdrawal.clearance
             : null;
-        let path;
-        if (clearance) {
-            // The close proof needs only a root the vault ever held (A1):
-            // the deposit-time path first, then the indexer at the vault's
-            // current root, then the vault's logs; never the operator alone.
-            path = await this.exitPathLocked(state, { currentRoot: expectedActiveRoot, walletRequest,
-                ...(refusedRoot != null ? { sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot } : {}) });
-        } else {
-            // A record set aside before its clearance (an earlier build): the
-            // ownership proof needs a root within the server's window.
-            path = await this.treePath(identity.noteId, true, expectedActiveRoot);
-            clearance = await this.backgroundClearance({ state, nullifier, path });
+        if (!clearance) {
+            // A record set aside before its clearance (an earlier build).
+            clearance = await this.backgroundClearance({ state, nullifier });
         }
         const plan = await this.worker.call('prepareWithdrawal', {
             config: config.wallet_core, state,
             args: { mode: 'mutual', destination: identity.destination,
-                valid_until: nowSeconds() + this.exitTiming().exitProofValiditySeconds, active_root: path.active_root,
-                merkle_siblings: path.siblings, clearance }, provingKey: this.withdrawalProvingKey()
+                valid_until: nowSeconds() + this.exitTiming().exitProofValiditySeconds, clearance },
+            provingKey: this.withdrawalProvingKey()
         });
         const inputs = plan.public_inputs;
         const encodedDestination = Array.isArray(inputs?.destination)
@@ -6354,7 +6408,7 @@ class BrowserWalletRuntime extends EventTarget {
         if (!plan.proof || Number(inputs?.note_id) !== identity.noteId
             || Number(inputs?.chain_id) !== identity.chainId
             || !sameFelt(inputs?.contract_address, identity.contractAddress)
-            || !sameFelt(inputs?.active_root, path.active_root)
+            || !this.exitStatementMatches(inputs, state, await this.stateNoteLeaf(state))
             || !sameFelt(inputs?.withdrawal_nullifier, nullifier)
             || !sameFelt(inputs?.final_balance, state.current_balance)
             || String(encodedDestination || '').toLowerCase() !== identity.destination.toLowerCase()
@@ -6362,7 +6416,6 @@ class BrowserWalletRuntime extends EventTarget {
             throw new Error('The generated withdrawal proof does not match its saved balance and vault.');
         }
         Object.assign(plan, { destination: identity.destination, mode: 'mutual', phase: 'prepared',
-            ...(path.source ? { pathSource: path.source } : {}),
             operationId: uuid(), noteId: identity.noteId, withdrawalNullifier: nullifier,
             clearanceReserved: true, createdAt: Number(record.createdAt || Date.now()),
             ...(clearance?.signature ? { clearance } : {}) });

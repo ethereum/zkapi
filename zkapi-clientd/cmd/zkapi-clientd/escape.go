@@ -62,6 +62,10 @@ func runEscape(ctx context.Context, c config.Config, o escapeOptions, out io.Wri
 		return errors.New("there is no private balance to withdraw")
 	}
 	body := map[string]any{"destination": o.destination, "note_id": state.NoteID}
+	// No fee mode unless named (or a configured payout default for a new
+	// escape): the daemon pays a new escape's fees from the payout where the
+	// deployment sponsors it. An explicit --fees wallet stays available: the
+	// escape is the exit that needs no operator.
 	o.gasless.apply(body, savedWithdrawal(state))
 	if o.earlyExit != "" {
 		body["early_exit"] = o.earlyExit

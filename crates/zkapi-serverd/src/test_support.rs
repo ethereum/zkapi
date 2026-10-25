@@ -185,7 +185,6 @@ impl TestNote {
             .state
             .withdrawal(
                 &self.deployment,
-                &self.tree,
                 &DevWithdrawal {
                     kind: WithdrawalKind::Ownership,
                     destination: [0; 20],
@@ -308,13 +307,32 @@ pub(crate) fn processor_note(
     note
 }
 
-/// Kind-2 ownership proofs for clearance tests. Proving is slow in debug
-/// builds, so each is generated once per test binary.
+/// A kind-2 ownership proof for clearance tests, generated once per test
+/// binary.
 pub(crate) struct OwnershipFixture {
     pub(crate) note: TestNote,
-    /// The note's tree root (the processor fixture must observe it).
-    pub(crate) root: Felt252,
     pub(crate) request: ClearanceRequestV2C,
+}
+
+impl OwnershipFixture {
+    /// The note the proof is for.
+    pub(crate) fn note_id(&self) -> u32 {
+        self.request.ownership_proof.public_inputs.note_id
+    }
+
+    /// The leaf the vault stores for the note (and the proof's `note_leaf`).
+    pub(crate) fn leaf(&self) -> Felt252 {
+        self.note.state.note.leaf()
+    }
+
+    /// Store the note Active with its leaf on `processor`'s test chain.
+    pub(crate) fn deposit_on(&self, processor: &crate::processor::RequestProcessor) {
+        processor.set_test_note(
+            self.note_id(),
+            self.leaf(),
+            crate::native_billing::NoteStatus::Active,
+        );
+    }
 }
 
 /// Deployment of `ownership_processor`: the keys and identity the cached
@@ -347,49 +365,27 @@ pub(crate) fn current_time() -> u64 {
         .as_secs()
 }
 
-fn prove_ownership(fake_tree: bool) -> OwnershipFixture {
+fn prove_ownership() -> OwnershipFixture {
     let deployment = deployment_of(&ownership_server_config(), ownership_seeds());
-    let mut note = TestNote::genesis(deployment, 1_950_000);
-    if fake_tree {
-        // A genesis note in a tree that no vault ever had: the proof itself
-        // verifies, but its root is unknown to the server and the vault.
-        note.tree.set_leaf(1, Felt252::from_u64(0xfa4e));
-    }
+    let note = TestNote::genesis(deployment, 1_950_000);
     // Fresh for the whole test run: at most an hour ahead.
     let request = note.ownership_request(current_time() + 3_000);
-    OwnershipFixture {
-        root: note.root(),
-        note,
-        request,
-    }
+    assert_eq!(
+        request.ownership_proof.public_inputs.note_leaf,
+        note.state.note.leaf()
+    );
+    OwnershipFixture { note, request }
 }
 
-/// A real kind-2 proof for a note in a tree the processor fixture observes.
+/// A real kind-2 proof of a genesis note.
 pub(crate) async fn ownership_fixture() -> &'static OwnershipFixture {
     static FIXTURE: tokio::sync::OnceCell<OwnershipFixture> = tokio::sync::OnceCell::const_new();
     FIXTURE
-        .get_or_init(|| async {
-            tokio::task::spawn_blocking(|| prove_ownership(false))
-                .await
-                .unwrap()
-        })
+        .get_or_init(|| async { tokio::task::spawn_blocking(prove_ownership).await.unwrap() })
         .await
 }
 
-/// A real kind-2 proof over a fake genesis tree: valid, but at a root no
-/// vault knows.
-pub(crate) async fn fake_tree_ownership_fixture() -> &'static OwnershipFixture {
-    static FIXTURE: tokio::sync::OnceCell<OwnershipFixture> = tokio::sync::OnceCell::const_new();
-    FIXTURE
-        .get_or_init(|| async {
-            tokio::task::spawn_blocking(|| prove_ownership(true))
-                .await
-                .unwrap()
-        })
-        .await
-}
-
-/// The real revision-3 vault's calldata, getter selectors and layouts, and
+/// The real revision-4 vault's calldata, getter selectors and layouts, and
 /// event layouts (`tests/fixtures/vault_calldata_golden.json`, checked
 /// against the compiled protocol/contracts sources by
 /// `check-calldata-golden.sh`).

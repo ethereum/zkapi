@@ -21,10 +21,15 @@ import (
 // mutable remote manifest must not silently change the vault, signer or oracle
 // that owns an existing wallet. Updating deployments requires a source release.
 //
-// This release serves only the concession-exit vault (revision 3, circuit
-// zkapi-v2-concession-v1). Until it is deployed on a network, the network's
-// manifest is a "not_deployed" placeholder that pins only the circuit, the
-// setup and the vault parameters, and nothing starts against it.
+// This release serves only the leaf-bound concession-exit vault (revision 4,
+// circuit zkapi-v2-concession-v2), whose exits bind the note's stored leaf
+// and need no Merkle path. Sepolia ships its staging deployment,
+// zkapi-native-eth-sepolia-leaf-v4-20261020 (development proving setup).
+// Mainnet's manifest is a "not_deployed" placeholder that pins only the
+// circuit, the setup and the vault parameters, and nothing starts against
+// it. A wallet saves its manifest's exact bytes (writeDeploymentManifest)
+// and refuses any other, so a deployed manifest is never edited in place:
+// another vault gets another deployment ID and its own state directories.
 //
 //go:embed deployments/*.json
 var deploymentFiles embed.FS
@@ -43,7 +48,20 @@ func SetPackagedDeploymentsForTesting(fsys fs.FS) func() {
 }
 
 // RequiredCircuitID is the statement this release proves and verifies.
-const RequiredCircuitID = "zkapi-v2-concession-v1"
+const RequiredCircuitID = "zkapi-v2-concession-v2"
+
+// Vault revision 4's pins: exits bind the note's stored leaf
+// (LEAF_BOUND_EXIT_VERSION() 1), deposits of fewer than min_deposit_units
+// revert (minDeposit()), and a deposit's gas limit adds fresh_slot_gas for
+// the first write of a frontier level (depositGasLimit).
+const (
+	requiredVaultRevision = 4
+	requiredLeafBoundExit = 1
+	// minFreshSlotGas and maxFreshSlotGas bound a profile's fresh_slot_gas:
+	// 22,100 under mainnet rules, about 110,000 under EIP-8037 (Sepolia).
+	minFreshSlotGas = 5_000
+	maxFreshSlotGas = 1_000_000
+)
 
 // ErrDeploymentNotDeployed refuses a network whose packaged manifest is a
 // placeholder: its vault is not deployed yet.
@@ -55,13 +73,82 @@ var ErrDeploymentNotDeployed = errors.New("deployment_not_deployed: the zkAPI co
 // withdrawn with it.
 const LegacyRelease = "zkapi-clientd 0.1.7 (release line release/v2-note-bound)"
 
-// legacyDeploymentIDs are the earlier vaults' deployments (circuit
-// zkapi-v2-note-bound-v1). Their wallets live in their own state directories,
-// which this release never opens; an open note there gets a warning.
-var legacyDeploymentIDs = map[string][]string{
-	"mainnet": {"zkapi-native-eth-mainnet-note-bound-v1-fresh-20260930", "zkapi-native-eth-mainnet-note-bound-v1-fresh-20260928"},
-	"sepolia": {"zkapi-native-eth-sepolia-note-bound-v1-fresh-20260930"},
+// deploymentDisplay names deployments for people. It lives in Go, not in the
+// manifests, whose exact bytes existing wallets saved, and it is never
+// derived from a server URL (/v0.2 was the revision-3 server's path).
+var deploymentDisplay = map[string]string{
+	"zkapi-native-eth-sepolia-leaf-v4-20261020": "zkAPI v0.2",
 }
+
+// DeploymentDisplay is the name shown for deployment id.
+func DeploymentDisplay(id string) string {
+	if name := deploymentDisplay[id]; name != "" {
+		return name
+	}
+	return "zkAPI deployment " + id
+}
+
+// PackagedDeploymentInfo is this build's deployment on a network, for display
+// and for matching a running daemon. It holds no wallet state.
+type PackagedDeploymentInfo struct {
+	ID                string
+	Display           string
+	Contract          string
+	ProtocolServerURL string
+	BundlerURL        string
+	VaultRevision     int
+	ChainID           uint64
+	// Deployed is false for a placeholder, which has no contract or endpoints.
+	Deployed bool
+}
+
+// PackagedDeployment describes the network's embedded deployment without a
+// network read.
+func PackagedDeployment(network string) (PackagedDeploymentInfo, error) {
+	identity, _, err := pinnedDeployment(network)
+	if err != nil {
+		return PackagedDeploymentInfo{}, err
+	}
+	info := PackagedDeploymentInfo{ID: identity.ID, Display: DeploymentDisplay(identity.ID), Contract: identity.Contract, ProtocolServerURL: identity.ProtocolServerURL, VaultRevision: identity.VaultRevision, ChainID: identity.ChainID, Deployed: identity.deployed()}
+	if identity.Gasless != nil {
+		info.BundlerURL = identity.Gasless.BundlerURL
+	}
+	return info, nil
+}
+
+// The ways out of an earlier deployment's wallet. This build cannot load
+// those deployments' manifests (other circuits, keys or vault revisions), so
+// their recovery files are reported, never opened, changed or migrated.
+const (
+	noteBoundRecovery = "withdraw it through the legacy dispatcher (--vault-protocol legacy with the original profile) or the earlier release, " + LegacyRelease + ", which closes deposits there and keeps that vault's mutual close and escape (withdraw --escape)"
+	v02BundleRecovery = "recover it with the local CLI bundle built from git branch origin/v0.2, run with the same --config-dir"
+)
+
+// earlierDeployments are the deployments earlier builds served on each
+// network. Their wallets live in their own state directories.
+var earlierDeployments = map[string][]struct {
+	id, display, recovery string
+	noteBound             bool
+}{
+	"mainnet": {
+		{"zkapi-native-eth-mainnet-note-bound-v1-fresh-20260930", "the earlier note-bound vault", noteBoundRecovery, true},
+		{"zkapi-native-eth-mainnet-note-bound-v1-fresh-20260928", "the earlier note-bound vault", noteBoundRecovery, true},
+	},
+	"sepolia": {
+		{"zkapi-native-eth-sepolia-note-bound-v1-fresh-20260930", "the earlier note-bound vault", noteBoundRecovery, true},
+		{"zkapi-native-eth-sepolia-note-bound-v1-fresh-20260928", "the earlier note-bound vault", noteBoundRecovery, true},
+		{"zkapi-native-eth-sepolia-concession-v1-r3", "the earlier concession vault, revision 3", v02BundleRecovery + " and --vault-protocol concession-v1", false},
+		{"zkapi-native-eth-sepolia-concession-v2-r4-20261017", "the earlier concession vault, revision 4 without leaf-bound exits", v02BundleRecovery + " (its default concession stack)", false},
+	},
+}
+
+// The recovery files a wallet keeps per deployment: the companion's in
+// zkapi/<network>/<deployment_id>/ and the payment address's in
+// funding/<network>/<deployment_id>/. A saved manifest alone is none.
+var (
+	companionRecoveryFiles = []string{"note_state.json", "pending_journal.json", "prepared_withdrawal.json", "oa-withdrawal.json", "exit_lock.json", "escape_withdrawal.json"}
+	fundingRecoveryFiles   = []string{"address-funding.json", "pending-deposit.json"}
+)
 
 // LegacyWalletWarning reports an open note of an earlier vault in stateDir
 // (the companion state root), with the way out; "" when there is none. The
@@ -71,13 +158,105 @@ func LegacyWalletWarning(stateDir, network string) string {
 	if network == "" {
 		network = "mainnet"
 	}
-	for _, id := range legacyDeploymentIDs[network] {
-		dir := filepath.Join(stateDir, network, id)
+	for _, earlier := range earlierDeployments[network] {
+		if !earlier.noteBound {
+			continue
+		}
+		dir := filepath.Join(stateDir, network, earlier.id)
 		if _, err := os.Lstat(filepath.Join(dir, "note_state.json")); err == nil {
-			return fmt.Sprintf("A private note of the earlier zkAPI vault (deployment %s) is still open in %s. This release serves only the concession-exit vault and never opens that wallet; withdraw the note with the earlier zkapi-clientd release, %s, which closes deposits there and keeps that vault's mutual close and escape (withdraw --escape), then fund this release.", id, dir, LegacyRelease)
+			return fmt.Sprintf("A private note of the earlier zkAPI vault (deployment %s) is still open in %s. This release serves only the concession-exit vault and never opens that wallet; withdraw the note with the earlier zkapi-clientd release, %s, which closes deposits there and keeps that vault's mutual close and escape (withdraw --escape), then fund this release.", earlier.id, dir, LegacyRelease)
 		}
 	}
 	return ""
+}
+
+// EarlierDeployment is an earlier deployment whose recovery files are still
+// in a profile. Files are relative to the profile directory; ID is empty for
+// the earlier release's per-network payment files.
+type EarlierDeployment struct {
+	ID       string   `json:"id"`
+	Display  string   `json:"display"`
+	Recovery string   `json:"recovery"`
+	Files    []string `json:"files"`
+}
+
+// EarlierDeploymentState lists which recovery files of the network's earlier
+// deployments exist in profile directory dir. It only calls Lstat: contents
+// are never read, opened or changed, so a wallet another build owns stays
+// exactly as that build left it.
+func EarlierDeploymentState(dir, network string) []EarlierDeployment {
+	if network == "" {
+		network = "mainnet"
+	}
+	present := func(relative ...string) bool {
+		_, err := os.Lstat(filepath.Join(append([]string{dir}, relative...)...))
+		return err == nil
+	}
+	current, _, _ := pinnedDeployment(network)
+	var found []EarlierDeployment
+	for _, earlier := range earlierDeployments[network] {
+		if earlier.id == current.ID {
+			continue
+		}
+		var files []string
+		for _, place := range []struct {
+			root  string
+			names []string
+		}{{"zkapi", companionRecoveryFiles}, {"funding", fundingRecoveryFiles}} {
+			for _, name := range place.names {
+				if present(place.root, network, earlier.id, name) {
+					files = append(files, filepath.Join(place.root, network, earlier.id, name))
+				}
+			}
+		}
+		if len(files) != 0 {
+			found = append(found, EarlierDeployment{ID: earlier.id, Display: earlier.display, Recovery: earlier.recovery, Files: files})
+		}
+	}
+	var root []string
+	for _, name := range fundingRecoveryFiles {
+		if present("funding", network, name) {
+			root = append(root, filepath.Join("funding", network, name))
+		}
+	}
+	if len(root) != 0 {
+		found = append(found, EarlierDeployment{Display: "the earlier zkapi-clientd release's payment address", Recovery: "keep them for the earlier release, " + LegacyRelease + ", which withdraws that note", Files: root})
+	}
+	return found
+}
+
+// EarlierDeploymentWarnings words EarlierDeploymentState for people, one
+// warning per earlier deployment, naming its ID, directories and way out.
+// They never block: this build only opens its own deployment's directories.
+func EarlierDeploymentWarnings(dir, network string) []string {
+	if network == "" {
+		network = "mainnet"
+	}
+	serves := "its own deployment"
+	if current, err := PackagedDeployment(network); err == nil {
+		serves = current.Display
+		if !strings.Contains(serves, current.ID) {
+			serves += " (deployment " + current.ID + ")"
+		}
+	}
+	var warnings []string
+	for _, earlier := range EarlierDeploymentState(dir, network) {
+		if earlier.ID == "" {
+			warnings = append(warnings, LegacyFundingWarning(filepath.Join(dir, "funding"), network))
+			continue
+		}
+		var places []string
+		for i := 0; i < len(earlier.Files); {
+			parent := filepath.Dir(earlier.Files[i])
+			var names []string
+			for ; i < len(earlier.Files) && filepath.Dir(earlier.Files[i]) == parent; i++ {
+				names = append(names, filepath.Base(earlier.Files[i]))
+			}
+			places = append(places, fmt.Sprintf("%s (%s)", filepath.Join(dir, parent), strings.Join(names, ", ")))
+		}
+		warnings = append(warnings, fmt.Sprintf("Recovery files of %s (deployment %s) remain in %s. This build serves %s and never opens, changes or migrates them; to use that wallet, %s.", earlier.Display, earlier.ID, strings.Join(places, " and "), serves, earlier.Recovery))
+	}
+	return warnings
 }
 
 type deploymentIdentity struct {
@@ -99,7 +278,14 @@ type deploymentIdentity struct {
 	MaxPauseDuration uint64 `json:"max_pause_duration_seconds"`
 	SettlementWindow uint64 `json:"settlement_window_seconds"`
 	ExitConcession   int    `json:"exit_concession"`
-	DeployBlock      uint64 `json:"deploy_block"`
+	LeafBoundExit    int    `json:"leaf_bound_exit"`
+	// MinDepositUnits is the vault's minDeposit(), in billing units.
+	MinDepositUnits uint64 `json:"min_deposit_units"`
+	// FreshSlotGas is the gas of writing a fresh storage slot on this
+	// network, which the deposit gas policy adds when a deposit in the
+	// window first writes a frontier level.
+	FreshSlotGas uint64 `json:"fresh_slot_gas"`
+	DeployBlock  uint64 `json:"deploy_block"`
 	// The contracts the client checks before trusting the vault.
 	ProofAdapter     string             `json:"proof_adapter_address"`
 	PoseidonLibrary  string             `json:"poseidon_library_address"`
@@ -167,6 +353,16 @@ type proofSetupIdentity struct {
 	WithdrawalVerifyingKeySHA256 string `json:"withdrawal_verifying_key_sha256"`
 }
 
+// MinimumDeposit is the deployed vault's minDeposit() in billing units, as
+// the release pins it (min_deposit_units); a smaller deposit is refused.
+func (c *Client) MinimumDeposit() (uint64, error) {
+	deployment, _, err := deployedDeployment(c.config.Network)
+	if err != nil {
+		return 0, err
+	}
+	return deployment.MinDepositUnits, nil
+}
+
 // MatchesDeployment checks a public management response against this release's
 // immutable network/vault identity without a network read or wallet operation.
 func MatchesDeployment(network, deploymentID, contract string) bool {
@@ -222,9 +418,13 @@ func parseDeploymentIdentity(network string, raw []byte) (deploymentIdentity, er
 	if json.Unmarshal(raw, &identity) != nil || identity.ChainID != chain || identity.ID == "" || identity.Asset != "native_eth" || identity.Unit != "gwei" || identity.Proof.Circuit != RequiredCircuitID || identity.Proof.SetupID == "" || identity.NoteTTL == 0 {
 		return deploymentIdentity{}, invalid
 	}
-	// Only the concession vault: revision 3 with the concession exit, whose
-	// clearances require an ownership proof.
-	if identity.VaultRevision != 3 || identity.ExitConcession != 1 || identity.ClearanceOwnershipProof != "required" || identity.SettlementWindow == 0 || identity.ChallengePeriod == 0 || identity.MaxPauseDuration < 2*identity.ChallengePeriod {
+	// Only the leaf-bound concession vault: revision 4 with the concession
+	// exit and leaf-bound exits, whose clearances require an ownership proof.
+	// A revision-3 profile (circuit zkapi-v2-concession-v1) is refused.
+	if identity.VaultRevision != requiredVaultRevision || identity.ExitConcession != 1 || identity.LeafBoundExit != requiredLeafBoundExit || identity.ClearanceOwnershipProof != "required" || identity.SettlementWindow == 0 || identity.ChallengePeriod == 0 || identity.MaxPauseDuration < 2*identity.ChallengePeriod {
+		return deploymentIdentity{}, invalid
+	}
+	if identity.MinDepositUnits == 0 || identity.MinDepositUnits > maxSafeNoteAmount || identity.FreshSlotGas < minFreshSlotGas || identity.FreshSlotGas > maxFreshSlotGas {
 		return deploymentIdentity{}, invalid
 	}
 	for _, pin := range []string{identity.Proof.RequestVKKeccak256, identity.Proof.WithdrawalVKKeccak256} {

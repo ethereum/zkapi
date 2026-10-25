@@ -1,6 +1,8 @@
 //! Rewrite the generated sources of an existing setup directory from its keys
-//! (`Groth16ProofAdapter.sol`, `Bn254Poseidon.sol` and the manifest's `poseidon`
-//! section), after a change to the generators that leaves the keys alone:
+//! (`Groth16ProofAdapter.sol`, `Bn254PoseidonRuntime.sol`, `poseidon-runtime.json`
+//! and the manifest's `poseidon` section), after a change to the generators that
+//! leaves the keys alone (then copy `Bn254PoseidonRuntime.sol` to
+//! `protocol/contracts/src/poseidon/`, as CI diffs the two):
 //!
 //! ```text
 //! cargo run --release -p zkapi-proof --example refresh_setup_sources -- ../setup/v2-concession-dev

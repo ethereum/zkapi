@@ -216,8 +216,9 @@ const log = (address, topics, words, extra = {}) => ({ address: lower(address), 
 export const logs = Object.freeze({
     mutualClose: (vault, { noteId, nullifier = 0x99n, finalBalance, destination }) => log(vault,
         [GASLESS_ABI_VAULT.mutualCloseEvent, `0x${word(noteId)}`], [nullifier, finalBalance, BigInt(destination)]),
-    escapeInitiated: (vault, { noteId, nullifier = 0x99n, finalBalance, destination, challengeDeadline, root = 0x77n }) => log(vault,
-        [GASLESS_ABI_VAULT.escapeInitiatedEvent, `0x${word(noteId)}`], [nullifier, finalBalance, BigInt(destination), challengeDeadline, root]),
+    // Vault revision 4: no root word.
+    escapeInitiated: (vault, { noteId, nullifier = 0x99n, finalBalance, destination, challengeDeadline }) => log(vault,
+        [GASLESS_ABI_VAULT.escapeInitiatedEvent, `0x${word(noteId)}`], [nullifier, finalBalance, BigInt(destination), challengeDeadline]),
     escapeFinalized: (vault, { noteId, nullifier = 0x99n, finalBalance, destination }) => log(vault,
         [GASLESS_ABI_VAULT.escapeFinalizedEvent, `0x${word(noteId)}`], [nullifier, finalBalance, BigInt(destination)]),
     settled: (paymaster, { key, sender, payee, kind, noteId, received, charged, owedPaid, paidOut }) => log(paymaster,
@@ -401,14 +402,16 @@ export function fakeGaslessChain({ chainId, vault, gasless, noteId = 7, noteStat
         }
         if (target === lower(vault)) {
             const state = chain.vaultState;
-            if (sel === '9f18e4ed') {
+            if (sel === 'd154f5bf') {
+                // noteRecord(noteId): the stored leaf and the status (a retired note is Closed with leaf 0).
                 const note = state.notes.get(Number(arg(0)));
-                return `0x${[0n, note?.deposit ?? 0n, 0n, BigInt(note?.status ?? 0)].map(word).join('')}`;
+                return `0x${[note?.leaf ?? (note ? 0x1eafn : 0n), BigInt(note?.status ?? 0)].map(word).join('')}`;
             }
             if (sel === 'a2f9f1ce') {
                 const pending = state.pending.get(Number(arg(0)));
                 if (!pending) return `0x${[0n, 0n, 0n, 0n, 0n, 0n].map(word).join('')}`;
-                return `0x${[1n, pending.activeRoot ?? 0x11n, pending.nullifier, pending.finalBalance, BigInt(pending.destination), pending.challengeDeadline].map(word).join('')}`;
+                // Word 1 (the old activeRoot) is always zero in vault revision 4.
+                return `0x${[1n, 0n, pending.nullifier, pending.finalBalance, BigInt(pending.destination), pending.challengeDeadline].map(word).join('')}`;
             }
             if (sel === 'f8ffe6e0') {
                 const pending = state.pending.get(Number(arg(0)));
@@ -417,7 +420,7 @@ export function fakeGaslessChain({ chainId, vault, gasless, noteId = 7, noteStat
             if (sel === selector('paused')) return `0x${word(state.paused ? 1n : 0n)}`;
             if (sel === selector('pausedAt')) return `0x${word(state.pausedAt)}`;
             if (sel === 'fdab463d') return `0x${word(state.currentRoot)}`;
-            if (sel === '7cb4a03c') return `0x${word(2_000_000_000n)}`;
+            if (sel === '5a747a98') return `0x${word(2_000_000_000n)}`;
             if (sel === '6cda756a') return `0x${word(0n)}`;
             if (sel === 'aad24061') return `0x${word(0n)}`;
             if (sel === '91f6e93a') return `0x${word(state.escapePayoutCredits.get(lower(address(0))) ?? 0n)}`;

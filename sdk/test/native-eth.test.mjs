@@ -145,7 +145,11 @@ test('native deposit preflights and submits payable value once, without token mi
         calls.push({ method, params });
         if (method === 'eth_chainId') return '0xaa36a7';
         if (method === 'eth_getBalance') return '0xde0b6b3a7640000';
-        if (method === 'eth_call') return '0x77';
+        // nextNoteId() at latest, the m of the deposit gas policy.
+        if (method === 'eth_call') {
+            assert.equal(params[0].data, `0x${codec.ABI.nextNoteId}`);
+            return `0x${word(0x77)}`;
+        }
         if (method === 'eth_getTransactionCount') return '0x1';
         if (method === 'eth_estimateGas') return '0x100000';
         if (method === 'eth_sendTransaction') return HASH;
@@ -155,6 +159,9 @@ test('native deposit preflights and submits payable value once, without token mi
     t.mock.method(client, 'refresh', async () => {});
     const plan = { commitment: '0x1', secret: 'local-secret', amount: 3333334, zero_path: Array(32).fill('0x0') };
     const { default: runtime } = await import('../services/browserWalletRuntime.js');
+    const pinned = runtime.browserConfig;
+    runtime.browserConfig = { trusted_deployment: { fresh_slot_gas: 110_000 } };
+    t.after(() => { runtime.browserConfig = pinned; });
     t.mock.method(runtime, 'pendingDeposit', async () => null);
     // The deployment pins and canary caps are checked before any deposit (zkapi-deployment tests).
     const verified = [];
@@ -181,6 +188,11 @@ test('native deposit preflights and submits payable value once, without token mi
     assert.equal(send.data, codec.encodeDeposit(plan, 3333334n));
     assert.equal(send.to, VAULT);
     assert.equal(calls.filter(call => call.method === 'eth_sendTransaction').length, 1);
+    // The deposit's gas limit is the C.8 policy at nextNoteId 0x77 (119):
+    // the window holds 127 (7 levels, 16,500 each beyond t_now = 3).
+    const { depositGasLimit } = await import('../services/zkapiGas.mjs');
+    assert.equal(BigInt(send.gas), depositGasLimit({ estimate: 0x100000n, nextNoteId: 0x77, freshSlotGas: 110_000 }));
+    assert.equal(BigInt(send.gas), (12n * (0x100000n + 4n * 16_500n + 105_000n) + 9n) / 10n);
 });
 
 test('native external recovery matches exact wei while zero-value legacy and withdrawal calls remain strict', () => {
@@ -224,7 +236,7 @@ test('native lease proves a fixed USD tier with its exact feed quote and keeps p
     runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1', expiry_ts: 2_000_000_000 } };
     const q = quote();
     runtime.nativeBillingQuote = async () => q;
-    runtime.treePath = async () => ({ active_root: '0x1', siblings: [] });
+    runtime.requestPath = async () => ({ active_root: '0x1', siblings: [], source: 'indexer' });
     runtime.commit = async next => { runtime.runtime = next; };
     let proof;
     runtime.worker = { call: async (_operation, inputs) => {
@@ -258,7 +270,7 @@ test('checksummed feed pins produce a canonical lowercase quote in the actual pr
         assert.equal(url, `${funding.protocol_server_url}/v2/billing/quote`);
         return q;
     };
-    runtime.treePath = async () => ({ active_root: '0x1', siblings: [] });
+    runtime.requestPath = async () => ({ active_root: '0x1', siblings: [], source: 'indexer' });
     runtime.commit = async next => { runtime.runtime = next; };
     runtime.worker = { call: async (_operation, input) => {
         const request = { client_request_id: input.args.client_request_id, payload: input.args.payload,
@@ -379,7 +391,7 @@ test('a finalized price update cannot reprice a pending proof until exact supers
     let current = quote();
     let quoteReads = 0;
     runtime.nativeBillingQuote = async () => { quoteReads++; return current; };
-    runtime.treePath = async () => ({ active_root: '0x1', siblings: [] });
+    runtime.requestPath = async () => ({ active_root: '0x1', siblings: [], source: 'indexer' });
     runtime.commit = async next => { runtime.runtime = next; };
     let proofs = 0;
     runtime.worker = { call: async (_operation, input) => {
@@ -462,16 +474,13 @@ test('prefunding quote exposes only the exact public native call and never conne
     const calls = [];
     client.setWalletProvider({ request: async ({ method, params }) => {
         calls.push(method);
-        if (method === 'eth_chainId') return '0xaa36a7';
-        assert.equal(method, 'eth_call', 'quoting cannot connect, sign or broadcast');
-        assert.equal(params[0].data, `0x${codec.ABI.currentRoot}`);
-        return '0x77';
+        assert.equal(method, 'eth_chainId', 'quoting cannot connect, sign or broadcast, and reads no vault root');
+        return '0xaa36a7';
     } });
     const draft = { operationId: 'prefunding-quote', amount: 3333334, commitment: '0x1', secret: 'never-expose-this',
-        next_note_id: 2, active_root: '0x77', zero_path: Array(32).fill('0x0') };
-    t.mock.method(runtime, 'prepareDepositQuote', async (amount, root) => {
-        assert.equal(amount, 3333334);
-        assert.equal(root, 0x77n);
+        next_note_id: 2 };
+    t.mock.method(runtime, 'prepareDepositQuote', async (...args) => {
+        assert.deepEqual(args, [3333334], 'no root argument');
         return draft;
     });
     const result = await client.prepareDepositQuote('0.003333334', { from: FROM });
@@ -479,7 +488,7 @@ test('prefunding quote exposes only the exact public native call and never conne
         depositWei: '3333334000000000', chainId: funding.chain_id, contractAddress: VAULT,
         transaction: { from: FROM, to: VAULT, data: codec.encodeDeposit(draft, 3333334n), value: `0x${3333334000000000n.toString(16)}` } });
     assert.doesNotMatch(JSON.stringify(result), /never-expose-this|secret|zero_path|active_root/);
-    assert.deepEqual(new Set(calls), new Set(['eth_chainId', 'eth_call']));
+    assert.deepEqual(new Set(calls), new Set(['eth_chainId']));
     assert.ok(Object.isFrozen(result));
     assert.ok(Object.isFrozen(result.transaction));
     for (const from of [undefined, '0x0', `0x${'00'.repeat(20)}`]) {
@@ -490,12 +499,11 @@ test('prefunding quote exposes only the exact public native call and never conne
 function nativeReceiptHarness() {
     const client = new ZkapiClient();
     client.config = { funding };
-    const plan = { operationId: 'deposit', next_note_id: 1, commitment: '0x1', amount: 123,
-        active_root: '0x77', zero_path: Array(32).fill('0x0') };
+    const plan = { operationId: 'deposit', next_note_id: 1, commitment: '0x1', amount: 123 };
     const blockHash = `0x${'55'.repeat(32)}`;
     const receipt = { status: '0x1', transactionHash: HASH, blockHash, blockNumber: '0x123',
         gasUsed: '0x64', effectiveGasPrice: '0x3b9aca00', logs: [{ address: VAULT,
-            topics: [codec.ABI.noteDeposited, '0x1', '0x1'], data: `0x${[123, 2_000_000_000, 7].map(word).join('')}` }] };
+            topics: [codec.ABI.noteDeposited, '0x1', '0x1'], data: `0x${[123, 2_000_000_000].map(word).join('')}` }] };
     const transaction = { hash: HASH, blockHash, blockNumber: '0x123', from: FROM, to: VAULT,
         chainId: '0xaa36a7', value: `0x${123000000000n.toString(16)}`, input: codec.encodeDeposit(plan, 123n) };
     const chain = { id: '0xaa36a7', blockHash };
@@ -546,8 +554,12 @@ test('native deposit recovery saves actual mined fee before the pending journal 
     client.browserMode = true;
     plan.transactionHash = HASH;
     t.mock.method(runtime, 'pendingDeposit', async () => plan);
-    t.mock.method(runtime, 'treePath', async () => ({}));
-    t.mock.method(client, 'readBrowserNote', async () => ({ status: 1, amount: 123n, commitment: '0x1', expiryTs: 2_000_000_000 }));
+    // The receipt names note 1 and its expiry; the vault holds that leaf.
+    t.mock.method(runtime, 'noteLeafFromFields', async fields => {
+        assert.deepEqual(fields, { noteId: 1, commitment: '0x1', amount: 123, expiryTs: 2_000_000_000n });
+        return '0x1eaf';
+    });
+    t.mock.method(client, 'readBrowserNote', async noteId => ({ noteId, status: 1, leaf: 0x1eafn }));
     t.mock.method(client, 'refresh', async () => {});
     const originalRequest = client.ethereum.request;
     client.ethereum.request = async request => request.method === 'eth_getTransactionReceipt' ? receipt : originalRequest(request);
@@ -560,6 +572,8 @@ test('native deposit recovery saves actual mined fee before the pending journal 
     assert.equal(saved.transactionHash, HASH);
     assert.equal(saved.receiptMetadata.feeWei, result.feeWei);
     assert.equal(saved.receiptMetadata.fundingAddress, FROM);
+    assert.equal(saved.expiry_ts, 2_000_000_000, 'the expiry from the NoteDeposited event');
+    assert.equal(saved.note_id, 1);
 });
 
 test('provider fee changes rejected before signing release the SDK claim for a safe new quote', async t => {
@@ -569,18 +583,21 @@ test('provider fee changes rejected before signing release the SDK claim for a s
     client.browserMode = true;
     client.config = { funding };
     const plan = { operationId: 'quote-operation', phase: 'prepared', next_note_id: 1,
-        commitment: '0x1', secret: 'local-only', amount: 3333334, active_root: '0x77', zero_path: Array(32).fill('0x0') };
+        commitment: '0x1', secret: 'local-only', amount: 3333334 };
     const submission = { operationId: plan.operationId, submissionId: 'claim' };
     t.mock.method(client, 'connectWallet', async () => FROM);
     t.mock.method(client, 'refresh', async () => {});
     t.mock.method(runtime, 'pendingDeposit', async () => null);
+    const pinned = runtime.browserConfig;
+    runtime.browserConfig = { trusted_deployment: { fresh_slot_gas: 22_100 } };
+    t.after(() => { runtime.browserConfig = pinned; });
     t.mock.method(runtime, 'verifyDeploymentForDeposit', async () => ({ ok: true }));
     t.mock.method(runtime, 'prepareDeposit', async (amount, options) => {
         assert.equal(amount, plan.amount);
         assert.equal(options.preparedOperationId, plan.operationId);
         return plan;
     });
-    t.mock.method(runtime, 'refreshPendingDeposit', async (_amount, _root, options) => {
+    t.mock.method(runtime, 'refreshPendingDeposit', async (_amount, options) => {
         assert.equal(options.expectedOperationId, plan.operationId);
         return plan;
     });
@@ -600,7 +617,7 @@ test('provider fee changes rejected before signing release the SDK claim for a s
     client.setWalletProvider({ request: async ({ method }) => {
         if (method === 'eth_chainId') return '0xaa36a7';
         if (method === 'eth_getBalance') return '0xde0b6b3a7640000';
-        if (method === 'eth_call') return '0x77';
+        if (method === 'eth_call') return `0x${word(0x77)}`;
         if (method === 'eth_estimateGas') return '0x100000';
         if (method === 'eth_getTransactionCount') return '0x0';
         assert.equal(method, 'eth_sendTransaction');

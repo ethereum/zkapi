@@ -1,8 +1,8 @@
 //! End-to-end tests of the companion's exits against an in-process operator
 //! (protocol server and indexer) and a simulated vault behind JSON-RPC: the
 //! escape routes, the mutual close's decision, E0's bounds on a hanging
-//! operator, the stale-device pre-check, the three path sources, E5 after a
-//! raise and E6.
+//! operator, the stale-device pre-check, exits without any path (vault
+//! revision 4), E5 after a raise and E6.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -65,7 +65,20 @@ struct World {
     /// log queries).
     logs_down: bool,
     // Chain.
-    known_roots: HashSet<Felt252>,
+    /// The leaf the vault stored for the note (`noteRecord`).
+    note_leaf: Felt252,
+    /// `currentRoot()`.
+    vault_root: Felt252,
+    /// The vault's leaves by note id (`noteLeaves`, `nextNoteId()`).
+    leaves: Vec<Felt252>,
+    /// `nextNoteId()` and `noteLeaves` fail (a node that caps `eth_call`).
+    state_reads_down: bool,
+    /// `LEAF_BOUND_EXIT_VERSION()`; `None`: it reverts (vault revision 3).
+    leaf_bound_version: Option<u64>,
+    /// `minDeposit()`.
+    min_deposit: u128,
+    /// The block parameter of every `eth_call` answered.
+    call_blocks: Vec<Value>,
     note_status: u8,
     pending: Option<chain::PendingEscape>,
     challenged: HashSet<Felt252>,
@@ -116,7 +129,7 @@ async fn exit_rpc(State(world): State<Shared>, Json(body): Json<Value>) -> Respo
 }
 
 fn answer(world: &Shared, body: &Value, lies: bool) -> Response {
-    let world = world.lock().unwrap();
+    let mut world = world.lock().unwrap();
     let params = &body["params"];
     match body["method"].as_str().unwrap_or("") {
         "eth_chainId" => rpc_result(json!("0x1")),
@@ -183,14 +196,43 @@ fn answer(world: &Shared, body: &Value, lies: bool) -> Response {
             let data = params[0]["data"].as_str().unwrap_or("");
             let selector = &data[2..10];
             let argument = &data[10..];
+            world.call_blocks.push(params[1].clone());
             let result = match selector {
-                chain::NOTES => format!(
-                    "0x{}{}{}{}",
-                    word(0u8),
-                    word(DEPOSIT),
-                    word(4_000_000_000u64),
+                chain::NOTE_RECORD => format!(
+                    "0x{}{}",
+                    felt_word(&world.note_leaf),
                     word(if lies { 1 } else { world.note_status })
                 ),
+                chain::LEAF_BOUND_EXIT_VERSION => match world.leaf_bound_version {
+                    Some(version) => format!("0x{}", word(version)),
+                    None => {
+                        return Json(json!({"jsonrpc": "2.0", "id": 1,
+                            "error": {"code": 3, "message": "execution reverted", "data": "0x"}}))
+                        .into_response()
+                    }
+                },
+                chain::CURRENT_ROOT => format!("0x{}", felt_word(&world.vault_root)),
+                chain::MIN_DEPOSIT => format!("0x{}", word(world.min_deposit)),
+                zkapi_client::tree::NEXT_NOTE_ID_SELECTOR
+                | zkapi_client::tree::NOTE_LEAVES_SELECTOR
+                    if world.state_reads_down =>
+                {
+                    return Json(json!({"jsonrpc": "2.0", "id": 1,
+                        "error": {"code": -32000, "message": "gas limit exceeded"}}))
+                    .into_response()
+                }
+                zkapi_client::tree::NEXT_NOTE_ID_SELECTOR => {
+                    format!("0x{}", word(world.leaves.len() as u64))
+                }
+                zkapi_client::tree::NOTE_LEAVES_SELECTOR => {
+                    let start = usize::from_str_radix(&argument[..64], 16).unwrap();
+                    let count = usize::from_str_radix(&argument[64..128], 16).unwrap();
+                    let leaves: String = world.leaves[start..start + count]
+                        .iter()
+                        .map(felt_word)
+                        .collect();
+                    format!("0x{}{}{leaves}", word(32u8), word(count as u64))
+                }
                 chain::PENDING_WITHDRAWALS if lies => format!("0x{}", "0".repeat(64 * 6)),
                 chain::PENDING_WITHDRAWALS => match world.pending {
                     Some(pending) => format!(
@@ -221,10 +263,6 @@ fn answer(world: &Shared, body: &Value, lies: bool) -> Response {
                         "0x{}",
                         word(u8::from(world.challenged.contains(&nullifier)))
                     )
-                }
-                chain::IS_KNOWN_ROOT => {
-                    let root = Felt252::from_hex(&format!("0x{argument}")).unwrap();
-                    format!("0x{}", word(u8::from(world.known_roots.contains(&root))))
                 }
                 chain::EFFECTIVE_EXPIRY => format!("0x{}", word(4_000_000_000u64)),
                 _ => return (StatusCode::BAD_REQUEST, "unknown selector").into_response(),
@@ -337,38 +375,22 @@ impl Drop for Harness {
     }
 }
 
-/// The deposit-time path the harness confirms its note with.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DepositPathChoice {
-    Kept,
-    Absent,
-    /// A path that does not lead from the note's leaf to the root given.
-    NotProving,
-}
-
 impl Harness {
-    /// A note deposited next to two others, confirmed with or without its
-    /// deposit-time path.
-    async fn new(keep_deposit_path: bool) -> Self {
-        Self::build(if keep_deposit_path {
-            DepositPathChoice::Kept
-        } else {
-            DepositPathChoice::Absent
-        })
-        .await
-    }
-
-    async fn build(choice: DepositPathChoice) -> Self {
-        Self::build_expiring(choice, 4_000_000_000).await
+    /// A note deposited next to two others. Its exits need nothing from the
+    /// deposit but the note itself (vault revision 4).
+    async fn new() -> Self {
+        Self::build_expiring(4_000_000_000).await
     }
 
     /// The harness with the note's expiry at `expiry`.
-    async fn build_expiring(choice: DepositPathChoice, expiry: u64) -> Self {
+    async fn build_expiring(expiry: u64) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let world: Shared = Arc::new(Mutex::new(World {
             note_status: 1,
+            leaf_bound_version: Some(1),
+            min_deposit: 1_000_000,
             block: 100,
             now: now_seconds(),
             ..Default::default()
@@ -389,6 +411,8 @@ impl Harness {
                         "root": world.indexer_root,
                         "next_note_id": world.indexer_leaves.len(),
                         "leaves": world.indexer_leaves,
+                        "block_number": world.block,
+                        "block_hash": format!("0x{}", "33".repeat(32)),
                     }))
                 }),
             )
@@ -434,7 +458,7 @@ impl Harness {
                 "removed": false,
                 "topics": [zkapi_client::tree::NOTE_DEPOSITED_TOPIC, format!("0x{}", word(note)),
                     format!("0x{}", felt_word(&commitment))],
-                "data": format!("0x{}{}{}", word(DEPOSIT), word(expiry), felt_word(&tree.root())),
+                "data": format!("0x{}{}", word(DEPOSIT), word(expiry)),
             }));
         }
         let deposit_root = tree.root();
@@ -442,28 +466,19 @@ impl Harness {
         {
             let mut world = world.lock().unwrap();
             world.logs = logs;
-            world.known_roots.insert(deposit_root);
+            world.note_leaf = leaf;
+            world.vault_root = deposit_root;
+            world.leaves = (0..=NOTE_ID).map(|note| tree.leaf(note)).collect();
             world.indexer_root = deposit_root;
             world.indexer_leaves = (0..=NOTE_ID).map(|id| tree.leaf(id)).collect();
         }
         let service = AuthService::new(config.clone()).unwrap();
-        let (root, siblings) = match choice {
-            DepositPathChoice::Kept => (Some(deposit_root), Some(deposit_siblings.clone())),
-            DepositPathChoice::Absent => (None, None),
-            DepositPathChoice::NotProving => {
-                let mut wrong = deposit_siblings.clone();
-                wrong[1] = Felt252::from_u64(404);
-                (Some(deposit_root), Some(wrong))
-            }
-        };
         service
             .confirm_deposit(ConfirmDepositRequest {
                 secret,
                 note_id: NOTE_ID,
                 amount: DEPOSIT,
                 expiry_ts: expiry,
-                deposit_root: root,
-                deposit_siblings: siblings,
             })
             .await
             .unwrap();
@@ -638,7 +653,13 @@ impl Harness {
             .verify(&inputs, &proof)
             .unwrap());
         let mut world = self.world.lock().unwrap();
-        assert!(world.known_roots.contains(&inputs.active_root));
+        // The vault compares the proof's leaf and fields with its record.
+        assert_eq!(inputs.note_leaf, world.note_leaf);
+        assert_eq!((inputs.note_id, inputs.deposit_amount), (NOTE_ID, DEPOSIT));
+        assert_eq!(
+            &calldata[2 + 8 + 3 * 64..2 + 8 + 4 * 64],
+            felt_word(&world.note_leaf)
+        );
         world.note_status = 2;
         world.pending = Some(chain::PendingEscape {
             nullifier: inputs.withdrawal_nullifier,
@@ -680,7 +701,6 @@ impl Harness {
         world.challenged.insert(nullifier);
         world.block += 1;
         let block = world.block;
-        let root = world.indexer_root;
         world.logs.push(json!({
             "address": format!("0x{}", hex::encode(VAULT)),
             "blockNumber": format!("0x{block:x}"),
@@ -688,7 +708,7 @@ impl Harness {
             "removed": false,
             "transactionHash": format!("0x{}", "cd".repeat(32)),
             "topics": [chain::escape_challenged_topic(), format!("0x{}", word(NOTE_ID))],
-            "data": format!("0x{}{}", felt_word(&nullifier), felt_word(&root)),
+            "data": format!("0x{}", felt_word(&nullifier)),
         }));
     }
 
@@ -725,12 +745,13 @@ impl Harness {
 
 /// E2 step 5 then E4 and E5: the operator refuses the clearance, the mutual
 /// close turns into an escape conceding nothing, the owner confirms it, the
-/// escape is proved from the deposit-time path with no indexer, initiated,
+/// escape is proved with no path and no indexer (bound to the note's leaf),
+/// initiated,
 /// raised by the challenger, finalized; the payout matcher follows the raise
 /// and the note closes, which releases the exit lock.
 #[tokio::test]
 async fn a_refused_clearance_escapes_and_a_raised_escape_finalizes() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     let refused = harness
         .service
         .oa_prepare_withdrawal([0x22; 20], false)
@@ -741,8 +762,8 @@ async fn a_refused_clearance_escapes_and_a_raised_escape_finalizes() {
     };
     assert_eq!(detail["reason"], "mutual_refused");
     assert_eq!(detail["conceded"], "0");
-    // From now on the indexer serves a path at a root the vault never held:
-    // the escape uses the deposit-time path, so no indexer read matters.
+    // From now on the indexer serves a root the vault never held: the
+    // escape reads no path, so no indexer answer matters.
     harness.world.lock().unwrap().indexer_root = Felt252::from_u64(99);
     // The owner sees the decision before any escape proof exists.
     let decision = harness.prepare(None, None).await.unwrap();
@@ -758,11 +779,9 @@ async fn a_refused_clearance_escapes_and_a_raised_escape_finalizes() {
     ));
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     assert_eq!(plan["status"], "prepared");
-    assert_eq!(plan["path_source"], "deposit");
-    assert_eq!(
-        plan["public_inputs"]["active_root"],
-        json!(harness.deposit_root)
-    );
+    assert!(plan.get("path_source").is_none());
+    assert_eq!(plan["public_inputs"]["note_leaf"], json!(harness.leaf));
+    assert!(plan["public_inputs"].get("active_root").is_none());
     // Asking again hands out the same plan, not a second proof.
     let again = harness.prepare(Some("0"), None).await.unwrap();
     assert_eq!(again["proof"], plan["proof"]);
@@ -824,7 +843,7 @@ async fn a_refused_clearance_escapes_and_a_raised_escape_finalizes() {
 /// refused, and nothing is closed; a credited payout is reported.
 #[tokio::test]
 async fn the_payout_matcher_refuses_unexplained_amounts_and_reports_credits() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.release_request(1_000, 100_000);
     harness.set_reading("unknown");
     let decision = harness.prepare(None, None).await.unwrap();
@@ -848,7 +867,7 @@ async fn the_payout_matcher_refuses_unexplained_amounts_and_reports_credits() {
     );
     assert!(harness.wallet().state().is_some());
     // The amount the raise explains is accepted, credited or not.
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.release_request(1_000, 100_000);
     harness.set_reading("unknown");
     let plan = harness.prepare(Some("0"), None).await.unwrap();
@@ -869,7 +888,7 @@ async fn the_payout_matcher_refuses_unexplained_amounts_and_reports_credits() {
 /// concedes the bound. The mutual close waits too.
 #[tokio::test]
 async fn a_withheld_request_waits_for_t_then_concedes_the_bound() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.release_request(1_000, 60);
     harness.set_reading("reserved");
     assert!(matches!(
@@ -897,7 +916,7 @@ async fn a_withheld_request_waits_for_t_then_concedes_the_bound() {
         .unwrap();
     assert_eq!(early["conceded"], "1000");
     // A request sent long ago is past T: the bound is conceded.
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.release_request(1_000, 100_000);
     harness.set_reading("reserved");
     let decision = harness.prepare(None, None).await.unwrap();
@@ -915,7 +934,7 @@ async fn a_withheld_request_waits_for_t_then_concedes_the_bound() {
 /// operator call is made at all.
 #[tokio::test]
 async fn a_hanging_operator_cannot_delay_the_exit() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.release_request(1_000, 60);
     harness.world.lock().unwrap().hang = true;
     // The decision makes no proof: a bounded recovery pass and reading.
@@ -949,7 +968,7 @@ async fn a_hanging_operator_cannot_delay_the_exit() {
     // Past must_initiate_by: nothing is asked of the operator, neither by
     // E1 (a request is pending, so a pass would ask for its response), nor
     // by the reading, nor by the stale-device pre-check before proving.
-    let harness = Harness::build_expiring(DepositPathChoice::Kept, now_seconds() + 1_000).await;
+    let harness = Harness::build_expiring(now_seconds() + 1_000).await;
     harness.release_request(1_000, 60);
     harness.world.lock().unwrap().hang = true;
     let calls = harness.world.lock().unwrap().operator_calls;
@@ -962,7 +981,7 @@ async fn a_hanging_operator_cannot_delay_the_exit() {
     assert_eq!(harness.world.lock().unwrap().operator_calls, calls);
     // Without the pending request the decision is E2's cutoff, also with no
     // operator call.
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     let path = harness.config.state_dir.join("note_state.json");
     let mut state = zkapi_client::note_state::NoteState::load(&path).unwrap();
     state.expiry_ts = now_seconds() + 1_000;
@@ -979,7 +998,7 @@ async fn a_hanging_operator_cannot_delay_the_exit() {
 /// ignored.
 #[tokio::test]
 async fn the_stale_device_pre_check_refuses_only_on_verified_evidence() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     // A real request proof from the successor state, made by "another
     // device": a copy of the wallet that spent this state.
     let copy = tempfile::tempdir().unwrap();
@@ -1054,7 +1073,7 @@ async fn the_stale_device_pre_check_refuses_only_on_verified_evidence() {
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     assert_eq!(plan["status"], "prepared");
     // Verified evidence refuses a new escape (here: after the first expired).
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.world.lock().unwrap().evidence.insert(
         successor.to_string(),
         json!({"public_inputs": spent.public_inputs, "proof": spent.proof}),
@@ -1068,29 +1087,42 @@ async fn the_stale_device_pre_check_refuses_only_on_verified_evidence() {
     assert!(harness.wallet().exit_lock().unwrap().is_none());
 }
 
-/// E4 step 1 without a saved path: the indexer's path only at a root the
-/// vault knows, else a rebuild from the vault's logs.
+/// Vault revision 4: an escape needs no Merkle path, root, indexer or log
+/// scan. With the indexer down and every RPC refusing `eth_getLogs`, the
+/// escape is still proved, bound to the note's leaf and fields, and its
+/// calldata carries the leaf in word 3 and the packed fields in word 8.
 #[tokio::test]
-async fn without_a_deposit_path_the_escape_uses_a_known_root_or_rebuilds() {
-    let harness = Harness::new(false).await;
-    assert!(harness.wallet().deposit_path().is_none());
-    let plan = harness.prepare(Some("0"), None).await.unwrap();
-    assert_eq!(plan["path_source"], "indexer");
-
-    let harness = Harness::new(false).await;
+async fn an_escape_needs_no_path_indexer_or_logs() {
+    let harness = Harness::new().await;
     {
         let mut world = harness.world.lock().unwrap();
-        // The indexer reports a root the vault never held (a lying or
-        // diverged indexer).
-        world.indexer_leaves[0] = Felt252::from_u64(5);
+        world.indexer_hang = true;
+        world.logs_down = true;
         world.indexer_root = Felt252::from_u64(6);
     }
+    let started = Instant::now();
     let plan = harness.prepare(Some("0"), None).await.unwrap();
-    assert_eq!(plan["path_source"], "rebuild");
+    assert_eq!(plan["status"], "prepared");
+    assert!(started.elapsed() < OPERATOR_HANG / 2);
+    let inputs: WithdrawalPublicInputsV2C =
+        serde_json::from_value(plan["public_inputs"].clone()).unwrap();
+    assert_eq!(inputs.note_leaf, harness.leaf);
     assert_eq!(
-        plan["public_inputs"]["active_root"],
-        json!(harness.deposit_root)
+        (inputs.note_id, inputs.deposit_amount, inputs.expiry_ts),
+        (NOTE_ID, DEPOSIT, 4_000_000_000)
     );
+    let calldata = plan["calldata"].as_str().unwrap();
+    let word_at = |index: usize| &calldata[10 + index * 64..10 + (index + 1) * 64];
+    assert_eq!(word_at(3), felt_word(&harness.leaf));
+    assert_eq!(
+        word_at(8),
+        felt_word(&zkapi_types::pack_note_fields(
+            NOTE_ID,
+            DEPOSIT,
+            4_000_000_000
+        ))
+    );
+    harness.initiate(&plan);
     assert_eq!(harness.leaf, harness.wallet().current_note_leaf().unwrap());
     let _ = harness.secret;
 }
@@ -1099,7 +1131,7 @@ async fn without_a_deposit_path_the_escape_uses_a_known_root_or_rebuilds() {
 /// a finalized block; then the lock is released and chats may resume.
 #[tokio::test]
 async fn an_escape_that_never_landed_releases_the_lock_once_dead() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     let valid_until = plan["valid_until"].as_u64().unwrap();
     let status = harness.service.oa_escape_status().await.unwrap();
@@ -1126,7 +1158,7 @@ async fn an_escape_that_never_landed_releases_the_lock_once_dead() {
     // A defeat (another device spent the successor) is reported as such,
     // only from the defeat's log in a finalized block: the flag alone, or a
     // log in a block not yet final, reports nothing.
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     let nullifier: Felt252 = serde_json::from_value(plan["withdrawal_nullifier"].clone()).unwrap();
     harness.world.lock().unwrap().challenged.insert(nullifier);
@@ -1159,7 +1191,7 @@ async fn an_escape_that_never_landed_releases_the_lock_once_dead() {
 /// defeat: chats stay stopped until the proof is dead on this clock too.
 #[tokio::test]
 async fn a_lying_pinned_rpc_neither_releases_a_live_lock_nor_reports_a_defeat() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     // A real request at the current state, journaled in the wallet itself.
     let request = harness
         .wallet()
@@ -1241,7 +1273,7 @@ async fn failing_defeat_logs_settle_nothing_once_the_proof_is_dead() {
         );
     };
     // A defeat saved by an earlier reading is never overwritten.
-    let harness = Harness::new(true).await.with_exit_rpc();
+    let harness = Harness::new().await.with_exit_rpc();
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     let dead = plan["valid_until"].as_u64().unwrap() + 901;
     let nullifier: Felt252 = serde_json::from_value(plan["withdrawal_nullifier"].clone()).unwrap();
@@ -1261,7 +1293,7 @@ async fn failing_defeat_logs_settle_nothing_once_the_proof_is_dead() {
 
     // An escape that never landed: the dead lock is released as before, but
     // the escape is reported expired only from logs that loaded.
-    let harness = Harness::new(true).await.with_exit_rpc();
+    let harness = Harness::new().await.with_exit_rpc();
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     let dead = plan["valid_until"].as_u64().unwrap() + 901;
     {
@@ -1296,7 +1328,7 @@ async fn failing_defeat_logs_settle_nothing_once_the_proof_is_dead() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_exit_decision_and_a_request_preparation_never_interleave() {
     for round in 0..4 {
-        let harness = Harness::new(true).await;
+        let harness = Harness::new().await;
         harness.set_reading("reserved");
         let second = AuthService::new(harness.config.clone()).unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -1341,14 +1373,16 @@ impl AuthService {
     async fn request_through_lock(&self, config: &AuthConfig) -> Result<(), AuthError> {
         let config = config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
-        let indexer = self.indexer.clone();
+        let paths = self.paths.clone();
         super::super::spawn_blocking(move || {
             let _guard = wallet_mutex.lock().unwrap();
             let _lockfile = super::super::acquire_wallet_lock(&config.state_dir)?;
             let mut wallet = super::super::load_wallet(&config)?;
             let runtime = super::super::current_thread_runtime()?;
             let state = wallet.state().unwrap().clone();
-            let (root, siblings) = runtime.block_on(indexer.root_and_path(state.note_id))?;
+            let leaf = wallet.current_note_leaf().unwrap();
+            let (root, siblings) =
+                runtime.block_on(async { paths.path(state.note_id, &leaf).await })?;
             wallet
                 .prepare_request_with_bound(
                     "{}",
@@ -1372,14 +1406,14 @@ impl AuthService {
 /// state request-free); one that released an escape is not.
 #[tokio::test]
 async fn a_decision_leaves_no_lock_and_the_cancel_route_releases_an_unused_one() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     let decision = harness.prepare(None, None).await.unwrap();
     assert_eq!(decision["status"], "decision");
     assert!(harness.wallet().exit_lock().unwrap().is_none());
     harness.wallet().check_request_allowed().unwrap();
 
     // E3 waits, on the escape route and on the mutual route.
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.release_request(1_000, 60);
     harness.set_reading("reserved");
     assert_eq!(harness.prepare(None, None).await.unwrap()["status"], "wait");
@@ -1395,7 +1429,7 @@ async fn a_decision_leaves_no_lock_and_the_cancel_route_releases_an_unused_one()
 
     // A refused clearance released an ownership proof: the lock stays (in
     // escape mode) until the owner cancels it.
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     assert!(matches!(
         harness
             .service
@@ -1423,7 +1457,7 @@ async fn a_decision_leaves_no_lock_and_the_cancel_route_releases_an_unused_one()
     harness.service.oa_escape_cancel().await.unwrap();
 
     // A released escape keeps its lock.
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.prepare(Some("0"), None).await.unwrap();
     assert!(matches!(
         harness.service.oa_escape_cancel().await,
@@ -1440,7 +1474,7 @@ async fn a_decision_leaves_no_lock_and_the_cancel_route_releases_an_unused_one()
 /// the still-live ownership proof.
 #[tokio::test]
 async fn an_expiring_close_is_proved_again_and_never_handed_out_stale() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.grant_clearance();
     let first = harness
         .service
@@ -1478,13 +1512,13 @@ async fn an_expiring_close_is_proved_again_and_never_handed_out_stale() {
             (
                 fresh.public_inputs.withdrawal_nullifier,
                 fresh.public_inputs.final_balance,
-                fresh.public_inputs.active_root,
+                fresh.public_inputs.note_leaf,
                 fresh.public_inputs.kind,
             ),
             (
                 first.public_inputs.withdrawal_nullifier,
                 first.public_inputs.final_balance,
-                first.public_inputs.active_root,
+                first.public_inputs.note_leaf,
                 1,
             )
         );
@@ -1535,7 +1569,7 @@ async fn an_expiring_close_is_proved_again_and_never_handed_out_stale() {
 /// delays the decision by one `RECOVERY_BUDGET`, never longer.
 #[tokio::test]
 async fn a_live_key_whose_retirement_hangs_delays_the_escape_by_one_budget() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     *harness.service.direct_lease.lock().await = Some(super::super::ActiveOpenRouterLease {
         session_id: "oa-single-use".into(),
         client_request_id: "live".into(),
@@ -1570,7 +1604,7 @@ async fn a_live_key_whose_retirement_hangs_delays_the_escape_by_one_budget() {
 /// gives way to the current state's own mutual close, and is archived.
 #[tokio::test]
 async fn a_close_kept_for_an_earlier_state_gives_way_to_the_current_states_close() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     // A request from this state made elsewhere, whose successor arrives late.
     let copy = tempfile::tempdir().unwrap();
     let (mut other, request) = harness.request_from_a_copy(copy.path());
@@ -1638,7 +1672,7 @@ async fn a_close_kept_for_an_earlier_state_gives_way_to_the_current_states_close
 /// escape is pending: the exit RPC alone decides E6.
 #[tokio::test]
 async fn escapes_follow_the_exit_rpc_when_the_pinned_rpc_is_down_or_lies() {
-    let harness = Harness::new(true).await.with_exit_rpc();
+    let harness = Harness::new().await.with_exit_rpc();
     harness.world.lock().unwrap().pinned_down = true;
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     assert_eq!(plan["status"], "prepared");
@@ -1652,7 +1686,7 @@ async fn escapes_follow_the_exit_rpc_when_the_pinned_rpc_is_down_or_lies() {
     assert_eq!(done["status"], "complete");
     assert_eq!(done["payout"], (DEPOSIT - 250).to_string());
 
-    let harness = Harness::new(true).await.with_exit_rpc();
+    let harness = Harness::new().await.with_exit_rpc();
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     harness.initiate(&plan);
     harness.world.lock().unwrap().pinned_lies = true;
@@ -1684,11 +1718,12 @@ async fn escapes_follow_the_exit_rpc_when_the_pinned_rpc_is_down_or_lies() {
 /// WP-D's chain check, in the companion: an exit RPC the owner configured
 /// for another network (here chain 5, where the same vault address could
 /// hold a Closed note) is never read for the escape's state or its lock
-/// (E6), nor for a root or a rebuild (E4 step 1), and the pinned RPC is not
-/// asked in its place. Pointed back at the vault's chain, it decides again.
+/// (E6), and the pinned RPC is not asked in its place. Pointed back at the
+/// vault's chain, it decides again. The escape itself reads no root or path
+/// (vault revision 4), so it is proved meanwhile.
 #[tokio::test]
 async fn an_exit_rpc_on_another_chain_decides_nothing() {
-    let harness = Harness::new(true).await.with_exit_rpc();
+    let harness = Harness::new().await.with_exit_rpc();
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     harness.initiate(&plan);
     {
@@ -1706,84 +1741,77 @@ async fn an_exit_rpc_on_another_chain_decides_nothing() {
     assert_eq!(status["phase"], "pending", "{status}");
     assert_eq!(status["chain_rpc"], "exit");
 
-    let harness = Harness::new(false).await.with_exit_rpc();
+    let harness = Harness::new().await.with_exit_rpc();
     harness.world.lock().unwrap().exit_chain = Some(5);
-    let refused = harness.prepare(Some("0"), None).await;
-    assert!(
-        matches!(&refused, Err(AuthError::Wallet(message)) if message.contains("chain 5")),
-        "{refused:?}"
-    );
-    harness.world.lock().unwrap().exit_chain = None;
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     assert_eq!(plan["status"], "prepared");
+    // Without a start block from the exit RPC, raises are scanned from the
+    // deployment block.
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(harness.config.state_dir.join(ESCAPE_RECORD_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["start_block"], harness.config.deploy_block);
 }
 
-/// E4 step 1 with the owner's exit RPC down and no deposit-time path: the
-/// pinned RPC neither confirms the indexer's root nor serves the logs of a
-/// rebuild (a root it vouched for is proved and signed), so no escape is
-/// proved until the exit RPC answers.
+/// E4 with the owner's exit RPC down: the escape reads no root, path or log
+/// (vault revision 4), so it is proved anyway, and the pinned RPC decides
+/// nothing about it in the exit RPC's place.
 #[tokio::test]
-async fn without_its_exit_rpc_an_escape_takes_no_root_from_the_pinned_rpc() {
-    let harness = Harness::new(false).await.with_exit_rpc();
-    {
-        let mut world = harness.world.lock().unwrap();
-        world.exit_down = true;
-        world.pinned_calls = 0;
-    }
-    let refused = harness.prepare(Some("0"), None).await;
-    assert!(
-        matches!(&refused, Err(AuthError::Wallet(message)) if message.contains("429")),
-        "{refused:?}"
-    );
-    assert!(harness.wallet().exit_lock().unwrap().is_none());
-    harness.world.lock().unwrap().exit_down = false;
+async fn with_its_exit_rpc_down_an_escape_is_still_proved() {
+    let harness = Harness::new().await.with_exit_rpc();
+    harness.world.lock().unwrap().exit_down = true;
     let plan = harness.prepare(Some("0"), None).await.unwrap();
+    assert_eq!(plan["status"], "prepared");
+    assert_eq!(plan["public_inputs"]["note_leaf"], json!(harness.leaf));
+    // E_low needs both RPCs: with the exit RPC down it is the note's expiry.
     assert_eq!(
-        (plan["status"].as_str(), plan["path_source"].as_str()),
-        (Some("prepared"), Some("indexer"))
+        plan["must_initiate_by"],
+        exit_policy::must_initiate_by(4_000_000_000)
     );
 }
 
-/// E0: the indexer is the operator's. One that accepts a connection and
-/// never answers cannot hold the wallet's locks: the mutual close waiting
-/// on it fails within its bound, and the escape route, which takes the same
-/// locks, decides meanwhile and after.
+/// E0: the indexer is the operator's, and since vault revision 4 no exit
+/// reads it. One that accepts a connection and never answers holds neither
+/// exit route: the mutual close (refused by the unreachable operator here)
+/// and the escape decision complete without it. A request preparation waits
+/// for it at most one `CALL_TIMEOUT`, then takes its path from the vault's
+/// own tree.
 #[tokio::test]
-async fn a_hanging_indexer_cannot_hold_the_exit_routes() {
-    let harness = Arc::new(Harness::new(true).await);
+async fn a_hanging_indexer_holds_no_exit_route_and_delays_a_request_once() {
+    let harness = Arc::new(Harness::new().await);
     harness.world.lock().unwrap().indexer_hang = true;
     let started = Instant::now();
-    let mutual = {
-        let harness = harness.clone();
-        tokio::spawn(async move {
-            harness
-                .service
-                .oa_prepare_withdrawal([0x22; 20], false)
-                .await
-        })
-    };
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let decision = tokio::time::timeout(Duration::from_secs(15), harness.prepare(None, None))
         .await
         .expect("a hanging indexer held the escape decision")
         .unwrap();
     assert_eq!(decision["status"], "decision");
-    let mutual = tokio::time::timeout(Duration::from_secs(15), mutual)
-        .await
-        .expect("a hanging indexer held the mutual close")
-        .unwrap();
-    assert!(matches!(mutual, Err(AuthError::Indexer(_))), "{mutual:?}");
+    let mutual = tokio::time::timeout(
+        Duration::from_secs(15),
+        harness.service.oa_prepare_withdrawal([0x22; 20], false),
+    )
+    .await
+    .expect("a hanging indexer held the mutual close");
+    assert!(
+        matches!(mutual, Err(AuthError::EscapeRequired(_))),
+        "{mutual:?}"
+    );
     assert!(started.elapsed() < Duration::from_secs(15));
-    // Nothing was released: no lock is left, requests resume.
-    assert!(harness.wallet().exit_lock().unwrap().is_none());
-    // A request preparation (a chat) is bounded the same way.
-    let failed = tokio::time::timeout(
+
+    let harness = Harness::new().await;
+    harness.world.lock().unwrap().indexer_hang = true;
+    let started = Instant::now();
+    tokio::time::timeout(
         Duration::from_secs(15),
         harness.service.request_through_lock(&harness.config),
     )
     .await
-    .expect("a hanging indexer held a request preparation");
-    assert!(matches!(failed, Err(AuthError::Indexer(_))), "{failed:?}");
+    .expect("a hanging indexer held a request preparation")
+    .unwrap();
+    assert!(started.elapsed() >= crate::indexer::CALL_TIMEOUT);
+    let request = harness.wallet().pending_api_request().unwrap().unwrap();
+    assert_eq!(request.public_inputs.active_root, harness.deposit_root);
 }
 
 /// E4 step 2 binds the evidence to N+: the operator legitimately holds the
@@ -1792,7 +1820,7 @@ async fn a_hanging_indexer_cannot_hold_the_exit_routes() {
 /// escape, or an operator could refuse every escape this way.
 #[tokio::test]
 async fn evidence_at_another_nullifier_does_not_stop_the_escape() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     let copy = tempfile::tempdir().unwrap();
     let (_, own) = harness.request_from_a_copy(copy.path());
     assert_eq!(own.public_inputs.request_nullifier, harness.nullifier());
@@ -1805,12 +1833,33 @@ async fn evidence_at_another_nullifier_does_not_stop_the_escape() {
     assert_eq!(plan["status"], "prepared");
 }
 
-/// E4 step 1 without a saved path: an indexer path that is consistent with
-/// itself but at a root the vault never held is not used; the path is
-/// rebuilt from the vault's logs at a root it did hold.
+/// Request paths (vault revision 4): the indexer's path is used only at a
+/// root the vault's `currentRoot()` reports at the indexer's block; one
+/// consistent with itself at a root the vault never held is not. The path
+/// then comes from the vault's state, every read pinned to one block hash,
+/// or from its logs when the state reads fail, at the vault's root.
 #[tokio::test]
-async fn an_indexer_path_at_a_root_the_vault_never_held_is_rebuilt() {
-    let harness = Harness::new(false).await;
+async fn request_paths_need_the_vaults_root_and_rebuild_from_its_state() {
+    use crate::request_path::PathSource;
+    let harness = Harness::new().await;
+    let paths = &harness.service.paths;
+    let (root, siblings, source) = paths
+        .path_with_source(NOTE_ID, &harness.leaf)
+        .await
+        .unwrap();
+    assert_eq!(source, PathSource::Indexer);
+    assert_eq!(
+        (root, siblings),
+        (harness.deposit_root, harness.deposit_siblings.clone())
+    );
+    // The vault's root was read at the indexer's block hash.
+    assert!(harness
+        .world
+        .lock()
+        .unwrap()
+        .call_blocks
+        .iter()
+        .any(|block| { block["blockHash"] == format!("0x{}", "33".repeat(32)) }));
     {
         let mut world = harness.world.lock().unwrap();
         // A tree with one more note than the vault ever recorded.
@@ -1820,14 +1869,175 @@ async fn an_indexer_path_at_a_root_the_vault_never_held_is_rebuilt() {
             tree.set_leaf(id as u32, *leaf);
         }
         world.indexer_root = tree.root();
-        assert!(!world.known_roots.contains(&world.indexer_root));
+        assert_ne!(world.indexer_root, world.vault_root);
+        world.call_blocks.clear();
     }
-    let plan = harness.prepare(Some("0"), None).await.unwrap();
-    assert_eq!(plan["path_source"], "rebuild");
+    let (root, siblings, source) = paths
+        .path_with_source(NOTE_ID, &harness.leaf)
+        .await
+        .unwrap();
+    assert_eq!(source, PathSource::Rebuild);
     assert_eq!(
-        plan["public_inputs"]["active_root"],
-        json!(harness.deposit_root)
+        (root, siblings),
+        (harness.deposit_root, harness.deposit_siblings.clone())
     );
+    {
+        // nextNoteId(), the noteLeaves page and currentRoot(), all pinned to
+        // the one block hash of `latest`.
+        let world = harness.world.lock().unwrap();
+        let pinned: Vec<&Value> = world
+            .call_blocks
+            .iter()
+            .filter(|block| block.is_object())
+            .collect();
+        assert!(pinned.len() >= 3, "{pinned:?}");
+        assert!(pinned.iter().all(|block| *block == pinned[0]));
+        assert_eq!(pinned[0]["requireCanonical"], true);
+    }
+    // The state reads fail: the logs at the same block, at the vault's root.
+    harness.world.lock().unwrap().state_reads_down = true;
+    let (root, _, source) = paths
+        .path_with_source(NOTE_ID, &harness.leaf)
+        .await
+        .unwrap();
+    assert_eq!((root, source), (harness.deposit_root, PathSource::Rebuild));
+    // A note whose leaf the vault does not hold gets no path at all.
+    let refused = paths
+        .path(NOTE_ID, &Felt252::from_u64(77))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("does not hold note 3's leaf"),
+        "{refused}"
+    );
+    // Nor does a vault whose root the rebuilt tree does not reproduce.
+    harness.world.lock().unwrap().vault_root = Felt252::from_u64(8);
+    assert!(paths.path(NOTE_ID, &harness.leaf).await.is_err());
+}
+
+/// The deployment check before the first request proof: a vault without
+/// `LEAF_BOUND_EXIT_VERSION()` (revision 3, the call reverts) or with another
+/// version is refused, and nothing is proved; a vault revision 4 passes, once.
+#[tokio::test]
+async fn a_revision_3_vault_is_refused_before_any_request_proof() {
+    for version in [None, Some(2)] {
+        let harness = Harness::new().await;
+        harness.world.lock().unwrap().leaf_bound_version = version;
+        let refused = harness
+            .service
+            .request_through_lock(&harness.config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, AuthError::InvalidInput(message) if message.contains("deployment check failed")),
+            "{version:?}: {refused:?}"
+        );
+        assert!(!harness.wallet().has_pending_request());
+        let refused = harness.service.check_vault().await.unwrap_err();
+        assert!(
+            refused.to_string().contains("LEAF_BOUND_EXIT_VERSION"),
+            "{refused}"
+        );
+    }
+    let harness = Harness::new().await;
+    harness.service.check_vault().await.unwrap();
+    harness
+        .service
+        .request_through_lock(&harness.config)
+        .await
+        .unwrap();
+    // A deployment that pins another minDeposit() than the vault's is
+    // refused, and one that pins the vault's passes. A deposit plan below
+    // the minimum is refused (the vault would revert DepositTooSmall).
+    for (pinned, passes) in [(Some(5), false), (Some(1_000_000), true), (None, true)] {
+        let mut config = harness.config.clone();
+        config.min_deposit_units = pinned;
+        let service = AuthService::new(config).unwrap();
+        let checked = service.check_vault().await;
+        assert_eq!(checked.is_ok(), passes, "{pinned:?}: {checked:?}");
+        if !passes {
+            assert!(checked
+                .unwrap_err()
+                .to_string()
+                .contains("minDeposit() is 1000000"));
+        }
+    }
+    let mut config = harness.config.clone();
+    config.min_deposit_units = Some(1_000_000);
+    let service = AuthService::new(config).unwrap();
+    let refused = service.prepare_deposit(999_999).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("deposit_too_small"),
+        "{refused}"
+    );
+}
+
+/// The note a deposit confirmation installs must reproduce the leaf the
+/// vault stored: with another expiry every exit would revert
+/// (`NoteLeafMismatch`), so it is refused. A deposit-time path that callers
+/// before vault revision 4 send is read and ignored.
+#[tokio::test]
+async fn a_deposit_confirmation_must_reproduce_the_stored_leaf() {
+    let harness = Harness::new().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = harness.config.clone();
+    config.state_dir = directory.path().to_path_buf();
+    let service = AuthService::new(config).unwrap();
+    let confirm = |expiry: u64| {
+        serde_json::from_value::<ConfirmDepositRequest>(json!({
+            "secret": harness.secret, "note_id": NOTE_ID, "amount": DEPOSIT as u64,
+            "expiry_ts": expiry,
+            "deposit_root": harness.deposit_root, "deposit_siblings": harness.deposit_siblings,
+        }))
+        .unwrap()
+    };
+    let refused = service
+        .confirm_deposit(confirm(4_000_086_400))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("note_leaf_mismatch"),
+        "{refused}"
+    );
+    assert!(service.status().await.unwrap().note.is_none());
+    // An empty record (an RPC that lags the deposit) or one that cannot be
+    // read never confirms the note: deposit_pending (503), nothing installed.
+    let stored = harness.world.lock().unwrap().note_leaf;
+    harness.world.lock().unwrap().note_leaf = Felt252::ZERO;
+    let empty = service
+        .confirm_deposit(confirm(4_000_000_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(empty, AuthError::DepositPending(_)), "{empty:?}");
+    assert_eq!(empty.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(empty.code(), "deposit_pending");
+    assert!(service.status().await.unwrap().note.is_none());
+    harness.world.lock().unwrap().note_leaf = stored;
+    harness.world.lock().unwrap().pinned_down = true;
+    let failed = service
+        .confirm_deposit(confirm(4_000_000_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(failed, AuthError::DepositPending(_)), "{failed:?}");
+    assert!(service.status().await.unwrap().note.is_none());
+    harness.world.lock().unwrap().pinned_down = false;
+    // Without an RPC the deposit cannot be checked against the vault.
+    let mut without = harness.config.clone();
+    without.state_dir = directory.path().join("without-rpc");
+    without.demo_rpc_url = None;
+    let without = AuthService::new(without).unwrap();
+    let refused = without
+        .confirm_deposit(confirm(4_000_000_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, AuthError::InvalidInput(_)), "{refused:?}");
+    assert!(without.status().await.unwrap().note.is_none());
+    // The stored leaf confirms it.
+    let status = service
+        .confirm_deposit(confirm(4_000_000_000))
+        .await
+        .unwrap();
+    assert_eq!(status.note.unwrap().expiry_ts, 4_000_000_000);
 }
 
 /// E4 step 3: a successor that becomes installable after the decision and
@@ -1836,7 +2046,7 @@ async fn an_indexer_path_at_a_root_the_vault_never_held_is_rebuilt() {
 /// successor's arrival would then defeat.
 #[tokio::test]
 async fn a_successor_installable_before_proving_moves_the_escape_to_it() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     // A real request at the current state, journaled in the wallet itself.
     let mut wallet = harness.wallet();
     let request = wallet
@@ -1874,7 +2084,7 @@ async fn a_successor_installable_before_proving_moves_the_escape_to_it() {
 /// E5: the escape is closed only on a finalize receipt in a finalized block.
 #[tokio::test]
 async fn finalize_waits_for_a_finalized_block() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     harness.initiate(&plan);
     let hash = harness.finalize(false);
@@ -1889,25 +2099,13 @@ async fn finalize_waits_for_a_finalized_block() {
     assert_eq!(done["status"], "complete");
 }
 
-/// Amendment A1 at confirmation: a deposit path that does not lead from the
-/// note's leaf to the root given is not kept; the note is confirmed, and
-/// its exits find their path elsewhere.
-#[tokio::test]
-async fn a_deposit_path_that_does_not_prove_is_not_kept() {
-    let harness = Harness::build(DepositPathChoice::NotProving).await;
-    assert!(harness.wallet().state().is_some());
-    assert!(harness.wallet().deposit_path().is_none());
-    let plan = harness.prepare(Some("0"), None).await.unwrap();
-    assert_eq!(plan["path_source"], "indexer");
-}
-
 /// E2 step 4 without a record of a release: the server's nullifier_used
 /// claim leaves nothing to wait for, so the exit escapes at once conceding
 /// the bound (here nothing), on both routes and on every later decision,
 /// instead of a wait that moves with each decision.
 #[tokio::test]
 async fn nullifier_used_with_nothing_released_escapes_at_once() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     harness.world.lock().unwrap().clearance = Some((
         409,
         json!({"status": "error", "client_request_id": "", "error_code": "nullifier_used",
@@ -1937,7 +2135,7 @@ async fn nullifier_used_with_nothing_released_escapes_at_once() {
 /// escape decision of the current state.
 #[tokio::test]
 async fn a_refusal_recorded_for_an_earlier_state_does_not_steer_this_one() {
-    let harness = Harness::new(true).await;
+    let harness = Harness::new().await;
     let mut earlier = harness.wallet().state().unwrap().clone();
     earlier.current_anchor = Felt252::from_u64(0xe1);
     let mut record = crate::oa_withdrawal::reserve(&harness.config, &earlier, [0x22; 20]).unwrap();

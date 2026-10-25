@@ -1,0 +1,16 @@
+name = "zkapi-formal"
+defaultTargets = ["ZkapiFormal"]
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+rev = "8accc04827c389e678c3ef83e623b402e7480394"
+
+[[lean_lib]]
+name = "ZkapiFormal"
+globs = ["ZkapiFormal", "ZkapiFormal.+"]
+
+# Proof of concept for the implementation layer (not a default target): `lake build ZkapiPoC`.
+[[lean_lib]]
+name = "ZkapiPoC"
+srcDir = "poc"

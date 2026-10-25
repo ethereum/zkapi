@@ -13,15 +13,18 @@ import {ZkApiWithdrawalPaymaster} from "zkapi-contracts/gasless/ZkApiWithdrawalP
 import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 import {SetupPolicy} from "./SetupPolicy.sol";
 
-/// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v1, vault revision 3).
-/// @notice Links (or deploys) the Bn254Poseidon library, deploys the circuit-specific Groth16
-///         verifier and the native ETH ZkApiVault with its 11 constructor arguments, checks the
-///         adapter's circuit and verifying-key hashes against the setup manifest and the vault's
-///         getters against the inputs, then (unless GASLESS=0) deploys the gasless-withdrawal
-///         paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same broadcast, stakes
-///         it and its transit-account factory, funds its deposit and checks its getters, and writes
-///         the provisional deployment manifest, including the linked addresses and every runtime
-///         codehash, to $OUTPUT_PATH.pending.
+/// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v2, vault revision 4).
+/// @notice Deploys (or reuses) the vault's Poseidon, Bn254PoseidonRuntime, after checking its
+///         runtime codehash against the setup's poseidon-runtime.json, deploys the circuit-specific
+///         Groth16 verifier folded for the vault (the address the vault gets next, the chain and the
+///         signing keys) and the native ETH ZkApiVault with its 13 constructor arguments, checks the
+///         adapter's circuit and verifying-key hashes against the setup manifest, its folded
+///         constants against the vault's and its folded points against the manifest's verifying
+///         keys, and the vault's getters against the inputs, then (unless GASLESS=0) deploys the
+///         gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same
+///         broadcast, stakes it and its transit-account factory, funds its deposit and checks its
+///         getters, and writes the provisional deployment manifest, including the Poseidon address
+///         and every runtime codehash, to $OUTPUT_PATH.pending.
 /// @dev    forge runs run() locally before it sends any transaction, so every check here and the
 ///         provisional manifest describe the simulated deployment: its addresses assume the
 ///         deployer's nonces at simulation time, and deployBlockLowerBound is the chain head the
@@ -36,8 +39,11 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///         that created the vault) and deploymentStatus "deployed". Profiles take their pins and
 ///         deploy_block from $OUTPUT_PATH only. A dry run (no --broadcast) writes deploymentStatus
 ///         "simulated", which finalize refuses.
-///         The script links the vault itself (creation code from out/ZkApiVault.sol/ZkApiVault.json
-///         with the library placeholder replaced), so forge never links it.
+///         The vault links no library: it takes the Poseidon runtime's address as its twelfth
+///         constructor argument (an immutable, called with STATICCALL), and minDeposit as its
+///         thirteenth. The runtime is compiled
+///         with the legacy pipeline (foundry.toml compilation_restrictions; script/PoseidonRuntime
+///         Artifact.sol pulls it into out/) and deployed from its artifact.
 ///         The gasless block needs the canonical EntryPoint v0.7.0 runtime at ENTRY_POINT and the
 ///         SenderCreator runtime at 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C, both pinned by
 ///         keccak256 (the paymaster's constructor pins the EntryPoint the same way): on a public
@@ -70,6 +76,9 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///           MAX_PAUSE_DURATION_SECONDS – longest a pause blocks exits; at least twice the
 ///                         challenge period. Required except on local chains (default 7 days).
 ///           REQUEST_CHARGE_CAP – positive per-request gwei limit; defaults to 1,000,000.
+///           MIN_DEPOSIT – the smallest deposit in gwei units (the vault's minDeposit immutable,
+///                         1 to 2^53 - 1); defaults to 1,000,000 (0.001 ETH). Every leaf of the
+///                         request tree locks at least this much, so spam leaves lock capital.
 ///           SETUP_MANIFEST – the setup's manifest.json; the adapter's CIRCUIT_ID_HASH and VK hashes
 ///                         must match it. Required except on local chains (default
 ///                         protocol/setup/v2-concession-dev). SetupPolicy decides which setups
@@ -81,13 +90,17 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///                         included (the Sepolia drill vault, or a vault that trusts its
 ///                         setup's generator not to forge proofs); recorded in the manifest
 ///                         as allowDevSetup. Default 0.
-///           POSEIDON_ADDRESS – an already deployed Bn254Poseidon to link; its runtime codehash
-///                         must equal the compiled library's at that address. Unset deploys a
-///                         fresh library.
+///           POSEIDON_ADDRESS – an already deployed Bn254PoseidonRuntime to reuse; its runtime
+///                         codehash must equal runtime_codehash of poseidon-runtime.json in the
+///                         directory of SETUP_MANIFEST (as must the compiled runtime's). Unset
+///                         deploys a fresh one.
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
 ///         Gasless withdrawals (ERC-4337):
 ///           GASLESS     – 1 (default) deploys ZkApiWithdrawalPaymaster after the vault; 0 skips
 ///                         the block and writes withdrawalPaymaster: null.
+///           PAYMASTER_GAS_SCHEDULE – 0 (Original, default) or 1 (Glamsterdam / current Sepolia).
+///                         GASLESS=1 probes the RPC before broadcast and rejects a mismatched
+///                         selection or prices above the supported bound.
 ///           ENTRY_POINT – the EntryPoint v0.7.0; defaults to the canonical
 ///                         0x0000000071727De22E5E9d8BAf0edAc6f37da032 and must carry its runtime.
 ///           PAYMASTER_OWNER – owner of the paymaster (policy, fee ceilings, call caps, key
@@ -123,10 +136,19 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     uint64 internal constant DEFAULT_NOTE_TTL = 30 days;
     uint64 internal constant LOCAL_MAX_PAUSE_DURATION = 7 days;
-    uint256 internal constant VAULT_REVISION = 3;
+    uint256 internal constant VAULT_REVISION = 4;
+    uint256 internal constant DEFAULT_MIN_DEPOSIT = 1_000_000;
     string internal constant DEFAULT_SETUP_MANIFEST = "../../protocol/setup/v2-concession-dev/manifest.json";
+    /// The vault's Poseidon, legacy-compiled, by its artifact path (a name lookup does not find
+    /// artifacts of the additional compiler profile).
+    string internal constant POSEIDON_ARTIFACT = "out/Bn254PoseidonRuntime.sol/Bn254PoseidonRuntime.json";
+    /// The setup file that pins the runtime (zkapi-proof poseidon_runtime.rs), next to SETUP_MANIFEST.
+    string internal constant POSEIDON_RUNTIME_MANIFEST = "poseidon-runtime.json";
     /// Largest integer a JSON number carries exactly in JavaScript (Number.MAX_SAFE_INTEGER).
     uint256 internal constant MAX_SAFE_INTEGER = 9_007_199_254_740_991;
+    /// The empty request tree's root (MerkleUpdateLib.EMPTY_ROOT), which a fresh vault's computed
+    /// currentRoot() must return.
+    uint256 internal constant EMPTY_ROOT = 0x1eb94e909bac5b6e3331993876bdde00f84b31e0103a29af6617fc021318b81e;
 
     /// The canonical ERC-4337 EntryPoint v0.7.0 and the SenderCreator it created (its nonce 1,
     /// an immutable of its runtime), pinned by the keccak256 of their runtime code on every chain.
@@ -142,6 +164,13 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     uint256 internal constant FLAT_FEE_HARD_CAP = 0.001 ether;
     uint256 internal constant MAX_FEE_HARD_CAP = 500 gwei;
     uint256 internal constant PRIORITY_FEE_HARD_CAP = 20 gwei;
+    /// The paymaster's FRESH_SLOT_GAS_BOUND (_checkGasless compares the deployed getter), and a
+    /// creation whose constructor returns what GAS reads around one fresh SSTORE (slot 0, cleared
+    /// again): gas, push1 1, push0, sstore, gas, swap1, sub, push0, push0, sstore, then
+    /// mstore(0, used) and return(0, 32). It measures 22,107 under EIP-2929 storage pricing.
+    uint256 internal constant ORIGINAL_FRESH_SLOT_GAS_BOUND = 25_000;
+    uint256 internal constant GLAMSTERDAM_FRESH_SLOT_GAS_BOUND = 120_000;
+    bytes internal constant FRESH_SLOT_PROBE = hex"5a60015f555a90035f5f555f5260205ff3";
     /// Placeholder the manifest serializer writes for withdrawalPaymaster with GASLESS=0; it is
     /// replaced by a JSON null before the file is written (vm.serialize* has no null).
     string internal constant NULL_PLACEHOLDER = "__null__";
@@ -154,6 +183,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         uint64 challengePeriod;
         uint64 maxPauseDuration;
         uint128 requestChargeCap;
+        uint128 minDeposit;
         uint256 stateKeyX;
         uint256 stateKeyY;
         uint256 clearanceKeyX;
@@ -166,11 +196,16 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         bytes32 requestVkHash;
         bytes32 withdrawalVkHash;
         bool allowDevSetup;
+        /// The manifest itself, whose verifying keys' IC points the adapter's fold is checked against.
+        string manifest;
+        /// runtime_codehash of the setup's poseidon-runtime.json: the only Poseidon code deployed.
+        bytes32 poseidonCodehash;
     }
 
     /// The gasless block's inputs (GASLESS and the PAYMASTER_* variables).
     struct Gasless {
         bool enabled;
+        ZkApiWithdrawalPaymaster.GasSchedule gasSchedule;
         IEntryPoint entryPoint;
         address owner;
         address feeKeeper;
@@ -207,46 +242,49 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         Params memory p = _params(vm.addr(deployerKey), local);
         Setup memory setup = _setup(local);
         Gasless memory g = _gasless(p, local);
+        if (g.enabled) _requireSponsorableGasSchedule(g.gasSchedule);
 
         address poseidonIn = vm.envOr("POSEIDON_ADDRESS", address(0));
-        bytes memory poseidonRuntime = vm.getDeployedCode("Bn254Poseidon.sol:Bn254Poseidon");
+        require(
+            keccak256(vm.getDeployedCode(POSEIDON_ARTIFACT)) == setup.poseidonCodehash,
+            "the compiled Bn254PoseidonRuntime is not the runtime poseidon-runtime.json pins"
+        );
         if (poseidonIn != address(0)) {
             require(
-                poseidonIn.codehash == _libraryCodehash(poseidonRuntime, poseidonIn),
-                "POSEIDON_ADDRESS runtime code is not the compiled Bn254Poseidon"
+                poseidonIn.codehash == setup.poseidonCodehash,
+                "POSEIDON_ADDRESS runtime code is not the pinned Bn254PoseidonRuntime"
             );
         }
 
         vm.startBroadcast(deployerKey);
         Deployed memory d;
         d.poseidonReused = poseidonIn != address(0);
-        d.poseidon = d.poseidonReused ? poseidonIn : _create(vm.getCode("Bn254Poseidon.sol:Bn254Poseidon"));
-        d.adapter = new Groth16ProofAdapter();
-        d.vault = ZkApiVault(
-            _create(
-                abi.encodePacked(
-                    _linkedVaultCreationCode(d.poseidon),
-                    abi.encode(
-                        p.treasury,
-                        p.noteTtl,
-                        p.challengePeriod,
-                        p.requestChargeCap,
-                        address(d.adapter),
-                        p.stateKeyX,
-                        p.stateKeyY,
-                        p.clearanceKeyX,
-                        p.clearanceKeyY,
-                        p.owner,
-                        p.maxPauseDuration
-                    )
-                )
-            )
+        d.poseidon = d.poseidonReused ? poseidonIn : _create(vm.getCode(POSEIDON_ARTIFACT));
+        // The adapter folds the vault's address into its verifying keys: the vault is the deployer's
+        // next creation after the adapter. Checked against the deployed vault below (_checkAdapter).
+        address predictedVault = vm.computeCreateAddress(p.deployer, vm.getNonce(p.deployer) + 1);
+        d.adapter = new Groth16ProofAdapter(predictedVault, p.stateKeyX, p.stateKeyY, p.clearanceKeyX, p.clearanceKeyY);
+        d.vault = new ZkApiVault(
+            p.treasury,
+            p.noteTtl,
+            p.challengePeriod,
+            p.requestChargeCap,
+            address(d.adapter),
+            p.stateKeyX,
+            p.stateKeyY,
+            p.clearanceKeyX,
+            p.clearanceKeyY,
+            p.owner,
+            p.maxPauseDuration,
+            d.poseidon,
+            p.minDeposit
         );
         if (g.enabled) _deployGasless(d, p, g);
         vm.stopBroadcast();
 
-        require(d.poseidon.codehash == _libraryCodehash(poseidonRuntime, d.poseidon), "linked library codehash");
-        _checkAdapter(d.adapter, setup);
+        // Before anything is written: the vault's Poseidon is the pinned runtime.
+        require(d.poseidon.codehash == setup.poseidonCodehash, "Bn254PoseidonRuntime codehash");
+        _checkAdapter(d, setup);
         _checkVault(d, p);
         if (g.enabled) _checkGasless(d, p, g);
         bool broadcast =
@@ -323,11 +361,17 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         // casting to 'uint128' is safe because cap is at most MAX_SAFE_INTEGER
         // forge-lint: disable-next-line(unsafe-typecast)
         p.requestChargeCap = uint128(cap);
+        uint256 minDeposit = vm.envOr("MIN_DEPOSIT", DEFAULT_MIN_DEPOSIT);
+        require(minDeposit > 0 && minDeposit <= MAX_SAFE_INTEGER, "MIN_DEPOSIT must be positive safe gwei units");
+        // casting to 'uint128' is safe because minDeposit is at most MAX_SAFE_INTEGER
+        // forge-lint: disable-next-line(unsafe-typecast)
+        p.minDeposit = uint128(minDeposit);
     }
 
     function _setup(bool local) internal view returns (Setup memory setup) {
         string memory path = local ? vm.envOr("SETUP_MANIFEST", DEFAULT_SETUP_MANIFEST) : vm.envString("SETUP_MANIFEST");
         string memory manifest = vm.readFile(path);
+        setup.manifest = manifest;
         setup.circuitId = vm.parseJsonString(manifest, ".circuit_id");
         setup.setupId = vm.parseJsonString(manifest, ".setup_id");
         setup.requestVkHash = vm.parseJsonBytes32(manifest, ".vk_keccak256.request");
@@ -347,12 +391,23 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             require(
                 _eq(vm.parseJsonString(ceremony, ".circuit_id"), CIRCUIT_ID)
                     && _eq(vm.parseJsonString(ceremony, ".setup_id"), CEREMONY_SETUP_ID),
-                "protocol/setup/v2-concession/manifest.json is not the zkapi-v2-concession-v1 mpc-1 setup"
+                "protocol/setup/v2-concession/manifest.json is not the zkapi-v2-concession-v2 mpc-1 setup"
             );
             facts.ceremonyRequestVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.request");
             facts.ceremonyWithdrawalVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.withdrawal");
         }
         _checkSetupPolicy(facts, local, setup.allowDevSetup);
+
+        // The Poseidon runtime the setup pins (generated with its sources), read once the setup
+        // may deploy at all.
+        string memory runtimeManifest = string.concat(_directory(path), POSEIDON_RUNTIME_MANIFEST);
+        require(vm.exists(runtimeManifest), string.concat("no ", runtimeManifest, " next to SETUP_MANIFEST"));
+        string memory runtime = vm.readFile(runtimeManifest);
+        require(
+            _eq(vm.parseJsonString(runtime, ".contract"), "Bn254PoseidonRuntime"),
+            "poseidon-runtime.json does not describe Bn254PoseidonRuntime"
+        );
+        setup.poseidonCodehash = vm.parseJsonBytes32(runtime, ".runtime_codehash");
     }
 
     /// The gasless block's inputs. The variables are read and bounded before the EntryPoint is
@@ -364,6 +419,9 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         require(flag <= 1, "GASLESS must be 0 or 1");
         g.enabled = flag == 1;
         if (!g.enabled) return g;
+        uint256 schedule = vm.envOr("PAYMASTER_GAS_SCHEDULE", uint256(0));
+        require(schedule <= 1, "PAYMASTER_GAS_SCHEDULE must be 0 (Original) or 1 (Glamsterdam)");
+        g.gasSchedule = ZkApiWithdrawalPaymaster.GasSchedule(schedule);
         g.entryPoint = IEntryPoint(vm.envOr("ENTRY_POINT", CANONICAL_ENTRY_POINT));
         g.owner = vm.envOr("PAYMASTER_OWNER", p.owner);
         require(g.owner != address(0), "PAYMASTER_OWNER must be nonzero");
@@ -435,6 +493,31 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         );
     }
 
+    /// Probe the actual RPC before broadcasting: Forge's local EVM may use another schedule.
+    /// The selected policy must match the RPC, and an unknown higher price fails closed. Keep
+    /// this call below 2^24 gas so EIP-8037 state allocations remain visible to GAS.
+    function _requireSponsorableGasSchedule(ZkApiWithdrawalPaymaster.GasSchedule schedule) internal {
+        bytes memory answer;
+        try vm.rpc(
+            "eth_call", string.concat('[{"data":"', vm.toString(FRESH_SLOT_PROBE), '","gas":"0xffffff"},"latest"]')
+        ) returns (
+            bytes memory result
+        ) {
+            answer = result;
+        } catch {
+            revert("GASLESS=1 measures a fresh storage slot through the RPC (eth_call), which failed");
+        }
+        require(answer.length == 32, "fresh-slot probe: unexpected eth_call result");
+        uint256 freshSlotGas = abi.decode(answer, (uint256));
+        bool repriced = freshSlotGas > ORIGINAL_FRESH_SLOT_GAS_BOUND;
+        require(
+            repriced == (schedule == ZkApiWithdrawalPaymaster.GasSchedule.Glamsterdam),
+            "PAYMASTER_GAS_SCHEDULE does not match the RPC gas schedule"
+        );
+        require(freshSlotGas <= GLAMSTERDAM_FRESH_SLOT_GAS_BOUND, "fresh-slot pricing above supported schedules");
+        console2.log("gas schedule fresh slot", freshSlotGas);
+    }
+
     /// Deploys the paymaster (which deploys the factory, which deploys the account logic), stakes
     /// both with the EntryPoint and funds the float, inside the broadcast. The first stake may only
     /// be set by the paymaster's owner, so when PAYMASTER_OWNER is not the deployer the paymaster
@@ -443,7 +526,13 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     function _deployGasless(Deployed memory d, Params memory p, Gasless memory g) internal {
         bool handover = g.owner != p.deployer;
         d.paymaster = new ZkApiWithdrawalPaymaster(
-            g.entryPoint, d.vault, handover ? p.deployer : g.owner, g.policy, g.maxFeeCeiling, g.priorityFeeCeiling
+            g.entryPoint,
+            d.vault,
+            handover ? p.deployer : g.owner,
+            g.policy,
+            g.maxFeeCeiling,
+            g.priorityFeeCeiling,
+            g.gasSchedule
         );
         d.factory = d.paymaster.factory();
         d.implementation = address(d.factory.implementation());
@@ -455,11 +544,79 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         d.paymasterOwnershipPending = handover;
     }
 
-    /// The adapter compiled into this script verifies the setup in SETUP_MANIFEST.
-    function _checkAdapter(Groth16ProofAdapter adapter, Setup memory setup) internal view {
+    /// The adapter compiled into this script verifies the setup in SETUP_MANIFEST, and is folded for
+    /// the vault deployed after it: its folded vault, chain and keys are the vault's, and its folded
+    /// points are IC0 + Σ c · IC with the manifest's IC points, summed here through the precompiles.
+    /// A wrong fold would only cost gas (its proofs take the adapter's generic path), but the
+    /// manifest records the deployment as it is meant to be, so any mismatch stops the script
+    /// before the manifest is written.
+    function _checkAdapter(Deployed memory d, Setup memory setup) internal view {
+        Groth16ProofAdapter adapter = d.adapter;
+        ZkApiVault vault = d.vault;
         require(adapter.CIRCUIT_ID_HASH() == keccak256(bytes(setup.circuitId)), "adapter CIRCUIT_ID_HASH != manifest");
         require(adapter.REQUEST_VK_HASH() == setup.requestVkHash, "adapter REQUEST_VK_HASH != manifest");
         require(adapter.WITHDRAWAL_VK_HASH() == setup.withdrawalVkHash, "adapter WITHDRAWAL_VK_HASH != manifest");
+        require(adapter.foldedVault() == address(vault), "adapter folded for another vault address");
+        require(adapter.foldedChainId() == block.chainid, "adapter folded for another chain");
+        require(
+            adapter.foldedStateSigningKeyX() == vault.stateSigningKeyX()
+                && adapter.foldedStateSigningKeyY() == vault.stateSigningKeyY()
+                && adapter.foldedClearanceSigningKeyX() == vault.clearanceSigningKeyX()
+                && adapter.foldedClearanceSigningKeyY() == vault.clearanceSigningKeyY(),
+            "adapter folded for other signing keys than the vault's"
+        );
+        uint256[] memory constants = new uint256[](7);
+        constants[0] = vault.PROTOCOL_VERSION();
+        constants[1] = block.chainid;
+        constants[2] = uint160(address(vault));
+        constants[3] = vault.stateSigningKeyX();
+        constants[4] = vault.stateSigningKeyY();
+        constants[5] = vault.clearanceSigningKeyX();
+        constants[6] = vault.clearanceSigningKeyY();
+        // Groth16 IC indices of the folded inputs (input i is IC i + 1): protocolVersion, chainId,
+        // contractAddress, stateSigningKeyX/Y and, for withdrawals, clearanceSigningKeyX/Y.
+        uint256[7] memory points = [uint256(1), 2, 3, 5, 6, 7, 8];
+        (uint256 x, uint256 y) = _foldedPoint(setup.manifest, ".request.ic", constants, points, 5);
+        require(
+            adapter.foldedRequestIc0X() == x && adapter.foldedRequestIc0Y() == y,
+            "adapter request fold != manifest verifying key"
+        );
+        (x, y) = _foldedPoint(setup.manifest, ".withdrawal.ic", constants, points, 7);
+        require(
+            adapter.foldedWithdrawalIc0X() == x && adapter.foldedWithdrawalIc0Y() == y,
+            "adapter withdrawal fold != manifest verifying key"
+        );
+    }
+
+    /// IC[0] + Σ constants[k] · IC[points[k]] over the first `count` folded inputs of the IC list at
+    /// `key` in the setup manifest, through ecMul and ecAdd.
+    function _foldedPoint(
+        string memory manifest,
+        string memory key,
+        uint256[] memory constants,
+        uint256[7] memory points,
+        uint256 count
+    ) internal view returns (uint256 x, uint256 y) {
+        (x, y) = _manifestPoint(manifest, key, 0);
+        for (uint256 k = 0; k < count; ++k) {
+            (uint256 px, uint256 py) = _manifestPoint(manifest, key, points[k]);
+            (bool ok, bytes memory out) = address(7).staticcall(abi.encode(px, py, constants[k]));
+            require(ok && out.length == 64, "ecMul of a manifest IC point");
+            (px, py) = abi.decode(out, (uint256, uint256));
+            (ok, out) = address(6).staticcall(abi.encode(x, y, px, py));
+            require(ok && out.length == 64, "ecAdd of a manifest IC point");
+            (x, y) = abi.decode(out, (uint256, uint256));
+        }
+    }
+
+    function _manifestPoint(string memory manifest, string memory key, uint256 index)
+        internal
+        pure
+        returns (uint256, uint256)
+    {
+        string memory at = string.concat(key, "[", vm.toString(index), "]");
+        return
+            (vm.parseJsonUint(manifest, string.concat(at, "[0]")), vm.parseJsonUint(manifest, string.concat(at, "[1]")));
     }
 
     /// Post-deploy checks: the vault's getters equal the inputs and the expected constants.
@@ -467,20 +624,25 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         ZkApiVault vault = d.vault;
         require(vault.PROTOCOL_VERSION() == 2, "PROTOCOL_VERSION");
         require(vault.CONCESSION_ESCAPE_VERSION() == 1, "CONCESSION_ESCAPE_VERSION");
-        require(vault.ROOT_HISTORY_WINDOW() == 1 days, "ROOT_HISTORY_WINDOW");
+        require(vault.LEAF_BOUND_EXIT_VERSION() == 1, "LEAF_BOUND_EXIT_VERSION");
         require(address(vault.proofAdapter()) == address(d.adapter), "proofAdapter");
+        require(address(vault.poseidon()) == d.poseidon, "poseidon");
         require(vault.owner() == p.owner && vault.treasury() == p.treasury, "owner or treasury");
         require(
             vault.noteTtl() == p.noteTtl && vault.challengePeriod() == p.challengePeriod
-                && vault.maxPauseDuration() == p.maxPauseDuration && vault.requestChargeCap() == p.requestChargeCap,
-            "periods or cap"
+                && vault.maxPauseDuration() == p.maxPauseDuration && vault.requestChargeCap() == p.requestChargeCap
+                && vault.minDeposit() == p.minDeposit,
+            "periods, cap or minDeposit"
         );
         require(
             vault.stateSigningKeyX() == p.stateKeyX && vault.stateSigningKeyY() == p.stateKeyY
                 && vault.clearanceSigningKeyX() == p.clearanceKeyX && vault.clearanceSigningKeyY() == p.clearanceKeyY,
             "signing keys"
         );
-        require(vault.isKnownRoot(vault.currentRoot()), "empty root not recorded");
+        require(
+            vault.currentRoot() == EMPTY_ROOT && vault.nextNoteId() == 0 && vault.pauseEpochCount() == 0,
+            "not an empty vault"
+        );
     }
 
     /// Post-deploy checks of the gasless block: the paymaster's and the factory's pins equal the
@@ -491,6 +653,15 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         ZkApiWithdrawalPaymaster pm = d.paymaster;
         ZkApiWithdrawalAccountFactory factory = d.factory;
         require(pm.ENTRY_POINT_V070_CODEHASH() == ENTRY_POINT_V070_CODEHASH, "EntryPoint codehash pin");
+        require(pm.gasSchedule() == g.gasSchedule, "paymaster gasSchedule");
+        require(
+            pm.FRESH_SLOT_GAS_BOUND()
+                == (g.gasSchedule == ZkApiWithdrawalPaymaster.GasSchedule.Glamsterdam
+                        ? GLAMSTERDAM_FRESH_SLOT_GAS_BOUND
+                        : ORIGINAL_FRESH_SLOT_GAS_BOUND),
+            "paymaster FRESH_SLOT_GAS_BOUND"
+        );
+        require(!pm.scheduleRepriced(), "paymaster gas schedule");
         require(address(pm.entryPoint()) == address(g.entryPoint), "paymaster entryPoint");
         require(address(pm.vault()) == address(d.vault), "paymaster vault");
         require(address(pm.adapter()) == address(d.adapter), "paymaster adapter");
@@ -567,6 +738,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeUint(m, "protocolVersion", vault.PROTOCOL_VERSION());
         vm.serializeUint(m, "vaultRevision", VAULT_REVISION);
         vm.serializeUint(m, "concessionEscapeVersion", vault.CONCESSION_ESCAPE_VERSION());
+        vm.serializeUint(m, "leafBoundExitVersion", vault.LEAF_BOUND_EXIT_VERSION());
         vm.serializeString(m, "circuitId", setup.circuitId);
         vm.serializeString(m, "setupId", setup.setupId);
         vm.serializeBool(m, "allowDevSetup", setup.allowDevSetup);
@@ -584,6 +756,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeBytes32(m, "poseidonRuntimeCodehash", d.poseidon.codehash);
         vm.serializeAddress(m, "treasury", p.treasury);
         vm.serializeUint(m, "requestChargeCap", p.requestChargeCap);
+        vm.serializeUint(m, "minDeposit", p.minDeposit);
         vm.serializeString(m, "billing_asset", "native_eth");
         vm.serializeString(m, "billing_unit", "gwei");
         vm.serializeUint(m, "nativeAssetWeiPerUnit", vault.nativeAssetWeiPerUnit());
@@ -592,7 +765,6 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeUint(m, "pauseCooldown", vault.PAUSE_COOLDOWN());
         vm.serializeUint(m, "treasuryChangeDelay", vault.treasuryChangeDelay());
         vm.serializeUint(m, "unpauseClaimGrace", vault.unpauseClaimGrace());
-        vm.serializeUint(m, "rootHistoryWindow", vault.ROOT_HISTORY_WINDOW());
         // serializeUint writes values up to 2^64 - 1 as bare JSON numbers, which JavaScript rounds
         // above 2^53 - 1; key coordinates can be any field element, so they are decimal strings.
         vm.serializeString(m, "stateSigningKeyX", vm.toString(p.stateKeyX));
@@ -630,6 +802,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeBytes32(m, "accountImplementationRuntimeCodehash", d.implementation.codehash);
         vm.serializeBytes(m, "accountCreationCode", d.factory.accountCreationCode());
         vm.serializeBytes32(m, "accountCreationCodeKeccak256", d.factory.accountCreationCodeHash());
+        vm.serializeUint(m, "paymasterGasSchedule", uint256(g.gasSchedule));
         vm.serializeAddress(m, "paymasterOwner", g.owner);
         vm.serializeBool(m, "paymasterOwnershipTransferPending", d.paymasterOwnershipPending);
         vm.serializeAddress(m, "paymasterDeployer", p.deployer);
@@ -709,40 +882,18 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         console2.logBytes32(address(d.factory).codehash);
     }
 
-    /// ZkApiVault's creation code with every Bn254Poseidon placeholder replaced by `poseidon`.
-    function _linkedVaultCreationCode(address poseidon) internal view returns (bytes memory) {
-        string memory artifact = vm.readFile(string.concat(vm.projectRoot(), "/out/ZkApiVault.sol/ZkApiVault.json"));
-        string memory code = vm.parseJsonString(artifact, ".bytecode.object");
-        uint256 at = vm.indexOf(code, "__$");
-        require(at != type(uint256).max, "ZkApiVault creation code has no library placeholder");
-        bytes memory raw = bytes(code);
-        bytes memory placeholder = new bytes(40);
-        for (uint256 i = 0; i < 40; ++i) {
-            placeholder[i] = raw[at + i];
+    /// The directory part of `path`, with its final "/" ("" for a bare file name).
+    function _directory(string memory path) internal pure returns (string memory) {
+        bytes memory raw = bytes(path);
+        uint256 end = raw.length;
+        while (end > 0 && raw[end - 1] != "/") {
+            --end;
         }
-        require(placeholder[37] == "$" && placeholder[38] == "_" && placeholder[39] == "_", "placeholder shape");
-        string memory linked = vm.replace(code, string(placeholder), _hex40(poseidon));
-        require(vm.indexOf(linked, "__$") == type(uint256).max, "ZkApiVault links a library other than Bn254Poseidon");
-        return vm.parseBytes(linked);
-    }
-
-    /// The runtime codehash of the compiled library deployed at `at`. A library with call
-    /// protection starts with PUSH20 <its own address>, written at deployment; Bn254Poseidon's
-    /// via-IR code has none (all its functions are pure), so its code does not depend on `at`.
-    function _libraryCodehash(bytes memory runtime, address at) internal pure returns (bytes32) {
-        if (runtime.length > 21 && uint8(runtime[0]) == 0x73 && bytes20(_slice20(runtime, 1)) == bytes20(0)) {
-            bytes20 word = bytes20(at);
-            for (uint256 i = 0; i < 20; ++i) {
-                runtime[1 + i] = word[i];
-            }
+        bytes memory out = new bytes(end);
+        for (uint256 i = 0; i < end; ++i) {
+            out[i] = raw[i];
         }
-        return keccak256(runtime);
-    }
-
-    function _slice20(bytes memory data, uint256 start) internal pure returns (bytes20 out) {
-        assembly ("memory-safe") {
-            out := mload(add(add(data, 0x20), start))
-        }
+        return string(out);
     }
 
     function _create(bytes memory initcode) internal returns (address deployed) {
@@ -750,17 +901,6 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             deployed := create(0, add(initcode, 0x20), mload(initcode))
         }
         require(deployed != address(0), "contract creation failed");
-    }
-
-    function _hex40(address value) internal pure returns (string memory) {
-        bytes memory digits = "0123456789abcdef";
-        bytes memory out = new bytes(40);
-        uint160 v = uint160(value);
-        for (uint256 i = 40; i > 0; --i) {
-            out[i - 1] = digits[v & 0xf];
-            v >>= 4;
-        }
-        return string(out);
     }
 
     /// A positive uint64 that JSON carries exactly to JavaScript (at most 2^53 - 1 seconds).

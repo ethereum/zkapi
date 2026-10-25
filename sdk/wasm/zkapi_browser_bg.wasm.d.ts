@@ -8,7 +8,8 @@ export const browser_circuit_id: () => [number, number];
 export const browser_complete_response: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_confirm_deposit: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_generate_deposit: () => [number, number, number, number];
-export const browser_note_path_matches: (a: number, b: number, c: number, d: number) => [number, number, number];
+export const browser_note_leaf: (a: number, b: number) => [number, number, number, number];
+export const browser_note_leaf_from_fields: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
 export const browser_prepare_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
 export const browser_prepare_withdrawal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
 export const browser_setup_id: () => [number, number];
@@ -19,6 +20,7 @@ export const browser_verify_request: (a: number, b: number, c: number, d: number
 export const browser_wallet_status: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_withdrawal_nullifier: (a: number, b: number) => [number, number, number, number];
 export const browsernotetree_apply: (a: number, b: number, c: number) => [number, number, number, number];
+export const browsernotetree_from_state: (a: number, b: number) => [number, number, number];
 export const browsernotetree_new: () => number;
 export const browsernotetree_next_note_id: (a: number) => number;
 export const browsernotetree_path: (a: number, b: number) => [number, number, number, number];

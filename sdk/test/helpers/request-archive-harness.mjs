@@ -173,6 +173,23 @@ export const word = value => `0x${BigInt(value).toString(16).padStart(64, '0')}`
 /** The harness's next_anchor(N). */
 export const derivedAnchor = nullifier => `0x${(BigInt(nullifier) + 0x9000n).toString(16)}`;
 
+/**
+ * The harness's registration commitment R = H_reg(s, 0) (the real worker
+ * hashes; the fake one keeps the secret's low bits so the commitment matters).
+ */
+export const fakeRegistration = secret => `0x${(0x7e9n << 240n | (BigInt(secret) & ((1n << 64n) - 1n))).toString(16)}`;
+
+/** The harness's note leaf P(d_leaf', R, F(n, D, e))[1]: distinct for each preimage, below the field modulus. */
+export function fakeNoteLeaf(noteId, commitment, amount, expiryTs) {
+    const fields = (BigInt(noteId) << 192n) | (BigInt(amount) << 64n) | BigInt(expiryTs);
+    const mixed = (fields * 0x9e3779b97f4a7c15n + BigInt(commitment) * 0x632be59bd9b4e019n) % (1n << 250n);
+    return `0x${(mixed | (1n << 250n)).toString(16)}`;
+}
+
+/** The note leaf of a harness state (its R from its secret). */
+export const stateNoteLeaf = state => fakeNoteLeaf(state.note_id, fakeRegistration(state.secret_s ?? 0),
+    state.deposit_amount, state.expiry_ts);
+
 export function noteState(changes = {}) {
     return {
         protocol_version: 2,
@@ -190,8 +207,8 @@ export function noteState(changes = {}) {
 
 // The fields of the WebAssembly's BrowserNoteState (zkapi-browser lib.rs).
 // Serde drops every other field of a state that passes through it, so the
-// fake worker returns only these: host-side fields such as deposit_path
-// survive only where the runtime carries them over itself.
+// fake worker returns only these: host-side fields such as the registration
+// commitment survive only where the runtime carries them over itself.
 export const BROWSER_NOTE_STATE_FIELDS = Object.freeze(['protocol_version', 'chain_id', 'contract_address', 'note_id',
     'secret_s', 'deposit_amount', 'expiry_ts', 'current_balance', 'balance_blinding', 'current_commitment_x',
     'current_commitment_y', 'current_anchor', 'is_genesis', 'state_signature', 'prev_anchor', 'bound_at_state']);
@@ -202,8 +219,8 @@ export function wasmNoteState(state) {
         .map(field => [field, structuredClone(state[field])]));
 }
 
-/** The deposit-time path a note saves (Amendment A1). */
-export const depositPath = (root = '0x51') => ({ active_root: root, siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`) });
+/** The deposit-time path a vault revision 3 wallet saved, which a revision-4 wallet reads and ignores. */
+export const legacyDepositPath = (root = '0x51') => ({ active_root: root, siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`) });
 
 /**
  * `promise`, or a failed assertion once `ms` passes: a property broken into
@@ -239,6 +256,11 @@ export function createHarness(BrowserWalletRuntime, {
     const quote = nativeQuote(funding);
     const chain = {
         root: '0x77',
+        // The indexer's root; null follows the vault's.
+        indexerRoot: null,
+        indexerDown: false,
+        nextNoteId: 8n,
+        minDeposit: 1n,
         challenged: new Set(),
         effectiveExpiry: 2_000_000_000n,
         challengePeriod: 86_400n,
@@ -266,6 +288,9 @@ export function createHarness(BrowserWalletRuntime, {
     runtime.manifest = { deployment_id: DEPLOYMENT };
     runtime.browserConfig = {
         trusted_deployment: {
+            min_deposit_units: 1,
+            fresh_slot_gas: 22_100,
+            note_ttl: 2_592_000,
             ...(vaultRevision != null ? { vault_revision: vaultRevision } : {}),
             ...(clearanceOwnershipProof != null ? { clearance_ownership_proof: clearanceOwnershipProof } : {})
         },
@@ -294,19 +319,30 @@ export function createHarness(BrowserWalletRuntime, {
     runtime.scheduleSettlement = () => {};
     runtime.nativeBillingQuote = async () => quote;
     runtime.verifyLease = async () => {};
-    runtime.treePath = async noteId => ({
-        active_root: chain.root,
-        note_id: noteId,
-        siblings: Array.from({ length: 32 }, (_, index) => `${chain.root}${index.toString(16)}`)
-    });
+    // The operator's indexer: a request path at its root (requestPath checks
+    // it against the vault's currentRoot()).
+    runtime.indexerPath = async noteId => {
+        if (chain.indexerDown) throw new Error('fetch failed (indexer down)');
+        const root = chain.indexerRoot ?? chain.root;
+        return { active_root: root, note_id: Number(noteId),
+            siblings: Array.from({ length: 32 }, (_, index) => `${root}${index.toString(16)}`) };
+    };
+    // The state rebuild through the pinned RPC (zkapiTreeRebuild tests run the real one).
+    runtime.rebuildRequestPath = async noteId => {
+        chain.rebuilds = (chain.rebuilds || 0) + 1;
+        return { active_root: chain.root, note_id: Number(noteId), source: 'state',
+            siblings: Array.from({ length: 32 }, (_, index) => `${chain.root}${index.toString(16)}`) };
+    };
     runtime.vaultWord = async data => {
         chain.reads.push(data);
         if (data === '0xfdab463d') {
             if (chain.failRoot) throw new Error('RPC unavailable');
             return BigInt(chain.root);
         }
+        if (data === '0x7a2043a3') return chain.nextNoteId;
+        if (data === '0x41b3d185') return chain.minDeposit;
         if (data === '0xf3f480d9') return chain.challengePeriod;
-        if (data.startsWith('0x7cb4a03c')) return chain.effectiveExpiry;
+        if (data.startsWith('0x5a747a98')) return chain.effectiveExpiry;
         if (data.startsWith('0x6cda756a')) return chain.challenged.has(BigInt(`0x${data.slice(10)}`)) ? 1n : 0n;
         throw new Error(`Unexpected vault read ${data}`);
     };
@@ -348,14 +384,9 @@ export function createHarness(BrowserWalletRuntime, {
             if (operation === 'withdrawalNullifier') return nullifierFor(payload.state.current_anchor);
             if (operation === 'successorNullifier') return successorFor(payload.state.current_anchor);
             if (operation === 'verifyRequest') return worker.verify(payload);
-            if (operation === 'notePathMatches') return worker.pathMatches ? worker.pathMatches(payload) : true;
-            if (operation === 'rebuildTreePath') {
-                // The rebuilt path at the last event's root (per-event checks
-                // run in the real worker: zkapi-tree-rebuild tests).
-                worker.rebuilds = (worker.rebuilds || 0) + 1;
-                const root = payload.events.at(-1).root;
-                return { active_root: root, note_id: payload.noteId,
-                    siblings: Array.from({ length: 32 }, (_, index) => `${root}${index.toString(16)}`) };
+            if (operation === 'noteLeaf') return stateNoteLeaf(payload.state);
+            if (operation === 'noteLeafFromFields') {
+                return fakeNoteLeaf(payload.noteId, payload.commitment, payload.amount, payload.expiryTs);
             }
             if (operation === 'checkUnrecoverableResponse') {
                 // S1, S2, S4 and S6 as the WebAssembly checks them, in the
@@ -437,6 +468,12 @@ export function createHarness(BrowserWalletRuntime, {
             if (operation === 'prepareWithdrawal') {
                 const { state, args } = payload;
                 if (worker.failWithdrawal) throw worker.failWithdrawal;
+                // PrepareWithdrawalArgs denies unknown fields: an exit takes no path.
+                for (const field of Object.keys(args)) {
+                    if (!['mode', 'destination', 'conceded', 'valid_until', 'clearance'].includes(field)) {
+                        throw new Error(`invalid_withdrawal_args: unknown field \`${field}\``);
+                    }
+                }
                 const nullifier = nullifierFor(state.current_anchor);
                 if (args.mode !== 'mutual' && args.clearance) throw new Error(`invalid_withdrawal_args: a ${args.mode} proof takes no clearance`);
                 if (!args.valid_until) throw new Error('invalid_withdrawal_args: valid_until must be set');
@@ -449,11 +486,12 @@ export function createHarness(BrowserWalletRuntime, {
                     mode: args.mode,
                     public_inputs: {
                         protocol_version: 2, chain_id: funding.chain_id, contract_address: VAULT,
-                        active_root: args.active_root,
+                        note_leaf: stateNoteLeaf(state),
                         state_signing_key_x: KEYS.state_signing_key.x, state_signing_key_y: KEYS.state_signing_key.y,
                         clearance_signing_key_x: KEYS.clearance_signing_key.x,
                         clearance_signing_key_y: KEYS.clearance_signing_key.y,
-                        note_id: state.note_id, final_balance: state.current_balance - Number(args.conceded || 0),
+                        note_id: state.note_id, deposit_amount: String(state.deposit_amount), expiry_ts: String(state.expiry_ts),
+                        final_balance: state.current_balance - Number(args.conceded || 0),
                         destination: args.mode === 'ownership' ? Array(20).fill(0) : destinationBytes(args.destination),
                         withdrawal_nullifier: nullifier,
                         kind: { escape: 0, mutual: 1, ownership: 2 }[args.mode],

@@ -22,7 +22,7 @@ func withdrawWithRemainder(ctx context.Context, c config.Config, ui setupPrompte
 		return err
 	}
 	if closed.Phase == "no_note" {
-		ui.Printf("No saved private withdrawal destination. Use withdraw --public to return public ETH.\n")
+		ui.Printf("No saved private withdrawal destination. Use zkapi-clientd withdraw --public to return public ETH.\n")
 		return nil
 	}
 	if closed.Phase != "complete" {
@@ -45,9 +45,13 @@ func withdrawWithRemainder(ctx context.Context, c config.Config, ui setupPrompte
 	}
 	switch action {
 	case "done":
-		ui.Printf("Public return already completed; no duplicate sweep. Any later funds or fee dust can be returned with withdraw --public.\n")
+		ui.Printf("Public return already completed; no duplicate sweep. Any later funds or fee dust can be returned with zkapi-clientd withdraw --public.\n")
 		return nil
 	case "empty":
+		if closed.FeePayer == "payout" {
+			ui.Printf("No public ETH remains to return: the network fee was paid from the payout, and this wallet holds no ETH.\n")
+			return nil
+		}
 		ui.Printf("No public ETH remains to return.\n")
 		return nil
 	case "resume":
@@ -55,8 +59,14 @@ func withdrawWithRemainder(ctx context.Context, c config.Config, ui setupPrompte
 		return runPublicReturn(ctx, c, []string{"--resume"}, setupUIWriter{ui})
 	}
 	quote, err := requestPaymentQuote(ctx, c, http.MethodPost, "/admin/return/quote", "return", map[string]string{"destination": destination, "amount_wei": ""})
+	if returnBelowFee(err) {
+		// Dust that cannot pay its own transfer is not a failure of the
+		// withdrawal: nothing was signed, and later funds can join it.
+		ui.Printf("The private withdrawal is complete. The remaining public ETH (%s ETH) does not cover the network fee of returning it, so nothing was sent; return it later with %s.\n", fundingUnits(state.ETHBalance, 18), publicReturnCommand)
+		return nil
+	}
 	if err != nil {
-		return fmt.Errorf("private withdrawal completed; public return could not be quoted (balance may be below its network fee); retry withdraw --public: %w", err)
+		return fmt.Errorf("private withdrawal completed; public return could not be quoted; retry %s: %w", publicReturnCommand, err)
 	}
 	if !strings.EqualFold(quote.Destination, destination) || !strings.EqualFold(quote.Address, closed.Address) || quote.ChainID != closed.ChainID {
 		return errors.New("public return quote changed wallet or destination; stopped without approval")
@@ -68,9 +78,16 @@ func withdrawWithRemainder(ctx context.Context, c config.Config, ui setupPrompte
 		return err
 	}
 	if !ok {
-		return errors.New("public return declined; private withdrawal is complete and public ETH remains recoverable with withdraw --public")
+		return errors.New("public return declined; private withdrawal is complete and public ETH remains recoverable with zkapi-clientd withdraw --public")
 	}
 	return runPublicReturn(ctx, c, []string{"--approve", quote.ID}, setupUIWriter{ui})
+}
+
+// returnBelowFee reports the daemon's refusal of a sweep whose balance does
+// not exceed its maximum network fee (its "send more ETH" refusal).
+func returnBelowFee(err error) bool {
+	var failed *managementError
+	return errors.As(err, &failed) && strings.Contains(failed.message, "send more ETH to the payment address for Ethereum network fees")
 }
 
 func remainderAction(closed zkapi.AddressWithdrawalStatus, state zkapi.AddressReturnStatus) (string, error) {

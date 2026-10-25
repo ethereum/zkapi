@@ -62,9 +62,9 @@ test('the transit account is the CREATE2 of the pinned creation code and the fiv
     assert.equal(transitAccountAddress(args), low(V.transit_account));
     assert.equal(create2TransitAccount({ ...args, creationCode: V.account_creation_code }), low(V.transit_account), 'the independent CREATE2');
     assert.equal(codehash(V.account_creation_code), low(V.account_creation_code_keccak256));
-    // The proxy's runtime is the creation code after its 13-byte stub, then the arguments.
-    assert.equal(`0x${V.account_creation_code.slice(2 + 26)}${[V.entry_point, V.vault, V.paymaster, V.owner, V.payee]
-        .map(address => BigInt(address).toString(16).padStart(64, '0')).join('')}`, low(V.transit_runtime_code));
+    // The compact proxy stores only the owner and payee after its 53-byte runtime.
+    assert.equal(`0x${V.account_creation_code.slice(2 + 24 * 2)}${V.owner.slice(2)}${V.payee.slice(2)}`.toLowerCase(), low(V.transit_runtime_code));
+    assert.equal((V.transit_runtime_code.length - 2) / 2, 93);
     // Another payee or owner is another account; a bad argument is refused.
     assert.notEqual(transitAccountAddress({ ...args, payee: V.owner }), low(V.transit_account));
     assert.notEqual(transitAccountAddress({ ...args, owner: V.payee }), low(V.transit_account));
@@ -180,10 +180,13 @@ test('the gas policy normalizes from both spellings, compares with the contract�
     const vectors = normalizeGasPolicy(V.gas_policy);
     const profile = normalizeGasPolicy(gaslessProfileFromVectors({ spelling: 'profile' }).gas_policy);
     assert.ok(sameGasPolicy(vectors, profile), 'postop_* / call_cap and post_op_* / call_hard_cap pin the same constants');
-    assert.deepEqual(profile.defaults.callDefault.map(String), ['642500', '680000', '287500', '97500']);
+    assert.deepEqual(profile.defaults.callDefault.map(String), ['402500', '395000', '250000', '60000']);
     assert.equal(profile.defaults.postOpDefault, 270_000n);
     assert.equal(vectors.finalizeReserveGas, vectors.pvgFloor + vectors.verificationFloor + vectors.callFloor[2] + vectors.pmVerificationFloor + vectors.postOpFloor);
     assert.equal(vectors.finalizeReserveGas.toString(), V.gas_policy.finalize_reserve_gas);
+    // Vault revision 4's paymaster (zkapi-clientd pins the same figures).
+    assert.equal(BigInt(vectors.pmVerificationFloor), 340_000n);
+    assert.equal(BigInt(vectors.finalizeReserveGas), 880_000n);
     // gasPolicy() is two uint256[4] then 22 scalars (30 words).
     const words = [...vectors.callFloor, ...vectors.callHardCap, vectors.postOpFloor, vectors.postOpCap, vectors.verificationFloor,
         vectors.verificationFloorInit, vectors.verificationCap, vectors.pvgFloor, vectors.pvgCap, vectors.pmVerificationFloor,
@@ -224,21 +227,21 @@ test('the profile pins are read, validated and absent when the deployment has no
 test('gas fields come from the pinned policy within every floor and cap, never from an estimate', () => {
     const fields = gasFields({ gasPolicy, kind: KIND.close, withInitCode: true, calldataBytes: 1_764 });
     assert.deepEqual(fields, {
-        callGasLimit: 642_500n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
-        paymasterVerificationGasLimit: 430_000n, paymasterPostOpGasLimit: 275_000n
+        callGasLimit: 402_500n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
+        paymasterVerificationGasLimit: 370_000n, paymasterPostOpGasLimit: 275_000n
     });
     assert.equal(gasFields({ gasPolicy, kind: KIND.close, withInitCode: false, calldataBytes: 0 }).verificationGasLimit, 80_000n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.forward, calldataBytes: 0 }).callGasLimit, 97_500n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.escape, calldataBytes: 0 }).callGasLimit, 680_000n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.finalize, calldataBytes: 0 }).callGasLimit, 287_500n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.forward, calldataBytes: 0 }).callGasLimit, 60_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.escape, calldataBytes: 0 }).callGasLimit, 395_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.finalize, calldataBytes: 0 }).callGasLimit, 250_000n);
     // Profile defaults win; the live callCap bounds the call limit; the pvg clamps to the floor and the cap.
     const profile = normalizeGasPolicy(gaslessProfileFromVectors({ spelling: 'profile' }).gas_policy);
     assert.equal(gasFields({ gasPolicy: profile, kind: KIND.close, calldataBytes: 0 }).paymasterPostOpGasLimit, 270_000n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, callCap: 600_000n }).callGasLimit, 600_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, callCap: 300_000n }).callGasLimit, 300_000n);
     assert.equal(preVerificationGasFor(gasPolicy, 0), gasPolicy.pvgFloor);
     assert.equal(preVerificationGasFor(gasPolicy, 100_000), gasPolicy.pvgCap);
     // An override outside the range is refused with the field index of GasLimitOutOfRange.
-    assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { callGasLimit: 539_999n } }),
+    assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { callGasLimit: 209_999n } }),
         error => error.code === 'gas_limit_out_of_range' && error.data.field === 2);
     assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { paymasterPostOpGasLimit: 350_001n } }),
         error => error.code === 'gas_limit_out_of_range' && error.data.field === 4);
@@ -316,8 +319,10 @@ test('preVerificationGas follows the rule zkapi-clientd shares, to the gas, on t
     });
     const cases = [
         // label, op, A (LIM-070 term), B (reference minimum), handleOps bytes (C = 21,000 + 16 × bytes + 10,000), PVG
-        ['close with initCode', operation(), 66_316n, 52_668n, 1_764, 66_316n],
-        ['close without initCode', operation({ initCode: '0x' }), 65_356n, 51_696n, 1_668, 65_356n],
+        // Vault revision 4's close carries six more nonzero calldata bytes
+        // (the leaf and the packed note fields): A and B each grow by 6 × 12 = 72.
+        ['close with initCode', operation(), 66_388n, 52_740n, 1_764, 66_388n],
+        ['close without initCode', operation({ initCode: '0x' }), 65_428n, 51_768n, 1_668, 65_428n],
         ['forward', operation({ initCode: '0x', callData: encodeTransitWithdraw('0x'), nonce: packNonce(FORWARD_NONCE_KEY, 0n), callGasLimit: 97_500n }),
             57_904n, 44_136n, 804, 57_904n],
         ['finalize', operation({ initCode: '0x', callData: encodeTransitWithdraw(encodeFinalizeEscape(C.note_id)), nonce: packNonce(C.nonce_key, 1n),
@@ -484,7 +489,8 @@ test('AA codes and the paymaster’s errors decode from FailedOp / FailedOpWithR
         ['NotPendingEscape()', 'not_pending_escape', '', {}], ['NotStranded()', 'not_stranded', '', {}],
         ['NotRepayable()', 'not_repayable', '', {}], ['NothingToSweep()', 'nothing_to_sweep', '', {}],
         ['InvalidPayee()', 'invalid_payee', '', {}], ['FeeAboveCeiling()', 'gas_above_paymaster_ceiling', '', {}],
-        ['UnknownRoot()', 'unknown_root', '', {}], ['NoteNotActive()', 'note_not_active', '', {}],
+        ['NoteLeafMismatch()', 'note_leaf_mismatch', '', {}], ['InvalidNoteFields()', 'invalid_note_fields', '', {}],
+        ['NoteNotActive()', 'note_not_active', '', {}],
         ['ChallengedNullifier()', 'challenged_nullifier', '', {}], ['SupersededState()', 'superseded_state', '', {}],
         ['InvalidProof()', 'invalid_proof', '', {}], ['SponsorshipInFlight(bytes32)', 'sponsorship_in_flight', word(1), { key: `0x${word(1)}` }]
     ];

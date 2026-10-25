@@ -1,13 +1,13 @@
 # zkAPI sample host: two builds on one origin
 
 During the move from circuit `zkapi-v2-note-bound-v1` to
-`zkapi-v2-concession-v1`, a host serves both browser builds side by side
+`zkapi-v2-concession-v2`, a host serves both browser builds side by side
 (design `docs/design/concession-exit.md` §10.5):
 
 | Build | Package entry | Served at | Vault |
 | --- | --- | --- | --- |
 | legacy (note-bound) | `zkapi-sdk-legacy` | `/zkapi/` (its existing `publicPath`) | the legacy vault |
-| current (concession) | `zkapi-sdk` | `/zkapi/v2c/` | the vault revision 3 |
+| current (concession) | `zkapi-sdk` | `/zkapi/v2c/` | the vault revision 4 |
 
 There is no multi-circuit loader. Each package keeps its own WebAssembly,
 proving keys and worker, and bundles its own `../wasm/zkapi_browser.js`. Both

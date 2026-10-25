@@ -8,29 +8,35 @@ order, encodings, and constraints.
 
 - Proof system: circuit-specific Groth16 on BN254; every prover uses the
   `CircomReduction` QAP reduction, and verification is standard Groth16.
-- Circuit: `zkapi-v2-concession-v1` (vault revision 3); `protocol_version`
-  stays 2.
+- Circuit: `zkapi-v2-concession-v2` (vault revision 4, leaf-bound exits);
+  `protocol_version` stays 2.
 - Circuit field: BN254 scalar field, modulus
   `0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001`.
 - Hash: domain-separated Poseidon, exponent 5, rate 2, capacity 1,
-  8 full rounds and 57 partial rounds. Leaves, nullifiers, commitments and
-  signatures are sponge hashes with the domain as the first absorbed element;
-  a note-tree node is one permutation of `(domain "zkapi.v2.node", left,
-  right)`, its first rate lane (the domain in the capacity lane), so a node
-  costs one permutation and no sponge hash can collide with one.
+  8 full rounds and 57 partial rounds. Nullifiers, registration
+  commitments and signatures are sponge hashes with the domain as the first
+  absorbed element. A note-tree node is one permutation of `(domain
+  "zkapi.v2.node", left, right)` and a note leaf one permutation of `(domain
+  "zkapi.v2c.leaf", registration, fields)`, each its first rate lane (the
+  domain in the capacity lane), so each costs one permutation and no sponge
+  hash can collide with one.
 - Balance commitment: `E(B, r, L) = B*G + r*H + L*J` on Baby-JubJub,
   where `L` is the private active-note leaf.
 - Server authentication: separate Baby-JubJub Schnorr keys for state and
   clearance signatures, pinned by the deployment.
-- Note tree: depth 32, zero leaf 0, note ID as the leaf index; append-only
-  except for the retired leaves of closed notes. The vault keeps the tree's
-  frontier and appends each deposit's leaf itself, without a Merkle proof;
-  only `retireClosedLeaf` takes siblings.
+- Note tree (request proofs only): depth 32, zero leaf 0, note ID as the
+  leaf index, each note's leaf the word the vault stores for it (zero once
+  retired). The vault keeps the tree's frontier, appends each deposit's leaf
+  itself (one compression per trailing one of the note ID), and computes
+  `currentRoot()` on demand; it keeps no root history. `noteLeaves` and
+  `frontier` expose the state for rebuilds; only `retireClosedLeaf` takes
+  siblings, and reads only those below the retired leaf's level.
 
 [Native hash functions](rust/crates/zkapi-core/src/v2.rs) and
 [circuit constraints](rust/crates/zkapi-proof/src/groth16.rs) use the
-`zkapi.v2.*` domain labels, and `zkapi.v2c.null` (arity 4) and
-`zkapi.v2c.anchor` (arity 2) for nullifiers and successor anchors. The
+`zkapi.v2.*` domain labels, `zkapi.v2c.null` (arity 4) and
+`zkapi.v2c.anchor` (arity 2) for nullifiers and successor anchors, and the
+capacity-lane domain `zkapi.v2c.leaf` for note leaves. The
 independent note-binding generator is derived
 under `zkapi.v2.note-binding.generator.v1`. Native helpers, circuits, setup
 manifest, and generated Solidity must agree. This is a classical elliptic-curve
@@ -38,8 +44,10 @@ proof and signature system.
 
 ## Notes and state
 
-A registration commitment is `C = H_reg(secret, 0)`. The leaf is
-`L = H_leaf(note_id, C, deposit_amount, expiry)`. The user keeps the secret,
+A registration commitment is `C = H_reg(secret, 0)`. The note's fields are
+`F = note_id·2^192 + deposit_amount·2^64 + expiry` (u32, u128 and u64, so
+`F < 2^224`), and its leaf is `L = P(d_leaf, C, F)[1]` with `d_leaf =
+"zkapi.v2c.leaf"`. The user keeps the secret,
 private balance and blinding, current and previous anchors, server signature
 and `bound_at_state` locally. Genesis has balance equal to the deposit and
 anchor 1. A state's nullifier is `N(τ) = H_null(secret, note_id, τ)`, and the
@@ -74,25 +82,28 @@ The request statement contains these 12 field elements:
 11. anonymous commitment x
 12. anonymous commitment y
 
-The request proof establishes note membership, secret knowledge, genesis or
+The request proof establishes note membership (a path from the note's leaf to
+the active root), secret knowledge, genesis or
 valid signed state on the derived anchor chain, `deposit ≥ balance ≥ solvency
 bound`, expiry at least the request time, correct rerandomization, and the
 nullifier/authorization tag. The authorization tag binds the nullifier to a
 private context derived from the exact client request ID and payload hash.
-Runtime validation binds the public deployment, keys, the exact current root,
-time, and charge bound to the configured service.
+Runtime validation binds the public deployment, keys, the active root (the
+vault's computed `currentRoot()`, or a root the server read from the vault no
+more than `request_root_grace_seconds` ago), time, and charge bound to the
+configured service.
 
 The withdrawal statement contains these 16 field elements:
 
 1. protocol version
 2. chain ID
 3. vault address
-4. active root
+4. note leaf
 5. state signing key x
 6. state signing key y
 7. clearance signing key x
 8. clearance signing key y
-9. note ID
+9. note fields (`note_id·2^192 + deposit_amount·2^64 + expiry`)
 10. final balance
 11. destination address
 12. withdrawal nullifier
@@ -101,7 +112,9 @@ The withdrawal statement contains these 16 field elements:
 15. conceded amount
 16. valid until
 
-The withdrawal proof establishes membership and the note-bound state, and
+The withdrawal proof proves no Merkle membership. It establishes that the note
+leaf is `P(d_leaf, H_reg(secret, 0), fields)[1]` for range-checked
+`(note_id, deposit, expiry)` packing to the fields, the note-bound state, and
 `final_balance + conceded = balance ≤ deposit`. Its kind is 0 (escape), 1
 (mutual close) or 2 (ownership proof). An escape's next nullifier is the
 nullifier of the state's successor, `N(succ(N))`; it is 0 for the other kinds,
@@ -110,9 +123,20 @@ clearance signature. An ownership proof has a zero destination. The
 destination is bound by 160 Boolean constraints and `valid_until` by a 64-bit
 range check. The vault checks the deployment, pinned keys, the kind, that the
 block time is at most `valid_until`, a destination other than zero and the
-vault itself, that it ever held the proof's root (`knownRoots`), note status,
-nullifier use, and the balance before settlement. It refuses kind 2
-everywhere; the server refuses an ownership proof whose `valid_until` has
+vault itself, that the fields are below 2^224, that the note they name is
+active and its stored leaf is the statement's note leaf, that the deposit is
+at most `MAX_NATIVE_UNITS`, nullifier use, and the balance, all before the
+proof; it then takes the deposit and expiry from the fields.
+
+Because the deposit comes from the proof-bound fields rather than from
+storage, a broken verifier or setup (a forged proof) can drain the whole vault
+in a single forged mutual close, where a vault that kept each deposit in
+storage would pay at most that note's deposit per forged exit. The eventual
+loss under a broken verifier is total either way (it also forges defeats and
+requests, and nothing can move funds out of a paused vault); the ceremony, the
+VK and codehash pins, and the `D ≤ MAX_NATIVE_UNITS` bound are the mitigations
+([Amendment A3](../docs/design/concession-exit.md#amendment-a3-leaf-bound-exits)). The vault refuses
+kind 2 everywhere; the server refuses an ownership proof whose `valid_until` has
 passed or is more than an hour ahead.
 
 ## Wire format and persistence
@@ -147,8 +171,10 @@ storage and transport from its caller.
 ## Native ETH settlement
 
 [ZkApiVault](contracts/src/ZkApiVault.sol) accounts in whole gwei. A deposit
-must attach exactly `amount * 1 gwei`, have positive amount, and stay within
-`MAX_NATIVE_UNITS = 2^53 - 1`. The vault buckets expiry to daily boundaries.
+must attach exactly `amount * 1 gwei`, be at least `minDeposit` (a constructor
+immutable, default 1,000,000 gwei in `Deploy.s.sol`), and stay within
+`MAX_NATIVE_UNITS = 2^53 - 1`. The vault buckets expiry to daily boundaries
+and stores one word per note, its leaf and status.
 
 No withdrawal changes the tree. Mutual close pays the user's final balance to
 the chosen destination and the spent amount to the treasury; a destination
@@ -163,10 +189,14 @@ set in `challengedNullifiers`, so a later escape from that state reverts
 while a cleared mutual close remains possible. A valid request proof at the
 escaped nullifier only raises the concession (`raiseEscapeConcession`), to at
 most its solvency bound. An escape can be finalized after its deadline and
-pays the state balance minus the concession. Active notes can be claimed for
-the treasury after `effectiveExpiry`, which adds paused time and a
-post-defeat grace and is never earlier than `unpauseClaimGrace` after an
-unpause. `retireClosedLeaf` removes a closed note's leaf.
+pays the state balance minus the concession (the escape record keeps the
+deposit and expiry the leaf binds). Active notes can be claimed for the
+treasury after `effectiveExpiry`, which adds paused time (pause epochs) and a
+post-defeat grace (`graceUntil`) and is never earlier than `unpauseClaimGrace`
+after an unpause; `claimExpired` and `effectiveExpiry` take the note's
+commitment, amount and expiry, which must reproduce its stored leaf.
+`retireClosedLeaf` removes a closed note's leaf. `recordRoot` records the
+current root, note count and block as an audit trail that nothing depends on.
 
 The owner can pause deposits and expiry claims until it unpauses, and escapes
 and mutual closes for at most `maxPauseDuration` (at least twice the challenge
@@ -184,7 +214,8 @@ needs more gas is paid).
 
 ## Source ownership
 
-- [zkapi-core](rust/crates/zkapi-core): native hashing and Merkle helpers.
+- [zkapi-core](rust/crates/zkapi-core): native hashing, Merkle helpers and
+  the vault's frontier model.
 - [zkapi-proof](rust/crates/zkapi-proof): circuits, proving and verification,
   signing, commitments, and setup serialization.
 - [zkapi-browser](rust/crates/zkapi-browser): browser wallet core.
@@ -194,8 +225,8 @@ needs more gas is paid).
 
 ## Setup compatibility and verification
 
-The wire version is v2 and the circuit ID is `zkapi-v2-concession-v1`. Key
-files carry the header `zkapi-v2-concession-v1/<setup_id>/<kind>\0`. Release
+The wire version is v2 and the circuit ID is `zkapi-v2-concession-v2`. Key
+files carry the header `zkapi-v2-concession-v2/<setup_id>/<kind>\0`. Release
 builds accept only the ceremony setup `mpc-1` whose verifying-key hashes equal
 the pins in `compact.rs`; the committed development setup `dev`
 ([v2-concession-dev](setup/v2-concession-dev/README.md)) loads only with the

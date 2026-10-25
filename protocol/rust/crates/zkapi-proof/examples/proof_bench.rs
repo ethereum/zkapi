@@ -1,4 +1,4 @@
-//! Native proving benchmark for the `zkapi-v2-concession-v1` circuits with
+//! Native proving benchmark for the `zkapi-v2-concession-v2` circuits with
 //! the shipping `CircomReduction` prover:
 //!
 //! ```text
@@ -382,7 +382,6 @@ fn withdrawal_fixture(genesis: bool, kind: WithdrawalKind) -> Result<WithdrawalF
     };
     let (public, witness) = common.state.withdrawal(
         &common.deployment,
-        &common.tree,
         &DevWithdrawal {
             kind,
             destination,

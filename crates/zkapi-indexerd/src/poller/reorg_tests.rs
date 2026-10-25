@@ -37,6 +37,8 @@ fn config(chain: &MockChain, confirmations: u64, cursor: Option<&Path>) -> Polle
         resync: false,
         catch_up_interval: Duration::ZERO,
         anchor_unavailable_limit: 5,
+        bootstrap_from_state: false,
+        state_page_size: STATE_PAGE_SIZE,
     }
 }
 
@@ -143,16 +145,25 @@ fn assert_canonical(chain: &MockChain, service: &IndexerService) {
 }
 
 fn assert_serves_head(chain: &MockChain, indexer: &Indexer) {
+    assert_serves_head_tree(chain, indexer);
+    let view = indexer.view();
+    assert_eq!(
+        view.mirror.pending_escapes(),
+        chain.state_at(view.block_number).pending_escapes()
+    );
+}
+
+/// The served view is the head's tree: its block, the vault's computed root
+/// and note count, and the vault's leaves. (A view bootstrapped from state
+/// lists no escape initiated before the bootstrap.)
+fn assert_serves_head_tree(chain: &MockChain, indexer: &Indexer) {
     let view = indexer.view();
     let head = chain.head();
     assert_eq!(view.block_number, head);
     assert_eq!(view.block_hash, chain.hash_at(head));
     assert_eq!(view.root, chain.root_at(head));
     assert_eq!(view.next_note_id, chain.next_note_id_at(head));
-    assert_eq!(
-        view.mirror.pending_escapes(),
-        chain.state_at(head).pending_escapes()
-    );
+    assert_eq!(view.mirror.current_leaves(), chain.leaves_at(head));
 }
 
 async fn serve(service: Arc<IndexerService>) -> String {
@@ -170,13 +181,12 @@ async fn get(base: &str, path: &str) -> (u16, Value) {
     (status, response.json().await.unwrap())
 }
 
-const SERVED_ROUTES: [&str; 8] = [
+const SERVED_ROUTES: [&str; 7] = [
     "/v1/tree/root",
     "/v1/tree/next-note-id",
     "/v1/tree/snapshot",
     "/v1/tree/notes/0/path",
-    "/v1/tree/notes/0/zero-path",
-    "/v1/tree/roots/0x1",
+    "/v1/notes/0/deposit",
     "/v1/nullifiers/0x1/published",
     "/v1/escapes/pending",
 ];
@@ -725,7 +735,7 @@ async fn corrupted_checkpoint_is_never_served_and_is_rebuilt() {
         number: 4,
         hash: chain.hash_at(4),
     };
-    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &chain.state_at(2));
+    super::tests::write_v4_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &chain.state_at(2));
 
     let mut indexer = Indexer::new(config(&chain, 2, Some(&cursor)));
     let base = serve(indexer.service.clone()).await;
@@ -746,7 +756,7 @@ fn restart_at_head_checkpoint(chain: &MockChain, cursor: &Path, mirror: &TreeMir
         number: head,
         hash: chain.hash_at(head),
     };
-    super::tests::write_v3_checkpoint(cursor, VAULT, CHAIN_ID, &anchor, mirror);
+    super::tests::write_v4_checkpoint(cursor, VAULT, CHAIN_ID, &anchor, mirror);
     Indexer::new(config(chain, 0, Some(cursor)))
 }
 
@@ -834,13 +844,13 @@ fn checkpoint_for_another_vault_is_refused() {
     let service = IndexerService::new_syncing(settings(12));
 
     let other_vault = "0x00000000000000000000000000000000000000bb";
-    super::tests::write_v3_checkpoint(&cursor, other_vault, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v4_checkpoint(&cursor, other_vault, CHAIN_ID, &anchor, &TreeMirror::new());
     let Err(error) = JsonRpcLogPoller::new(offline_config(&cursor), &service) else {
         panic!("a checkpoint for another vault must be refused");
     };
     assert!(format!("{error:#}").contains("--resync"));
 
-    super::tests::write_v3_checkpoint(&cursor, VAULT, 1, &anchor, &TreeMirror::new());
+    super::tests::write_v4_checkpoint(&cursor, VAULT, 1, &anchor, &TreeMirror::new());
     let Err(error) = JsonRpcLogPoller::new(offline_config(&cursor), &service) else {
         panic!("a checkpoint for another chain must be refused");
     };
@@ -849,7 +859,7 @@ fn checkpoint_for_another_vault_is_refused() {
     assert!(cursor.exists());
 
     // A newer binary's checkpoint is never replaced.
-    std::fs::write(&cursor, r#"{"version":4}"#).unwrap();
+    std::fs::write(&cursor, r#"{"version":5}"#).unwrap();
     assert!(JsonRpcLogPoller::new(offline_config(&cursor), &service).is_err());
     assert!(cursor.exists());
 }
@@ -876,7 +886,7 @@ fn resync_flag_and_sentinel_archive_checkpoint() {
     };
     let service = IndexerService::new_syncing(settings(12));
 
-    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v4_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
     let mut config = offline_config(&cursor);
     config.resync = true;
     let poller = JsonRpcLogPoller::new(config.clone(), &service).unwrap();
@@ -885,7 +895,7 @@ fn resync_flag_and_sentinel_archive_checkpoint() {
     assert_eq!(archives(dir.path(), "resync").len(), 1);
     drop(poller);
 
-    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v4_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
     let sentinel = dir.path().join("indexer.cursor.resync");
     std::fs::write(&sentinel, b"").unwrap();
     config.resync = false;
@@ -1660,4 +1670,304 @@ async fn rebuild_replay_does_not_report_a_missed_re_escape_again() {
         logs.lines_with("missed re-escape already reported").len(),
         1
     );
+}
+
+fn bootstrap_config(chain: &MockChain, confirmations: u64, cursor: Option<&Path>) -> PollerConfig {
+    PollerConfig {
+        bootstrap_from_state: true,
+        // Small pages, so that a bootstrap reads several.
+        state_page_size: 4,
+        ..config(chain, confirmations, cursor)
+    }
+}
+
+/// The `eth_call`s of one selector, as (data, block hash).
+fn calls_of(chain: &MockChain, selector: &str) -> Vec<(String, String)> {
+    chain
+        .calls("eth_call")
+        .iter()
+        .filter(|params| params[0]["data"].as_str().unwrap().starts_with(selector))
+        .map(|params| {
+            (
+                params[0]["data"].as_str().unwrap().to_string(),
+                params[1]["blockHash"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Eleven notes: closes, two retirements, an escape (900 of note 3) and an
+/// escape later defeated (910 of note 4).
+fn mine_history(chain: &MockChain) {
+    chain.mine(
+        (0..7)
+            .map(|index| Tx::Deposit {
+                commitment: 0x100 + index,
+            })
+            .collect(),
+    );
+    chain.mine(vec![Tx::Close { note_id: 0 }, Tx::Close { note_id: 5 }]);
+    chain.mine(vec![Tx::Retire { note_id: 5 }, Tx::Retire { note_id: 0 }]);
+    chain.mine(vec![
+        Tx::Escape {
+            note_id: 3,
+            nullifier: 900,
+        },
+        Tx::Escape {
+            note_id: 4,
+            nullifier: 910,
+        },
+        Tx::Close { note_id: 6 },
+    ]);
+    chain.mine(
+        (7..11)
+            .map(|index| Tx::Deposit {
+                commitment: 0x100 + index,
+            })
+            .collect(),
+    );
+}
+
+/// `--bootstrap-from-state` reads the tree at one block hash, `confirmations`
+/// below the head, in `noteLeaves` pages, and arrives at the mirror a full log
+/// replay builds at that block; both then follow the same logs.
+#[tokio::test]
+async fn bootstrap_from_state_equals_the_log_built_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = dir.path().join("indexer.cursor");
+    let chain = MockChain::start().await;
+    mine_history(&chain);
+    chain.mine_empty(2);
+    let mut logged = Indexer::new(config(&chain, 2, None));
+    logged.poll_to_idle().await;
+    assert_serves_head(&chain, &logged);
+
+    chain.clear_calls();
+    let mut booted = Indexer::new(bootstrap_config(&chain, 2, Some(&cursor)));
+    booted.poll_to_idle().await;
+    let head = chain.head();
+    let bootstrap_block = head - 2;
+    let pinned = chain.hash_at(bootstrap_block);
+    assert_serves_head_tree(&chain, &booted);
+    let view = booted.view();
+    assert_eq!(view.block_number, head);
+    assert_eq!(view.root, logged.view().root);
+    assert_eq!(view.next_note_id, 11);
+    assert_eq!(
+        view.mirror.current_leaves(),
+        logged.view().mirror.current_leaves()
+    );
+    assert_eq!(view.mirror.current_leaves(), chain.leaves_at(head));
+
+    // Every bootstrap read is pinned to the bootstrap block's hash: the
+    // pages (0..4, 4..8, 8..11), then nextNoteId() and currentRoot().
+    let pages = calls_of(&chain, NOTE_LEAVES);
+    assert_eq!(
+        pages,
+        [(0, 4), (4, 4), (8, 3)]
+            .iter()
+            .map(|(start, count)| (
+                format!("{NOTE_LEAVES}{start:064x}{count:064x}"),
+                pinned.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+    for selector in [NEXT_NOTE_ID, CURRENT_ROOT] {
+        assert!(
+            calls_of(&chain, selector)
+                .iter()
+                .any(|(_, hash)| *hash == pinned),
+            "{selector}"
+        );
+    }
+    // No log is read below the bootstrap block.
+    let logs = chain.calls("eth_getLogs");
+    assert!(!logs.is_empty());
+    for params in &logs {
+        let from = u64::from_str_radix(
+            params[0]["fromBlock"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        assert!(from > bootstrap_block, "logs read from block {from}");
+    }
+
+    // The checkpoint is v4, anchored at the bootstrap block, with the notes
+    // marked as read from state: no preimages, no escapes, no nullifiers.
+    let checkpoint = read_checkpoint(&cursor).unwrap();
+    assert_eq!(checkpoint.version, 4);
+    assert_eq!(checkpoint.last_processed_block, bootstrap_block);
+    assert_eq!(checkpoint.last_processed_block_hash, pinned);
+    assert_eq!(checkpoint.mirror.state_notes, 11);
+    assert!(checkpoint.mirror.preimages.iter().all(Option::is_none));
+    assert!(checkpoint.mirror.pending_escapes.is_empty());
+    assert_eq!(booted.service.health().state_note_count, Some(11));
+    use crate::tree_mirror::NoteStatus;
+    assert_eq!(view.mirror.note_status(0), Some(NoteStatus::Closed));
+    assert_eq!(view.mirror.note_status(3), Some(NoteStatus::Unknown));
+
+    // Both follow the same later events: a deposit, an exit and a retirement
+    // of notes from before the bootstrap, and the defeat of an escape
+    // initiated before it.
+    chain.mine(vec![
+        Tx::Deposit { commitment: 0x200 },
+        Tx::Close { note_id: 1 },
+        Tx::Challenge { note_id: 4 },
+    ]);
+    chain.mine(vec![Tx::Retire { note_id: 6 }, Tx::Retire { note_id: 1 }]);
+    chain.mine_empty(3);
+    logged.poll_to_idle().await;
+    booted.poll_to_idle().await;
+    assert_serves_head(&chain, &logged);
+    assert_serves_head_tree(&chain, &booted);
+    let view = booted.view();
+    // Only the escape listed before the bootstrap is missing.
+    assert_eq!(
+        view.mirror.pending_escapes(),
+        Vec::<crate::tree_mirror::PendingEscape>::new()
+    );
+    assert_eq!(logged.view().mirror.pending_escapes().len(), 1);
+    assert_eq!(
+        view.mirror.current_leaves(),
+        logged.view().mirror.current_leaves()
+    );
+    assert_eq!(view.mirror.preimage(11), logged.view().mirror.preimage(11));
+    assert!(view.mirror.preimage(11).is_some());
+    assert_eq!(view.mirror.note_status(4), Some(NoteStatus::Active));
+    assert_eq!(view.mirror.note_status(6), Some(NoteStatus::Closed));
+    let health = booted.service.health();
+    assert_eq!(health.missed_re_escape_count, 0);
+    assert_eq!(health.divergence_count, 0);
+
+    // A restart continues from the checkpoint; the state is not read again.
+    drop(booted);
+    chain.mine(vec![Tx::Deposit { commitment: 0x201 }]);
+    chain.clear_calls();
+    let mut restarted = Indexer::new(bootstrap_config(&chain, 2, Some(&cursor)));
+    restarted.poll_to_idle().await;
+    assert_serves_head_tree(&chain, &restarted);
+    assert!(calls_of(&chain, NOTE_LEAVES).is_empty());
+    assert_eq!(restarted.view().mirror.state_notes(), 11);
+}
+
+/// A `noteLeaves` page answered from another block than the pinned one does
+/// not reproduce the pinned `currentRoot()`: nothing is committed or served
+/// until a bootstrap verifies.
+#[tokio::test]
+async fn a_bootstrap_page_from_another_block_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = dir.path().join("indexer.cursor");
+    let chain = MockChain::start().await;
+    mine_history(&chain);
+    // Note 6, closed below the bootstrap block, is retired above it.
+    chain.mine_empty(3);
+    let retire = chain.mine(vec![Tx::Retire { note_id: 6 }]);
+    chain.serve_leaf_pages_at(Some(retire));
+    let mut indexer = Indexer::new(bootstrap_config(&chain, 2, Some(&cursor)));
+    let base = serve(indexer.service.clone()).await;
+    for _ in 0..3 {
+        indexer.cycle().await;
+        assert!(indexer.service.view().is_err());
+        assert!(
+            !cursor.exists(),
+            "an unverified bootstrap is never persisted"
+        );
+    }
+    assert_unavailable(&base, "diverged").await;
+    let health = indexer.service.health();
+    assert!(
+        health
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("state bootstrap"),
+        "{health:?}"
+    );
+    assert!(chain.calls("eth_getLogs").is_empty());
+
+    chain.serve_leaf_pages_at(None);
+    indexer.cycle().await;
+    assert_serves_head_tree(&chain, &indexer);
+    assert!(indexer.view().mirror.get_leaf(6).is_zero());
+    assert_eq!(
+        read_checkpoint(&cursor).unwrap().last_processed_block,
+        chain.head() - 2
+    );
+}
+
+/// A bootstrap before the first deposit (a new deployment) holds the whole
+/// history: the published-nullifier table is conclusive.
+#[tokio::test]
+async fn bootstrap_of_a_new_deployment_holds_the_whole_history() {
+    let chain = MockChain::start().await;
+    chain.mine_empty(3);
+    let mut indexer = Indexer::new(bootstrap_config(&chain, 2, None));
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    chain.mine(vec![
+        Tx::Deposit { commitment: 0xa },
+        Tx::Deposit { commitment: 0xb },
+    ]);
+    chain.mine(vec![Tx::Escape {
+        note_id: 0,
+        nullifier: 900,
+    }]);
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert!(indexer.view().mirror.has_complete_history());
+    assert!(indexer.view().mirror.preimage(1).is_some());
+    let base = serve(indexer.service.clone()).await;
+    let (status, body) = get(&base, "/v1/nullifiers/0x386/published").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["published"], false);
+    let (status, body) = get(&base, "/v1/escapes/pending").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["escapes"], json!([escape_entry(0, 900)]));
+}
+
+/// A bootstrap at a block before the vault's deployment is an empty mirror
+/// whose logs start right after it.
+#[tokio::test]
+async fn bootstrap_below_the_deployment_follows_the_logs() {
+    let chain = MockChain::start().await;
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    // Head 2, the bootstrap block (head - 2) is block 0, without vault code.
+    let mut indexer = Indexer::new(bootstrap_config(&chain, 2, None));
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert!(indexer.view().mirror.has_complete_history());
+    assert_eq!(indexer.view().next_note_id, 1);
+}
+
+/// In bootstrap mode a rebuild reads the state again rather than replaying
+/// logs from the deployment block.
+#[tokio::test]
+async fn rebuild_in_bootstrap_mode_reads_the_state_again() {
+    let chain = MockChain::start().await;
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    chain.mine_empty(3);
+    let mut indexer = Indexer::new(bootstrap_config(&chain, 1, None));
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+
+    // The bootstrap block is reorganized with another deposit.
+    chain.reorg(
+        3,
+        vec![vec![Tx::Deposit { commitment: 0xc }], vec![], vec![]],
+    );
+    chain.clear_calls();
+    assert!(indexer.poll().await.is_err());
+    assert_eq!(indexer.poll().await.unwrap(), PollOutcome::MoreWork);
+    assert_eq!(indexer.service.status(), SyncStatus::Rebuilding);
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    assert_eq!(indexer.view().next_note_id, 2);
+    assert_eq!(indexer.service.health().rebuild_count, 1);
+    assert!(!calls_of(&chain, NOTE_LEAVES).is_empty());
+    for params in chain.calls("eth_getLogs") {
+        assert_ne!(params[0]["fromBlock"], "0x0");
+    }
 }

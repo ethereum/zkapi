@@ -66,14 +66,16 @@ func testEscapePlan(conceded, stateBalance uint64, destination string) escapePla
 	var plan escapePlan
 	plan.Status, plan.Action, plan.NoteID = "prepared", "escape", 12
 	plan.StateBalance, plan.Conceded, plan.BoundAtState = fmt.Sprint(stateBalance), fmt.Sprint(conceded), "1000"
-	plan.PublicInputs = withdrawalInputs{ProtocolVersion: 2, ChainID: 1, Contract: addressTestVault, ActiveRoot: "0x9", StateKeyX: "0x1", StateKeyY: "0x2", ClearanceKeyX: "0x3", ClearanceKeyY: "0x4", NoteID: 12, FinalBalance: stateBalance - conceded, Destination: decoded, Nullifier: "0x123", Kind: 0, NextNullifier: "0x456", Conceded: conceded, ValidUntil: uint64(time.Now().Unix()) + exitProofValidity}
+	plan.PublicInputs = withdrawalInputs{ProtocolVersion: 2, ChainID: 1, Contract: addressTestVault, NoteLeaf: "0x9", StateKeyX: "0x1", StateKeyY: "0x2", ClearanceKeyX: "0x3", ClearanceKeyY: "0x4", NoteID: 12, DepositAmount: withdrawalTestDeposit, ExpiryTs: 1_786_060_800, FinalBalance: stateBalance - conceded, Destination: decoded, Nullifier: "0x123", Kind: 0, NextNullifier: "0x456", Conceded: conceded, ValidUntil: uint64(time.Now().Unix()) + exitProofValidity}
 	plan.Proof.Backend = "groth16_bn254"
 	plan.Proof.Proof = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 256))
 	return plan
 }
 
-// Design §6.7: the escape calldata is the 16-word tuple (836 bytes); kind
-// 0; a successor nullifier that is set and differs from the nullifier;
+// Design §6.7: the escape calldata is the 16-word tuple (836 bytes) of vault
+// revision 4, with the note leaf as word 3 and the packed note fields as
+// word 8; kind 0; a successor nullifier that is set and differs from the
+// nullifier;
 // word 9 + word 14 equal to the companion-reported state balance; word 14
 // equal to the concession the owner confirmed, at most the bound unless
 // zero; valid_until in the signing window; and the binding over words[:16].
@@ -87,12 +89,15 @@ func TestEscapeCalldataChecksEveryWord(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := hex.DecodeString(data[2:])
-	if len(raw) != 836 || hex.EncodeToString(raw[:4]) != "a38d62aa" || escapeSelector != "a38d62aa" {
+	if len(raw) != 836 || hex.EncodeToString(raw[:4]) != "8cd67c60" || escapeSelector != "8cd67c60" {
 		t.Fatalf("escape calldata is %d bytes with selector %x", len(raw), raw[:4])
 	}
 	word := func(i int) *big.Int { return new(big.Int).SetBytes(raw[4+i*32 : 4+(i+1)*32]) }
 	if word(9).Uint64()+word(14).Uint64() != 99999 || word(14).Uint64() != 700 || word(12).Sign() != 0 || word(16).Uint64() != 17*32 || word(17).Uint64() != 256 {
 		t.Fatal("wrong escape words")
+	}
+	if word(3).Uint64() != 9 || word(8).Cmp(noteFields(12, withdrawalTestDeposit, 1_786_060_800)) != 0 {
+		t.Fatalf("wrong note words: leaf %x, fields %x", word(3), word(8))
 	}
 	if err := validateSignedEscape(raw, config, expected, time.Now()); err != nil {
 		t.Fatal(err)
@@ -109,6 +114,12 @@ func TestEscapeCalldataChecksEveryWord(t *testing.T) {
 		"other chain":            func(p *escapePlan) { p.PublicInputs.ChainID = 11155111 },
 		"other vault":            func(p *escapePlan) { p.PublicInputs.Contract = addressTestToken },
 		"other note":             func(p *escapePlan) { p.PublicInputs.NoteID = 13 },
+		"zero leaf":              func(p *escapePlan) { p.PublicInputs.NoteLeaf = "0x0" },
+		"leaf not a field":       func(p *escapePlan) { p.PublicInputs.NoteLeaf = fieldWord(bn254ScalarModulus) },
+		"no deposit amount":      func(p *escapePlan) { p.PublicInputs.DepositAmount = 0 },
+		"deposit above 2^53-1":   func(p *escapePlan) { p.PublicInputs.DepositAmount = maxSafeNoteAmount + 1 },
+		"deposit below balance":  func(p *escapePlan) { p.PublicInputs.DepositAmount = 99998 },
+		"no expiry":              func(p *escapePlan) { p.PublicInputs.ExpiryTs = 0 },
 		"expired":                func(p *escapePlan) { p.PublicInputs.ValidUntil = uint64(time.Now().Unix()) - 1 },
 		"too far in the future":  func(p *escapePlan) { p.PublicInputs.ValidUntil += exitProofClockAllowance + 60 },
 		"short proof":            func(p *escapePlan) { p.Proof.Proof = "AA==" },
@@ -127,16 +138,24 @@ func TestEscapeCalldataChecksEveryWord(t *testing.T) {
 	if _, _, err := escapeCalldata(testEscapePlan(0, 99999, withdrawalTestDestination), config, saved(0), time.Now()); err != nil {
 		t.Errorf("a zero concession refused: %v", err)
 	}
-	// A re-proof keeps the binding unless another bound input changed.
+	// A re-proof keeps the binding unless another bound input changed: the
+	// note leaf and fields are bound, only valid_until is not.
 	reproof := testEscapePlan(700, 99999, withdrawalTestDestination)
-	reproof.PublicInputs.ActiveRoot, reproof.PublicInputs.ValidUntil = "0xb", reproof.PublicInputs.ValidUntil+5
+	reproof.PublicInputs.ValidUntil += 5
 	if _, again, err := escapeCalldata(reproof, config, expected, time.Now()); err != nil || again.Binding != expected.Binding {
-		t.Fatalf("a re-proof at another root changed the binding: %v", err)
+		t.Fatalf("a re-proof with a fresh lifetime changed the binding: %v", err)
 	}
-	other := testEscapePlan(700, 99999, withdrawalTestDestination)
-	other.PublicInputs.StateKeyX = "0x77"
-	if _, _, err := escapeCalldata(other, config, expected, time.Now()); err == nil {
-		t.Fatal("a changed signing key kept the binding")
+	for name, mutate := range map[string]func(*withdrawalInputs){
+		"signing key": func(p *withdrawalInputs) { p.StateKeyX = "0x77" },
+		"note leaf":   func(p *withdrawalInputs) { p.NoteLeaf = "0xb" },
+		"deposit":     func(p *withdrawalInputs) { p.DepositAmount++ },
+		"expiry":      func(p *withdrawalInputs) { p.ExpiryTs += vaultExpiryBucket },
+	} {
+		other := testEscapePlan(700, 99999, withdrawalTestDestination)
+		mutate(&other.PublicInputs)
+		if _, _, err := escapeCalldata(other, config, expected, time.Now()); err == nil {
+			t.Errorf("a changed %s kept the binding", name)
+		}
 	}
 	// Signed bytes are checked against the saved confirmation alone too (a
 	// resumed transaction has no plan): payout plus concession must be its
@@ -153,7 +172,7 @@ func TestEscapeCalldataChecksEveryWord(t *testing.T) {
 		}
 	}
 	// Every word of the signed bytes is checked.
-	for _, index := range []int{0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 16, 17, 4, 15} {
+	for _, index := range []int{0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 16, 17, 4, 15} {
 		tampered := append([]byte(nil), raw...)
 		tampered[4+index*32+31] ^= 1
 		if validateSignedEscape(tampered, config, expected, time.Now()) == nil {
@@ -287,7 +306,7 @@ func escapeEndToEnd(t *testing.T, pinnedDown bool) *withdrawalFixture {
 	}
 	record := f.journal(t)
 	initiate := f.accepted[record.Pending.Hash]
-	if hex.EncodeToString(initiate.Data()[:4]) != "a38d62aa" || len(initiate.Data()) != 836 || initiate.Value().Sign() != 0 {
+	if hex.EncodeToString(initiate.Data()[:4]) != "8cd67c60" || len(initiate.Data()) != 836 || initiate.Value().Sign() != 0 {
 		t.Fatal("not an initiateEscapeWithdrawal call")
 	}
 	if len(f.escape.submitted) != 1 || !strings.EqualFold(f.escape.submitted[0], record.Pending.Hash) {

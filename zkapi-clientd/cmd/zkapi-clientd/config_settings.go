@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
@@ -33,6 +34,40 @@ unless explicitly replaced or cleared. Vault changes are a separate operation.
 The former set-* commands have been removed.
 `
 
+// Options configure accepts with --setup: the profile options it applies before
+// preparing the wallet, the deposit amount and its own selectors.
+var setupFlags = map[string]bool{
+	"setup": true, "usd": true, "edit": true, "menu": true, "api-key": true, "status": true,
+	"network": true, "listen": true, "relay-url": true, "zkapi-binary": true, "proof-setup-dir": true,
+	"exit-rpc-url": true, "bundler-url": true, "withdrawal-fees": true,
+	"key-reuse-window-seconds": true, "require-api-key": true, "web-search": true,
+}
+
+// configFlagNames returns the flag names in args, stopping at "--". Values
+// never start with "-" in these commands, so a bare word is a flag value.
+func configFlagNames(args []string) map[string]bool {
+	names := map[string]bool{}
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			continue
+		}
+		names[strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]] = true
+	}
+	return names
+}
+
+func sortedFlagNames(names map[string]bool) []string {
+	sorted := make([]string, 0, len(names))
+	for name := range names {
+		sorted = append(sorted, name)
+	}
+	sort.Strings(sorted)
+	return sorted
+}
+
 // Handle profile-only settings before protocol dispatch. The same editor serves
 // both engines, even if a protocol artifact is absent; it never starts a wallet.
 // Vault preference keeps its existing separately locked storage, so old profiles
@@ -48,6 +83,22 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 			err = nil
 		}
 		return true, err
+	}
+	// Wallet setup is explicit. --setup (with its --usd amount) and the
+	// interactive selectors belong to configure, which accepts the network,
+	// listener, transport and companion options beside them; it then rejects
+	// mixed selectors itself. A settings-only edit never prepares or funds.
+	names := configFlagNames(args)
+	if names["setup"] || names["usd"] || names["edit"] || names["menu"] || names["api-key"] {
+		for _, name := range sortedFlagNames(names) {
+			if !setupFlags[name] {
+				return true, fmt.Errorf("--%s is a saved setting, not a wallet setup option; save it with config --%s first, then run config --setup; nothing saved", name, name)
+			}
+		}
+		if names["usd"] && !names["setup"] && len(names) > 1 {
+			return true, errors.New("--usd is the new-deposit amount for wallet setup; add --setup to prepare and fund, or omit --usd to save settings only; nothing saved")
+		}
+		return false, nil
 	}
 	selected := false
 	for _, arg := range args {

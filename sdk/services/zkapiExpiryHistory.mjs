@@ -1,6 +1,7 @@
-// ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount, uint256 newRoot)
-// claimExpired closes the note and sends its entire deposit to the service treasury.
-export const EXPIRED_CLAIMED_TOPIC = '0x5534ce4a9fb7fe545375064cc186660ac10ba2152cb1592b29b244d2fe169ae4';
+// ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount) (vault revision 4: no root word)
+// claimExpired(noteId, commitment, amount, expiryTs) closes the note and sends its entire
+// deposit to the service treasury.
+export const EXPIRED_CLAIMED_TOPIC = '0xe5962fdd811b0b8d9b9cdaf37e396f36dd238f127d52ef65ae07d96edb32fd96';
 const HASH = /^0x[0-9a-f]{64}$/i;
 const ADDRESS = /^0x[0-9a-f]{40}$/i;
 const QUANTITY = /^0x(?:0|[1-9a-f][0-9a-f]*)$/i;
@@ -65,7 +66,7 @@ function parsedLog(log, vaultAddress, from, to) {
     // Once an event matches the public vault/topic, dropping malformed data
     // would permanently skip a possible claim when the caller saves its cursor.
     if (log.removed !== false || !Array.isArray(log.topics) || log.topics.length !== 2
-        || !HASH.test(log.topics[1]) || !/^0x[0-9a-f]{128}$/i.test(log.data || '')
+        || !HASH.test(log.topics[1]) || !/^0x[0-9a-f]{64}$/i.test(log.data || '')
         || !HASH.test(log.transactionHash || '') || !HASH.test(log.blockHash || '')) {
         throw new ExpiryHistoryValidationError('The RPC returned a malformed or removed expiry event. Retry the scan.');
     }

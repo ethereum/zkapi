@@ -50,7 +50,7 @@ tempfile = { workspace = true }
 # release build (resolver 2).
 zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof", features = ["dev-setup", "dev-fixtures"] }
 # The scripts/v2-acceptance.mjs wallet driver (examples/v2_acceptance_wallet.rs)
-# runs the browser wallet core of circuit zkapi-v2-concession-v1. A
+# runs the browser wallet core of circuit zkapi-v2-concession-v2. A
 # dev-dependency: never part of a server build.
 zkapi-browser = { path = "../../protocol/rust/crates/zkapi-browser" }
 # The driver's `spend_refused_successor` synthesizes the request circuit for a

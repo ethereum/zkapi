@@ -43,6 +43,9 @@ func withdrawalTestStatus(phase string) map[string]any {
 		"token_address": "", "token_decimals": 9, "billing_asset": "native_eth", "billing_unit": "gwei", "native_asset_wei_per_unit": "1000000000",
 		"eth_balance": "1000000000000000", "private_balance": 99971, "amount": 99971,
 		"note_id": 58, "phase": phase, "message": "Withdrawal progress saved locally.",
+		// A current daemon on a deployment without sponsorship; tests of the
+		// payout-only flow set "payout", tests of an older daemon remove it.
+		"new_withdrawal_fees": "wallet",
 	}
 	if phase != "ready" && phase != "no_note" {
 		state["destination"] = withdrawalTestDestination
@@ -431,7 +434,7 @@ func TestInferenceConflictDistinguishesWithdrawalFromUnknownConflict(t *testing.
 			bridge := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/oa/v1/status":
-					_ = json.NewEncoder(w).Encode(map[string]any{"bridge_version": 5, "chain_id": 1, "mode": "direct_openrouter", "require_oa_org_key_source": true, "deployment_id": "zkapi-native-eth-mainnet-concession-v1-test", "contract_address": "0xC0C0000000000000000000000000000000000001", "billing_asset": "native_eth", "billing_unit": "gwei", "circuit_id": "zkapi-v2-concession-v1", "exit_concession": 1, "setup_id": "dev", "escape_routes_version": 2})
+					_ = json.NewEncoder(w).Encode(map[string]any{"bridge_version": 5, "chain_id": 1, "mode": "direct_openrouter", "require_oa_org_key_source": true, "deployment_id": "zkapi-native-eth-mainnet-concession-v1-test", "contract_address": "0xC0C0000000000000000000000000000000000001", "billing_asset": "native_eth", "billing_unit": "gwei", "circuit_id": "zkapi-v2-concession-v2", "exit_concession": 1, "setup_id": "dev", "escape_routes_version": 2})
 				case "/oa/v1/lease":
 					body, _ := io.ReadAll(r.Body)
 					if string(body) != `{"request_limit_micro_usd":1000000}` {

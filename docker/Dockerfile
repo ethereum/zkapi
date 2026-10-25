@@ -36,10 +36,10 @@ WORKDIR /srv/zkapi
 COPY --from=builder /app/target/release/zkapi /usr/local/bin/zkapi
 COPY --from=builder /app/target/release/zkapi-indexerd /usr/local/bin/zkapi-indexerd
 COPY --from=builder /app/target/release/zkapi-challenged /usr/local/bin/zkapi-challenged
-# The setup of circuit zkapi-v2-concession-v1 the daemons load. By default the
-# ceremony setup: a release build loads only its pinned mpc-1 keys, which
-# G-SETUP commits, and until then the daemons refuse to start. With
-# ALLOW_DEV_SETUP=1, the single-party development setup.
+# The setup of circuit zkapi-v2-concession-v2 (vault revision 4) the daemons
+# load. By default the ceremony setup: a release build loads only its pinned
+# mpc-1 keys, which G-SETUP commits, and until then the daemons refuse to
+# start. With ALLOW_DEV_SETUP=1, the single-party development setup.
 COPY --from=builder /app/protocol/setup/v2-concession${ALLOW_DEV_SETUP:+-dev} /srv/zkapi/protocol/setup/v2-concession${ALLOW_DEV_SETUP:+-dev}
 ENV ZKAPI_PROOF_SETUP_DIR=/srv/zkapi/protocol/setup/v2-concession${ALLOW_DEV_SETUP:+-dev}
 

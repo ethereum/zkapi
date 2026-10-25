@@ -6,9 +6,10 @@
 //! lock is set, the request journal and archive are read and the server is
 //! asked, with no request preparation in between. Operator calls are bounded
 //! (E0: 20 s each, 120 s per recovery pass, none after `must_initiate_by`);
-//! the escape needs no operator at all: its Merkle path is the one saved at
-//! deposit (Amendment A1), else the indexer's at a root the vault knows, else
-//! a rebuild from the vault's logs (§6.6).
+//! the escape needs no operator at all, and since vault revision 4 no Merkle
+//! path, root, indexer or log scan either: the proof carries the note's leaf
+//! and fields, and the vault compares them with the leaf it stored at
+//! deposit.
 
 use std::time::Duration;
 
@@ -31,7 +32,6 @@ use super::{
 use crate::chain::{self, Rpc};
 use crate::config::AuthConfig;
 use crate::error::AuthError;
-use crate::indexer::IndexerClient;
 
 pub(crate) const ESCAPE_RECORD_FILE: &str = "escape_withdrawal.json";
 
@@ -243,9 +243,17 @@ pub(crate) async fn recovery_pass_with_response(
     }
 }
 
-/// E0's `E_low`, reading `effectiveExpiry` through the pinned RPC and the
-/// user's exit RPC when one is configured; any failure leaves `expiry_ts`.
-async fn e_low(config: &AuthConfig, note_id: u32, expiry_ts: u64) -> u64 {
+/// E0's `E_low`, reading `effectiveExpiry(noteId, commitment, amount,
+/// expiryTs)` through the pinned RPC and the user's exit RPC when one is
+/// configured; any failure, or a 0 for a preimage that does not reproduce the
+/// stored leaf, leaves `expiry_ts`.
+async fn e_low(
+    config: &AuthConfig,
+    note_id: u32,
+    commitment: Felt252,
+    amount: u128,
+    expiry_ts: u64,
+) -> u64 {
     let Some(exit_url) = config.exit_rpc_url.as_deref() else {
         return expiry_ts;
     };
@@ -256,7 +264,9 @@ async fn e_low(config: &AuthConfig, note_id: u32, expiry_ts: u64) -> u64 {
         let url = url.map(str::to_string);
         async move {
             let rpc = Rpc::new(url.as_deref()?).ok()?.on_chain(config.chain_id);
-            chain::effective_expiry(&rpc, &vault, note_id).await.ok()
+            chain::effective_expiry(&rpc, &vault, note_id, &commitment, amount, expiry_ts)
+                .await
+                .ok()
         }
     };
     let (pinned, exit) = tokio::join!(read(config.demo_rpc_url.as_deref()), read(Some(exit_url)));
@@ -267,7 +277,7 @@ async fn e_low(config: &AuthConfig, note_id: u32, expiry_ts: u64) -> u64 {
 /// is configured, otherwise the pinned RPC (§1.2(6), §6.7). The pinned RPC is
 /// operator-influenced (§2.1), so when the owner named an RPC of their own it
 /// is never asked in its place, even when that one fails: what it answered
-/// would decide what is proved and signed (the root, the start block) or the
+/// would decide what is proved and signed (the start block) or the
 /// escape's state (pending, closed, defeated), and the lock's release (E5,
 /// E6). A failing exit RPC is reported; the owner retries or names another.
 /// Every reading must come from the deployment's chain: an RPC on another
@@ -309,8 +319,16 @@ pub(crate) async fn decide(
     recover: bool,
 ) -> Result<Decided, AuthError> {
     let state = wallet.state().ok_or(AuthError::NoActiveNote)?.clone();
-    let must_initiate_by =
-        exit_policy::must_initiate_by(e_low(config, state.note_id, state.expiry_ts).await);
+    let must_initiate_by = exit_policy::must_initiate_by(
+        e_low(
+            config,
+            state.note_id,
+            zkapi_core::v2::registration_commitment(&state.secret_s),
+            state.deposit_amount,
+            state.expiry_ts,
+        )
+        .await,
+    );
     let installed = if recover {
         recovery_pass_with_response(wallet, must_initiate_by)
             .await
@@ -386,76 +404,6 @@ fn wallet_holds_request(wallet: &Wallet, client_request_id: &str) -> Result<bool
         .records
         .iter()
         .any(|record| record.journal.client_request_id == client_request_id))
-}
-
-/// Where an escape's Merkle path came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PathSource {
-    Deposit,
-    Indexer,
-    Rebuild,
-}
-
-/// E4 step 1: a path at a root the vault knows, without the operator when
-/// possible.
-pub(crate) async fn escape_path(
-    config: &AuthConfig,
-    indexer: &IndexerClient,
-    wallet: &Wallet,
-) -> Result<(Felt252, Vec<Felt252>, PathSource), AuthError> {
-    if let Some(path) = wallet.deposit_path() {
-        return Ok((path.root, path.siblings.clone(), PathSource::Deposit));
-    }
-    let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
-    let leaf = wallet.current_note_leaf().ok_or(AuthError::NoActiveNote)?;
-    let vault = chain::vault_address(&config.contract_address)?;
-    let rpcs: Vec<Rpc> = deciding_rpc(config).into_iter().collect();
-    // The indexer's path, at a root the vault confirms it held.
-    let from_indexer = async {
-        let (root, siblings) = indexer.root_and_path(state.note_id).await.ok()?;
-        let array: [Felt252; zkapi_types::MERKLE_DEPTH] = siblings.clone().try_into().ok()?;
-        if zkapi_core::v2::merkle_root(state.note_id, &leaf, &array) != root {
-            return None;
-        }
-        for rpc in &rpcs {
-            if matches!(
-                chain::known_root(rpc, &vault, &root, "latest").await,
-                Ok(true)
-            ) {
-                return Some((root, siblings));
-            }
-        }
-        None
-    };
-    if let Ok(Some((root, siblings))) = tokio::time::timeout(CALL_TIMEOUT * 2, from_indexer).await {
-        return Ok((root, siblings, PathSource::Indexer));
-    }
-    // §6.6: rebuild from the vault's logs up to the finalized block.
-    let mut last_error = AuthError::Wallet(
-        "no Merkle path: no saved deposit path, the indexer's path is not at a root the vault knows, and no RPC is configured for a rebuild".into(),
-    );
-    for rpc in &rpcs {
-        let rebuilt = async {
-            let (finalized, _) = rpc.block("finalized").await?;
-            let logs = rpc
-                .logs(
-                    &vault,
-                    json!([zkapi_client::tree::TREE_TOPICS]),
-                    config.deploy_block,
-                    finalized,
-                )
-                .await?;
-            zkapi_client::tree::path_from_logs(&logs, &vault, state.note_id, &leaf)
-                .map_err(|error| AuthError::Wallet(error.to_string()))
-        }
-        .await;
-        match rebuilt {
-            Ok((root, siblings)) => return Ok((root, siblings, PathSource::Rebuild)),
-            Err(error) => last_error = error,
-        }
-    }
-    Err(last_error)
 }
 
 /// E4 step 2: the stale-device pre-check. A request proof at `N⁺` that
@@ -619,7 +567,6 @@ impl AuthService {
         let mut lease = self.direct_lease.lock().await;
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
-        let indexer = self.indexer.clone();
         let early_exit = request.early_exit;
         let result = spawn_blocking(move || {
             let _guard = wallet_mutex
@@ -629,7 +576,6 @@ impl AuthService {
             let mut wallet = load_wallet(&config)?;
             current_thread_runtime()?.block_on(prepare_escape_locked(
                 &config,
-                &indexer,
                 &mut wallet,
                 destination,
                 confirmed,
@@ -762,7 +708,6 @@ impl AuthService {
 
 async fn prepare_escape_locked(
     config: &AuthConfig,
-    indexer: &IndexerClient,
     wallet: &mut Wallet,
     destination: [u8; 20],
     confirmed: Option<u128>,
@@ -791,7 +736,6 @@ async fn prepare_escape_locked(
     }
     let result = decide_and_prove_escape(
         config,
-        indexer,
         wallet,
         destination,
         destination_hex,
@@ -812,7 +756,6 @@ async fn prepare_escape_locked(
 
 async fn decide_and_prove_escape(
     config: &AuthConfig,
-    indexer: &IndexerClient,
     wallet: &mut Wallet,
     destination: [u8; 20],
     destination_hex: String,
@@ -858,7 +801,6 @@ async fn decide_and_prove_escape(
             return Err(AuthError::ConcededMismatch(value));
         }
         wallet.set_exit_lock(ExitMode::Escape)?;
-        let (root, siblings, path_source) = escape_path(config, indexer, wallet).await?;
         let successor = wallet
             .current_successor_nullifier()
             .ok_or(AuthError::NoActiveNote)?;
@@ -876,8 +818,7 @@ async fn decide_and_prove_escape(
             }
         }
         let bound = wallet.state().map_or(0, |state| state.bound_at_state);
-        let (public_inputs, proof) =
-            wallet.withdrawal_escape_hatch(destination, conceded, root, siblings)?;
+        let (public_inputs, proof) = wallet.withdrawal_escape_hatch(destination, conceded)?;
         let mut warnings = advisory_warnings(
             config,
             &public_inputs.withdrawal_nullifier,
@@ -914,7 +855,6 @@ async fn decide_and_prove_escape(
         };
         save_record(config, &record)?;
         let mut plan = plan_json(&record, config, &warnings);
-        plan["path_source"] = serde_json::to_value(path_source).unwrap_or_default();
         plan["must_initiate_by"] = json!(decided.facts.must_initiate_by);
         return Ok(plan);
     }

@@ -24,8 +24,11 @@ import (
 // one on chain: the runtime code of the vault, its proof adapter and the
 // Poseidon library hash to the build's pins, the vault names the pinned
 // adapter, and the vault's and adapter's getters return the pinned keys,
-// periods, versions, circuit and verifying keys. A mismatch refuses deposits
-// (deployment_mismatch); exits stay allowed.
+// periods, versions (CONCESSION_ESCAPE_VERSION() and, for vault revision 4,
+// LEAF_BOUND_EXIT_VERSION(), both 1), minimum deposit, circuit and verifying
+// keys. A vault of revision 3 has no LEAF_BOUND_EXIT_VERSION() and fails the
+// check. A mismatch refuses deposits (deployment_mismatch); exits stay
+// allowed.
 
 // errDeploymentMismatch prefixes every failed deployment check.
 var errDeploymentMismatch = errors.New("deployment_mismatch")
@@ -41,7 +44,8 @@ const (
 	selectorNoteTTL                 = "0x225af2e7"
 	selectorMaxPauseDuration        = "0x64433d27"
 	selectorConcessionEscapeVersion = "0x5e00b426"
-	selectorRootHistoryWindow       = "0x1fe72de0"
+	selectorLeafBoundExitVersion    = "0xc0baafb1"
+	selectorMinDeposit              = minDepositSelector
 	selectorCircuitIDHash           = "0xda0e8385"
 	selectorRequestVKHash           = "0xfe351488"
 	selectorWithdrawalVKHash        = "0x7fcd0926"
@@ -95,13 +99,27 @@ func (r rpcCaller) call(ctx context.Context, method string, params []any, result
 	}
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
-		Error  json.RawMessage `json:"error"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	if json.Unmarshal(raw, &envelope) != nil || len(envelope.Error) != 0 || len(envelope.Result) == 0 || json.Unmarshal(envelope.Result, result) != nil {
+	if json.Unmarshal(raw, &envelope) != nil {
+		return fmt.Errorf("invalid answer from the RPC %s", r.url)
+	}
+	if envelope.Error != nil && (envelope.Error.Code == 3 || strings.Contains(strings.ToLower(envelope.Error.Message), "revert")) {
+		return fmt.Errorf("%w: the RPC %s", errCallReverted, r.url)
+	}
+	if envelope.Error != nil || len(envelope.Result) == 0 || json.Unmarshal(envelope.Result, result) != nil {
 		return fmt.Errorf("invalid answer from the RPC %s", r.url)
 	}
 	return nil
 }
+
+// errCallReverted is an eth_call the node executed and that reverted: a
+// getter the pinned deployment has is missing (a vault before revision 4
+// has no LEAF_BOUND_EXIT_VERSION() or minDeposit()).
+var errCallReverted = errors.New("the call reverted")
 
 func (r rpcCaller) word(ctx context.Context, to, data string) (string, error) {
 	var result string
@@ -171,12 +189,16 @@ func verifyDeploymentCode(ctx context.Context, client *http.Client, rpcURL strin
 		{"noteTtl()", d.Contract, selectorNoteTTL, uintWord(d.NoteTTL)},
 		{"maxPauseDuration()", d.Contract, selectorMaxPauseDuration, uintWord(d.MaxPauseDuration)},
 		{"CONCESSION_ESCAPE_VERSION()", d.Contract, selectorConcessionEscapeVersion, uintWord(1)},
-		{"ROOT_HISTORY_WINDOW()", d.Contract, selectorRootHistoryWindow, uintWord(86400)},
+		{"LEAF_BOUND_EXIT_VERSION()", d.Contract, selectorLeafBoundExitVersion, uintWord(1)},
+		{"minDeposit()", d.Contract, selectorMinDeposit, uintWord(d.MinDepositUnits)},
 		{"the adapter's CIRCUIT_ID_HASH()", d.ProofAdapter, selectorCircuitIDHash, circuitHash},
 		{"the adapter's REQUEST_VK_HASH()", d.ProofAdapter, selectorRequestVKHash, addressABIWord(strings.ToLower(d.Proof.RequestVKKeccak256))},
 		{"the adapter's WITHDRAWAL_VK_HASH()", d.ProofAdapter, selectorWithdrawalVKHash, addressABIWord(strings.ToLower(d.Proof.WithdrawalVKKeccak256))},
 	} {
 		got, err := rpc.word(ctx, getter.contract, getter.selector)
+		if errors.Is(err, errCallReverted) {
+			return mismatch(getter.label + ", which reverted,")
+		}
 		if err != nil {
 			return err
 		}

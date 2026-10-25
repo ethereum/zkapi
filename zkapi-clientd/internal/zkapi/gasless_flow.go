@@ -166,6 +166,21 @@ type gaslessRefusal struct {
 
 func (e *gaslessRefusal) Error() string { return e.Code + ": " + e.Message }
 
+// Refusal codes the management API names for the payout-only withdrawal.
+const (
+	// A new withdrawal on a deployment with reviewed gasless support asked
+	// for a wallet-paid fee; only the payout pays it.
+	CodeWalletFeesUnavailable = "wallet_fees_unavailable"
+	// The operation needed now would exceed the authorized maximum fee (or
+	// a raised flat fee or debt); the authorization holds and a later retry
+	// may fit, or a new quote authorizes a new maximum.
+	CodeFeeAboveAuthorization = "fee_above_authorization"
+	// The payout address cannot receive a sponsored payout.
+	CodeInvalidPayee = "invalid_payee"
+	// The approved quote was replaced or no longer matches the withdrawal.
+	CodeQuoteChanged = "quote_changed"
+)
+
 func refuse(code, format string, args ...any) error {
 	return &gaslessRefusal{Code: code, Message: fmt.Sprintf(format, args...)}
 }
@@ -249,15 +264,23 @@ func (h *FundingHandler) ensureGaslessChecked(ctx context.Context) error {
 // never accepts as a payee.
 var errGaslessPayee = errors.New("invalid_payee")
 
+// maxPrecompilePayee is the highest address the factory reserves for
+// precompiles (0x01-0x11 and P256VERIFY at 0x100 today, zero included).
+var maxPrecompilePayee = big.NewInt(0xffff)
+
 // checkGaslessPayee applies the factory's InvalidPayee rule
 // (ZkApiWithdrawalAccountFactory.createAccount reverts for the zero
-// address, the vault, the paymaster, the EntryPoint and the factory
-// itself): getAddress is pure and derives a transit account for such a
-// payee too, but that account can never be created, so a proof bound to it
-// would strand the payout (no sponsored operation, no sweep). The payout
-// address is refused before anything is reserved.
+// address and every other address up to 0xffff, the precompiles' range,
+// the vault, the paymaster, the EntryPoint and the factory itself):
+// getAddress is pure and derives a transit account for such a payee too,
+// but that account can never be created, so a proof bound to it would
+// strand the payout (no sponsored operation, no sweep). The payout address
+// is refused before anything is reserved.
 func checkGaslessPayee(profile gaslessProfile, vault, payee string) error {
 	address := common.HexToAddress(payee)
+	if new(big.Int).SetBytes(address.Bytes()).Cmp(maxPrecompilePayee) <= 0 && address != (common.Address{}) {
+		return fmt.Errorf("%w: the payout address %s is in the precompiles' range (up to 0xffff), which the transit account's factory never accepts as a payee; withdraw to another address", errGaslessPayee, address.Hex())
+	}
 	names := []struct {
 		address common.Address
 		name    string
@@ -659,7 +682,7 @@ func (h *FundingHandler) gaslessLive(ctx context.Context, env *gaslessEnvironmen
 // checkGaslessLive turns the live state into the refusals of design 3.1.
 func checkGaslessLive(live gaslessLive, kind uint8, g gaslessGasPolicy) error {
 	if live.SponsorshipPaused {
-		return refuse("sponsorship_paused", "the paymaster has paused sponsorship; use --fees wallet")
+		return refuse("sponsorship_paused", "the paymaster has paused sponsorship; retry later")
 	}
 	if kind == gaslessKindEscape && !live.EscapesEnabled {
 		return refuse("escapes_disabled", "the paymaster does not sponsor escape initiations; initiate the escape with --fees wallet, then rerun with --fees payout once it is on chain to finalize it sponsored")
@@ -668,7 +691,7 @@ func checkGaslessLive(live gaslessLive, kind uint8, g gaslessGasPolicy) error {
 		return refuse("exits_paused", "the vault is paused; exits reopen at Unix %d", live.ReopenAt)
 	}
 	if live.Attempts >= g.MaxAttempts {
-		return refuse("gasless_attempts_exhausted", "this state used its %d sponsored attempts; use --fees wallet", g.MaxAttempts)
+		return refuse("gasless_attempts_exhausted", "this state used its %d sponsored attempts", g.MaxAttempts)
 	}
 	return nil
 }
@@ -678,7 +701,7 @@ func checkGaslessLive(live gaslessLive, kind uint8, g gaslessGasPolicy) error {
 func (h *FundingHandler) checkBundler(ctx context.Context, env *gaslessEnvironment) error {
 	result, refused, err := h.bundlerCall(ctx, env.bundler, "eth_chainId", []any{})
 	if err != nil {
-		return refuse("bundler_unavailable", "the bundler %s did not answer; use --fees wallet or another --bundler-url", env.bundler)
+		return refuse("bundler_unavailable", "the bundler %s did not answer; retry later, or use another --bundler-url", env.bundler)
 	}
 	if refused == nil {
 		var chain string
@@ -708,8 +731,9 @@ func (h *FundingHandler) checkBundler(ctx context.Context, env *gaslessEnvironme
 
 // ----------------------------------------------------------------- fees and gas
 
-// gaslessFees picks the operation's fees from the latest base fee and the
-// chain's median tip by selectGaslessFees.
+// gaslessFees uses the bundler's suggested tip when available, as the SDK
+// does. The chain's validated median is the fallback; the current chain base
+// fee and the paymaster's ceilings always determine the final fee bounds.
 func (h *FundingHandler) gaslessFees(ctx context.Context, env *gaslessEnvironment, live gaslessLive) (maxFee, priority *big.Int, err error) {
 	var block struct {
 		Number string `json:"number"`
@@ -723,15 +747,56 @@ func (h *FundingHandler) gaslessFees(ctx context.Context, env *gaslessEnvironmen
 	if e1 != nil || e2 != nil || !number.IsUint64() {
 		return nil, nil, errAddressFeeData
 	}
-	var history addressFeeHistory
-	if h.addressRPC(ctx, env.config, "eth_feeHistory", []any{"0x14", block.Number, []int{50}}, &history) != nil {
-		return nil, nil, errAddressFeeData
-	}
-	tip, err := lowPriorityFee(history, number.Uint64(), base)
-	if err != nil {
-		return nil, nil, err
+	tip := h.bundlerPriorityFee(ctx, env)
+	if tip == nil {
+		var history addressFeeHistory
+		if h.addressRPC(ctx, env.config, "eth_feeHistory", []any{"0x14", block.Number, []int{50}}, &history) != nil {
+			return nil, nil, errAddressFeeData
+		}
+		tip, err = lowPriorityFee(history, number.Uint64(), base)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	return selectGaslessFees(base, tip, live.MaxFeeCeiling, live.PriorityFeeCeiling)
+}
+
+// Optional bundler extensions quote that service's tip, which can differ
+// greatly from unrelated transactions in eth_feeHistory. Only the tip is a
+// hint: never accept its maxFeePerGas instead of checking the chain's base
+// fee. Missing or malformed extensions fall back to validated chain history.
+func (h *FundingHandler) bundlerPriorityFee(ctx context.Context, env *gaslessEnvironment) *big.Int {
+	for _, method := range []string{"pimlico_getUserOperationGasPrice", "rundler_maxPriorityFeePerGas"} {
+		result, refused, err := h.bundlerCall(ctx, env.bundler, method, []any{})
+		if err != nil || refused != nil {
+			continue
+		}
+		var encoded string
+		if method == "pimlico_getUserOperationGasPrice" {
+			var tiers struct {
+				Standard struct {
+					Tip string `json:"maxPriorityFeePerGas"`
+				} `json:"standard"`
+				Fast struct {
+					Tip string `json:"maxPriorityFeePerGas"`
+				} `json:"fast"`
+			}
+			if json.Unmarshal(result, &tiers) != nil {
+				continue
+			}
+			encoded = tiers.Standard.Tip
+			if encoded == "" {
+				encoded = tiers.Fast.Tip
+			}
+		} else if json.Unmarshal(result, &encoded) != nil {
+			continue
+		}
+		tip, err := feeQuantity(encoded)
+		if err == nil && tip.BitLen() <= 128 {
+			return tip
+		}
+	}
+	return nil
 }
 
 // selectGaslessFees is the fee rule both clients share (the SDK's
@@ -748,7 +813,7 @@ func selectGaslessFees(base, tip, maxFeeCeiling, priorityFeeCeiling *big.Int) (m
 		priority.Set(priorityFeeCeiling)
 	}
 	if new(big.Int).Add(base, priority).Cmp(maxFeeCeiling) > 0 {
-		return nil, nil, refuse("gas_above_paymaster_ceiling", "the network fee (base %s wei plus tip %s wei per gas) is above the paymaster's ceiling of %s wei; sponsorship is refused during this fee spike, use --fees wallet or retry later", base, priority, maxFeeCeiling)
+		return nil, nil, refuse("gas_above_paymaster_ceiling", "the network fee (base %s wei plus tip %s wei per gas) is above the paymaster's ceiling of %s wei; sponsorship is refused during this fee spike, retry later", base, priority, maxFeeCeiling)
 	}
 	maxFee = new(big.Int).Add(new(big.Int).Mul(base, big.NewInt(2)), priority)
 	if maxFee.Cmp(maxFeeCeiling) > 0 {
@@ -962,10 +1027,10 @@ func checkGaslessAmounts(a gaslessAmounts, kind uint8, live gaslessLive, percent
 		minimum = live.MinEscapeNet
 	}
 	if a.MinimumReceived.Cmp(minimum) <= 0 || a.Payout.Sign() == 0 {
-		return refuse("payout_below_gas", "the payout (%s wei) does not cover the sponsored fee (at most %s wei, plus %s wei owed); use --fees wallet", a.Payout, a.FeeCap, a.Owed)
+		return refuse("payout_below_gas", "the payout (%s wei) does not cover the sponsored fee (at most %s wei, plus %s wei owed)", a.Payout, a.FeeCap, a.Owed)
 	}
 	if a.MaxCost.Cmp(live.MaxSponsoredCost) > 0 {
-		return refuse("gasless_refused", "the operation's maximum cost %s wei is above the paymaster's policy of %s wei; use --fees wallet", a.MaxCost, live.MaxSponsoredCost)
+		return refuse("gasless_refused", "the operation's maximum cost %s wei is above the paymaster's policy of %s wei; retry when fees are lower", a.MaxCost, live.MaxSponsoredCost)
 	}
 	if options.FeeCapGwei != 0 {
 		// The cap bounds what the payout may lose: for a contract payout
@@ -984,7 +1049,7 @@ func checkGaslessAmounts(a gaslessAmounts, kind uint8, live gaslessLive, percent
 		}
 	}
 	if !options.AllowExpensiveGas && new(big.Int).Mul(a.FeeCap, big.NewInt(100)).Cmp(new(big.Int).Mul(a.Payout, new(big.Int).SetUint64(percent))) > 0 {
-		return refuse("gasless_uneconomic", "the sponsored fee may reach %s wei, more than %d%% of the %s wei payout; pass --allow-expensive-gas to accept it, or use --fees wallet", a.FeeCap, percent, a.Payout)
+		return refuse("gasless_uneconomic", "the sponsored fee may reach %s wei, more than %d%% of the %s wei payout; pass --allow-expensive-gas to accept it, or retry when fees are lower", a.FeeCap, percent, a.Payout)
 	}
 	return nil
 }
@@ -1007,7 +1072,7 @@ func (h *FundingHandler) crossCheckQuote(ctx context.Context, env *gaslessEnviro
 		return refuse("gasless_policy_mismatch", "the paymaster's quote disagrees with the profile's gas policy; --fees payout is disabled until the profile is updated")
 	}
 	if words[4].Sign() == 0 {
-		return refuse("gasless_attempts_exhausted", "this state used its sponsored attempts; use --fees wallet")
+		return refuse("gasless_attempts_exhausted", "this state used its sponsored attempts")
 	}
 	if kind == gaslessKindEscape && words[5].Sign() == 0 {
 		return refuse("escapes_disabled", "the paymaster will not sponsor this escape (escapes disabled, the note already sponsored, or an open sponsored escape of this transit account); use --fees wallet")
@@ -1055,14 +1120,14 @@ func (h *FundingHandler) dryRunGaslessOp(ctx context.Context, env *gaslessEnviro
 	if failure, ok := decodeAAFailure(refused.revertData()); ok {
 		return &failure, nil
 	}
-	return nil, refuse("gasless_refused", "the dry run of the sponsored operation was refused by the RPC (%s); use --fees wallet or retry", strings.TrimSpace(refused.Message))
+	return nil, refuse("gasless_refused", "the dry run of the sponsored operation was refused by the RPC (%s); retry later", strings.TrimSpace(refused.Message))
 }
 
 // refusalOfFailure maps a dry run's FailedOp to a refusal (design 3.1).
 func refusalOfFailure(f aaFailure) error {
 	switch f.Code {
 	case "AA31":
-		return refuse("paymaster_underfunded", "the paymaster's deposit cannot cover this operation; retry later or use --fees wallet")
+		return refuse("paymaster_underfunded", "the paymaster's deposit cannot cover this operation; retry later")
 	case "AA32":
 		return refuse("op_window", "the operation is outside its time window (a finalization before the challenge deadline, or an expired proof); rerun later")
 	case "AA24":
@@ -1070,11 +1135,11 @@ func refusalOfFailure(f aaFailure) error {
 	}
 	switch f.Inner {
 	case "SponsorshipPaused":
-		return refuse("sponsorship_paused", "the paymaster has paused sponsorship; use --fees wallet")
+		return refuse("sponsorship_paused", "the paymaster has paused sponsorship; retry later")
 	case "AttemptsExhausted":
-		return refuse("gasless_attempts_exhausted", "this state used its sponsored attempts; use --fees wallet")
+		return refuse("gasless_attempts_exhausted", "this state used its sponsored attempts")
 	case "PayoutBelowCost":
-		return refuse("payout_below_gas", "the paymaster finds the payout too small for the sponsored fee; use --fees wallet")
+		return refuse("payout_below_gas", "the paymaster finds the payout too small for the sponsored fee")
 	case "ExitsPaused":
 		return refuse("exits_paused", "the vault is paused; rerun once exits reopen")
 	case "FeeAboveCeiling":
@@ -1084,7 +1149,7 @@ func refusalOfFailure(f aaFailure) error {
 	case "NoteNotActive", "NullifierUsed", "NotPendingEscape":
 		return refuse("note_closed", "the vault no longer accepts this exit (%s): the note may have been closed by another transaction, with the payout in the transit account; run withdraw --collect", f.Inner)
 	}
-	return refuse("gasless_refused", "the sponsored operation would fail: %s; use --fees wallet", f.String())
+	return refuse("gasless_refused", "the sponsored operation would fail: %s", f.String())
 }
 
 // ----------------------------------------------------------- quote and submit
@@ -1164,10 +1229,19 @@ func gaslessQuoteKind(w *addressWithdrawalRecord, kind uint8) string {
 func (h *FundingHandler) submitUserOperation(ctx context.Context, config fundingConfig, record *addressFundingRecord, kind uint8, vaultCall []byte) error {
 	w := record.Withdrawal
 	mode := quoteMode(ctx)
-	if mode == nil || (mode.Capture == nil && mode.Approval == nil) {
+	if mode == nil || (mode.Capture == nil && mode.Approval == nil && mode.Authorized == nil) {
 		return errors.New("review and approve a current payment quote before signing")
 	}
 	options := withdrawalOptions(ctx)
+	authorized := mode.Authorized
+	if authorized != nil {
+		// A resume under the authorization uses the bundler and the choices
+		// it was approved with, whatever the request carries.
+		if err := ValidateBundlerURL(authorized.BundlerURL); err != nil {
+			return errAddressQuoteChanged
+		}
+		options.BundlerURL, options.FeeCapGwei, options.AllowExpensiveGas = authorized.BundlerURL, authorized.FeeCapGwei, authorized.AllowExpensiveGas
+	}
 	if mode.Approval != nil {
 		// The approval binds the choices the quote was made with (the
 		// CLI's --approve carries no flags): the bundler the quote was
@@ -1193,6 +1267,29 @@ func (h *FundingHandler) submitUserOperation(ctx context.Context, config funding
 	env, err := h.gaslessEnvironment(ctx, config, record, options)
 	if err != nil {
 		return err
+	}
+	quoteKind := gaslessQuoteKind(w, kind)
+	// A payout close is approved once, under a maximum: its operation is
+	// built at the fees of the moment it is signed. Other kinds (and quotes
+	// of older builds) sign the fields their quote showed. The
+	// authorization is journaled before the bundler or the chain is asked
+	// anything: from here on a crash, a refusal or a fee change is retried
+	// under it.
+	authorizeOnce := kind == gaslessKindClose && w.Mode != "escape"
+	if mode.Approval != nil && authorizeOnce && mode.Approval.MaxTotalFeeWei != "" {
+		if err := checkGaslessApproval(record, mode.Approval, quoteKind, kind, env.account.Hex(), env.bundler); err != nil {
+			return err
+		}
+		if mode.Approval.PayoutWei != new(big.Int).Mul(new(big.Int).SetUint64(w.Amount), big.NewInt(1_000_000_000)).String() {
+			return errAddressQuoteChanged
+		}
+		if authorized, err = newGaslessAuthorization(mode.Approval, w); err != nil {
+			return err
+		}
+		w.Authorization, w.GaslessRefusal = authorized, ""
+		if err := h.saveAddress(record); err != nil {
+			return err
+		}
 	}
 	if err := env.needBundler(); err != nil {
 		return err
@@ -1224,60 +1321,206 @@ func (h *FundingHandler) submitUserOperation(ctx context.Context, config funding
 		return err
 	}
 	var fixed *gaslessGasFields
-	quoteKind := gaslessQuoteKind(w, kind)
-	if mode.Approval != nil {
+	if mode.Approval != nil && authorized == nil {
 		if fixed, err = validateGaslessApproval(record, mode.Approval, quoteKind, kind, env.account.Hex(), env.bundler); err != nil {
 			return err
 		}
 	}
-	op, err := h.buildGaslessOp(ctx, env, kind, vaultCall, nullifier, live, fixed)
-	if err != nil {
-		return err
-	}
-	// The bundler's estimate is a cross-check of the limits, which never
-	// follow it; its preVerificationGas, though, is what that bundler
-	// requires to carry the operation (pure compensation, which the
-	// paymaster does not measure), so a higher one within the cap is
-	// adopted before the amounts are quoted, and bound at approval.
-	adoptedPVG := uint64(0)
-	if mode.Capture != nil {
-		if estimate, err := h.estimateUserOperation(ctx, env, op); err != nil {
-			return err
-		} else if estimate != nil {
-			if err := checkGaslessEstimate(*estimate, env.profile.GasPolicy, kind, live.CallCap); err != nil {
-				return err
-			}
-			if estimate.PreVerificationGas > op.PreVerificationGas {
-				adoptedPVG = estimate.PreVerificationGas
-				op.PreVerificationGas = adoptedPVG
-			}
+	if authorized != nil {
+		if !authorizeOnce || usableAuthorization(w) != authorized || !authorizationMatches(authorized, record, payout, env.bundler) {
+			return errAddressQuoteChanged
+		}
+		if authorized.Rebuilds >= maxAuthorizedRebuilds {
+			authorized.revoke("gasless_rebuilds_exhausted: the withdrawal was retried the most times one approval allows")
+			return refuse("gasless_rebuilds_exhausted", "the withdrawal was retried %d times under your approval; review a new quote (zkapi-clientd withdraw --to %s)", maxAuthorizedRebuilds, w.Destination)
 		}
 	}
-	if live.Deposit.Cmp(op.maxCost()) < 0 {
-		return refuse("paymaster_underfunded", "the paymaster's deposit (%s wei) cannot cover this operation's maximum cost (%s wei); retry later or use --fees wallet", live.Deposit, op.maxCost())
+	// prepare builds the operation (without initCode when the transit
+	// account was created meanwhile) and puts it through the pricing and
+	// every check before it is signed. The dry run's rebuild goes through
+	// it again, so no copy is signed outside the bound, the policy, the
+	// deposit, the paymaster's quote or the EntryPoint's hash.
+	g := env.profile.GasPolicy
+	percent := uint64(env.profile.UneconomicFractionPercent)
+	var bound *big.Int
+	var amounts gaslessAmounts
+	prepare := func(dropInit bool) (*gaslessUserOp, common.Hash, error) {
+		op, err := h.buildGaslessOp(ctx, env, kind, vaultCall, nullifier, live, fixed)
+		if err != nil {
+			return nil, common.Hash{}, err
+		}
+		if dropInit {
+			op.InitCode = nil
+		}
+		// One charged inclusion per authorization: a copy is only ever
+		// built at the nonce of the first one signed under it. A nonce that
+		// moved since means a copy (or another operation of the account)
+		// was included; it is never moved onto a new nonce.
+		if authorized != nil && authorized.Nonce != "" && op.Nonce.String() != authorized.Nonce {
+			return nil, common.Hash{}, refuse("nonce_consumed", "the transit account's nonce moved past the one your approval signed (an operation was included); nothing more is signed under it; check the withdrawal's status, then review a new quote (zkapi-clientd withdraw --to %s)", w.Destination)
+		}
+		// The bundler's estimate is a cross-check of the limits, which never
+		// follow it; its preVerificationGas, though, is what that bundler
+		// requires to carry the operation (pure compensation, which the
+		// paymaster does not measure), so a higher one within the cap is
+		// adopted before the amounts are checked (an approval of an older
+		// quote binds the one it showed).
+		if fixed == nil {
+			// A quote asks with the probe (the paymaster verifies the proof
+			// during validation, so a bundler may decline it: the local
+			// rule's preVerificationGas then stands); once approved the
+			// real operation is estimated.
+			estimated := op
+			if mode.Capture != nil {
+				estimated = op.probe()
+			}
+			if estimate, err := h.estimateUserOperation(ctx, env, estimated); err != nil {
+				return nil, common.Hash{}, err
+			} else if estimate != nil {
+				if err := checkGaslessEstimate(*estimate, g, kind, live.CallCap); err != nil {
+					return nil, common.Hash{}, err
+				}
+				if estimate.PreVerificationGas > op.PreVerificationGas {
+					op.PreVerificationGas = estimate.PreVerificationGas
+				}
+			}
+		}
+		hasCode, isEmpty, err := h.payeeState(ctx, env)
+		if err != nil {
+			return nil, common.Hash{}, err
+		}
+		bound = nil
+		if authorizeOnce && fixed == nil {
+			bound = authorizationBound(payout, live, g, percent, hasCode, options)
+			if authorized != nil {
+				bound = authorized.wei(authorized.MaxTotalFeeWei)
+			} else if room := new(big.Int).Sub(new(big.Int).Sub(payout, live.Owed), big.NewInt(1)); bound.Cmp(room) > 0 {
+				// An accepted expensive fee still leaves the payout address
+				// something: the floor shown is never zero.
+				bound = room
+			}
+			if bound == nil || bound.Sign() <= 0 {
+				return nil, common.Hash{}, refuse("payout_below_gas", "the payout (%s wei) does not cover a sponsored fee", payout)
+			}
+			clampGaslessFees(op, live, g, bound, hasCode, op.PreVerificationGas)
+		}
+		if live.Deposit.Cmp(op.maxCost()) < 0 {
+			return nil, common.Hash{}, refuse("paymaster_underfunded", "the paymaster's deposit (%s wei) cannot cover this operation's maximum cost (%s wei); retry later", live.Deposit, op.maxCost())
+		}
+		amounts = gaslessAmountsFor(kind, payout, op, live, g, hasCode, isEmpty)
+		if authorized != nil {
+			if err := checkGaslessAuthorization(authorized, amounts, op, g); err != nil {
+				return nil, common.Hash{}, err
+			}
+		}
+		if err := checkGaslessAmounts(amounts, kind, live, percent, options); err != nil {
+			return nil, common.Hash{}, err
+		}
+		if bound != nil && authorized == nil {
+			if loss := payoutLoss(op, live.FlatFee, g, hasCode); loss.Cmp(bound) > 0 {
+				return nil, common.Hash{}, refuse("gasless_uneconomic", "the payout may lose up to %s wei to the sponsored fee now, above the %s wei limit for this withdrawal (%d%% of the payout, the paymaster's policy, or your --fee-cap-gwei); retry when fees are lower, or pass --allow-expensive-gas to accept more", loss, bound, percent)
+			}
+		}
+		if err := h.crossCheckQuote(ctx, env, kind, noteID, nullifier, op, amounts, live); err != nil {
+			return nil, common.Hash{}, err
+		}
+		// The EntryPoint's hash is checked on the probe (the operation
+		// with its exit proof made unusable), so the real proof leaves this
+		// process only after the owner's approval: the hashing it checks is
+		// the same, the call data hashed with the rest.
+		probe := op.probe()
+		if remote, err := h.gaslessWord(ctx, env, env.entryPoint, probe.getUserOpHashCalldata()); err != nil {
+			return nil, common.Hash{}, err
+		} else if common.BigToHash(remote) != probe.hash(env.entryPoint, env.config.ChainID) {
+			return nil, common.Hash{}, refuse("entry_point_hash_mismatch", "the EntryPoint hashes the operation differently than this client; nothing was signed")
+		}
+		hash := op.hash(env.entryPoint, env.config.ChainID)
+		// A quote publishes nothing executable: neither a valid owner
+		// signature (an operation signed before the approval could be
+		// relayed by whoever sees it) nor the exit proof (the vault's close
+		// is permissionless). It is checked locally and against the
+		// paymaster's public views only.
+		if mode.Capture != nil {
+			return op, hash, nil
+		}
+		if op.Signature, err = signUserOpHash(hash, env.key); err != nil {
+			return nil, common.Hash{}, err
+		}
+		return op, hash, nil
 	}
-	hasCode, isEmpty, err := h.payeeState(ctx, env)
+	op, hash, err := prepare(false)
 	if err != nil {
 		return err
 	}
-	amounts := gaslessAmountsFor(kind, payout, op, live, env.profile.GasPolicy, hasCode, isEmpty)
-	if err := checkGaslessAmounts(amounts, kind, live, uint64(env.profile.UneconomicFractionPercent), options); err != nil {
+	if mode.Capture != nil {
+		// A quote simulates nothing: handleOps would need the real proof
+		// (the paymaster verifies it during validation, before any
+		// signature check) and a valid signature, neither of which is shown
+		// before the approval. The approval's signed dry run, journaled
+		// first, checks the real operation.
+		quote, err := h.saveGaslessQuote(record, quoteKind, kind, op, amounts, env, options, bound)
+		if err != nil {
+			return err
+		}
+		*mode.Capture = quote
+		return nil
+	}
+	// The bound a re-signed copy must respect is journaled with the
+	// operation, so a resume from a fresh process enforces it: the one the
+	// approved quote showed, tightened by a cap given with the approval.
+	// Under an authorization that bound is its maximum.
+	if authorized != nil {
+		if mode.Approval == nil {
+			authorized.Rebuilds++
+		}
+	} else {
+		bound = feeBumpBound(amounts, options)
+		if approved, ok := new(big.Int).SetString(mode.Approval.FeeBumpCapWei, 10); ok && approved.Sign() > 0 && approved.Cmp(bound) < 0 {
+			bound = approved
+		}
+	}
+	// journal saves a signed copy (op_built, its bytes, hash and nonce, and
+	// every earlier copy at that nonce) before anything outside this
+	// process sees its signature, the dry run included: a crash or a lost
+	// answer from here on leaves a copy the resume recovers, never one it
+	// does not know.
+	journal := func(op *gaslessUserOp, hash common.Hash) error {
+		encoded, err := json.Marshal(op.toJSON())
+		if err != nil {
+			return errors.New("cannot encode the user operation")
+		}
+		prior, from := []string(nil), uint64(0)
+		if w.UserOp != nil && w.UserOp.Nonce == op.Nonce.String() {
+			prior, from = w.UserOp.Hashes, w.UserOp.SubmittedAtBlock
+		} else if authorized != nil {
+			prior, from = authorized.SignedHashes, authorized.FromBlock
+		}
+		w.UserOp = &addressUserOp{Kind: gaslessKindNames[kind], JSON: encoded, Hash: hash.Hex(), Nonce: op.Nonce.String(), InitCode: len(op.InitCode) != 0, BundlerURL: env.bundler, BuiltAt: time.Now().Unix(), FeeCapWei: bound.String(), FeeCapGwei: options.FeeCapGwei, AllowExpensiveGas: options.AllowExpensiveGas, Hashes: append([]string{}, prior...), SubmittedAtBlock: from}
+		w.UserOp.listHash(hash.Hex())
+		if authorized != nil {
+			if authorized.Nonce == "" {
+				authorized.Nonce = op.Nonce.String()
+			}
+			authorized.remember(w.UserOp)
+		}
+		if kind == gaslessKindClose || kind == gaslessKindEscape {
+			w.UserOp.ValidUntil = validUntilOfVaultCall(vaultCall)
+		}
+		w.Phase, w.GaslessRefusal = gaslessBuiltPhase(kind), ""
+		if w.StartBlock == 0 {
+			w.StartBlock = h.latestBlock(ctx, env.config)
+		}
+		record.Quote = nil
+		return h.saveAddress(record)
+	}
+	if err := journal(op, hash); err != nil {
 		return err
 	}
-	if err := h.crossCheckQuote(ctx, env, kind, noteID, nullifier, op, amounts, live); err != nil {
-		return err
-	}
-	hash := op.hash(env.entryPoint, env.config.ChainID)
-	if remote, err := h.gaslessWord(ctx, env, env.entryPoint, op.getUserOpHashCalldata()); err != nil {
-		return err
-	} else if common.BigToHash(remote) != hash {
-		return refuse("entry_point_hash_mismatch", "the EntryPoint hashes the operation differently than this client; nothing was signed")
-	}
-	if op.Signature, err = signUserOpHash(hash, env.key); err != nil {
-		return err
-	}
-	// The dry run, with one rebuild for a stale nonce (AA25) or an account
-	// another transaction created meanwhile (AA10).
+	// The signed dry run, with one rebuild for a stale nonce (AA25: under
+	// an authorization the pinned nonce refuses it) or an account another
+	// transaction created meanwhile (AA10); every rebuilt copy is journaled
+	// before its own dry run. A refusal stops the record with the copies
+	// kept, so a late inclusion is still found.
 	for attempt := 0; ; attempt++ {
 		failure, err := h.dryRunGaslessOp(ctx, env, op)
 		if err != nil {
@@ -1290,55 +1533,43 @@ func (h *FundingHandler) submitUserOperation(ctx context.Context, config funding
 			if fixed != nil {
 				fixed.InitCode = fixed.InitCode && failure.Code != "AA10"
 			}
-			if op, err = h.buildGaslessOp(ctx, env, kind, vaultCall, nullifier, live, fixed); err != nil {
+			if op, hash, err = prepare(failure.Code == "AA10"); err != nil {
 				return err
 			}
-			if failure.Code == "AA10" {
-				op.InitCode = nil
-			}
-			if op.PreVerificationGas < adoptedPVG {
-				op.PreVerificationGas = adoptedPVG
-			}
-			hash = op.hash(env.entryPoint, env.config.ChainID)
-			if op.Signature, err = signUserOpHash(hash, env.key); err != nil {
+			if err := journal(op, hash); err != nil {
 				return err
 			}
 			continue
 		}
 		return refusalOfFailure(*failure)
 	}
-	if mode.Capture != nil {
-		quote, err := h.saveGaslessQuote(record, quoteKind, kind, op, amounts, env, options)
-		if err != nil {
-			return err
-		}
-		*mode.Capture = quote
-		return nil
-	}
-	encoded, err := json.Marshal(op.toJSON())
-	if err != nil {
-		return errors.New("cannot encode the user operation")
-	}
-	// The bound a re-signed copy must respect is journaled with the
-	// operation, so a resume from a fresh process enforces it: the one the
-	// approved quote showed, tightened by a cap given with the approval.
-	bound := feeBumpBound(amounts, options)
-	if approved, ok := new(big.Int).SetString(mode.Approval.FeeBumpCapWei, 10); ok && approved.Sign() > 0 && approved.Cmp(bound) < 0 {
-		bound = approved
-	}
-	w.UserOp = &addressUserOp{Kind: gaslessKindNames[kind], JSON: encoded, Hash: hash.Hex(), Nonce: op.Nonce.String(), InitCode: len(op.InitCode) != 0, BundlerURL: env.bundler, BuiltAt: time.Now().Unix(), FeeCapWei: bound.String(), FeeCapGwei: options.FeeCapGwei, AllowExpensiveGas: options.AllowExpensiveGas}
-	if kind == gaslessKindClose || kind == gaslessKindEscape {
-		w.UserOp.ValidUntil = validUntilOfVaultCall(vaultCall)
-	}
-	w.Phase, w.GaslessRefusal = gaslessBuiltPhase(kind), ""
-	if w.StartBlock == 0 {
-		w.StartBlock = h.latestBlock(ctx, env.config)
-	}
-	record.Quote = nil
-	if err := h.saveAddress(record); err != nil {
-		return err
-	}
 	return h.sendUserOperation(ctx, env, record)
+}
+
+// probe is op as it may be shown outside this process before the approval
+// (the EntryPoint's hash check, a quote's gas estimate): the exit proof's
+// 256 bytes replaced (no verifier accepts them, so nothing can be closed
+// with it; every byte stays nonzero, so the calldata costs no less) and a
+// placeholder signature. The gas, the fees and the other words are op's.
+func (op *gaslessUserOp) probe() *gaslessUserOp {
+	probe := *op
+	probe.Signature = placeholderSignature()
+	if vaultCall, err := vaultCallOfTransitCallData(op.CallData); err == nil && len(vaultCall) == withdrawalCalldataLength {
+		unusable := append([]byte{}, vaultCall...)
+		for i := len(unusable) - 256; i < len(unusable); i++ {
+			unusable[i] = 0xff
+		}
+		probe.CallData = transitCallData(unusable)
+	}
+	return &probe
+}
+
+// placeholderSignature is a 65-byte signature no key makes (r = s = 0):
+// the transit account answers it with SIG_VALIDATION_FAILED.
+func placeholderSignature() []byte {
+	signature := make([]byte, 65)
+	signature[64] = 27
+	return signature
 }
 
 // validUntilOfVaultCall is word 15 of an 836-byte exit call, 0 otherwise.
@@ -1390,7 +1621,7 @@ func (h *FundingHandler) estimateUserOperation(ctx context.Context, env *gasless
 // bundler is suspect (gasless_estimate_above_cap).
 func checkGaslessEstimate(estimate GaslessQuoteGas, g gaslessGasPolicy, kind uint8, callCap uint64) error {
 	if estimate.CallGasLimit > callCap || estimate.VerificationGasLimit > g.VerificationCap || estimate.PreVerificationGas > g.PVGCap || estimate.PaymasterVerificationGasLimit > g.PMVerificationCap || estimate.PaymasterPostOpGasLimit > g.PostOpCap {
-		return refuse("gasless_estimate_above_cap", "the bundler estimates gas above the paymaster's caps; it cannot be trusted, use another --bundler-url or --fees wallet")
+		return refuse("gasless_estimate_above_cap", "the bundler estimates gas above the paymaster's caps; it cannot be trusted, use another --bundler-url")
 	}
 	return nil
 }
@@ -1399,7 +1630,7 @@ func checkGaslessEstimate(estimate GaslessQuoteGas, g gaslessGasPolicy, kind uin
 // operation's gas fields and the choices the quote was made with (the fee
 // cap, the bound on a re-signed copy, the expensive-gas acceptance), bound
 // at approval.
-func (h *FundingHandler) saveGaslessQuote(record *addressFundingRecord, quoteKind string, kind uint8, op *gaslessUserOp, a gaslessAmounts, env *gaslessEnvironment, options addressWithdrawalOptions) (AddressPaymentQuote, error) {
+func (h *FundingHandler) saveGaslessQuote(record *addressFundingRecord, quoteKind string, kind uint8, op *gaslessUserOp, a gaslessAmounts, env *gaslessEnvironment, options addressWithdrawalOptions, bound *big.Int) (AddressPaymentQuote, error) {
 	w := record.Withdrawal
 	id, err := quoteID()
 	if err != nil {
@@ -1420,6 +1651,13 @@ func (h *FundingHandler) saveGaslessQuote(record *addressFundingRecord, quoteKin
 	if a.PayeeHasCode {
 		q.PayeeHasCode, q.CreditSurchargeWei = true, a.CreditSurcharge.String()
 		q.Warnings = append(q.Warnings, gaslessPayeeAdvisory)
+	}
+	if bound != nil {
+		// Authorize once: the maximum and the floor are what is approved;
+		// the operation's own figures are this moment's estimate.
+		q.MaxTotalFeeWei, q.FeeBumpCapWei, q.FeeMayChange = bound.String(), bound.String(), true
+		q.MinNetPayoutWei = new(big.Int).Sub(new(big.Int).Sub(a.Payout, bound), a.Owed).String()
+		q.ExpiresAt = time.Now().Add(authorizedQuoteLifetime).UnixMilli()
 	}
 	if kind == gaslessKindEscape {
 		// No floor is promised for the payout of an escape initiation: its
@@ -1450,18 +1688,8 @@ const gaslessQuoteLifetime = 2 * time.Minute
 // (the one the quote was checked against is the one the signed operation
 // goes to); the gas fields and fees it carries are the ones signed.
 func validateGaslessApproval(record *addressFundingRecord, q *AddressPaymentQuote, quoteKind string, kind uint8, transit, bundler string) (*gaslessGasFields, error) {
-	w := record.Withdrawal
-	if q == nil || record.Quote == nil || record.Quote.ID != q.ID || q.FeePolicy != "payout" || q.Kind != quoteKind || q.ExpiresAt <= time.Now().UnixMilli() || q.DeploymentID != record.DeploymentID || q.ChainID != record.ChainID || !strings.EqualFold(q.Address, record.Address) || !strings.EqualFold(q.Contract, record.Contract) {
-		return nil, errAddressQuoteChanged
-	}
-	if q.BundlerURL == "" || q.BundlerURL != bundler {
-		return nil, errAddressQuoteChanged
-	}
-	if w == nil || q.NoteID != w.NoteID || q.Binding != w.Binding || !strings.EqualFold(q.Destination, w.Destination) || !strings.EqualFold(q.TransitAccount, transit) || q.UserOpKind != gaslessKindNames[kind] || q.UserOpGas == nil {
-		return nil, errAddressQuoteChanged
-	}
-	if kind != gaslessKindForward && q.Amount != w.Amount && q.Amount != w.Payout {
-		return nil, errAddressQuoteChanged
+	if err := checkGaslessApproval(record, q, quoteKind, kind, transit, bundler); err != nil {
+		return nil, err
 	}
 	maxFee, ok1 := new(big.Int).SetString(q.MaxFeePerGas, 10)
 	priority, ok2 := new(big.Int).SetString(q.MaxPriorityFeePerGas, 10)
@@ -1471,6 +1699,26 @@ func validateGaslessApproval(record *addressFundingRecord, q *AddressPaymentQuot
 	}
 	g := q.UserOpGas
 	return &gaslessGasFields{Call: g.CallGasLimit, Verification: g.VerificationGasLimit, PVG: g.PreVerificationGas, PMVerification: g.PaymasterVerificationGasLimit, PostOp: g.PaymasterPostOpGasLimit, MaxFee: maxFee, Priority: priority, FeeCap: flatFee, InitCode: g.InitCode}, nil
+}
+
+// checkGaslessApproval is the identity an approval must name: the saved
+// quote, unexpired, for this deployment, wallet, note, binding, payout
+// address, transit account, operation kind, amount and bundler.
+func checkGaslessApproval(record *addressFundingRecord, q *AddressPaymentQuote, quoteKind string, kind uint8, transit, bundler string) error {
+	w := record.Withdrawal
+	if q == nil || record.Quote == nil || record.Quote.ID != q.ID || q.FeePolicy != "payout" || q.Kind != quoteKind || q.ExpiresAt <= time.Now().UnixMilli() || q.DeploymentID != record.DeploymentID || q.ChainID != record.ChainID || !strings.EqualFold(q.Address, record.Address) || !strings.EqualFold(q.Contract, record.Contract) {
+		return errAddressQuoteChanged
+	}
+	if q.BundlerURL == "" || q.BundlerURL != bundler {
+		return errAddressQuoteChanged
+	}
+	if w == nil || q.NoteID != w.NoteID || q.Binding != w.Binding || !strings.EqualFold(q.Destination, w.Destination) || !strings.EqualFold(q.TransitAccount, transit) || q.UserOpKind != gaslessKindNames[kind] || q.UserOpGas == nil {
+		return errAddressQuoteChanged
+	}
+	if kind != gaslessKindForward && q.Amount != w.Amount && q.Amount != w.Payout {
+		return errAddressQuoteChanged
+	}
+	return nil
 }
 
 // sendUserOperation sends the journaled operation to the bundler and
@@ -1507,6 +1755,26 @@ func (h *FundingHandler) sendUserOperation(ctx context.Context, env *gaslessEnvi
 				return nil
 			}
 			return h.sendUserOperation(ctx, env, record)
+		case bundlerRefusedFees(refused) && usableAuthorization(w) != nil && kind == gaslessKindClose:
+			// Priced too low for this bundler: re-signed with higher fees
+			// within the approval's maximum, not given up.
+			var encoded gaslessUserOpJSON
+			if json.Unmarshal(u.JSON, &encoded) != nil {
+				return errors.New("the saved user operation is invalid; preserve the recovery file")
+			}
+			op, err := gaslessUserOpFromJSON(encoded)
+			if err != nil {
+				return err
+			}
+			sent := u.Hash
+			if err := h.bumpUserOperationFees(ctx, env, record, op); err != nil {
+				return err
+			}
+			if u.Hash == sent && w.Phase == gaslessBuiltPhase(kind) {
+				stopUserOperation(w, CodeFeeAboveAuthorization+": the bundler wants higher fees than the paymaster's ceilings allow now ("+message+"); it is retried under your approval")
+				return h.saveAddress(record)
+			}
+			return nil
 		default:
 			reason := "bundler_refused: " + message
 			if failure, ok := decodeAAFailure(refused.revertData()); ok {
@@ -1555,6 +1823,25 @@ func bundlerHoldsOperation(refused *rpcError) bool {
 	return false
 }
 
+// bundlerRefusedFees reports a refusal of an operation's price (its fees
+// below what the bundler accepts, or a same-nonce replacement priced too
+// low), never a validation failure.
+func bundlerRefusedFees(refused *rpcError) bool {
+	if _, ok := decodeAAFailure(refused.revertData()); ok {
+		return false
+	}
+	message := strings.ToLower(refused.Message)
+	if aaCodeInMessage.MatchString(message) {
+		return false
+	}
+	for _, phrase := range []string{"underpriced", "fee too low", "fees too low", "maxfeepergas", "maxpriorityfeepergas", "max fee per gas", "priority fee", "gas price too low"} {
+		if strings.Contains(message, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 // bundlerRefusedAA10 reports a refusal for an initCode whose sender exists.
 func bundlerRefusedAA10(refused *rpcError) bool {
 	if failure, ok := decodeAAFailure(refused.revertData()); ok {
@@ -1576,6 +1863,9 @@ var aaCodeInMessage = regexp.MustCompile(`\baa[0-9]{2}\b`)
 // inclusion is still found (lateUserOperation).
 func stopUserOperation(w *addressWithdrawalRecord, reason string) {
 	w.Phase, w.GaslessRefusal = "gasless_refused", reason
+	if !retryableRefusal(reason) {
+		w.Authorization.revoke(reason)
+	}
 	if w.UserOp != nil && gaslessKindOf(w.UserOp.Kind) == gaslessKindForward {
 		w.Phase, w.FundsWaitingInTransit = "complete", true
 	}
@@ -1602,8 +1892,38 @@ func (h *FundingHandler) resignUserOperation(ctx context.Context, env *gaslessEn
 	}
 	change(op)
 	for attempt := 0; ; attempt++ {
+		// Every re-signed copy meets the bounds of a first one before it
+		// is signed.
+		if err := h.checkReplacement(ctx, env, record, op); err != nil {
+			if GaslessRefusalCode(err) == "" {
+				return err
+			}
+			stopUserOperation(w, err.Error())
+			return h.saveAddress(record)
+		}
 		hash := op.hash(env.entryPoint, env.config.ChainID)
+		if remote, err := h.gaslessWord(ctx, env, env.entryPoint, op.getUserOpHashCalldata()); err != nil {
+			return err
+		} else if common.BigToHash(remote) != hash {
+			stopUserOperation(w, "entry_point_hash_mismatch: the EntryPoint hashes the re-signed operation differently than this client; nothing was signed")
+			return h.saveAddress(record)
+		}
 		if op.Signature, err = signUserOpHash(hash, env.key); err != nil {
+			return err
+		}
+		// Journaled before the dry run shows its signature to the RPC: the
+		// copy is the record's from here on, the earlier ones kept.
+		reencoded, err := json.Marshal(op.toJSON())
+		if err != nil {
+			return errors.New("cannot encode the user operation")
+		}
+		u.JSON, u.Hash, u.InitCode = reencoded, hash.Hex(), len(op.InitCode) != 0
+		u.listHash(hash.Hex())
+		u.SubmittedAt = 0
+		if a := usableAuthorization(w); a != nil {
+			a.remember(u)
+		}
+		if err := h.saveAddress(record); err != nil {
 			return err
 		}
 		failure, err := h.dryRunGaslessOp(ctx, env, op)
@@ -1611,30 +1931,56 @@ func (h *FundingHandler) resignUserOperation(ctx context.Context, env *gaslessEn
 			return err
 		}
 		if failure == nil {
-			break
+			return nil
 		}
 		if attempt == 0 && failure.Code == "AA10" && len(op.InitCode) != 0 {
 			op.InitCode = nil
 			continue
 		}
 		if failure.Code == "AA25" {
-			// The nonce is gone: nothing is re-signed; the resume looks for
-			// the operation that took it.
-			u.SubmittedAt = 0
-			return h.saveAddress(record)
+			// The nonce is gone: nothing more is signed; the resume looks
+			// for the operation that took it.
+			return nil
 		}
 		stopUserOperation(w, GaslessRefusalCode(refusalOfFailure(*failure))+": "+failure.String())
 		return h.saveAddress(record)
 	}
-	reencoded, err := json.Marshal(op.toJSON())
-	if err != nil {
-		return errors.New("cannot encode the user operation")
+}
+
+// checkReplacement puts a re-signed copy of a close under its authorization
+// through the bounds a first copy meets: the paymaster's policy and deposit,
+// the payout floor, and the authorization's maximum, flat fee cap and debt,
+// at the payout address's current state. Records without an authorization
+// keep the checks their re-sign paths make.
+func (h *FundingHandler) checkReplacement(ctx context.Context, env *gaslessEnvironment, record *addressFundingRecord, op *gaslessUserOp) error {
+	w := record.Withdrawal
+	a := usableAuthorization(w)
+	if a == nil || w.UserOp == nil || gaslessKindOf(w.UserOp.Kind) != gaslessKindClose {
+		return nil
 	}
-	hash := op.hash(env.entryPoint, env.config.ChainID)
-	u.JSON, u.Hash, u.InitCode = reencoded, hash.Hex(), len(op.InitCode) != 0
-	u.listHash(hash.Hex())
-	u.SubmittedAt = 0
-	return h.saveAddress(record)
+	live, err := h.gaslessLive(ctx, env, gaslessKindClose, common.Hash{})
+	if err != nil {
+		return err
+	}
+	payout, err := h.gaslessPayout(ctx, env, record, gaslessKindClose)
+	if err != nil {
+		return err
+	}
+	hasCode, isEmpty, err := h.payeeState(ctx, env)
+	if err != nil {
+		return err
+	}
+	if op.maxCost().Cmp(live.MaxSponsoredCost) > 0 {
+		return refuse(CodeFeeAboveAuthorization, "the re-signed operation's maximum cost %s wei would be above the paymaster's policy of %s wei; it is retried under your approval", op.maxCost(), live.MaxSponsoredCost)
+	}
+	if live.Deposit.Cmp(op.maxCost()) < 0 {
+		return refuse("paymaster_underfunded", "the paymaster's deposit (%s wei) cannot cover the re-signed operation's maximum cost (%s wei); retry later", live.Deposit, op.maxCost())
+	}
+	amounts := gaslessAmountsFor(gaslessKindClose, payout, op, live, env.profile.GasPolicy, hasCode, isEmpty)
+	if err := checkGaslessAuthorization(a, amounts, op, env.profile.GasPolicy); err != nil {
+		return err
+	}
+	return checkGaslessAmounts(amounts, gaslessKindClose, live, uint64(env.profile.UneconomicFractionPercent), addressWithdrawalOptions{FeeCapGwei: a.FeeCapGwei, AllowExpensiveGas: a.AllowExpensiveGas})
 }
 
 // ---------------------------------------------------------------------- follow
@@ -1695,21 +2041,87 @@ func (h *FundingHandler) findUserOperationByNonce(ctx context.Context, env *gasl
 	return "", "", nil
 }
 
-// parseUserOperationEvent finds the UserOperationEvent of one of hashes in
-// receipt: the hash, whether it succeeded and its actual gas cost.
-func parseUserOperationEvent(receipt *addressReceipt, entryPoint common.Address, hashes []string) (hash string, success bool, actualGasCost *big.Int, found bool) {
+// parseUserOperationEvent finds in receipt the EntryPoint's
+// UserOperationEvent of one of hashes that sender sent under paymaster with
+// nonce: the hash, whether it succeeded and its actual gas cost. An event
+// naming one of the hashes with another sender, paymaster or nonce is not
+// the operation's (a forged or mistaken receipt never settles a record).
+func parseUserOperationEvent(receipt *addressReceipt, entryPoint, sender, paymaster common.Address, nonce *big.Int, hashes []string) (hash string, success bool, actualGasCost *big.Int, found bool) {
+	senderTopic, paymasterTopic := "0x"+addressABIWord(strings.ToLower(sender.Hex())), "0x"+addressABIWord(strings.ToLower(paymaster.Hex()))
 	for _, log := range receipt.Logs {
-		if log.Removed || !strings.EqualFold(log.Address, entryPoint.Hex()) || len(log.Topics) != 4 || !strings.EqualFold(log.Topics[0], userOperationEventTopic) || !isHex(log.Data, 128) {
+		if log.Removed || !strings.EqualFold(log.Address, entryPoint.Hex()) || len(log.Topics) != 4 || !strings.EqualFold(log.Topics[0], userOperationEventTopic) || !strings.EqualFold(log.Topics[2], senderTopic) || !strings.EqualFold(log.Topics[3], paymasterTopic) || !isHex(log.Data, 128) {
+			continue
+		}
+		data := log.Data[2:]
+		if nonce == nil || new(big.Int).SetBytes(common.FromHex(data[:64])).Cmp(nonce) != 0 {
 			continue
 		}
 		for _, candidate := range hashes {
 			if strings.EqualFold(log.Topics[1], candidate) {
-				data := log.Data[2:]
 				return log.Topics[1], new(big.Int).SetBytes(common.FromHex(data[64:128])).Sign() != 0, new(big.Int).SetBytes(common.FromHex(data[128:192])), true
 			}
 		}
 	}
 	return "", false, nil, false
+}
+
+// bundlerReceiptTransaction asks the bundler's eth_getUserOperationReceipt
+// for each of hashes. The answer is only a hint: the transaction it names is
+// adopted when the chain's own receipt of it (eth_getTransactionReceipt)
+// carries the EntryPoint's UserOperationEvent of that very hash from the
+// transit account, under the paymaster, with the operation's nonce. "" when
+// no bundler is known, none answers, or no answer checks out.
+func (h *FundingHandler) bundlerReceiptTransaction(ctx context.Context, env *gaslessEnvironment, bundler string, nonce *big.Int, hashes []string) string {
+	if bundler == "" {
+		return ""
+	}
+	for _, hash := range hashes {
+		result, refused, err := h.bundlerCall(ctx, bundler, "eth_getUserOperationReceipt", []any{hash})
+		if err != nil || refused != nil {
+			continue
+		}
+		var receipt struct {
+			Receipt struct {
+				TransactionHash string `json:"transactionHash"`
+			} `json:"receipt"`
+		}
+		if json.Unmarshal(result, &receipt) != nil || !isHex(receipt.Receipt.TransactionHash, 32) {
+			continue
+		}
+		candidate, _, err := h.addressFinalReceipt(ctx, env.config, receipt.Receipt.TransactionHash, false)
+		if err != nil || candidate == nil {
+			continue
+		}
+		if _, _, _, found := parseUserOperationEvent(candidate, env.entryPoint, env.account, env.paymaster, nonce, []string{hash}); found {
+			return receipt.Receipt.TransactionHash
+		}
+	}
+	return ""
+}
+
+// operationNonceConsumed reads whether the EntryPoint's nonce of the transit
+// account under nonce's key has moved past nonce: then one operation with
+// that nonce (a copy of the journaled one, every copy sharing it) was
+// included. It is what settles a follow whose log search failed: an
+// unconsumed nonce proves that no copy was included, so following may go on;
+// a consumed one means a copy landed where this RPC cannot find it.
+func (h *FundingHandler) operationNonceConsumed(ctx context.Context, env *gaslessEnvironment, nonce *big.Int) (bool, error) {
+	current, err := h.gaslessWord(ctx, env, env.entryPoint, "0x"+selectorGetNonce+addressABIWord(strings.ToLower(env.account.Hex()))+addressABIWord(new(big.Int).Rsh(nonce, 64).Text(16)))
+	if err != nil {
+		return false, err
+	}
+	if new(big.Int).Rsh(current, 64).Cmp(new(big.Int).Rsh(nonce, 64)) != 0 {
+		return false, errors.New("the EntryPoint answered a nonce under another key")
+	}
+	return current.Cmp(nonce) > 0, nil
+}
+
+// errOperationNotLocated stops a follow whose sponsored operation was
+// included (its nonce is consumed) while neither the RPC's log search nor a
+// bundler receipt the chain confirms locates its transaction: nothing is
+// re-sent, re-signed or given up, and the record stays as it is.
+func errOperationNotLocated(searchErr error) error {
+	return fmt.Errorf("the sponsored operation was included (the EntryPoint consumed its nonce), but its transaction cannot be located: the RPC refused the log search (%v) and no bundler receipt was confirmed on chain. Nothing was re-sent; the withdrawal stays pending. Set an exit RPC that serves eth_getLogs (zkapi-clientd config --exit-rpc-url URL), or retry later", searchErr)
 }
 
 // parseUserOperationRevertReason names the revert of hash in receipt.
@@ -1775,13 +2187,18 @@ func parseCollected(receipt *addressReceipt, paymaster, sender common.Address) (
 }
 
 // followUserOperation follows the saved operation (design 3.3), mirroring
-// followEscapeTransaction: the bundle transaction is looked for on chain by
-// the operation's hashes (authoritative) and through the bundler's receipt
-// (a hint whose transaction must carry the event), the real receipt comes
-// from eth_getTransactionReceipt and needs finality, an operation never
-// sent (op_built) is re-sent as identical bytes, one the bundler forgot is
-// re-sent or re-signed with fees raised an eighth, every hash journaled,
-// and one whose proof is about to expire is abandoned 60 s before.
+// followEscapeTransaction: the bundle transaction is looked for through the
+// bundler's receipt (a hint, adopted only when the chain's receipt of the
+// transaction it names carries the operation's exact event) and on chain by
+// the operation's hashes; a log search that fails never keeps a confirmed
+// receipt from settling the record, and never counts as absence: the
+// EntryPoint's nonce decides (unconsumed, no copy was included and
+// following goes on; consumed, the record stays pending). The real receipt
+// comes from eth_getTransactionReceipt and needs finality, an operation
+// never sent (op_built) is re-sent as identical bytes, one the bundler
+// forgot is re-sent or re-signed with fees raised an eighth, every hash
+// journaled, and one whose proof is about to expire is abandoned 60 s
+// before.
 func (h *FundingHandler) followUserOperation(ctx context.Context, config fundingConfig, record *addressFundingRecord) (*gaslessOutcome, error) {
 	w := record.Withdrawal
 	u := w.UserOp
@@ -1819,39 +2236,35 @@ func (h *FundingHandler) followUserOperation(ctx context.Context, config funding
 	}
 	tx := u.TransactionHash
 	if tx == "" {
-		if tx, err = h.findUserOperationEvent(ctx, env, hashes, from); err != nil {
-			return nil, err
-		}
+		// The bundler's receipt first: a log search an RPC refuses (one that
+		// serves no multi-block eth_getLogs) must not keep a receipt the
+		// chain confirms from being checked.
+		tx = h.bundlerReceiptTransaction(ctx, env, env.bundler, op.Nonce, hashes)
 	}
-	if tx == "" && u.SubmittedAt != 0 && env.bundler != "" {
-		// The bundler's receipt names a transaction; only the chain decides.
-		for _, hash := range hashes {
-			result, refused, err := h.bundlerCall(ctx, env.bundler, "eth_getUserOperationReceipt", []any{hash})
-			if err != nil || refused != nil {
-				continue
-			}
-			var receipt struct {
-				Receipt struct {
-					TransactionHash string `json:"transactionHash"`
-				} `json:"receipt"`
-			}
-			if json.Unmarshal(result, &receipt) == nil && isHex(receipt.Receipt.TransactionHash, 32) {
-				if candidate, _, err := h.addressFinalReceipt(ctx, env.config, receipt.Receipt.TransactionHash, false); err == nil && candidate != nil {
-					if _, _, _, found := parseUserOperationEvent(candidate, env.entryPoint, hashes); found {
-						tx = receipt.Receipt.TransactionHash
-					}
-				}
-			}
-		}
+	var searchErr error
+	if tx == "" {
+		tx, searchErr = h.findUserOperationEvent(ctx, env, hashes, from)
 	}
-	if tx == "" && u.Ambiguous {
+	if tx == "" && searchErr == nil && u.Ambiguous {
 		candidate, included, err := h.findUserOperationByNonce(ctx, env, op.Nonce, from)
+		if err != nil {
+			searchErr = err
+		} else if candidate != "" {
+			tx, hashes = candidate, append(hashes, included)
+			u.listHash(included)
+		}
+	}
+	if tx == "" && searchErr != nil {
+		// Nothing located, and the search itself failed: absence is never
+		// inferred from it. The nonce decides whether following (a re-send
+		// of the identical bytes, a re-sign or a bump within the bound) may
+		// go on.
+		consumed, err := h.operationNonceConsumed(ctx, env, op.Nonce)
 		if err != nil {
 			return nil, err
 		}
-		if candidate != "" {
-			tx, hashes = candidate, append(hashes, included)
-			u.listHash(included)
+		if consumed {
+			return nil, errOperationNotLocated(searchErr)
 		}
 	}
 	if tx != "" {
@@ -1864,7 +2277,7 @@ func (h *FundingHandler) followUserOperation(ctx context.Context, config funding
 			u.TransactionHash, u.IncludedHash = "", ""
 			return &gaslessOutcome{}, h.saveAddress(record)
 		}
-		hash, success, _, found := parseUserOperationEvent(receipt, env.entryPoint, hashes)
+		hash, success, _, found := parseUserOperationEvent(receipt, env.entryPoint, env.account, env.paymaster, op.Nonce, hashes)
 		if !found {
 			u.TransactionHash, u.IncludedHash = "", ""
 			return &gaslessOutcome{}, h.saveAddress(record)
@@ -1891,6 +2304,9 @@ func (h *FundingHandler) followUserOperation(ctx context.Context, config funding
 		}
 		u.Revert = parseUserOperationRevertReason(receipt, env.entryPoint, hash)
 		w.Phase = "op_reverted"
+		// An included operation used one of the key's attempts: the owner
+		// decides on another (rerun --to), never an automatic retry.
+		w.Authorization.revoke("op_reverted: " + u.Revert)
 		if settlement := parsePaymasterSettlement(receipt, env.paymaster, env.account, env.payee); settlement.Credited != nil {
 			w.PayoutCredited, w.PaymasterCredited = true, true
 		}
@@ -1898,7 +2314,11 @@ func (h *FundingHandler) followUserOperation(ctx context.Context, config funding
 	}
 	now := time.Now().Unix()
 	if u.ValidUntil != 0 && now >= int64(u.ValidUntil)-int64(gaslessExpiryMargin/time.Second) {
-		stopUserOperation(w, "op_expired: the proof's lifetime ran out before the operation was included; rerun --to to prove again (a late inclusion fails harmlessly)")
+		reason := "op_expired: the proof's lifetime ran out before the operation was included; rerun --to to prove again (a late inclusion fails harmlessly)"
+		if usableAuthorization(w) != nil {
+			reason = "op_expired: the proof's lifetime ran out before the operation was included; it is proved again under your approval once the expired copy can no longer be included"
+		}
+		stopUserOperation(w, reason)
 		return &gaslessOutcome{}, h.saveAddress(record)
 	}
 	if env.journaled {
@@ -2010,7 +2430,20 @@ func (h *FundingHandler) bumpUserOperationFees(ctx context.Context, env *gasless
 	}
 	bumped := *op
 	bumped.MaxFeePerGas, bumped.MaxPriorityFeePerGas = maxFee, priority
+	// The payout address as it is now: one that gained code since the
+	// quote owes the credit surcharge, inside the bound as well.
+	hasCode, isEmpty, err := h.payeeState(ctx, env)
+	if err != nil {
+		return err
+	}
 	stop := func(reason string) error {
+		if usableAuthorization(w) != nil {
+			// Above the approval's maximum for now: the record waits (a
+			// late inclusion of the dropped copy is still followed) and is
+			// rebuilt under the approval when fees allow.
+			stopUserOperation(w, fmt.Sprintf("%s: the bundler dropped the operation %s, and re-signing it higher is not possible now: %s; it is retried under your approval", CodeFeeAboveAuthorization, u.Hash, reason))
+			return h.saveAddress(record)
+		}
 		stopUserOperation(w, fmt.Sprintf("fee_bump_needs_quote: the bundler dropped the operation %s for its fees, and re-signing it an eighth higher is not allowed: %s; rerun the command for a fresh quote at the current fees (a late inclusion of the dropped operation is harmless), or use --fees wallet", u.Hash, reason))
 		return h.saveAddress(record)
 	}
@@ -2018,9 +2451,16 @@ func (h *FundingHandler) bumpUserOperationFees(ctx context.Context, env *gasless
 	if !ok || bound.Sign() <= 0 {
 		bound = new(big.Int).Add(op.maxCost(), live.FlatFee)
 	}
-	if feeCap := new(big.Int).Add(bumped.maxCost(), live.FlatFee); feeCap.Cmp(bound) > 0 {
+	feeCap := new(big.Int).Add(bumped.maxCost(), live.FlatFee)
+	if usableAuthorization(w) != nil {
+		// The approval's maximum counts what the payout may lose.
+		feeCap = payoutLoss(&bumped, live.FlatFee, env.profile.GasPolicy, hasCode)
+	}
+	if feeCap.Cmp(bound) > 0 {
 		limit := fmt.Sprintf("the approved maximum of %s wei (a quote made with --fee-cap-gwei allows re-signing up to that cap)", bound)
-		if u.FeeCapGwei != 0 {
+		if usableAuthorization(w) != nil {
+			limit = fmt.Sprintf("the %s wei you authorized", bound)
+		} else if u.FeeCapGwei != 0 {
 			limit = fmt.Sprintf("your --fee-cap-gwei of %d gwei", u.FeeCapGwei)
 		}
 		return stop(fmt.Sprintf("the fee could reach %s wei, above %s", feeCap, limit))
@@ -2038,11 +2478,12 @@ func (h *FundingHandler) bumpUserOperationFees(ctx context.Context, env *gasless
 		}
 		return err
 	}
-	hasCode, isEmpty, err := h.payeeState(ctx, env)
-	if err != nil {
-		return err
-	}
 	amounts := gaslessAmountsFor(kind, payout, &bumped, live, env.profile.GasPolicy, hasCode, isEmpty)
+	if a := usableAuthorization(w); a != nil {
+		if err := checkGaslessAuthorization(a, amounts, &bumped, env.profile.GasPolicy); err != nil {
+			return stop(err.Error())
+		}
+	}
 	if err := checkGaslessAmounts(amounts, kind, live, uint64(env.profile.UneconomicFractionPercent), addressWithdrawalOptions{FeeCapGwei: u.FeeCapGwei, AllowExpensiveGas: u.AllowExpensiveGas}); err != nil {
 		return stop(err.Error())
 	}
@@ -2065,11 +2506,15 @@ func (h *FundingHandler) bumpUserOperationFees(ctx context.Context, env *gasless
 // gave up on (a re-sign the approval does not allow, a refused re-signed
 // copy, an expired proof): a bundler may include a dropped operation after
 // all. Every journaled copy is looked for, whatever the last send did (a
-// re-signed copy the bundler refused leaves an earlier copy that it took).
-// Found, the record returns to the submitted phase of the operation's
-// kind, so the resume follows its bundle transaction instead of proving
-// again or falling back to the wallet. An operation already found on chain
-// (TransactionHash set) was not dropped and is not looked for.
+// re-signed copy the bundler refused leaves an earlier copy that it took),
+// first through a bundler receipt the chain confirms, then by the chain's
+// logs. A log search that fails proves nothing: the EntryPoint's nonce then
+// decides (unconsumed, no copy was included; consumed, the inclusion cannot
+// be located and the caller stops before any fallback). Found, the record
+// returns to the submitted phase of the operation's kind, so the resume
+// follows its bundle transaction instead of proving again or falling back
+// to the wallet. An operation already found on chain (TransactionHash set)
+// was not dropped and is not looked for.
 func (h *FundingHandler) lateUserOperation(ctx context.Context, config fundingConfig, record *addressFundingRecord) (bool, error) {
 	w := record.Withdrawal
 	u := w.UserOp
@@ -2103,9 +2548,39 @@ func (h *FundingHandler) lateUserOperation(ctx context.Context, config fundingCo
 	if from == 0 {
 		from = env.deployment.DeployBlock
 	}
-	tx, err := h.findUserOperationEvent(ctx, env, hashes, from)
-	if err != nil || tx == "" {
+	var encoded gaslessUserOpJSON
+	if json.Unmarshal(u.JSON, &encoded) != nil {
+		return false, errors.New("the saved user operation is invalid; preserve the recovery file")
+	}
+	op, err := gaslessUserOpFromJSON(encoded)
+	if err != nil {
 		return false, err
+	}
+	// A read-only hint from the bundler the operation was sent to (else
+	// the configured one); nothing is sent to it.
+	bundler := ""
+	for _, candidate := range []string{u.BundlerURL, withdrawalOptions(ctx).BundlerURL, h.client.config.BundlerURL} {
+		if candidate != "" && ValidateBundlerURL(candidate) == nil {
+			bundler = candidate
+			break
+		}
+	}
+	tx := h.bundlerReceiptTransaction(ctx, env, bundler, op.Nonce, hashes)
+	if tx == "" {
+		var searchErr error
+		if tx, searchErr = h.findUserOperationEvent(ctx, env, hashes, from); searchErr != nil {
+			consumed, err := h.operationNonceConsumed(ctx, env, op.Nonce)
+			if err != nil {
+				return false, err
+			}
+			if consumed {
+				return false, errOperationNotLocated(searchErr)
+			}
+			return false, nil
+		}
+	}
+	if tx == "" {
+		return false, nil
 	}
 	w.Phase, w.GaslessRefusal = gaslessSubmittedPhase(gaslessKindOf(u.Kind)), ""
 	return true, h.saveAddress(record)
@@ -2317,6 +2792,9 @@ func (h *FundingHandler) followTransitTransaction(ctx context.Context, config fu
 // GaslessAvailability is whether --fees payout can carry the next
 // withdrawal (design 3.1 pre-flight), and why not.
 type GaslessAvailability struct {
+	// Required: new withdrawals on this deployment pay the fee from the
+	// payout; there is no wallet-paid alternative to offer.
+	Required            bool   `json:"required,omitempty"`
 	Available           bool   `json:"available"`
 	Reason              string `json:"reason,omitempty"`
 	Message             string `json:"message,omitempty"`
@@ -2342,9 +2820,9 @@ func (h *FundingHandler) GaslessAvailability(ctx context.Context) (GaslessAvaila
 		if code == "" {
 			return GaslessAvailability{}, err
 		}
-		return GaslessAvailability{Reason: code, Message: err.Error()}, nil
+		return GaslessAvailability{Required: h.newWithdrawalFees() == "payout", Reason: code, Message: err.Error()}, nil
 	}
-	return GaslessAvailability{Available: true, BundlerURL: env.bundler, PaymasterDepositWei: live.Deposit.String(), FlatFeeWei: live.FlatFee.String(), MaxFeeCeilingWei: live.MaxFeeCeiling.String(), EscapesEnabled: live.EscapesEnabled}, nil
+	return GaslessAvailability{Required: h.newWithdrawalFees() == "payout", Available: true, BundlerURL: env.bundler, PaymasterDepositWei: live.Deposit.String(), FlatFeeWei: live.FlatFee.String(), MaxFeeCeilingWei: live.MaxFeeCeiling.String(), EscapesEnabled: live.EscapesEnabled}, nil
 }
 
 // gaslessPreflight is the availability check before a transit account is
@@ -2411,6 +2889,24 @@ func (h *FundingHandler) gaslessPrepareCheck(ctx context.Context, config funding
 		return false, err
 	}
 	live.Owed = new(big.Int)
+	if kind == gaslessKindClose {
+		// The close is built within the authorization's bound at approval;
+		// the pre-flight prices it the same way.
+		bound := authorizationBound(payout, live, g, uint64(env.profile.UneconomicFractionPercent), hasCode, options)
+		if room := new(big.Int).Sub(payout, big.NewInt(1)); bound.Cmp(room) > 0 {
+			bound = room
+		}
+		if bound.Sign() > 0 {
+			clampGaslessFees(op, live, g, bound, hasCode, 0)
+		}
+		if err := checkGaslessAmounts(gaslessAmountsFor(kind, payout, op, live, g, hasCode, isEmpty), kind, live, uint64(env.profile.UneconomicFractionPercent), options); err != nil {
+			return hasCode, err
+		}
+		if bound.Sign() <= 0 || payoutLoss(op, live.FlatFee, g, hasCode).Cmp(bound) > 0 {
+			return hasCode, refuse("gasless_uneconomic", "the payout may lose up to %s wei to the sponsored fee now, above the %s wei limit for this withdrawal (%d%% of the payout, the paymaster's policy, or your --fee-cap-gwei); retry when fees are lower, or pass --allow-expensive-gas to accept more", payoutLoss(op, live.FlatFee, g, hasCode), bound, env.profile.UneconomicFractionPercent)
+		}
+		return hasCode, nil
+	}
 	return hasCode, checkGaslessAmounts(gaslessAmountsFor(kind, payout, op, live, g, hasCode, isEmpty), kind, live, uint64(env.profile.UneconomicFractionPercent), options)
 }
 

@@ -1,27 +1,34 @@
 #!/usr/bin/env node
-// Expected runtime codehashes of a zkAPI deployment (vault revision 3), computed from the
-// pinned-compiler Forge artifacts alone: the vault's deployedBytecode with the Bn254Poseidon
-// link applied and its immutableReferences filled from the constructor arguments, the adapter's
-// deployedBytecode, and the library's deployedBytecode (with its own address in a call-protection
-// prefix, if the compiler emitted one). A deployment with the gasless-withdrawal paymaster adds
+// Expected runtime codehashes of a zkAPI deployment (vault revision 4), computed from the
+// pinned-compiler Forge artifacts alone: the vault's deployedBytecode with its immutableReferences
+// filled from the constructor arguments (the Poseidon runtime's address among them; the vault links
+// no library), the adapter's deployedBytecode with its immutables filled from the vault, the chain
+// and the signing keys it is folded for (the folded IC points recomputed here on BN254 from the
+// verifying-key constants in the artifact's AST), and the Poseidon runtime's deployedBytecode
+// (Bn254PoseidonRuntime, legacy-compiled, no immutables; the setup's poseidon-runtime.json pins
+// its codehash, which Deploy.s.sol checks). A deployment with the gasless-withdrawal paymaster adds
 // the paymaster's, the transit-account factory's and the account logic's deployedBytecode with
 // their immutables filled the same way, and the two canonical ERC-4337 v0.7.0 runtimes (the
 // EntryPoint and its SenderCreator), which are pinned constants. Anyone can rebuild the artifacts
-// from source (protocol/contracts/foundry.toml pins solc, via_ir, 10,000 runs, bytecode_hash
-// "none" and cbor_metadata false) and audit a deployment.
+// from source (demo/contracts/foundry.toml pins solc, via_ir (off for the Poseidon runtime),
+// the optimizer profiles, bytecode_hash "none" and cbor_metadata false) and audit a deployment. The manifest
+// keeps the field names poseidonLibrary, poseidonLibraryReused and poseidonRuntimeCodehash: they
+// name the Poseidon runtime contract now.
 //
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json [--check] [--rpc URL]
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json.pending --rpc URL \
 //     --finalize .demo/deployment.json [--broadcast-log FILE] [--confirmations N]
 //   node scripts/expected-codehashes.mjs --poseidon 0x.. --note-ttl 2592000 --challenge-period 172800 \
-//     --max-pause-duration 3888000 --request-charge-cap 50000 --proof-adapter 0x.. \
-//     --state-key-x .. --state-key-y .. --clearance-key-x .. --clearance-key-y .. \
-//     [--vault 0x.. --entry-point 0x.. --paymaster 0x.. --factory 0x.. --account-implementation 0x.. \
+//     --max-pause-duration 3888000 --request-charge-cap 50000 --min-deposit 1000000 --proof-adapter 0x.. \
+//     --state-key-x .. --state-key-y .. --clearance-key-x .. --clearance-key-y .. --vault 0x.. --chain-id 1 \
+//     [--entry-point 0x.. --paymaster 0x.. --factory 0x.. --account-implementation 0x.. \
 //      --wei-per-unit 1000000000 --creation-code-keccak 0x..]
 //
 // --deployment reads Deploy.s.sol's manifest; flags override its fields. --artifacts DIR selects
-// the Forge out directory (default protocol/contracts/out). --check compares the result with the
-// manifest's recorded codehashes, and --rpc URL with eth_getCode at the manifest's addresses (the
+// the Forge out directory (default demo/contracts/out, the Deploy.s.sol build). The standalone
+// protocol artifacts use different optimizer profiles and need an explicit --artifacts override.
+// --check compares the result with the manifest's recorded codehashes, and --rpc URL with
+// eth_getCode at the manifest's addresses (the
 // EntryPoint's and SenderCreator's included); any mismatch exits 1. Prints JSON; integers wider
 // than 2^53 - 1 print as decimal strings.
 //
@@ -228,6 +235,132 @@ function filledRuntimeCode(contract, art, values) {
     return code;
 }
 
+// ------------------------------------------------------- BN254 G1 (the adapter's folded points)
+// Affine arithmetic over the base field, with the identity as (0, 0), exactly as the ecAdd (0x06)
+// and ecMul (0x07) precompiles compute: the adapter's constructor sums its folded points with them,
+// and the expected codehash must hold the same words. Small and slow on purpose (a few curve
+// operations per audit); every input point is checked to be on the curve, as the precompiles do.
+
+export const BN254_BASE_MODULUS = 21888242871839275222246405745257275088696311157297823662689037894645226208583n;
+export const BN254_SCALAR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+const G1_IDENTITY = Object.freeze([0n, 0n]);
+
+const fq = n => ((n % BN254_BASE_MODULUS) + BN254_BASE_MODULUS) % BN254_BASE_MODULUS;
+
+function fqInverse(a) {
+    let [r0, r1] = [fq(a), BN254_BASE_MODULUS];
+    let [s0, s1] = [1n, 0n];
+    if (r0 === 0n) fail('BN254: inverse of zero');
+    while (r1 !== 0n) {
+        const q = r0 / r1;
+        [r0, r1] = [r1, r0 - q * r1];
+        [s0, s1] = [s1, s0 - q * s1];
+    }
+    return fq(s0);
+}
+
+function g1Check(point, label) {
+    const [x, y] = point;
+    if (typeof x !== 'bigint' || typeof y !== 'bigint' || x < 0n || y < 0n || x >= BN254_BASE_MODULUS || y >= BN254_BASE_MODULUS) {
+        fail(`${label}: not a pair of base-field elements`);
+    }
+    if ((x !== 0n || y !== 0n) && fq(y * y - x * x * x - 3n) !== 0n) fail(`${label}: not on BN254`);
+    return point;
+}
+
+/// P + Q as the ecAdd precompile computes it.
+export function g1Add(p, q) {
+    const [x1, y1] = g1Check(p, 'g1Add P');
+    const [x2, y2] = g1Check(q, 'g1Add Q');
+    if (x1 === 0n && y1 === 0n) return [x2, y2];
+    if (x2 === 0n && y2 === 0n) return [x1, y1];
+    let slope;
+    if (x1 === x2) {
+        if (fq(y1 + y2) === 0n) return [...G1_IDENTITY];
+        slope = fq(3n * x1 * x1 * fqInverse(2n * y1));
+    } else {
+        slope = fq((y2 - y1) * fqInverse(x2 - x1));
+    }
+    const x3 = fq(slope * slope - x1 - x2);
+    return [x3, fq(slope * (x1 - x3) - y1)];
+}
+
+/// s · P as the ecMul precompile computes it (any 256-bit scalar).
+export function g1Mul(p, scalar) {
+    g1Check(p, 'g1Mul P');
+    if (typeof scalar !== 'bigint' || scalar < 0n || scalar >= 1n << 256n) fail('g1Mul: not a 256-bit scalar');
+    let result = [...G1_IDENTITY];
+    let addend = [p[0], p[1]];
+    for (let k = scalar; k > 0n; k >>= 1n) {
+        if (k & 1n) result = g1Add(result, addend);
+        addend = g1Add(addend, addend);
+    }
+    return result;
+}
+
+/// Name -> value (BigInt) of every constant with a literal value in an artifact's AST.
+function literalConstants(ast) {
+    if (!ast) fail('artifact has no AST; build with ast = true (foundry.toml)');
+    const values = new Map();
+    const visit = node => {
+        if (Array.isArray(node)) return node.forEach(visit);
+        if (!node || typeof node !== 'object') return;
+        if (node.nodeType === 'VariableDeclaration' && node.constant === true && node.value?.nodeType === 'Literal'
+            && node.value.kind === 'number' && !node.value.subdenomination) {
+            values.set(node.name, BigInt(String(node.value.value).replaceAll('_', '')));
+        }
+        for (const value of Object.values(node)) if (value && typeof value === 'object') visit(value);
+    };
+    visit(ast);
+    return values;
+}
+
+/// The Groth16 IC indices the adapter folds, with the constant of each (input i is IC i + 1, in
+/// the order of Types.RequestPublicInputs / Types.WithdrawalPublicInputs): protocolVersion,
+/// chainId, contractAddress, stateSigningKeyX/Y and, for withdrawals, clearanceSigningKeyX/Y.
+const ADAPTER_FOLDS = Object.freeze({ REQUEST: [1, 2, 3, 5, 6], WITHDRAWAL: [1, 2, 3, 5, 6, 7, 8] });
+const ADAPTER_PROTOCOL_VERSION = 2n;
+
+/// The immutables of Groth16ProofAdapter, by name, as 32-byte hex words: the vault, chain and keys
+/// it is folded for (the vault's own; its constructor stores block.chainid), and the folded points
+/// IC0 + Σ c · IC of both verifying keys, from the IC constants of the artifact being hashed.
+export function adapterImmutables(art, inputs) {
+    const chainId = uint(inputs.chainId, 64, 'chainId');
+    const vault = address(inputs.vault ?? fail('the adapter is folded for the vault: missing vault'), 'vault');
+    const key = name => {
+        const value = uint(inputs[name], 256, name);
+        if (value >= BN254_SCALAR_MODULUS) fail(`${name} is not below the BN254 scalar field order`);
+        return value;
+    };
+    const keys = ['stateSigningKeyX', 'stateSigningKeyY', 'clearanceSigningKeyX', 'clearanceSigningKeyY'].map(key);
+    const scalars = [ADAPTER_PROTOCOL_VERSION, chainId, BigInt(vault), ...keys];
+    const constants = literalConstants(art.ast);
+    const ic = (prefix, index) => {
+        const name = `${prefix}_IC${index}`;
+        const x = constants.get(`${name}_X`) ?? fail(`Groth16ProofAdapter has no constant ${name}_X`);
+        const y = constants.get(`${name}_Y`) ?? fail(`Groth16ProofAdapter has no constant ${name}_Y`);
+        return g1Check([x, y], `Groth16ProofAdapter ${name}`);
+    };
+    const folded = prefix => ADAPTER_FOLDS[prefix].reduce(
+        (sum, point, k) => g1Add(sum, g1Mul(ic(prefix, point), scalars[k])),
+        ic(prefix, 0),
+    );
+    const [requestX, requestY] = folded('REQUEST');
+    const [withdrawalX, withdrawalY] = folded('WITHDRAWAL');
+    return {
+        foldedChainId: word(chainId, 'chainId'),
+        foldedVault: word(vault, 'vault'),
+        foldedStateSigningKeyX: word(keys[0], 'stateSigningKeyX'),
+        foldedStateSigningKeyY: word(keys[1], 'stateSigningKeyY'),
+        foldedClearanceSigningKeyX: word(keys[2], 'clearanceSigningKeyX'),
+        foldedClearanceSigningKeyY: word(keys[3], 'clearanceSigningKeyY'),
+        foldedRequestIc0X: word(requestX, 'foldedRequestIc0X'),
+        foldedRequestIc0Y: word(requestY, 'foldedRequestIc0Y'),
+        foldedWithdrawalIc0X: word(withdrawalX, 'foldedWithdrawalIc0X'),
+        foldedWithdrawalIc0Y: word(withdrawalY, 'foldedWithdrawalIc0Y'),
+    };
+}
+
 // ------------------------------------------------------------------------------- codehashes
 
 /// The constructor-derived immutables of ZkApiVault, by name, as 32-byte hex words.
@@ -250,7 +383,18 @@ export function vaultImmutables(inputs) {
         clearanceSigningKeyX: word(inputs.clearanceSigningKeyX, 'clearanceSigningKeyX'),
         clearanceSigningKeyY: word(inputs.clearanceSigningKeyY, 'clearanceSigningKeyY'),
         maxPauseDuration: word(maxPauseDuration, 'maxPauseDuration'),
+        poseidon: word(address(inputs.poseidonLibrary, 'poseidonLibrary'), 'poseidonLibrary'),
+        minDeposit: word(minDeposit(inputs.minDeposit), 'minDeposit'),
     };
+}
+
+/// The vault's minDeposit immutable (revision 4): 1 to 2^53 - 1 gwei units, as its constructor
+/// requires.
+function minDeposit(value) {
+    if (value === undefined || value === null) fail('minDeposit is required (vault revision 4)');
+    const units = uint(value, 128, 'minDeposit');
+    if (units === 0n || units > 9_007_199_254_740_991n) fail('minDeposit must be 1 to 2^53 - 1 gwei units');
+    return units;
 }
 
 // ------------------------------------------------------------- gasless withdrawals (ERC-4337)
@@ -262,10 +406,10 @@ export const ENTRY_POINT_V070_CODEHASH = '0x8db5ff695839d655407cc8490bb7a5d82337
 export const SENDER_CREATOR = '0xefc2c1444ebcc4db75e7613d20c6a62ff67a167c';
 export const SENDER_CREATOR_V070_CODEHASH = '0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689';
 // ZkApiWithdrawalAccountFactory's constants: every transit account's creation code is
-// CREATION_STUB ‖ PROXY_HEAD ‖ <account logic address> ‖ PROXY_TAIL (74 bytes).
-const CREATION_STUB = '600d80380380916000396000f3';
-const PROXY_HEAD = '36600060003760a0603d36396000600060a03601600073';
-const PROXY_TAIL = '5af43d600060003e3d600082603b57fd5bf3';
+// CREATION_STUB ‖ PROXY_HEAD ‖ <account logic address> ‖ PROXY_TAIL (77 bytes).
+const CREATION_STUB = '603560185f39601460b9603539601460d9604939605d5ff3';
+const PROXY_HEAD = '365f5f376028603536395f5f602836015f73';
+const PROXY_TAIL = '5af43d5f5f3e3d5f82603357fd5bf3';
 /// ZkApiWithdrawalPaymaster.GasPolicy after its two uint256[4] arrays (callFloor, callHardCap),
 /// in ABI order; the manifest's paymasterGasPolicy names them the same, with callHardCap as callCap.
 export const GAS_POLICY_SCALARS = Object.freeze([
@@ -292,7 +436,7 @@ export function createAddress(deployer, nonce) {
     return `0x${keccak256(hexToBytes(rlp)).slice(26)}`;
 }
 
-/// The 74-byte creation code of every transit account of a factory whose account logic is at
+/// The 77-byte creation code of every transit account of a factory whose account logic is at
 /// `implementation` (ZkApiWithdrawalAccountFactory.accountCreationCode()).
 export function accountCreationCode(implementation) {
     return `0x${CREATION_STUB}${PROXY_HEAD}${address(implementation, 'implementation').slice(2)}${PROXY_TAIL}`;
@@ -314,6 +458,45 @@ export function gasPolicyWords(policy) {
 /// words, from a manifest's gasless fields; checks the fields against each other first (the logic
 /// is the factory's nonce-1 creation, the creation code is the factory's constants around it, and
 /// its keccak256 is both contracts' accountCreationCodeHash).
+// Constructor-fixed gas budgets, never selected from chainId. Keep in lockstep with the
+// reviewed schedules in ZkApiWithdrawalPaymaster; manifest gas figures are checked separately.
+export function gasScheduleImmutables(schedule = 0) {
+    const choice = uint(schedule, 8, 'gasSchedule');
+    if (choice > 1n) fail('gasSchedule must be Original (0) or Glamsterdam (1)');
+    const budgets = {
+        FRESH_SLOT_GAS_BOUND: [25000, 120000],
+        CALL_FLOOR_CLOSE: [220000, 550000],
+        CALL_FLOOR_ESCAPE: [160000, 800000],
+        CALL_FLOOR_FINALIZE: [200000, 500000],
+        CALL_HARD_CAP_CLOSE: [950000, 1400000],
+        CALL_HARD_CAP_ESCAPE: [1100000, 1800000],
+        CALL_HARD_CAP_FINALIZE: [400000, 750000],
+        POSTOP_FLOOR: [250000, 560000],
+        POSTOP_CAP: [350000, 700000],
+        VERIFICATION_FLOOR: [50000, 140000],
+        VERIFICATION_FLOOR_INIT: [110000, 490000],
+        VERIFICATION_CAP: [400000, 496000],
+        PM_VERIFICATION_FLOOR: [340000, 496000],
+        POSTOP_BASE_GAS: [17000, 23000],
+        POSTOP_ESCAPE_GAS: [71200, 339000],
+        POSTOP_FINALIZE_EXTRA_GAS: [5000, 20000],
+        POSTOP_ESCAPE_FORWARD_GAS: [30000, 145000],
+        POSTOP_ESCAPE_DEPOSIT_GAS: [15000, 9000],
+        EOA_PUSH_GAS: [9100, 11400],
+        NEW_ACCOUNT_GAS: [25000, 183600],
+        CREDIT_GAS: [46000, 223000],
+        ACCOUNT_CALL_OVERHEAD_GAS: [11500, 16000],
+        ACCOUNT_CALL_OVERHEAD_ESCAPE_GAS: [4800, 8000],
+        FAILURE_POSTOP_GAS: [70000, 250000],
+        FAILURE_DEBT_DEPOSIT_GAS: [20000, 30000],
+    };
+    const selected = Object.fromEntries(Object.entries(budgets).map(([name, choices]) => [name, choices[Number(choice)]]));
+    selected.FINALIZE_RESERVE_GAS = 40_000 + selected.VERIFICATION_FLOOR + selected.CALL_FLOOR_FINALIZE
+        + selected.PM_VERIFICATION_FLOOR + selected.POSTOP_FLOOR;
+    return { gasSchedule: word(choice, 'gasSchedule'),
+        ...Object.fromEntries(Object.entries(selected).map(([name, value]) => [name, word(value, name)])) };
+}
+
 export function gaslessImmutables(inputs) {
     const entryPoint = address(inputs.entryPoint, 'entryPoint');
     const vault = address(inputs.vault, 'vault');
@@ -336,6 +519,7 @@ export function gaslessImmutables(inputs) {
     const hashWord = creationHash.slice(2);
     return {
         paymaster: {
+            ...gasScheduleImmutables(inputs.gasSchedule ?? 0),
             entryPoint: word(entryPoint, 'entryPoint'),
             vault: word(vault, 'vault'),
             adapter: word(address(inputs.proofAdapter, 'proofAdapter'), 'proofAdapter'),
@@ -355,7 +539,9 @@ export function gaslessImmutables(inputs) {
             implementation: word(implementation, 'withdrawalAccountImplementation'),
             accountCreationCodeHash: hashWord,
         },
-        implementation: { self: word(implementation, 'withdrawalAccountImplementation') },
+        implementation: { self: word(implementation, 'withdrawalAccountImplementation'),
+            fixedEntryPoint: word(entryPoint, 'entryPoint'), fixedVault: word(vault, 'vault'),
+            fixedPaymaster: word(paymaster, 'withdrawalPaymaster') },
         accountCreationCode: creation,
     };
 }
@@ -366,22 +552,11 @@ export function hasGasless(inputs) {
 }
 
 export function expectedRuntimeCode(artifactsDir, inputs) {
-    const poseidon = address(inputs.poseidonLibrary, 'poseidonLibrary').slice(2);
-
     const vaultArtifact = artifact(artifactsDir, 'ZkApiVault');
     let vault = vaultArtifact.deployedBytecode.object.replace(/^0x/, '');
-    const links = vaultArtifact.deployedBytecode.linkReferences ?? {};
-    let linked = 0;
-    for (const [file, libraries] of Object.entries(links)) {
-        for (const [name, refs] of Object.entries(libraries)) {
-            if (name !== 'Bn254Poseidon') fail(`ZkApiVault links an unexpected library ${file}:${name}`);
-            for (const ref of refs) {
-                vault = patch(vault, ref.start, ref.length, poseidon);
-                ++linked;
-            }
-        }
+    if (Object.keys(vaultArtifact.deployedBytecode.linkReferences ?? {}).length) {
+        fail('ZkApiVault links a library: the artifacts predate the Poseidon runtime (rebuild)');
     }
-    if (linked === 0) fail('ZkApiVault has no Bn254Poseidon link reference');
     const names = immutableNames(vaultArtifact.ast);
     const values = vaultImmutables(inputs);
     const filled = new Set();
@@ -395,20 +570,15 @@ export function expectedRuntimeCode(artifactsDir, inputs) {
     if (/[^0-9a-fA-F]/.test(vault)) fail('ZkApiVault runtime code still has an unlinked placeholder');
 
     const adapterArtifact = artifact(artifactsDir, 'Groth16ProofAdapter');
-    const adapterRefs = adapterArtifact.deployedBytecode;
-    if (Object.keys(adapterRefs.linkReferences ?? {}).length || Object.keys(adapterRefs.immutableReferences ?? {}).length) {
-        fail('Groth16ProofAdapter is expected to have no links and no immutables');
-    }
-    const adapter = adapterRefs.object.replace(/^0x/, '');
+    const adapter = filledRuntimeCode('Groth16ProofAdapter', adapterArtifact, adapterImmutables(adapterArtifact, inputs));
 
-    const libraryArtifact = artifact(artifactsDir, 'Bn254Poseidon');
-    let library = libraryArtifact.deployedBytecode.object.replace(/^0x/, '');
-    // A library with call protection starts with PUSH20 <its own address>, written at deployment.
-    // Bn254Poseidon's via-IR code has none (all its functions are pure), so its code does not
-    // depend on its address.
-    if (library.startsWith('73' + '0'.repeat(40))) library = patch(library, 1, 20, poseidon);
+    // The Poseidon runtime: legacy-compiled, no immutables, no links, so its runtime code is the
+    // artifact's as it stands.
+    const runtimeArtifact = artifact(artifactsDir, 'Bn254PoseidonRuntime');
+    const runtime = filledRuntimeCode('Bn254PoseidonRuntime', runtimeArtifact, {});
+    if (runtimeArtifact.metadata?.settings?.viaIR) fail('Bn254PoseidonRuntime was compiled with via_ir; its pinned codehash is the legacy pipeline\'s');
 
-    const code = { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${library}` };
+    const code = { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${runtime}` };
     if (!hasGasless(inputs)) return code;
     const immutables = gaslessImmutables(inputs);
     code.paymaster = `0x${filledRuntimeCode('ZkApiWithdrawalPaymaster', artifact(artifactsDir, 'ZkApiWithdrawalPaymaster'), immutables.paymaster)}`;
@@ -509,22 +679,26 @@ export function deploymentInputs(deployment, overrides = {}) {
         challengePeriod: deployment.challengePeriod,
         maxPauseDuration: deployment.maxPauseDuration,
         requestChargeCap: deployment.requestChargeCap,
+        minDeposit: deployment.minDeposit,
         stateSigningKeyX: deployment.stateSigningKeyX,
         stateSigningKeyY: deployment.stateSigningKeyY,
         clearanceSigningKeyX: deployment.clearanceSigningKeyX,
         clearanceSigningKeyY: deployment.clearanceSigningKeyY,
+        // The adapter is folded for the vault and its chain.
+        vault: deployment.vault,
+        chainId: deployment.chainId,
         withdrawalPaymaster: deployment.withdrawalPaymaster ?? null,
         ...overrides,
     };
     if (hasGasless(inputs)) {
         Object.assign(inputs, {
-            vault: deployment.vault,
             entryPoint: deployment.entryPoint ?? CANONICAL_ENTRY_POINT,
             withdrawalAccountFactory: deployment.withdrawalAccountFactory,
             withdrawalAccountImplementation: deployment.withdrawalAccountImplementation,
             nativeAssetWeiPerUnit: deployment.nativeAssetWeiPerUnit,
             accountCreationCode: deployment.accountCreationCode,
             accountCreationCodeKeccak256: deployment.accountCreationCodeKeccak256,
+            gasSchedule: deployment.paymasterGasSchedule ?? 0,
             ...overrides,
         });
     }
@@ -734,11 +908,13 @@ const FLAGS = {
     '--challenge-period': 'challengePeriod',
     '--max-pause-duration': 'maxPauseDuration',
     '--request-charge-cap': 'requestChargeCap',
+    '--min-deposit': 'minDeposit',
     '--state-key-x': 'stateSigningKeyX',
     '--state-key-y': 'stateSigningKeyY',
     '--clearance-key-x': 'clearanceSigningKeyX',
     '--clearance-key-y': 'clearanceSigningKeyY',
     '--vault': 'vault',
+    '--chain-id': 'chainId',
     '--entry-point': 'entryPoint',
     '--paymaster': 'withdrawalPaymaster',
     '--factory': 'withdrawalAccountFactory',
@@ -748,7 +924,7 @@ const FLAGS = {
 };
 
 function parseArgs(argv) {
-    const args = { artifacts: join(ROOT, 'protocol/contracts/out'), inputs: {}, check: false, confirmations: 1 };
+    const args = { artifacts: join(ROOT, 'demo/contracts/out'), inputs: {}, check: false, confirmations: 1 };
     for (let i = 0; i < argv.length; i++) {
         const flag = argv[i];
         const next = () => argv[++i] ?? fail(`${flag} needs a value`);

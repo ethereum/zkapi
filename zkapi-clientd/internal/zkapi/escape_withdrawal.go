@@ -35,7 +35,8 @@ var escapeKinds = map[string]bool{"escape": true, "escape_finalize": true, "esca
 
 // escapeGasLimits sign an escape transaction whose simulation failed (E4
 // step 5: advisory): above each entry point's measured cost (initiation
-// about 0.6M gas, finalization at most about 0.2M, a credit claim far less).
+// about 0.37M gas on vault revision 4, finalization at most about 0.2M, a
+// credit claim far less).
 var escapeGasLimits = map[string]uint64{"escape": 900_000, "escape_finalize": 350_000, "escape_claim": 150_000}
 
 // escapePlan is the companion's /oa/v1/withdraw/escape/prepare answer.
@@ -131,11 +132,13 @@ func escapeCalldata(plan escapePlan, config fundingConfig, saved *addressWithdra
 
 // validateSignedEscape checks signed initiateEscapeWithdrawal calldata
 // against the saved, owner-confirmed escape: 836 bytes; the fixed words 0,
-// 1, 2, 8, 9, 10 and 11; kind 0 (word 12); a successor nullifier (word 13)
-// that is set, differs from the nullifier and is the saved one; the
+// 1, 2, 9, 10 and 11; a nonzero note leaf (word 3); note fields (word 8) of
+// the saved note, below 2^224, with a deposit of at most 2^53 - 1 units that
+// covers the state balance; kind 0 (word 12); a successor nullifier (word
+// 13) that is set, differs from the nullifier and is the saved one; the
 // confirmed concession (word 14), at most the bound unless zero; payout plus
 // concession equal to the state balance; the bytes offset and length; and
-// the binding over the 16 tuple words with the root and valid_until blanked.
+// the binding over the 16 tuple words with valid_until blanked.
 // With a nonzero now (before signing), valid_until must lie in
 // [now, now + 10,800 + 300].
 func validateSignedEscape(data []byte, config fundingConfig, saved *addressWithdrawalRecord, now time.Time) error {
@@ -147,13 +150,16 @@ func validateSignedEscape(data []byte, config fundingConfig, saved *addressWithd
 	for i := range words {
 		words[i] = hex.EncodeToString(data[4+i*32 : 4+(i+1)*32])
 	}
-	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: strings.Repeat("0", 64), 13: addressABIWord(saved.NextNullifier), 14: fmt.Sprintf("%064x", saved.Conceded), 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
+	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: strings.Repeat("0", 64), 13: addressABIWord(saved.NextNullifier), 14: fmt.Sprintf("%064x", saved.Conceded), 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
 	for index, value := range expected {
 		if !strings.EqualFold(words[index], value) {
 			return invalid
 		}
 	}
 	if words[13] == strings.Repeat("0", 64) || strings.EqualFold(words[13], words[11]) {
+		return invalid
+	}
+	if !validNoteWords(words, saved.NoteID, saved.StateBalance) {
 		return invalid
 	}
 	if saved.Amount+saved.Conceded != saved.StateBalance || saved.Amount > saved.StateBalance {

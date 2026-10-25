@@ -12,10 +12,13 @@ import {
 
 export { gaslessPins };
 
-// keccak256("zkapi-v2-concession-v1"), the adapter's CIRCUIT_ID_HASH.
-export const CONCESSION_CIRCUIT_ID_HASH = '0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687';
+// keccak256("zkapi-v2-concession-v2"), the adapter's CIRCUIT_ID_HASH.
+export const CONCESSION_CIRCUIT_ID_HASH = '0xcbe7e9ff73a9d6e589b63f04856d01d48cc2306851a024a7621aab30a50488c1';
 export const CONCESSION_ESCAPE_VERSION = 1n;
-export const ROOT_HISTORY_WINDOW_SECONDS = 86_400n;
+// Vault revision 4's capability marker (leaf-bound exits): a revision-3 vault
+// has no such getter, so the probe refuses it.
+export const LEAF_BOUND_EXIT_VERSION = 1n;
+export const VAULT_REVISION = 4;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const WORD = /^0x[0-9a-fA-F]{64}$/;
 
@@ -50,6 +53,7 @@ export function deploymentPins(trusted) {
         challenge_period: t.challenge_period,
         note_ttl: t.note_ttl,
         max_pause_duration: t.max_pause_duration,
+        min_deposit_units: t.min_deposit_units,
         state_signing_key: t.state_signing_key?.x != null && t.state_signing_key?.y != null ? t.state_signing_key : null,
         clearance_signing_key: t.clearance_signing_key?.x != null && t.clearance_signing_key?.y != null
             ? t.clearance_signing_key : null
@@ -65,6 +69,15 @@ export function deploymentPins(trusted) {
     for (const key of ['vault_runtime_codehash', 'adapter_runtime_codehash', 'poseidon_runtime_codehash',
         'request_vk_keccak256', 'withdrawal_vk_keccak256']) {
         if (!WORD.test(required[key])) throw checkError(`The profile's ${key} is not a 32-byte hash.`, 'deployment_unverifiable');
+    }
+    // A profile of another vault revision (revision 3's root-bound exits)
+    // names another statement: refused before any read.
+    if (t.vault_revision !== VAULT_REVISION || t.leaf_bound_exit !== 1) {
+        throw checkError('The build-pinned profile is not a vault revision 4 (leaf-bound exit) deployment.',
+            'deployment_unverifiable', { vault_revision: t.vault_revision ?? null, leaf_bound_exit: t.leaf_bound_exit ?? null });
+    }
+    if (!Number.isSafeInteger(required.min_deposit_units) || required.min_deposit_units <= 0) {
+        throw checkError('The profile\'s min_deposit_units is not a positive integer.', 'deployment_unverifiable');
     }
     return required;
 }
@@ -119,7 +132,8 @@ export async function verifyDeployment({ request, trusted, chainId, source = 'rp
     await call('noteTtl', vault, ABI.noteTtl, BigInt(pins.note_ttl));
     await call('maxPauseDuration', vault, ABI.maxPauseDuration, BigInt(pins.max_pause_duration));
     await call('CONCESSION_ESCAPE_VERSION', vault, ABI.CONCESSION_ESCAPE_VERSION, CONCESSION_ESCAPE_VERSION);
-    await call('ROOT_HISTORY_WINDOW', vault, ABI.ROOT_HISTORY_WINDOW, ROOT_HISTORY_WINDOW_SECONDS);
+    await call('LEAF_BOUND_EXIT_VERSION', vault, ABI.LEAF_BOUND_EXIT_VERSION, LEAF_BOUND_EXIT_VERSION);
+    await call('minDeposit', vault, ABI.minDeposit, BigInt(pins.min_deposit_units));
     await call('CIRCUIT_ID_HASH', adapter, ABI.CIRCUIT_ID_HASH, BigInt(CONCESSION_CIRCUIT_ID_HASH));
     await call('REQUEST_VK_HASH', adapter, ABI.REQUEST_VK_HASH, BigInt(pins.request_vk_keccak256));
     await call('WITHDRAWAL_VK_HASH', adapter, ABI.WITHDRAWAL_VK_HASH, BigInt(pins.withdrawal_vk_keccak256));
@@ -202,6 +216,10 @@ export async function verifyGaslessDeployment({ request, trusted, chainId, sourc
         equals(pins.accountCreationCodeKeccak256, actual => actual === pins.accountCreationCodeKeccak256));
     await call('paymaster.gasPolicy', pins.paymaster, GASLESS_ABI.gasPolicy, decodeGasPolicy,
         equals('the profile’s gas_policy', actual => sameGasPolicy(actual, pins.gasPolicy)));
+    if (pins.gasSchedule != null) {
+        await call('paymaster.gasSchedule', pins.paymaster, GASLESS_ABI.gasSchedule, decodeWord,
+            equals(pins.gasSchedule.toString(), actual => actual === pins.gasSchedule));
+    }
     const sample = transitAccountAddress({
         factory: pins.factory, creationCodeHex: pins.accountCreationCode, entryPoint: pins.entryPoint, vault: trusted.contract_address,
         paymaster: pins.paymaster, owner: GASLESS_SAMPLE_OWNER, payee: GASLESS_SAMPLE_PAYEE

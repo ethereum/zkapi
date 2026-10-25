@@ -1,9 +1,11 @@
-//! zkAPI Groth16 circuits (`zkapi-v2-concession-v1`) and native proof interface.
+//! zkAPI Groth16 circuits (`zkapi-v2-concession-v2`) and native proof interface.
 //!
 //! * [`groth16`]: the request and withdrawal circuits and native mirrors of
 //!   their hashes.
 //! * [`compact`]: wire-level provers and verifiers, key headers and setup
 //!   policy, setup directories and the generated Solidity adapter.
+//! * [`poseidon_runtime`]: the vault's generated Poseidon contract
+//!   (`Bn254PoseidonRuntime.sol`) and its sidecar `poseidon-runtime.json`.
 //! * [`reduction`]: the snarkjs-compatible R1CS-to-QAP reduction every prover
 //!   uses.
 //! * [`r1cs`]: export of the circuits as circom `.r1cs` files for the
@@ -29,5 +31,6 @@ pub mod compact;
 #[cfg(feature = "dev-fixtures")]
 pub mod dev;
 pub mod groth16;
+pub mod poseidon_runtime;
 pub mod r1cs;
 pub mod reduction;

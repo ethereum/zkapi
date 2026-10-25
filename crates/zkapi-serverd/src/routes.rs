@@ -1,7 +1,10 @@
 //! Axum HTTP routes for the zkAPI server.
 //!
 //! Endpoints:
-//! - GET  /health                   -- process health and config summary
+//! - GET  /health                   -- process health and config summary;
+//!   `status` is "degraded" without a recent vault root read or with an
+//!   indexer that disagrees with the vault or cannot be read
+//! - GET  /metrics                  -- Prometheus gauges of the root poller
 //! - GET  /v1/attestation           -- published signer metadata for deployments
 //! - POST /v2/openrouter/leases     -- open a prompt-private runtime-key lease
 //! - POST /v2/openrouter/leases/:id -- retire a rejected runtime-key lease
@@ -131,17 +134,7 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
     // to be defeated.
     config.challenge_period_seconds = Some(binding.challenge_period_seconds);
     let store = Arc::new(NullifierStore::new(&config.db_path)?);
-    let initial_root = if let Some(indexer_url) = config.indexer_url.as_deref() {
-        match fetch_indexer_root(indexer_url).await {
-            Ok(root) => root,
-            Err(err) => {
-                tracing::warn!("failed to fetch initial root from indexer: {}", err);
-                startup_root_from_vault(&config).await
-            }
-        }
-    } else {
-        config.initial_root
-    };
+    let initial_root = config.initial_root;
     let dashboard = Arc::new(DashboardHub::new(500));
     let signing_keys = VaultSigningKeys {
         state: signer.state_public_key(),
@@ -161,7 +154,18 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         }
         processor.store().write_deployment_binding(&binding)?;
     }
-    // O5: admission needs a root the indexer and the vault agree on.
+    // O5': admission needs a recent vault read. Read it once before serving,
+    // then every poll interval; the indexer is compared for health only.
+    match processor.refresh_roots(config.indexer_url.as_deref()).await {
+        Ok(()) => tracing::info!(
+            root = %processor.current_root(),
+            "read the vault's currentRoot() at the latest block"
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            "vault currentRoot() unavailable at startup; requests are refused until the root poller reads it"
+        ),
+    }
     spawn_root_poller(
         processor.clone(),
         config.indexer_url.clone(),
@@ -190,34 +194,6 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         serve.await?;
     }
     Ok(())
-}
-
-/// The vault's currentRoot() for a server whose indexer cannot serve a
-/// verified root at startup (unverified, stale or replaying), instead of
-/// --initial-root (0x0 by default), which would refuse every new request as
-/// stale_root until the poller reads a verified root. Clearance already
-/// accepts the same read; --initial-root remains the fallback.
-async fn startup_root_from_vault(config: &ServerConfig) -> Felt252 {
-    let read = async {
-        anyhow::Ok(
-            NativeBillingOracle::for_server(config)?
-                .vault_current_root()
-                .await?,
-        )
-    };
-    match read.await {
-        Ok(root) => {
-            tracing::info!(
-                root = %root,
-                "starting with the vault's currentRoot() until the indexer serves a verified root"
-            );
-            root
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "vault currentRoot() unavailable at startup; using --initial-root");
-            config.initial_root
-        }
-    }
 }
 
 /// The deployment manifest, which must pin this server's vault and signing
@@ -785,6 +761,7 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
     let router = Router::new()
         .route("/", get(handle_health))
         .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
         .route("/v1/attestation", get(handle_attestation))
         .layer(
             CorsLayer::new()
@@ -845,6 +822,9 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
+    /// "ok", or "degraded" (still serving) without a vault root read within
+    /// root_max_staleness_seconds, or with an indexer that disagrees with
+    /// the vault or cannot be read.
     status: &'static str,
     protocol_version: u16,
     chain_id: u64,
@@ -858,6 +838,13 @@ struct HealthResponse {
     testnet_password_required: bool,
     /// POST /v2/withdraw/clearance requires a kind-2 `ownership_proof`.
     clearance_ownership_proof_required: bool,
+    /// O5': the request-root grace period.
+    request_root_grace_seconds: u64,
+    /// Seconds since the last successful vault root read (None: never).
+    vault_root_age_seconds: Option<u64>,
+    /// The indexer's root against the vault's: "agrees", "disagrees",
+    /// "unavailable", "unchecked" or "not_configured". Health only.
+    indexer_root: &'static str,
     #[serde(flatten)]
     deployment: DeploymentInfo,
 }
@@ -868,8 +855,11 @@ struct HealthResponse {
 struct DeploymentInfo {
     circuit_id: &'static str,
     setup_id: String,
-    /// Vault capability: concession exits (revision 3).
+    /// Vault capability: concession exits (revision 3 and later).
     exit_concession: u8,
+    /// Vault capability: leaf-bound exits (revision 4).
+    leaf_bound_exit: u8,
+    vault_revision: u64,
     /// Lease TTL + settlement grace + settlement deadline: a lease's charge
     /// is final this long after its issuance.
     settlement_window_seconds: Option<u64>,
@@ -880,6 +870,8 @@ fn deployment_info(processor: &RequestProcessor) -> DeploymentInfo {
         circuit_id: zkapi_proof::compact::CIRCUIT_ID,
         setup_id: processor.setup_id().to_string(),
         exit_concession: 1,
+        leaf_bound_exit: 1,
+        vault_revision: crate::deployment::VAULT_REVISION,
         settlement_window_seconds: processor
             .config()
             .openrouter_leases
@@ -904,8 +896,9 @@ struct AttestationResponse {
 
 async fn handle_health(State(processor): State<AppState>) -> Json<HealthResponse> {
     let config = processor.config();
+    let roots = processor.root_health();
     Json(HealthResponse {
-        status: "ok",
+        status: if roots.degraded() { "degraded" } else { "ok" },
         protocol_version: config.protocol_version,
         chain_id: config.chain_id,
         contract_address: config.contract_address,
@@ -917,8 +910,80 @@ async fn handle_health(State(processor): State<AppState>) -> Json<HealthResponse
         request_modes: vec!["direct_openrouter"],
         testnet_password_required: config.testnet_password.is_some(),
         clearance_ownership_proof_required: true,
+        request_root_grace_seconds: config.request_root_grace_seconds,
+        vault_root_age_seconds: roots.vault_root_age_seconds,
+        indexer_root: roots.indexer.as_str(),
         deployment: deployment_info(&processor),
     })
+}
+
+/// Prometheus text exposition of the root poller's state (O5').
+async fn handle_metrics(State(processor): State<AppState>) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        root_metrics(&processor.root_health()),
+    )
+        .into_response()
+}
+
+fn root_metrics(roots: &crate::processor::RootHealth) -> String {
+    use crate::processor::IndexerRootStatus;
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, kind: &str, value: u64| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    };
+    gauge(
+        "zkapi_indexer_root_disagreement",
+        "1 while the indexer root differs from the vault's currentRoot() at the indexer's block (health only; admission uses vault reads).",
+        "gauge",
+        u64::from(roots.indexer == IndexerRootStatus::Disagrees),
+    );
+    gauge(
+        "zkapi_indexer_root_disagreements_total",
+        "Root polls that found the indexer root different from the vault's.",
+        "counter",
+        roots.indexer_disagreements,
+    );
+    gauge(
+        "zkapi_indexer_root_unavailable",
+        "1 while the indexer root (or the vault root at its block) cannot be read.",
+        "gauge",
+        u64::from(roots.indexer == IndexerRootStatus::Unavailable),
+    );
+    gauge(
+        "zkapi_vault_root_stale",
+        "1 while no vault currentRoot() read is recent enough: requests are refused (root_unavailable).",
+        "gauge",
+        u64::from(roots.vault_root_stale),
+    );
+    if let Some(age) = roots.vault_root_age_seconds {
+        gauge(
+            "zkapi_vault_root_age_seconds",
+            "Seconds since the last successful vault currentRoot() read.",
+            "gauge",
+            age,
+        );
+    }
+    if let Some(block) = roots.vault_root_block {
+        gauge(
+            "zkapi_vault_root_block",
+            "Block of the last vault currentRoot() read.",
+            "gauge",
+            block,
+        );
+    }
+    gauge(
+        "zkapi_request_root_window_roots",
+        "Vault roots admission accepts now (the latest and those replaced within the grace period).",
+        "gauge",
+        roots.window_roots as u64,
+    );
+    out
 }
 
 async fn handle_attestation(State(processor): State<AppState>) -> Json<AttestationResponse> {
@@ -1220,8 +1285,7 @@ fn error_to_response(
     client_request_id: &str,
     processor: &RequestProcessor,
 ) -> ErrorHttpResponse {
-    // A clearance StaleRoot carries the vault root it read; report that,
-    // not this server's possibly lagging indexer root.
+    // A StaleRoot carries the latest vault root admission compared with.
     let latest_root = match err {
         ServerError::StaleRoot { latest_root } => {
             Some(Felt252::from_hex(latest_root).unwrap_or_else(|_| processor.current_root()))
@@ -1250,6 +1314,9 @@ fn build_error_response(
         | ServerError::NativeQuoteExpired
         | ServerError::NativeQuoteSuperseded => StatusCode::CONFLICT,
         ServerError::Replay | ServerError::NullifierUsed => StatusCode::CONFLICT,
+        ServerError::NoteLeafMismatch { .. } | ServerError::NoteNotActive { .. } => {
+            StatusCode::CONFLICT
+        }
         ServerError::LeasePending | ServerError::LeaseSettlementPending { .. } => {
             StatusCode::CONFLICT
         }
@@ -1316,8 +1383,10 @@ fn spawn_openrouter_lease_settler(processor: Arc<RequestProcessor>, interval: Du
     });
 }
 
-/// O5: refresh the indexer root and the vault's currentRoot() every
-/// `interval`; admission accepts only a root they agreed on recently.
+/// O5': read the vault's currentRoot() at the latest block every
+/// `interval` (and compare the indexer's root with it, for health only);
+/// admission refuses every request once no read succeeded for
+/// root_max_staleness_seconds.
 fn spawn_root_poller(
     processor: Arc<RequestProcessor>,
     indexer_url: Option<String>,
@@ -1330,14 +1399,10 @@ fn spawn_root_poller(
         loop {
             ticker.tick().await;
             if let Err(err) = processor.refresh_roots(indexer_url.as_deref()).await {
-                tracing::warn!("failed to refresh the indexer and vault roots: {}", err);
+                tracing::warn!("failed to read the vault root: {}", err);
             }
         }
     });
-}
-
-async fn fetch_indexer_root(indexer_url: &str) -> anyhow::Result<Felt252> {
-    crate::processor::fetch_indexer_root(indexer_url).await
 }
 
 #[cfg(test)]
@@ -1467,6 +1532,19 @@ mod rate_limit_tests {
                 "chain_read_unavailable",
                 true,
             ),
+            // Clearance against the vault's noteRecord (vault revision 4).
+            (
+                ServerError::NoteLeafMismatch { note_id: 7 },
+                StatusCode::CONFLICT,
+                "note_leaf_mismatch",
+                false,
+            ),
+            (
+                ServerError::NoteNotActive { note_id: 7 },
+                StatusCode::CONFLICT,
+                "note_not_active",
+                false,
+            ),
         ] {
             let (actual, _, Json(body)) = build_error_response(&error, "request", None);
             assert_eq!(actual, status, "{code}");
@@ -1484,7 +1562,7 @@ mod rate_limit_tests {
             &ServerError::StaleRoot {
                 latest_root: vault_root.to_hex(),
             },
-            "clearance",
+            "request",
             &processor,
         );
         let (status, _, Json(body)) = *response;
@@ -1516,8 +1594,8 @@ mod startup_tests {
     use super::*;
     use crate::native_billing::{
         NativeBillingConfig, CHALLENGE_PERIOD_SELECTOR, CLEARANCE_SIGNING_KEY_X_SELECTOR,
-        CLEARANCE_SIGNING_KEY_Y_SELECTOR, CURRENT_ROOT_SELECTOR, STATE_SIGNING_KEY_X_SELECTOR,
-        STATE_SIGNING_KEY_Y_SELECTOR,
+        CLEARANCE_SIGNING_KEY_Y_SELECTOR, CURRENT_ROOT_SELECTOR, NEXT_NOTE_ID_SELECTOR,
+        RETIREMENT_EPOCH_SELECTOR, STATE_SIGNING_KEY_X_SELECTOR, STATE_SIGNING_KEY_Y_SELECTOR,
     };
     use crate::signer::strong_test_seeds;
     use serde_json::{json, Value};
@@ -1535,14 +1613,18 @@ mod startup_tests {
         CLEARANCE_SIGNING_KEY_Y_SELECTOR,
         CHALLENGE_PERIOD_SELECTOR,
     ];
-    /// The startup probes, in order: six getters and three code reads, each
-    /// after an eth_chainId check.
-    const PROBE_READS: [(&str, &str); 9] = [
+    /// The startup probes, in order: seven getters and three code reads,
+    /// each after an eth_chainId check.
+    const PROBE_READS: [(&str, &str); 10] = [
         (
             "eth_call",
             crate::deployment::CONCESSION_ESCAPE_VERSION_SELECTOR,
         ),
-        ("eth_call", crate::deployment::ROOT_HISTORY_WINDOW_SELECTOR),
+        (
+            "eth_call",
+            crate::deployment::LEAF_BOUND_EXIT_VERSION_SELECTOR,
+        ),
+        ("eth_call", crate::deployment::MIN_DEPOSIT_SELECTOR),
         ("eth_call", crate::deployment::PROOF_ADAPTER_SELECTOR),
         ("eth_call", crate::deployment::CIRCUIT_ID_HASH_SELECTOR),
         ("eth_call", crate::deployment::REQUEST_VK_HASH_SELECTOR),
@@ -1579,7 +1661,8 @@ mod startup_tests {
     #[derive(Clone)]
     struct Probes {
         version: u64,
-        root_window: u64,
+        leaf_bound: u64,
+        min_deposit: u64,
         adapter: String,
         circuit_id_hash: [u8; 32],
         request_vk: String,
@@ -1590,13 +1673,14 @@ mod startup_tests {
     }
 
     impl Probes {
-        /// A revision-3 deployment of the development setup, as
+        /// A revision-4 deployment of the development setup, as
         /// `crate::deployment::tests::manifest_json` pins it.
         fn matching() -> Self {
             let identity = crate::deployment::tests::dev_identity();
             Self {
                 version: 1,
-                root_window: 86_400,
+                leaf_bound: 1,
+                min_deposit: 1_000_000,
                 adapter: ADAPTER.into(),
                 circuit_id_hash: zkapi_proof::compact::CIRCUIT_ID_HASH,
                 request_vk: identity.request_vk_keccak256,
@@ -1617,7 +1701,8 @@ mod startup_tests {
         /// Holds every response until permits are added.
         gate: Option<Arc<Semaphore>>,
         challenge_period: u64,
-        /// Answers currentRoot() when set.
+        /// Answers the root poller (latest block 7, and currentRoot() and
+        /// nextNoteId() at its hash) when set.
         root: Option<Felt252>,
         probes: Probes,
     }
@@ -1676,10 +1761,11 @@ mod startup_tests {
                             .unwrap_or_default()
                             .to_string()
                     };
-                    let block = request["params"][1]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
+                    let block = match &request["params"][1] {
+                        Value::String(tag) => tag.clone(),
+                        Value::Null => String::new(),
+                        pinned => pinned.to_string(),
+                    };
                     calls
                         .lock()
                         .unwrap()
@@ -1690,6 +1776,13 @@ mod startup_tests {
                     let word = |value: &Felt252| format!("0x{}", hex::encode(value.as_bytes()));
                     let number = |value: u64| format!("0x{value:064x}");
                     let probes = &vault.probes;
+                    let block_hash = format!("0x{}", "07".repeat(32));
+                    if method == "eth_getBlockByNumber" && vault.root.is_some() {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                        let block = json!({"number": "0x7", "hash": block_hash, "timestamp": format!("0x{now:x}")});
+                        return Ok(Json(json!({"jsonrpc":"2.0", "id":1, "result":block})));
+                    }
+                    let pinned = request["params"][1]["blockHash"] == json!(block_hash);
                     let result = match (method.as_str(), vault.keys.as_ref()) {
                         ("eth_chainId", _) => vault.chain.to_string(),
                         ("eth_getCode", Some(_)) => {
@@ -1708,9 +1801,14 @@ mod startup_tests {
                             number(probes.version)
                         }
                         ("eth_call", Some(_))
-                            if data == crate::deployment::ROOT_HISTORY_WINDOW_SELECTOR =>
+                            if data == crate::deployment::LEAF_BOUND_EXIT_VERSION_SELECTOR =>
                         {
-                            number(probes.root_window)
+                            number(probes.leaf_bound)
+                        }
+                        ("eth_call", Some(_))
+                            if data == crate::deployment::MIN_DEPOSIT_SELECTOR =>
+                        {
+                            number(probes.min_deposit)
                         }
                         ("eth_call", Some(_))
                             if data == crate::deployment::PROOF_ADAPTER_SELECTOR =>
@@ -1740,9 +1838,11 @@ mod startup_tests {
                             CHALLENGE_PERIOD_SELECTOR => {
                                 format!("0x{:064x}", vault.challenge_period)
                             }
-                            CURRENT_ROOT_SELECTOR if vault.root.is_some() => {
+                            CURRENT_ROOT_SELECTOR if vault.root.is_some() && pinned => {
                                 word(vault.root.as_ref().unwrap())
                             }
+                            NEXT_NOTE_ID_SELECTOR if vault.root.is_some() && pinned => number(1),
+                            RETIREMENT_EPOCH_SELECTOR if vault.root.is_some() && pinned => number(0),
                             _ => return Err(StatusCode::BAD_REQUEST),
                         },
                         _ => return Err(StatusCode::BAD_REQUEST),
@@ -1997,10 +2097,21 @@ mod startup_tests {
                 Box::new(|probes| probes.version = 0),
                 "CONCESSION_ESCAPE_VERSION()",
             ),
+            // A revision-3 vault has no LEAF_BOUND_EXIT_VERSION().
             (
-                Box::new(|probes| probes.root_window = 3_600),
-                "ROOT_HISTORY_WINDOW()",
+                Box::new(|probes| probes.leaf_bound = 0),
+                "LEAF_BOUND_EXIT_VERSION()",
             ),
+            (
+                Box::new(|probes| probes.leaf_bound = 2),
+                "LEAF_BOUND_EXIT_VERSION()",
+            ),
+            // The manifest pins min_deposit_units 1,000,000.
+            (
+                Box::new(|probes| probes.min_deposit = 999_999),
+                "minDeposit()",
+            ),
+            (Box::new(|probes| probes.min_deposit = 0), "minDeposit()"),
             (
                 Box::new(|probes| {
                     probes.adapter = "0x00000000000000000000000000000000000ba0ba".into()
@@ -2131,7 +2242,7 @@ mod startup_tests {
                 .json()
                 .await
                 .unwrap();
-            assert_eq!(health["circuit_id"], "zkapi-v2-concession-v1");
+            assert_eq!(health["circuit_id"], "zkapi-v2-concession-v2");
             assert_eq!(health["setup_id"], "dev");
             assert_eq!(health["exit_concession"], 1);
             assert_eq!(health["settlement_window_seconds"], 300 + 21_600);
@@ -2252,7 +2363,8 @@ mod startup_tests {
             .to_string();
         assert!(error.contains("after 3 attempts"), "{error}");
         assert!(!error.contains(&rpc), "{error}");
-        assert_eq!(methods(&calls).len(), 3);
+        // Three startup probes, each with four bounded transport retries.
+        assert_eq!(methods(&calls).len(), 3 * 4);
         assert!(!db_path.exists());
     }
 
@@ -2518,6 +2630,7 @@ mod startup_tests {
             },
             VaultRpc::serving(keys_of(seeds)),
         ] {
+            let unavailable = vault.unavailable;
             let matching =
                 vault.keys == Some(keys_of(seeds)) && !vault.unavailable && vault.chain == "0x1";
             let (rpc, calls) = vault_rpc(vault).await;
@@ -2540,6 +2653,9 @@ mod startup_tests {
             if matching {
                 // Verified once, probes included, then idle.
                 assert_eq!(calls.len(), 1 + KEY_READS.len() + PROBE_CALLS);
+            } else if unavailable {
+                // Transport retries back off 500ms rather than hammering an outage.
+                assert_eq!(calls.len(), 1);
             } else {
                 assert!(calls.len() > 2);
             }
@@ -2646,10 +2762,11 @@ mod startup_tests {
         );
     }
 
-    /// Optional review nit (seam:ops-config#9): with the indexer unavailable at
-    /// startup, the server starts at the vault's currentRoot(), not at 0x0.
+    /// O5': the server reads the vault's currentRoot() at the latest block
+    /// hash before it serves, whether or not the indexer is up: an
+    /// unavailable indexer only degrades /health.
     #[tokio::test]
-    async fn startup_without_an_indexer_root_uses_the_vault_root() {
+    async fn startup_reads_the_vault_root_before_serving() {
         let seeds = strong_test_seeds();
         let vault_root = Felt252::from_u64(0x7007);
         let (rpc, _) = vault_rpc(VaultRpc {
@@ -2671,6 +2788,39 @@ mod startup_tests {
             .await
             .unwrap();
         assert_eq!(health["current_root"], json!(vault_root));
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["indexer_root"], "unavailable");
+        assert_eq!(
+            health["vault_root_age_seconds"]
+                .as_u64()
+                .map(|age| age <= 5),
+            Some(true)
+        );
+        assert_eq!(health["request_root_grace_seconds"], 60);
+        assert_eq!(health["vault_revision"], 4);
+        assert_eq!(health["leaf_bound_exit"], 1);
+        let metrics = reqwest::get(format!("http://{}/metrics", config.listen_addr))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            metrics.contains("\nzkapi_indexer_root_disagreement 0\n"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("\nzkapi_indexer_root_unavailable 1\n"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("\nzkapi_vault_root_stale 0\n"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("\nzkapi_vault_root_block 7\n"),
+            "{metrics}"
+        );
         server.abort();
     }
 
@@ -3262,7 +3412,7 @@ pub(crate) mod settlement_route_tests {
         for uri in ["/health", "/v1/attestation"] {
             let (status, body) = get_json(&app, uri).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(body["circuit_id"], "zkapi-v2-concession-v1", "{uri}");
+            assert_eq!(body["circuit_id"], "zkapi-v2-concession-v2", "{uri}");
             assert_eq!(body["setup_id"], "dev", "{uri}");
             assert_eq!(body["exit_concession"], 1, "{uri}");
             assert_eq!(body["settlement_window_seconds"], 300 + 21_600, "{uri}");
@@ -3338,10 +3488,12 @@ pub(crate) mod settlement_route_tests {
             crate::test_support::ownership_server_config(),
             Arc::new(NullifierStore::in_memory().unwrap()),
             Arc::new(ServerSigner::new(&state_seed, &clear_seed)),
-            fixture.root,
+            Felt252::ZERO,
         )
         .unwrap();
-        let app = create_router(Arc::new(processor));
+        fixture.deposit_on(&processor);
+        let processor = Arc::new(processor);
+        let app = create_router(processor.clone());
         let nullifier = fixture.request.withdrawal_nullifier;
         let (status, _, body) = post_clearance(&app, &fixture.request).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -3349,6 +3501,17 @@ pub(crate) mod settlement_route_tests {
             body["withdrawal_nullifier"],
             serde_json::to_value(nullifier).unwrap()
         );
+        // Once the vault reports the note's escape, the same request is a
+        // 409 note_not_active.
+        processor.set_test_note(
+            fixture.note_id(),
+            fixture.leaf(),
+            crate::native_billing::NoteStatus::PendingWithdrawal,
+        );
+        let (status, _, body) = post_clearance(&app, &fixture.request).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error_code"], "note_not_active");
+        assert_eq!(body["retriable"], false);
         let mut legacy = serde_json::to_value(&fixture.request).unwrap();
         let inputs = legacy["ownership_proof"]["public_inputs"]
             .as_object_mut()

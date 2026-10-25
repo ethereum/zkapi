@@ -1,7 +1,7 @@
 name: zkapi
 
 x-daemon: &daemon
-  image: zkapi/aws:${ZKAPI_IMAGE_TAG:-concession-v1}
+  image: zkapi/aws:${ZKAPI_IMAGE_TAG:-concession-v2}
   build:
     context: ../..
     dockerfile: docker/Dockerfile
@@ -115,7 +115,7 @@ services:
       start_period: 60s
 
   signer:
-    image: zkapi/signer:${ZKAPI_IMAGE_TAG:-concession-v1}
+    image: zkapi/signer:${ZKAPI_IMAGE_TAG:-concession-v2}
     build:
       context: ./signer
     profiles: ["challenge"]
@@ -142,7 +142,7 @@ services:
         max-file: "5"
 
   gateway:
-    image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v1}
+    image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v2}
     build:
       context: ../..
       dockerfile: docker/aws/Dockerfile.gateway

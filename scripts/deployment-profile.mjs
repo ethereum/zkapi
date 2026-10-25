@@ -4,10 +4,16 @@
 // --finalize` wrote (docs/migration-concession-vault.md, B2 step 5):
 //
 //   node scripts/deployment-profile.mjs --finalized deployment.json \
-//     --deployment-id zkapi-native-eth-sepolia-concession-v1 \
+//     --deployment-id zkapi-native-eth-sepolia-concession-v2 \
 //     --protocol-server-url https://... --indexer-url https://... --rpc-url https://... \
-//     --verifier-url https://... [--bundler-url https://...] [--format trusted|sdk|clientd] \
-//     [--base FILE] [--out FILE]
+//     --verifier-url https://... [--bundler-url https://...] [--fresh-slot-gas N] \
+//     [--format trusted|sdk|clientd] [--base FILE] [--out FILE]
+//
+// Vault revision 4 profiles carry `min_deposit_units` (the vault's minDeposit)
+// and `fresh_slot_gas`, the gas of a fresh storage slot on the network, which
+// clients add to a deposit's gas limit (docs/deployment.md, deposit gas limit):
+// 22,100 by default on mainnet and local chains, 110,000 on Sepolia (EIP-8037);
+// any other chain must pass --fresh-slot-gas (or carry it in --base).
 //
 // - `trusted` (the default) prints `{ "trusted_deployment": ... }`: the
 //   manifest serverd, `zkapi db init` and zkapi-challenged read with
@@ -71,7 +77,8 @@ export function setupPins(setupDir, finalized) {
  * both builds' wallets in one store keyed by that ID.
  */
 export function deploymentProfile(finalized, { deploymentId, protocolServerUrl, indexerUrl, rpcUrl, verifierUrl,
-    inferenceBase = 'https://openrouter.ai/api/v1', priceFeed, settlementWindowSeconds, keyHashes, canary = null, bundlerUrl = null }) {
+    inferenceBase = 'https://openrouter.ai/api/v1', priceFeed, settlementWindowSeconds, keyHashes, canary = null, bundlerUrl = null,
+    freshSlotGas = undefined }) {
     assert.ok(typeof deploymentId === 'string' && /^[a-z0-9][a-z0-9.-]{2,127}$/.test(deploymentId),
         'name the deployment with a new deployment ID (lowercase letters, digits, dots and dashes)');
     assert.ok(!deploymentId.includes('note-bound'), 'a deployment ID of the legacy vault cannot name the concession vault');
@@ -84,7 +91,7 @@ export function deploymentProfile(finalized, { deploymentId, protocolServerUrl, 
         + 'zkapi-clientd refuses a profile whose bundler URL carries any of these, so a hosted bundler\'s API key cannot ride in the URL');
     assert.ok(bundlerUrl === null || finalized.withdrawalPaymaster != null, '--bundler-url names a bundler for a deployment without the paymaster');
     const profile = trustedDeployment(finalized, { deploymentId, protocolServerUrl, indexerUrl, rpcUrl, priceFeed, keyHashes,
-        settlementWindowSeconds, inferenceBase, verifierUrl, bundlerUrl });
+        settlementWindowSeconds, inferenceBase, verifierUrl, bundlerUrl, freshSlotGas });
     return { ...profile, canary };
 }
 
@@ -106,12 +113,15 @@ export function clientdProfile(base, profile, finalized, keyHashes) {
         protocol_server_url: profile.protocol_server_url,
         indexer_url: profile.indexer_url,
         request_charge_cap: profile.request_charge_cap,
+        min_deposit_units: profile.min_deposit_units,
+        fresh_slot_gas: profile.fresh_slot_gas,
         note_ttl_seconds: profile.note_ttl,
         challenge_period_seconds: profile.challenge_period,
         max_pause_duration_seconds: profile.max_pause_duration,
         settlement_window_seconds: profile.settlement_window_seconds,
-        vault_revision: 3,
+        vault_revision: 4,
         exit_concession: 1,
+        leaf_bound_exit: 1,
         clearance_ownership_proof: 'required',
         state_signing_key: profile.state_signing_key,
         clearance_signing_key: profile.clearance_signing_key,
@@ -147,7 +157,8 @@ function options(args) {
     const flags = { '--finalized': 'finalized', '--deployment-id': 'deploymentId', '--protocol-server-url': 'protocolServerUrl',
         '--indexer-url': 'indexerUrl', '--rpc-url': 'rpcUrl', '--verifier-url': 'verifierUrl', '--inference-base': 'inferenceBase',
         '--price-feed': 'priceFeed', '--settlement-window-seconds': 'settlementWindowSeconds', '--setup-dir': 'setupDir',
-        '--canary': 'canary', '--format': 'format', '--base': 'base', '--out': 'out', '--bundler-url': 'bundlerUrl' };
+        '--canary': 'canary', '--format': 'format', '--base': 'base', '--out': 'out', '--bundler-url': 'bundlerUrl',
+        '--fresh-slot-gas': 'freshSlotGas' };
     const parsed = { format: 'trusted' };
     for (let i = 0; i < args.length; i += 2) {
         const key = flags[args[i]];
@@ -186,6 +197,7 @@ function main(args) {
         settlementWindowSeconds: settlement == null ? undefined : Number(settlement), keyHashes,
         canary: opts.canary ? JSON.parse(opts.canary) : (baseProfile?.canary ?? null),
         bundlerUrl: opts.bundlerUrl ?? null,
+        freshSlotGas: opts.freshSlotGas !== undefined ? Number(opts.freshSlotGas) : baseProfile?.fresh_slot_gas,
     });
     let output;
     if (opts.format === 'trusted') output = { trusted_deployment: profile };

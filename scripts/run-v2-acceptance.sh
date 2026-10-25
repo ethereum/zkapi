@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The local end-to-end acceptance of circuit zkapi-v2-concession-v1 (vault
-# revision 3) and the §10.7 Phase B drill scenarios that run on Anvil
+# The local end-to-end acceptance of circuit zkapi-v2-concession-v2 (vault
+# revision 4, leaf-bound exits) and the §10.7 Phase B drill scenarios that run on Anvil
 # (docs/v2-acceptance.md): builds the drill binaries and the contracts, then
 # runs scripts/v2-acceptance.mjs. Extra arguments go to the harness, for
 # example --output-dir DIR.

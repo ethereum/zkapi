@@ -42,7 +42,7 @@ const TOPIC = Object.freeze({
     finalized: keccak256Hex('EscapeWithdrawalFinalized(uint32,uint256,uint128,address)')
 });
 const SELECTOR = Object.freeze({
-    notes: selectorOf('notes(uint32)'),
+    notes: selectorOf('noteRecord(uint32)'),
     pending: selectorOf('pendingWithdrawals(uint32)'),
     concessions: selectorOf('pendingConcessions(uint32)'),
     credits: selectorOf('escapePayoutCredits(address)')
@@ -100,7 +100,7 @@ function scriptedChain() {
             }
             if (method === 'eth_call') {
                 const [{ data }] = params;
-                if (data.startsWith(SELECTOR.notes)) return `0x${[0, 0, 0, chain.noteStatus].map(word).join('')}`;
+                if (data.startsWith(SELECTOR.notes)) return `0x${[0x1eaf, chain.noteStatus].map(word).join('')}`;
                 if (data.startsWith(SELECTOR.pending)) {
                     return `0x${[1, 0x11, NULLIFIER, chain.pending.finalBalance, DESTINATION, CLOSE_BLOCK].map(word).join('')}`;
                 }
@@ -181,7 +181,7 @@ test('E5: after a raise the escape\'s start receipt still matches its start, on 
     // The start receipt: initiated at B with nothing conceded.
     chain.receipts.set(START_HASH, { transactionHash: START_HASH, blockNumber: hex(START_BLOCK), status: '0x1', logs: [
         { address: VAULT, topics: [ABI.escapeInitiatedEvent, `0x${word(NOTE_ID)}`],
-            data: `0x${[NULLIFIER, B, DESTINATION, deadline, 0x77].map(word).join('')}`, removed: false },
+            data: `0x${[NULLIFIER, B, DESTINATION, deadline].map(word).join('')}`, removed: false },
         { address: VAULT, topics: [ABI.escapeConcessionRecordedEvent, `0x${word(NOTE_ID)}`],
             data: `0x${[0x5099, B, 0].map(word).join('')}`, removed: false }
     ] });
@@ -350,6 +350,7 @@ const pinnedProfile = (overrides = {}) => ({
     poseidon_runtime_codehash: codehash(CODE[POSEIDON]),
     request_vk_keccak256: `0x${'4d'.repeat(32)}`, withdrawal_vk_keccak256: `0x${'29'.repeat(32)}`,
     challenge_period: 172_800, note_ttl: 2_592_000, max_pause_duration: 3_888_000,
+    vault_revision: 4, leaf_bound_exit: 1, min_deposit_units: 1_000,
     state_signing_key: { x: '0x111', y: '0x112' }, clearance_signing_key: { x: '0x113', y: '0x114' },
     ...overrides
 });
@@ -360,7 +361,8 @@ function deploymentChain({ code = CODE, getters = {}, balance = 0n } = {}) {
         [`${VAULT}:${ABI.stateSigningKeyY}`]: 0x112n, [`${VAULT}:${ABI.clearanceSigningKeyX}`]: 0x113n,
         [`${VAULT}:${ABI.clearanceSigningKeyY}`]: 0x114n, [`${VAULT}:${ABI.challengePeriod}`]: 172_800n,
         [`${VAULT}:${ABI.noteTtl}`]: 2_592_000n, [`${VAULT}:${ABI.maxPauseDuration}`]: 3_888_000n,
-        [`${VAULT}:${ABI.CONCESSION_ESCAPE_VERSION}`]: 1n, [`${VAULT}:${ABI.ROOT_HISTORY_WINDOW}`]: 86_400n,
+        [`${VAULT}:${ABI.CONCESSION_ESCAPE_VERSION}`]: 1n, [`${VAULT}:${ABI.LEAF_BOUND_EXIT_VERSION}`]: 1n,
+        [`${VAULT}:${ABI.minDeposit}`]: 1_000n,
         [`${ADAPTER}:${ABI.CIRCUIT_ID_HASH}`]: BigInt(CONCESSION_CIRCUIT_ID_HASH),
         [`${ADAPTER}:${ABI.REQUEST_VK_HASH}`]: BigInt(`0x${'4d'.repeat(32)}`),
         [`${ADAPTER}:${ABI.WITHDRAWAL_VK_HASH}`]: BigInt(`0x${'29'.repeat(32)}`),

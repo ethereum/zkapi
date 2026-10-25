@@ -335,3 +335,86 @@ func TestRebindAutoSelectsOnlyOurLeafNearPreparedSlot(t *testing.T) {
 		})
 	}
 }
+
+// rebindWithoutReceipt prepares a deposit whose transaction left no receipt
+// this daemon kept (lost, or signed elsewhere), with a slot prepared at chain
+// time preparedAt, and the vault holding note 12 as deposited at minedAt
+// with commitment.
+func rebindWithoutReceipt(t *testing.T, preparedAt, minedAt int64, commitment string) (*addressFixture, uint64) {
+	t.Helper()
+	f := newAddressFixture(t, true)
+	if _, err := f.h.prepare(context.Background(), 100000); err != nil {
+		t.Fatal(err)
+	}
+	record := f.savedDeposit(t)
+	record.Slot = &depositSlot{NoteID: 12, PathSHA256: "0x" + strings.Repeat("0", 64), PreparedAt: preparedAt, PreparedChainAt: preparedAt}
+	if err := f.h.save(record); err != nil {
+		t.Fatal(err)
+	}
+	expiry := expiryAt(minedAt)
+	f.mu.Lock()
+	f.finalized = "0x20"
+	f.registerDeposit(12, commitment, 100000, expiry)
+	f.mu.Unlock()
+	return f, expiry
+}
+
+// Design C.9: a vault of revision 4 stores only the note's leaf. With no
+// receipt, rebind finds the expiry by trying each day bucket from the slot's
+// preparation to the finalized block's time, and accepts the one whose leaf
+// is the vault's: here the deposit was prepared a minute before a day
+// boundary and mined two minutes later, in the next bucket. The search reads
+// the vault's own leaves (noteLeaves at the finalized block), not the
+// indexer's.
+func TestRebindWithoutAReceiptRecoversTheExpiryAcrossADayBoundary(t *testing.T) {
+	boundary := addressTestHeader.Time / vaultExpiryBucket * vaultExpiryBucket
+	preparedAt := int64(boundary) - 60
+	for _, automatic := range []bool{false, true} {
+		t.Run(map[bool]string{false: "named note", true: "automatic"}[automatic], func(t *testing.T) {
+			f, expiry := rebindWithoutReceipt(t, preparedAt, preparedAt+120, "0x1234")
+			if expiry == expiryAt(preparedAt) {
+				t.Fatal("the fixture's deposit did not cross a day boundary")
+			}
+			f.mu.Lock()
+			f.indexerStatus = http.StatusServiceUnavailable
+			f.mu.Unlock()
+			var note *uint64
+			if !automatic {
+				note = &[]uint64{12}[0]
+			}
+			status, err := f.h.RebindDeposit(context.Background(), note, nil)
+			if err != nil || status.Phase != "active" || f.activated != 1 {
+				t.Fatalf("rebind did not recover the note: %+v %v", status, err)
+			}
+			if body := f.confirmBodies[0]; body["note_id"] != float64(12) || body["expiry_ts"] != float64(expiry) {
+				t.Fatalf("rebind bound the wrong expiry: %+v (want %d)", body, expiry)
+			}
+			if binding := f.savedDeposit(t).Binding; binding == nil || binding.ExpiryTs != expiry || binding.IndexerBlock != 0 {
+				t.Fatalf("wrong binding: %+v", binding)
+			}
+			// The indexer is down: the automatic search read the vault's leaves.
+			if automatic && f.leafPageReads == 0 {
+				t.Fatal("the automatic search did not read the vault's leaves")
+			}
+		})
+	}
+}
+
+// The slot holds another deposit (another commitment, the same amount): no
+// expiry reproduces its leaf, so nothing is bound.
+func TestRebindWithoutAReceiptRefusesAnotherCommitment(t *testing.T) {
+	now := int64(addressTestHeader.Time)
+	for _, automatic := range []bool{false, true} {
+		f, _ := rebindWithoutReceipt(t, now-3600, now-3000, "0x5678")
+		var note *uint64
+		if !automatic {
+			note = &[]uint64{12}[0]
+		}
+		if _, err := f.h.RebindDeposit(context.Background(), note, nil); err == nil {
+			t.Fatal("rebind bound a note of another commitment")
+		}
+		if f.activated != 0 || f.resetCalls != 0 || f.savedDeposit(t).Active || f.savedDeposit(t).Binding != nil {
+			t.Fatal("refused rebind changed state")
+		}
+	}
+}

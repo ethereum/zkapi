@@ -1,4 +1,4 @@
-//! Groth16 circuits of `zkapi-v2-concession-v1` over BN254.
+//! Groth16 circuits of `zkapi-v2-concession-v2` (leaf-bound exits) over BN254.
 //!
 //! Both circuits use Poseidon over the BN254 scalar field, a note-bound
 //! Baby-JubJub Pedersen balance commitment `C = B·G + r·H + L·J`, and a
@@ -15,7 +15,15 @@
 //!   signed (or genesis) state and authorizes an escape (kind 0, which also
 //!   publishes the successor nullifier and may concede an amount), a mutual
 //!   close under a clearance signature (kind 1) or an ownership proof
-//!   (kind 2, no destination).
+//!   (kind 2, no destination). It proves no Merkle membership: it publishes
+//!   the note's leaf `L` (input 3) and its fields
+//!   `F = n·2^192 + D·2^64 + e` (input 8), binds `L = P(d_leaf', R(s), F)[1]`
+//!   to the owner's secret, and the vault compares `L` with the leaf it
+//!   stored at deposit.
+//!
+//! The note leaf is one Poseidon permutation with the domain in the capacity
+//! lane, `L = P(d_leaf', H(d_reg, s, 0), F)[1]` ([`note_leaf`]), in both
+//! circuits; the request circuit proves its membership in the request tree.
 //!
 //! The native helpers at the end of this module ([`nullifier`],
 //! [`next_anchor`], [`successor_nullifier`], ...) mirror `zkapi_core::v2`.
@@ -67,7 +75,8 @@ pub const DESTINATION_BITS: usize = 160;
 pub const REQUEST_ROW_BUDGET: usize = 32_700;
 
 const DOMAIN_REG: &[u8] = b"zkapi.v2.reg";
-const DOMAIN_LEAF: &[u8] = b"zkapi.v2.leaf";
+/// The note leaf's capacity-lane domain (zkapi_core::v2::DOMAIN_LEAF).
+const DOMAIN_LEAF: &[u8] = b"zkapi.v2c.leaf";
 const DOMAIN_NODE: &[u8] = b"zkapi.v2.node";
 const DOMAIN_NULLIFIER: &[u8] = b"zkapi.v2c.null";
 const DOMAIN_ANCHOR: &[u8] = b"zkapi.v2c.anchor";
@@ -116,16 +125,36 @@ fn poseidon_hash_var(
     Ok(sponge.squeeze_field_elements(1)?[0].clone())
 }
 
-/// The note tree's node hash: one permutation of the state `(DOMAIN_NODE, left, right)`, its
-/// first rate lane (zkapi_core::v2::compress_fields). The domain sits in the capacity lane, so
-/// a node costs one permutation instead of the sponge's two and cannot collide with any sponge
-/// hash, whose capacity lane starts at zero.
-pub fn merkle_node(left: CircuitField, right: CircuitField) -> CircuitField {
+/// One permutation of the state `(capacity, left, right)`, its first rate lane
+/// (zkapi_core::v2::compress_fields). With a domain in the capacity lane it costs one
+/// permutation instead of the sponge's two and cannot collide with any sponge hash, whose
+/// capacity lane starts at zero.
+pub fn compress(capacity: CircuitField, left: CircuitField, right: CircuitField) -> CircuitField {
     let mut sponge = PoseidonSponge::new(poseidon_config());
-    sponge.state[0] = domain(DOMAIN_NODE);
+    sponge.state[0] = capacity;
     let inputs: &[CircuitField] = &[left, right];
     sponge.absorb(&inputs);
     sponge.squeeze_native_field_elements(1)[0]
+}
+
+/// The note tree's node hash: [`compress`] with `DOMAIN_NODE`.
+pub fn merkle_node(left: CircuitField, right: CircuitField) -> CircuitField {
+    compress(domain(DOMAIN_NODE), left, right)
+}
+
+/// [`compress`] in the circuit, with the capacity domain `label`: one permutation (240
+/// constraints).
+fn compress_var(
+    cs: ConstraintSystemRef<CircuitField>,
+    label: &[u8],
+    left: &FpVar<CircuitField>,
+    right: &FpVar<CircuitField>,
+) -> Result<FpVar<CircuitField>, SynthesisError> {
+    let mut sponge = PoseidonSpongeVar::new(cs, poseidon_config());
+    sponge.state[0] = domain_var(label);
+    let inputs: &[FpVar<CircuitField>] = &[left.clone(), right.clone()];
+    sponge.absorb(&inputs)?;
+    Ok(sponge.squeeze_field_elements(1)?[0].clone())
 }
 
 fn merkle_node_var(
@@ -133,11 +162,34 @@ fn merkle_node_var(
     left: &FpVar<CircuitField>,
     right: &FpVar<CircuitField>,
 ) -> Result<FpVar<CircuitField>, SynthesisError> {
-    let mut sponge = PoseidonSpongeVar::new(cs, poseidon_config());
-    sponge.state[0] = domain_var(DOMAIN_NODE);
-    let inputs: &[FpVar<CircuitField>] = &[left.clone(), right.clone()];
-    sponge.absorb(&inputs)?;
-    Ok(sponge.squeeze_field_elements(1)?[0].clone())
+    compress_var(cs, DOMAIN_NODE, left, right)
+}
+
+/// `F = n·2^192 + D·2^64 + e` over the bits of the range-checked integers: a linear
+/// combination, no constraint. The UInt32/UInt128/UInt64 allocations constrain every bit to be
+/// Boolean, so F < 2^224 < p and (n, D, e) ↦ F is injective.
+fn note_fields_var(
+    note_id: &UInt32<CircuitField>,
+    deposit_amount: &UInt128<CircuitField>,
+    expiry: &UInt64<CircuitField>,
+) -> Result<FpVar<CircuitField>, SynthesisError> {
+    let mut bits = expiry.bits.to_vec();
+    bits.extend(deposit_amount.bits.iter().cloned());
+    bits.extend(note_id.bits.iter().cloned());
+    Boolean::le_bits_to_fp(&bits)
+}
+
+/// The note leaf `L = P(d_leaf', H(d_reg, s, 0), fields)[1]`.
+fn note_leaf_var(
+    cs: ConstraintSystemRef<CircuitField>,
+    secret: &FpVar<CircuitField>,
+    fields: &FpVar<CircuitField>,
+) -> Result<FpVar<CircuitField>, SynthesisError> {
+    let registration = poseidon_hash_var(
+        cs.clone(),
+        &[domain_var(DOMAIN_REG), secret.clone(), FpVar::zero()],
+    )?;
+    compress_var(cs, DOMAIN_LEAF, &registration, fields)
 }
 
 fn domain(label: &[u8]) -> CircuitField {
@@ -423,7 +475,7 @@ pub struct RequestCircuit {
     pub witness: RequestWitness,
 }
 
-/// Registration `R = H(d_reg, s, 0)`, leaf `L = H(d_leaf, n, R, D, expiry)`
+/// Registration `R = H(d_reg, s, 0)`, leaf `L = P(d_leaf', R, n·2^192 + D·2^64 + e)[1]`
 /// and the depth-32 path over the bits of `n`, which must end at
 /// `active_root`. Returns `L`.
 fn enforce_note_membership(
@@ -435,20 +487,8 @@ fn enforce_note_membership(
     merkle_siblings: &[CircuitField; REQUEST_MERKLE_DEPTH],
     active_root: &FpVar<CircuitField>,
 ) -> Result<FpVar<CircuitField>, SynthesisError> {
-    let registration = poseidon_hash_var(
-        cs.clone(),
-        &[domain_var(DOMAIN_REG), secret.clone(), FpVar::zero()],
-    )?;
-    let leaf = poseidon_hash_var(
-        cs.clone(),
-        &[
-            domain_var(DOMAIN_LEAF),
-            note_id.to_fp()?,
-            registration,
-            deposit_amount.to_fp()?,
-            expiry.to_fp()?,
-        ],
-    )?;
+    let fields = note_fields_var(note_id, deposit_amount, expiry)?;
+    let leaf = note_leaf_var(cs.clone(), secret, &fields)?;
     let mut current = leaf.clone();
     for (level, sibling_value) in merkle_siblings.iter().enumerate() {
         let sibling = FpVar::new_witness(cs.clone(), || Ok(*sibling_value))?;
@@ -637,7 +677,9 @@ impl ConstraintSynthesizer<CircuitField> for RequestCircuit {
 
 /// The withdrawal statement (public inputs 0–15).
 ///
-/// `destination` is a field element so that out-of-range values can be
+/// `note_leaf` (input 3) is the note's leaf and `note_fields` (input 8) its packed
+/// `n·2^192 + D·2^64 + e`; both are raw field elements so that wrong or non-canonical values
+/// can be expressed. `destination` is a field element so that out-of-range values can be
 /// expressed; honest statements carry an Ethereum address (< 2^160).
 /// `kind` is 0 (escape), 1 (mutual close) or 2 (ownership proof).
 #[derive(Clone, Debug)]
@@ -645,10 +687,10 @@ pub struct WithdrawalPublic {
     pub protocol_version: u16,
     pub chain_id: u64,
     pub contract_address: CircuitField,
-    pub active_root: CircuitField,
+    pub note_leaf: CircuitField,
     pub state_signing_key: EdwardsAffine,
     pub clearance_signing_key: EdwardsAffine,
-    pub note_id: u32,
+    pub note_fields: CircuitField,
     pub final_balance: u128,
     pub destination: CircuitField,
     pub withdrawal_nullifier: CircuitField,
@@ -664,12 +706,12 @@ impl WithdrawalPublic {
             CircuitField::from(self.protocol_version as u64),
             CircuitField::from(self.chain_id),
             self.contract_address,
-            self.active_root,
+            self.note_leaf,
             self.state_signing_key.x,
             self.state_signing_key.y,
             self.clearance_signing_key.x,
             self.clearance_signing_key.y,
-            CircuitField::from(self.note_id),
+            self.note_fields,
             CircuitField::from(self.final_balance),
             self.destination,
             self.withdrawal_nullifier,
@@ -682,14 +724,16 @@ impl WithdrawalPublic {
 }
 
 /// Private withdrawal witness. There is no `prev_anchor`: exits never need
-/// the predecessor state. The destination bits and the kind bits `k1`, `k2`
-/// are derived from the public inputs during synthesis.
+/// the predecessor state, and no Merkle path: the leaf is public. `note_id`,
+/// `deposit_amount` and `expiry` must pack to the statement's `note_fields`.
+/// The destination bits and the kind bits `k1`, `k2` are derived from the
+/// public inputs during synthesis.
 #[derive(Clone, Debug)]
 pub struct WithdrawalWitness {
     pub secret: CircuitField,
+    pub note_id: u32,
     pub deposit_amount: u128,
     pub expiry: u64,
-    pub merkle_siblings: [CircuitField; REQUEST_MERKLE_DEPTH],
     pub state_balance: u128,
     pub state_blinding: EdwardsScalarField,
     pub current_anchor: CircuitField,
@@ -715,13 +759,12 @@ impl ConstraintSynthesizer<CircuitField> for WithdrawalCircuit {
         let chain_id =
             FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.chain_id)))?;
         let contract_address = FpVar::new_input(cs.clone(), || Ok(self.public.contract_address))?;
-        let active_root = FpVar::new_input(cs.clone(), || Ok(self.public.active_root))?;
+        let note_leaf = FpVar::new_input(cs.clone(), || Ok(self.public.note_leaf))?;
         let state_signing_key =
             EdwardsVar::new_input(cs.clone(), || Ok(self.public.state_signing_key))?;
         let clearance_signing_key =
             EdwardsVar::new_input(cs.clone(), || Ok(self.public.clearance_signing_key))?;
-        let note_id_field =
-            FpVar::new_input(cs.clone(), || Ok(CircuitField::from(self.public.note_id)))?;
+        let note_fields = FpVar::new_input(cs.clone(), || Ok(self.public.note_fields))?;
         let final_balance_field = FpVar::new_input(cs.clone(), || {
             Ok(CircuitField::from(self.public.final_balance))
         })?;
@@ -742,9 +785,12 @@ impl ConstraintSynthesizer<CircuitField> for WithdrawalCircuit {
         let secret = FpVar::new_witness(cs.clone(), || Ok(self.witness.secret))?;
         secret.enforce_not_equal(&FpVar::zero())?;
 
-        // W2: note_id is a u32 equal to input 8.
-        let note_id = UInt32::new_witness(cs.clone(), || Ok(self.public.note_id))?;
-        note_id.to_fp()?.enforce_equal(&note_id_field)?;
+        // W2: n (u32), D (u128) and e (u64) pack to input 8: n·2^192 + D·2^64 + e.
+        let note_id = UInt32::new_witness(cs.clone(), || Ok(self.witness.note_id))?;
+        let note_id_field = note_id.to_fp()?;
+        let deposit_amount = UInt128::new_witness(cs.clone(), || Ok(self.witness.deposit_amount))?;
+        let expiry = UInt64::new_witness(cs.clone(), || Ok(self.witness.expiry))?;
+        note_fields_var(&note_id, &deposit_amount, &expiry)?.enforce_equal(&note_fields)?;
 
         // W3: f (input 9) and c (input 14) are u128, B is a u128 witness, and
         // B == f + c over the field. f + c < 2^129 cannot wrap, so c <= B and f <= B.
@@ -758,22 +804,14 @@ impl ConstraintSynthesizer<CircuitField> for WithdrawalCircuit {
             .enforce_equal(&(final_balance.to_fp()? + conceded.to_fp()?))?;
 
         // W4: D >= B. The expiry is a u64 with no time check.
-        let deposit_amount = UInt128::new_witness(cs.clone(), || Ok(self.witness.deposit_amount))?;
         deposit_amount
             .is_ge(&balance)?
             .enforce_equal(&Boolean::TRUE)?;
-        let expiry = UInt64::new_witness(cs.clone(), || Ok(self.witness.expiry))?;
 
-        // W5: registration, leaf and the path to input 3.
-        let leaf = enforce_note_membership(
-            cs.clone(),
-            &secret,
-            &note_id,
-            &deposit_amount,
-            &expiry,
-            &self.witness.merkle_siblings,
-            &active_root,
-        )?;
+        // W5: registration R = H(d_reg, s, 0) and the leaf P(d_leaf', R, input 8)[1] equal
+        // input 3. There is no Merkle path: the vault holds the leaf it computed at deposit.
+        let leaf = note_leaf_var(cs.clone(), &secret, &note_fields)?;
+        leaf.enforce_equal(&note_leaf)?;
 
         // W6: genesis is exactly tau == 1, and genesis implies B == D.
         let anchor = FpVar::new_witness(cs.clone(), || Ok(self.witness.current_anchor))?;
@@ -900,19 +938,26 @@ pub fn registration_commitment(secret: CircuitField) -> CircuitField {
     poseidon_hash(&[domain(DOMAIN_REG), secret, CircuitField::ZERO])
 }
 
+/// Native `F = n·2^192 + D·2^64 + e` (zkapi_core::v2::note_fields).
+pub fn note_fields(note_id: u32, deposit_amount: u128, expiry: u64) -> CircuitField {
+    let two = CircuitField::from(2u64);
+    CircuitField::from(note_id) * two.pow([192u64])
+        + CircuitField::from(deposit_amount) * two.pow([64u64])
+        + CircuitField::from(expiry)
+}
+
+/// Native `L = P(d_leaf', R, F)[1]` (zkapi_core::v2::note_leaf).
 pub fn note_leaf(
     note_id: u32,
     registration: CircuitField,
     deposit_amount: u128,
     expiry: u64,
 ) -> CircuitField {
-    poseidon_hash(&[
+    compress(
         domain(DOMAIN_LEAF),
-        CircuitField::from(note_id),
         registration,
-        CircuitField::from(deposit_amount),
-        CircuitField::from(expiry),
-    ])
+        note_fields(note_id, deposit_amount, expiry),
+    )
 }
 
 pub fn merkle_root(
@@ -1134,10 +1179,10 @@ mod tests {
                 protocol_version: PV,
                 chain_id: CHAIN,
                 contract_address: contract(),
-                active_root: note.root(),
+                note_leaf: leaf,
                 state_signing_key: state_signer.public,
                 clearance_signing_key: clearance_signer.public,
-                note_id: note.note_id,
+                note_fields: note_fields(note.note_id, note.deposit_amount, note.expiry),
                 final_balance: state_balance,
                 destination: CircuitField::from(0xbeef_u64),
                 withdrawal_nullifier,
@@ -1148,9 +1193,9 @@ mod tests {
             },
             witness: WithdrawalWitness {
                 secret: note.secret,
+                note_id: note.note_id,
                 deposit_amount: note.deposit_amount,
                 expiry: note.expiry,
-                merkle_siblings: note.siblings,
                 state_balance,
                 state_blinding,
                 current_anchor,
@@ -1260,7 +1305,7 @@ mod tests {
         {
             let mut circuit = fixture_escape_from(withdrawal_fixture());
             circuit.witness.secret = CircuitField::from(secret as u64);
-            circuit.public.note_id = note_id;
+            circuit.witness.note_id = note_id;
             circuit.witness.deposit_amount = amount;
             let leaf = note_leaf(
                 note_id,
@@ -1268,8 +1313,8 @@ mod tests {
                 amount,
                 circuit.witness.expiry,
             );
-            circuit.public.active_root =
-                merkle_root(note_id, leaf, &circuit.witness.merkle_siblings);
+            circuit.public.note_leaf = leaf;
+            circuit.public.note_fields = note_fields(note_id, amount, circuit.witness.expiry);
             circuit.public.withdrawal_nullifier = nullifier(
                 circuit.witness.secret,
                 note_id,
@@ -1289,7 +1334,7 @@ mod tests {
         circuit.public.kind = 0;
         circuit.public.next_nullifier = successor_nullifier(
             circuit.witness.secret,
-            circuit.public.note_id,
+            circuit.witness.note_id,
             circuit.witness.current_anchor,
         );
         circuit
@@ -1298,6 +1343,211 @@ mod tests {
     #[test]
     fn escape_conversion_of_the_fixture_is_satisfied() {
         assert!(satisfied(fixture_escape_from(withdrawal_fixture())));
+    }
+
+    /// Kind 2 (ownership, no destination) is the same leaf-bound statement.
+    #[test]
+    fn ownership_conversion_of_the_fixture_is_satisfied() {
+        let mut circuit = withdrawal_fixture();
+        circuit.public.kind = 2;
+        circuit.public.destination = CircuitField::ZERO;
+        assert!(satisfied(circuit));
+    }
+
+    fn two_pow(bits: u64) -> CircuitField {
+        CircuitField::from(2u64).pow([bits])
+    }
+
+    /// Input 3 must be the leaf of the prover's own registration and input 8.
+    #[test]
+    fn withdrawal_refuses_a_wrong_leaf() {
+        for circuit in [
+            withdrawal_fixture(),
+            fixture_escape_from(withdrawal_fixture()),
+        ] {
+            for delta in [CircuitField::ONE, -CircuitField::ONE] {
+                let mut wrong = circuit.clone();
+                wrong.public.note_leaf += delta;
+                assert!(!satisfied(wrong));
+            }
+            // Another note's leaf: another secret, and another note ID with the same secret.
+            let mut other = circuit.clone();
+            other.public.note_leaf = note_leaf(
+                0,
+                registration_commitment(CircuitField::from(43u64)),
+                5_000_000,
+                4_000_000_000,
+            );
+            assert!(!satisfied(other));
+            let mut other = circuit.clone();
+            other.public.note_leaf = note_leaf(
+                1,
+                registration_commitment(circuit.witness.secret),
+                5_000_000,
+                4_000_000_000,
+            );
+            assert!(!satisfied(other));
+            // A zero (retired) leaf.
+            let mut retired = circuit.clone();
+            retired.public.note_leaf = CircuitField::ZERO;
+            assert!(!satisfied(retired));
+        }
+    }
+
+    /// Input 8 must be exactly the packing of the witness's n, D and e: off by one, with
+    /// neighbouring fields swapped or shifted, or carried above 2^224, it is unsatisfiable even
+    /// with input 3 recomputed over the forged fields.
+    #[test]
+    fn withdrawal_refuses_fields_that_are_not_the_packing() {
+        let base = withdrawal_fixture();
+        let packed = base.public.note_fields;
+        let (n, d, e) = (
+            base.witness.note_id,
+            base.witness.deposit_amount,
+            base.witness.expiry,
+        );
+        let forged = [
+            packed + CircuitField::ONE,
+            packed - CircuitField::ONE,
+            // n and e swapped.
+            note_fields(e as u32, d, n as u64),
+            // One unit of D moved into e and back the other way.
+            packed - two_pow(64) + CircuitField::ONE,
+            packed + two_pow(64) - CircuitField::ONE,
+            // The same value with a bit carried above the u32 note ID.
+            packed + two_pow(224),
+            packed + two_pow(253),
+            // D scaled into the note ID's bits.
+            CircuitField::from(d) * two_pow(192) + CircuitField::from(e),
+        ];
+        for fields in forged {
+            let mut circuit = fixture_escape_from(base.clone());
+            circuit.public.note_fields = fields;
+            circuit.public.note_leaf = compress(
+                domain(DOMAIN_LEAF),
+                registration_commitment(circuit.witness.secret),
+                fields,
+            );
+            assert!(!satisfied(circuit));
+        }
+    }
+
+    /// The witness's n, D and e must be the ones in input 8: the nullifiers use n, and W4 and
+    /// W6 use D, from the fields the leaf binds.
+    #[test]
+    fn withdrawal_witness_must_match_the_fields() {
+        let base = fixture_escape_from(withdrawal_fixture());
+        let mut n = base.clone();
+        n.witness.note_id = 1;
+        assert!(!satisfied(n));
+        let mut d = base.clone();
+        d.witness.deposit_amount += 1;
+        assert!(!satisfied(d));
+        let mut d = base.clone();
+        d.witness.deposit_amount = 6_000_000_000;
+        assert!(!satisfied(d));
+        let mut e = base.clone();
+        e.witness.expiry += 86_400;
+        assert!(!satisfied(e));
+        // A genesis state must hold exactly the D of the fields.
+        let mut genesis = withdrawal_fixture();
+        genesis.witness.current_anchor = CircuitField::ONE;
+        genesis.witness.state_balance = 5_000_000;
+        genesis.public.final_balance = 5_000_000;
+        genesis.public.kind = 0;
+        genesis.public.withdrawal_nullifier = nullifier(
+            genesis.witness.secret,
+            genesis.witness.note_id,
+            CircuitField::ONE,
+        );
+        genesis.public.next_nullifier = successor_nullifier(
+            genesis.witness.secret,
+            genesis.witness.note_id,
+            CircuitField::ONE,
+        );
+        assert!(satisfied(genesis.clone()));
+        let note = Note::new();
+        let mut larger = genesis;
+        larger.witness.deposit_amount = 6_000_000;
+        larger.witness.state_balance = 6_000_000;
+        larger.public.final_balance = 6_000_000;
+        larger.public.note_fields = note_fields(note.note_id, 6_000_000, note.expiry);
+        larger.public.note_leaf = note_leaf(
+            note.note_id,
+            registration_commitment(note.secret),
+            6_000_000,
+            note.expiry,
+        );
+        // Consistent with itself, so satisfied: the vault's stored leaf is what refuses it.
+        assert!(satisfied(larger.clone()));
+        assert_ne!(larger.public.note_leaf, note.leaf());
+    }
+
+    /// The leaf and fields gadgets compute the native helpers.
+    #[test]
+    fn leaf_gadgets_equal_native_helpers() {
+        let cs = ConstraintSystem::<CircuitField>::new_ref();
+        let secret = CircuitField::from(42u64);
+        let secret_var = FpVar::new_witness(cs.clone(), || Ok(secret)).unwrap();
+        for (n, d, e) in [
+            (7u32, 5_000_000u128, 4_000_000_000u64),
+            (u32::MAX, u128::MAX, u64::MAX),
+            (0, 0, 0),
+        ] {
+            let n_var = UInt32::new_witness(cs.clone(), || Ok(n)).unwrap();
+            let d_var = UInt128::new_witness(cs.clone(), || Ok(d)).unwrap();
+            let e_var = UInt64::new_witness(cs.clone(), || Ok(e)).unwrap();
+            let fields = note_fields_var(&n_var, &d_var, &e_var).unwrap();
+            assert_eq!(fields.value().unwrap(), note_fields(n, d, e));
+            let leaf = note_leaf_var(cs.clone(), &secret_var, &fields).unwrap();
+            assert_eq!(
+                leaf.value().unwrap(),
+                note_leaf(n, registration_commitment(secret), d, e)
+            );
+        }
+        assert!(cs.is_satisfied().unwrap());
+        // The design's vector: s = 42, n = 7, D = 5,000,000, e = 4,000,000,000.
+        assert_eq!(
+            note_leaf(7, registration_commitment(secret), 5_000_000, 4_000_000_000)
+                .into_bigint()
+                .to_bytes_be(),
+            hex_bytes("1698e82280376fc3506cb7ebf7278db1764d0183aea5fd4d3b475c644b61395f")
+        );
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Constraint counts of circuit zkapi-v2-concession-v2 (design C, circuit_changes §3): one
+    /// permutation per leaf in both circuits, no Merkle path in the withdrawal circuit.
+    #[test]
+    fn circuit_shapes_are_pinned() {
+        let request = synthesize(fixture(), SynthesisMode::Setup).unwrap();
+        let withdrawal = synthesize(withdrawal_fixture(), SynthesisMode::Setup).unwrap();
+        assert_eq!(
+            (
+                request.num_constraints(),
+                request.num_instance_variables(),
+                request.num_witness_variables()
+            ),
+            (23_507, 13, 23_215)
+        );
+        assert_eq!(
+            (
+                withdrawal.num_constraints(),
+                withdrawal.num_instance_variables(),
+                withdrawal.num_witness_variables()
+            ),
+            (20_545, 17, 20_062)
+        );
+        for cs in [request, withdrawal] {
+            let rows = cs.num_constraints() + cs.num_instance_variables();
+            assert_eq!(rows.next_power_of_two(), 1 << 15);
+        }
     }
 
     /// Q6a, Q9, W8 and W10 gadgets compute exactly the native helpers.

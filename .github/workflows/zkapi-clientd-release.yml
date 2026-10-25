@@ -58,6 +58,7 @@ jobs:
       - name: Test package generation and source preparation
         run: |
           python3 zkapi-clientd/scripts/test-packages.py
+          python3 zkapi-clientd/scripts/test-package-publication.py
           python3 zkapi-clientd/scripts/test-prepare-zkapi.py
           python3 zkapi-clientd/scripts/test-source-install.py
       - name: Prepare pinned native wallet source

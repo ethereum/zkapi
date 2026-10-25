@@ -235,8 +235,7 @@ function baseRuntime(overrides = {}) {
             current_balance: 1_000_000,
             current_anchor: '0x1234',
             expiry_ts: 2_000_000_000,
-            // The deposit-time path: exits need no indexer (Amendment A1).
-            deposit_path: { active_root: '0x1', siblings: Array(32).fill('0x0') },
+            deposit_amount: 1_000_000,
             ...(stateOverride || {})
         }
     };
@@ -333,10 +332,8 @@ function withdrawalReceipt({
         globalThis.zkapiWallet.addressWord(destination)
     ];
     if (mode === 'escape') {
-        words.push(
-            globalThis.zkapiWallet.abiWord(BigInt(challengeDeadline)),
-            globalThis.zkapiWallet.abiWord(101n)
-        );
+        // Vault revision 4: no root word.
+        words.push(globalThis.zkapiWallet.abiWord(BigInt(challengeDeadline)));
     }
     return {
         status: '0x1',
@@ -899,7 +896,7 @@ test('browser withdrawal recovery invariants', async t => {
         attachDurableRuntime(browserWalletRuntime, durable);
         browserWalletRuntime.settleActiveLease = async () => null;
         browserWalletRuntime.recoverPending = async () => false;
-        browserWalletRuntime.treePath = async () => ({ active_root: '0x1', siblings: [] });
+        browserWalletRuntime.indexerPath = async () => assert.fail('an exit reads no indexer');
         browserWalletRuntime.remoteJson = async (url, init = {}) => {
             assert.match(url, /\/v2\/withdraw\/clearance$/);
             assert.equal(init.method, 'POST');
@@ -912,13 +909,17 @@ test('browser withdrawal recovery invariants', async t => {
         browserWalletRuntime.worker = {
             async call(operation, payload) {
                 if (operation === 'withdrawalNullifier') return '0x777';
+                if (operation === 'noteLeaf') return '0x1eaf';
                 assert.equal(operation, 'prepareWithdrawal');
+                assert.equal(payload.args.active_root, undefined, 'an exit takes no root');
                 return {
                     mode: payload.args.mode,
                     proof: 'proof-before-wallet',
                     public_inputs: {
-                        active_root: payload.args.active_root,
+                        note_leaf: '0x1eaf',
                         note_id: 7,
+                        deposit_amount: '1000000',
+                        expiry_ts: '2000000000',
                         final_balance: 1_000_000,
                         withdrawal_nullifier: '0x777',
                         kind: { escape: 0, mutual: 1, ownership: 2 }[payload.args.mode],
@@ -1011,7 +1012,7 @@ test('browser withdrawal recovery invariants', async t => {
         attachDurableRuntime(browserWalletRuntime, durable);
         browserWalletRuntime.settleActiveLease = async () => null;
         browserWalletRuntime.recoverPending = async () => false;
-        browserWalletRuntime.treePath = async () => assert.fail('an escape uses the saved deposit path');
+        browserWalletRuntime.indexerPath = async () => assert.fail('an escape takes no path');
         // The stale-device pre-check finds no evidence at N⁺.
         browserWalletRuntime.remoteJson = async url => {
             assert.match(url, /\/v2\/nullifiers\/0x5777\/evidence$/);
@@ -1022,13 +1023,16 @@ test('browser withdrawal recovery invariants', async t => {
             async call(operation, payload) {
                 if (operation === 'withdrawalNullifier') return '0x777';
                 if (operation === 'successorNullifier') return '0x5777';
+                if (operation === 'noteLeaf') return '0x1eaf';
                 assert.equal(operation, 'prepareWithdrawal');
                 return {
                     mode: payload.args.mode,
                     proof: 'escape-proof-before-wallet',
                     public_inputs: {
-                        active_root: payload.args.active_root,
+                        note_leaf: '0x1eaf',
                         note_id: 7,
+                        deposit_amount: '1000000',
+                        expiry_ts: '2000000000',
                         final_balance: 1_000_000,
                         withdrawal_nullifier: '0x777',
                         kind: { escape: 0, mutual: 1, ownership: 2 }[payload.args.mode],
@@ -1380,7 +1384,7 @@ test('browser withdrawal recovery invariants', async t => {
             clearanceReserved: true,
             proof: 'stale-proof',
             public_inputs: {
-                active_root: '0xold-root',
+                note_leaf: '0x1eaf',
                 note_id: 7,
                 withdrawal_nullifier: '0x777'
             },
@@ -4534,8 +4538,6 @@ test('browser withdrawal recovery invariants', async t => {
                 secret: 'saved-deposit-secret',
                 commitment: '0x1',
                 next_note_id: 7,
-                active_root: '0x2',
-                zero_path: Array(32).fill('0x0'),
                 transactionHash: oldHash,
                 transactionHashes: [oldHash],
                 transactionAttempts: [{

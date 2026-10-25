@@ -10,28 +10,19 @@ interface IZkApiWithdrawalPaymaster {
     function collect() external payable;
 }
 
-/// @title ZkApiWithdrawalAccount – The logic of every transit account S of a gasless withdrawal
-/// @notice A transit account is a 221-byte proxy the factory deploys with CREATE2: 61 bytes that
-///         delegate every call here with the account's five immutable arguments (entryPoint, vault,
-///         paymaster, owner, payee; abi-encoded, 160 bytes) appended to the calldata, and those 160
-///         bytes. Its address therefore commits to its payee: a withdrawal proof that names S as its
-///         destination binds the final payout address, and nobody (the owner key, the paymaster
-///         operator, a bundler) can redirect it. S holds no storage and no amounts; it only forwards
-///         whatever it receives to the paymaster, which keeps the measured gas charge and pushes the
-///         rest to `payee`. One copy of this logic serves every account, so creating one costs the
-///         deposit of 221 bytes rather than of this contract.
-/// @dev Validation reads only the calldata, the appended arguments and the ecrecover precompile: as
-///      an unstaked sender under ERC-7562 it touches no storage, no balance and no other contract.
-///      `withdraw` and `sweep` are execution-phase code. The paymaster trusts the gas S reports
-///      because it verifies, in validation, that the sender is a factory-created proxy of this
-///      logic (its arguments reproduce its CREATE2 address). Called on this contract itself rather
-///      than through a proxy, every function reverts NotProxy, whatever the calldata carries: the
-///      logic never relays a call or holds a balance of its own.
+/// @title ZkApiWithdrawalAccount – Logic shared by sponsored withdrawal transit accounts
+/// @notice Each account is a 93-byte proxy: 53 bytes of forwarding code and 40 packed bytes for
+///         owner and payee. The proxy appends that tail to every call. This implementation fixes
+///         the EntryPoint, vault and paymaster at construction; its factory commits to all five
+///         addresses in the unchanged CREATE2 preimage. A proof naming the account therefore binds
+///         its payout address. The account forwards receipts to the paymaster for fee settlement.
+/// @dev Validation reads only calldata, immutable code values and the ecrecover precompile. Direct
+///      calls to this implementation are refused even with a forged argument tail.
 contract ZkApiWithdrawalAccount is IAccount {
     /// @notice The only sponsored entry point's selector; the paymaster accepts no other callData.
     bytes4 public constant SELECTOR_WITHDRAW = bytes4(keccak256("withdraw(bytes)"));
-    /// @notice abi.encode(entryPoint, vault, paymaster, owner, payee): what the proxy appends.
-    uint256 public constant ARGS_LENGTH = 160;
+    /// @notice abi.encodePacked(owner, payee): what the proxy appends.
+    uint256 public constant ARGS_LENGTH = 40;
     /// @dev secp256k1n / 2: signatures with a higher s are rejected so that every operation has one
     ///      signature, as EIP-2 requires of transactions.
     uint256 private constant SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
@@ -39,9 +30,15 @@ contract ZkApiWithdrawalAccount is IAccount {
     /// @dev This contract's own address: a delegatecall from a proxy sees the proxy's address
     ///      instead, which is how a direct call is told apart from a proxied one.
     address private immutable self;
+    address private immutable fixedEntryPoint;
+    address private immutable fixedVault;
+    address private immutable fixedPaymaster;
 
-    constructor() {
+    constructor(address entryPoint_, address vault_, address paymaster_) {
         self = address(this);
+        fixedEntryPoint = entryPoint_;
+        fixedVault = vault_;
+        fixedPaymaster = paymaster_;
     }
 
     struct Args {
@@ -149,19 +146,18 @@ contract ZkApiWithdrawalAccount is IAccount {
         IZkApiWithdrawalPaymaster(a.paymaster).collect{value: bal}();
     }
 
-    /// @dev The five arguments the proxy appends to every call, in abi.encode layout. A call that
+    /// @dev Shared deployment addresses are immutable; the proxy appends only packed owner/payee. A call that
     ///      reaches this contract directly is refused before its calldata is looked at, so a tail
     ///      crafted to look like arguments cannot make the logic relay a call or send its balance.
     function _args() private view returns (Args memory a) {
         if (address(this) == self || msg.data.length < ARGS_LENGTH) revert NotProxy();
+        a.entryPoint = fixedEntryPoint;
+        a.vault = fixedVault;
+        a.paymaster = fixedPaymaster;
         assembly ("memory-safe") {
             let base := sub(calldatasize(), ARGS_LENGTH)
-            let mask := 0xffffffffffffffffffffffffffffffffffffffff
-            mstore(a, and(calldataload(base), mask))
-            mstore(add(a, 0x20), and(calldataload(add(base, 0x20)), mask))
-            mstore(add(a, 0x40), and(calldataload(add(base, 0x40)), mask))
-            mstore(add(a, 0x60), and(calldataload(add(base, 0x60)), mask))
-            mstore(add(a, 0x80), and(calldataload(add(base, 0x80)), mask))
+            mstore(add(a, 0x60), shr(96, calldataload(base)))
+            mstore(add(a, 0x80), shr(96, calldataload(add(base, 20))))
         }
     }
 }

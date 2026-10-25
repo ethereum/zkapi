@@ -1,6 +1,6 @@
 # Local concession-exit acceptance
 
-This process tests circuit `zkapi-v2-concession-v1` (vault revision 3) end to
+This process tests circuit `zkapi-v2-concession-v2` (vault revision 4) end to
 end on a disposable Anvil chain, runs every scenario of the Sepolia drill
 (design §10.7 Phase B) and the mainnet smoke tests of Phase C, and measures
 gas.
@@ -123,12 +123,13 @@ with `evm_increaseTime`. Both daemons' startup checks hold for them
 
 A time skip moves only block time. The daemons and clients keep the wall
 clock, and clients bound exit proofs by it (valid for 3 hours). The chain
-therefore starts two challenge periods behind the wall clock, so that block
-time meets it when the bounded pause ends. That is just before the
-missed-defeat drill: the challenger counts a miss only for evidence written
-(wall clock) before the escape's deadline (block time).
+starts 3,540 seconds behind the wall clock, within the drill server's
+explicit 3,600-second root staleness limit. The bounded pause moves block
+time past the wall clock before the missed-defeat drill: the challenger
+counts a miss only for evidence written (wall clock) before the escape's
+deadline (block time).
 
-From then on block time runs at most one period ahead, and two at the end. An
+Later skips keep block time less than three periods ahead. An
 SDK that must judge a chain deadline (to finalize) gets its device clock moved
 to block time. The SDK whose operator withholds gets its clock moved to the
 settlement time `T` it reports. In the late-successor drill, the last before
@@ -147,31 +148,50 @@ Before the scenarios, serverd must refuse to start with:
 - the published development seeds;
 - seeds whose keys the vault does not pin;
 - no seeds;
-- a profile that pins another vault codehash.
+- a profile that pins another vault codehash;
+- the removed clearance root window, as `--clearance-root-window-seconds` or
+  `ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS` ("removed in vault revision 4:
+  clearance checks the note leaf").
+
+The vault is deployed with `MIN_DEPOSIT` equal to the drill's deposit
+(1,000,000 gwei), and the harness checks `minDeposit()`,
+`LEAF_BOUND_EXIT_VERSION() == 1` and the manifest's `vaultRevision` 4,
+`leafBoundExitVersion` 1 and `minDeposit` (and no `rootHistoryWindow`). Every
+profile pins `min_deposit_units` and `fresh_slot_gas`. serverd's `/health`
+reports `leaf_bound_exit` 1, `vault_revision` 4 and the default request-root
+grace (60 s).
+
+The vault stores one word per note, its leaf and status (`noteRecord`); the
+harness takes a note's deposit and expiry from its `NoteDeposited` event. For
+every exit it checks the calldata's binding: word 3 (`noteLeaf`) is
+`noteRecord(n).leaf` and word 8 (`noteFields`) is `n·2^192 + D·2^64 + e` of
+the deposit. No exit carries a root or a Merkle path; requests still prove
+membership at a root serverd read from the vault.
 
 | # | Scenario (design §10.7 Phase B) | Client | What is asserted |
 | --- | --- | --- | --- |
-| 1 | Honest flow | wallet core | Two requests settle at the measured charge and install (S1–S6). A kind-2 ownership proof reverts `WrongWithdrawalKind` as an escape or a close. The clearance reserves the nullifier. The close proves at the deposit-time root (A1). Payout `D − 800`, treasury 800, the wallet's balance equals the payout. |
+| 1 | Honest flow | wallet core | Two requests settle at the measured charge and install (S1–S6). The wallet's leaf equals `noteRecord(n).leaf`. A kind-2 ownership proof reverts `WrongWithdrawalKind` as an escape or a close. The clearance reserves the nullifier. The close names the note's leaf and fields, with no root or path (Amendment A3). Before the proof the vault refuses the same close with `noteLeaf + 1` (`NoteLeafMismatch`, also sent and reverted), `noteFields ≥ 2^224` (`InvalidNoteFields`) and `noteFields` naming an unused note (`NoteNotActive`); a deposit the proof did not bind passes those checks and fails the proof. Payout `D − 800`, treasury 800, the wallet's balance equals the payout. A clearance after the close is refused `note_not_active` (409). |
+| 2a | Minimum deposit | — | A deposit of `minDeposit − 1` gwei reverts `DepositTooSmall` (also sent and reverted) and creates no note; every drill note deposits exactly `minDeposit`. |
 | 2 | Stale exit after spending, defeat, `SupersededState`, re-escape from an older state, defeat | wallet core | The operator serves the evidence at `S2⁺` and it verifies. The escape from `S2` is defeated through the signer with the request at `N3`. `S1` reverts `SupersededState`. `S0` is recorded and defeated with the request at `N1`. `S2` again reverts `ChallengedNullifier`. Defeats move no funds, and the newest state closes. |
 | 3 | Codehash-mismatch profile refuses deposits | SDK | `deposit` fails `deployment_mismatch` on `vault_runtime_codehash`, read through the wallet and the pinned RPC. Nothing is signed. |
-| 4 | Indexer down, exit with the deposit-time path | SDK | Deposit (deployment checks pass), request, settle. Another deposit moves the root, the indexer stops, and the SDK escapes (`E2.escape`, `c = 0`, path source `deposit`) at the note's deposit root, not the current one. The indexer restarts from its checkpoint. |
+| 4 | Indexer down, escape bound to the note's leaf | SDK | A deposit below `min_deposit_units` is refused `deposit_too_small` before any transaction. Deposit (deployment checks pass, the SDK's own deposit gas limit covers the gas used), request, settle. Another deposit moves the request root and the indexer stops: serverd's `/health` turns `degraded` with `indexer_root` `unavailable`, and `/metrics` shows `zkapi_indexer_root_unavailable 1` while vault reads stay fresh. With the indexer also unreachable from the SDK, the SDK escapes (`E2.escape`, `c = 0`) without calling it: no path, root or log scan. The calldata's `noteLeaf` is `noteRecord(n).leaf` and its `noteFields` packs the deposit's `(n, D, e)`; the note is `PendingWithdrawal`. The indexer restarts from its checkpoint. |
 | 5 | Honest close (the Phase C smoke test) | SDK | Deposit, request, settle, then `withdraw('mutual')`: the SDK's own exit lock, ownership proof, clearance and close proof. `MutualClose` pays `D − 400` to the destination and 400 to the treasury, the clearance nullifier reads `usedNullifiers` and `clearance_reserved`, the record is `closed`, and the SDK holds no note and no exit lock. |
 | 6 | Under-concession, raise, finalize, deferred credit, claim | wallet core | The escape concedes 100 while a request is in flight. The server settles 400, signs nothing (`exit_deferred`), and the challenger raises to 400. Finalization to a destination that needs more than 100,000 gas credits the payout (`EscapePayoutDeferred`); `claimEscapePayout`, sent by a third party, pays it. |
-| 7 | Forced early exit with `c = 0`, raise to the real charge, client state closed | companion | Serverd switches to the OA org key source; the companion's OA bridge lease is verified. The operator is unreachable: `early_exit: concede_nothing` prepares `c = 0` from the deposit path (`path_source` `deposit`). The key lapses, the server settles 400, the challenger raises to 400. After finalization (9) the companion records `complete` (payout `D − 400`, `conceded_final` 400) and `has_note` is false. |
-| 8 | Stale-device pre-check; honest close | companion | A copy of the companion's wallet taken at the genesis state is the stale device; the newest device spends the genesis state and its successor. A second `zkapi-walletd` on the copy refuses the escape with `device_not_newest` and holds no exit lock and no escape record: nothing left it. The newest device then closes through its mutual route (kind 2, clearance, kind 1); the close pays `D − 800`, and `/oa/v1/withdraw/confirm` records it. |
+| 7 | Forced early exit with `c = 0`, raise to the real charge, client state closed | companion | `/oa/v1/status` reports `leaf_bound_exit` 1, `vault_revision` 4 and the circuit. `/deposit/prepare` refuses an amount below `min_deposit_units` (`deposit_too_small`), and its plan carries no path. `/deposit/confirm` with an expiry that does not reproduce the stored leaf is refused (`note_leaf_mismatch`); with the event's expiry it installs the note. Serverd switches to the OA org key source; the companion's OA bridge lease is verified. The operator is unreachable: `early_exit: concede_nothing` prepares `c = 0` with no Merkle path (no `path_source`); its `public_inputs.note_leaf` and the calldata's words 3 and 8 are the note's. The key lapses, the server settles 400, the challenger raises to 400. After finalization (9) the companion records `complete` (payout `D − 400`, `conceded_final` 400) and `has_note` is false. |
+| 8 | Stale-device pre-check; honest close | companion | A copy of the companion's wallet taken at the genesis state is the stale device; the newest device spends the genesis state and its successor. A second `zkapi-walletd` on the copy refuses the escape with `device_not_newest` and holds no exit lock and no escape record: nothing left it. The newest device then closes through its mutual route (kind 2, clearance, kind 1); the harness packs the 18-field statement into the vault tuple (word 8 from `note_id`, `deposit_amount`, `expiry_ts`), the close pays `D − 800`, and `/oa/v1/withdraw/confirm` records it. |
 | 9 | Pause with an escape pending, then finalize | all three | Escapes 4, 6 and 7 are pending when the owner pauses. A new escape reverts `Paused`. Finalization, the deferred credit and the claim all run while paused. The SDK record is `closed` with `concededFinal` 0, the companion holds no note, and the wallet core holds the state it escaped. |
-| 10 | Pause past `maxPauseDuration`, then escape; re-pause cooldown; replay of an abandoned proof after `valid_until` | wallet core | Past `pausedAt + maxPauseDuration` a fresh escape lands while still paused. A proof prepared earlier and abandoned now reverts `ProofExpired` for anyone. After `unpause`, `pause` reverts `PauseCooldown`. |
+| 10 | Pause past `maxPauseDuration`, then escape; re-pause cooldown; replay of an abandoned proof after `valid_until` | wallet core | Past `pausedAt + maxPauseDuration` a fresh escape lands while still paused. Clearance reads the note fresh on every call: it is granted for the Active note just before the escape and refused `note_not_active` for the same state just after. A proof prepared earlier and abandoned now reverts `ProofExpired` for anyone. After `unpause`, `pause` reverts `PauseCooldown`. |
 | 11–13 | Born-spent anchor 1, reused anchor, random anchor | wallet core | The drill server signs the bad successor. The wallet refuses it (S4, archived `invalid_successor`, state unchanged). In a scratch copy installed without the checks, the wallet core refuses to prove from it, and the request circuit synthesized for it is unsatisfied (Q6a; anchor 1 names the genesis nullifier). A successor refused for S4 is handled like a withheld one (E3): the owner exits before `T` conceding 0, and the challenger raises to the settled 400. The wallet core has no exit rules of its own, so the harness applies them; 15 has the SDK decide. |
 | 14 | Overcharge | wallet core | The successor charges `bound + 1`; the wallet refuses it (S3). The response passes S1, S2, S4 and S6, so the escape concedes `min(charge, bound)`, the bound, at once (E3, lost ε), and no raise exceeds it. |
 | 15 | Random anchor, through the SDK | SDK | The SDK archives the successor `invalid_successor`; its balance is unchanged. A mutual withdrawal waits (`request_settlement_pending`). The SDK's early escape decides `E3.forced` conceding 0, to a destination that needs more than 100,000 gas to receive; the challenger raises to 400. At finalization (21) the payout is credited and the SDK's own `claimEscapePayout` delivers it. |
 | 16 | Lying `expired_unaccepted` | SDK | The operator reserves the lease, keeps and spends the key, and answers `native_quote_expired`; `/expire` lies. The SDK archives `discarded_expired_unaccepted`. The mutual close's clearance reveals the reservation, so the SDK waits (`request_settlement_pending`). The forced escape concedes 0, the server settles 400 (`exit_deferred`), and the challenger raises to 400. |
 | 17 | Withholding, then concession at `T` | SDK | The server settles and never signs. The state's bound is the SDK request's, 400,000 gwei (its $1 limit at the mock price). Before `T` a withdrawal waits. At `T` (device clock) it decides `E3.T` and concedes exactly that bound. The challenger finds the concession covers the settled 400 and sends nothing; there is no defeat. Payout `B − b`. |
-| 18 | Indexer down, then rebuild from logs | SDK | The SDK loses its deposit-time path, a later deposit moves the root, and the indexer stops. The escape (`E2.escape`, path source `rebuild`) proves at the current root, rebuilt from the vault's logs through the wallet provider. |
+| 18 | Indexer down: request path from the vault's state, escape without one | SDK | A later deposit moves the request root, the indexer stops and the SDK cannot reach it. A request still succeeds: the SDK tries the indexer, then rebuilds the path from the vault's state (`nextNoteId`, `noteLeaves` pages and `currentRoot` at one block hash; `request_path_source` `state`), and serverd admits the root it read from the vault. The escape (`E2.escape`) makes no indexer call and needs no path, root or log scan; its calldata is bound to the note's stored leaf and fields, and it lands. The later note escapes from the wallet core after the indexer restarts. |
 | 19 | `hang` | SDK | After a served request, serverd restarts with `--adversary hang`, behind a gateway that relays without timeouts. The SDK's escape (`E3.forced`, `c = 0`) lands within its exit budget (each operator call 20 s, each recovery pass 120 s) and before `must_initiate_by`. The operator comes back, settles 400, and the challenger raises to it. |
-| 20 | Missed defeat (challenger stopped), then `retireClosedLeaf` | wallet core | With the challenger stopped, an escape from the genesis state, whose successor's request is in the evidence, finalizes. The restarted challenger counts the miss for that note (`last_missed.note_id`, `kind` defeat), logs `MISSED escape deadline` for it, and retires the leaf through the signer (`ClosedLeafRetired`, new root, retirement budget 1). The note's leaf is gone from the current root. |
+| 20 | Missed defeat (challenger stopped), then `retireClosedLeaf` | wallet core | With the challenger stopped, an escape from the genesis state, whose successor's request is in the evidence, finalizes. The restarted challenger counts the miss for that note (`last_missed.note_id`, `kind` defeat), logs `MISSED escape deadline` for it, and retires the leaf through the signer (`ClosedLeafRetired`, retirement budget 1). `retireClosedLeaf`'s siblings at and above `ℓ = msb(n XOR nextNoteId)` are zero. `noteRecord(n)` turns from (leaf, `Closed`) to (0, `Closed`), `currentRoot()` changes, the indexer's snapshot (at the vault's root) and `noteLeaves(n, 1)` hold 0, and an exit of the note reverts `NoteNotActive`. |
 | 21 | Finalize every pending escape | all | Each payout is `B − c_final`, each treasury share `D − payout`. Escapes 17–20 were never defeated. Each SDK record is `closed` with `concededFinal = B − payout` and no payout alert; the SDK claims its credited payout (15). Each wallet core escape is the one it proved: the finalized nullifier is the wallet's, from the state it holds (from its `S0` snapshot for 20). |
 | 22 | Late successor, then switch | SDK | The operator's successor reaches the SDK only after it released an escape proof (`E3.forced`, `c = 0`), which the owner rejects in the wallet: nothing is broadcast. The successor is archived `late_successor` and does not install, and a cancel keeps the lock while the proof can land. Once block time and the device clock pass `valid_until + 900`, E6 releases the lock and installs the successor (bound reset), and the owner closes from that newer state: `MutualClose` pays `D − 400`, and no escape of the note ever lands. |
-| 23 | Expiry sweep; pause after the cooldown | — | `claimExpired` after `effectiveExpiry` pays the treasury `D`. `pause` succeeds after `PAUSE_COOLDOWN`. At the end the vault holds nothing and owes no treasury arrears. |
+| 23 | Expiry sweep; pause after the cooldown; `recordRoot` | — | The note's preimage comes from its `NoteDeposited` event. `effectiveExpiry` with another expiry answers 0, and `claimExpired` with it reverts `NoteLeafMismatch`. `claimExpired(noteId, commitment, amount, expiryTs)` after `effectiveExpiry` pays the treasury `D` and leaves the note (leaf, `Closed`). `pause` succeeds after `PAUSE_COOLDOWN`. `recordRoot()` emits only `RootRecorded` (the current root and note count) and changes neither `currentRoot()` nor `nextNoteId()`. At the end the vault holds nothing and owes no treasury arrears. |
 
 Rows 24 to 31 are gasless withdrawals (ERC-4337, `fees: 'payout'`). A
 withdrawal proof names a transit account `S` derived from (owner, payee). A
@@ -218,10 +238,13 @@ companion (8) and the wallet core (1, 2) each closed cooperatively.
 
 `gas.json` holds every transaction's `gasUsed` by operation:
 
-- deposit, escape, defeat and raise;
+- deposit (each with its `note_id`, and the SDK's chosen `gas_limit`;
+  `deposits_by_note_index` lists them, since a deposit's gas depends on the
+  frontier levels its index completes), escape, defeat and raise;
 - mutual close, finalize (paid or deferred) and `claimEscapePayout`;
-- `retireClosedLeaf`, `claimExpired`, pause and unpause;
-- the reverted `SupersededState`, `ProofExpired` and ownership-proof calls;
+- `retireClosedLeaf`, `claimExpired`, `recordRoot`, pause and unpause;
+- the reverted `SupersededState`, `ProofExpired`, `DepositTooSmall`,
+  `NoteLeafMismatch` and ownership-proof calls;
 - the gasless bundles: `gasless_close_first` (with `S`'s creation),
   `gasless_close_repeat`, `gasless_escape`, `gasless_finalize`,
   `gasless_forward`, `gasless_self_bundle` and `gasless_griefing_bundle`.

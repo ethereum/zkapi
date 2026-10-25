@@ -7,7 +7,9 @@ const sdkRoot = path.dirname(fileURLToPath(import.meta.url));
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 
 /** The proof statement this SDK revision supports. */
-export const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v1';
+export const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v2';
+/** The vault revision this SDK revision's exits and deposits target (leaf-bound exits). */
+export const REQUIRED_VAULT_REVISION = 4;
 /** sdk/assets/manifest.json schema: circuitId, setupId, sourceRevision, files. */
 export const ASSET_MANIFEST_SCHEMA = 2;
 /** Setups a bundle can be built for (scripts/build-browser-client.sh --setup). */
@@ -79,8 +81,9 @@ export async function verifyBrowserSdkAssets() {
 /**
  * Refuse a profile this bundle must not be built for: a placeholder
  * (`deployment_status: "not_deployed"`) or a status other than "deployed",
- * another circuit or setup, a vault without the concession exit, or keys
- * other than the shipped ones. A single-party (`dev`) profile builds on any
+ * another circuit or setup, a vault other than revision 4 (the concession
+ * exit and leaf-bound exits), a profile without the deposit pins
+ * (`min_deposit_units`, `fresh_slot_gas`), or keys other than the shipped ones. A single-party (`dev`) profile builds on any
  * network, mainnet included: its vault was deployed with ALLOW_DEV_SETUP=1.
  */
 export function assertDeployableProfile(config, manifest, network, hashes) {
@@ -108,6 +111,15 @@ export function assertDeployableProfile(config, manifest, network, hashes) {
     if (trusted.exit_concession !== 1) {
         throw codedError('exit_concession_required',
             `The ${network} profile does not pin a vault with exit_concession 1.`);
+    }
+    if (trusted.vault_revision !== REQUIRED_VAULT_REVISION || trusted.leaf_bound_exit !== 1) {
+        throw codedError('vault_revision_unsupported',
+            `The ${network} profile pins vault revision ${trusted.vault_revision} (leaf_bound_exit ${trusted.leaf_bound_exit}); this SDK needs revision ${REQUIRED_VAULT_REVISION} with leaf_bound_exit 1.`);
+    }
+    for (const field of ['min_deposit_units', 'fresh_slot_gas']) {
+        if (!Number.isSafeInteger(trusted[field]) || trusted[field] <= 0) {
+            throw codedError('deposit_pins_missing', `The ${network} profile does not pin a positive ${field}.`);
+        }
     }
     for (const [field, file] of [
         ['request_proving_key_sha256', 'assets/proofs/request.pk'],

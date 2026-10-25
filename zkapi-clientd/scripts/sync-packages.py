@@ -18,9 +18,15 @@ MANIFESTS = ("arch/PKGBUILD", "arch/.SRCINFO", "homebrew/zkapi-clientd.rb", "nix
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("version", help="Published MAJOR.MINOR.PATCH with packaging/releases checksum metadata")
+    parser.add_argument("version", nargs="?", help="Published MAJOR.MINOR.PATCH; defaults to the checked-in package version")
     parser.add_argument("--check", action="store_true", help="Fail if checked-in packages need refreshing")
     args = parser.parse_args()
+    if args.version is None:
+        checked_in = re.search(r"^pkgver=([0-9]+\.[0-9]+\.[0-9]+)$",
+                               (PACKAGING / "arch/PKGBUILD").read_text(), re.MULTILINE)
+        if not checked_in:
+            parser.error("cannot determine the checked-in PKGBUILD version")
+        args.version = checked_in.group(1)
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
         parser.error("version must be MAJOR.MINOR.PATCH")
     record = json.loads((PACKAGING / f"releases/clientd-{args.version}.json").read_text())

@@ -17,8 +17,10 @@
 // - `hold_successors`: the operator's signed successor reaches the SDK only
 //   once an exit proof was released (a late successor, E4.6): until then
 //   every recovery answer reads as still reserved;
-// - `drop_deposit_path`: the saved deposit-time path is lost, so an exit
-//   takes its path from the indexer or the vault's logs.
+// - `indexer_down`: the operator's indexer is unreachable, so a request's
+//   path is rebuilt from the vault's state (noteLeaves at one block hash).
+// Exits need no Merkle path (vault revision 4): they are bound to the note's
+// leaf, so no exit reads the indexer or the vault's logs.
 //
 // Gasless withdrawals (ERC-4337, `fees: 'payout'`): `withdraw` and `finalize`
 // pass `fees` and the other sponsored options through; `collect`
@@ -66,6 +68,10 @@ const fetchLog = [];
 // reserved until this wallet's exit lock holds a released escape or close.
 let holdSuccessors = false;
 let heldReadings = 0;
+// `indexer_down`: the indexer's origin answers as unreachable.
+let indexerOrigin = null;
+let indexerDown = false;
+let indexerRefused = 0;
 const exitProofReleased = () => (runtime?.runtime?.exitLock?.released || []).some(entry => Number(entry.kind) <= 1);
 const SUCCESSOR_ROUTES = /^\/v2\/(?:requests|nullifiers|openrouter\/leases)\/[^/]+$/;
 globalThis.fetch = async (input, init = {}) => {
@@ -75,6 +81,10 @@ globalThis.fetch = async (input, init = {}) => {
     }
     if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1') throw new TypeError(`the acceptance SDK only reaches loopback (${url.origin})`);
     fetchLog.push({ method: init.method || 'GET', path: url.pathname, origin: url.origin });
+    if (indexerDown && (url.origin === indexerOrigin || url.pathname.startsWith('/v1/tree/'))) {
+        indexerRefused += 1;
+        throw new TypeError(`fetch failed (the indexer at ${url.origin} is down)`);
+    }
     const response = await realFetch(url, init);
     if (!holdSuccessors || !SUCCESSOR_ROUTES.test(url.pathname) || exitProofReleased()) return response;
     const text = await response.text();
@@ -139,7 +149,8 @@ const provider = {
                     throw Object.assign(new Error('User rejected the request.'), { code: 4001 });
                 }
                 const hash = await walletRpc('eth_sendTransaction', [tx]);
-                sent.push({ hash, to: tx.to, data: tx.data?.slice(0, 10), value: tx.value ?? '0x0' });
+                // `gas`: the limit the SDK set (a deposit's comes from the C.8 policy).
+                sent.push({ hash, to: tx.to, data: tx.data?.slice(0, 10), value: tx.value ?? '0x0', gas: tx.gas ?? null });
                 return hash;
             }
             case 'personal_sign': {
@@ -282,13 +293,11 @@ async function handle(command) {
         case 'hold_successors':
             holdSuccessors = command.on !== false;
             return { holding: holdSuccessors, held_readings: heldReadings };
-        case 'drop_deposit_path': {
-            await client.refresh({ quiet: true });
-            const current = runtime.runtime;
-            const { deposit_path: dropped, ...kept } = current.state;
-            await runtime.commit({ ...current, state: kept });
-            await client.refresh({ quiet: true });
-            return { dropped: Boolean(dropped), ...state() };
+        case 'indexer_down': {
+            indexerDown = command.on !== false;
+            const trusted = runtime?.browserConfig?.trusted_deployment;
+            indexerOrigin = trusted?.indexer_url ? new URL(trusted.indexer_url).origin : null;
+            return { indexer_down: indexerDown, indexer_refused: indexerRefused };
         }
         case 'close':
             setTimeout(() => process.exit(0), 10);
@@ -305,7 +314,7 @@ function summarize(value) {
     const { secret, secret_s: secretS, balance_blinding: blinding, ...rest } = value;
     return JSON.parse(JSON.stringify(rest, (_, v) => typeof v === 'bigint' ? v.toString() : v));
 }
-const PLAN_FIELDS = ['mode', 'phase', 'noteId', 'decision', 'pathSource', 'concededAtInit', 'boundAtState', 'stateBalance',
+const PLAN_FIELDS = ['mode', 'phase', 'noteId', 'decision', 'concededAtInit', 'boundAtState', 'stateBalance',
     'validUntil', 'withdrawalNullifier', 'destination', 'warnings'];
 function state() {
     const snapshot = client.snapshot();
@@ -341,7 +350,10 @@ function state() {
             transactionHash: plan.transactionHash ?? null }) : null,
         gasless: summarize(snapshot.gasless ?? snapshot.config?.gasless ?? null),
         held_readings: heldReadings,
-        deposit_path_saved: Boolean(durable.state?.deposit_path),
+        indexer_refused: indexerRefused,
+        // Where the last request's Merkle path came from: 'indexer', or the
+        // vault's 'state' (or 'logs') when the indexer lagged or was down.
+        request_path_source: runtime?.lastRequestPathSource ?? null,
         worker_operations: [...new Set(workerOperations)],
         device_clock_offset_seconds: clockOffsetMs / 1000,
     };

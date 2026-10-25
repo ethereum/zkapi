@@ -8,10 +8,11 @@ import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
-import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {Bn254PoseidonReference} from "./reference/Bn254PoseidonReference.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
 import {AcceptAllProofs} from "./mocks/MockProofAdapters.sol";
+import {PoseidonRuntime, ReferenceHashes} from "./helpers/PoseidonRuntime.sol";
 
 contract RejectingTreasury {
     receive() external payable {
@@ -55,7 +56,7 @@ contract ZkApiVaultPauseTest is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
+            zero = Bn254PoseidonReference.compress(DOMAIN_NODE, zero, zero);
         }
         vault = new ZkApiVault(
             treasury,
@@ -68,7 +69,9 @@ contract ZkApiVaultPauseTest is Test {
             13,
             14,
             address(this),
-            MAX_PAUSE
+            MAX_PAUSE,
+            PoseidonRuntime.etch(),
+            1
         );
         vm.deal(user, 100 ether);
     }
@@ -77,28 +80,28 @@ contract ZkApiVaultPauseTest is Test {
 
     function test_claimExpiredRevertsWhilePaused() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = _expiryOf(id);
         vm.warp(expiry);
         vault.pause();
         vm.expectRevert(Errors.Paused.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(expiry + 7 days);
         vault.unpause();
         // The note had already expired when the pause began, but nobody could claim it
         // while users were locked out, and its owner gets the unpause grace to exit.
         uint256 claimAt = expiry + 7 days + vault.unpauseClaimGrace();
-        assertEq(vault.effectiveExpiry(id), claimAt);
+        assertEq(_effectiveExpiry(id), claimAt);
         vm.warp(claimAt - 1);
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(claimAt);
-        vault.claimExpired(id);
+        _claimExpired(id);
         assertEq(treasury.balance, uint256(UNITS) * 1 gwei);
     }
 
     function test_pauseExtendsExpiryAndKeepsExitsAfterUnpause() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = _expiryOf(id);
         Types.WithdrawalPublicInputs memory close = _withdrawal(id, 99, true);
         Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 98, false);
         vm.warp(expiry - 1 days);
@@ -110,7 +113,7 @@ contract ZkApiVaultPauseTest is Test {
         vm.warp(expiry + 30 days);
         vault.unpause();
         // One day remained when the pause began; one day remains after it.
-        assertEq(vault.effectiveExpiry(id), expiry + 31 days);
+        assertEq(_effectiveExpiry(id), expiry + 31 days);
 
         uint256 snapshot = vm.snapshotState();
         vault.initiateEscapeWithdrawal(escape, "");
@@ -121,9 +124,9 @@ contract ZkApiVaultPauseTest is Test {
 
         vm.warp(expiry + 31 days - 1);
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(expiry + 31 days);
-        vault.claimExpired(id);
+        _claimExpired(id);
     }
 
     function test_repeatedPausesAccumulateOnlyAfterDeposit() public {
@@ -139,23 +142,23 @@ contract ZkApiVaultPauseTest is Test {
         vm.warp(vm.getBlockTimestamp() + vault.PAUSE_COOLDOWN());
         vault.pause();
         vault.unpause(); // zero-length pause
-        (,, uint64 firstExpiry,) = vault.notes(first);
-        (,, uint64 secondExpiry,) = vault.notes(second);
+        uint64 firstExpiry = _expiryOf(first);
+        uint64 secondExpiry = _expiryOf(second);
         assertEq(vault.totalPausedDuration(), 8 days);
-        assertEq(vault.effectiveExpiry(first), firstExpiry + 8 days);
-        assertEq(vault.effectiveExpiry(second), secondExpiry + 5 days);
+        assertEq(_effectiveExpiry(first), firstExpiry + 8 days);
+        assertEq(_effectiveExpiry(second), secondExpiry + 5 days);
     }
 
     function test_effectiveExpiryProjectsWhilePaused() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
-        assertEq(vault.effectiveExpiry(id), expiry);
-        assertEq(vault.effectiveExpiry(7), 0);
+        uint64 expiry = _expiryOf(id);
+        assertEq(_effectiveExpiry(id), expiry);
+        assertEq(vault.effectiveExpiry(7, bytes32(uint256(42)), UNITS, _expiryOf(0)), 0);
         vault.pause();
         vm.warp(vm.getBlockTimestamp() + 2 days);
-        assertEq(vault.effectiveExpiry(id), expiry + 2 days);
+        assertEq(_effectiveExpiry(id), expiry + 2 days);
         vm.warp(vm.getBlockTimestamp() + 3 days);
-        assertEq(vault.effectiveExpiry(id), expiry + 5 days);
+        assertEq(_effectiveExpiry(id), expiry + 5 days);
     }
 
     function testFuzz_effectiveExpiryMatchesPauseModel(uint32[6] memory gaps, uint8 depositAfter) public {
@@ -207,7 +210,7 @@ contract ZkApiVaultPauseTest is Test {
 
         uint256 snapshot = vm.snapshotState();
         vault.challengeEscapeWithdrawal(id, request, "");
-        (,,, Types.NoteStatus status) = vault.notes(id);
+        (, Types.NoteStatus status) = vault.noteRecord(id);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
         assertFalse(vault.usedNullifiers(101));
         vm.revertToState(snapshot);
@@ -222,7 +225,7 @@ contract ZkApiVaultPauseTest is Test {
 
     function test_challengeDuringPauseGrantsGraceAfterUnpause() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = _expiryOf(id);
         Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 101, false);
         Types.RequestPublicInputs memory request = _request(101 + SUCCESSOR);
         vm.warp(expiry - 1 hours);
@@ -233,12 +236,12 @@ contract ZkApiVaultPauseTest is Test {
         vm.warp(vm.getBlockTimestamp() + 10 days);
         vault.unpause();
         uint256 graceEnd = vm.getBlockTimestamp() + vault.challengePeriod();
-        assertEq(vault.effectiveExpiry(id), graceEnd);
+        assertEq(_effectiveExpiry(id), graceEnd);
         vm.warp(graceEnd - 1);
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(graceEnd);
-        vault.claimExpired(id);
+        _claimExpired(id);
     }
 
     /// A challenge after a completed pause longer than challengePeriod still grants exactly
@@ -246,7 +249,7 @@ contract ZkApiVaultPauseTest is Test {
     /// grace ends an hour after the unpause claim grace and the latter cannot hide it.
     function test_challengeSoonAfterCompletedPauseGetsExactGrace() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = _expiryOf(id);
         vm.warp(expiry - 2 hours);
         vault.pause();
         vm.warp(expiry + 10 days);
@@ -263,7 +266,7 @@ contract ZkApiVaultPauseTest is Test {
     /// challenge time.
     function test_challengeLongAfterCompletedPauseGetsExactGrace() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = _expiryOf(id);
         vm.warp(vm.getBlockTimestamp() + 1 days);
         vault.pause();
         vm.warp(vm.getBlockTimestamp() + 10 days);
@@ -289,8 +292,8 @@ contract ZkApiVaultPauseTest is Test {
         vault.unpause();
         vm.warp(vm.getBlockTimestamp() + 2 days);
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
-        assertEq(vault.effectiveExpiry(id), expiry);
+        uint64 expiry = _expiryOf(id);
+        assertEq(_effectiveExpiry(id), expiry);
         vm.warp(uint256(expiry) - 2 hours);
         vault.initiateEscapeWithdrawal(_withdrawal(id, 101, false), "");
         vm.warp(vm.getBlockTimestamp() + 1 hours);
@@ -308,18 +311,18 @@ contract ZkApiVaultPauseTest is Test {
         vault.challengeEscapeWithdrawal(id, request, "");
         uint256 graceEnd = challengedAt + vault.challengePeriod();
         assertGt(graceEnd, vault.lastUnpausedAt() + vault.unpauseClaimGrace());
-        assertEq(vault.effectiveExpiry(id), graceEnd);
+        assertEq(_effectiveExpiry(id), graceEnd);
         vm.warp(graceEnd - 1);
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(graceEnd);
-        vault.claimExpired(id);
+        _claimExpired(id);
         assertEq(treasury.balance, uint256(UNITS) * 1 gwei);
     }
 
     function test_pauseJustBeforeExpiryLeavesClaimGraceAfterUnpause() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = _expiryOf(id);
         Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 98, false);
         vm.warp(expiry - 1);
         vault.pause();
@@ -329,15 +332,15 @@ contract ZkApiVaultPauseTest is Test {
         // One second of note time was left, but every unpause restores the full grace.
         uint256 claimAt = unpausedAt + vault.unpauseClaimGrace();
         assertEq(vault.lastUnpausedAt(), unpausedAt);
-        assertEq(vault.effectiveExpiry(id), claimAt);
+        assertEq(_effectiveExpiry(id), claimAt);
         vm.warp(claimAt - 1);
         uint256 snapshot = vm.snapshotState();
         vault.initiateEscapeWithdrawal(escape, "");
         vm.revertToState(snapshot);
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(claimAt);
-        vault.claimExpired(id);
+        _claimExpired(id);
         assertEq(treasury.balance, uint256(UNITS) * 1 gwei);
     }
 
@@ -346,7 +349,7 @@ contract ZkApiVaultPauseTest is Test {
     /// restarts the claim grace, so the pause costs the note no time.
     function test_pauseCooldownLetsTheNextExitThrough() public {
         uint32 id = _deposit(42);
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = _expiryOf(id);
         uint256 time = uint256(expiry) - 1 hours;
         vm.warp(time);
         Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 99, false);
@@ -357,7 +360,7 @@ contract ZkApiVaultPauseTest is Test {
         time += 12;
         vm.warp(time);
         vault.unpause();
-        assertEq(vault.effectiveExpiry(id), time + vault.unpauseClaimGrace());
+        assertEq(_effectiveExpiry(id), time + vault.unpauseClaimGrace());
         // The owner tries again just before the retry, and up to the last second of the cooldown.
         vm.expectRevert(Errors.PauseCooldown.selector);
         vault.pause();
@@ -429,7 +432,7 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(user.balance, 100 ether - 3 * uint256(UNITS) * 1 gwei + 1_400_000 gwei);
         vm.warp(vm.getBlockTimestamp() + 3650 days);
         vm.expectRevert(Errors.Paused.selector);
-        vault.claimExpired(idle);
+        _claimExpired(idle);
         assertEq(treasury.balance, 600_000 gwei);
     }
 
@@ -659,12 +662,36 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(vault.treasuryChangeDelay(), vault.MIN_TREASURY_CHANGE_DELAY());
         assertEq(vault.unpauseClaimGrace(), 1 days);
         ZkApiVault slow = new ZkApiVault(
-            treasury, 30 days, 5 days, 100_000, address(new AcceptAllProofs()), 11, 12, 13, 14, address(this), 10 days
+            treasury,
+            30 days,
+            5 days,
+            100_000,
+            address(new AcceptAllProofs()),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            10 days,
+            PoseidonRuntime.etch(),
+            1
         );
         assertEq(slow.treasuryChangeDelay(), 5 days);
         assertEq(slow.unpauseClaimGrace(), 5 days);
         ZkApiVault fast = new ZkApiVault(
-            treasury, 30 days, 1 hours, 100_000, address(new AcceptAllProofs()), 11, 12, 13, 14, address(this), 2 hours
+            treasury,
+            30 days,
+            1 hours,
+            100_000,
+            address(new AcceptAllProofs()),
+            11,
+            12,
+            13,
+            14,
+            address(this),
+            2 hours,
+            PoseidonRuntime.etch(),
+            1
         );
         assertEq(fast.treasuryChangeDelay(), 2 days);
         assertEq(fast.unpauseClaimGrace(), 1 days);
@@ -682,9 +709,9 @@ contract ZkApiVaultPauseTest is Test {
         vault.finalizeEscapeWithdrawal(escaping);
         assertEq(user.balance - before, 700_000 gwei);
         assertEq(vault.treasuryArrears(), 300_000);
-        (,, uint64 expiry,) = vault.notes(expiring);
+        uint64 expiry = _expiryOf(expiring);
         vm.warp(expiry);
-        vault.claimExpired(expiring);
+        _claimExpired(expiring);
         assertEq(vault.treasuryArrears(), 300_000 + UNITS);
         assertEq(address(vault).balance, uint256(300_000 + UNITS) * 1 gwei);
         _switchTreasury(treasury);
@@ -718,8 +745,9 @@ contract ZkApiVaultPauseTest is Test {
     /// The same bound on claimExpired.
     function test_gasBurningTreasuryIsBoundedOnExpiryClaim() public {
         uint32 id = _deposit(42);
-        vm.warp(vault.effectiveExpiry(id));
-        bytes memory claim = abi.encodeCall(vault.claimExpired, (id));
+        vm.warp(_effectiveExpiry(id));
+        bytes memory claim =
+            abi.encodeCall(vault.claimExpired, (id, notes[id].commitment, notes[id].amount, notes[id].expiryTs));
         _assertGasBurningTreasuryBounded("claimExpired", claim, UNITS);
     }
 
@@ -747,7 +775,7 @@ contract ZkApiVaultPauseTest is Test {
                 assertEq(costly.payments(), 1);
             } else {
                 ++reverted;
-                (,,, Types.NoteStatus status) = vault.notes(id);
+                (, Types.NoteStatus status) = vault.noteRecord(id);
                 assertEq(uint256(status), uint256(Types.NoteStatus.Active));
             }
             assertEq(vault.treasuryArrears(), 0);
@@ -821,7 +849,7 @@ contract ZkApiVaultPauseTest is Test {
                 assertEq(costly.payments(), 1);
             } else {
                 ++reverted;
-                (,,, Types.NoteStatus status) = vault.notes(id);
+                (, Types.NoteStatus status) = vault.noteRecord(id);
                 assertEq(uint256(status), uint256(Types.NoteStatus.PendingWithdrawal));
             }
             assertEq(vault.escapePayoutCredits(address(costly)), 0);
@@ -879,12 +907,13 @@ contract ZkApiVaultPauseTest is Test {
             "pause"
         ];
         string[2] memory bounded = ["initiateEscapeWithdrawal", "mutualClose"];
-        string[9] memory exempt = [
+        string[10] memory exempt = [
             "challengeEscapeWithdrawal",
             "raiseEscapeConcession",
             "finalizeEscapeWithdrawal",
             "claimEscapePayout",
             "retireClosedLeaf",
+            "recordRoot",
             "unpause",
             "cancelTreasuryChange",
             "transferOwnership",
@@ -987,10 +1016,37 @@ contract ZkApiVaultPauseTest is Test {
 
     // --------------------------------------------------------------- helpers
 
+    /// What each note's leaf binds (the vault keeps only the leaf).
+    struct Note {
+        bytes32 commitment;
+        uint128 amount;
+        uint64 expiryTs;
+    }
+
+    mapping(uint32 => Note) notes;
+
     function _deposit(bytes32 commitment) private returns (uint32 id) {
         id = vault.nextNoteId();
         vm.prank(user);
         vault.deposit{value: uint256(UNITS) * 1 gwei}(commitment, UNITS);
+        uint256 raw = vm.getBlockTimestamp() + vault.noteTtl();
+        notes[id] = Note(commitment, UNITS, uint64(((raw + 1 days - 1) / 1 days) * 1 days));
+        (uint256 leaf,) = vault.noteRecord(id);
+        assertEq(leaf, _leafAt(id));
+    }
+
+    function _expiryOf(uint32 id) private view returns (uint64) {
+        return notes[id].expiryTs;
+    }
+
+    function _effectiveExpiry(uint32 id) private view returns (uint64) {
+        Note storage note = notes[id];
+        return vault.effectiveExpiry(id, note.commitment, note.amount, note.expiryTs);
+    }
+
+    function _claimExpired(uint32 id) private {
+        Note storage note = notes[id];
+        vault.claimExpired(id, note.commitment, note.amount, note.expiryTs);
     }
 
     function _deposit(uint256 commitment) private returns (uint32) {
@@ -998,7 +1054,7 @@ contract ZkApiVaultPauseTest is Test {
     }
 
     function _status(uint32 id) private view returns (Types.NoteStatus status) {
-        (,,, status) = vault.notes(id);
+        (, status) = vault.noteRecord(id);
     }
 
     function _deadline(uint32 id) private view returns (uint64 deadline) {
@@ -1026,18 +1082,18 @@ contract ZkApiVaultPauseTest is Test {
             if (i >= deposited) pausedSinceDeposit += duration;
         }
         if (deposited == 3) id = _deposit(bytes32(uint256(42)));
-        (,, uint64 expiry,) = vault.notes(id);
+        uint64 expiry = _expiryOf(id);
         shiftedExpiry = uint256(expiry) + pausedSinceDeposit;
     }
 
     /// effectiveExpiry(id) is `claimAt`, and claimExpired fails a second before it and succeeds at it.
     function _assertClaimableExactlyAt(uint32 id, uint256 claimAt) private {
-        assertEq(vault.effectiveExpiry(id), claimAt);
+        assertEq(_effectiveExpiry(id), claimAt);
         vm.warp(claimAt - 1);
         vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id);
+        _claimExpired(id);
         vm.warp(claimAt);
-        vault.claimExpired(id);
+        _claimExpired(id);
     }
 
     function _switchTreasury(address next) private {
@@ -1080,8 +1136,8 @@ contract ZkApiVaultPauseTest is Test {
     /// Exits leave leaves in place (no test here retires one), so every deposited note's leaf.
     function _leafAt(uint32 index) private view returns (uint256) {
         if (index >= vault.nextNoteId()) return 0;
-        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(index);
-        return NoteLeafLib.computeLeaf(index, commitment, amount, expiry);
+        Note storage note = notes[index];
+        return ReferenceHashes.leaf(index, note.commitment, note.amount, note.expiryTs);
     }
 
     /// Path for slots 0..3 of a tree whose other leaves are empty.
@@ -1090,7 +1146,7 @@ contract ZkApiVaultPauseTest is Test {
         siblings = emptySiblings;
         siblings[0] = _leafAt(index ^ 1);
         uint32 otherPair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _leafAt(otherPair * 2), _leafAt(otherPair * 2 + 1));
+        siblings[1] = Bn254PoseidonReference.compress(DOMAIN_NODE, _leafAt(otherPair * 2), _leafAt(otherPair * 2 + 1));
     }
 
     /// A close (kind 1) or an escape (kind 0, successor nullifier + SUCCESSOR) with a 700,000
@@ -1104,12 +1160,12 @@ contract ZkApiVaultPauseTest is Test {
             2,
             uint64(block.chainid),
             address(vault),
-            vault.currentRoot(),
+            _leafAt(id),
             11,
             12,
             13,
             14,
-            id,
+            NoteLeafLib.pack(id, notes[id].amount, notes[id].expiryTs),
             700_000,
             user,
             nullifier,

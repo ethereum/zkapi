@@ -1110,7 +1110,8 @@ fn development_keys_round_trip_through_zkeys() {
         "withdrawal.vk",
         "manifest.json",
         "Groth16ProofAdapter.sol",
-        "Bn254Poseidon.sol",
+        "Bn254PoseidonRuntime.sol",
+        "poseidon-runtime.json",
     ] {
         assert!(
             std::fs::read(output.join(file)).unwrap()

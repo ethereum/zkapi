@@ -70,8 +70,9 @@ network fee from the payout (`fees: 'payout'`, through an ERC-4337 paymaster),
 so the payout address needs no ETH; the vault is unchanged.
 
 The packaged WASM and proving keys support the current circuit
-`zkapi-v2-concession-v1` (vault revision 3), with the development setup until
-the multi-party ceremony has run. Until a revision-3 vault is deployed, the
+`zkapi-v2-concession-v2` (vault revision 4, leaf-bound exits), with the
+development setup until the multi-party ceremony has run. Until a revision-4
+vault is deployed, the
 packaged network profiles are placeholders and `npm run build:browser` and
 `npm run build:mainnet` refuse them by design (`deployment_not_deployed`);
 `npm run verify:builds` checks exactly that. Notes of the earlier circuit
@@ -82,7 +83,7 @@ artifact hashes; `npm run verify:wasm` rebuilds it reproducibly and compares.
 
 ## Full local lifecycle acceptance
 
-Run `npm run test:e2e:v2` to build and test circuit `zkapi-v2-concession-v1`
+Run `npm run test:e2e:v2` to build and test circuit `zkapi-v2-concession-v2`
 end to end on a fresh local chain. It covers the honest flow and the Sepolia
 drill scenarios that run locally, and writes a gas report. The drill scenarios
 include withholding, bad successor anchors, a lying expiry check, forced and
@@ -99,8 +100,8 @@ withdrawal encoders' calldata to an Anvil vault.
 ## Operator services
 
 - `zkapi serverd`: native ETH lease authorization, settlement and Schnorr signing.
-- `zkapi-indexerd` / `zkapi indexer`: vault event indexing and Merkle paths
-  from a view verified against the vault.
+- `zkapi-indexerd` / `zkapi indexer`: vault event indexing and request-tree
+  Merkle paths from a view verified against the vault (exits need no path).
 - `zkapi db init`: create the server database with its append-only request
   evidence and bind it to the deployment manifest, before any daemon starts.
 - `zkapi-challenged`: durable escape monitoring; defeats escapes from spent
@@ -136,7 +137,9 @@ it is not part of connecting a client to the configured vault.
 
 The active protocol uses Groth16 over BN254, Poseidon, note-bound Baby-JubJub
 commitments and Schnorr signatures, a nullifier chain whose successor anchors
-are derived from the spent nullifier, and a 32-level append-only Merkle tree.
+are derived from the spent nullifier, and a 32-level append-only Merkle tree
+for request proofs. Exits bind to the note's leaf, which the vault stores
+directly, and prove no Merkle path.
 The ledger uses integer gwei. An escape concedes at most the request budget of
 the state it leaves and needs no operator cooperation. Production keys need
 the multi-party setup described in

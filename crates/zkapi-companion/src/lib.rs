@@ -5,6 +5,7 @@ pub mod error;
 pub mod exit_kit;
 pub mod indexer;
 mod oa_withdrawal;
+mod request_path;
 pub mod routes;
 pub mod service;
 pub mod wallet_lock;

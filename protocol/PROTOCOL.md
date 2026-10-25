@@ -1,7 +1,7 @@
 # ZK API Usage Credits
 
 This note describes the active zkAPI v2 usage-credit protocol, circuit
-`zkapi-v2-concession-v1` (vault revision 3). The implementation uses BN254
+`zkapi-v2-concession-v2` (vault revision 4, leaf-bound exits). The implementation uses BN254
 Groth16 proofs, BN254 Poseidon hashing, Baby-JubJub Schnorr signatures, and
 native ETH settlement in whole gwei. See [SPEC.md](SPEC.md) for exact public
 statements, the [concession exit design](../docs/design/concession-exit.md) for
@@ -48,7 +48,8 @@ This makes the protocol naturally sequential: one state authorizes one next requ
 - $C_{\max}$: maximum ordinary per-request charge.
 - $S_{\max}$: optional higher cap for policy-violation deductions.
 - $B$: current private available balance.
-- $L = H_{\text{leaf}}(\text{noteId}, C, D, T_{\text{exp}})$: active membership leaf.
+- $F = \text{noteId} \cdot 2^{192} + D \cdot 2^{64} + T_{\text{exp}}$: the note's packed fields (32-, 128- and 64-bit values, so $F < 2^{224}$).
+- $L = H_{\text{leaf}}(C, F)$: active membership leaf, one Poseidon permutation with the capacity domain `zkapi.v2c.leaf`.
 - $E(B)$: shorthand for the note-bound homomorphic commitment
   $E(B,r,L) = B G + r H + L J$ on Baby-JubJub. The private leaf term remains
   fixed throughout every state transition and rerandomization.
@@ -87,7 +88,7 @@ $$
 
 into the smart contract.
 
-4. The contract records the deposit amount $D$ and expiry $T_{\text{exp}}$, then inserts the full note leaf $L$ into the on-chain Merkle tree at the note ID.
+4. The contract computes the full note leaf $L$ from $C$, the note ID, $D$ and the bucketed expiry $T_{\text{exp}}$, stores it with the note's status in one word, and appends it to the on-chain Merkle tree (used by request proofs) at the note ID. The deposit must be at least the vault's `minDeposit`.
 
 ## Request Generation
 
@@ -100,7 +101,7 @@ To make a request, the user sends:
 The proof $\pi_{\text{req}}$ proves:
 
 1. **Membership**  
-   $L = H_{\text{leaf}}(\text{noteId}, H(s, 0), D, T_{\text{exp}})$ is in the active Merkle tree.
+   $L = H_{\text{leaf}}(H(s, 0), F)$ is in the active Merkle tree.
 
 2. **Secret knowledge**  
    The prover knows $s$.
@@ -232,7 +233,7 @@ No separate on-chain policy stake or `slashPolicyStake` function is required. Th
 
 Withdrawal is a **final spend** of a state. A withdrawal proof shows:
 
-1. membership for the full note leaf $L$ derived from $C = H(s, 0)$;
+1. that the public note leaf $L$ is $H_{\text{leaf}}(H(s, 0), F)$ for the public note fields $F$, which pack the note ID, $D$ and $T_{\text{exp}}$ (no Merkle path);
 2. knowledge of $s$;
 3. a valid state $(E(B), \tau, \sigma)$ of that note (genesis, or signed);
 4. knowledge of the opening of $E(B)$, with $B \leq D$;
@@ -247,12 +248,12 @@ There are three kinds. Only the first two settle on chain.
 | Mutual close | Instant exit with the operator's consent | $\sigma_{\text{clear}}(x)$; $c = 0$ |
 | Ownership | Prove ownership to the server | $\text{Dest} = 0$, $c = 0$, no $x^{+}$; the contract refuses it |
 
-No withdrawal changes the Merkle tree: notes are never removed by an exit, and a proof may use any root the contract ever held.
+No withdrawal changes the Merkle tree, and no withdrawal uses it: the contract compares $L$ with the leaf it stored for the note, requires the note to be active, and takes $D$ and $T_{\text{exp}}$ from $F$. Because $D$ comes from the proof rather than from storage, a broken verifier or setup could drain the whole vault with one forged exit ([Amendment A3](../docs/design/concession-exit.md#amendment-a3-leaf-bound-exits)).
 
 ### Mutual Close (Instant Path)
 
 1. The user sends $x$ together with an ownership proof $\pi_{\text{own}}$ for the same $x$, valid for at most an hour.
-2. The server checks whether $x$ is already in `spent_nullifiers`, and verifies $\pi_{\text{own}}$ against its deployment, signing keys and a root the contract held. Only the note owner can produce it.
+2. The server checks whether $x$ is already in `spent_nullifiers`, verifies $\pi_{\text{own}}$ against its deployment and signing keys, and reads the note's record from the contract: the stored leaf must equal the proof's $L$ and the note must be active. Only the note owner can produce the proof.
 3. If both checks pass, the server signs:
 
 $$
@@ -323,10 +324,10 @@ This means the server is paid for the user's entire lifetime of API usage in one
 To handle abandoned accounts, each note carries the expiry time $T_{\text{exp}}$. If the note is still open and no withdrawal is in progress after its effective expiry, the server may call:
 
 $$
-\text{claimExpired}(\text{noteId})
+\text{claimExpired}(\text{noteId}, C, D, T_{\text{exp}})
 $$
 
-The contract then closes the note and transfers the full deposit $D$ to the server treasury $A_{\text{srv}}$. The effective expiry is $T_{\text{exp}}$ extended by any time the contract spent paused, and by at least one challenge window after a defeat. The claim is unavailable while the contract is paused and for a grace period after each unpause, and never applies to a note with a pending escape. Requests still require $T_{\text{exp}}$ to be at least the request time, so a user starts an exit well before it.
+The arguments must reproduce the note's stored leaf. The contract then closes the note and transfers the full deposit $D$ to the server treasury $A_{\text{srv}}$. The effective expiry is $T_{\text{exp}}$ extended by any time the contract spent paused, and by at least one challenge window after a defeat. The claim is unavailable while the contract is paused and for a grace period after each unpause, and never applies to a note with a pending escape. Requests still require $T_{\text{exp}}$ to be at least the request time, so a user starts an exit well before it.
 
 This guarantees that the server is eventually paid even if the user disappears without withdrawing. An implementation may additionally offer a separate rollover / renewal transaction that extends $T_{\text{exp}}$, but that mechanism is orthogonal to the accounting model described here.
 

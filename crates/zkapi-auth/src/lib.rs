@@ -4,7 +4,7 @@
 //! selected by configuration:
 //!
 //! - [`AuthSchemeKind::StateAnchor`] — the reference state-anchor chain of
-//!   circuit `zkapi-v2-concession-v1`: a note-bound Pedersen balance
+//!   circuit `zkapi-v2-concession-v2`: a note-bound Pedersen balance
 //!   commitment on Baby-JubJub, a note-bound nullifier chain whose successor
 //!   anchors are derived (`τ' = H(d_anchor', N)`), and a Schnorr state
 //!   signature carrying the state forward (delegates to the `protocol`

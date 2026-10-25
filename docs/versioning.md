@@ -53,7 +53,7 @@ revision, because a vault is immutable: a new vault is always a new MINOR.
 | Line | Branch | Circuit | Vault | Status |
 | --- | --- | --- | --- | --- |
 | `0.1.x` | `release/v2-note-bound` | `zkapi-v2-note-bound-v1` | the originally deployed vault (revision 1) | Maintenance only: security fixes and the drain tooling of the [migration](migration-concession-vault.md). Ends when the legacy vault is drained and its stack retired |
-| `0.2.x` | `main` | `zkapi-v2-concession-v1` | the concession-exit vault (revision 3) | Development; the first release is `0.2.0` |
+| `0.2.x` | `main` | `zkapi-v2-concession-v2` | the concession-exit vault with leaf-bound exits (revision 4; revision 3 and `zkapi-v2-concession-v1` were never deployed and are refused) | Development; the first release is `0.2.0` |
 
 ## Numbers that are not release versions
 
@@ -64,11 +64,11 @@ normally forces a MINOR bump.
 | Number | What it identifies |
 | --- | --- |
 | `protocol_version` (2) | The note and proof layout inside signed states and public inputs |
-| circuit ID, setup ID (`zkapi-v2-concession-v1`, `dev`, `mpc-1`) | The statement a proof proves and the keys that verify it; pinned in the vault's adapter |
-| `vault_revision` (3), `exit_concession` (1) | The contract revision and its capability marker |
+| circuit ID, setup ID (`zkapi-v2-concession-v2`, `dev`, `mpc-1`) | The statement a proof proves and the keys that verify it; pinned in the vault's adapter |
+| `vault_revision` (4), `exit_concession` (1), `leaf_bound_exit` (1) | The contract revision and its capability markers (`CONCESSION_ESCAPE_VERSION()`, `LEAF_BOUND_EXIT_VERSION()`) |
 | `bridge_version` (5) | The wire contract between `zkapi-clientd` and its companion |
 | `/v1`, `/v2` in API paths | The generation of an endpoint family |
-| store, checkpoint and file formats (`zkapi-exit-kit-v1`, indexer cursor version, IndexedDB version) | On-disk formats; each build refuses a format it does not know |
+| store, checkpoint and file formats (`zkapi-exit-kit-v1`, indexer checkpoint version 4, IndexedDB version) | On-disk formats; each build refuses a format it does not know |
 
 A contract is identified by chain, address, runtime codehash and circuit ID,
 never by a semantic version. It is not upgraded; a new revision is a new

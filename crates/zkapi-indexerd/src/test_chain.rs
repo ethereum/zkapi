@@ -1,12 +1,15 @@
 //! Deterministic JSON-RPC chain for poller tests.
 //!
 //! Blocks carry hashes derived from (fork id, number) with parent links. Vault
-//! logs and the vault state after each block come from a reference mirror, so
-//! event roots are the roots the real vault would emit. Controls cover the
-//! failure modes the indexer must survive: reorgs, a `eth_getLogs` replica
-//! that silently lags the head, dropped logs, pruned historical state, RPCs
-//! without EIP-1898 support, a wrong chain, a frozen or stale head, transport
-//! errors and rate limits. Every call is recorded for assertions.
+//! logs and the vault state after each block come from a reference mirror
+//! (note statuses and escapes) and the vault's own tree model
+//! (`zkapi_core::merkle::Frontier`), which answers `currentRoot()`,
+//! `nextNoteId()` and `noteLeaves(start, count)` as revision 4 computes them.
+//! Controls cover the failure modes the indexer must survive: reorgs, a
+//! `eth_getLogs` replica that silently lags the head, dropped logs, pruned
+//! historical state, RPCs without EIP-1898 support, `noteLeaves` pages served
+//! from another block, a wrong chain, a frozen or stale head, transport errors
+//! and rate limits. Every call is recorded for assertions.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -19,6 +22,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
+use zkapi_core::leaf::compute_note_leaf;
+use zkapi_core::merkle::Frontier;
 use zkapi_types::Felt252;
 
 use crate::events::VaultEvent;
@@ -87,6 +92,14 @@ struct MockLog {
     data: String,
 }
 
+/// The vault's state: note statuses and escapes (a reference mirror) and
+/// the tree as the vault keeps it.
+#[derive(Clone)]
+struct VaultState {
+    mirror: TreeMirror,
+    tree: Frontier,
+}
+
 #[derive(Clone)]
 struct Block {
     number: u64,
@@ -95,7 +108,7 @@ struct Block {
     timestamp: u64,
     logs: Vec<MockLog>,
     /// Vault state after the block; `None` before deployment.
-    state: Option<Arc<TreeMirror>>,
+    state: Option<Arc<VaultState>>,
 }
 
 #[derive(Default)]
@@ -110,6 +123,12 @@ struct Faults {
     /// The vault answers CONCESSION_ESCAPE_VERSION() with this value; `None`
     /// reverts, as a vault before revision 3 does.
     escape_version: Option<u64>,
+    /// The vault answers LEAF_BOUND_EXIT_VERSION() with this value; `None`
+    /// reverts, as a vault before revision 4 does.
+    leaf_bound_version: Option<u64>,
+    /// `noteLeaves` answers from this block's state whatever block hash it
+    /// is asked for.
+    leaf_pages_at: Option<u64>,
     fail: HashMap<String, u32>,
     rate_limit: HashMap<String, u32>,
 }
@@ -137,12 +156,18 @@ impl Chain {
             .map(|block| (block.hash.clone(), block.state.clone()));
         let (parent_hash, parent_state) =
             parent.unwrap_or_else(|| (format!("0x{}", "0".repeat(64)), None));
-        let mut state =
-            parent_state.or_else(|| (number >= DEPLOY_BLOCK).then(|| Arc::new(TreeMirror::new())));
+        let mut state = parent_state.or_else(|| {
+            (number >= DEPLOY_BLOCK).then(|| {
+                Arc::new(VaultState {
+                    mirror: TreeMirror::new(),
+                    tree: Frontier::new(),
+                })
+            })
+        });
         let mut logs = Vec::new();
         for tx in txs {
-            let mirror = Arc::make_mut(state.as_mut().expect("vault is deployed"));
-            logs.extend(apply(mirror, tx));
+            let vault = Arc::make_mut(state.as_mut().expect("vault is deployed"));
+            logs.extend(apply(vault, tx));
         }
         let hash = block_hash(self.fork, number);
         self.hashes.insert(hash.clone(), number);
@@ -231,32 +256,62 @@ impl Chain {
         else {
             return Ok(json!("0x"));
         };
-        match params[0]["data"].as_str().unwrap_or_default() {
-            "0xfdab463d" => Ok(json!(felt_word(state.root()))),
-            "0x7a2043a3" => Ok(json!(format!("0x{:064x}", state.next_note_id()))),
-            "0x5e00b426" => match self.faults.escape_version {
-                Some(version) => Ok(json!(format!("0x{version:064x}"))),
-                None => Err((-32000, "execution reverted".to_string())),
-            },
-            _ => Err((-32000, "execution reverted".to_string())),
+        let revert = || Err((-32000, "execution reverted".to_string()));
+        let version = |version: Option<u64>| match version {
+            Some(version) => Ok(json!(format!("0x{version:064x}"))),
+            None => revert(),
+        };
+        let data = params[0]["data"].as_str().unwrap_or_default();
+        if let Some(args) = data.strip_prefix("0x31749c58") {
+            // noteLeaves(uint32 start, uint32 count)
+            let word = |index: usize| {
+                args.get(index * 64..(index + 1) * 64)
+                    .and_then(|word| u64::from_str_radix(word, 16).ok())
+            };
+            let (Some(start), Some(count)) = (word(0), word(1)) else {
+                return revert();
+            };
+            if start + count > u64::from(state.tree.next_index()) {
+                // InvalidNoteRange
+                return Err((3, "execution reverted: 0x9fe6fd7a".to_string()));
+            }
+            let source = match self.faults.leaf_pages_at {
+                Some(at) => self.blocks[at as usize].state.clone().expect("deployed"),
+                None => state.clone(),
+            };
+            let mut out = format!("0x{:064x}{count:064x}", 32);
+            for index in start..start + count {
+                out.push_str(&felt_hex(source.tree.leaf(index as u32)));
+            }
+            return Ok(json!(out));
+        }
+        match data {
+            "0xfdab463d" => Ok(json!(felt_word(state.tree.root()))),
+            "0x7a2043a3" => Ok(json!(format!("0x{:064x}", state.tree.next_index()))),
+            "0x5e00b426" => version(self.faults.escape_version),
+            "0xc0baafb1" => version(self.faults.leaf_bound_version),
+            _ => revert(),
         }
     }
 }
 
-/// Apply a vault call to the reference mirror and return the logs it emits.
-fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
+/// Apply a vault call to the vault state and return the logs it emits.
+fn apply(vault: &mut VaultState, tx: Tx) -> Vec<MockLog> {
+    let mirror = &mut vault.mirror;
     let destination = format!("0x{:064x}", 0xd0d0_u64);
     let note_topic = |note_id: u32| format!("0x{note_id:064x}");
     match tx {
         Tx::Deposit { commitment } => {
             let note_id = mirror.next_note_id();
+            let commitment_felt = Felt252::from_u64(commitment);
             mirror.process_event(&VaultEvent::NoteDeposited {
                 note_id,
-                commitment: Felt252::from_u64(commitment),
+                commitment: commitment_felt,
                 amount: DEPOSIT_AMOUNT,
                 expiry_ts: EXPIRY_TS,
-                new_root: Felt252::ZERO,
             });
+            let leaf = compute_note_leaf(note_id, &commitment_felt, DEPOSIT_AMOUNT, EXPIRY_TS);
+            assert_eq!(vault.tree.append(leaf), Ok(note_id));
             vec![MockLog {
                 topics: vec![
                     event_topic(NOTE_DEPOSITED),
@@ -266,7 +321,6 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
                 data: words(&[
                     format!("{DEPOSIT_AMOUNT:064x}"),
                     format!("{EXPIRY_TS:064x}"),
-                    felt_hex(mirror.root()),
                 ]),
             }]
         }
@@ -295,7 +349,6 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
                     nullifier: Felt252::from_u64(nullifier),
                     final_balance: 10,
                     challenge_deadline: deadline,
-                    current_root: Felt252::ZERO,
                 },
                 VaultEvent::EscapeConcessionRecorded {
                     note_id,
@@ -314,7 +367,6 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
                         format!("{:064x}", 10),
                         strip(&destination),
                         format!("{deadline:064x}"),
-                        felt_hex(mirror.root()),
                     ]),
                 },
                 MockLog {
@@ -346,14 +398,10 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
         }
         Tx::Challenge { note_id } => {
             let nullifier = pending_nullifier(mirror, note_id);
-            mirror.process_event(&VaultEvent::EscapeWithdrawalChallenged {
-                note_id,
-                nullifier,
-                current_root: Felt252::ZERO,
-            });
+            mirror.process_event(&VaultEvent::EscapeWithdrawalChallenged { note_id, nullifier });
             vec![MockLog {
                 topics: vec![event_topic(ESCAPE_CHALLENGED), note_topic(note_id)],
-                data: words(&[felt_hex(nullifier), felt_hex(mirror.root())]),
+                data: words(&[felt_hex(nullifier)]),
             }]
         }
         Tx::Finalize { note_id } => {
@@ -376,21 +424,22 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
             mirror.process_event(&VaultEvent::ExpiredClaimed {
                 note_id,
                 deposit_amount: DEPOSIT_AMOUNT,
-                current_root: Felt252::ZERO,
             });
             vec![MockLog {
                 topics: vec![event_topic(EXPIRED_CLAIMED), note_topic(note_id)],
-                data: words(&[format!("{DEPOSIT_AMOUNT:064x}"), felt_hex(mirror.root())]),
+                data: words(&[format!("{DEPOSIT_AMOUNT:064x}")]),
             }]
         }
         Tx::Retire { note_id } => {
-            mirror.process_event(&VaultEvent::ClosedLeafRetired {
-                note_id,
-                new_root: Felt252::ZERO,
-            });
+            // The vault reads only the retirement level's siblings.
+            vault
+                .tree
+                .retire(note_id, &mirror.get_path(note_id))
+                .expect("mock vault: retirement reverts");
+            mirror.process_event(&VaultEvent::ClosedLeafRetired { note_id });
             vec![MockLog {
                 topics: vec![event_topic(CLOSED_LEAF_RETIRED), note_topic(note_id)],
-                data: words(&[felt_hex(mirror.root())]),
+                data: "0x".to_string(),
             }]
         }
         Tx::Raw { topics, data } => vec![MockLog { topics, data }],
@@ -429,6 +478,7 @@ impl MockChain {
             hashes: HashMap::new(),
             faults: Faults {
                 escape_version: Some(1),
+                leaf_bound_version: Some(1),
                 ..Faults::default()
             },
             calls: Vec::new(),
@@ -494,21 +544,44 @@ impl MockChain {
         self.with(|chain| chain.blocks[number as usize].hash.clone())
     }
 
+    /// The vault's note statuses and escapes after block `number`, as a
+    /// mirror built from complete logs.
     pub(crate) fn state_at(&self, number: u64) -> Arc<TreeMirror> {
         self.with(|chain| {
-            chain.blocks[number as usize]
-                .state
-                .clone()
-                .unwrap_or_else(|| Arc::new(TreeMirror::new()))
+            Arc::new(
+                chain.blocks[number as usize]
+                    .state
+                    .as_ref()
+                    .map_or_else(TreeMirror::new, |state| state.mirror.clone()),
+            )
         })
     }
 
+    fn tree_at(&self, number: u64) -> Frontier {
+        self.with(|chain| {
+            chain.blocks[number as usize]
+                .state
+                .as_ref()
+                .map_or_else(Frontier::new, |state| state.tree.clone())
+        })
+    }
+
+    /// The vault's `currentRoot()` after block `number` (computed from its
+    /// frontier, as revision 4 does).
     pub(crate) fn root_at(&self, number: u64) -> Felt252 {
-        self.state_at(number).root()
+        self.tree_at(number).root()
     }
 
     pub(crate) fn next_note_id_at(&self, number: u64) -> u32 {
-        self.state_at(number).next_note_id()
+        self.tree_at(number).next_index()
+    }
+
+    /// The vault's `noteLeaves(0, nextNoteId())` after block `number`.
+    pub(crate) fn leaves_at(&self, number: u64) -> Vec<Felt252> {
+        let tree = self.tree_at(number);
+        (0..tree.next_index())
+            .map(|index| tree.leaf(index))
+            .collect()
     }
 
     pub(crate) fn is_canonical(&self, hash: &str) -> bool {
@@ -561,6 +634,18 @@ impl MockChain {
     /// The vault's CONCESSION_ESCAPE_VERSION() (`None`: the getter reverts).
     pub(crate) fn set_escape_version(&self, version: Option<u64>) {
         self.with(|chain| chain.faults.escape_version = version);
+    }
+
+    /// The vault's LEAF_BOUND_EXIT_VERSION() (`None`: the getter reverts,
+    /// as on a revision-3 vault).
+    pub(crate) fn set_leaf_bound_version(&self, version: Option<u64>) {
+        self.with(|chain| chain.faults.leaf_bound_version = version);
+    }
+
+    /// Answer `noteLeaves` from block `at`'s state, ignoring the block hash
+    /// asked for (`None` restores pinned answers).
+    pub(crate) fn serve_leaf_pages_at(&self, at: Option<u64>) {
+        self.with(|chain| chain.faults.leaf_pages_at = at);
     }
 
     /// Timestamp for blocks mined from now on (`None`: wall clock).

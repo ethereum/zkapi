@@ -3,8 +3,10 @@
 //! A kit is the encrypted state an escape needs when neither the browser
 //! host nor this device's wallet is available: the trusted deployment
 //! profile, the note's secret and current signed state (`s`, `note_id`, `D`,
-//! expiry, `B`, `r`, `τ`, `τ_prev`, `σ`), `bound_at_state`, `state_seq`,
-//! `exported_at`, and the deposit-time Merkle path when one was kept.
+//! expiry, `B`, `r`, `τ`, `τ_prev`, `σ`), `bound_at_state`, `state_seq` and
+//! `exported_at`. Since vault revision 4 an escape needs nothing else: it is
+//! bound to the leaf the vault stored at deposit, which `s`, `note_id`, `D`
+//! and the expiry reproduce, so a kit carries no Merkle path.
 //!
 //! File format (JSON), the browser SDK's (`sdk/services/zkapiExitKit.mjs`):
 //!
@@ -15,17 +17,19 @@
 //!   "ciphertext": base64(AES-256-GCM(JSON contents), AAD "zkapi-exit-kit-v1") }
 //! ```
 //!
-//! The contents carry the deposit-time path as
-//! `merkle_path: {active_root, siblings}`. Kits written by earlier builds
-//! of this crate (`"kdf": {"name": "PBKDF2-SHA256"}`, the path as
-//! `deposit_path: {root, siblings}`) are read too, and amounts and counters
-//! in the note may be JSON numbers or decimal strings.
+//! Kits sealed before vault revision 4 carry the deposit-time path
+//! (`merkle_path: {active_root, siblings}`, or `deposit_path: {root,
+//! siblings}` from earlier builds of this crate, whose kdf is named
+//! `PBKDF2-SHA256`): they are read, and the path ignored. Amounts and
+//! counters in the note may be JSON numbers or decimal strings.
 //!
 //! `zkapi-walletd exit-kit escape` runs E4 from a kit with the bundled keys:
-//! a path from the kit or a rebuild through the user's RPC, the stale-device
-//! pre-check, the codehash pins (advisory for exits), an escape conceding at
-//! most `bound_at_state`. It prints the vault and calldata, or signs and
-//! submits the transaction with a key the user supplies.
+//! no path, root, indexer or log scan; with the user's RPC the deployment
+//! check (`LEAF_BOUND_EXIT_VERSION()`), the vault's record of the note and
+//! the codehash pins (advisory for exits); the stale-device pre-check; an
+//! escape conceding at most `bound_at_state`. It prints the vault and
+//! calldata, or signs and submits the transaction with a key the user
+//! supplies.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -37,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zkapi_client::config::{ClientConfig, ClientProofMode};
 use zkapi_client::exit_lock::ExitMode;
-use zkapi_client::note_state::{DepositPath, NoteState};
+use zkapi_client::note_state::NoteState;
 use zkapi_client::wallet::Wallet;
 use zkapi_types::wire::CurvePointWire;
 use zkapi_types::Felt252;
@@ -60,33 +64,8 @@ pub struct KitContents {
     pub bound_at_state: String,
     pub state_seq: u64,
     pub exported_at: u64,
-    /// The deposit-time Merkle path (Amendment A1), as the SDK writes it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merkle_path: Option<KitMerklePath>,
-    /// The same path as kits of earlier builds of this crate wrote it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deposit_path: Option<DepositPath>,
-}
-
-/// A kit's deposit-time Merkle path: the root its deposit set and the
-/// note's siblings there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KitMerklePath {
-    pub active_root: Felt252,
-    pub siblings: Vec<Felt252>,
-}
-
-impl KitContents {
-    /// The kit's deposit-time path, in either encoding.
-    pub fn path(&self) -> Option<DepositPath> {
-        self.merkle_path
-            .as_ref()
-            .map(|path| DepositPath {
-                root: path.active_root,
-                siblings: path.siblings.clone(),
-            })
-            .or_else(|| self.deposit_path.clone())
-    }
+    // A `merkle_path` or `deposit_path` (kits sealed before vault revision
+    // 4) is read and ignored: no exit needs a path.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,11 +263,6 @@ fn normalize_contents(value: &mut Value) {
             integer(entry);
         }
     }
-    if value.get("merkle_path").is_some_and(Value::is_null) {
-        if let Some(object) = value.as_object_mut() {
-            object.remove("merkle_path");
-        }
-    }
 }
 
 pub fn now_seconds() -> u64 {
@@ -308,11 +282,6 @@ pub fn export(state_dir: &Path, manifest: &Value) -> anyhow::Result<KitContents>
         bound_at_state: note.bound_at_state.to_string(),
         state_seq: note.state_seq,
         exported_at: now_seconds(),
-        merkle_path: note.deposit_path.as_ref().map(|path| KitMerklePath {
-            active_root: path.root,
-            siblings: path.siblings.clone(),
-        }),
-        deposit_path: None,
         note,
     })
 }
@@ -380,6 +349,7 @@ pub async fn escape(kit: &KitContents, options: &EscapeOptions) -> anyhow::Resul
             "the kit's deployment is a not_deployed placeholder",
         ));
     }
+    check_profile(profile)?;
     let bound: u128 = kit.bound_at_state.parse()?;
     if !zkapi_client::exit_policy::concession_allowed(options.conceded, bound) {
         return Err(kit_error(format!(
@@ -434,53 +404,45 @@ pub async fn escape(kit: &KitContents, options: &EscapeOptions) -> anyhow::Resul
     } else {
         let mut note = kit.note.clone();
         note.bound_at_state = bound;
-        note.deposit_path = kit.path().or(note.deposit_path);
         note.save(&state_path)?;
     }
     let wallet = Wallet::new(config)?;
     let mut warnings = Vec::new();
-    let rpc = options.rpc_url.as_deref().map(Rpc::new).transpose()?;
-    // The pins: advisory for an exit, which stays allowed (§6.5).
+    // Every reading must come from the note's chain.
+    let rpc = options
+        .rpc_url
+        .as_deref()
+        .map(|url| Rpc::new(url).map(|rpc| rpc.on_chain(kit.note.chain_id)))
+        .transpose()?;
     if let Some(rpc) = &rpc {
-        warnings.extend(check_codehashes(rpc, profile, &vault).await);
-    }
-    // E4 step 1: the kit's path, else a rebuild from the vault's logs.
-    let (root, siblings, source) = match wallet.deposit_path() {
-        Some(path) => (path.root, path.siblings.clone(), "deposit"),
-        None => {
-            let rpc = rpc.as_ref().ok_or_else(|| {
-                kit_error(
-                    "the kit holds no Merkle path; pass --rpc to rebuild one from the vault's logs",
-                )
-            })?;
-            let deploy_block = profile_u64(profile, &["deploy_block"]).unwrap_or(0);
-            let (finalized, _) = rpc.block("finalized").await?;
-            let logs = rpc
-                .logs(
-                    &vault,
-                    json!([zkapi_client::tree::TREE_TOPICS]),
-                    deploy_block,
-                    finalized,
-                )
-                .await?;
-            let leaf = wallet
-                .current_note_leaf()
-                .ok_or_else(|| kit_error("no note"))?;
-            let (root, siblings) =
-                zkapi_client::tree::path_from_logs(&logs, &vault, kit.note.note_id, &leaf)
-                    .map_err(|error| kit_error(error.to_string()))?;
-            (root, siblings, "rebuild")
+        // A revision-3 vault would revert this proof: refused, unless the
+        // RPC cannot say (the escape is then made, and the vault decides).
+        match chain::check_leaf_bound_vault(rpc, &vault, None).await {
+            chain::VaultCheck::Refused(reason) => {
+                return Err(kit_error(format!("deployment check failed: {reason}")))
+            }
+            chain::VaultCheck::Unreachable(error) => warnings.push(format!(
+                "LEAF_BOUND_EXIT_VERSION() could not be read ({error}); the escape is made for a vault revision 4 vault"
+            )),
+            chain::VaultCheck::LeafBound => {}
         }
-    };
-    if let Some(rpc) = &rpc {
-        if matches!(
-            chain::known_root(rpc, &vault, &root, "latest").await,
-            Ok(false)
-        ) {
-            warnings.push(format!(
-                "{} reports the path's root as unknown to the vault; the escape may revert",
-                rpc.url()
-            ));
+        // The pins: advisory for an exit, which stays allowed (§6.5).
+        warnings.extend(check_codehashes(rpc, profile, &vault).await);
+        // The vault's record of the note: the escape is bound to its leaf.
+        let leaf = wallet
+            .current_note_leaf()
+            .ok_or_else(|| kit_error("no note"))?;
+        match chain::note_record(rpc, &vault, kit.note.note_id, "latest").await {
+            Ok((stored, 1)) if stored == leaf => {}
+            Ok((stored, status)) if stored == leaf => warnings.push(format!(
+                "the vault reports note {} with status {status}, not active: the escape reverts unless the note is active",
+                kit.note.note_id
+            )),
+            Ok(_) => warnings.push(format!(
+                "the vault's leaf of note {} is not this kit's: the escape reverts (NoteLeafMismatch); the kit's note does not match the deposit",
+                kit.note.note_id
+            )),
+            Err(error) => warnings.push(format!("noteRecord() could not be read: {error}")),
         }
     }
     // E4 step 2: the stale-device pre-check.
@@ -501,7 +463,7 @@ pub async fn escape(kit: &KitContents, options: &EscapeOptions) -> anyhow::Resul
     }
     wallet.set_exit_lock(ExitMode::Escape)?;
     let (public_inputs, proof) =
-        wallet.withdrawal_escape_hatch(options.destination, options.conceded, root, siblings)?;
+        wallet.withdrawal_escape_hatch(options.destination, options.conceded)?;
     let calldata = chain::withdrawal_calldata(chain::INITIATE_ESCAPE, &public_inputs, &proof)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     if let Some(rpc) = &rpc {
@@ -532,12 +494,41 @@ pub async fn escape(kit: &KitContents, options: &EscapeOptions) -> anyhow::Resul
         "valid_until": public_inputs.valid_until,
         "withdrawal_nullifier": public_inputs.withdrawal_nullifier,
         "next_nullifier": public_inputs.next_nullifier,
-        "path_source": source,
+        "note_leaf": public_inputs.note_leaf,
         "state_seq": kit.state_seq,
         "exported_at": kit.exported_at,
         "finalize_data": chain::finalize_calldata(kit.note.note_id),
         "warnings": warnings,
     }))
+}
+
+/// A profile of another circuit or vault revision is refused: this build
+/// proves only `zkapi-v2-concession-v2` for vault revision 4 (leaf-bound
+/// exits). A profile that names neither is accepted (the vault is checked
+/// when an RPC is given).
+fn check_profile(profile: &Value) -> anyhow::Result<()> {
+    let circuit = profile_str(profile, &["circuit_id", "proof_setup.circuit_id"]);
+    if let Some(circuit) = circuit.filter(|circuit| *circuit != zkapi_proof::compact::CIRCUIT_ID) {
+        return Err(kit_error(format!(
+            "the kit's deployment uses circuit {circuit}; this build proves only {} (vault revision 4). Escape with the release that matches the deployment",
+            zkapi_proof::compact::CIRCUIT_ID
+        )));
+    }
+    if let Some(revision) =
+        profile_u64(profile, &["vault_revision"]).filter(|revision| *revision != 4)
+    {
+        return Err(kit_error(format!(
+            "the kit's deployment is vault revision {revision}; this build escapes only from vault revision 4 (leaf-bound exits)"
+        )));
+    }
+    if let Some(version) =
+        profile_u64(profile, &["leaf_bound_exit"]).filter(|version| *version != 1)
+    {
+        return Err(kit_error(format!(
+            "the kit's deployment has leaf_bound_exit {version}, not 1"
+        )));
+    }
+    Ok(())
 }
 
 /// The runtime codehashes and adapter of the profile, through `rpc`.
@@ -650,8 +641,17 @@ pub async fn sign_and_send(
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let call = json!({"from": from_hex, "to": format!("0x{}", hex::encode(to)), "data": data});
-    let gas = chain::quantity(&rpc.request("eth_estimateGas", json!([call])).await?)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let estimate = rpc
+        .request("eth_estimateGas", json!([call]))
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            match chain::vault_error(&message) {
+                Some(reason) => kit_error(format!("the vault refuses this transaction: {reason}")),
+                None => anyhow::anyhow!(message),
+            }
+        })?;
+    let gas = chain::quantity(&estimate).map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let gas = gas + gas / 5;
     let block = rpc
         .request("eth_getBlockByNumber", json!(["latest", false]))
@@ -767,8 +767,6 @@ mod tests {
             bound_at_state: "500".into(),
             state_seq: 3,
             exported_at: 1_800_000_000,
-            merkle_path: None,
-            deposit_path: None,
         }
     }
 
@@ -805,10 +803,11 @@ mod tests {
         "/../../protocol/setup/v2-concession-dev"
     );
 
-    /// A wallet with a deposit-time path and a released request (bound 700),
-    /// exported to a kit and escaped from it with no wallet, host, indexer
-    /// or operator: the calldata is the 836-byte escape whose proof verifies
-    /// and which concedes at most the kit's bound.
+    /// A wallet with a released request (bound 700), exported to a kit and
+    /// escaped from it with no wallet, host, indexer, operator or RPC: the
+    /// calldata is the 836-byte escape, bound to the note's leaf and fields
+    /// (no path), whose proof verifies and which concedes at most the kit's
+    /// bound.
     #[tokio::test]
     async fn an_exported_kit_escapes_without_the_wallet() {
         let directory = tempfile::tempdir().unwrap();
@@ -845,16 +844,7 @@ mod tests {
         tree.set_leaf(9, leaf);
         let mut wallet = Wallet::new(config).unwrap();
         wallet
-            .confirm_deposit_with_path(
-                secret,
-                9,
-                2_000_000,
-                4_000_000_000,
-                Some(DepositPath {
-                    root: tree.root(),
-                    siblings: tree.siblings(9).to_vec(),
-                }),
-            )
+            .confirm_deposit(secret, 9, 2_000_000, 4_000_000_000)
             .unwrap();
         wallet
             .prepare_request_with_bound(
@@ -888,15 +878,20 @@ mod tests {
         let refused = escape(&kit, &options(701, "kit")).await.unwrap_err();
         assert!(refused.to_string().contains("at most 700"), "{refused}");
         let result = escape(&kit, &options(700, "kit")).await.unwrap();
-        assert_eq!(result["path_source"], "deposit");
         assert_eq!(result["payout"], (2_000_000u128 - 700).to_string());
+        assert_eq!(result["note_leaf"], json!(leaf));
         assert_eq!(result["to"], format!("0x{}", hex::encode(vault)));
         let data = hex::decode(result["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
         assert_eq!(data.len(), 836);
         assert_eq!(hex::encode(&data[..4]), chain::INITIATE_ESCAPE);
         let words: Vec<&[u8]> = data[4..].chunks(32).collect();
         let word_u128 = |index: usize| u128::from_be_bytes(words[index][16..].try_into().unwrap());
-        assert_eq!(word_u128(8), 9);
+        // Word 3 is the note's leaf, word 8 its fields (no root).
+        assert_eq!(words[3], leaf.0);
+        assert_eq!(
+            words[8],
+            zkapi_types::pack_note_fields(9, 2_000_000, 4_000_000_000).0
+        );
         assert_eq!(word_u128(12), 0);
         assert_eq!(word_u128(14), 700);
         assert_eq!(word_u128(9) + word_u128(14), 2_000_000);
@@ -906,12 +901,14 @@ mod tests {
             protocol_version: 2,
             chain_id: 11_155_111,
             contract_address: contract,
-            active_root: Felt252(words[3].try_into().unwrap()),
+            note_leaf: Felt252(words[3].try_into().unwrap()),
             state_signing_key_x: state_key.public_key().x,
             state_signing_key_y: state_key.public_key().y,
             clearance_signing_key_x: clearance_key.public_key().x,
             clearance_signing_key_y: clearance_key.public_key().y,
             note_id: 9,
+            deposit_amount: 2_000_000,
+            expiry_ts: 4_000_000_000,
             final_balance: word_u128(9),
             destination: [0x33; 20],
             withdrawal_nullifier: Felt252(words[11].try_into().unwrap()),
@@ -950,9 +947,10 @@ mod tests {
     const SDK_KIT_VAULT: [u8; 20] = [0x77; 20];
 
     /// The inputs of the SDK kit fixture: a browser-shaped note state (the
-    /// WASM's field names, amounts as JSON numbers, the deposit-time path
-    /// as `{active_root, siblings}`) and a `trusted_deployment` profile.
-    /// Run with `ZKAPI_KIT_FIXTURE_INPUTS=<file>` and `--ignored`.
+    /// WASM's field names, amounts as JSON numbers; no Merkle path since
+    /// vault revision 4) and a `trusted_deployment` profile of vault
+    /// revision 4. Run with `ZKAPI_KIT_FIXTURE_INPUTS=<file>` and
+    /// `--ignored`.
     #[test]
     #[ignore]
     fn write_sdk_kit_fixture_inputs() {
@@ -962,15 +960,6 @@ mod tests {
         let clearance_key = zkapi_proof::compact::CompactSigner::from_seed(&Felt252::from_u64(12));
         let contract = zkapi_types::serialization::address_to_felt(&SDK_KIT_VAULT);
         let secret = Felt252::from_u64(271_828);
-        let leaf = zkapi_core::v2::note_leaf(
-            4,
-            &zkapi_core::v2::registration_commitment(&secret),
-            5_000_000,
-            4_000_000_000,
-        );
-        let mut tree = zkapi_client::tree::SparseTree::new();
-        tree.set_leaf(3, Felt252::from_u64(5));
-        tree.set_leaf(4, leaf);
         let mut wallet = Wallet::new(ClientConfig {
             protocol_version: 2,
             chain_id: 11_155_111,
@@ -993,10 +982,6 @@ mod tests {
             .unwrap();
         let mut state = serde_json::to_value(wallet.state().unwrap()).unwrap();
         state["bound_at_state"] = json!(1_000_000);
-        state["deposit_path"] = json!({
-            "active_root": tree.root(),
-            "siblings": tree.siblings(4).to_vec(),
-        });
         let inputs = json!({
             "state": state,
             "state_seq": 1,
@@ -1011,18 +996,22 @@ mod tests {
                 "state_signing_key": {"x": state_key.public_key().x, "y": state_key.public_key().y},
                 "clearance_signing_key": {"x": clearance_key.public_key().x, "y": clearance_key.public_key().y},
                 "settlement_window_seconds": 14_705,
-                "circuit_id": "zkapi-v2-concession-v1",
+                "circuit_id": zkapi_proof::compact::CIRCUIT_ID,
                 "setup_id": "dev",
+                "vault_revision": 4,
+                "exit_concession": 1,
+                "leaf_bound_exit": 1,
             },
         });
         std::fs::write(target, serde_json::to_vec_pretty(&inputs).unwrap()).unwrap();
     }
 
     /// E7 across packages: a kit the browser SDK sealed (WebCrypto's kdf
-    /// names, the deposit-time path as `merkle_path`, the browser's note
-    /// encoding) decrypts here, and its escape proves from the kit's own
-    /// path with no RPC, indexer or operator. Kits of this crate's earlier
-    /// encoding (`PBKDF2-SHA256`, `deposit_path`) still decrypt.
+    /// names, the browser's note encoding) decrypts here, and its escape
+    /// proves with no path, RPC, indexer or operator. A kit that carries a
+    /// deposit-time path (`merkle_path`, or this crate's earlier
+    /// `deposit_path` with the `PBKDF2-SHA256` envelope: kits sealed before
+    /// vault revision 4) is accepted, and the path ignored.
     #[tokio::test]
     async fn a_kit_the_browser_sdk_sealed_escapes() {
         let file: KitFile = serde_json::from_str(SDK_KIT).unwrap();
@@ -1074,18 +1063,11 @@ mod tests {
         assert_eq!(kit.bound_at_state, expected["bound_at_state"]);
         assert_eq!(kit.state_seq, expected["state_seq"].as_u64().unwrap());
         assert_eq!(kit.exported_at, expected["exported_at"].as_u64().unwrap());
-        assert!(kit.merkle_path.is_some() && kit.deposit_path.is_none());
-        let shared_path = kit.merkle_path.as_ref().unwrap();
-        assert_eq!(
-            shared_path.active_root.to_hex(),
-            expected["merkle_path_root"]
-        );
-        assert_eq!(
-            shared_path.siblings.len() as u64,
-            expected["merkle_path_siblings"].as_u64().unwrap()
-        );
-        let path = kit.path().unwrap();
-        assert_eq!(path.siblings.len(), 32);
+        // No path in the kit, and none in its expected contents.
+        let plain = serde_json::to_value(&kit).unwrap();
+        assert!(plain.get("merkle_path").is_none() && plain.get("deposit_path").is_none());
+        assert!(expected.get("merkle_path_root").is_none());
+        assert_eq!(vectors["exit_inputs"]["needs_merkle_path"], false);
         let directory = tempfile::tempdir().unwrap();
         let options = |conceded: u128| EscapeOptions {
             destination: [0x44; 20],
@@ -1097,7 +1079,6 @@ mod tests {
         };
         assert!(escape(&kit, &options(1_000_001)).await.is_err());
         let result = escape(&kit, &options(1_000_000)).await.unwrap();
-        assert_eq!(result["path_source"], "deposit");
         assert_eq!(result["to"], format!("0x{}", hex::encode(SDK_KIT_VAULT)));
         assert_eq!(result["payout"], "4000000");
         let data = hex::decode(result["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
@@ -1110,12 +1091,14 @@ mod tests {
             protocol_version: 2,
             chain_id: 11_155_111,
             contract_address: zkapi_types::serialization::address_to_felt(&SDK_KIT_VAULT),
-            active_root: Felt252(words[3].try_into().unwrap()),
+            note_leaf: Felt252(words[3].try_into().unwrap()),
             state_signing_key_x: state_key.public_key().x,
             state_signing_key_y: state_key.public_key().y,
             clearance_signing_key_x: clearance_key.public_key().x,
             clearance_signing_key_y: clearance_key.public_key().y,
             note_id: 4,
+            deposit_amount: 5_000_000,
+            expiry_ts: kit.note.expiry_ts,
             final_balance: word_u128(9),
             destination: [0x44; 20],
             withdrawal_nullifier: Felt252(words[11].try_into().unwrap()),
@@ -1124,7 +1107,15 @@ mod tests {
             conceded: 1_000_000,
             valid_until: word_u128(15) as u64,
         };
-        assert_eq!(public.active_root, path.root);
+        assert_eq!(
+            public.note_leaf,
+            zkapi_core::v2::note_leaf(
+                4,
+                &zkapi_core::v2::registration_commitment(&kit.note.secret_s),
+                5_000_000,
+                kit.note.expiry_ts
+            )
+        );
         let proof = zkapi_types::wire::Groth16ProofWire {
             backend: zkapi_types::wire::ProofBackendWire::Groth16Bn254,
             proof: base64::engine::general_purpose::STANDARD.encode(&data[4 + 18 * 32..]),
@@ -1134,18 +1125,56 @@ mod tests {
             .verify(&public, &proof)
             .unwrap());
 
-        // This crate's earlier envelope and path encoding.
-        let mut older = contents();
-        older.deposit_path = Some(DepositPath {
-            root: Felt252::from_u64(9),
-            siblings: vec![Felt252::from_u64(1); 32],
+        // Kits sealed before vault revision 4 carry the deposit-time path,
+        // as the SDK wrote it (`merkle_path`) or as this crate's earlier
+        // builds did (`deposit_path`, with the `PBKDF2-SHA256` envelope):
+        // accepted, the path ignored, the escape the same.
+        let mut with_paths = plain.clone();
+        with_paths["merkle_path"] = json!({
+            "active_root": Felt252::from_u64(9),
+            "siblings": vec![Felt252::from_u64(1); 32],
         });
-        let mut sealed =
-            encrypt_with_iterations(&older, "correct horse battery staple", 1_000).unwrap();
-        sealed.kdf.name = "PBKDF2-SHA256".into();
-        sealed.kdf.hash = None;
-        let opened = decrypt(&sealed, "correct horse battery staple").unwrap();
-        assert_eq!(opened.path().unwrap().root, Felt252::from_u64(9));
+        with_paths["note"]["deposit_path"] = json!({
+            "root": Felt252::from_u64(9),
+            "siblings": vec![Felt252::from_u64(1); 32],
+        });
+        let mut older = with_paths.clone();
+        older.as_object_mut().unwrap().remove("merkle_path");
+        older["deposit_path"] = with_paths["note"]["deposit_path"].clone();
+        for (label, contents, earlier_envelope) in [
+            ("merkle_path", &with_paths, false),
+            ("deposit_path", &older, true),
+        ] {
+            let mut sealed = seal(
+                &serde_json::to_vec(contents).unwrap(),
+                "correct horse battery staple",
+                1_000,
+            )
+            .unwrap();
+            if earlier_envelope {
+                sealed.kdf.name = "PBKDF2-SHA256".into();
+                sealed.kdf.hash = None;
+            }
+            let opened = decrypt(&sealed, "correct horse battery staple").unwrap();
+            assert_eq!(serde_json::to_value(&opened).unwrap(), plain, "{label}");
+            let directory = tempfile::tempdir().unwrap();
+            let result = escape(
+                &opened,
+                &EscapeOptions {
+                    destination: [0x44; 20],
+                    conceded: 1_000_000,
+                    rpc_url: None,
+                    work_dir: directory.path().join("kit"),
+                    proof_setup_dir: SETUP_DIR.into(),
+                    offline: true,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["payout"], "4000000", "{label}");
+            assert_eq!(result["note_leaf"], json!(public.note_leaf), "{label}");
+        }
+        let sealed = encrypt_with_iterations(&kit, "correct horse battery staple", 1_000).unwrap();
         for (name, hash) in [
             ("PBKDF2", None),
             ("PBKDF2", Some("SHA-1")),
@@ -1217,10 +1246,12 @@ mod tests {
     }
 
     /// E7 "with the companion's bundled keys and the codehash pins": a kit's
-    /// escape refuses a placeholder profile and a note of another vault, and
-    /// checks the profile's pinned runtime codehashes and adapter through
-    /// the user's RPC: a mismatch is reported (an exit stays allowed), a
-    /// match is silent.
+    /// escape refuses a placeholder profile, a profile of another circuit or
+    /// vault revision and a note of another vault, and through the user's
+    /// RPC refuses a vault without `LEAF_BOUND_EXIT_VERSION()` 1 (revision
+    /// 3), reports a vault leaf other than the kit's, and checks the
+    /// profile's pinned runtime codehashes and adapter: a mismatch is
+    /// reported (an exit stays allowed), a match is silent.
     #[tokio::test]
     async fn a_kit_escape_checks_its_profile_and_pins() {
         use axum::{extract::State, routing::post, Json, Router};
@@ -1245,23 +1276,54 @@ mod tests {
         other.trusted_deployment["contract_address"] = json!(format!("0x{}", "88".repeat(20)));
         let refused = escape(&other, &options(None, "b")).await.unwrap_err();
         assert!(refused.to_string().contains("another vault"), "{refused}");
+        for (field, value, needle) in [
+            (
+                "circuit_id",
+                json!("zkapi-v2-concession-v1"),
+                "circuit zkapi-v2-concession-v1",
+            ),
+            ("vault_revision", json!(3), "vault revision 3"),
+            ("leaf_bound_exit", json!(0), "leaf_bound_exit 0"),
+        ] {
+            let mut other = kit.clone();
+            other.trusted_deployment[field] = value;
+            let refused = escape(&other, &options(None, "b")).await.unwrap_err();
+            assert!(refused.to_string().contains(needle), "{field}: {refused}");
+        }
 
         // The chain as the user's RPC serves it.
         let adapter = [0xadu8; 20];
         let poseidon = [0x9eu8; 20];
-        type Codes = Arc<Mutex<std::collections::HashMap<[u8; 20], Vec<u8>>>>;
-        let codes: Codes = Arc::new(Mutex::new(
-            [
+        /// The vault as the RPC serves it: code by address, the probe's
+        /// answer (`None`: it reverts, a revision-3 vault) and the note's
+        /// stored leaf.
+        struct Chain {
+            codes: std::collections::HashMap<[u8; 20], Vec<u8>>,
+            version: Option<u64>,
+            leaf: Felt252,
+        }
+        type Codes = Arc<Mutex<Chain>>;
+        let leaf = zkapi_core::v2::note_leaf(
+            kit.note.note_id,
+            &zkapi_core::v2::registration_commitment(&kit.note.secret_s),
+            kit.note.deposit_amount,
+            kit.note.expiry_ts,
+        );
+        let codes: Codes = Arc::new(Mutex::new(Chain {
+            codes: [
                 (SDK_KIT_VAULT, vec![0x60, 0x01]),
                 (adapter, vec![0x60, 0x02]),
                 (poseidon, vec![0x60, 0x03]),
             ]
             .into_iter()
             .collect(),
-        ));
+            version: Some(1),
+            leaf,
+        }));
         async fn rpc(State(codes): State<Codes>, Json(body): Json<Value>) -> Json<Value> {
             let params = &body["params"];
             let result = match body["method"].as_str().unwrap_or("") {
+                "eth_chainId" => json!("0xaa36a7"),
                 "eth_getCode" => {
                     let address: [u8; 20] =
                         hex::decode(params[0].as_str().unwrap().trim_start_matches("0x"))
@@ -1274,6 +1336,7 @@ mod tests {
                             codes
                                 .lock()
                                 .unwrap()
+                                .codes
                                 .get(&address)
                                 .cloned()
                                 .unwrap_or_default()
@@ -1282,9 +1345,17 @@ mod tests {
                 }
                 "eth_call" => {
                     let data = params[0]["data"].as_str().unwrap();
+                    let chain = codes.lock().unwrap();
                     let word = match &data[2..10] {
                         chain::PROOF_ADAPTER => format!("{}{}", "0".repeat(24), "ad".repeat(20)),
-                        chain::IS_KNOWN_ROOT => format!("{:064x}", 1),
+                        chain::LEAF_BOUND_EXIT_VERSION => match chain.version {
+                            Some(version) => format!("{version:064x}"),
+                            None => {
+                                return Json(json!({"jsonrpc": "2.0", "id": body["id"],
+                                    "error": {"code": 3, "message": "execution reverted"}}))
+                            }
+                        },
+                        chain::NOTE_RECORD => format!("{}{:064x}", hex::encode(chain.leaf.0), 1),
                         _ => format!("{:064x}", 0),
                     };
                     json!(format!("0x{word}"))
@@ -1319,14 +1390,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mismatches(&result), 0, "{result}");
+        assert!(!result["warnings"].to_string().contains("noteRecord"));
         codes
             .lock()
             .unwrap()
+            .codes
             .insert(SDK_KIT_VAULT, vec![0x60, 0x0f]);
-        let result = escape(&pinned, &options(Some(url), "d")).await.unwrap();
+        let result = escape(&pinned, &options(Some(url.clone()), "d"))
+            .await
+            .unwrap();
         assert_eq!(mismatches(&result), 1, "{result}");
         assert!(result["warnings"].to_string().contains("the vault code"));
-        assert_eq!(result["path_source"], "deposit");
+        // The vault holds another leaf for the note: reported, the escape
+        // is still made.
+        codes.lock().unwrap().leaf = Felt252::from_u64(5);
+        let result = escape(&pinned, &options(Some(url.clone()), "e"))
+            .await
+            .unwrap();
+        assert!(
+            result["warnings"].to_string().contains("NoteLeafMismatch"),
+            "{result}"
+        );
+        // A revision-3 vault (the probe reverts) or another version is
+        // refused before any proof.
+        for (version, needle) in [(None, "no LEAF_BOUND_EXIT_VERSION()"), (Some(2), "not 1")] {
+            codes.lock().unwrap().version = version;
+            let refused = escape(&pinned, &options(Some(url.clone()), "f"))
+                .await
+                .unwrap_err();
+            assert!(refused.to_string().contains(needle), "{refused}");
+        }
+        assert!(!directory.path().join("f").join("exit_lock.json").exists());
         server.abort();
     }
 

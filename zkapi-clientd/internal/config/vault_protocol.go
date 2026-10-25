@@ -9,6 +9,13 @@ import (
 	"syscall"
 )
 
+// ErrConcessionV1Protocol refuses a profile whose saved vault protocol is
+// concession-v1: the local CLI bundle built from git branch origin/v0.2
+// saved it to select its Sepolia revision-3 stack, whose wallet this build
+// cannot open. The value is known, not corrupt, so the owner is told where
+// it is served; the file itself is never rewritten.
+var ErrConcessionV1Protocol = errors.New("this profile's saved vault protocol is concession-v1, the Sepolia revision-3 vault (deployment zkapi-native-eth-sepolia-concession-v1-r3) of the local CLI bundle built from git branch origin/v0.2. This build serves only the leaf-bound revision-4 vault and cannot open that wallet; recover it by running that bundle with the same --config-dir. The vault-protocol file was left unchanged")
+
 // Kept outside config.json so the pinned legacy decoder can still read its
 // unchanged profile. The preference shares daemon.lock with all config edits.
 func LoadVaultProtocol(dir string) (string, error) {
@@ -34,6 +41,9 @@ func LoadVaultProtocol(dir string) (string, error) {
 		return "", errors.New("cannot read saved vault protocol")
 	}
 	value := strings.TrimSpace(string(raw))
+	if value == "concession-v1" {
+		return "", ErrConcessionV1Protocol
+	}
 	if value != "legacy" && value != "concession" {
 		return "", errors.New("invalid saved vault protocol; expected legacy or concession")
 	}

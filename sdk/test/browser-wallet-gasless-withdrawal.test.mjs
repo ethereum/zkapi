@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    DEPLOYMENT, VAULT, createHarness, depositPath, memoryIndexedDb, noteState, nullifierFor, within
+    DEPLOYMENT, VAULT, createHarness, memoryIndexedDb, noteState, nullifierFor, within
 } from './helpers/request-archive-harness.mjs';
 import { deployedProfile } from './helpers/deployed-profile.mjs';
 import {
@@ -49,7 +49,7 @@ const wei = units => BigInt(units) * GWEI;
  * chain (the exit RPC and the pinned RPC), a scripted bundler over fetch and a
  * fake wallet that only signs.
  */
-async function scenario({ state = noteState({ current_balance: 500_000_000, deposit_path: depositPath('0x51') }), profile = {},
+async function scenario({ state = noteState({ current_balance: 500_000_000 }), profile = {},
     gasless = gaslessProfileFromVectors({ spelling: 'profile', ...profile }), from = OWNER, allow = [] } = {}) {
     indexedDB.clear();
     storage.clear();
@@ -160,10 +160,11 @@ test('a sponsored close creates the transit account, signs the hash once, journa
     assert.equal(op.paymasterData, `0x${BigInt(VECTORS.policy.flat_fee_wei).toString(16).padStart(24, '0')}`, 'feeCapWei = the flat fee shown');
     assert.equal(BigInt(op.maxFeePerGas), 2n * chain.baseFee + chain.priorityFee);
     assert.equal(BigInt(op.maxPriorityFeePerGas), chain.priorityFee);
-    assert.equal(BigInt(op.callGasLimit), 642_500n, 'the profile default, not the bundler estimate');
-    assert.equal(BigInt(op.verificationGasLimit), 180_000n, 'verification_default_init');
+    assert.equal(BigInt(op.callGasLimit), 402_500n, 'the profile default, not the bundler estimate');
+    assert.equal(BigInt(op.verificationGasLimit), 150_000n, 'verification_default_init');
     assert.equal(BigInt(op.paymasterPostOpGasLimit), 270_000n);
-    assert.equal(BigInt(op.paymasterVerificationGasLimit), 430_000n);
+    // The transit vectors' default (PM_VERIFICATION_FLOOR 340,000 plus margin).
+    assert.equal(BigInt(op.paymasterVerificationGasLimit), 370_000n);
     // Journaled before eth_sendUserOperation, with the signature; two dry runs (unsigned, then signed) and the EntryPoint hash cross-check.
     assert.equal(journalAtSend.userOpPhase, 'op_built');
     assert.deepEqual(journalAtSend.userOp, op);
@@ -402,7 +403,7 @@ test('a reverted execution (NoteNotActive after a replay) leaves the payout in S
     assert.equal(unpackNonce(forward.nonce).key, FORWARD_NONCE_KEY);
     assert.equal(forward.callData, encodeTransitWithdraw('0x'));
     assert.equal('factory' in forward, false);
-    assert.equal(BigInt(forward.callGasLimit), 97_500n);
+    assert.equal(BigInt(forward.callGasLimit), 60_000n);
     assert.equal(wallet.signatures.length, 2);
     saved = await record();
     assert.equal(saved.fundsWaitingInTransit, false);
@@ -454,10 +455,10 @@ test('refusals before any prompt: the wrong owner account, AA31, a paused paymas
     assert.equal(spike.wallet.signatures.length, 0);
     assert.equal(proofs(spike.h, 'mutual').length, 0, 'the fee ceiling refuses in the pre-flight, before the proof binds S');
 
-    const small = await scenario({ state: noteState({ current_balance: 20_000_000, deposit_path: depositPath('0x51') }) });
+    const small = await scenario({ state: noteState({ current_balance: 20_000_000 }) });
     await assert.rejects(small.withdraw('mutual'), { code: 'payout_below_gas' });
 
-    const uneconomic = await scenario({ state: noteState({ current_balance: 100_000_000, deposit_path: depositPath('0x51') }) });
+    const uneconomic = await scenario({ state: noteState({ current_balance: 100_000_000 }) });
     await assert.rejects(uneconomic.withdraw('mutual'), error => error.code === 'gasless_uneconomic' && error.data.uneconomicFractionPercent === 25n);
     assert.equal(uneconomic.wallet.signatures.length, 0);
     uneconomic.bundler.autoMine = uneconomic.closeBundle();
@@ -515,7 +516,7 @@ test('a sponsored escape records its initiation debt; its finalization after the
     assert.equal(escapeAmounts[0].minimumReceived, null);
     assert.ok(BigInt(escapeAmounts[0].estimatedReceived) > 0n);
     assert.equal(unpackNonce(bundler.sent[0].op.nonce).key, BigInt(nullifier) & ((1n << 192n) - 1n));
-    assert.equal(BigInt(bundler.sent[0].op.callGasLimit), 680_000n, 'the escape default');
+    assert.equal(BigInt(bundler.sent[0].op.callGasLimit), 395_000n, 'the escape default');
     let saved = await record();
     assert.equal(saved.mode, 'escape');
     assert.equal(saved.phase, 'pending');
@@ -548,7 +549,7 @@ test('a sponsored escape records its initiation debt; its finalization after the
     const finalizeOp = bundler.sent.at(-1).op;
     assert.equal(finalizeOp.callData, encodeTransitWithdraw(encodeFinalizeEscape(NOTE_ID)));
     assert.equal(unpackNonce(finalizeOp.nonce).key, BigInt(nullifier) & ((1n << 192n) - 1n), 'uint192(pending.withdrawalNullifier)');
-    assert.equal(BigInt(finalizeOp.callGasLimit), 287_500n);
+    assert.equal(BigInt(finalizeOp.callGasLimit), 250_000n);
     assert.ok(statuses.some(message => /receives at least/.test(message)));
     assert.ok(statuses.some(message => /0\.004 ETH of debt paid/.test(message)), statuses.join('\n'));
     saved = await record();
@@ -1001,7 +1002,7 @@ test('a bundler estimate between the signed default and the paymaster’s cap is
     between.bundler.autoMine = between.closeBundle();
     const result = await within(5_000, between.withdraw('mutual'), 'estimate between the default and the cap');
     assert.equal(result.status, 'closed');
-    assert.equal(BigInt(between.bundler.sent[0].op.callGasLimit), 642_500n, 'the pinned default is still what is signed');
+    assert.equal(BigInt(between.bundler.sent[0].op.callGasLimit), 402_500n, 'the pinned default is still what is signed');
     const above = await scenario();
     above.bundler.estimate = { callGasLimit: '0xf4240' };
     await assert.rejects(above.withdraw('mutual'), error => error.code === 'gasless_estimate_above_cap'
@@ -2564,4 +2565,138 @@ test('with escapes disabled, a direct escape started from the wallet is finalize
     assert.equal(saved.feePayer, undefined);
     // Its finalization cannot be sponsored: the record has no transit account.
     await assert.rejects(client.finalizeEscape(started.recordId, () => {}, { fees: 'payout' }), { code: 'gasless_plan_mismatch' });
+});
+
+test('the approved gas quote rejects rising fees before clearance, proof or signing', async () => {
+    const s = await scenario();
+    const quote = await s.client.gaslessWithdrawalQuote('mutual', { destination: PAYEE });
+    assert.equal(quote.available, true);
+    s.chain.baseFee *= 2n;
+    await assert.rejects(s.withdraw('mutual', { maxCostWei: quote.maxCost }), { code: 'gasless_cost_above_cap' });
+    assert.equal(proofs(s.h, 'mutual').length, 0);
+    assert.equal(await s.prepared(), null);
+    assert.equal(s.wallet.signatures.length, 0);
+    assert.equal(s.bundler.sent.length, 0);
+});
+
+test('replacement and resume cannot increase the approved gas cap without a new explicit quote', async () => {
+    const s = await scenario();
+    const quote = await s.client.gaslessWithdrawalQuote('mutual', { destination: PAYEE });
+    s.bundler.onSend = async () => ({ error: { code: -32602, message: 'replacement underpriced: fee too low' } });
+    await assert.rejects(within(5_000, s.withdraw('mutual', { maxCostWei: quote.maxCost,
+        feeCapWei: quote.flatFeeWei }), 'bounded replacement'), { code: 'gasless_cost_above_cap' });
+    assert.equal(s.wallet.signatures.length, 1, 'only the approved operation is signed');
+    const saved = await s.prepared();
+    assert.equal(saved.gaslessMaxCostWei, quote.maxCost);
+    assert.equal(runtime.snapshot().config.prepared_withdrawal.max_cost_wei, quote.maxCost);
+    await assert.rejects(within(5_000, s.withdraw('mutual'), 'bounded resume'), { code: 'gasless_cost_above_cap' });
+    assert.equal(s.wallet.signatures.length, 1, 'a resume never signs above the saved cap');
+    // A user can explicitly review and approve a larger new quote to finish
+    // the same reserved withdrawal; the journal then preserves that cap.
+    const revisedCap = (BigInt(quote.maxCost) * 2n).toString();
+    s.bundler.onSend = null;
+    s.bundler.autoMine = s.closeBundle();
+    const result = await within(5_000, s.withdraw('mutual', { maxCostWei: revisedCap }), 'newly approved quote');
+    assert.equal(result.status, 'closed');
+});
+
+test('contract payout quotes include credit bookkeeping and total approval bounds it', async () => {
+    const s = await scenario();
+    s.chain.setCode(PAYEE, '0x60006000fd');
+    const quote = await s.client.gaslessWithdrawalQuote('mutual', { destination: PAYEE });
+    assert.equal(quote.available, true);
+    const credit = BigInt(VECTORS.gas_policy.credit_gas) * BigInt(quote.fees.maxFeePerGas);
+    assert.equal(quote.creditSurchargeWei, credit.toString());
+    assert.equal(quote.minimumReceivedWei, (BigInt(quote.payoutWei) - BigInt(quote.maxCost) - BigInt(quote.flatFeeWei) - credit).toString());
+    const noCreditCap = (BigInt(quote.maxCost) + BigInt(quote.flatFeeWei)).toString();
+    await assert.rejects(s.withdraw('mutual', { maxCostWei: quote.maxCost, maxTotalFeeWei: noCreditCap }), { code: 'gasless_cost_above_cap' });
+    assert.equal(s.wallet.signatures.length, 0);
+    assert.equal(proofs(s.h, 'mutual').length, 0);
+    s.bundler.autoMine = s.closeBundle({ credited: true });
+    const result = await s.withdraw('mutual', { maxCostWei: quote.maxCost, maxTotalFeeWei: (BigInt(noCreditCap) + credit).toString() });
+    assert.equal(result.status, 'closed');
+    assert.equal(result.paymasterCredited, true);
+});
+
+test('a signed sponsored resume refuses another tab replacing the reviewed operation or concession', async () => {
+    for (const field of ['operationId', 'statement']) {
+        const s = await scenario();
+        const quote = await s.client.gaslessWithdrawalQuote('mutual', { destination: PAYEE });
+        s.bundler.onSend = async () => ({ error: { code: -32602, message: 'replacement underpriced: fee too low' } });
+        await assert.rejects(s.withdraw('mutual', { maxCostWei: quote.maxCost }), { code: 'gasless_cost_above_cap' });
+        const reviewed = await s.prepared();
+        const sent = s.bundler.sent.length;
+        const preflight = s.client.gaslessPreflight.bind(s.client);
+        s.client.gaslessPreflight = async (...args) => {
+            const result = await preflight(...args);
+            const replacement = structuredClone(runtime.runtime.preparedWithdrawal);
+            if (field === 'operationId') replacement.operationId += '-other-tab';
+            else replacement.public_inputs.conceded = 1;
+            await runtime.commit({ ...runtime.runtime, preparedWithdrawal: replacement });
+            return result;
+        };
+        await assert.rejects(s.withdraw('mutual', { expectedWithdrawalOperationId: reviewed.operationId }), { code: 'withdrawal_note_changed' });
+        assert.equal(s.bundler.sent.length, sent, `${field}: no replay of the replacement`);
+        assert.equal(s.wallet.signatures.length, 1, `${field}: no new signature`);
+    }
+});
+
+test('the sponsored wallet claim atomically refuses a changed statement after preparation', async t => {
+    const s = await scenario();
+    const claim = runtime.claimPreparedWithdrawalUserOp.bind(runtime);
+    t.mock.method(runtime, 'claimPreparedWithdrawalUserOp', async options => {
+        const replacement = structuredClone(runtime.runtime.preparedWithdrawal);
+        replacement.public_inputs.conceded = 1;
+        await runtime.commit({ ...runtime.runtime, preparedWithdrawal: replacement });
+        return claim(options);
+    });
+    await assert.rejects(s.withdraw('mutual'), { code: 'withdrawal_note_changed' });
+    assert.equal(s.wallet.signatures.length, 0);
+    assert.equal(s.bundler.sent.length, 0);
+});
+
+test('background recovery cannot claim a replacement plan then replay the old operation', async () => {
+    for (const hadClaim of [false, true]) {
+        const s = await scenario();
+        const quote = await s.client.gaslessWithdrawalQuote('mutual', { destination: PAYEE });
+        s.bundler.onSend = async () => ({ error: { code: -32602, message: 'replacement underpriced: fee too low' } });
+        await assert.rejects(s.withdraw('mutual', { maxCostWei: quote.maxCost }), { code: 'gasless_cost_above_cap' });
+        let saved = await s.prepared();
+        if (hadClaim) {
+            saved = { ...saved, submissionId: 'crashed-claim', submissionOwner: 'dead-tab',
+                submissionStartedAt: 1, userOpSubmittedAt: 1, userOpFollowedAt: 1 };
+            await runtime.commit({ ...runtime.runtime, preparedWithdrawal: saved });
+        }
+        const sent = s.bundler.sent.length;
+        const find = s.client.findUserOperationInclusion.bind(s.client);
+        s.client.findUserOperationInclusion = async (...args) => {
+            const result = await find(...args);
+            const replacement = { ...runtime.runtime.preparedWithdrawal, operationId: 'other-tab-operation' };
+            await runtime.commit({ ...runtime.runtime, preparedWithdrawal: replacement });
+            return result;
+        };
+        await assert.rejects(s.client.recoverGaslessSubmission(saved), { code: 'withdrawal_note_changed' });
+        assert.equal(s.bundler.sent.length, sent);
+    }
+});
+
+
+test('an expired sponsored resume binds its captured operation during the re-proof lock even without a caller ID', async t => {
+    const s = await scenario();
+    const quote = await s.client.gaslessWithdrawalQuote('mutual', { destination: PAYEE });
+    s.bundler.onSend = async () => ({ error: { code: -32602, message: 'replacement underpriced: fee too low' } });
+    await assert.rejects(s.withdraw('mutual', { maxCostWei: quote.maxCost }), { code: 'gasless_cost_above_cap' });
+    const expired = structuredClone(runtime.runtime.preparedWithdrawal);
+    expired.public_inputs.valid_until = Math.floor(Date.now() / 1_000) - 1;
+    await runtime.commit({ ...runtime.runtime, preparedWithdrawal: expired });
+    const prepare = runtime.prepareWithdrawal.bind(runtime);
+    t.mock.method(runtime, 'prepareWithdrawal', async (...args) => {
+        const replacement = { ...runtime.runtime.preparedWithdrawal, operationId: 'another-tab-operation' };
+        await runtime.commit({ ...runtime.runtime, preparedWithdrawal: replacement });
+        return prepare(...args);
+    });
+    const sent = s.bundler.sent.length;
+    await assert.rejects(s.withdraw('mutual'), { code: 'withdrawal_note_changed' });
+    assert.equal(s.bundler.sent.length, sent);
+    assert.equal(s.wallet.signatures.length, 1);
 });

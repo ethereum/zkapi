@@ -12,7 +12,11 @@ The native vault exposes `billingToken() == address(0)` and
 `nativeAssetWeiPerUnit() == 1000000000`. Its deposit selector accepts
 integer gwei and requires exactly `amount * 1 gwei` in `msg.value`. Wrong values
 revert atomically. Native deposits are capped at JavaScript's maximum exact
-integer, 9,007,199,254,740,991 units. Withdrawal and expiry payouts convert ledger
+integer, 9,007,199,254,740,991 units, and must be at least the vault's
+`minDeposit()` (default 1,000,000 gwei, 0.001 ETH; `DepositTooSmall()`
+below it), which the profiles pin as `min_deposit_units`. A deposit's gas
+depends on its note ID, so clients set an explicit gas limit
+([Deposit gas limit](deployment.md#deposit-gas-limit)). Withdrawal and expiry payouts convert ledger
 units back to wei and enforce proof, nullifier, destination, timing
 and reentrancy protections. A failed transfer to a mutual-close destination
 reverts the complete close; the user can prove the close again to another
@@ -39,7 +43,7 @@ share, or needs more than 100,000 gas to receive it, cannot block a close: the s
 `withdrawTreasuryArrears()`.
 
 The deployment manifest pins the vault address, native asset, and circuit
-`zkapi-v2-concession-v1` with its setup, its exact WASM and key hashes, and the
+`zkapi-v2-concession-v2` with its setup, its exact WASM and key hashes, and the
 runtime code hashes of the vault, adapter and Poseidon library. The circuit
 binds each signed balance to its deposit note. An escape concedes an amount up
 to its state's request budget; the challenger raises it to what the request at
@@ -65,7 +69,7 @@ The public deployment manifest and browser trust configuration must agree on:
 
 Pin the RPC URL, chain, vault and protocol/signing/proof-asset
 fields too. Both manifest `proof_setup.circuit_id` and browser
-`trusted_deployment.circuit_id` must equal `zkapi-v2-concession-v1`, the setup
+`trusted_deployment.circuit_id` must equal `zkapi-v2-concession-v2`, the setup
 IDs must agree, and all request/withdrawal proving and verifying key hashes
 must match that setup. The example feed is Sepolia; it does not select a production feed.
 The server checks chain ID, feed decimals and the vault's native-unit getter
@@ -163,7 +167,7 @@ vault's `usedNullifiers(request_nullifier)` at `latest`. Only an explicit ABI
 `false` permits issuance. Consumed nullifiers return `nullifier_used`; unavailable,
 wrong-chain or malformed RPC responses fail closed with a retriable server error.
 This live authorization read does not refresh the frozen quote or require the
-original Merkle root to remain current after unrelated deposits.
+request's Merkle root to remain current after unrelated deposits.
 
 The lease row is created, with its frozen TTL and write-once settlement
 deadline, right after the reservation and before that check. After provider
@@ -248,10 +252,16 @@ require prompt-private leases with a proof-bound native quote.
 `POST /v2/withdraw/clearance` signs a mutual-close clearance only against a
 kind-2 ownership proof of the same nullifier (`ClearanceRequestV2C`): its
 destination, conceded amount and successor nullifier are zero, its
-`valid_until` lies between now and an hour ahead, and its root is one the
-server saw within `--clearance-root-window-seconds`, the vault's
-`currentRoot()`, or any root the vault ever held (`knownRoots`), so a wallet's
-deposit-time path serves. This circuit has no proof-less clearance: the
+`valid_until` lies between now and an hour ahead, and, after the proof
+verifies, a fresh `noteRecord(note_id)` read from the vault (one `eth_call` at
+`latest` per clearance, never cached) shows the note `Active` with the proof's
+`note_leaf` as its stored leaf (else `409 note_leaf_mismatch` or `409
+note_not_active`). No root or Merkle path is involved, so a wallet needs only
+its note and newest state. `--clearance-root-window-seconds`
+(`ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS`) was removed in vault revision 4: the
+server refuses to start while it is set ("removed in vault revision 4:
+clearance checks the note leaf; delete this setting"). This circuit has no
+proof-less clearance: the
 legacy clearance budget is gone, and `--allow-legacy-clearance` refuses
 startup. A nullifier with any request row is refused (`nullifier_used`); a
 granted clearance reserves it for good, and asking again signs again. See the
@@ -283,11 +293,24 @@ one key source; to change it, see
 `--openrouter-settlement-deadline-seconds` (default 21600) sets the settlement
 deadline described below. The server also requires `--deployment` (the
 deployment manifest the database was initialized from with `zkapi db init`),
-admits a request only at the exact current root while its indexer's root and
-the vault's `currentRoot()` agreed within `--root-max-staleness-seconds`
-(default 60; otherwise `503 root_unavailable`), and, with
+admits a request only at a root it read from the vault's `currentRoot()`:
+the current one, or one additions replaced no more than
+`--request-root-grace-seconds` ago (`ZKAPI_REQUEST_ROOT_GRACE_SECONDS`, default
+60, 0 to 600; otherwise `409 stale_root` with the latest root). The poller reads
+`retirementEpoch()` with the root at the same canonical block hash. A changed
+epoch or a reorg clears every historical root immediately, without grace.
+Retirement takes effect at the next successful poll, so the polling interval
+and RPC latency still matter. Every request is refused (`503 root_unavailable`)
+when no successful read is within `--root-max-staleness-seconds` (default 60),
+when the RPC's latest block timestamp is older than that bound, or when its
+head regresses below the last observed height (until it catches up); the indexer's root is a
+health signal (`zkapi_indexer_root_disagreement`, degraded `/health`), never
+an admission gate. Read-only RPC calls retry transport errors and HTTP
+408/429/5xx up to four attempts within one 15-second deadline, honoring bounded
+`Retry-After`. These failures are retriable service failures, not invalid user
+requests; no price, root or nullifier result is cached by that retry loop. With
 `--request-limit-max-usd-micros` (6,000,000 during the canary, and recommended
-permanently), refuses a request whose lease budget exceeds that ceiling before
+permanently), it refuses a request whose lease budget exceeds that ceiling before
 anything is reserved (`400 request_limit_exceeded`). This ceiling bounds the
 operator's per-request exposure.
 

@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -35,6 +33,18 @@ func payoutTestQuote(kind string) zkapi.AddressPaymentQuote {
 	return q
 }
 
+// authorizedPayoutTestQuote is a payout close quote with the bounded
+// authorization (authorize once): the most the payout may lose under it
+// (MaxTotalFeeWei, above the operation as built now) and the floor
+// payout − MaxTotalFeeWei − owed.
+func authorizedPayoutTestQuote() zkapi.AddressPaymentQuote {
+	q := payoutTestQuote("close")
+	q.Binding = strings.Repeat("b", 64)
+	q.FeeCapWei, q.MinimumReceivedWei, q.ExpectedFeeWei, q.RequiredFeeWei, q.FeeReserveWei = "3300000000000", "96671000000000", "2000000000000", "3300000000000", "3300000000000"
+	q.MaxTotalFeeWei, q.MinNetPayoutWei, q.FeeMayChange, q.FeeBumpCapWei = "4000000000000", "95971000000000", true, "4000000000000"
+	return q
+}
+
 func gaslessTestStatus(phase string) map[string]any {
 	state := withdrawalTestStatus(phase)
 	state["fee_payer"], state["transit_account"] = "payout", gaslessTestTransit
@@ -44,23 +54,29 @@ func gaslessTestStatus(phase string) map[string]any {
 	return state
 }
 
-// --fees payout (or the configured default) asks for a sponsored
-// withdrawal: the quote request carries the fee mode, the bundler, the fee
-// cap and the expensive-gas acceptance, and the payout quote is printed with
-// its figures and the approval command.
+// A withdrawal sends no fee mode unless one is named (or a payout default is
+// configured): the daemon applies the deployment's payout-only policy, and
+// the payout quote prints its bounded terms. --fees payout carries the
+// bundler, the fee cap and the expensive-gas acceptance; a named wallet fee
+// reaches the daemon only on a deployment without sponsorship (the local
+// refusal on a payout deployment is TestWithdrawWalletFeesRefusedLocallyForANewPayoutWithdrawal),
+// and a configured wallet default is never sent.
 func TestWithdrawFeesPayoutQuotesASponsoredOperation(t *testing.T) {
 	for name, test := range map[string]struct {
 		args   []string
 		config func(*config.Config)
+		policy string
 		body   map[string]any
+		payout bool
 	}{
-		"flag":                       {args: []string{"--to", withdrawalTestDestination, "--fees", "payout"}, body: map[string]any{"fees": "payout"}},
-		"flag with options":          {args: []string{"--to", withdrawalTestDestination, "--fees", "payout", "--bundler-url", "https://bundler.example/rpc", "--fee-cap-gwei", "100", "--allow-expensive-gas"}, body: map[string]any{"fees": "payout", "bundler_url": "https://bundler.example/rpc", "fee_cap_gwei": float64(100), "allow_expensive_gas": true}},
-		"configured default":         {args: []string{"--to", withdrawalTestDestination}, config: func(c *config.Config) { c.ZKAPI.WithdrawalFees, c.ZKAPI.BundlerURL = "payout", "http://127.0.0.1:4337" }, body: map[string]any{"fees": "payout", "bundler_url": "http://127.0.0.1:4337"}},
-		"flag overrides the default": {args: []string{"--to", withdrawalTestDestination, "--fees", "wallet"}, config: func(c *config.Config) { c.ZKAPI.WithdrawalFees = "payout" }, body: map[string]any{"fees": "wallet"}},
-		// The wallet default is not sent: a plain rerun keeps a saved
-		// withdrawal's fee mode.
-		"default": {args: []string{"--to", withdrawalTestDestination}, body: map[string]any{}},
+		"flag":               {args: []string{"--to", withdrawalTestDestination, "--fees", "payout"}, body: map[string]any{"fees": "payout"}, payout: true},
+		"flag with options":  {args: []string{"--to", withdrawalTestDestination, "--fees", "payout", "--bundler-url", "https://bundler.example/rpc", "--fee-cap-gwei", "100", "--allow-expensive-gas"}, body: map[string]any{"fees": "payout", "bundler_url": "https://bundler.example/rpc", "fee_cap_gwei": float64(100), "allow_expensive_gas": true}, payout: true},
+		"configured default": {args: []string{"--to", withdrawalTestDestination}, config: func(c *config.Config) { c.ZKAPI.WithdrawalFees, c.ZKAPI.BundlerURL = "payout", "http://127.0.0.1:4337" }, body: map[string]any{"fees": "payout", "bundler_url": "http://127.0.0.1:4337"}, payout: true},
+		// The default on a payout deployment: nothing named, a payout quote.
+		"default":                     {args: []string{"--to", withdrawalTestDestination}, policy: "payout", body: map[string]any{}, payout: true},
+		"configured wallet default":   {args: []string{"--to", withdrawalTestDestination}, policy: "payout", config: func(c *config.Config) { c.ZKAPI.WithdrawalFees = "wallet" }, body: map[string]any{}, payout: true},
+		"wallet without sponsorship":  {args: []string{"--to", withdrawalTestDestination, "--fees", "wallet"}, policy: "wallet", config: func(c *config.Config) { c.ZKAPI.WithdrawalFees = "payout" }, body: map[string]any{"fees": "wallet"}},
+		"default without sponsorship": {args: []string{"--to", withdrawalTestDestination}, policy: "wallet", body: map[string]any{}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var sequence []string
@@ -76,14 +92,18 @@ func TestWithdrawFeesPayoutQuotesASponsoredOperation(t *testing.T) {
 							t.Errorf("quote request %s = %v, want %v", key, body[key], value)
 						}
 					}
-					if test.body["fees"] == "payout" {
-						_ = json.NewEncoder(w).Encode(payoutTestQuote("close"))
+					if test.payout {
+						_ = json.NewEncoder(w).Encode(authorizedPayoutTestQuote())
 					} else {
 						_ = json.NewEncoder(w).Encode(paymentTestQuote("withdrawal"))
 					}
 					return
 				}
-				_ = json.NewEncoder(w).Encode(withdrawalTestStatus("ready"))
+				state := withdrawalTestStatus("ready")
+				if test.policy != "" {
+					state["new_withdrawal_fees"] = test.policy
+				}
+				_ = json.NewEncoder(w).Encode(state)
 			}))
 			defer s.Close()
 			c := withdrawalTestConfig(s)
@@ -97,17 +117,20 @@ func TestWithdrawFeesPayoutQuotesASponsoredOperation(t *testing.T) {
 			if strings.Join(sequence, ",") != "GET /admin/withdrawal,POST /admin/withdrawal/quote" {
 				t.Fatalf("wrong sequence: %v", sequence)
 			}
-			if test.body["fees"] == "payout" {
-				for _, want := range []string{"Fee paid from the payout by a sponsored close operation", "Transit account: " + gaslessTestTransit, "Bundler: https://bundler.example/rpc", "Payout: 0.000099971000000000 ETH", "Maximum fee taken from it: 0.003300000000000000 ETH", "receives at least: 0.000096671000000000 ETH", "--approve " + testQuoteID, "Quoting does not sign or send"} {
+			if test.payout {
+				for _, want := range []string{"Fee paid from the payout by a sponsored close operation", "Transit account: " + gaslessTestTransit, "Bundler: https://bundler.example/rpc", "Payout: 0.000099971000000000 ETH", "Estimated network fee: about 0.000002000000000000 ETH (an estimate; the actual fee may change)", "At most 0.000004000000000000 ETH may be taken from the payout", withdrawalTestDestination + " receives at least 0.000095971000000000 ETH", "This one approval covers this destination, note and transit account", "--approve " + testQuoteID, "Quoting does not sign or send"} {
 					if !strings.Contains(out.String(), want) {
 						t.Fatalf("missing %q in %s", want, out.String())
 					}
 				}
-				if strings.Contains(out.String(), "Required top-up") || strings.Contains(out.String(), "Payment URI") {
-					t.Fatalf("a payout quote asked for ETH: %s", out.String())
+				if strings.Contains(out.String(), "Required top-up") || strings.Contains(out.String(), "Payment URI") || strings.Contains(out.String(), "--fees wallet") {
+					t.Fatalf("a payout quote asked for ETH or a wallet fee: %s", out.String())
 				}
 			} else if !strings.Contains(out.String(), "Maximum approved fee allowance") {
 				t.Fatalf("the wallet quote was not printed: %s", out.String())
+			}
+			if test.policy == "payout" && (!strings.Contains(out.String(), "Network fee: paid from the payout (this wallet needs no ETH)") || strings.Contains(out.String(), "Available for network fees")) {
+				t.Fatalf("the payout policy header: %s", out.String())
 			}
 		})
 	}
@@ -258,15 +281,19 @@ func TestWithdrawApproveFollowsTheSponsoredOperation(t *testing.T) {
 	}
 }
 
-// A reverted operation or a refused gasless path stops the command with
-// the way out; a reverted operation is proved again only by its hash.
+// A reverted operation, or a refusal that ends the approval, stops the
+// command with the way out (never a wallet-paid fee); a refusal the daemon
+// retries within the authorization is followed (TestWithdrawApproveFollowsARetryableRefusal).
+// A reverted operation is proved again only by its hash.
 func TestWithdrawGaslessFailuresStopAndRetryByTheOperationHash(t *testing.T) {
 	for _, phase := range []string{"op_reverted", "gasless_refused"} {
 		t.Run(phase, func(t *testing.T) {
+			posts := 0
 			s := withdrawalApprovalTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodPost {
+					posts++
 					state := gaslessTestStatus(phase)
-					state["gasless_refusal"] = "payout_below_gas: the payout does not cover the sponsored fee"
+					state["gasless_refusal"] = "payout_below_gas: the payout (1 wei) does not cover the sponsored fee; use --fees wallet"
 					_ = json.NewEncoder(w).Encode(state)
 					return
 				}
@@ -274,8 +301,11 @@ func TestWithdrawGaslessFailuresStopAndRetryByTheOperationHash(t *testing.T) {
 			}))
 			defer s.Close()
 			err := runWithdrawal(context.Background(), withdrawalTestConfig(s), []string{"--approve", testQuoteID}, &bytes.Buffer{})
-			if err == nil || (phase == "gasless_refused" && !strings.Contains(err.Error(), "payout_below_gas")) || (phase == "op_reverted" && !strings.Contains(err.Error(), "reverted")) {
-				t.Fatalf("%s did not stop with its reason: %v", phase, err)
+			if err == nil || posts != 1 || (phase == "gasless_refused" && (!strings.Contains(err.Error(), "payout_below_gas") || !strings.Contains(err.Error(), "rerun withdraw --to "+withdrawalTestDestination+" to review a new quote"))) || (phase == "op_reverted" && !strings.Contains(err.Error(), "reverted")) {
+				t.Fatalf("%s did not stop with its reason: posts=%d %v", phase, posts, err)
+			}
+			if strings.Contains(err.Error(), "--fees wallet") {
+				t.Fatalf("%s suggested a wallet-paid fee: %v", phase, err)
 			}
 		})
 	}
@@ -455,119 +485,17 @@ func TestConfigureBundlerAndWithdrawalFeesFlags(t *testing.T) {
 	}
 }
 
-// Design 3.3: the guided withdrawal offers to pay the fee from the payout
-// whenever the pre-flight says it can, before any fee QR; the choice goes
-// into the quote, no payment QR is shown, the approval prompt states what
-// reaches the destination, and the sponsored phases are followed to the
-// amount received.
-func TestGuidedWithdrawalOffersThePayoutFeeWhenAvailable(t *testing.T) {
-	payoutState := func(phase string) zkapi.AddressWithdrawalStatus {
-		s := withdrawalWizardState(phase)
-		s.FeePayer, s.TransitAccount, s.UserOpHash = "payout", gaslessTestTransit, gaslessTestOpHash
-		s.TransactionHash = ""
-		if phase == "complete" {
-			s.TransactionHash, s.ReceivedWei, s.ChargedWei = "0x"+strings.Repeat("b", 64), "96671000000000", "3300000000000000"
-		}
-		return s
-	}
-	f := &withdrawalWizardFixture{availability: &zkapi.GaslessAvailability{Available: true, BundlerURL: "https://bundler.example/rpc"}}
-	f.quote = func(call int, destination string, note uint64, retry string) (zkapi.AddressPaymentQuote, error) {
-		q := payoutTestQuote("close")
-		q.ID, q.Binding = fmt.Sprintf("%064x", call), strings.Repeat("b", 64)
-		return q, nil
-	}
-	resumes := 0
-	f.approve = func(string) (zkapi.AddressWithdrawalStatus, error) { return payoutState("op_submitted"), nil }
-	f.resume = func(int, string, uint64) (zkapi.AddressWithdrawalStatus, error) {
-		resumes++
-		if resumes == 1 {
-			return payoutState("op_submitted"), nil
-		}
-		return payoutState("complete"), nil
-	}
-	u := &fundingWizardUI{answers: []string{withdrawalTestDestination, "payout"}, confirmations: []bool{true}}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
-		t.Fatal(err)
-	}
-	if u.asks != 2 || f.availabilityCalls != 1 || f.quoteCalls != 2 || f.fees[0] != "payout" || f.fees[1] != "payout" || f.approveCalls != 1 || resumes != 2 || u.continues != 1 {
-		t.Fatalf("calls: ui=%+v service=%+v", u, f)
-	}
-	if len(u.questions) != 2 || !strings.Contains(u.questions[1], "payout (taken from the payout; no ETH needed)") {
-		t.Fatalf("the fee question was not asked after the destination: %v", u.questions)
-	}
-	output := u.String()
-	for _, want := range []string{"no ETH is needed from this wallet", "Transit account: " + gaslessTestTransit, "Fee taken from the payout: at most 0.003300000000000000 ETH", "receives at least 0.000096671000000000 ETH", "reached " + withdrawalTestDestination + " after a sponsored network fee of 0.003300000000000000 ETH"} {
-		if !strings.Contains(output, want) {
-			t.Fatalf("missing %q in %s", want, output)
-		}
-	}
-	for _, forbidden := range []string{"Scan with an Ethereum wallet", "Waiting for ETH", "Payment URI", "Fees funded"} {
-		if strings.Contains(output, forbidden) {
-			t.Fatalf("the payout path showed %q: %s", forbidden, output)
-		}
-	}
-	// Unavailable: no question, the wallet path as before.
-	f = &withdrawalWizardFixture{}
-	u = &fundingWizardUI{answers: []string{withdrawalTestDestination}, confirmations: []bool{true}}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, "payout"); err != nil {
-		t.Fatal(err)
-	}
-	if u.asks != 1 || f.availabilityCalls != 1 || len(f.fees) == 0 || f.fees[0] != "" {
-		t.Fatalf("the wallet path asked or quoted differently: ui=%+v service=%+v", u, f)
-	}
-	// Available but declined (the configured default is the wallet): the
-	// answer selects the wallet path.
-	f = &withdrawalWizardFixture{availability: &zkapi.GaslessAvailability{Available: true}}
-	u = &fundingWizardUI{answers: []string{withdrawalTestDestination, "wallet"}, confirmations: []bool{true}}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
-		t.Fatal(err)
-	}
-	// The chosen wallet is named to the daemon (it falls a saved sponsored
-	// withdrawal back to the wallet-paid path).
-	if u.asks != 2 || len(f.fees) == 0 || f.fees[0] != "wallet" {
-		t.Fatalf("declining the payout fee did not select the wallet: %+v", f)
-	}
-	// A saved sponsored withdrawal keeps its fee mode without asking.
-	f = &withdrawalWizardFixture{availability: &zkapi.GaslessAvailability{Available: true}}
-	f.status = func(int) (zkapi.AddressWithdrawalStatus, error) {
-		s := payoutState("quoted")
-		s.UserOpHash = ""
-		return s, nil
-	}
-	f.quote = func(call int, destination string, note uint64, retry string) (zkapi.AddressPaymentQuote, error) {
-		q := payoutTestQuote("close")
-		q.ID, q.Binding = fmt.Sprintf("%064x", call), strings.Repeat("b", 64)
-		return q, nil
-	}
-	f.approve = func(string) (zkapi.AddressWithdrawalStatus, error) { return payoutState("complete"), nil }
-	u = &fundingWizardUI{confirmations: []bool{true}}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, ""); err != nil {
-		t.Fatal(err)
-	}
-	if u.asks != 0 || f.availabilityCalls != 0 || f.fees[0] != "payout" {
-		t.Fatalf("a saved sponsored withdrawal asked again: ui=%+v service=%+v", u, f)
-	}
-	// A gasless refusal stops with the wallet-paid way out instead of
-	// retrying forever.
-	f = &withdrawalWizardFixture{availability: &zkapi.GaslessAvailability{Available: true}}
-	f.quote = func(int, string, uint64, string) (zkapi.AddressPaymentQuote, error) {
-		return zkapi.AddressPaymentQuote{}, &managementError{message: "payout_below_gas: the payout does not cover the sponsored fee", code: "payout_below_gas"}
-	}
-	u = &fundingWizardUI{answers: []string{withdrawalTestDestination, "payout"}}
-	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error { return errors.New("waited") }, "")
-	if err == nil || !strings.Contains(err.Error(), "payout_below_gas") || !strings.Contains(err.Error(), "--fees wallet") || f.quoteCalls != 1 {
-		t.Fatalf("refusal: %v %+v", err, f)
-	}
-}
-
-// The payout quote labels the expected charge as an estimate at today's
-// base fee beside the signed maximum, and for a payout address with code
-// states the credit case and its surcharge, which the floor deducts.
+// A legacy payout quote (no bounded authorization) labels the expected
+// charge as an estimate beside the signed maximum; an authorized quote says
+// the actual fee may change, states the maximum the payout may lose, the
+// floor the destination receives and the approval's scope. For a payout
+// address with code both state the credit case and its surcharge, which the
+// floor deducts.
 func TestPayoutQuotePrintsTheEstimateAndTheContractPayeeCase(t *testing.T) {
 	q := payoutTestQuote("close")
 	var out bytes.Buffer
 	printPayoutQuote(&out, q)
-	if !strings.Contains(out.String(), "Maximum fee taken from it: 0.003300000000000000 ETH (expected charge at today's base fee: about 0.002000000000000000 ETH, an estimate;") || strings.Contains(out.String(), "has code") {
+	if !strings.Contains(out.String(), "Maximum fee taken from it: 0.003300000000000000 ETH (expected charge at today's base fee: about 0.002000000000000000 ETH, an estimate;") || strings.Contains(out.String(), "has code") || strings.Contains(out.String(), "This one approval") {
 		t.Fatalf("plain payout quote: %s", out.String())
 	}
 	q.PayeeHasCode, q.CreditSurchargeWei, q.MinimumReceivedWei = true, "92046000000000", "4579000000000"
@@ -578,12 +506,31 @@ func TestPayoutQuotePrintsTheEstimateAndTheContractPayeeCase(t *testing.T) {
 			t.Fatalf("missing %q in %s", want, out.String())
 		}
 	}
+	a := authorizedPayoutTestQuote()
+	out.Reset()
+	printPayoutQuote(&out, a)
+	for _, want := range []string{"about 0.000002000000000000 ETH (an estimate; the actual fee may change)", "At most 0.000004000000000000 ETH may be taken from the payout", withdrawalTestDestination + " receives at least 0.000095971000000000 ETH", "This one approval covers this destination, note and transit account; fee changes within this maximum are handled without asking again; a new destination or note needs a new approval.", "Transit account: " + gaslessTestTransit, "Bundler: https://bundler.example/rpc"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("missing %q in %s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "Maximum fee taken from it") || strings.Contains(out.String(), "has code") {
+		t.Fatalf("authorized quote printed the legacy terms: %s", out.String())
+	}
+	a.PayeeHasCode, a.CreditSurchargeWei = true, "92046000000000"
+	out.Reset()
+	printPayoutQuote(&out, a)
+	if !strings.Contains(out.String(), "The payout address has code") || !strings.Contains(out.String(), "--claim-credit --to "+a.Destination) {
+		t.Fatalf("authorized contract payee: %s", out.String())
+	}
 }
 
 // A plain rerun keeps a saved withdrawal's fee mode: with zkapi.withdrawal_fees
 // payout, the configured default is sent only for a new withdrawal, so a
 // saved record the owner moved to the wallet is not switched back to the
-// sponsored path; a named --fees is always sent.
+// sponsored path; a named --fees is always sent for a saved record (the
+// daemon decides: a wallet fee is explicit recovery there), also on a payout
+// deployment.
 func TestWithdrawConfiguredPayoutDefaultKeepsASavedWithdrawalsMode(t *testing.T) {
 	for name, test := range map[string]struct {
 		args []string
@@ -595,75 +542,45 @@ func TestWithdrawConfiguredPayoutDefaultKeepsASavedWithdrawalsMode(t *testing.T)
 		"escape rerun":     {args: []string{"--escape", "--to", withdrawalTestDestination}, want: nil},
 		"escape named pay": {args: []string{"--escape", "--to", withdrawalTestDestination, "--fees", "payout"}, want: "payout"},
 	} {
-		t.Run(name, func(t *testing.T) {
-			posts := 0
-			s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				saved := gaslessTestStatus("quoted")
-				saved["fee_payer"], saved["user_op_hash"] = "wallet", nil
-				if r.Method == http.MethodPost {
-					posts++
-					var body map[string]any
-					_ = json.NewDecoder(r.Body).Decode(&body)
-					if body["fees"] != test.want {
-						t.Errorf("fees sent %v, want %v: %+v", body["fees"], test.want, body)
+		for _, policy := range []string{"", "payout"} {
+			t.Run(name+" "+policy, func(t *testing.T) {
+				posts := 0
+				s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					saved := gaslessTestStatus("quoted")
+					saved["fee_payer"], saved["user_op_hash"] = "wallet", nil
+					if policy != "" {
+						saved["new_withdrawal_fees"] = policy
 					}
-					if r.URL.Path == "/admin/escape" {
-						saved["mode"] = "escape"
-						_ = json.NewEncoder(w).Encode(saved)
+					if r.Method == http.MethodPost {
+						posts++
+						var body map[string]any
+						_ = json.NewDecoder(r.Body).Decode(&body)
+						if body["fees"] != test.want {
+							t.Errorf("fees sent %v, want %v: %+v", body["fees"], test.want, body)
+						}
+						if r.URL.Path == "/admin/escape" {
+							saved["mode"] = "escape"
+							_ = json.NewEncoder(w).Encode(saved)
+							return
+						}
+						_ = json.NewEncoder(w).Encode(paymentTestQuote("withdrawal"))
 						return
 					}
-					_ = json.NewEncoder(w).Encode(paymentTestQuote("withdrawal"))
-					return
+					_ = json.NewEncoder(w).Encode(saved)
+				}))
+				defer s.Close()
+				c := withdrawalTestConfig(s)
+				c.ZKAPI.WithdrawalFees = "payout"
+				var out bytes.Buffer
+				_ = runWithdrawal(context.Background(), c, test.args, &out)
+				if posts == 0 {
+					t.Fatal("no request reached the daemon")
 				}
-				_ = json.NewEncoder(w).Encode(saved)
-			}))
-			defer s.Close()
-			c := withdrawalTestConfig(s)
-			c.ZKAPI.WithdrawalFees = "payout"
-			_ = runWithdrawal(context.Background(), c, test.args, &bytes.Buffer{})
-			if posts == 0 {
-				t.Fatal("no request reached the daemon")
-			}
-		})
-	}
-}
-
-// In the guided menu a refused sponsored withdrawal whose sponsored path is
-// unavailable (paused, no bundler, the pins) still has the wallet-paid way
-// out: it is named to the daemon without asking, and a refusal read back
-// from the status stops with that remedy, not "needs recovery".
-func TestGuidedWithdrawalRefusedSponsoredWithdrawalFallsBackToTheWallet(t *testing.T) {
-	refused := func() zkapi.AddressWithdrawalStatus {
-		s := withdrawalWizardState("gasless_refused")
-		s.FeePayer, s.TransitAccount, s.UserOpHash = "payout", gaslessTestTransit, gaslessTestOpHash
-		s.GaslessRefusal = "sponsorship_paused: the paymaster has paused sponsorship; use --fees wallet"
-		return s
-	}
-	f := &withdrawalWizardFixture{status: func(int) (zkapi.AddressWithdrawalStatus, error) { return refused(), nil }}
-	f.quote = func(call int, destination string, note uint64, retry string) (zkapi.AddressPaymentQuote, error) {
-		if f.fees[len(f.fees)-1] != "wallet" {
-			return zkapi.AddressPaymentQuote{}, &managementError{message: "sponsorship_paused: the paymaster has paused sponsorship", code: "sponsorship_paused"}
+				// The record moved to the wallet pays its fee from the wallet.
+				if !strings.Contains(test.args[0], "escape") && !strings.Contains(out.String(), "Available for network fees") {
+					t.Fatalf("a wallet-bound record hid its fee balance: %s", out.String())
+				}
+			})
 		}
-		q := withdrawalWizardQuote()
-		q.ID = fmt.Sprintf("%064x", call)
-		return q, nil
-	}
-	u := &fundingWizardUI{confirmations: []bool{true}}
-	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, "payout"); err != nil {
-		t.Fatalf("the wallet-paid way out was not taken: %v (%s)", err, u.String())
-	}
-	if u.asks != 0 || len(f.fees) == 0 || f.fees[0] != "wallet" || f.approveCalls != 1 || !strings.Contains(u.String(), "cannot be paid from the payout now") {
-		t.Fatalf("calls: ui=%+v service=%+v", u, f)
-	}
-	// The status read back after a failed quote shows the refusal: the
-	// remedy is the wallet-paid fee.
-	f = &withdrawalWizardFixture{status: func(int) (zkapi.AddressWithdrawalStatus, error) { return refused(), nil }}
-	f.quote = func(int, string, uint64, string) (zkapi.AddressPaymentQuote, error) {
-		return zkapi.AddressPaymentQuote{}, errors.New("local withdrawal request failed")
-	}
-	u = &fundingWizardUI{}
-	err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll, "")
-	if err == nil || strings.Contains(err.Error(), "needs recovery") || !strings.Contains(err.Error(), "--fees wallet") || !strings.Contains(err.Error(), "sponsorship_paused") {
-		t.Fatalf("the refusal did not stop with the wallet remedy: %v", err)
 	}
 }

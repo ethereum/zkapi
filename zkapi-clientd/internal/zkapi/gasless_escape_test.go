@@ -595,3 +595,38 @@ func TestGaslessEscapeRefusedFinalizationFallsBackToTheWallet(t *testing.T) {
 		t.Fatal("the initiation's inclusion was reported or settled again")
 	}
 }
+
+// A sponsored FORWARD may collect the transit account's balance after its
+// escape only once the vault's noteRecord shows the escaped note Closed (or
+// retired, Closed with its leaf zeroed); PendingWithdrawal is not evidence.
+func TestTransitEvidenceFollowsTheNoteRecordStatus(t *testing.T) {
+	f, g := newGaslessEscapeFixture(t)
+	hash := f.sponsoredEscape(t)
+	g.mineUserOp(t, hash, true, fixtureSettlement{Charged: big.NewInt(1_000_000_000_000)})
+	config, err := f.h.config(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := f.h.journaledEnvironment(context.Background(), config, &[]addressFundingRecord{f.journal(t)}[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		name     string
+		mutate   func(*fixtureNote)
+		evidence bool
+	}{
+		{"pending withdrawal", func(*fixtureNote) {}, false},
+		{"closed", func(n *fixtureNote) { n.status = noteClosed }, true},
+		{"retired", func(n *fixtureNote) { n.status, n.retired = noteClosed, true }, true},
+	} {
+		f.mu.Lock()
+		note := f.vaultNotes[uint32(f.noteID)]
+		step.mutate(&note)
+		f.vaultNotes[uint32(f.noteID)] = note
+		f.mu.Unlock()
+		if _, evidence, err := f.h.transitBalance(context.Background(), env, f.noteID); err != nil || evidence != step.evidence {
+			t.Fatalf("%s: evidence %v, want %v (%v)", step.name, evidence, step.evidence, err)
+		}
+	}
+}

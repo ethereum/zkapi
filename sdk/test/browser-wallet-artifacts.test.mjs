@@ -73,8 +73,10 @@ test('browser build contains every wallet WASM operation', () => {
         'browser_prepare_withdrawal',
         'browser_verify_request',
         'browser_check_unrecoverable_response',
-        'browser_note_path_matches',
+        'browser_note_leaf',
+        'browser_note_leaf_from_fields',
         'browsernotetree_new',
+        'browsernotetree_from_state',
         'browsernotetree_apply',
         'browsernotetree_root',
         'browsernotetree_next_note_id',
@@ -125,7 +127,7 @@ test('static proof keys are the concession development setup and match its manif
     const setup = path.join(root, '../protocol/setup/v2-concession-dev');
     const setupManifest = JSON.parse(fs.readFileSync(path.join(setup, 'manifest.json'), 'utf8'));
     const manifest = JSON.parse(fs.readFileSync(path.join(root, 'assets/manifest.json'), 'utf8'));
-    assert.equal(setupManifest.circuit_id, 'zkapi-v2-concession-v1');
+    assert.equal(setupManifest.circuit_id, 'zkapi-v2-concession-v2');
     assert.equal(manifest.schema, 2);
     assert.equal(manifest.circuitId, setupManifest.circuit_id);
     assert.equal(manifest.setupId, setupManifest.setup_id);
@@ -136,40 +138,70 @@ test('static proof keys are the concession development setup and match its manif
         assert.equal(manifest.files[`assets/proofs/${file}`], setupManifest.files[file], file);
     }
     assert.equal(sha256(path.join(root, 'assets/proofs/request.pk')),
-        '7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba');
+        'fb5f0ec0908b29aa5a3ba75c5cefda70ca0bc1d68da031c4a21ef63c0806af87');
     assert.equal(sha256(path.join(root, 'assets/proofs/withdrawal.pk')),
-        '43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1');
+        'c04e0368a85378c268b68c9c18764b0d1f86bac98fb21d69e6e80918ce2e486f');
     assert.equal(sha256(path.join(root, 'assets/proofs/request.vk')),
-        '11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf');
+        '95ea85413634f40b44314b8d9a0c2a79281c7a868eec13308fbe07dc1d0a8bd3');
+    assert.deepEqual(manifest.vkKeccak256, {
+        request: '0x38348b670fd21c8c622075f84f5c4a246f54081e09886b0a3c86c89edc01e1c8',
+        withdrawal: '0xc14844d3af2b29303852e7e47e642830552e0c73df3ebbed8f0d27c316be9ffa'
+    });
     // Each key file names its circuit, setup and kind.
     for (const kind of ['request', 'withdrawal']) {
-        const header = `zkapi-v2-concession-v1/${manifest.setupId}/${kind}\0`;
+        const header = `zkapi-v2-concession-v2/${manifest.setupId}/${kind}\0`;
         assert.equal(fs.readFileSync(path.join(root, `assets/proofs/${kind}.pk`)).subarray(0, header.length).toString('latin1'), header);
     }
 });
 
+// Sepolia pins its staging deployment; mainnet is still a placeholder.
 for (const network of ['sepolia', 'mainnet']) {
-    test(`the ${network} profile is a not_deployed placeholder pinning the shipped circuit, setup and keys`, () => {
+    const deployed = network === 'sepolia';
+    test(`the ${network} profile ${deployed ? 'pins its deployment' : 'is a not_deployed placeholder'} with the shipped circuit, setup and keys`, () => {
         const config = JSON.parse(fs.readFileSync(path.join(__dirname, `assets/config/${network}.json`), 'utf8'));
         const manifest = JSON.parse(fs.readFileSync(path.join(root, 'assets/manifest.json'), 'utf8'));
         const trusted = config.trusted_deployment;
-        assert.equal(trusted.deployment_status, 'not_deployed');
+        assert.equal(trusted.deployment_status, deployed ? 'deployed' : 'not_deployed');
         assert.equal(trusted.chain_id, network === 'mainnet' ? 1 : 11155111);
-        assert.equal(trusted.circuit_id, 'zkapi-v2-concession-v1');
+        assert.equal(trusted.circuit_id, 'zkapi-v2-concession-v2');
         assert.equal(trusted.setup_id, manifest.setupId);
         assert.equal(trusted.request_proving_key_sha256, sha256(path.join(root, 'assets/proofs/request.pk')));
         assert.equal(trusted.withdrawal_proving_key_sha256, sha256(path.join(root, 'assets/proofs/withdrawal.pk')));
         assert.equal(trusted.request_verifying_key_sha256, sha256(path.join(root, 'assets/proofs/request.vk')));
         assert.equal(trusted.request_vk_keccak256, manifest.vkKeccak256.request);
         assert.equal(trusted.withdrawal_vk_keccak256, manifest.vkKeccak256.withdrawal);
-        assert.equal(trusted.vault_revision, 3);
+        assert.equal(trusted.vault_revision, 4);
         assert.equal(trusted.exit_concession, 1);
+        assert.equal(trusted.leaf_bound_exit, 1);
+        // The deposit pins (scripts/deployment-profile.mjs): the vault's
+        // minDeposit and the network's fresh-slot gas (EIP-8037 on Sepolia).
+        assert.equal(trusted.min_deposit_units, 1_000_000);
+        assert.equal(trusted.fresh_slot_gas, network === 'mainnet' ? 22_100 : 110_000);
         assert.equal(trusted.clearance_ownership_proof, 'required');
-        // Nothing that only a deployment determines is pinned yet.
-        for (const field of ['deployment_id', 'contract_address', 'deploy_block', 'protocol_server_url', 'indexer_url',
+        // What only a deployment determines: pinned for a deployed network,
+        // still null on a placeholder.
+        const deploymentFields = ['deployment_id', 'contract_address', 'deploy_block', 'protocol_server_url', 'indexer_url',
             'state_signing_key', 'clearance_signing_key', 'vault_runtime_codehash', 'proof_adapter_address',
-            'adapter_runtime_codehash', 'poseidon_library_address', 'poseidon_runtime_codehash', 'verifier_url']) {
-            assert.equal(trusted[field], null, field);
+            'adapter_runtime_codehash', 'poseidon_library_address', 'poseidon_runtime_codehash', 'verifier_url'];
+        if (deployed) {
+            assert.equal(typeof trusted.deployment_id, 'string');
+            assert.ok(trusted.deployment_id.length > 0, 'deployment_id');
+            for (const field of ['contract_address', 'proof_adapter_address', 'poseidon_library_address']) {
+                assert.match(trusted[field], /^0x[0-9a-fA-F]{40}$/, field);
+            }
+            for (const field of ['vault_runtime_codehash', 'adapter_runtime_codehash', 'poseidon_runtime_codehash']) {
+                assert.match(trusted[field], /^0x[0-9a-f]{64}$/, field);
+            }
+            assert.ok(Number.isSafeInteger(trusted.deploy_block) && trusted.deploy_block > 0, 'deploy_block');
+            for (const field of ['protocol_server_url', 'indexer_url', 'verifier_url']) {
+                assert.equal(new URL(trusted[field]).protocol, 'https:', field);
+            }
+            for (const field of ['state_signing_key', 'clearance_signing_key']) {
+                assert.match(trusted[field].x, /^0x[0-9a-f]{64}$/, `${field}.x`);
+                assert.match(trusted[field].y, /^0x[0-9a-f]{64}$/, `${field}.y`);
+            }
+        } else {
+            for (const field of deploymentFields) assert.equal(trusted[field], null, field);
         }
         assert.equal(config.deployment_manifest_url, null);
         assert.deepEqual(config.allowed_deployment_manifest_urls, []);
@@ -242,7 +274,7 @@ test('wallet transactions use a bounded preflight gas limit and leave EIP-1559 f
     const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
     const send = sourceMethodAt(client, 'async sendContractTransaction(');
     const estimateIndex = send.indexOf("method: 'eth_estimateGas'");
-    const gasIndex = send.indexOf('transaction.gas = bufferedGasLimit(estimate)');
+    const gasIndex = send.indexOf('transaction.gas = depositGas');
     const submitIndex = send.indexOf("method: 'eth_sendTransaction'");
     assert.ok(estimateIndex >= 0 && gasIndex > estimateIndex && submitIndex > gasIndex);
     assert.match(send, /catch \(error\) \{[\s\S]*const estimateError = contractEstimateError\(error\);[\s\S]*tagTransactionError\(estimateError, 'estimate', false\)[\s\S]*\}\s*let hash;[\s\S]*method: 'eth_sendTransaction'/);
@@ -251,8 +283,9 @@ test('wallet transactions use a bounded preflight gas limit and leave EIP-1559 f
     assert.match(send, /exitEstimate\.blocking\?\.\(estimateError\)/);
     assert.ok(gas.EXIT_FALLBACK_GAS_LIMIT < gas.MAX_TRANSACTION_GAS_LIMIT);
     assert.doesNotMatch(send, /transaction\.(?:gasPrice|maxFeePerGas|maxPriorityFeePerGas)\s*=/);
+    assert.match(send, /: bufferedGasLimit\(estimate\)/);
+    assert.match(send, /depositGasLimit\(\{ estimate, nextNoteId: await this\.walletNextNoteId\(to\)/);
     assert.match(client, /contractRevertSelector\(error\)/);
-    assert.match(client, /error\?\.code !== 'stale_root'/);
 });
 
 test('published vault challenge-period getter is probed before the reverting fallback', () => {
@@ -269,47 +302,26 @@ test('published vault challenge-period getter is probed before the reverting fal
     );
 });
 
-test('a saved withdrawal proof is reused until its valid_until, never refreshed with new siblings', () => {
+test('a saved withdrawal proof is reused until its valid_until; exits read no root and take no path', () => {
     const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
-    const rootSync = fs.readFileSync(path.join(__dirname, 'services/zkapiWithdrawalRoot.mjs'), 'utf8');
     const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
-    assert.match(runtime, /expectedActiveRoot/);
-    assert.match(runtime, /waitForExpectedActiveRoot/);
-    assert.match(rootSync, /indexer_root_lag/);
-    assert.match(client, /`0x\$\{ABI\.currentRoot\}`/);
-    // Deposits still re-prove on any stale root.
-    assert.match(client, /const attempts = 3/);
-    assert.match(client, /Refreshing the deposit before retrying/);
-    // Exits do no Merkle work and the vault accepts any root it ever held:
-    // a proof stays usable until valid_until (E4.7) and calldata carries no
-    // path. Behaviour: browser-wallet-exit-rules.test.mjs.
+    // The deposit-time path machinery and the root-bound exit options are gone.
+    assert.equal(fs.existsSync(path.join(__dirname, 'services/zkapiWithdrawalRoot.mjs')), false);
+    for (const removed of [/waitForExpectedActiveRoot/, /expectedActiveRoot/, /refusedRoot/, /exitPathLocked/, /verifiedDepositPath/,
+        /notePathMatches/, /pathSource/, /unknown_root/]) {
+        assert.doesNotMatch(runtime, removed, String(removed));
+        assert.doesNotMatch(client, removed, String(removed));
+    }
+    // A proof stays usable until valid_until (E4.7); calldata carries no path.
+    // Behaviour: browser-wallet-exit-rules.test.mjs.
     const reuse = sourceMethodAt(runtime, 'reusablePlan(');
     assert.match(reuse, /withdrawalProofStillValid\(inputs\)/);
-    assert.doesNotMatch(runtime, /siblingsRoot/);
     const withdraw = sourceMethodAt(client, 'async performWithdrawal(');
-    assert.match(client, /const REPROVABLE_EXIT_ERRORS = Object\.freeze\(\['proof_expired', 'unknown_root'\]\)/);
+    assert.match(client, /const REPROVABLE_EXIT_ERRORS = Object\.freeze\(\['proof_expired'\]\)/);
     assert.match(withdraw, /REPROVABLE_EXIT_ERRORS\.includes\(error\?\.code\)/);
-});
-
-test('withdrawal root synchronization waits for the indexer and fails closed', async () => {
-    const roots = await import(pathToFileURL(path.join(__dirname, 'services/zkapiWithdrawalRoot.mjs')));
-    let calls = 0;
-    const current = await roots.waitForExpectedActiveRoot(async () => {
-        calls += 1;
-        return { active_root: calls === 1 ? '0x10' : '0x11' };
-    }, 17n, { attempts: 3, delayMs: 0, sleep: async () => {} });
-    assert.equal(current.active_root, '0x11');
-    assert.equal(calls, 2);
-    assert.equal(roots.sameFelt('0x11', 17n), true);
-
-    await assert.rejects(
-        roots.waitForExpectedActiveRoot(
-            async () => ({ active_root: '0x12' }),
-            '0x13',
-            { attempts: 2, delayMs: 0, sleep: async () => {} }
-        ),
-        error => error.code === 'indexer_root_lag'
-    );
+    assert.doesNotMatch(withdraw, /ABI\.currentRoot/);
+    // Only a request reads the vault's root (requestPath).
+    assert.match(sourceMethodAt(runtime, 'async requestPath('), /VAULT_SELECTORS\.currentRoot/);
 });
 
 test('only a never-submitted prepared deposit can be replaced after cancellation', () => {
@@ -319,14 +331,16 @@ test('only a never-submitted prepared deposit can be replaced after cancellation
     assert.match(runtime, /A previous deposit may already be in MetaMask\. Recover it before changing the amount/);
 });
 
-test('browser deposits refresh an unsigned Merkle path before submission', () => {
+test('browser deposits rebase an unsigned plan onto the vault\'s next note id before submission', () => {
     const runtime = fs.readFileSync(path.join(__dirname, 'services/browserWalletRuntime.js'), 'utf8');
     const client = fs.readFileSync(path.join(__dirname, 'services/zkapiClient.js'), 'utf8');
     const refresh = sourceMethodAt(runtime, 'async refreshPendingDeposit(');
-    assert.match(refresh, /async refreshPendingDeposit\(amount, expectedActiveRoot = null,/);
-    assert.match(refresh, /const refreshed = \{[\s\S]*\.\.\.pending,[\s\S]*next_note_id: path\.note_id,[\s\S]*active_root: path\.active_root,[\s\S]*zero_path: path\.siblings/);
-    assert.doesNotMatch(refresh, /secret:/);
-    assert.match(client, /await browserWalletRuntime\.refreshPendingDeposit\([\s\S]*Number\(amount\),[\s\S]*expectedActiveRoot/);
-    assert.match(client, /const attempts = 3/);
-    assert.match(client, /error\?\.code !== 'stale_root'/);
+    assert.match(refresh, /async refreshPendingDeposit\(amount, \{ expectedOperationId = null \} = \{\}\)/);
+    assert.match(refresh, /const refreshed = \{ \.\.\.kept, next_note_id: await this\.nextDepositNoteId\(\) \}/);
+    assert.doesNotMatch(refresh, /secret:|zero_path: path|active_root: path/);
+    assert.match(client, /await browserWalletRuntime\.refreshPendingDeposit\(Number\(amount\), \{ expectedOperationId: plan\.operationId \}\)/);
+    // A deposit never reverts with StaleRoot any more: it is sent once.
+    const deposit = sourceMethodAt(client, 'async performDeposit(');
+    assert.doesNotMatch(deposit, /stale_root|const attempts/);
+    assert.match(deposit, /depositGas: \{ freshSlotGas: browserWalletRuntime\.browserConfig\?\.trusted_deployment\?\.fresh_slot_gas \}/);
 });

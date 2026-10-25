@@ -1,4 +1,5 @@
-//! Browser-safe zkAPI wallet operations for circuit `zkapi-v2-concession-v1`.
+//! Browser-safe zkAPI wallet operations for circuit `zkapi-v2-concession-v2`
+//! (vault revision 4, leaf-bound exits).
 //!
 //! This crate deliberately owns neither storage nor transport. Every operation
 //! accepts an immutable state snapshot and returns the complete next snapshot,
@@ -22,12 +23,19 @@
 //!   Exits never need it.
 //! * Withdrawal kinds: an escape (kind 0) concedes at most `bound_at_state`;
 //!   a mutual close (kind 1) and an ownership proof (kind 2) concede nothing,
-//!   and an ownership proof has no destination ([`prepare_withdrawal`]).
+//!   and an ownership proof has no destination ([`prepare_withdrawal`]). No
+//!   exit takes a Merkle path or root: its statement binds the note's leaf
+//!   (`note_leaf`, `note_id`, `deposit_amount`, `expiry_ts`), which the vault
+//!   compares with the leaf it stored at deposit.
 //! * Lost ε: a finalized response whose journal is lost is checked against
 //!   S1, S2, S4 and S6 ([`check_unrecoverable_response`]) before its charge
 //!   may lower an escape's concession.
-//! * A saved deposit-time path is kept only if it leads to its root
-//!   ([`note_path_matches`]); the vault accepts any root it ever held.
+//! * Requests alone need a path, at a root the vault reports: from the
+//!   indexer's snapshot ([`tree_path`]), the vault's `noteLeaves` state
+//!   ([`NoteTree::from_state`]) or its logs ([`NoteTree::apply`]), always
+//!   checked against `currentRoot()`.
+//! * Recovery recomputes a deposit's leaf from its public fields
+//!   ([`note_leaf_from_fields`]) to match the vault's `noteRecord(n).leaf`.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -59,7 +67,8 @@ pub mod codes {
     pub const BOUND_FIXED_AT_STATE: &str = "bound_fixed_at_state";
     /// A signed state without its predecessor's anchor cannot prove requests.
     pub const PREV_ANCHOR_MISSING: &str = "prev_anchor_missing";
-    /// The Merkle path does not lead from the note's leaf to the given root.
+    /// A request's Merkle path does not lead from the note's leaf to the
+    /// given root.
     pub const MERKLE_PATH_MISMATCH: &str = "merkle_path_mismatch";
     /// The state holds less than the requested solvency bound.
     pub const INSUFFICIENT_BALANCE: &str = "insufficient_balance";
@@ -82,6 +91,11 @@ pub mod codes {
     pub const CLEARANCE_INVALID: &str = "clearance_invalid";
     /// A tree event is out of order or names an impossible leaf change.
     pub const TREE_EVENT_INVALID: &str = "tree_event_invalid";
+    /// The vault's leaves do not reproduce its `currentRoot()` (or their
+    /// count is not its `nextNoteId()`) at the block they were read at.
+    pub const TREE_ROOT_MISMATCH: &str = "tree_root_mismatch";
+    /// A note field (commitment, amount, expiry) is malformed.
+    pub const NOTE_FIELDS_INVALID: &str = "note_fields_invalid";
 }
 
 fn refusal(code: &str, detail: impl std::fmt::Display) -> anyhow::Error {
@@ -235,6 +249,10 @@ pub struct CompleteResponseArgs {
 ///
 /// `valid_until` is the last second at which the vault (kinds 0 and 1) or
 /// the server (kind 2) accepts the proof.
+///
+/// There is no path or root: an exit is bound to the note's leaf (vault
+/// revision 4). The fields of earlier builds, `active_root` and
+/// `merkle_siblings`, are refused like any unknown field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareWithdrawalArgs {
@@ -244,14 +262,13 @@ pub struct PrepareWithdrawalArgs {
     #[serde(default)]
     pub conceded: Option<u128>,
     pub valid_until: u64,
-    pub active_root: Felt252,
-    pub merkle_siblings: Vec<Felt252>,
     #[serde(default)]
     pub clearance: Option<ClearanceResponseV2>,
 }
 
-/// A withdrawal proof. Exits do no Merkle work on chain, so the plan carries
-/// no path: the calldata is the 16-word statement and the proof.
+/// A withdrawal proof. Exits do no Merkle work, so the plan carries no path:
+/// the calldata is the 16-word statement (word 3 `noteLeaf`, word 8
+/// `noteFields`) and the proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawalPlan {
     pub mode: String,
@@ -359,13 +376,14 @@ fn deserialize_u128_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u
     parsed.map_err(|_| serde::de::Error::custom("expected a decimal or 0x-hex u128 string"))
 }
 
-/// One leaf-changing vault event, in the vault's log order (§6.6). Amounts
-/// travel as strings because JavaScript numbers lose precision above 2^53.
+/// One leaf-changing vault event, in the vault's log order. Amounts travel
+/// as strings because JavaScript numbers lose precision above 2^53. No event
+/// carries a root since vault revision 4.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TreeEvent {
-    /// `NoteDeposited(noteId, commitment, amount, expiryTs, newRoot)` sets
-    /// leaf `note_id` to `note_leaf(note_id, commitment, amount, expiry_ts)`.
+    /// `NoteDeposited(noteId, commitment, amount, expiryTs)` sets leaf
+    /// `note_id` to `note_leaf(note_id, commitment, amount, expiry_ts)`.
     NoteDeposited {
         note_id: u32,
         commitment: Felt252,
@@ -373,14 +391,17 @@ pub enum TreeEvent {
         amount: u128,
         expiry_ts: u64,
     },
-    /// `ClosedLeafRetired(noteId, newRoot)` zeroes leaf `note_id`.
+    /// `ClosedLeafRetired(noteId)` zeroes leaf `note_id`.
     ClosedLeafRetired { note_id: u32 },
 }
 
-/// The vault's note tree rebuilt from its logs. Deposits take consecutive
-/// note ids from 0; a retirement zeroes a deposited, not yet retired leaf.
-/// Each [`NoteTree::apply`] returns the new root, which the caller compares
-/// with the event's own root.
+/// The vault's note tree, for request paths: built from the vault's state
+/// ([`NoteTree::from_state`]: `noteLeaves` pages, `nextNoteId()` and
+/// `currentRoot()` read at one block hash) or rebuilt from its logs
+/// ([`NoteTree::apply`] per event). Deposits take consecutive note ids from
+/// 0; a retirement zeroes a deposited, not yet retired leaf. Events carry no
+/// root: after the last event of a block, compare [`NoteTree::root`] with
+/// the vault's `currentRoot()` at that block's hash.
 #[derive(Clone)]
 pub struct NoteTree {
     tree: MerkleTree,
@@ -401,6 +422,55 @@ impl NoteTree {
             next_note_id: 0,
             retired: Default::default(),
         }
+    }
+
+    /// The tree whose leaf `i` is `leaves[i]`, a zero leaf being a retired
+    /// note, as the vault's `noteLeaves(0, nextNoteId)` returns them.
+    /// Unchecked: [`NoteTree::from_state`] also checks the count and root.
+    pub fn from_leaves(leaves: Vec<Felt252>) -> Result<Self> {
+        let next_note_id = u32::try_from(leaves.len())
+            .map_err(|_| refusal(codes::TREE_EVENT_INVALID, "more leaves than note ids"))?;
+        let retired = leaves
+            .iter()
+            .enumerate()
+            .filter(|(_, leaf)| leaf.is_zero())
+            .map(|(index, _)| index as u32)
+            .collect();
+        Ok(Self {
+            tree: MerkleTree::from_leaves(&leaves),
+            next_note_id,
+            retired,
+        })
+    }
+
+    /// The tree of the vault's state at one block: `snapshot.leaves` are
+    /// its `noteLeaves` pages in order, `snapshot.next_note_id` its
+    /// `nextNoteId()` and `snapshot.root` its `currentRoot()`, all read at the
+    /// same block hash (EIP-1898). Refused with [`codes::TREE_ROOT_MISMATCH`]
+    /// unless the leaves are exactly `next_note_id` and reproduce the root.
+    pub fn from_state(snapshot: TreeSnapshot) -> Result<Self> {
+        if snapshot.leaves.len() != snapshot.next_note_id as usize {
+            return Err(refusal(
+                codes::TREE_ROOT_MISMATCH,
+                format!(
+                    "{} leaves for nextNoteId {}",
+                    snapshot.leaves.len(),
+                    snapshot.next_note_id
+                ),
+            ));
+        }
+        let tree = Self::from_leaves(snapshot.leaves)?;
+        if tree.root() != snapshot.root {
+            return Err(refusal(
+                codes::TREE_ROOT_MISMATCH,
+                format!(
+                    "the leaves give root {}, the vault reports {}",
+                    tree.root().to_hex(),
+                    snapshot.root.to_hex()
+                ),
+            ));
+        }
+        Ok(tree)
     }
 
     pub fn root(&self) -> Felt252 {
@@ -881,23 +951,6 @@ pub fn check_unrecoverable_response(
     })
 }
 
-/// A Merkle path to check against a note ([`note_path_matches`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NotePathArgs {
-    pub active_root: Felt252,
-    pub siblings: Vec<Felt252>,
-}
-
-/// Whether `siblings` lead from `state`'s leaf to `active_root`. The wallet
-/// keeps a deposit-time path only when it does: the vault accepts any root it
-/// ever held, so that path proves exits for the note's whole life
-/// (Amendment A1).
-pub fn note_path_matches(state: &BrowserNoteState, args: NotePathArgs) -> Result<bool> {
-    let siblings = siblings_array(args.siblings)?;
-    Ok(core::merkle_root(state.note_id, &state_note_leaf(state), &siblings) == args.active_root)
-}
-
 enum WithdrawalMode {
     Escape {
         destination: [u8; 20],
@@ -1014,8 +1067,10 @@ pub fn prepare_withdrawal(
 /// Prove an exit from `state`: kind 0 (`escape`), 1 (`mutual`) or 2
 /// (`ownership`), see [`PrepareWithdrawalArgs`]. The statement carries the
 /// canonical `withdrawal_nullifier`, `next_nullifier` (the successor
-/// nullifier for an escape, 0 otherwise), `final_balance = B − conceded` and
-/// `valid_until`. Exits never need `prev_anchor`.
+/// nullifier for an escape, 0 otherwise), `final_balance = B − conceded`,
+/// `valid_until` and the note's leaf with its fields (`note_leaf`, `note_id`,
+/// `deposit_amount`, `expiry_ts`). Exits never need `prev_anchor`, a Merkle
+/// path or a root.
 pub fn prepare_withdrawal_with_prover(
     config: &BrowserWalletConfig,
     state: &BrowserNoteState,
@@ -1025,8 +1080,6 @@ pub fn prepare_withdrawal_with_prover(
     validate_state(config, state)?;
     require_bundle_setup(prover.setup_id(), "withdrawal proving key")?;
     let mode = parse_withdrawal_mode(&args, state)?;
-    let siblings = siblings_array(args.merkle_siblings)?;
-    require_path(state, &args.active_root, &siblings)?;
     let state_blinding = parse_scalar(&state.balance_blinding)?;
     stored_commitment(state, &state_blinding)?;
     let nullifier = withdrawal_nullifier(state);
@@ -1076,7 +1129,6 @@ pub fn prepare_withdrawal_with_prover(
         secret: state.secret_s,
         deposit_amount: state.deposit_amount,
         expiry: state.expiry_ts,
-        merkle_siblings: siblings,
         state_balance: state.current_balance,
         state_blinding,
         current_anchor: state.current_anchor,
@@ -1091,7 +1143,6 @@ pub fn prepare_withdrawal_with_prover(
             protocol_version: state.protocol_version,
             chain_id: state.chain_id,
             contract_address: state.contract_address,
-            active_root: args.active_root,
             state_signing_key: config.state_signing_key.clone(),
             clearance_signing_key: config.clearance_signing_key.clone(),
             note_id: state.note_id,
@@ -1171,7 +1222,7 @@ fn validate_state(config: &BrowserWalletConfig, state: &BrowserNoteState) -> Res
 }
 
 fn stored_commitment(state: &BrowserNoteState, blinding: &Felt252) -> Result<CurvePointWire> {
-    let commitment = balance_commitment(state.current_balance, blinding, &state_note_leaf(state));
+    let commitment = balance_commitment(state.current_balance, blinding, &note_leaf(state));
     if commitment.x != state.current_commitment_x || commitment.y != state.current_commitment_y {
         return Err(refusal(
             codes::STATE_INVALID,
@@ -1186,7 +1237,7 @@ fn require_path(
     active_root: &Felt252,
     siblings: &[Felt252; MERKLE_DEPTH],
 ) -> Result<()> {
-    if core::merkle_root(state.note_id, &state_note_leaf(state), siblings) != *active_root {
+    if core::merkle_root(state.note_id, &note_leaf(state), siblings) != *active_root {
         return Err(refusal(
             codes::MERKLE_PATH_MISMATCH,
             "the Merkle path does not lead from this note's leaf to active_root",
@@ -1222,13 +1273,55 @@ fn parse_address(value: &str) -> Result<[u8; 20]> {
     Ok(address)
 }
 
-fn state_note_leaf(state: &BrowserNoteState) -> Felt252 {
+/// The note's leaf, `P(d_leaf', R(s), F(n, D, e))[1]`: the word the vault
+/// stored at deposit and every exit statement binds (`note_leaf`).
+pub fn note_leaf(state: &BrowserNoteState) -> Felt252 {
     core::note_leaf(
         state.note_id,
         &core::registration_commitment(&state.secret_s),
         state.deposit_amount,
         state.expiry_ts,
     )
+}
+
+/// An unsigned integer of at most `max` from decimal or `0x`-hex text.
+fn parse_amount_text(value: &str, what: &str, max: u128) -> Result<u128> {
+    let parsed = match value.strip_prefix("0x") {
+        Some(hex) => u128::from_str_radix(hex, 16),
+        None => value.parse::<u128>(),
+    };
+    parsed.ok().filter(|amount| *amount <= max).ok_or_else(|| {
+        refusal(
+            codes::NOTE_FIELDS_INVALID,
+            format!("{what} must be a decimal or 0x-hex integer of at most {max}"),
+        )
+    })
+}
+
+/// The leaf the vault stores for a deposit of `amount` with registration
+/// `commitment` (`R = H_reg(s, 0)`, hex) at `note_id`, expiring at
+/// `expiry_ts` (UNIX seconds): `P(d_leaf', R, n·2^192 + D·2^64 + e)[1]`.
+/// Recovery compares it with `noteRecord(note_id).leaf` to find a deposit's
+/// expiry without its receipt. `amount` and `expiry_ts` are decimal or
+/// `0x`-hex text (JavaScript numbers lose precision above 2^53).
+pub fn note_leaf_from_fields(
+    note_id: u32,
+    commitment: &str,
+    amount: &str,
+    expiry_ts: &str,
+) -> Result<Felt252> {
+    let commitment = Felt252::from_hex(commitment)
+        .ok()
+        .filter(|_| !commitment.trim_start_matches("0x").is_empty())
+        .ok_or_else(|| {
+            refusal(
+                codes::NOTE_FIELDS_INVALID,
+                "commitment must be a field element in hex",
+            )
+        })?;
+    let amount = parse_amount_text(amount, "amount", u128::MAX)?;
+    let expiry_ts = parse_amount_text(expiry_ts, "expiry_ts", u128::from(u64::MAX))? as u64;
+    Ok(core::note_leaf(note_id, &commitment, amount, expiry_ts))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1368,13 +1461,25 @@ mod wasm {
         )
     }
 
-    /// Whether `{active_root, siblings}` (JSON) is a path of the state's note.
+    /// The state's note leaf (JSON felt): the vault's stored leaf for the
+    /// note, which every exit statement binds.
     #[wasm_bindgen]
-    pub fn browser_note_path_matches(
-        state_json: &str,
-        path_json: &str,
-    ) -> std::result::Result<bool, JsValue> {
-        note_path_matches(&decode(state_json)?, decode(path_json)?).map_err(js_anyhow)
+    pub fn browser_note_leaf(state_json: &str) -> std::result::Result<String, JsValue> {
+        encode(&note_leaf(&decode(state_json)?))
+    }
+
+    /// The leaf of a deposit from its public fields (JSON felt), for
+    /// recovery against `noteRecord(note_id).leaf`: `commitment` is the
+    /// registration commitment in hex, `amount` and `expiry_ts` decimal or
+    /// 0x-hex strings.
+    #[wasm_bindgen]
+    pub fn browser_note_leaf_from_fields(
+        note_id: u32,
+        commitment: &str,
+        amount: &str,
+        expiry_ts: &str,
+    ) -> std::result::Result<String, JsValue> {
+        encode(&note_leaf_from_fields(note_id, commitment, amount, expiry_ts).map_err(js_anyhow)?)
     }
 
     #[wasm_bindgen]
@@ -1404,8 +1509,10 @@ mod wasm {
         encode(&tree_path_from_leaves(decode(leaves_json)?, note_id).map_err(js_anyhow)?)
     }
 
-    /// The note tree rebuilt from vault logs (§6.6): `apply` one event, in log
-    /// order, and compare the returned root with the event's.
+    /// The vault's note tree for request paths: `from_state` with the
+    /// vault's leaves, `nextNoteId()` and `currentRoot()` read at one block
+    /// hash, or `new` and `apply` one event at a time in log order, then
+    /// compare `root` with `currentRoot()` at the last event's block.
     #[wasm_bindgen]
     pub struct BrowserNoteTree {
         tree: NoteTree,
@@ -1419,6 +1526,15 @@ mod wasm {
             Self {
                 tree: NoteTree::new(),
             }
+        }
+
+        /// The tree of a `TreeSnapshot` (JSON `{root, next_note_id, leaves}`)
+        /// read from the vault at one block hash; refused with
+        /// `tree_root_mismatch` unless the leaves reproduce the root.
+        pub fn from_state(snapshot_json: &str) -> std::result::Result<BrowserNoteTree, JsValue> {
+            Ok(Self {
+                tree: NoteTree::from_state(decode(snapshot_json)?).map_err(js_anyhow)?,
+            })
         }
 
         /// Apply one `TreeEvent` (JSON) and return the new root (JSON felt).

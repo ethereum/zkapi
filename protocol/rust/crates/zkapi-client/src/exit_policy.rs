@@ -1,4 +1,4 @@
-//! Exit decisions of circuit `zkapi-v2-concession-v1` (design §6.3 C4 and
+//! Exit decisions of circuit `zkapi-v2-concession-v2` (design §6.3 C4 and
 //! §6.4 E0–E6) as pure functions of local facts.
 //!
 //! Nothing here reads the network or the clock: callers pass `now`, the

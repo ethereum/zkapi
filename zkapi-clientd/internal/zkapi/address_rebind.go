@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"net/http"
 	"os"
 	"slices"
@@ -12,10 +14,12 @@ import (
 )
 
 // RebindDeposit repairs a saved deposit's note binding from finalized vault
-// state and the indexer snapshot, for example after an RPC reported the wrong
-// note ID, or a revert for a deposit that landed. Only the note ID and expiry
-// can change: the secret, commitment and amount come from this daemon's own
-// journal. A companion note is replaced only when the caller names it and it
+// state, for example after an RPC reported the wrong note ID, or a revert for
+// a deposit that landed. Only the note ID and expiry can change: the secret,
+// commitment and amount come from this daemon's own journal. A vault of
+// revision 4 stores only each note's leaf, which commits to the note ID, the
+// commitment, the amount and the expiry, so the expiry is the bucketed day
+// whose leaf is the stored one (rebindExpiry). A companion note is replaced only when the caller names it and it
 // is an unspent genesis note of exactly this amount, with no pending request.
 // A withdrawal reservation of that note is first released through the
 // companion, which refuses while the withdrawal has a plan or the server
@@ -124,12 +128,14 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 		if !found && deposit.Slot != nil {
 			// Without a usable receipt, only our exact leaf from a slot this
 			// note's deposits were built for, earliest first, identifies it.
+			// The search reads the vault's leaves at the finalized block; the
+			// indexer is not needed.
 			ttl, err := h.noteTTL()
 			if err != nil {
 				return AddressFundingStatus{}, err
 			}
 			slots := append(signedDepositSlots(deposit, record), *deposit.Slot)
-			if snapshot, err := h.indexerSnapshot(ctx, config); err == nil && h.snapshotChainTime(ctx, config, snapshot) == nil {
+			if snapshot, err := h.finalizedLeafSnapshot(ctx, config, slots); err == nil {
 				candidate, found = findSignedDepositLeaf(snapshot, slots, commitment, deposit.Amount, ttl, snapshot.Time)
 			}
 		}
@@ -138,8 +144,8 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 		}
 	}
 
-	// Finalized vault state and the indexer must both hold exactly this
-	// deposit at the candidate note. Expiry is taken from the vault; an
+	// Finalized vault state must hold exactly this deposit at the candidate
+	// note: an Active note whose stored leaf is ours for one expiry. An
 	// active note remains closable after its expiry, so it is not required
 	// to be in the future.
 	finalizedNumber, finalizedHash, err := h.finalizedBlock(ctx, config)
@@ -150,24 +156,41 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 	if err != nil {
 		return AddressFundingStatus{}, err
 	}
-	if note.Status != noteActive || !strings.EqualFold(note.Commitment, "0x"+addressABIWord(deposit.Commitment)) || note.Amount != deposit.Amount {
-		guidance := "nothing was changed"
-		if automatic {
-			guidance = "compare the deposit on a block explorer and rerun with --note-id"
-		}
+	guidance := "nothing was changed"
+	if automatic {
+		guidance = "compare the deposit on a block explorer and rerun with --note-id"
+	}
+	if note.Status != noteActive {
 		return AddressFundingStatus{}, fmt.Errorf("finalized vault note %d does not hold this active deposit; %s", candidate, guidance)
 	}
-	expiry := note.ExpiryTs
-	if deposit.Rebind != nil && deposit.Rebind.ExpiryTs != expiry {
-		return AddressFundingStatus{}, errors.New("the saved rebind no longer matches finalized vault state; preserve recovery files")
+	var receiptExpiries []uint64
+	for _, entry := range saved {
+		if id, receiptExpiry, ok := receiptNote(entry); ok && id == candidate {
+			receiptExpiries = append(receiptExpiries, receiptExpiry)
+		}
 	}
-	snapshot, err := h.confirmedSnapshot(ctx, config, finalizedNumber)
+	expiry, found, err := h.rebindExpiry(ctx, config, note, candidate, commitment, deposit, record, receiptExpiries, finalizedNumber, finalizedHash)
 	if err != nil {
-		return AddressFundingStatus{}, fmt.Errorf("the zkAPI indexer has not confirmed note %d yet; retry shortly (%v)", candidate, err)
+		return AddressFundingStatus{}, err
 	}
-	leaf, present, err := snapshot.leaf(candidate)
-	if err != nil || !present || leaf.Cmp(noteLeaf(candidate, commitment, deposit.Amount, expiry)) != 0 {
-		return AddressFundingStatus{}, fmt.Errorf("the zkAPI indexer does not show this deposit at note %d; nothing was changed", candidate)
+	if !found {
+		if deposit.Rebind != nil {
+			return AddressFundingStatus{}, errors.New("the saved rebind no longer matches finalized vault state; preserve recovery files")
+		}
+		// The slot holds another deposit (another commitment or amount), or
+		// ours from outside the searched days.
+		return AddressFundingStatus{}, fmt.Errorf("finalized vault note %d does not hold this active deposit; %s", candidate, guidance)
+	}
+	// The indexer only corroborates: a view that has applied the finalized
+	// block must show the same leaf, and a lagging or unavailable one is
+	// skipped.
+	indexerBlock := uint64(0)
+	if snapshot, err := h.confirmedSnapshot(ctx, config, finalizedNumber); err == nil {
+		leaf, present, err := snapshot.leaf(candidate)
+		if err != nil || !present || leaf.Cmp(note.Leaf) != 0 {
+			return AddressFundingStatus{}, fmt.Errorf("the zkAPI indexer does not show this deposit at note %d; nothing was changed", candidate)
+		}
+		indexerBlock = snapshot.BlockNumber
 	}
 	// A saved transaction is the target only when its own receipt names the
 	// verified note; any other final saved deposit is retired below.
@@ -183,7 +206,7 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 		return AddressFundingStatus{}, err
 	}
 
-	deposit.Binding = &depositBinding{NoteID: candidate, ExpiryTs: expiry, BlockNumber: finalizedNumber, BlockHash: finalizedHash, IndexerBlock: snapshot.BlockNumber}
+	deposit.Binding = &depositBinding{NoteID: candidate, ExpiryTs: expiry, BlockNumber: finalizedNumber, BlockHash: finalizedHash, IndexerBlock: indexerBlock}
 	deposit.Active, deposit.Rebind = true, nil
 	if deposit.TransactionHash == "" {
 		deposit.TransactionHash = targetHash
@@ -218,6 +241,74 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 	}
 	_, _, status, err := h.addressSnapshot(ctx)
 	return status, err
+}
+
+// rebindExpiry finds the expiry of our deposit at the candidate note: the e
+// for which noteLeaf(candidate, commitment, amount, e) is the vault's stored
+// leaf. A resumed rebind tries only its journaled expiry. Otherwise the
+// expiries of saved receipts that name the candidate are tried first, then
+// every day bucket ceil((t + noteTtl) / 1 day) · 1 day for a deposit mined t
+// between the earliest preparation of this note's deposits (less a day; the
+// last 64 days without one) and the finalized block's time (plausibleExpiries:
+// normally one or two days, at most 66 Poseidon permutations). found is false
+// when none matches: the slot holds another deposit.
+func (h *FundingHandler) rebindExpiry(ctx context.Context, config fundingConfig, note vaultNoteState, candidate uint32, commitment *big.Int, deposit *depositRecord, record *addressFundingRecord, receiptExpiries []uint64, finalizedNumber uint64, finalizedHash string) (uint64, bool, error) {
+	if deposit.Rebind != nil {
+		expiry := deposit.Rebind.ExpiryTs
+		return expiry, note.holds(candidate, commitment, deposit.Amount, expiry), nil
+	}
+	for _, expiry := range receiptExpiries {
+		if note.holds(candidate, commitment, deposit.Amount, expiry) {
+			return expiry, true, nil
+		}
+	}
+	ttl, err := h.noteTTL()
+	if err != nil {
+		return 0, false, err
+	}
+	now, err := h.blockTime(ctx, config, finalizedNumber, finalizedHash)
+	if err != nil {
+		return 0, false, err
+	}
+	from := int64(0)
+	if deposit.Slot != nil {
+		slots := append(signedDepositSlots(deposit, record), *deposit.Slot)
+		from = slots[0].searchFrom()
+		for _, slot := range slots[1:] {
+			from = min(from, slot.searchFrom())
+		}
+	}
+	for _, expiry := range plausibleExpiries(from, now, ttl) {
+		if note.holds(candidate, commitment, deposit.Amount, expiry) {
+			return expiry, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// finalizedLeafSnapshot reads the vault's leaves at the finalized block, by
+// hash, for the slot search from slots (findSignedDepositLeaf): from the
+// lowest slot's run of empty slots to two pages of leaves beyond the highest
+// slot, with the finalized block's time.
+func (h *FundingHandler) finalizedLeafSnapshot(ctx context.Context, config fundingConfig, slots []depositSlot) (*treeSnapshot, error) {
+	number, hash, err := h.finalizedBlock(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	from, to := uint32(math.MaxUint32), uint32(0)
+	for _, slot := range slots {
+		from = min(from, slot.NoteID-min(slot.EmptyBefore, slot.NoteID))
+		to = max(to, slot.NoteID)
+	}
+	to = uint32(min(uint64(to)+2*noteLeavesPage, math.MaxUint32))
+	snapshot, err := h.vaultLeafSnapshot(ctx, config, number, hash, from, to)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot.Time, err = h.blockTime(ctx, config, number, hash); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
 }
 
 func pendingDepositHash(record *addressFundingRecord) string {

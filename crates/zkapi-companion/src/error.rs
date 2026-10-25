@@ -68,6 +68,10 @@ pub enum AuthError {
     DeviceNotNewest,
     #[error("exit_lock_conflict: {0}")]
     ExitLockConflict(String),
+    /// The vault does not show the deposited note yet (an empty
+    /// `noteRecord`), or its record could not be read: retry.
+    #[error("deposit_pending: {0}")]
+    DepositPending(String),
     #[error("this note state is reserved for a withdrawal: the server holds a clearance for its nullifier (an earlier withdrawal reserved it, or the operator released a stuck state) and refuses every request at it as a replay, so no chat request can settle this state; withdraw the balance by mutual close (in zkapi-clientd: config --menu, then withdraw), which sets the refused request aside first")]
     ClearanceReservedState,
 }
@@ -102,6 +106,7 @@ impl AuthError {
             Self::Wallet(_) | Self::Indexer(_) | Self::Upstream(_) | Self::KeyVerification(_) => {
                 StatusCode::BAD_GATEWAY
             }
+            Self::DepositPending(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -136,6 +141,7 @@ impl AuthError {
             Self::ConcededMismatch(_) => "conceded_mismatch",
             Self::DeviceNotNewest => "device_not_newest",
             Self::ExitLockConflict(_) => "exit_lock_conflict",
+            Self::DepositPending(_) => "deposit_pending",
         }
     }
 

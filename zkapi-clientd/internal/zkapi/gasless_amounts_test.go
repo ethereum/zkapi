@@ -85,8 +85,11 @@ func TestGaslessPreVerificationGasParity(t *testing.T) {
 		handleOpsBytes         int
 	}{
 		// A (LIM-070 term), B (reference minimum), PVG, handleOps bytes (C = 21,000 + 16 × bytes + 10,000)
-		{"close with initCode", closeWithInit, 66_316, 52_668, 66_316, 1_764},
-		{"close without initCode", &closeWithout, 65_356, 51_696, 65_356, 1_668},
+		// The revision-4 close carries the note leaf and the packed note
+		// fields (words 3 and 8): its non-zero bytes cost 72 gas more than
+		// the revision-3 close's in both A and B.
+		{"close with initCode", closeWithInit, 66_388, 52_740, 66_388, 1_764},
+		{"close without initCode", &closeWithout, 65_428, 51_768, 65_428, 1_668},
 		{"forward", &forward, 57_904, 44_136, 57_904, 804},
 		{"finalize", &finalize, 57_956, 44_196, 57_956, 868},
 	} {
@@ -124,7 +127,11 @@ func TestGaslessPreVerificationGasParity(t *testing.T) {
 // the cap) is what that bundler requires: it is adopted in the quote's
 // amounts and in the signed operation, which the approval binds; one above
 // the cap is refused; one below the client's own is ignored.
-func TestGaslessQuoteAdoptsTheBundlersPreVerificationGas(t *testing.T) {
+// The bundler's estimate is asked with the real operation only once it is
+// approved (a quote shows a bundler nothing executable, and a real bundler
+// declines the quote's probe): the approval adopts a higher
+// preVerificationGas within the cap, and refuses an estimate above a cap.
+func TestGaslessApprovalAdoptsTheBundlersPreVerificationGas(t *testing.T) {
 	f, g := newGaslessWithdrawalFixture(t)
 	policy := g.profile.GasPolicy
 	estimate := func(pvg uint64) map[string]string {
@@ -138,11 +145,8 @@ func TestGaslessQuoteAdoptsTheBundlersPreVerificationGas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	maxFee, _ := new(big.Int).SetString(quote.MaxFeePerGas, 10)
-	gas := quote.UserOpGas
-	maxCost := new(big.Int).Mul(new(big.Int).SetUint64(gas.PreVerificationGas+gas.VerificationGasLimit+gas.CallGasLimit+gas.PaymasterVerificationGasLimit+gas.PaymasterPostOpGasLimit), maxFee)
-	if gas.PreVerificationGas != wanted || quote.FeeCapWei != new(big.Int).Add(maxCost, g.flatFee).String() {
-		t.Fatalf("the bundler's preVerificationGas was not adopted: %+v", quote)
+	if quote.UserOpGas.PreVerificationGas == wanted || g.estimatesDeclined == 0 {
+		t.Fatalf("the quote's probe was estimated as the real operation: %+v", quote.UserOpGas)
 	}
 	status, err := f.h.ApproveAddressWithdrawal(payoutContext(payoutFees), quote.ID)
 	if err != nil || status.Phase != "op_submitted" {
@@ -156,7 +160,11 @@ func TestGaslessQuoteAdoptsTheBundlersPreVerificationGas(t *testing.T) {
 	f2.mu.Lock()
 	g2.estimate = estimate(policy.PVGCap + 1)
 	f2.mu.Unlock()
-	if _, err := f2.h.QuoteAddressWithdrawal(payoutContext(payoutFees), withdrawalTestDestination, f2.noteID, "", false); GaslessRefusalCode(err) != "gasless_estimate_above_cap" {
+	quote2, err := f2.h.QuoteAddressWithdrawal(payoutContext(payoutFees), withdrawalTestDestination, f2.noteID, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f2.h.ApproveAddressWithdrawal(payoutContext(payoutFees), quote2.ID); GaslessRefusalCode(err) != "gasless_estimate_above_cap" || len(g2.sends) != 0 {
 		t.Fatalf("an estimate above the cap: %v", err)
 	}
 	// Below the client's own: ignored, the shared rule's figure is quoted
