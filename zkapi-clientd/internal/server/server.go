@@ -86,13 +86,16 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []byte(`{"status":"ok"}`))
 		return
 	}
-	keylessInference := !a.RequireAPIKey && (r.URL.Path == "/v1/models" || r.URL.Path == "/v1/chat/completions")
-	if keylessInference {
+	keylessInference := !a.RequireAPIKey && (r.URL.Path == "/v1/models" || r.URL.Path == "/v1/chat/completions" || r.URL.Path == DelegatePath)
+	// Delegation is a local-agent route: it requires a loopback peer and Host
+	// even when a bearer key is configured.
+	if keylessInference || r.URL.Path == DelegatePath {
 		if !localInferenceRequest(r) {
 			writeError(w, 403, "local_connection_required", "Connect to this API through localhost.")
 			return
 		}
-	} else {
+	}
+	if !keylessInference {
 		header := r.Header.Get("Authorization")
 		key := sha256.Sum256([]byte(strings.TrimPrefix(header, "Bearer ")))
 		if !strings.HasPrefix(header, "Bearer ") || subtle.ConstantTimeCompare(key[:], a.key[:]) != 1 {
@@ -137,7 +140,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, data)
 	case r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost:
 		a.complete(w, r)
-	case r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/models":
+	case r.URL.Path == DelegatePath && r.Method == http.MethodPost:
+		a.delegate(w, r)
+	case r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/models" || r.URL.Path == DelegatePath:
 		writeError(w, 405, "method_not_allowed", "Method not allowed.")
 	default:
 		writeError(w, 404, "not_found", "Use /v1/models or /v1/chat/completions.")

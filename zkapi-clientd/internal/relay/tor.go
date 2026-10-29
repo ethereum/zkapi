@@ -27,3 +27,11 @@ func NewTorIdentity() (string, error) {
 func WithTorIdentity(ctx context.Context, identity string) context.Context {
 	return context.WithValue(ctx, torIdentityKey{}, identity)
 }
+
+// TorIdentity reports the isolation identity scoped to ctx, if any. It lets
+// callers and tests confirm which identity a request carries; it never
+// creates one.
+func TorIdentity(ctx context.Context) string {
+	identity, _ := ctx.Value(torIdentityKey{}).(string)
+	return identity
+}

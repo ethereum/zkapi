@@ -34,3 +34,5 @@ internal/zkapi/rewriter.go
 internal/zkapi/rewriter_reuse_test.go
 internal/zkapi/rewriter_safety_test.go
 internal/zkapi/rewriter_test.go
+internal/server/delegate.go
+internal/server/delegate_test.go

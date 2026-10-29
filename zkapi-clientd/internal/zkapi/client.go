@@ -70,6 +70,9 @@ type Client struct {
 	// them nil and always uses the packaged deployment manifest.
 	endpoints    *chainEndpoints
 	capabilities *deploymentCapabilities
+	// prepareTor opens the isolated SOCKS stream a delegation requires before
+	// any lease; nil uses relay.PrepareTor. Tests substitute a local fake.
+	prepareTor func(ctx context.Context, endpoint, destination, identity string) error
 }
 
 // chainEndpoints are the packaged deployment's remote origins. The payment RPC
@@ -423,7 +426,7 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 			return nil, err
 		}
 	}
-	lease, err := c.waitForLease(ctx, body)
+	lease, err := c.waitForLease(ctx, body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -496,7 +499,10 @@ type reusableLease struct {
 	until  time.Time
 }
 
-func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (providerLease, error) {
+// waitForLease acquires the request's key. With reuse false (delegation), it
+// neither consumes nor leaves a cached key: the lease is fresh and its group
+// retires as soon as the response slot is released.
+func (c *Client) waitForLease(ctx context.Context, body json.RawMessage, reuse bool) (providerLease, error) {
 	waiting, retirementAttempted := false, false
 	for {
 		if err := ctx.Err(); err != nil {
@@ -513,7 +519,7 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 		}
 		// Refresh public model policy even for cached access. A window never
 		// slides, and a different coarse cap cannot expand an existing key.
-		if cached := c.cachedLease; cached != nil && c.config.KeyReuseWindow > 0 &&
+		if cached := c.cachedLease; reuse && cached != nil && c.config.KeyReuseWindow > 0 &&
 			cached.budget == limit && c.now().Before(cached.until) {
 			activity.Diagnostic(ctx, "key=%d reused (within expiry/window and budget)", cached.serial)
 			activity.Report(ctx, activity.Event{Kind: activity.KeyReused, Key: cached.serial})
@@ -529,7 +535,7 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 			if err != nil {
 				return providerLease{}, err
 			}
-			accepted, err := c.acceptLease(lease, limit)
+			accepted, err := c.acceptLease(lease, limit, reuse)
 			if err == nil {
 				activity.Diagnostic(ctx, "payment: key=%d acquired; actual ETH charge reported after settlement", accepted.serial)
 				activity.Report(ctx, activity.Event{Kind: activity.KeyFresh, Key: accepted.serial})
@@ -605,7 +611,7 @@ func (c *Client) retireLease(ctx context.Context) error {
 
 // A newly handed-out lease is distinct from intentional in-memory reuse. Keep
 // rejecting a companion that returns a previous key, including after eviction.
-func (c *Client) acceptLease(raw json.RawMessage, budget uint64) (providerLease, error) {
+func (c *Client) acceptLease(raw json.RawMessage, budget uint64, reuse bool) (providerLease, error) {
 	var lease providerLease
 	now := c.now()
 	if json.Unmarshal(raw, &lease) != nil || !usableVerification(lease.Verified, lease.VerificationStatus, lease.VerificationDetail) || lease.APIKey == "" || strings.ContainsAny(lease.APIKey, "\r\n") || lease.ExpiresAt <= uint64(now.Unix()+1) || lease.ExpiresAt > 1<<63-1 || strings.TrimRight(lease.BaseURL, "/") != c.config.InferenceBaseURL {
@@ -625,12 +631,17 @@ func (c *Client) acceptLease(raw json.RawMessage, budget uint64) (providerLease,
 	c.usedLeases[hash] = lease.ExpiresAt
 	c.keySerial++
 	lease.serial = c.keySerial
-	until := now.Add(c.config.KeyReuseWindow)
+	window := c.config.KeyReuseWindow
+	if !reuse {
+		window = 0
+	}
+	until := now.Add(window)
 	if expiry := time.Unix(int64(lease.ExpiresAt)-1, 0); expiry.Before(until) {
 		until = expiry
 	}
 	c.leaseGroup = &leaseGroup{serial: lease.serial, until: until}
-	if c.config.KeyReuseWindow > 0 {
+	c.cachedLease = nil
+	if window > 0 {
 		c.cachedLease = &reusableLease{providerLease: lease, budget: budget, until: until}
 	}
 	select {
