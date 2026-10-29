@@ -188,3 +188,62 @@ func TestConfigSettingsWebSearch(t *testing.T) {
 		t.Fatal("invalid web search edit changed the profile", err)
 	}
 }
+
+// config --billing-mode is a saved setting on its own: the config dispatch
+// handles it (no setup parser, wallet or funding), switching back works, and
+// an invalid value changes nothing.
+func TestConfigSettingsBillingMode(t *testing.T) {
+	dir, original := startTestConfig(t)
+	status := func() string {
+		var out bytes.Buffer
+		if handled, err := runConfigSettings(dir, []string{"--status"}, &out); !handled || err != nil {
+			t.Fatal("status failed", err)
+		}
+		var saved struct {
+			BillingMode string `json:"billing_mode"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &saved); err != nil {
+			t.Fatal(err)
+		}
+		return saved.BillingMode
+	}
+	if status() != "metered" {
+		t.Fatal("the default billing mode is not metered")
+	}
+	for _, mode := range []string{"ticket", "metered", "ticket"} {
+		for _, args := range [][]string{{"--billing-mode", mode}, {"--billing-mode=" + mode}} {
+			if handled, err := runConfigSettings(dir, args, &bytes.Buffer{}); !handled || err != nil {
+				t.Fatalf("billing mode %v: handled=%v err=%v", args, handled, err)
+			}
+			saved, err := config.Load(dir)
+			if err != nil || saved.BillingMode != mode || saved.APIKey != original.APIKey || saved.ZKAPI != original.ZKAPI {
+				t.Fatal("billing mode edit lost the mode or changed wallet settings", err)
+			}
+			if status() != mode {
+				t.Fatal("status does not show the saved billing mode")
+			}
+		}
+	}
+	for _, name := range []string{"funding", "zkapi"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("billing mode edit started wallet setup: %s", name)
+		}
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"--billing-mode", "prepaid"}, {"--billing-mode", "ticket", "--web-search=invalid"}} {
+		if handled, err := runConfigSettings(dir, args, &bytes.Buffer{}); !handled || err == nil {
+			t.Fatalf("invalid edit %v was not rejected", args)
+		}
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("an invalid billing mode edit changed the profile", err)
+	}
+	// It is a saved setting, not a wallet setup option.
+	if handled, err := runConfigSettings(dir, []string{"--setup", "--billing-mode", "ticket"}, &bytes.Buffer{}); !handled || err == nil {
+		t.Fatal("--billing-mode was accepted beside --setup")
+	}
+}

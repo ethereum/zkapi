@@ -26,6 +26,9 @@ const settingsHelp = `Saved settings (stop serve before edits; no setup or payme
   config --cover-urls 'https://permitted.example/resource'
          [--cover-rate 5] [--cover-concurrency 4]
   config --clear-cover
+  config --billing-mode metered|ticket  (default: metered; ticket buys one
+         fixed-price ticket per request, settled when bought, so requests
+         run concurrently; see docs/CLI_ZKAPI.md)
   config                   Pretty-printed saved config (credentials redacted)
   config --setup           Explicit wallet setup/funding
 These edits can include --relay-url, --key-reuse-window-seconds,
@@ -104,7 +107,7 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	for _, arg := range args {
 		name := strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]
 		switch name {
-		case "web-search", "rewriter-instruction-file", "rewriter-default-instruction", "network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "relay-url", "listen", "require-api-key", "key-reuse-window-seconds", "status", "vault-protocol", "model", "clear-model", "rewriter-url", "rewriter-model", "rewriter-api-key-env", "rewriter-clear-api-key", "rewriter-notice", "clear-rewriter", "cover-urls", "cover-rate", "cover-concurrency", "clear-cover":
+		case "web-search", "rewriter-instruction-file", "rewriter-default-instruction", "network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "relay-url", "listen", "require-api-key", "key-reuse-window-seconds", "billing-mode", "status", "vault-protocol", "model", "clear-model", "rewriter-url", "rewriter-model", "rewriter-api-key-env", "rewriter-clear-api-key", "rewriter-notice", "clear-rewriter", "cover-urls", "cover-rate", "cover-concurrency", "clear-cover":
 			selected = true
 		}
 	}
@@ -131,6 +134,7 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	clearCover := f.Bool("clear-cover", false, "disable cover")
 	relay := f.String("relay-url", "", "saved routing endpoint")
 	reuse := f.Int("key-reuse-window-seconds", config.DefaultKeyReuseWindowSeconds, "key reuse window")
+	billing := f.String("billing-mode", "metered", "metered (settle each key from usage) or ticket (fixed-price tickets, concurrent requests)")
 	listen := f.String("listen", "", "local listener")
 	requireKey := f.Bool("require-api-key", false, "require local inference key")
 	webSearch := f.Bool("web-search", true, "automatically enable OpenRouter web search (search charges apply)")
@@ -286,6 +290,9 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	}
 	if seen["key-reuse-window-seconds"] {
 		next.KeyReuseWindowSeconds = *reuse
+	}
+	if seen["billing-mode"] {
+		next.BillingMode = *billing
 	}
 	if seen["listen"] {
 		next.Listen = *listen

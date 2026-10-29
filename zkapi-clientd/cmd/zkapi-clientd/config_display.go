@@ -37,6 +37,9 @@ func printSavedConfig(dir string, out io.Writer) error {
 	values["management_token"] = redactCredential(c.ManagementToken)
 	values["api_key"] = redactCredential(c.APIKey)
 	values["vault_protocol"] = protocol
+	if c.BillingMode == "" {
+		values["billing_mode"] = "metered"
+	}
 	values["rewriter"] = map[string]any{"url": safeConfigURL(c.Rewriter.URL), "model": c.Rewriter.Model, "api_key": redactCredential(c.Rewriter.APIKey), "notice": c.Rewriter.Notice, "instruction": c.Rewriter.EffectiveInstruction(), "instruction_source": "default"}
 	if c.Rewriter.Instruction != "" {
 		values["rewriter"].(map[string]any)["instruction_source"] = "custom"

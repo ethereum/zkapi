@@ -95,7 +95,10 @@ type Config struct {
 	VerifierURL           string `json:"verifier_url"`
 	RelayURL              string `json:"relay_url"` // empty: direct; wss: Wisp; socks5: proxy; tor: conversation isolation
 	Concurrency           int    `json:"concurrency"`
-	ZKAPI                 ZKAPI  `json:"zkapi"`
+	// BillingMode is "metered" (the default when empty) or "ticket":
+	// fixed-price tickets that settle when bought and run concurrently.
+	BillingMode string `json:"billing_mode,omitempty"`
+	ZKAPI       ZKAPI  `json:"zkapi"`
 }
 
 // ValidModelID excludes whitespace and terminal control characters.
@@ -185,6 +188,9 @@ func Validate(c Config) error {
 	}
 	if c.DefaultModel != "" && !ValidModelID(c.DefaultModel) {
 		return errors.New("invalid default model ID")
+	}
+	if c.BillingMode != "" && c.BillingMode != "metered" && c.BillingMode != "ticket" {
+		return errors.New("billing_mode must be metered or ticket")
 	}
 	if c.KeyReuseWindowSeconds < 0 || c.KeyReuseWindowSeconds > MaxKeyReuseWindowSeconds {
 		return errors.New("key_reuse_window_seconds must be between 0 and 300 (0 disables reuse)")

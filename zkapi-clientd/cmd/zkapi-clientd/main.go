@@ -259,7 +259,7 @@ func serveConfig(c config.Config, args []string) (config.Config, error) {
 }
 
 func zkConfig(c config.Config, client *http.Client) zkapi.Config {
-	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL), TorEndpoint: c.RelayURL, Rewriter: c.Rewriter, ExitRPCURL: c.ZKAPI.ExitRPCURL, BundlerURL: c.ZKAPI.BundlerURL}
+	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL), TorEndpoint: c.RelayURL, Rewriter: c.Rewriter, ExitRPCURL: c.ZKAPI.ExitRPCURL, BundlerURL: c.ZKAPI.BundlerURL, BillingMode: c.BillingMode}
 }
 
 type zkInference struct{ *zkapi.Client }
@@ -418,6 +418,21 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 			logger.Printf("zkAPI deployment check: %v", err)
 		}
 	}()
+	if c.BillingMode == zkapi.BillingTicket {
+		// No request of this process uses a ticket yet: return any claim an
+		// earlier run left to the companion's inventory once it is ready.
+		go func() {
+			for attempt := 0; attempt < 30 && life.Err() == nil; attempt++ {
+				releaseCtx, cancel := context.WithTimeout(life, 20*time.Second)
+				err := wallet.ReleaseTicketClaims(releaseCtx)
+				cancel()
+				if err == nil {
+					return
+				}
+				time.Sleep(2 * time.Second)
+			}
+		}()
+	}
 	api, err := server.New(backend, c.APIKey, c.Concurrency)
 	if err != nil {
 		return err
@@ -475,6 +490,9 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 		logger.Printf("Ephemeral key reuse enabled for up to %d seconds: different chats and local clients can share a key and spending cap. Run zkapi-clientd config --key-reuse-window-seconds 0 to isolate every request", c.KeyReuseWindowSeconds)
 	} else {
 		logger.Print("Ephemeral key isolation: fresh OpenRouter key for every completion, including background UI requests")
+	}
+	if c.BillingMode == zkapi.BillingTicket {
+		logger.Printf("Billing: fixed-price tickets; each settles when bought and up to %d requests run at once", c.Concurrency)
 	}
 	logger.Print("Request key_ref numbers identify keys within this process. Wallet session numbers track settlement separately; settled cost can arrive after the response ends")
 	statusDone := make(chan struct{})
