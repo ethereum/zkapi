@@ -87,6 +87,10 @@ pub fn build_router_with_token(service: Arc<AuthService>, token: Option<String>)
         .route("/oa/v1/status", get(oa_bridge_status))
         .route("/oa/v1/session-events", get(oa_session_events))
         .route("/oa/v1/lease", post(oa_bridge_lease))
+        .route("/oa/v1/tickets", get(oa_ticket_catalog))
+        .route("/oa/v1/ticket", post(oa_buy_ticket))
+        .route("/oa/v1/ticket/release", post(oa_release_ticket))
+        .route("/oa/v1/tickets/release-all", post(oa_release_all_tickets))
         .route("/oa/v1/billing/quote", get(oa_billing_quote))
         .route("/oa/v1/withdraw/status", get(oa_withdrawal_status))
         .route("/oa/v1/withdraw/prepare", post(oa_prepare_withdrawal))
@@ -213,6 +217,73 @@ async fn oa_bridge_lease(
         .await
     {
         Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+/// The tiers on sale and this wallet's paid tickets (no keys).
+async fn oa_ticket_catalog(State(service): State<Arc<AuthService>>) -> Response {
+    let catalog = match service.ticket_catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => return generic_error(error),
+    };
+    match service.ticket_inventory().await {
+        Ok(inventory) => {
+            Json(serde_json::json!({"catalog": catalog, "inventory": inventory})).into_response()
+        }
+        Err(error) => generic_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OaTicketBody {
+    /// The exact terms chosen from `GET /oa/v1/tickets`.
+    terms: zkapi_types::wire::TicketTermsV1,
+    /// The caller's idempotency key: a retry with the same ID returns the
+    /// same ticket and never buys another.
+    purchase_id: String,
+}
+
+/// Hand out a fixed-price ticket, buying one when the inventory holds none.
+/// Its successor is installed before the key is returned, so the next
+/// purchase can start at once while this key is used.
+async fn oa_buy_ticket(
+    State(service): State<Arc<AuthService>>,
+    Json(body): Json<OaTicketBody>,
+) -> Response {
+    match service.buy_ticket(&body.terms, &body.purchase_id).await {
+        Ok(ticket) => Json(ticket).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OaTicketReleaseBody {
+    client_request_id: String,
+    purchase_id: String,
+    /// Erase the key (the default: one ticket per request); false returns
+    /// the ticket for reuse.
+    consume: bool,
+}
+
+async fn oa_release_ticket(
+    State(service): State<Arc<AuthService>>,
+    Json(body): Json<OaTicketReleaseBody>,
+) -> Response {
+    match service
+        .release_ticket(&body.client_request_id, &body.purchase_id, body.consume)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({"released": true})).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+async fn oa_release_all_tickets(State(service): State<Arc<AuthService>>) -> Response {
+    match service.release_all_tickets().await {
+        Ok(released) => Json(serde_json::json!({"released": released})).into_response(),
         Err(error) => generic_error(error),
     }
 }

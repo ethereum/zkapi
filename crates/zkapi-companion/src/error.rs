@@ -74,6 +74,12 @@ pub enum AuthError {
     DepositPending(String),
     #[error("this note state is reserved for a withdrawal: the server holds a clearance for its nullifier (an earlier withdrawal reserved it, or the operator released a stuck state) and refuses every request at it as a replay, so no chat request can settle this state; withdraw the balance by mutual close (in zkapi-clientd: config --menu, then withdraw), which sets the refused request aside first")]
     ClearanceReservedState,
+    #[error("the protocol server sells no fixed-price tickets")]
+    TicketsUnavailable,
+    #[error("the protocol server sells no ticket tier {0}")]
+    TicketTierUnavailable(u32),
+    #[error("ticket tier {0} is now sold at other terms; read the catalog and choose again")]
+    TicketTermsChanged(u32),
 }
 
 impl AuthError {
@@ -107,6 +113,8 @@ impl AuthError {
                 StatusCode::BAD_GATEWAY
             }
             Self::DepositPending(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TicketsUnavailable | Self::TicketTierUnavailable(_) => StatusCode::BAD_REQUEST,
+            Self::TicketTermsChanged(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -131,6 +139,9 @@ impl AuthError {
             Self::Serialization(_) => "serialization_error",
             Self::ReceiptJournalMissing(_) => "receipt_journal_missing",
             Self::ClearanceReservedState => "clearance_reserved_state",
+            Self::TicketsUnavailable => "tickets_unavailable",
+            Self::TicketTierUnavailable(_) => "ticket_tier_unavailable",
+            Self::TicketTermsChanged(_) => "ticket_terms_changed",
             Self::OwnershipProofSent => "ownership_proof_sent",
             Self::BoundFixedAtState { .. } => "bound_fixed_at_state",
             Self::ExitLocked => "exit_locked",

@@ -498,7 +498,7 @@ struct OpenRouterLeaseExtensions {
     billing_quote: Option<crate::oa_native::Quote>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OaKeyVerificationEvidence {
     verifier_url: String,
     station_id: String,
@@ -751,7 +751,13 @@ pub struct AuthService {
     prepared_withdrawal: tokio::sync::Mutex<Option<WithdrawalPlan>>,
     oa_banned_stations: Mutex<std::collections::HashSet<String>>,
     oa_session_events: Arc<crate::oa_events::SessionEvents>,
+    /// Serializes ticket purchases; never held during inference.
+    ticket_mutex: tokio::sync::Mutex<()>,
 }
+
+#[path = "tickets.rs"]
+mod tickets;
+pub use tickets::{InventorySummary, TicketPurchase};
 
 impl AuthService {
     pub fn new(config: AuthConfig) -> Result<Arc<Self>, AuthError> {
@@ -771,6 +777,7 @@ impl AuthService {
             prepared_withdrawal: tokio::sync::Mutex::new(prepared_withdrawal),
             oa_banned_stations: Mutex::new(Default::default()),
             oa_session_events: Arc::new(crate::oa_events::SessionEvents::new()),
+            ticket_mutex: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -829,6 +836,8 @@ impl AuthService {
             "settlement_window_seconds": self.config.settlement_window_seconds,
             "escape_routes_version": 2,
             "session_events_version": 1,
+            // /oa/v1/tickets and /oa/v1/ticket: fixed-price tickets.
+            "tickets_version": 1,
             "deployment_id": self.config.deployment_id,
             "contract_address": self.config.contract_address,
             "billing_asset": self.config.billing_asset,
@@ -1741,6 +1750,24 @@ impl AuthService {
     /// child key immediately, so withdrawal charges measured usage without
     /// waiting for the provider-enforced lease expiry.
     pub async fn settle_for_withdrawal(&self) -> Result<WalletStatus, AuthError> {
+        // A ticket bought with a lost reply is paid: finish it (the server
+        // replays its successor and key) rather than retire it. This takes
+        // the purchase lock, so it runs before the request lock.
+        if self.config.request_mode == RequestMode::DirectOpenrouter
+            && self.config.billing_asset == "native_eth"
+            && self.pending_ticket().await?
+        {
+            if self.finish_pending_ticket().await? {
+                tracing::info!("finished a pending ticket purchase into the ticket inventory before settlement");
+            }
+        }
+        self.settle_metered_for_withdrawal().await
+    }
+
+    /// `settle_for_withdrawal` after any pending ticket is finished; a
+    /// ticket purchase calls it (under its purchase lock) to retire the
+    /// metered lease holding the state.
+    pub(crate) async fn settle_metered_for_withdrawal(&self) -> Result<WalletStatus, AuthError> {
         let _request_guard = self.direct_request_mutex.write().await;
 
         if self.config.request_mode == RequestMode::DirectOpenrouter {
@@ -1985,6 +2012,18 @@ impl AuthService {
             return Ok(());
         }
 
+        if self.config.billing_asset == "native_eth" && self.pending_ticket().await? {
+            // Never wait for a purchase while holding the lease slot.
+            let Ok(_purchase) = self.ticket_mutex.try_lock() else {
+                return Err(AuthError::LeasePending(
+                    "a ticket purchase is in progress".into(),
+                ));
+            };
+            drop(_purchase);
+            if self.finish_pending_ticket().await? {
+                tracing::warn!("finished a paid ticket purchase into the ticket inventory before a metered lease");
+            }
+        }
         if let Some(finished) = lease_slot.take() {
             tracing::info!(
                 client_request_id = %finished.client_request_id,
@@ -2829,6 +2868,11 @@ impl AuthService {
                 if crate::oa_native::saved_quote(&config, &request.payload).is_err() {
                     return Err(AuthError::LeasePending(
                         "a non-lease zkAPI request is still pending".to_string(),
+                    ));
+                }
+                if tickets::saved_ticket(&request.payload).is_some() {
+                    return Err(AuthError::LeasePending(
+                        "a ticket purchase is pending; it finishes before any metered lease".to_string(),
                     ));
                 }
                 return Ok(request);

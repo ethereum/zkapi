@@ -89,7 +89,11 @@ impl SessionEvents {
         };
         if !matches!(
             payload.get("type").and_then(serde_json::Value::as_str),
-            Some("oa_org_ephemeral_lease_settlement" | "openrouter_ephemeral_lease_settlement")
+            Some(
+                "oa_org_ephemeral_lease_settlement"
+                    | "openrouter_ephemeral_lease_settlement"
+                    | zkapi_types::wire::TICKET_SETTLEMENT_TYPE
+            )
         ) {
             return;
         }
