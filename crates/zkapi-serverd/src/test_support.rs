@@ -65,6 +65,25 @@ pub(crate) fn lease_payload(config: &ServerConfig, now: u64) -> String {
     .to_string()
 }
 
+/// A native quote at `usd_per_eth` (8 decimals), fresh now.
+pub(crate) fn lease_quote(usd_per_eth: u128) -> crate::native_billing::NativeBillingQuote {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    crate::native_billing::NativeBillingQuote {
+        asset: "native_eth".into(),
+        units_per_eth: 1_000_000_000,
+        chain_id: 1,
+        feed_address: native_config().feed_address,
+        round_id: "123".into(),
+        answer: (usd_per_eth * 100_000_000).to_string(),
+        decimals: 8,
+        updated_at: now,
+        expires_at: now + 4500,
+    }
+}
+
 /// The development setup every test proof uses.
 pub(crate) fn setup_directory() -> String {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

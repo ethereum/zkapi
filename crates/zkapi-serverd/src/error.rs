@@ -118,6 +118,21 @@ pub enum ServerError {
     #[error("chain state is unavailable: {0}; retry shortly")]
     ChainReadUnavailable(String),
 
+    /// A ticket purchase whose tier, terms or price this server does not
+    /// sell (`GET /v2/tickets`). Nothing was reserved.
+    #[error("ticket terms mismatch: {0}")]
+    TicketTermsMismatch(String),
+
+    /// The ticket's key was never issued or delivered and its request
+    /// settled at zero; install that successor through request recovery.
+    #[error("the ticket was not issued and settled at zero; recover its successor")]
+    TicketUnissued,
+
+    /// The ticket was paid and its successor is signed (recover it), but its
+    /// runtime key has expired and is not delivered again.
+    #[error("the ticket's runtime key has expired; recover its successor")]
+    TicketKeyExpired,
+
     #[error(
         "OA org key issuance was rate limited ({reason}); retry after {retry_after_seconds} seconds"
     )]
@@ -156,6 +171,9 @@ impl ServerError {
             ServerError::RequestLimitExceeded { .. } => "request_limit_exceeded",
             ServerError::Published => "published",
             ServerError::ChainReadUnavailable(_) => "chain_read_unavailable",
+            ServerError::TicketTermsMismatch(_) => "ticket_terms_mismatch",
+            ServerError::TicketUnissued => "ticket_unissued",
+            ServerError::TicketKeyExpired => "ticket_key_expired",
         }
     }
 
@@ -191,6 +209,9 @@ impl ServerError {
             ServerError::RequestLimitExceeded { .. } => false,
             ServerError::Published => false,
             ServerError::ChainReadUnavailable(_) => true,
+            ServerError::TicketTermsMismatch(_) => false,
+            ServerError::TicketUnissued => false,
+            ServerError::TicketKeyExpired => false,
         }
     }
 }

@@ -305,6 +305,10 @@ pub struct ServerConfig {
     /// finalized at its settlement deadline without a usage measurement.
     /// Off by default; startup otherwise refuses until they drain.
     pub allow_key_source_switch: bool,
+    /// Fixed-price ticket tiers (`--ticket-catalog`); None sells no tickets.
+    /// Tickets need the OA org key source, whose replay-safe issuance lets
+    /// an exact retry receive the same paid key again.
+    pub ticket_catalog: Option<std::sync::Arc<crate::tickets::TicketCatalog>>,
 }
 
 impl ServerConfig {
@@ -351,6 +355,21 @@ impl ServerConfig {
                 .is_none_or(|max| max > 0 && max <= crate::native_billing::MAX_SAFE_UNITS),
             "--request-limit-max-usd-micros must be positive and browser-safe"
         );
+        if let Some(catalog) = self.ticket_catalog.as_ref() {
+            anyhow::ensure!(
+                matches!(
+                    self.openrouter_leases.as_ref().map(|lease| &lease.source),
+                    Some(OpenRouterLeaseSourceConfig::OaOrg { .. })
+                ),
+                "--ticket-catalog requires the OA org key source (--oa-org-url)"
+            );
+            if let Some(max) = self.request_limit_max_usd_micros {
+                anyhow::ensure!(
+                    u128::from(catalog.max_credit_limit_micro_usd()) <= max,
+                    "a ticket tier's credit limit exceeds --request-limit-max-usd-micros"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -449,6 +468,7 @@ impl std::fmt::Debug for ServerConfig {
             challenge_period_seconds,
             deployment,
             allow_key_source_switch,
+            ticket_catalog,
         } = self;
         formatter
             .debug_struct("ServerConfig")
@@ -480,6 +500,7 @@ impl std::fmt::Debug for ServerConfig {
                     .map(|manifest| &manifest.contract_address),
             )
             .field("allow_key_source_switch", allow_key_source_switch)
+            .field("ticket_catalog", ticket_catalog)
             .finish()
     }
 }
@@ -510,6 +531,7 @@ impl Default for ServerConfig {
             challenge_period_seconds: None,
             deployment: None,
             allow_key_source_switch: false,
+            ticket_catalog: None,
         }
     }
 }

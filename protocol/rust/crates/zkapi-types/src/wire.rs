@@ -57,6 +57,53 @@ impl Default for OpenRouterLeaseAuthorization {
     }
 }
 
+/// Authorization mode of a fixed-price ticket purchase.
+pub const TICKET_MODE: &str = "zkapi_fixed_price_ticket";
+/// Settlement payload type of a ticket that settled at its fixed price.
+pub const TICKET_SETTLEMENT_TYPE: &str = "zkapi_ticket_settlement";
+/// `charge_basis` of a ticket that settled at its fixed price.
+pub const TICKET_CHARGE_BASIS: &str = "ticket";
+
+/// The terms one ticket buys, from the server's ticket catalog
+/// (`GET /v2/tickets`). The purchase authorization repeats them exactly, so
+/// the proof binds the fixed price and the key's allowance and lifetime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TicketTermsV1 {
+    /// The OA tier this ticket mirrors.
+    pub tier_id: u32,
+    pub tier_name: String,
+    /// OA inference tickets the tier costs; clients map a model's
+    /// `/chat/model-tickets` count to the tier with this count.
+    pub oa_tickets: u32,
+    /// The fixed price, converted to gwei at the purchase's frozen quote.
+    pub price_micro_usd: u64,
+    /// The runtime key's spending allowance.
+    pub credit_limit_micro_usd: u64,
+    /// The runtime key's lifetime (a whole number of minutes).
+    pub duration_seconds: u64,
+}
+
+/// Prompt-free payload of a ticket purchase (with `billing_quote`, removed
+/// before parsing). `price_units` is the fixed price in gwei at the bound
+/// quote: exactly the charge of the signed successor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAuthorization {
+    pub mode: String,
+    pub version: u16,
+    pub ticket: TicketTermsV1,
+    pub price_units: u64,
+}
+
+/// `GET /v2/tickets`: the tiers this server sells.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketCatalogResponse {
+    pub version: u16,
+    pub key_source: String,
+    pub tiers: Vec<TicketTermsV1>,
+}
+
 /// A freshly-issued, short-lived OpenRouter key. The plaintext key is only
 /// present in this live response; server recovery responses never contain it.
 #[derive(Clone, Serialize, Deserialize)]
