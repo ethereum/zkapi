@@ -82,6 +82,10 @@ func TestLiveSepoliaTicketAPIConcurrency(t *testing.T) {
 	if os.Getenv("ZKAPI_LIVE_TICKETS") != "spend-sepolia-test-funds" {
 		t.Skip("spends Sepolia test funds; set ZKAPI_LIVE_TICKETS=spend-sepolia-test-funds")
 	}
+	// TestMain installs the test fixtures; this test checks the companion,
+	// model policy and RPC against the real embedded Sepolia profile.
+	restore := SetPackagedDeploymentsForTesting(deploymentFiles)
+	defer restore()
 	companionURL := liveEnv(t, "ZKAPI_LIVE_COMPANION_URL", "")
 	profile := liveEnv(t, "ZKAPI_LIVE_PROFILE", "")
 	out := liveEnv(t, "ZKAPI_LIVE_OUT", "")
