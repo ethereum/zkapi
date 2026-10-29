@@ -147,3 +147,8 @@ inventory, never in the server's database, recovery responses or logs.
 - A ticket's unused allowance is not refunded; its price is fixed.
 - Tickets need the OA org key source and its replay-safe issuance.
 - The OA relay's per-key caps and hourly issuance budget bound the tiers.
+
+## API schema
+
+The machine-readable contract is in [openapi.yaml](openapi.yaml)
+(`GET /v2/tickets`, `TicketAuthorization`, `TicketTerms`).

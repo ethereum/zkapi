@@ -69,9 +69,33 @@ paths:
       summary: Read the pinned finalized native ETH billing quote
       responses:
         "200": {description: Native gwei quote with chain, feed and round binding}
+  /v2/tickets:
+    get:
+      summary: List the fixed-price ticket tiers this server sells
+      description: >-
+        Absent (404) when the server runs without --ticket-catalog. A purchase
+        must state one tier's terms exactly; see docs/tickets.md.
+      responses:
+        "200":
+          description: The ticket catalog
+          headers:
+            Cache-Control:
+              schema: {const: no-store}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TicketCatalog"}
+        "401": {$ref: "#/components/responses/TestnetPasswordRequired"}
+        "404": {description: The server sells no tickets}
   /v2/openrouter/leases:
     post:
-      summary: Open a prompt-private, spending-limited OpenRouter lease
+      summary: Open a prompt-private, spending-limited OpenRouter lease, or buy a fixed-price ticket
+      description: >-
+        The request's payload selects the mode: a metered lease
+        (OpenRouterLeaseAuthorization, settled from measured usage after
+        retirement) or a ticket purchase (TicketAuthorization, settled at its
+        fixed price before this response, which then also carries `ticket` and
+        the signed successor `request_response`). Each payload also carries its
+        frozen `billing_quote`.
       requestBody:
         required: true
         content:
@@ -79,13 +103,13 @@ paths:
             schema: {$ref: "#/components/schemas/ApiRequestV2"}
       responses:
         "201":
-          description: One-time plaintext runtime key and lease timing
+          description: One-time plaintext runtime key and lease timing; for a ticket also its terms and signed successor
           content:
             application/json:
               schema: {$ref: "#/components/schemas/OpenRouterLease"}
-        "400": {description: "Invalid request, proof, or disabled lease mode, or request_limit_exceeded: the lease budget exceeds the server's per-request ceiling (nothing reserved)"}
+        "400": {description: "Invalid request, proof, or disabled lease mode; request_limit_exceeded: the lease budget (for a ticket, its credit limit) exceeds the server's per-request ceiling (nothing reserved); ticket_terms_mismatch: the ticket's tier, terms or price_units are not on sale at the bound quote (nothing reserved); oa_key_policy_rejected"}
         "404": {$ref: "#/components/responses/LeaseRecordUnreadable"}
-        "409": {description: "Existing active or settling lease, a used nullifier, or stale_root (retriable): the request's root is neither the vault's latest root nor a vault root the server read that additions replaced within request_root_grace_seconds with no intervening retirement or reorg; latest_root is the latest"}
+        "409": {description: "Existing active or settling lease, a used nullifier, or stale_root (retriable): the request's root is neither the vault's latest root nor a vault root the server read that additions replaced within request_root_grace_seconds with no intervening retirement or reorg; latest_root is the latest. For a ticket: ticket_unissued (its key was never delivered and it settled at zero; recover the successor) or ticket_key_expired (paid; recover the successor; the key is not delivered again)"}
         "429":
           description: >-
             OA key capacity is temporarily limited, or the reference gateway
@@ -683,6 +707,63 @@ components:
           minimum: 0
           description: >-
             Present with OA rate limits, and matches the Retry-After header.
+    OpenRouterLeaseAuthorization:
+      type: object
+      description: Payload (with billing_quote) of a metered lease.
+      required: [mode, version, billing_quote]
+      additionalProperties: false
+      properties:
+        mode: {const: openrouter_ephemeral_lease}
+        version: {const: 1}
+        billing_quote: {$ref: "#/components/schemas/NativeBillingQuote"}
+    TicketAuthorization:
+      type: object
+      description: >-
+        Payload of a ticket purchase. price_units is the fixed price in gwei
+        at the bound quote, ceil(price_micro_usd * 10^9 * 10^decimals /
+        (answer * 10^6)); the signed successor charges exactly it.
+      required: [mode, version, ticket, price_units, billing_quote]
+      additionalProperties: false
+      properties:
+        mode: {const: zkapi_fixed_price_ticket}
+        version: {const: 1}
+        ticket: {$ref: "#/components/schemas/TicketTerms"}
+        price_units: {type: integer, minimum: 1, maximum: 9007199254740991}
+        billing_quote: {$ref: "#/components/schemas/NativeBillingQuote"}
+    TicketTerms:
+      type: object
+      required: [tier_id, tier_name, oa_tickets, price_micro_usd, credit_limit_micro_usd, duration_seconds]
+      additionalProperties: false
+      properties:
+        tier_id: {type: integer, minimum: 0}
+        tier_name: {type: string, minLength: 1, maxLength: 64}
+        oa_tickets: {type: integer, minimum: 1, description: The OA ticket count of the tier; unique in a catalog}
+        price_micro_usd: {type: integer, minimum: 1}
+        credit_limit_micro_usd: {type: integer, minimum: 1, description: The runtime key's spending allowance}
+        duration_seconds: {type: integer, minimum: 60, multipleOf: 60, description: The runtime key's lifetime}
+    TicketCatalog:
+      type: object
+      required: [version, key_source, tiers]
+      properties:
+        version: {const: 1}
+        key_source: {const: oa_org}
+        tiers:
+          type: array
+          items: {$ref: "#/components/schemas/TicketTerms"}
+    NativeBillingQuote:
+      type: object
+      description: The frozen finalized ETH/USD quote, exactly as GET /v2/billing/quote returned it.
+      required: [asset, units_per_eth, chain_id, feed_address, round_id, answer, decimals, updated_at, expires_at]
+      properties:
+        asset: {const: native_eth}
+        units_per_eth: {const: 1000000000}
+        chain_id: {type: integer}
+        feed_address: {type: string}
+        round_id: {type: string}
+        answer: {type: string}
+        decimals: {type: integer}
+        updated_at: {type: integer}
+        expires_at: {type: integer}
     OpenRouterLease:
       type: object
       required: [status, client_request_id, api_key, openrouter_api_base, issued_at, expires_at, valid_for_seconds, settle_after, spending_limit_usd, key_source]
@@ -708,3 +789,15 @@ components:
             key_valid_till: {type: integer}
             station_signature: {type: string}
             org_signature: {type: string}
+        billing_quote: {$ref: "#/components/schemas/NativeBillingQuote"}
+        ticket:
+          allOf: [{$ref: "#/components/schemas/TicketTerms"}]
+          description: A ticket purchase only, the terms bought.
+        request_response:
+          allOf: [{$ref: "#/components/schemas/RequestResponseV2"}]
+          description: >-
+            A ticket purchase only, the successor signed at the ticket's fixed
+            price (charge_applied = price_units; settlement payload type
+            zkapi_ticket_settlement, charge_basis ticket, repeating the terms,
+            price_units and billing_quote). Verify and install it before using
+            the key.
