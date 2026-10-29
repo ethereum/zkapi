@@ -73,7 +73,8 @@ The operator CLI supplies server/indexer/setup/signing-key commands; the host
 application integrates the browser SDK directly. The separate [zkapi-clientd](../zkapi-clientd/README.md) frontend provides a local
 OpenAI-compatible API backed by private native ETH balances. Its Rust
 wallet/prover companion, `zkapi-walletd`, is built from this repository's
-`crates/zkapi-companion` at a pinned commit. It has no ticket mode or token
-wallet. It checks deposits and withdrawals against the vault and the
+`crates/zkapi-companion` at a pinned commit. It has no token wallet. Besides
+metered leases, the server can sell [fixed-price tickets](tickets.md), which
+settle when bought, so a wallet's requests can run concurrently. It checks deposits and withdrawals against the vault and the
 operator's indexer before changing private state, and escapes without the
 operator, through the user's own exit RPC when one is configured.

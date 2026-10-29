@@ -1111,7 +1111,9 @@ or run the client in the same network namespace. `host.docker.internal` alone
 does not make a loopback-only listener reachable. Remote/container access is not
 a reason to expose an unauthenticated listener on all interfaces.
 
-Requests are serialized, including concurrent chat/title requests. By default,
+In the default metered billing mode, requests are serialized, including
+concurrent chat/title requests (see [Ticket billing](#ticket-billing) for
+concurrent requests). By default,
 compatible requests reuse an OpenRouter key for a fixed window of up to 60
 seconds from acquisition, capped by the provider's expiry. Reuse does not extend
 the window. Requests from **different chats and local clients**, including Open
@@ -1168,6 +1170,28 @@ actual cost and remaining private balance in ETH appear only after signed
 settlement, which can arrive after the response ends. Routine helper
 readiness/retry messages are hidden. The foreground daemon stops if its helper
 exits; only an external service manager can restart it.
+
+### Ticket billing
+
+`zkapi-clientd config --billing-mode ticket` (with `serve` stopped) switches
+the local API from metered leases to fixed-price tickets;
+`--billing-mode metered` switches back. Each completion buys one ticket of the
+tier its model's OA ticket count (`/chat/model-tickets`) selects from the
+protocol server's catalog (`GET /v2/tickets`). The ticket's price is charged,
+and the signed successor installed, when it is bought, before the request is
+sent, so the next request can buy its ticket and run while earlier responses
+are still streaming: up to `concurrency` requests at once. A ticket serves
+one request and is consumed afterwards, whatever its outcome; its unused
+allowance is not refunded. The key-reuse window does not apply to tickets.
+
+The companion keeps paid tickets in its private inventory until they are
+handed out, so a crash or lost reply neither loses a paid key nor buys a
+second one, and `serve` returns its earlier run's unused claims at startup,
+before the first request. Errors: `model_ticket_tier_unavailable` (no tier
+for the model's ticket count), `ticket_terms_changed` (the tier was repriced
+twice in a row), `tickets_unavailable` (the server sells no tickets). See
+[fixed-price tickets](../../docs/tickets.md) for pricing, lifetime and
+failure semantics.
 
 ### Mainnet production issuer and verifier
 

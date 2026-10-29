@@ -217,6 +217,32 @@ mod tests {
         serde_json::json!({"version": 1, "tiers": tiers}).to_string()
     }
 
+    /// The documented example mirrors the staging OA tiers at the OA
+    /// ticket-pack price, and fits the Sepolia settlement timing.
+    #[test]
+    fn the_example_catalog_is_valid() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/aws/ticket-catalog.example.json");
+        let catalog = TicketCatalog::load(&path).unwrap();
+        let counts: Vec<_> = catalog.tiers().iter().map(|tier| tier.oa_tickets).collect();
+        assert_eq!(counts, [1, 3, 5]);
+        for tier in catalog.tiers() {
+            assert_eq!(
+                tier.price_micro_usd,
+                u64::from(tier.oa_tickets) * 140_000,
+                "{}",
+                tier.tier_name
+            );
+        }
+        let sepolia = crate::config::PARAMETER_SETS[1];
+        crate::config::OpenRouterLeaseConfig {
+            ttl_seconds: catalog.max_duration_seconds(),
+            ..sepolia.lease_config(crate::test_support::lease_config().source)
+        }
+        .validate_settlement_timing(sepolia.challenge_period_seconds)
+        .unwrap();
+    }
+
     #[test]
     fn catalog_accepts_distinct_valid_tiers() {
         let mut thinking = instant();

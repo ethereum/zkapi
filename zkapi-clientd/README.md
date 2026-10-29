@@ -133,6 +133,10 @@ isolation identity for prefix-continuing message histories and rotates both
 identity and provider key for unrelated histories. No wrapper CLI is required.
 See [Tor mode and its limits](docs/CLI_ZKAPI.md#tor).
 
+For fixed-price tickets that run requests concurrently, stop `serve`, run
+`zkapi-clientd config --billing-mode ticket`, then restart `serve`; see
+[ticket billing](docs/CLI_ZKAPI.md#ticket-billing).
+
 For a fresh key per inference request, stop `serve`, run
 `zkapi-clientd config --key-reuse-window-seconds 0`, then restart `serve`.
 With reuse disabled, settlement starts after each response. Fresh keys may wait
