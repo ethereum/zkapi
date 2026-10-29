@@ -145,6 +145,31 @@ contracts, the bundler's EntryPoint and the server's `config.json` and
 `/v1/attestation` against the manifest; the second starts the companion on an
 empty temporary wallet and reads its status only.
 
+The live ticket test **spends Sepolia test funds** (two fixed-price tickets).
+It builds only with the `zkapi_live` tag and runs only with an explicit
+opt-in. It puts the real `internal/server` API around a real
+`Client` in ticket mode against a running companion, given by its loopback
+URL. Everything it calls is real: proofs, successor checks, OA key
+verification, model policy, provider streams and chain reads. It checks
+chain 11155111 and an idle, affordable note before buying, and writes only
+statuses, timings, process-local key references, prices and balances:
+
+```sh
+cd zkapi-clientd
+ZKAPI_LIVE_TICKETS=spend-sepolia-test-funds \
+  ZKAPI_LIVE_COMPANION_URL=http://127.0.0.1:19595 \
+  ZKAPI_LIVE_PROFILE=/path/to/test-profile \
+  ZKAPI_LIVE_OUT=/path/to/evidence.json \
+  go test -tags zkapi_live -v -count=1 -timeout 20m ./internal/zkapi \
+  -run '^TestLiveSepoliaTicketAPIConcurrency$'
+```
+
+The profile's `config.json` supplies the bridge token. The companion must
+serve a funded Sepolia note at a protocol server that sells tickets. The test
+streams two completions, starting the second one while the first is still
+producing output, and checks each charge, the balance delta and that the two
+streams overlapped.
+
 ## Run and configure
 
 ```sh
