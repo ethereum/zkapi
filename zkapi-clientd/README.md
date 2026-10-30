@@ -48,6 +48,18 @@ rewrites form a separate target-side history; normal continuations send only
 new user text to the rewriter. Cache misses rewrite unknown historical user
 turns rather than passing them raw. This discloses original text to the rewriter. See [configuration, privacy limits and client display](docs/REWRITER.md).
 
+## Delegation for other AI programs (MCP)
+
+`zkapi-clientd --config-dir PROFILE mcp` is a stdio MCP server for AI hosts.
+It attaches to the running `serve` daemon (never starts, funds or configures
+it) and offers `zkapi_delegate`, one paid, independent frontier-model
+completion per call, plus free `zkapi_list_models`. Delegation requires
+`tor://` routing with `IsolateSOCKSAuth`; each call gets a fresh key and Tor
+identity, never web search. The provider (and any configured rewriter) still
+reads the task, and network anonymity is not guaranteed. Development
+builds only. See [MCP delegation](docs/MCP_DELEGATION.md) and the portable
+agent skill in [skills/zkapi-delegate](skills/zkapi-delegate/SKILL.md).
+
 ## Build this branch
 
 Follow [development builds and validation](docs/DEVELOPMENT.md). Published

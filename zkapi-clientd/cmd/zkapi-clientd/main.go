@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,9 +23,11 @@ import (
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/delegatemcp"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/server"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 var version = "dev"
@@ -77,8 +80,8 @@ func run(args []string) error {
 		help()
 		return nil
 	}
-	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" {
-		return errors.New("unknown command; use config, serve, withdraw or list-models (--help for usage); saved settings belong under config")
+	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "mcp" {
+		return errors.New("unknown command; use config, serve, withdraw, list-models or mcp (--help for usage); saved settings belong under config")
 	}
 	if dir == "" {
 		dir, err = config.DefaultDir()
@@ -89,6 +92,13 @@ func run(args []string) error {
 	dir, err = filepath.Abs(dir)
 	if err != nil {
 		return err
+	}
+	if args[0] == "mcp" {
+		// Protocol-independent: a local HTTP client of the running daemon. It
+		// is never dispatched to another engine and writes only MCP to stdout.
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return runMCP(ctx, dir, args[1:], &mcp.StdioTransport{MaxLineLength: delegatemcp.MaxFrameBytes}, os.Stderr)
 	}
 	if args[0] == "config" {
 		if handled, err := runConfigSettings(dir, args[1:], os.Stdout); handled || err != nil {
@@ -196,6 +206,8 @@ func help() {
   serve [--model MODEL]  Open a missing note when funded, then serve inference
   withdraw [OPTIONS]     Guided withdrawal (fee paid from the payout where sponsored); --escape / --public
   list-models            List supported model IDs and per-query caps
+  mcp                    MCP stdio server for AI hosts, attached to the running daemon
+                         (strict paid delegation over Tor; see mcp --help)
 
 Run zkapi-clientd config --help for configuration options.
 Run zkapi-clientd --version to show the installed version.
@@ -266,41 +278,94 @@ type zkInference struct{ *zkapi.Client }
 
 func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.Response, error) {
 	response, err := z.Client.Complete(ctx, body)
+	return response, inferenceError(ctx, err)
+}
+
+// Delegate is the strict delegation capability (server.Delegator). Its
+// prerequisites are reported as configuration errors before any lease.
+func (z zkInference) Delegate(ctx context.Context, body json.RawMessage) (*http.Response, error) {
+	response, err := z.Client.Delegate(ctx, body)
+	return response, delegateBackendError(ctx, err)
+}
+
+func delegateBackendError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	var remote *zkapi.Error
+	if errors.As(err, &remote) {
+		switch remote.Code {
+		case "delegation_requires_tor":
+			return &server.BackendError{Status: 412, Code: "delegation_requires_tor", Message: "Delegation requires daemon-native Tor routing; nothing was spent. Run Tor with IsolateSOCKSAuth on its SOCKS port, stop serve, run zkapi-clientd config --relay-url tor://127.0.0.1:9050 (your SOCKS port), then start serve again."}
+		case "tor_preparation_failed":
+			return &server.BackendError{Status: 502, Code: "tor_preparation_failed", Message: "The isolated Tor route could not be opened before key acquisition; nothing was spent and no direct fallback was used. Check that Tor is running on the configured SOCKS port with IsolateSOCKSAuth."}
+		case "inference_transport_failed":
+			return &server.BackendError{Status: 502, Code: "inference_transport_failed", Message: "The provider connection failed after a key was acquired. The request was not retried and may have been charged."}
+		case "invalid_delegation":
+			return &server.BackendError{Status: 400, Code: "invalid_delegation", Message: "Invalid delegation request."}
+		}
+	}
+	return delegationError(inferenceError(ctx, err))
+}
+
+// delegationError is the strict-delegation error boundary. Its messages reach
+// an AI agent, which may paste them into a later delegated task, so wallet and
+// protocol identifiers (such as a note nullifier) never cross it. The owner
+// still gets them from the trusted local tools (zkapi-clientd config, chat).
+func delegationError(err error) error {
+	var safe *server.BackendError
+	if !errors.As(err, &safe) {
+		return err
+	}
+	switch safe.Code {
+	case "receipt_journal_missing":
+		return &server.BackendError{Status: safe.Status, Code: safe.Code, Message: "The wallet cannot continue from its current note state; nothing was sent to the provider. The operator must review it locally with zkapi-clientd config on the daemon's computer. Wallet identifiers are withheld from delegation."}
+	}
+	if hexIdentifier.MatchString(safe.Message) {
+		return &server.BackendError{Status: safe.Status, Code: safe.Code, Message: "The wallet could not prepare access; details are withheld from delegation. The operator can check zkapi-clientd config on the daemon's computer."}
+	}
+	return err
+}
+
+// hexIdentifier matches long hex values (nullifiers, keys, hashes, addresses).
+var hexIdentifier = regexp.MustCompile(`(?i)(0x)?[0-9a-f]{16,}`)
+
+func inferenceError(ctx context.Context, err error) error {
 	err = accessPreparationError(ctx, err)
 	var remote *zkapi.Error
 	if errors.As(err, &remote) {
 		switch remote.Code {
 		case "receipt_journal_missing":
 			// The message names the nullifier the operator needs.
-			return nil, &server.BackendError{Status: 409, Code: "receipt_journal_missing", Message: err.Error()}
+			return &server.BackendError{Status: 409, Code: "receipt_journal_missing", Message: err.Error()}
 		case "ownership_proof_sent":
 			// The note stays withdrawal-only; waiting or retrying cannot help.
-			return nil, &server.BackendError{Status: 409, Code: "ownership_proof_sent", Message: "A withdrawal sent, or may have sent, the ownership proof of the note's current state, so no chat request is made from it. Run zkapi-clientd config --menu and choose withdraw to finish the withdrawal."}
+			return &server.BackendError{Status: 409, Code: "ownership_proof_sent", Message: "A withdrawal sent, or may have sent, the ownership proof of the note's current state, so no chat request is made from it. Run zkapi-clientd config --menu and choose withdraw to finish the withdrawal."}
 		case "clearance_reserved_state":
 			// No chat can settle this state; waiting or retrying cannot help.
-			return nil, &server.BackendError{Status: 409, Code: "clearance_reserved_state", Message: "The note's current state is reserved for withdrawal on the zkAPI server (for example because the operator released it), so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance."}
+			return &server.BackendError{Status: 409, Code: "clearance_reserved_state", Message: "The note's current state is reserved for withdrawal on the zkAPI server (for example because the operator released it), so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance."}
 		case "testnet_password_required":
-			return nil, &server.BackendError{Status: 401, Code: "testnet_password_required", Message: remote.Error()}
+			return &server.BackendError{Status: 401, Code: "testnet_password_required", Message: remote.Error()}
 		case "invalid_model":
-			return nil, &server.BackendError{Status: 400, Code: "invalid_model", Message: "Select a model from /v1/models."}
+			return &server.BackendError{Status: 400, Code: "invalid_model", Message: "Select a model from /v1/models."}
 		case "model_not_found":
-			return nil, &server.BackendError{Status: 400, Code: "model_not_found", Message: "Model not found. Use a full provider/model ID from /v1/models."}
+			return &server.BackendError{Status: 400, Code: "model_not_found", Message: "Model not found. Use a full provider/model ID from /v1/models."}
 		case "model_budget_unavailable":
-			return nil, &server.BackendError{Status: 400, Code: "model_budget_unavailable", Message: "The model is unavailable or has no reviewed request budget. Select a model from /v1/models."}
+			return &server.BackendError{Status: 400, Code: "model_budget_unavailable", Message: "The model is unavailable or has no reviewed request budget. Select a model from /v1/models."}
 		case "model_policy_unavailable":
-			return nil, &server.BackendError{Status: 502, Code: "model_policy_unavailable", Message: "The current model policy could not be loaded. Retry when the model service is available."}
+			return &server.BackendError{Status: 502, Code: "model_policy_unavailable", Message: "The current model policy could not be loaded. Retry when the model service is available."}
 		}
 		switch remote.Status {
 		case http.StatusPaymentRequired:
-			return nil, &server.BackendError{Status: 402, Code: "funding_required", Message: "The private balance needs funding. Run zkapi-clientd config --setup to add funding."}
+			return &server.BackendError{Status: 402, Code: "funding_required", Message: "The private balance needs funding. Run zkapi-clientd config --setup to add funding."}
 		case http.StatusConflict:
 			if remote.Code == "withdrawal_pending" || remote.Code == "withdrawal_conflict" {
-				return nil, &server.BackendError{Status: 409, Code: "withdrawal_pending", Message: "The private balance is reserved for withdrawal. Run zkapi-clientd config --menu and choose withdraw to recover the saved destination."}
+				return &server.BackendError{Status: 409, Code: "withdrawal_pending", Message: "The private balance is reserved for withdrawal. Run zkapi-clientd config --menu and choose withdraw to recover the saved destination."}
 			}
-			return nil, &server.BackendError{Status: 409, Code: "wallet_conflict", Message: "The wallet could not safely prepare fresh anonymous access. Run zkapi-clientd config to check its state."}
+			return &server.BackendError{Status: 409, Code: "wallet_conflict", Message: "The wallet could not safely prepare fresh anonymous access. Run zkapi-clientd config to check its state."}
 		}
 	}
-	return response, err
+	return err
 }
 
 func serve(ctx context.Context, dir string, c config.Config, out io.Writer) error {

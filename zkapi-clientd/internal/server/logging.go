@@ -98,7 +98,7 @@ func logMethod(method string) string {
 
 func logRoute(path string) string {
 	switch path {
-	case "/v1/models", "/v1/chat/completions":
+	case "/v1/models", "/v1/chat/completions", DelegatePath:
 		return path
 	}
 	return ""
