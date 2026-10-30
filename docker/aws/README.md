@@ -355,6 +355,20 @@ blocked. The daemon opens `/data/server.db` read-only and needs the schema and
 with "run `zkapi db init` first". See
 [challenge operation](../../docs/challenge-service.md).
 
+### Fixed-price tickets
+
+Tickets are optional ([fixed-price tickets](../../docs/tickets.md)). To sell
+them, put a catalog in the configuration directory as
+`ticket-catalog.json` (start from `ticket-catalog.example.json`, which mirrors
+the OA tiers at the OA ticket-pack price) and add `compose.tickets.yml` to the
+compose files. It sets `ZKAPI_TICKET_CATALOG` and mounts the catalog
+read-only, and it changes only the server, which needs the OA org key source
+(`OA_ORG_URL`). Each tier's credit limit must fit `--request-limit-max-usd-micros`,
+and its credit limit and duration must fit the OA relay's per-key caps, or
+its purchases are refused and settle at zero. The gateway routes
+`GET /v2/tickets` with the other `/v2/` routes. Metered leases are
+unchanged. To stop selling tickets, recreate the server without the file.
+
 ## Starting the deployment
 
 Start in this order: the indexer, `zkapi db init` (the one-shot `db-init`
