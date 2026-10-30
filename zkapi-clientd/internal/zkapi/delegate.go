@@ -19,7 +19,8 @@ import (
 // taken from nor left in the reuse cache, and (when rewriting is configured) a
 // transcript that exists only for this call. Chat conversation, transcript and
 // cached-key state are not read or extended. The request slot, lease
-// acquisition, budget and settlement are the same as for chat.
+// acquisition, budget and settlement are the same as for chat; in ticket
+// billing mode each delegation buys its own ticket, as each chat request does.
 //
 // Delegation is defined only for daemon-native Tor routing. Without it the call
 // is refused before queueing, model policy, rewriting or any lease request.
@@ -56,6 +57,18 @@ func (c *Client) Delegate(ctx context.Context, body json.RawMessage) (*http.Resp
 	body, err = c.prepareDelegation(ctx, body, identity)
 	if err != nil {
 		return nil, err
+	}
+	if c.ticketMode() {
+		// Ticket billing: the delegation buys its own fixed-price ticket, a
+		// key no other request uses, consumed after this call. The ticket is
+		// settled when bought, so its inference runs outside the request slot.
+		ticket, err := c.acquireTicket(ctx, body)
+		if err != nil {
+			return nil, err
+		}
+		transferred = true
+		release()
+		return c.completeWithTicket(ctx, body, identity, ticket)
 	}
 	// A key cached by chat is a provider-visible identifier of that chat. It
 	// never serves a delegation, and reuse=false leaves no key for chat.

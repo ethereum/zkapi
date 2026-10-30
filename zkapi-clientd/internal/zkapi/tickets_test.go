@@ -397,3 +397,48 @@ func TestBillingModeIsExplicit(t *testing.T) {
 		t.Fatal("the default is not metered")
 	}
 }
+
+// In ticket mode a delegation buys its own ticket (never a metered lease),
+// sends through its isolated Tor identity, and consumes the ticket.
+func TestTicketModeDelegationBuysItsOwnTicket(t *testing.T) {
+	var keys []string
+	var mu sync.Mutex
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+	companion := &ticketCompanion{}
+	client := newTicketClient(t, companion, upstream, map[string]uint64{"example/model": 4})
+	client.config.TorMode, client.config.TorEndpoint = true, "tor://127.0.0.1:9050"
+	prepared := 0
+	client.prepareTor = func(context.Context, string, string, string) error {
+		prepared++
+		return nil
+	}
+	body := json.RawMessage(`{"model":"example/model","messages":[{"role":"user","content":"private content"}],"stream":false}`)
+	for range 2 {
+		response, err := client.Delegate(context.Background(), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drain(t, response)
+	}
+	companion.mu.Lock()
+	defer companion.mu.Unlock()
+	if prepared != 2 || len(companion.bodies) != 2 || len(companion.releases) != 2 {
+		t.Fatalf("tor=%d purchases=%d releases=%d", prepared, len(companion.bodies), len(companion.releases))
+	}
+	for _, release := range companion.releases {
+		if release["consume"] != true {
+			t.Fatalf("a delegation's ticket was not consumed: %v", release)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 || keys[0] == keys[1] {
+		t.Fatalf("delegations did not use distinct ticket keys: %d", len(keys))
+	}
+}
