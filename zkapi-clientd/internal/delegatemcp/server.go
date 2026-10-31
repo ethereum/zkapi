@@ -32,6 +32,29 @@ type Options struct {
 	DefaultModel string // display only: the running daemon applies its own default
 	Version      string
 	Transport    http.RoundTripper // tests only; nil dials Listen on loopback
+	Product      *Product          // nil is zkapi-clientd
+}
+
+// Product is the wording and route of the daemon this adapter serves.
+type Product struct {
+	Binary, ServerName, ServerTitle string
+	Label                           string // prefix of bracketed result notes
+	DelegateTool, ListModelsTool    string
+	DelegatePath                    string
+	Instructions                    string
+	DelegateTitle, DelegateText     string
+	ListTitle, ListText             string
+}
+
+func zkapiProduct() *Product {
+	return &Product{
+		Label: "zkapi", Binary: "zkapi-clientd", ServerName: "zkapi-clientd", ServerTitle: "zkAPI delegation",
+		DelegateTool: DelegateTool, ListModelsTool: ListModelsTool, DelegatePath: server.DelegatePath,
+		Instructions:  instructions,
+		DelegateTitle: "Ask a frontier model via zkAPI (paid)", DelegateText: delegateDescription,
+		ListTitle: "List zkAPI models (free)",
+		ListText:  "List model IDs usable with zkapi_delegate and each model's per-call spending cap. Free: no payment or key is used. Use search to narrow the list.",
+	}
 }
 
 type DelegateInput struct {
@@ -48,7 +71,8 @@ type ListModelsInput struct {
 
 type ListedModel struct {
 	ID             string `json:"id"`
-	PerQueryCapUSD string `json:"per_query_cap_usd"`
+	PerQueryCapUSD string `json:"per_query_cap_usd,omitempty"`
+	TicketCost     int    `json:"ticket_cost,omitempty"`
 }
 
 type ListModelsOutput struct {
@@ -106,22 +130,27 @@ func NewServer(options Options) (*mcp.Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	product := options.Product
+	if product == nil {
+		product = zkapiProduct()
+	}
+	d.product = product
 	version := options.Version
 	if version == "" {
 		version = "dev"
 	}
-	s := mcp.NewServer(&mcp.Implementation{Name: "zkapi-clientd", Title: "zkAPI delegation", Version: version}, &mcp.ServerOptions{
-		Instructions: instructions,
+	s := mcp.NewServer(&mcp.Implementation{Name: product.ServerName, Title: product.ServerTitle, Version: version}, &mcp.ServerOptions{
+		Instructions: product.Instructions,
 		// Tools only: no logging, resources, prompts, sampling or roots.
 		Capabilities: &mcp.ServerCapabilities{},
 	})
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        DelegateTool,
-		Title:       "Ask a frontier model via zkAPI (paid)",
-		Description: delegateDescription,
+		Name:        product.DelegateTool,
+		Title:       product.DelegateTitle,
+		Description: product.DelegateText,
 		InputSchema: delegateSchema(),
 		Annotations: &mcp.ToolAnnotations{
-			Title:        "Ask a frontier model via zkAPI (paid)",
+			Title:        product.DelegateTitle,
 			ReadOnlyHint: false,
 			// Each call spends private balance, which is not an additive update.
 			DestructiveHint: boolPointer(true),
@@ -132,12 +161,12 @@ func NewServer(options Options) (*mcp.Server, error) {
 		return delegateTool(ctx, d, input)
 	})
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        ListModelsTool,
-		Title:       "List zkAPI models (free)",
-		Description: "List model IDs usable with zkapi_delegate and each model's per-call spending cap. Free: no payment or key is used. Use search to narrow the list.",
+		Name:        product.ListModelsTool,
+		Title:       product.ListTitle,
+		Description: product.ListText,
 		InputSchema: listModelsSchema(),
 		Annotations: &mcp.ToolAnnotations{
-			Title:          "List zkAPI models (free)",
+			Title:          product.ListTitle,
 			ReadOnlyHint:   true,
 			IdempotentHint: true,
 			OpenWorldHint:  boolPointer(true),
@@ -176,9 +205,9 @@ func delegateTool(ctx context.Context, d *daemon, input DelegateInput) (*mcp.Cal
 	text := result.Answer
 	if result.Truncated {
 		if text == "" {
-			text = "[zkapi: no answer text: the answer stopped at a token or answer-size limit. A retry is a new paid call.]"
+			text = "[" + d.product.Label + ": no answer text: the answer stopped at a token or answer-size limit. A retry is a new paid call.]"
 		} else {
-			text += "\n\n[zkapi: answer incomplete: stopped at a token or answer-size limit]"
+			text += "\n\n[" + d.product.Label + ": answer incomplete: stopped at a token or answer-size limit]"
 		}
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, result, nil
@@ -197,13 +226,17 @@ func listModelsTool(ctx context.Context, d *daemon, savedDefault string, input L
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].ID < catalog[j].ID })
 	for _, model := range catalog {
 		// Web-search variants are refused by delegation; do not offer them.
-		if model.Budget == 0 || !validModelID(model.ID) || strings.HasSuffix(strings.ToLower(model.ID), ":online") ||
+		if (model.Budget == 0 && model.TicketCost == 0) || !validModelID(model.ID) || strings.HasSuffix(strings.ToLower(model.ID), ":online") ||
 			(search != "" && !strings.Contains(strings.ToLower(model.ID), search)) {
 			continue
 		}
 		output.Matched++
 		if len(output.Models) < maxListed {
-			output.Models = append(output.Models, ListedModel{ID: model.ID, PerQueryCapUSD: usd(model.Budget)})
+			listed := ListedModel{ID: model.ID, TicketCost: model.TicketCost}
+			if model.Budget != 0 {
+				listed.PerQueryCapUSD = usd(model.Budget)
+			}
+			output.Models = append(output.Models, listed)
 		}
 	}
 	output.Truncated = output.Matched > len(output.Models)
@@ -215,8 +248,16 @@ func listModelsTool(ctx context.Context, d *daemon, savedDefault string, input L
 	if output.Truncated {
 		fmt.Fprintf(&text, " (first %d shown; use search to narrow)", len(output.Models))
 	}
-	text.WriteString(". Caps are per-call spending limits, not prices.\n")
+	if output.Matched > 0 && output.Models[0].TicketCost != 0 {
+		text.WriteString(". Costs are inference tickets per call.\n")
+	} else {
+		text.WriteString(". Caps are per-call spending limits, not prices.\n")
+	}
 	for _, model := range output.Models {
+		if model.TicketCost != 0 {
+			fmt.Fprintf(&text, "%s  %d tickets\n", model.ID, model.TicketCost)
+			continue
+		}
 		fmt.Fprintf(&text, "%s  cap $%s\n", model.ID, model.PerQueryCapUSD)
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text.String()}}}, output, nil

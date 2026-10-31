@@ -50,6 +50,53 @@ type API struct {
 	Admin           http.Handler
 	ManagementToken string
 	Status          ServiceStatus
+	// Identity selects the product wording and delegation route. The zero
+	// value keeps zkapi-clientd's own, so another binary sharing this API
+	// never sends its users to a zkAPI wallet command.
+	Identity Identity
+}
+
+// Identity is the product wording of an API sharing these routes. Each field
+// falls back to the zkapi-clientd value when empty.
+type Identity struct {
+	// InvalidKeyMessage answers a missing or wrong local API key.
+	InvalidKeyMessage string
+	// AccessFailedMessage answers a credential source failure without a
+	// more specific safe error.
+	AccessFailedMessage string
+	// DelegatePath replaces the strict-delegation route.
+	DelegatePath string
+	// RewriteName labels a rewrite notice: the preview line, the JSON field
+	// "<name>_rewrite" and the synthetic chunk ID.
+	RewriteName string
+}
+
+func (a *API) rewriteName() string {
+	if a.Identity.RewriteName != "" {
+		return a.Identity.RewriteName
+	}
+	return "zkapi"
+}
+
+func (a *API) delegateRoute() string {
+	if a.Identity.DelegatePath != "" {
+		return a.Identity.DelegatePath
+	}
+	return DelegatePath
+}
+
+func (a *API) accessFailedMessage() string {
+	if a.Identity.AccessFailedMessage != "" {
+		return a.Identity.AccessFailedMessage
+	}
+	return "Anonymous access could not be prepared. Check funding with zkapi-clientd config; relay and verifier availability are also required."
+}
+
+func (a *API) invalidKeyMessage() string {
+	if a.Identity.InvalidKeyMessage != "" {
+		return a.Identity.InvalidKeyMessage
+	}
+	return "A valid local zkAPI client API key is required."
 }
 
 // ServiceStatus is safe local metadata, containing no wallet state or secrets.
@@ -86,10 +133,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []byte(`{"status":"ok"}`))
 		return
 	}
-	keylessInference := !a.RequireAPIKey && (r.URL.Path == "/v1/models" || r.URL.Path == "/v1/chat/completions" || r.URL.Path == DelegatePath)
+	delegatePath := a.delegateRoute()
+	keylessInference := !a.RequireAPIKey && (r.URL.Path == "/v1/models" || r.URL.Path == "/v1/chat/completions" || r.URL.Path == delegatePath)
 	// Delegation is a local-agent route: it requires a loopback peer and Host
 	// even when a bearer key is configured.
-	if keylessInference || r.URL.Path == DelegatePath {
+	if keylessInference || r.URL.Path == delegatePath {
 		if !localInferenceRequest(r) {
 			writeError(w, 403, "local_connection_required", "Connect to this API through localhost.")
 			return
@@ -100,7 +148,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		key := sha256.Sum256([]byte(strings.TrimPrefix(header, "Bearer ")))
 		if !strings.HasPrefix(header, "Bearer ") || subtle.ConstantTimeCompare(key[:], a.key[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			writeError(w, 401, "invalid_api_key", "A valid local zkAPI client API key is required.")
+			writeError(w, 401, "invalid_api_key", a.invalidKeyMessage())
 			return
 		}
 	}
@@ -140,9 +188,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, data)
 	case r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost:
 		a.complete(w, r)
-	case r.URL.Path == DelegatePath && r.Method == http.MethodPost:
+	case r.URL.Path == delegatePath && r.Method == http.MethodPost:
 		a.delegate(w, r)
-	case r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/models" || r.URL.Path == DelegatePath:
+	case r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/models" || r.URL.Path == delegatePath:
 		writeError(w, 405, "method_not_allowed", "Method not allowed.")
 	default:
 		writeError(w, 404, "not_found", "Use /v1/models or /v1/chat/completions.")
@@ -310,7 +358,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		Model string `json:"model"`
 	}
 	_ = json.Unmarshal(clean, &selected)
-	notice := &completionNotice{streaming: streaming, mode: a.RewriterNotice, model: selected.Model}
+	notice := &completionNotice{streaming: streaming, mode: a.RewriterNotice, model: selected.Model, name: a.rewriteName()}
 	ctx = notice.context(ctx, w)
 	response, err := a.backend.Complete(ctx, clean)
 	if err != nil {
@@ -329,7 +377,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 			notice.writeError(w, safe.Status, safe.Code, safe.Message)
 			return
 		}
-		notice.writeError(w, 502, "anonymous_access_failed", "Anonymous access could not be prepared. Check funding with zkapi-clientd config; relay and verifier availability are also required.")
+		notice.writeError(w, 502, "anonymous_access_failed", a.accessFailedMessage())
 		return
 	}
 	if response == nil || response.Body == nil {

@@ -20,6 +20,10 @@ import (
 // tools, plugins, streaming, headers, metadata or provider routing.
 const DelegatePath = "/v1/zkapi/delegate"
 
+// OADelegatePath is oa-clientd's strict-delegation route. A separate path keeps
+// a client configured for one daemon from silently spending the other's balance.
+const OADelegatePath = "/v1/oa/delegate"
+
 // Delegation bounds. Text limits are UTF-8 bytes.
 const (
 	MaxDelegationTaskBytes    = 32 << 10
@@ -189,7 +193,7 @@ func (a *API) delegate(w http.ResponseWriter, r *http.Request) {
 		case errors.As(err, &safe) && safe.Status >= 400 && safe.Status <= 599:
 			writeError(w, safe.Status, safe.Code, safe.Message)
 		default:
-			writeError(w, 502, "anonymous_access_failed", "Anonymous access could not be prepared. Check funding with zkapi-clientd config; relay and verifier availability are also required.")
+			writeError(w, 502, "anonymous_access_failed", a.accessFailedMessage())
 		}
 		return
 	}

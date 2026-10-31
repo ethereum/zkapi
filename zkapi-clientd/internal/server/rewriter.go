@@ -21,6 +21,14 @@ type completionNotice struct {
 	mode      string
 	started   bool
 	notice    *rewriter.Notice
+	name      string // product label; empty is zkapi
+}
+
+func (n *completionNotice) label() string {
+	if n.name != "" {
+		return n.name
+	}
+	return "zkapi"
 }
 
 func (n *completionNotice) context(ctx context.Context, w http.ResponseWriter) context.Context {
@@ -39,9 +47,9 @@ func (n *completionNotice) context(ctx context.Context, w http.ResponseWriter) c
 		n.started = true
 		delta := map[string]any{"role": "assistant"}
 		if n.mode != "metadata" {
-			delta["reasoning_content"] = previewText(notice)
+			delta["reasoning_content"] = previewText(n.label(), notice)
 		}
-		raw, _ := json.Marshal(map[string]any{"id": "chatcmpl-zkapi-rewrite", "model": n.model, "object": "chat.completion.chunk", "created": time.Now().Unix(), "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}, "zkapi_rewrite": notice})
+		raw, _ := json.Marshal(map[string]any{"id": "chatcmpl-" + n.label() + "-rewrite", "model": n.model, "object": "chat.completion.chunk", "created": time.Now().Unix(), "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}, n.label() + "_rewrite": notice})
 		control := http.NewResponseController(w)
 		_ = control.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", raw); err != nil {
@@ -54,10 +62,10 @@ func (n *completionNotice) context(ctx context.Context, w http.ResponseWriter) c
 		return err
 	})
 }
-func previewText(n rewriter.Notice) string {
+func previewText(label string, n rewriter.Notice) string {
 	// Quoted strings make control characters and delimiters unambiguous.
 	var b strings.Builder
-	b.WriteString("[zkapi prompt rewrite — NOT target-model thinking]\n")
+	b.WriteString("[" + label + " prompt rewrite — NOT target-model thinking]\n")
 	for _, text := range n.Texts {
 		fmt.Fprintf(&b, "%q\n", text)
 	}
@@ -83,7 +91,7 @@ func (n *completionNotice) annotateJSON(body io.Reader) ([]byte, error) {
 	if json.Unmarshal(raw, &result) != nil || result == nil {
 		return nil, fmt.Errorf("invalid response")
 	}
-	result["zkapi_rewrite"], _ = json.Marshal(n.notice)
+	result[n.label()+"_rewrite"], _ = json.Marshal(n.notice)
 	// Keep machine-readable answers intact. Non-streaming clients can read the
 	// explicit metadata; no notice is injected into assistant content.
 	return json.Marshal(result)

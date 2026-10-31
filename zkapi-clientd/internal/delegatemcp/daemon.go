@@ -33,9 +33,10 @@ const (
 // daemon is a client of the local API only. Requests carry nothing but the
 // local inference API key; there is no proxy, redirect, cookie or keep-alive.
 type daemon struct {
-	origin string
-	apiKey string
-	client *http.Client
+	product *Product
+	origin  string
+	apiKey  string
+	client  *http.Client
 }
 
 var errRedirect = errors.New("redirect refused")
@@ -66,7 +67,7 @@ func newDaemon(listen, apiKey string, transport http.RoundTripper) (*daemon, err
 		}
 	}
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errRedirect }}
-	return &daemon{origin: "http://" + address, apiKey: apiKey, client: client}, nil
+	return &daemon{product: zkapiProduct(), origin: "http://" + address, apiKey: apiKey, client: client}, nil
 }
 
 // toolError is a fixed or sanitized message that is safe to show the model.
@@ -100,7 +101,7 @@ func (d *daemon) do(ctx context.Context, method, path string, body []byte, limit
 		if errors.Is(err, errRedirect) {
 			return nil, 0, &commError{toolError{"The local daemon answered with a redirect, which is refused. Check the profile's listen address."}}
 		}
-		return nil, 0, &commError{toolError{fmt.Sprintf("The zkapi-clientd daemon at %s could not be reached or the connection failed. Check that zkapi-clientd serve is running for this profile; this tool never starts, funds or configures it.", d.origin)}}
+		return nil, 0, &commError{toolError{fmt.Sprintf("The %[1]s daemon at %[2]s could not be reached or the connection failed. Check that %[1]s serve is running for this profile; this tool never starts, funds or configures it.", d.product.Binary, d.origin)}}
 	}
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
@@ -119,7 +120,7 @@ func (d *daemon) do(ctx context.Context, method, path string, body []byte, limit
 // daemonError turns an error envelope into a short, single-line message. The
 // daemon's messages are fixed local text; they are still bounded and stripped
 // of control characters because any local process could own the port.
-func daemonError(status int, data []byte, delegation bool) error {
+func (d *daemon) daemonError(status int, data []byte, delegation bool) error {
 	var envelope struct {
 		Error struct {
 			Code    string `json:"code"`
@@ -130,9 +131,9 @@ func daemonError(status int, data []byte, delegation bool) error {
 	code, message := envelope.Error.Code, sanitize(envelope.Error.Message)
 	switch {
 	case delegation && (status == http.StatusNotFound || (status == http.StatusMethodNotAllowed && code == "")):
-		return &toolError{"The running zkapi-clientd daemon does not provide strict delegation (an older build). Upgrade zkapi-clientd and restart serve. Nothing was spent."}
+		return &toolError{fmt.Sprintf("The running %[1]s daemon does not provide strict delegation (an older build). Upgrade %[1]s and restart serve. Nothing was spent.", d.product.Binary)}
 	case code == "invalid_api_key":
-		return &toolError{"The daemon rejected this profile's local API key. Run zkapi-clientd mcp with the same --config-dir as the running daemon."}
+		return &toolError{fmt.Sprintf("The daemon rejected this profile's local API key. Run %s mcp with the same --config-dir as the running daemon.", d.product.Binary)}
 	case code == "browser_origin_denied" || code == "local_connection_required":
 		return &toolError{"The daemon refused this connection as non-local."}
 	}
@@ -183,6 +184,8 @@ func sanitize(text string) string {
 type catalogModel struct {
 	ID     string `json:"id"`
 	Budget uint64 `json:"oa_request_limit_micro_usd"`
+	// TicketCost is set by a daemon that pays in inference tickets.
+	TicketCost int `json:"oa_ticket_cost"`
 }
 
 // models reads the daemon's public catalog. The daemon serves it from public
@@ -195,7 +198,7 @@ func (d *daemon) models(ctx context.Context) ([]catalogModel, error) {
 		return nil, err
 	}
 	if status != http.StatusOK {
-		return nil, daemonError(status, data, false)
+		return nil, d.daemonError(status, data, false)
 	}
 	var catalog struct {
 		Data []catalogModel `json:"data"`
@@ -220,7 +223,7 @@ func (d *daemon) delegate(ctx context.Context, request server.DelegationRequest)
 	}
 	ctx, cancel := context.WithTimeout(ctx, delegateTimeout)
 	defer cancel()
-	data, status, err := d.do(ctx, http.MethodPost, server.DelegatePath, body, maxResultBody)
+	data, status, err := d.do(ctx, http.MethodPost, d.product.DelegatePath, body, maxResultBody)
 	if err != nil {
 		if ctx.Err() != nil {
 			return server.DelegationResult{}, &toolError{"The delegation was canceled or timed out. It was not retried; if it reached the provider it may have been charged."}
@@ -232,7 +235,7 @@ func (d *daemon) delegate(ctx context.Context, request server.DelegationRequest)
 		return server.DelegationResult{}, err
 	}
 	if status != http.StatusOK {
-		return server.DelegationResult{}, daemonError(status, data, true)
+		return server.DelegationResult{}, d.daemonError(status, data, true)
 	}
 	var result server.DelegationResult
 	if json.Unmarshal(data, &result) != nil {
