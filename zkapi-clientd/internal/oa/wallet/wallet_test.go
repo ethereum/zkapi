@@ -261,6 +261,119 @@ func TestLeaseTakesFromTailRenewsAndYields(t *testing.T) {
 	}
 }
 
+func eightLeasedFour() *State {
+	st := fresh()
+	for _, token := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		st.Active = append(st.Active, ticket(token))
+	}
+	st.RefreshLease(4, testNow)
+	st.LeaseDirty = false
+	return st
+}
+
+func leased(st *State) map[string]bool {
+	set := map[string]bool{}
+	for _, fingerprint := range st.Lease.Fingerprints {
+		set[fingerprint] = true
+	}
+	return set
+}
+
+func TestLeaseShrinksToALowerTargetKeepingTheTail(t *testing.T) {
+	st := eightLeasedFour()
+	expiry := st.Lease.ExpiresAtMS
+	st.RefreshLease(2, testNow.Add(time.Minute))
+	got := leased(st)
+	if len(got) != 2 || !got[Fingerprint("h")] || !got[Fingerprint("g")] {
+		t.Fatalf("lease = %v", st.Lease.Fingerprints)
+	}
+	if !st.LeaseDirty || st.Lease.ExpiresAtMS != expiry {
+		t.Fatalf("shrink must publish and need no renewal: dirty=%v", st.LeaseDirty)
+	}
+	if len(st.Active) != 8 || len(st.Archive) != 0 || len(st.Spent) != 0 {
+		t.Fatal("releasing a lease must not move any ticket")
+	}
+	st.LeaseDirty = false
+	st.RefreshLease(2, testNow.Add(2*time.Minute))
+	if st.LeaseDirty || len(leased(st)) != 2 {
+		t.Fatal("a settled lease needs no write")
+	}
+	st.RefreshLease(3, testNow.Add(3*time.Minute))
+	if got := leased(st); len(got) != 3 || !got[Fingerprint("f")] {
+		t.Fatalf("growing again = %v", st.Lease.Fingerprints)
+	}
+}
+
+func TestLeaseTargetZeroReleasesEverything(t *testing.T) {
+	st := eightLeasedFour()
+	st.RefreshLease(0, testNow.Add(time.Minute))
+	if len(st.Lease.Fingerprints) != 0 || st.Lease.ExpiresAtMS != 0 || !st.LeaseDirty {
+		t.Fatalf("lease = %+v", st.Lease)
+	}
+	st.LeaseDirty = false
+	st.RefreshLease(0, testNow.Add(2*time.Minute))
+	if st.LeaseDirty {
+		t.Fatal("an empty lease must stay quiet")
+	}
+}
+
+func TestLeaseShrinkKeepsInFlightReservationsAboveTarget(t *testing.T) {
+	st := eightLeasedFour()
+	reservation, err := st.Reserve("r", "nonce", 3, allow, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []int{2, 0} {
+		st.RefreshLease(target, testNow.Add(time.Minute))
+		got := leased(st)
+		for _, reservedTicket := range reservation.Tickets {
+			if !got[Fingerprint(reservedTicket.Token)] {
+				t.Fatalf("target %d dropped an in-flight ticket", target)
+			}
+		}
+		if len(got) != 3 {
+			t.Fatalf("target %d lease = %d", target, len(got))
+		}
+	}
+	st.CommitSpent("r", testNow)
+	st.RefreshLease(0, testNow.Add(2*time.Minute))
+	if len(st.Lease.Fingerprints) != 0 || st.Lease.ExpiresAtMS != 0 {
+		t.Fatalf("after commit lease = %+v", st.Lease)
+	}
+}
+
+func TestLeaseShrinkKeepsReservationWhenRestored(t *testing.T) {
+	st := eightLeasedFour()
+	if _, err := st.Reserve("r", "nonce", 2, allow, testNow); err != nil {
+		t.Fatal(err)
+	}
+	st.RefreshLease(1, testNow.Add(time.Minute))
+	st.RestorePending("r")
+	if len(st.Active) != 8 || len(st.Pending) != 0 {
+		t.Fatalf("active=%d", len(st.Active))
+	}
+	st.RefreshLease(1, testNow.Add(2*time.Minute))
+	if len(st.Lease.Fingerprints) != 1 {
+		t.Fatalf("lease = %v", st.Lease.Fingerprints)
+	}
+}
+
+func TestLeaseRefreshDropsConsumedAndClaimedFingerprints(t *testing.T) {
+	st := eightLeasedFour()
+	st.Lease.Fingerprints = append(st.Lease.Fingerprints, Fingerprint("gone"))
+	st.RefreshLease(4, testNow.Add(time.Minute))
+	if leased(st)[Fingerprint("gone")] || !st.LeaseDirty {
+		t.Fatal("a ticket no longer here must leave the lease")
+	}
+	late := testNow.Add(LeaseTTL + time.Hour)
+	st.OtherLeases = map[string]Lease{"other": {Fingerprints: []string{Fingerprint("h")}, ExpiresAtMS: late.Add(time.Hour).UnixMilli()}}
+	st.RefreshLease(4, late)
+	got := leased(st)
+	if got[Fingerprint("h")] || len(got) != 4 || !got[Fingerprint("d")] {
+		t.Fatalf("lapsed lease = %v", st.Lease.Fingerprints)
+	}
+}
+
 func TestStoreRefusesAnotherAccountAndOrg(t *testing.T) {
 	store, err := Open(oatest.PrivateDir(t))
 	if err != nil {

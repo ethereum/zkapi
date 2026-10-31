@@ -1066,6 +1066,92 @@ func TestLeaseLeavesHalfASmallWalletToTheBrowser(t *testing.T) {
 	}
 }
 
+func publishedLease(t *testing.T, org *fakeOrg, device string) struct {
+	Fingerprints []string `json:"fingerprints"`
+	ExpiresAtMS  int64    `json:"expires_at_ms"`
+} {
+	t.Helper()
+	var lease struct {
+		Fingerprints []string `json:"fingerprints"`
+		ExpiresAtMS  int64    `json:"expires_at_ms"`
+	}
+	plaintext, err := Open(testMaster, logicalLeaseItem, org.blobs[BlobID(testMaster, logicalLeaseItem+":"+device)])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(plaintext, &lease); err != nil {
+		t.Fatal(err)
+	}
+	return lease
+}
+
+// The live sequence: a default lease takes half of 8 tickets, then the setting is
+// lowered and serve restarts. The next sync must publish the smaller lease.
+func TestLoweringTheLeaseSettingPublishesTheSmallerLease(t *testing.T) {
+	org := newFakeOrg()
+	tickets := []wallet.Ticket{}
+	for i := 0; i < 8; i++ {
+		tickets = append(tickets, webTicket(fmt.Sprintf("t%d", i)))
+	}
+	seedBrowser(t, org, tickets, nil)
+	device := strings.Repeat("a", 32)
+	ctx := context.Background()
+	p := newPeer(t, org, device, 30)
+	if _, err := p.syncer.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(publishedLease(t, org, device).Fingerprints); got != 4 {
+		t.Fatalf("half of 8 expected, published %d", got)
+	}
+	walletBefore := org.blobs[BlobID(testMaster, logicalActive)].Ciphertext
+	restarted := &Syncer{Session: p.syncer.Session, Store: p.store, LeaseSize: 2}
+	if _, err := restarted.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lease := publishedLease(t, org, device)
+	want := map[string]bool{wallet.Fingerprint("t7"): true, wallet.Fingerprint("t6"): true}
+	if len(lease.Fingerprints) != 2 || !want[lease.Fingerprints[0]] || !want[lease.Fingerprints[1]] {
+		t.Fatalf("published lease = %v", lease.Fingerprints)
+	}
+	if org.blobs[BlobID(testMaster, logicalActive)].Ciphertext != walletBefore {
+		t.Fatal("changing a lease must not rewrite the wallet")
+	}
+	if state := p.state(t); len(state.Active) != 8 || state.LeaseDirty {
+		t.Fatalf("active=%d dirty=%v", len(state.Active), state.LeaseDirty)
+	}
+	pushes := len(org.pushes)
+	outcome, err := restarted.Once(ctx)
+	if err != nil || !outcome.Skipped || len(org.pushes) != pushes {
+		t.Fatalf("a settled lease must stay quiet: %+v %v", outcome, err)
+	}
+	empty := &Syncer{Session: p.syncer.Session, Store: p.store, LeaseSize: 0}
+	if _, err := empty.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if lease := publishedLease(t, org, device); len(lease.Fingerprints) != 0 || lease.ExpiresAtMS != 0 {
+		t.Fatalf("zero must release: %+v", lease)
+	}
+}
+
+func TestLeaseFollowsAShrinkingWalletHalfCap(t *testing.T) {
+	org := newFakeOrg()
+	seedBrowser(t, org, []wallet.Ticket{webTicket("a"), webTicket("b"), webTicket("c"), webTicket("d")}, nil)
+	device := strings.Repeat("a", 32)
+	ctx := context.Background()
+	p := newPeer(t, org, device, 30)
+	if _, err := p.syncer.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Another client spent two: only those two remain in the wallet.
+	seedBrowser(t, org, []wallet.Ticket{webTicket("a"), webTicket("b")}, []wallet.Ticket{webTicket("c"), webTicket("d")})
+	if _, err := p.syncer.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(publishedLease(t, org, device).Fingerprints); got != 1 {
+		t.Fatalf("half of 2 expected, published %d", got)
+	}
+}
+
 func TestSpendPublishesThisDevicesOwnRemovalRecord(t *testing.T) {
 	org := newFakeOrg()
 	seedBrowser(t, org, []wallet.Ticket{webTicket("a")}, nil)

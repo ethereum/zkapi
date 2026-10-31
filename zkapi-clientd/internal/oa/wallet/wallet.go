@@ -482,25 +482,50 @@ func (st *State) Available(now time.Time) int {
 // HeldByOthers counts active tickets other devices have leased.
 func (st *State) HeldByOthers(now time.Time) int { return len(st.Active) - st.Available(now) }
 
-// RefreshLease extends this device's lease toward target tickets, taking from
-// the tail of the wallet because the browser spends from the head. It renews
-// the expiry when less than half remains and reports nothing to the network.
+// RefreshLease moves this device's lease to target tickets, keeping those nearest
+// the tail of the wallet because the browser spends from the head. A lower target
+// releases the excess, so a smaller setting or wallet takes effect on the next sync.
+// Tickets reserved for a request in flight stay leased even above target, because the
+// org has not decided them. It renews the expiry when less than half remains and an
+// empty lease has none. It reports nothing to the network.
 func (st *State) RefreshLease(target int, now time.Time) {
 	held := st.heldElsewhere(now)
 	active := map[string]bool{}
 	for _, t := range st.Active {
 		active[Fingerprint(t.Token)] = true
 	}
+	reserved := map[string]bool{}
+	for _, reservation := range st.Pending {
+		for _, t := range reservation.Tickets {
+			reserved[Fingerprint(t.Token)] = true
+		}
+	}
 	current := map[string]bool{}
+	for _, fingerprint := range st.Lease.Fingerprints {
+		switch {
+		case reserved[fingerprint]:
+			current[fingerprint] = true
+		case !active[fingerprint]:
+			st.LeaseDirty = true // Consumed or removed.
+		case held[fingerprint] && st.Lease.ExpiresAtMS <= now.UnixMilli():
+			st.LeaseDirty = true // Our lease lapsed and another device claimed it.
+		default:
+			current[fingerprint] = true
+		}
+	}
+	// Release from the head, the end the browser spends from.
+	for i := 0; i < len(st.Active) && len(current) > target; i++ {
+		fingerprint := Fingerprint(st.Active[i].Token)
+		if current[fingerprint] && !reserved[fingerprint] {
+			delete(current, fingerprint)
+			st.LeaseDirty = true
+		}
+	}
 	kept := st.Lease.Fingerprints[:0:0]
 	for _, fingerprint := range st.Lease.Fingerprints {
-		if active[fingerprint] && held[fingerprint] && st.Lease.ExpiresAtMS <= now.UnixMilli() {
-			// Our lease lapsed and another device claimed the ticket meanwhile.
-			st.LeaseDirty = true
-			continue
+		if current[fingerprint] {
+			kept = append(kept, fingerprint)
 		}
-		current[fingerprint] = true
-		kept = append(kept, fingerprint)
 	}
 	st.Lease.Fingerprints = kept
 	for i := len(st.Active) - 1; i >= 0 && len(current) < target; i-- {
@@ -511,7 +536,14 @@ func (st *State) RefreshLease(target int, now time.Time) {
 			st.LeaseDirty = true
 		}
 	}
-	if len(st.Lease.Fingerprints) > 0 && st.Lease.ExpiresAtMS-now.UnixMilli() < int64(LeaseTTL/2/time.Millisecond) {
+	if len(st.Lease.Fingerprints) == 0 {
+		if st.Lease.ExpiresAtMS != 0 {
+			st.Lease.ExpiresAtMS = 0
+			st.LeaseDirty = true
+		}
+		return
+	}
+	if st.Lease.ExpiresAtMS-now.UnixMilli() < int64(LeaseTTL/2/time.Millisecond) {
 		st.Lease.ExpiresAtMS = now.Add(LeaseTTL).UnixMilli()
 		st.LeaseDirty = true
 	}

@@ -82,7 +82,8 @@ blob format. `oa-clientd` is another device on it:
   client remembers spent tickets even if a stale device drops the record.
 - **Leases only avoid collisions.** This client publishes an encrypted lease on up
   to `ticket_lease_size` tickets (default 30), never more than half the wallet, taken
-  from the wallet's tail, and renews it during sync. Browsers with lease support skip leased tickets once they
+  from the wallet's tail, and renews it during sync. Lowering the setting releases the
+  excess on the next sync, except tickets reserved for a request in flight. Browsers with lease support skip leased tickets once they
   have synced. A lease ends on `logout`, or by itself after 6 hours, so a stopped
   or lost daemon cannot strand tickets. Leases are not custody: replicas are stale
   by design, two clients can lease the same ticket, and an older browser ignores
