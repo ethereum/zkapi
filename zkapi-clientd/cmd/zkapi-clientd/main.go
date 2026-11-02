@@ -21,11 +21,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/delegatemcp"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/server"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/delegatemcp"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/server"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )

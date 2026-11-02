@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
 )
 
 // Billing modes. Metered (the default) settles each key from its measured

@@ -2,7 +2,7 @@
 
 A local OpenAI-compatible API, paid from your private ETH balance. No OA account or OpenRouter API key needed.
 
-To pay with OA account inference tickets instead, see [oa-clientd](docs/CLI_OA.md), a separate binary and profile that shares this API and none of this wallet.
+To pay with OA account inference tickets instead, see `oa-clientd` in [OpenAnonymity/oa-chat](https://github.com/OpenAnonymity/oa-chat) (directory `oa-clientd/`), a separate project with its own guide.
 
 > **Local migration build:** this worktree targets the new concession protocol.
 > Sepolia ships its leaf-bound staging deployment, shown as **zkAPI v0.2**

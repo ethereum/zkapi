@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
 

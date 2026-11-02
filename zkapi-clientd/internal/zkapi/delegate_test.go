@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 )
 
 const delegationTestBase = "https://inference.test/v1"

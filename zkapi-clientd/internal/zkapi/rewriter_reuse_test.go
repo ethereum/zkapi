@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 )
 
 func TestRewrittenContinuationReusesORKeyAndHistory(t *testing.T) {

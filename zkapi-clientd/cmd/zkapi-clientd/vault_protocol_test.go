@@ -8,9 +8,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/cover"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 )
 
 func legacySelectionConfig() config.Config {

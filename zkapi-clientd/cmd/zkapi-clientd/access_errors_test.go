@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/server"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/server"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
 

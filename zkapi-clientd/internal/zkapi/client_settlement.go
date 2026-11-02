@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
 )
 
 // Group metadata survives cache eviction after a failed or canceled response.

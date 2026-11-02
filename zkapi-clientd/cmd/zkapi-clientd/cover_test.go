@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/cover"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
 )
 
 func TestCoverConfigPreservesOtherSettings(t *testing.T) {

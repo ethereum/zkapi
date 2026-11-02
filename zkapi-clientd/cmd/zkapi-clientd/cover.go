@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/cover"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
 )
 
 func runCoverConfig(dir string, c config.Config, args []string, out io.Writer) error {

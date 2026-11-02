@@ -57,6 +57,33 @@ and rebuilt in **both** engines; see `packaging/legacy/shared-files.txt` and
 [protocol selection](VAULT_PROTOCOL.md). The original historical recovery binary
 is not overwritten.
 
+## Shared packages
+
+The payment-independent packages `activity`, `cover`, `delegatemcp`, `relay`,
+`rewriter` and `server` are not in this module. They live in
+`github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/...` (the `oa-clientd/` directory of
+`OpenAnonymity/oa-chat`), with their tests, and this module imports them through
+the immutable pseudo-version pinned in `go.mod`. That module's own command,
+account and ticket code is under its `internal/`, which Go keeps out of reach
+from here.
+
+- Dependencies point one way: this module requires that one, and that one must
+  never require this module, go-ethereum or a payment wallet (its own test fails
+  if it does). Payment, configuration, funding and wallet code stays here.
+- `go test ./...` here does not run the shared packages' tests. Run them in that
+  module (`cd oa-clientd && go test -race ./...` in an `oa-chat` checkout), or
+  against exactly the pinned version from this directory:
+  `go test -race github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/...`.
+- To change shared code: change and test it in `oa-chat`, push the commit, then
+  move the pin here with
+  `go get github.com/OpenAnonymity/oa-chat/oa-clientd@<commit> && go mod tidy` and
+  run this module's tests. Do not commit a `replace` directive or `go.work`; for
+  local work before the push, use a `go.work` outside both repositories.
+- The legacy engine still keeps these packages under `internal/`.
+  `scripts/build-legacy-privacy.sh` copies the listed shared files from the pinned
+  module's `pkg/` and maps their imports back, so a pin move is also a change to
+  the legacy engine's inputs: rebuild it and review its hash pin.
+
 ## Companion and proving assets
 
 The concession Rust companion can be compiled from the repository root:
@@ -147,7 +174,7 @@ empty temporary wallet and reads its status only.
 
 The live ticket test **spends Sepolia test funds** (two fixed-price tickets).
 It builds only with the `zkapi_live` tag and runs only with an explicit
-opt-in. It puts the real `internal/server` API around a real
+opt-in. It puts the real shared `pkg/server` API around a real
 `Client` in ticket mode against a running companion, given by its loopback
 URL. Everything it calls is real: proofs, successor checks, OA key
 verification, model policy, provider streams and chain reads. It checks
@@ -201,7 +228,7 @@ service at port 8012, not zkAPI or a wallet:
 
 ```sh
 cd zkapi-clientd
-ZKAPI_TEST_REWRITER=1 go test -v ./internal/rewriter -run '^TestLive'
+ZKAPI_TEST_REWRITER=1 go test -v github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter -run '^TestLive'
 ```
 
 Unit/local-fixture tests do not demonstrate Tor circuit construction, anonymity,

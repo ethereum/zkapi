@@ -8,8 +8,8 @@ import (
 	"io"
 
 	"context"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
 )
 
 // Only the immediately preceding request is remembered. Keeping one-way

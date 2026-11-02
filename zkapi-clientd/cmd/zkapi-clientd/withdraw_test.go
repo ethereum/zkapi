@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/server"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/server"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
 
