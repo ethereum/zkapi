@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 )
 
 // Delegate sends one self-contained, non-streaming completion as an

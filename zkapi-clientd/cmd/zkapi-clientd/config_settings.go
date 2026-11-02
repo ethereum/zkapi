@@ -9,9 +9,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/cover"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 )
 
 const settingsHelp = `Saved settings (stop serve before edits; no setup or payment):

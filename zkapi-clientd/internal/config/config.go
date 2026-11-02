@@ -14,9 +14,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/cover"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 )
 
 // Compatible requests share a provider credential within this fixed window,

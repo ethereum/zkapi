@@ -3,7 +3,7 @@
 package zkapi
 
 // Opt-in live Sepolia test of ticket billing through the real Go request
-// path: the real internal/server API around a real Client in BillingTicket
+// path: the real shared pkg/server API around a real Client in BillingTicket
 // mode, against a running companion (zkapi-walletd) whose loopback URL is
 // given explicitly. Every proof, signed successor check, OA key
 // verification, model and tier policy read, provider request and chain read
@@ -42,8 +42,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/server"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/server"
 )
 
 type liveStream struct {

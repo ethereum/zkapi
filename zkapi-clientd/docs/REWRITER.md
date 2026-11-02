@@ -171,7 +171,7 @@ config preservation. The opt-in live test uses only a synthetic prompt:
 
 ```sh
 cd zkapi-clientd
-ZKAPI_TEST_REWRITER=1 go test -v ./internal/rewriter -run TestLiveLocalRewriter
+ZKAPI_TEST_REWRITER=1 go test -v github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter -run TestLiveLocalRewriter
 ```
 
 Live tests use `http://localhost:8012`, model `qwen3.8-flash-next`, with no key.

@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 	"io"
 	"net"
 	"net/http"
@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
 )
 
 const (

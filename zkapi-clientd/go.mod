@@ -3,9 +3,8 @@ module github.com/ethereum/zkapi/zkapi-clientd
 go 1.25.0
 
 require (
-	github.com/coder/websocket v1.8.14
+	github.com/OpenAnonymity/oa-chat/oa-clientd v0.0.0-20261102185612-afd3ddd3f7d8
 	github.com/ethereum/go-ethereum v1.17.5
-	github.com/google/jsonschema-go v0.4.3
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	golang.org/x/sys v0.41.0
@@ -14,10 +13,12 @@ require (
 require (
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6 // indirect
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
+	github.com/coder/websocket v1.8.14 // indirect
 	github.com/consensys/gnark-crypto v0.18.1 // indirect
 	github.com/crate-crypto/go-eth-kzg v1.5.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/ethereum/c-kzg-4844/v2 v2.1.8 // indirect
+	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect

@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 )
 
 func TestConfigSettingsAtomicPreservationAndStatus(t *testing.T) {

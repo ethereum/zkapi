@@ -8,8 +8,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/delegatemcp"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/delegatemcp"
 )
 
 const mcpHelp = `Usage: zkapi-clientd [--config-dir DIR] mcp

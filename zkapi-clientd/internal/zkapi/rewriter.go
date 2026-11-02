@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 )
 
 func (c *Client) rewritePrompt(ctx context.Context, body json.RawMessage, identity string) (json.RawMessage, error) {
