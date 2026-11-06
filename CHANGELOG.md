@@ -12,6 +12,13 @@ Folded into 0.2.0's notes at release.
 
 ### Added
 
+- **Fixed-price tickets.** An optional billing mode beside metered leases:
+  `zkapi serverd --ticket-catalog FILE` sells OA-mirroring tiers at a fixed
+  USD price, settled in gwei at the purchase's frozen quote when the ticket is
+  bought; the purchase returns the key with its signed successor. The
+  companion keeps paid tickets in a private inventory
+  (`/oa/v1/ticket`), and `zkapi-clientd config --billing-mode ticket` runs
+  requests concurrently, one ticket each. See [docs/tickets.md](docs/tickets.md).
 - **Gasless withdrawals (ERC-4337, EntryPoint v0.7.0).** `fees: 'payout'` in
   the SDK (`client.withdraw`, `finalizeEscape`) and `--fees payout` in
   zkapi-clientd pay the network fee from the payout through an

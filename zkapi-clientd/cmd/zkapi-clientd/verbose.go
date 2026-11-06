@@ -3,7 +3,7 @@ package main
 import (
 	"errors"
 	"flag"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
 	"io"
 )
 

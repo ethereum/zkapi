@@ -24,6 +24,7 @@ pub mod settlement;
 pub mod signer;
 pub mod successor;
 pub mod testnet_auth;
+pub mod tickets;
 pub mod watcher;
 mod writer_lock;
 

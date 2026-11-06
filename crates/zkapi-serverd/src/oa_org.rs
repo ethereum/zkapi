@@ -31,6 +31,14 @@ pub struct IssuedOpenRouterLease {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification: Option<OaKeyVerificationEvidence>,
     pub billing_quote: crate::native_billing::NativeBillingQuote,
+    /// A ticket purchase: the terms bought, at the fixed price of `ticket`'s
+    /// authorization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<zkapi_types::wire::TicketTermsV1>,
+    /// A ticket purchase: the successor signed at the ticket's fixed price,
+    /// to verify and install at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_response: Option<zkapi_types::wire::RequestResponseV2>,
 }
 
 #[derive(Debug, Clone)]

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
 

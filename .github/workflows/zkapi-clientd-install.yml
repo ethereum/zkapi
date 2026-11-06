@@ -7,6 +7,7 @@ on:
       - 'zkapi-clientd/packaging/**'
       - '.github/workflows/zkapi-clientd-install.yml'
       - '.github/workflows/zkapi-clientd-release.yml'
+      - '.github/workflows/zkapi-clientd-publish.yml'
   push:
     paths:
       - 'zkapi-clientd/install.sh'
@@ -14,6 +15,7 @@ on:
       - 'zkapi-clientd/packaging/**'
       - '.github/workflows/zkapi-clientd-install.yml'
       - '.github/workflows/zkapi-clientd-release.yml'
+      - '.github/workflows/zkapi-clientd-publish.yml'
 permissions:
   contents: read
 jobs:
@@ -31,7 +33,8 @@ jobs:
         run: python3 zkapi-clientd/scripts/test-install.py
       - name: Test package generation and source preparation
         run: |
-          python3 zkapi-clientd/scripts/sync-packages.py 0.1.6 --check
+          python3 zkapi-clientd/scripts/sync-packages.py --check
           python3 zkapi-clientd/scripts/test-packages.py
+          python3 zkapi-clientd/scripts/test-package-publication.py
           python3 zkapi-clientd/scripts/test-prepare-zkapi.py
           python3 zkapi-clientd/scripts/test-source-install.py

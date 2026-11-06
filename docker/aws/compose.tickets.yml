@@ -1,0 +1,15 @@
+# Optional: sell fixed-price tickets (docs/tickets.md). Add this file after
+# compose.yml; it changes only the server. The catalog lives beside the other
+# configuration (${ZKAPI_CONFIG_DIR}/ticket-catalog.json, for example a copy
+# of ticket-catalog.example.json) and needs the OA org key source (OA_ORG_URL).
+services:
+  server:
+    environment:
+      ZKAPI_TICKET_CATALOG: /srv/zkapi/ticket-catalog.json
+    volumes:
+      - type: bind
+        source: ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/ticket-catalog.json
+        target: /srv/zkapi/ticket-catalog.json
+        read_only: true
+        bind:
+          create_host_path: false

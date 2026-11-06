@@ -2,8 +2,20 @@
 
 This directory is ready to copy to an AUR repository for `zkapi-clientd-bin`.
 It installs the checksum-pinned `0.1.6` release for x86_64 or aarch64, the native
-wallet companion and proving assets, and a systemd user service. Publication to
-the AUR is a separate maintainer step.
+wallet companion and proving assets, and a systemd user service.
+The release publication workflow maintains the AUR repository after its SSH
+key has been registered. See [initial publication and credentials](../../docs/CLI_PACKAGING.md#publishing-packages).
+
+Once the first push has created the public entry, install with an AUR helper:
+
+```sh
+yay -S zkapi-clientd-bin
+zkapi-clientd config
+systemctl --user enable --now zkapi-clientd.service
+```
+
+For updates, stop the service, upgrade with your AUR helper, and start it again.
+The package preserves the wallet and configuration.
 
 To build and install this checkout on Arch Linux as a regular user:
 

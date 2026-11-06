@@ -12,7 +12,8 @@ has the schemas.
 | GET | `/v1/attestation` | Public signing keys and protocol pins, with the same statement fields |
 | GET | `/v2/auth` | Validate the configured Sepolia shared password without side effects |
 | GET | `/v2/billing/quote` | Pinned finalized native ETH billing quote |
-| POST | `/v2/openrouter/leases` | Verify proof and reserve a bounded runtime key |
+| POST | `/v2/openrouter/leases` | Verify proof and reserve a bounded runtime key; with a ticket authorization, buy a fixed-price ticket and return its signed successor ([tickets](tickets.md)) |
+| GET | `/v2/tickets` | The fixed-price ticket tiers on sale (`404` when the server sells none) |
 | GET | `/v2/openrouter/leases/{client_request_id}` | Non-secret lease status and settlement deadline |
 | POST | `/v2/openrouter/leases/{client_request_id}` | Retire and settle the exact lease |
 | POST | `/v2/openrouter/leases/{client_request_id}/expire` | Authoritative recovery of an expired or superseded unaccepted request |
@@ -87,7 +88,9 @@ or prepared withdrawal. See
 
 A lease uses `ApiRequestV2`: client request ID, canonical prompt-free payload,
 payload hash, public inputs and `{backend: "groth16_bn254", proof: "base64..."}`.
-The authorization payload includes mode/version and its frozen `billing_quote`.
+The authorization payload includes mode/version and its frozen `billing_quote`
+(mode `openrouter_ephemeral_lease`; a ticket purchase uses mode
+`zkapi_fixed_price_ticket` with its terms and price, see [tickets](tickets.md)).
 The server recomputes payload/request binding, validates the native quote and
 verifies the proof. Proof bytes contain eight canonical 32-byte coordinates
 (256 bytes total). The request public inputs and their order are those of the

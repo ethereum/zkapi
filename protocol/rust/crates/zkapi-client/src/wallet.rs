@@ -54,6 +54,44 @@ use crate::note_state::NoteState;
 /// (`note_leaf_mismatch`, `note_not_active`, both final).
 #[cfg(not(test))]
 const CLEARANCE_RETRY_DELAYS_MS: [u64; 4] = [1_000, 2_000, 4_000, 8_000];
+/// A fixed-price ticket settles at exactly its authorized price, repeating
+/// the bought terms, or (never issued or delivered) at zero. On every path
+/// that installs a successor, a validly signed response charging anything
+/// else for a ticket is refused like an S3 failure.
+fn check_ticket_settlement(
+    request_payload: Option<&serde_json::Value>,
+    settled: &serde_json::Value,
+    response: &RequestResponseV2,
+) -> Result<(), ClientError> {
+    let Some(request) = request_payload.filter(|payload| {
+        payload.get("mode").and_then(|mode| mode.as_str()) == Some(zkapi_types::wire::TICKET_MODE)
+    }) else {
+        return Ok(());
+    };
+    if response.charge_applied == 0 {
+        return Ok(());
+    }
+    let price = request
+        .get("price_units")
+        .and_then(serde_json::Value::as_u64);
+    let paid = settled.get("type").and_then(serde_json::Value::as_str)
+        == Some(zkapi_types::wire::TICKET_SETTLEMENT_TYPE)
+        && settled.get("ticket") == request.get("ticket")
+        && price.is_some_and(|price| {
+            u128::from(price) == response.charge_applied
+                && settled
+                    .get("price_units")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(price.to_string().as_str())
+        });
+    if !paid {
+        return Err(ClientError::InvalidSuccessor(
+            "a ticket settled at another charge or terms than its fixed price".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 const CLEARANCE_RETRY_DELAYS_MS: [u64; 4] = [1, 2, 4, 8];
 
@@ -581,6 +619,7 @@ impl Wallet {
                         "native settlement changed the authorized quote".into(),
                     ));
                 }
+                check_ticket_settlement(request_payload.as_ref(), &settled, response)?;
             }
         }
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;

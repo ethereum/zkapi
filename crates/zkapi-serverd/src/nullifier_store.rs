@@ -314,6 +314,10 @@ pub(crate) enum FinalizeGuard {
     Unissued,
     /// A lease reopened with a concession: still marked `operator_conceded`.
     Conceded,
+    /// A ticket settled at its fixed price as its key is delivered: an
+    /// activated key that was never delivered nor committed to any charge.
+    /// The same transaction marks it delivered.
+    DeliverTicket,
 }
 
 impl FinalizeGuard {
@@ -331,7 +335,15 @@ impl FinalizeGuard {
                 "charge_basis = 'operator_conceded'
                  AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')"
             }
+            Self::DeliverTicket => {
+                "status = 'active' AND charge_basis IS NULL AND key_hash IS NOT NULL
+                 AND COALESCE(delivered, 0) = 0"
+            }
         }
+    }
+
+    fn marks_delivered(self) -> bool {
+        matches!(self, Self::DeliverTicket)
     }
 }
 
@@ -1256,7 +1268,8 @@ impl NullifierStore {
                 &format!(
                     "UPDATE openrouter_leases SET
                         status = 'finalized', usage_usd = ?1, charge_applied = ?2,
-                        charge_basis = ?3, last_error = NULL, updated_at = ?4
+                        charge_basis = ?3, last_error = NULL, updated_at = ?4,
+                        delivered = CASE WHEN ?7 THEN 1 ELSE delivered END
                      WHERE client_request_id = ?5 AND request_nullifier = ?6
                        AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')
                        AND {condition}"
@@ -1268,6 +1281,7 @@ impl NullifierStore {
                     now,
                     client_request_id,
                     nullifier.to_hex(),
+                    finalization.guard.marks_delivered(),
                 ],
             )
             .map_err(failed)?;

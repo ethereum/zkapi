@@ -110,7 +110,9 @@ historical recovery, but is no longer selected by this dispatcher.
 `bash zkapi-clientd/scripts/build-legacy-privacy.sh` reconstructs the pinned old
 protocol source in a temporary directory, applies `packaging/legacy/privacy.patch`
 (the adapter wiring), and overlays current files listed in
-`packaging/legacy/shared-files.txt`. Rewriter, target transcript, server preview,
+`packaging/legacy/shared-files.txt`; files of the shared packages come from the
+pinned shared module's `pkg/`, with imports mapped back to the old `internal/`
+paths ([shared packages](DEVELOPMENT.md#shared-packages)). Rewriter, target transcript, server preview,
 cover worker and their tests are shared verbatim—not independent forks. The
 script runs the legacy race suite and vet, builds `bin/zkapi-clientd-legacy-privacy`,
 and updates `cmd/zkapi-clientd/legacy_client.sha256`. Rebuild the primary client

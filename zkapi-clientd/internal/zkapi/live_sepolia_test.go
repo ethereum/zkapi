@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
 )
 
 // Opt-in read-only acceptance against the actual packaged Sepolia deployment.

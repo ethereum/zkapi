@@ -7,8 +7,8 @@ import (
 	"io"
 	"os"
 
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 )
 
 func runRewriterConfig(dir string, c config.Config, args []string, out io.Writer) error {

@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter"
 	"io"
 	"net"
 	"net/http"
@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/activity"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/relay"
 )
 
 const (
@@ -49,6 +49,8 @@ type Config struct {
 	// BundlerURL is the user's ERC-4337 bundler for gasless withdrawals
 	// (--bundler-url / zkapi.bundler_url); empty uses the profile's.
 	BundlerURL string `json:"bundler_url,omitempty"`
+	// BillingMode is BillingMetered (or empty) or BillingTicket.
+	BillingMode string `json:"billing_mode,omitempty"`
 }
 
 type Client struct {
@@ -70,6 +72,13 @@ type Client struct {
 	// them nil and always uses the packaged deployment manifest.
 	endpoints    *chainEndpoints
 	capabilities *deploymentCapabilities
+	// Ticket mode: the earlier run's claims are released once, before
+	// this process claims any ticket.
+	ticketRecoveryMu sync.Mutex
+	ticketsRecovered bool
+	// prepareTor opens the isolated SOCKS stream a delegation requires before
+	// any lease; nil uses relay.PrepareTor. Tests substitute a local fake.
+	prepareTor func(ctx context.Context, endpoint, destination, identity string) error
 }
 
 // chainEndpoints are the packaged deployment's remote origins. The payment RPC
@@ -208,6 +217,13 @@ func New(config Config) (*Client, error) {
 	if config.Network == "" {
 		config.Network = "mainnet"
 	}
+	switch config.BillingMode {
+	case "", BillingMetered:
+		config.BillingMode = BillingMetered
+	case BillingTicket:
+	default:
+		return nil, errors.New("zkAPI billing mode must be metered or ticket")
+	}
 	if _, err := ChainID(config.Network); err != nil {
 		return nil, err
 	}
@@ -319,6 +335,8 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			}
 			for _, code := range []string{nested.Code, flat, failure.Code} {
 				switch code {
+				case "ticket_terms_changed", "ticket_tier_unavailable", "tickets_unavailable":
+					return nil, &Error{response.StatusCode, code}
 				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state", "ownership_proof_sent",
 					// The concession exit (design §6.3, §6.4).
 					"escape_required", "conceded_mismatch", "device_not_newest", "exit_locked", "note_near_expiry", "bound_fixed_at_state", "invalid_successor", "late_successor", "exit_lock_conflict":
@@ -423,7 +441,18 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 			return nil, err
 		}
 	}
-	lease, err := c.waitForLease(ctx, body)
+	if c.ticketMode() {
+		ticket, err := c.acquireTicket(ctx, body)
+		if err != nil {
+			return nil, err
+		}
+		// The slot serialized conversation state and the purchase only: a
+		// bought ticket is settled, so its inference runs alongside others.
+		transferred = true
+		release()
+		return c.completeWithTicket(ctx, body, identity, ticket)
+	}
+	lease, err := c.waitForLease(ctx, body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -480,6 +509,49 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 	return response, nil
 }
 
+// completeWithTicket sends the request with a ticket's key, outside the
+// request slot, and consumes the ticket when the response ends: one ticket
+// per request, as key_reuse_window_seconds 0 isolates metered keys.
+// Inference is never retried automatically.
+func (c *Client) completeWithTicket(ctx context.Context, body json.RawMessage, identity string, ticket ticketLease) (*http.Response, error) {
+	inferenceCtx := ctx
+	if c.config.TorMode {
+		inferenceCtx = relay.WithTorIdentity(ctx, identity)
+	}
+	req, err := http.NewRequestWithContext(inferenceCtx, http.MethodPost, c.config.InferenceBaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		// Never sent: the ticket goes back unused.
+		c.releaseTicket(ticket.ClientRequestID, ticket.PurchaseID, false)
+		return nil, fmt.Errorf("create inference request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+ticket.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	response, err := c.inference.Do(req)
+	if err != nil {
+		// The provider may have received it: the ticket is spent.
+		c.releaseTicket(ticket.ClientRequestID, ticket.PurchaseID, true)
+		activity.Report(ctx, activity.Event{Kind: activity.KeyReleased, Key: ticket.serial})
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, &Error{http.StatusBadGateway, "inference_transport_failed"}
+	}
+	response.Header.Del("X-OA-Verification-Status")
+	response.Header.Del("X-OA-Verification-Detail")
+	response.Header.Set("X-OA-Verification-Status", ticket.VerificationStatus)
+	if ticket.VerificationStatus == "verifier-unavailable" {
+		response.Header.Set("X-OA-Verification-Detail", ticket.VerificationDetail)
+	}
+	response.Body = holdResponseSlotResult(ctx, response.Body, func(complete bool) {
+		activity.Report(ctx, activity.Event{Kind: activity.KeyReleased, Key: ticket.serial,
+			Complete: complete && response.StatusCode >= 200 && response.StatusCode < 300})
+		// One ticket per request: consumed whatever the outcome.
+		c.releaseTicket(ticket.ClientRequestID, ticket.PurchaseID, true)
+	})
+	return response, nil
+}
+
 type providerLease struct {
 	APIKey             string `json:"api_key"`
 	BaseURL            string `json:"base_url"`
@@ -496,7 +568,10 @@ type reusableLease struct {
 	until  time.Time
 }
 
-func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (providerLease, error) {
+// waitForLease acquires the request's key. With reuse false (delegation), it
+// neither consumes nor leaves a cached key: the lease is fresh and its group
+// retires as soon as the response slot is released.
+func (c *Client) waitForLease(ctx context.Context, body json.RawMessage, reuse bool) (providerLease, error) {
 	waiting, retirementAttempted := false, false
 	for {
 		if err := ctx.Err(); err != nil {
@@ -513,7 +588,7 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 		}
 		// Refresh public model policy even for cached access. A window never
 		// slides, and a different coarse cap cannot expand an existing key.
-		if cached := c.cachedLease; cached != nil && c.config.KeyReuseWindow > 0 &&
+		if cached := c.cachedLease; reuse && cached != nil && c.config.KeyReuseWindow > 0 &&
 			cached.budget == limit && c.now().Before(cached.until) {
 			activity.Diagnostic(ctx, "key=%d reused (within expiry/window and budget)", cached.serial)
 			activity.Report(ctx, activity.Event{Kind: activity.KeyReused, Key: cached.serial})
@@ -529,7 +604,7 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 			if err != nil {
 				return providerLease{}, err
 			}
-			accepted, err := c.acceptLease(lease, limit)
+			accepted, err := c.acceptLease(lease, limit, reuse)
 			if err == nil {
 				activity.Diagnostic(ctx, "payment: key=%d acquired; actual ETH charge reported after settlement", accepted.serial)
 				activity.Report(ctx, activity.Event{Kind: activity.KeyFresh, Key: accepted.serial})
@@ -605,7 +680,7 @@ func (c *Client) retireLease(ctx context.Context) error {
 
 // A newly handed-out lease is distinct from intentional in-memory reuse. Keep
 // rejecting a companion that returns a previous key, including after eviction.
-func (c *Client) acceptLease(raw json.RawMessage, budget uint64) (providerLease, error) {
+func (c *Client) acceptLease(raw json.RawMessage, budget uint64, reuse bool) (providerLease, error) {
 	var lease providerLease
 	now := c.now()
 	if json.Unmarshal(raw, &lease) != nil || !usableVerification(lease.Verified, lease.VerificationStatus, lease.VerificationDetail) || lease.APIKey == "" || strings.ContainsAny(lease.APIKey, "\r\n") || lease.ExpiresAt <= uint64(now.Unix()+1) || lease.ExpiresAt > 1<<63-1 || strings.TrimRight(lease.BaseURL, "/") != c.config.InferenceBaseURL {
@@ -625,12 +700,17 @@ func (c *Client) acceptLease(raw json.RawMessage, budget uint64) (providerLease,
 	c.usedLeases[hash] = lease.ExpiresAt
 	c.keySerial++
 	lease.serial = c.keySerial
-	until := now.Add(c.config.KeyReuseWindow)
+	window := c.config.KeyReuseWindow
+	if !reuse {
+		window = 0
+	}
+	until := now.Add(window)
 	if expiry := time.Unix(int64(lease.ExpiresAt)-1, 0); expiry.Before(until) {
 		until = expiry
 	}
 	c.leaseGroup = &leaseGroup{serial: lease.serial, until: until}
-	if c.config.KeyReuseWindow > 0 {
+	c.cachedLease = nil
+	if window > 0 {
 		c.cachedLease = &reusableLease{providerLease: lease, budget: budget, until: until}
 	}
 	select {

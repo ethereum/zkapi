@@ -13,6 +13,20 @@ Release automation renders `package.nix.in` from the exact release archives and
 publishes `zkapi-clientd-nix.tar.gz` as a standalone flake. It also includes the
 flake in the combined packaging archive.
 
+The publication workflow also maintains a standalone flake on the
+`clientd-packages` branch. After the first publication run:
+
+```sh
+nix profile install github:ethereum/zkapi/clientd-packages#zkapi-clientd
+```
+
+For NixOS/Home Manager, use
+`inputs.zkapi-clientd.url = "github:ethereum/zkapi/clientd-packages";` with the
+module declarations below. Run `nix flake update zkapi-clientd` and rebuild to
+use the latest published release. For profile installations use `nix profile
+list` and `nix profile upgrade NAME`. Publication does not change an existing
+lockfile or restart a running daemon. See [publication setup](https://github.com/ethereum/zkapi/blob/main/zkapi-clientd/docs/CLI_PACKAGING.md#publishing-packages).
+
 After extracting `zkapi-clientd-packaging.tar.gz`, install without root privileges:
 
 ```sh
@@ -27,6 +41,19 @@ The package supports x86_64/aarch64 on Linux and macOS. Linux ELF dependencies
 are patched into the Nix store and the matching companion/proof data are bundled.
 The companion is selected from the package's own `bin` directory. No user state
 is created by a build, installation, or activation.
+
+On a Linux system using Nix without NixOS or Home Manager, link the packaged
+unit after initializing the wallet:
+
+```sh
+systemctl --user link "$HOME/.nix-profile/lib/systemd/user/zkapi-clientd.service"
+systemctl --user enable --now zkapi-clientd.service
+```
+
+For upgrades, stop the service, upgrade the profile, run
+`systemctl --user daemon-reload`, and start the service again. Adjust the profile
+path if you use a named profile. On macOS, use Homebrew for launchd management;
+this Nix flake provides the executables on macOS and systemd services on Linux.
 
 ## NixOS user service
 

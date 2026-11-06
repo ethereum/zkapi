@@ -10,7 +10,8 @@ The default instruction contains no restaurant or other worked task examples.
 
 Three example-free candidates (semantic reconstruction, request compilation,
 minimal specification) were compared on 12 cases. Candidates and the battery
-are retained in `internal/rewriter/instruction_eval_test.go` for reproducibility.
+are retained in `pkg/rewriter/instruction_eval_test.go` of the shared module
+(`github.com/OpenAnonymity/oa-chat/oa-clientd`, see [development](DEVELOPMENT.md#shared-packages)) for reproducibility.
 A preliminary attempt was cut short by the command timeout; the full comparison
 was rerun with a longer test timeout.
 
@@ -80,12 +81,12 @@ From `zkapi-clientd`, with the local editor running:
 ```sh
 # Current default against all 16 cases:
 ZKAPI_EVAL_REWRITER=1 ZKAPI_EVAL_DEFAULT=1 \
-  go test -v ./internal/rewriter -run '^TestLiveInstructionEvaluation$' \
+  go test -v github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter -run '^TestLiveInstructionEvaluation$' \
   -parallel 2 -count 1 -timeout 15m
 
 # Compare the original three candidates against the current expanded battery:
 ZKAPI_EVAL_REWRITER=1 \
-  go test -v ./internal/rewriter -run '^TestLiveInstructionEvaluation$' \
+  go test -v github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/rewriter -run '^TestLiveInstructionEvaluation$' \
   -parallel 2 -count 1 -timeout 15m
 ```
 

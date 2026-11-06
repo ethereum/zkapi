@@ -41,6 +41,7 @@ use zkapi_types::wire::{
     ApiRequestV2, ClearanceOwnershipProofV2C, ClearanceRequestV2C, ClearanceResponseV2,
     CurvePointWire, Groth16ProofWire, OpenRouterLeaseAuthorization, OpenRouterLeaseResponse,
     OpenRouterLeaseStatusResponse, ProofBackendWire, RecoveryResponseV2, RequestResponseV2,
+    TicketAuthorization,
 };
 use zkapi_types::{
     canonical_payload_hash, canonical_request_context, Felt252, RequestPublicInputsV2,
@@ -392,6 +393,28 @@ struct IssuanceLease<'a> {
     lease_config: &'a OpenRouterLeaseConfig,
     spending_limit_usd: f64,
     oa_request_id: Option<&'a str>,
+    /// A ticket's tier duration, in place of the configured lease TTL.
+    ttl_seconds: Option<u64>,
+}
+
+/// The prompt-free authorization a lease request carries: a metered lease,
+/// settled from measured usage, or a fixed-price ticket, settled at purchase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeaseMode {
+    Metered(OpenRouterLeaseAuthorization),
+    Ticket(TicketAuthorization),
+}
+
+impl LeaseMode {
+    fn is_supported(&self) -> bool {
+        match self {
+            Self::Metered(authorization) => {
+                *authorization == OpenRouterLeaseAuthorization::default()
+            }
+            // parse_authorization admits only version 1.
+            Self::Ticket(_) => true,
+        }
+    }
 }
 
 /// What signing a settled request's successor did (`sign_successor`).
@@ -928,9 +951,7 @@ impl RequestProcessor {
     /// The proof-bound lease terms exactly as persisted: the prompt-free
     /// authorization and the frozen quote, checked only intrinsically.
     /// Settlement uses these and never reads mutable configuration.
-    fn lease_terms(
-        request: &ApiRequestV2,
-    ) -> Result<(OpenRouterLeaseAuthorization, NativeBillingQuote), ServerError> {
+    fn lease_terms(request: &ApiRequestV2) -> Result<(LeaseMode, NativeBillingQuote), ServerError> {
         let mut payload: serde_json::Value = serde_json::from_str(&request.payload)
             .map_err(|_| ServerError::InvalidRequest("invalid lease authorization".into()))?;
         let object = payload.as_object_mut().ok_or_else(|| {
@@ -942,17 +963,20 @@ impl RequestProcessor {
         let quote: NativeBillingQuote = serde_json::from_value(quote)
             .map_err(|_| ServerError::InvalidRequest("invalid native billing quote".into()))?;
         quote.validate_intrinsic(request.public_inputs.chain_id)?;
+        if let Some(ticket) = crate::tickets::parse_authorization(&payload)? {
+            return Ok((LeaseMode::Ticket(ticket), quote));
+        }
         let authorization = serde_json::from_value(payload).map_err(|_| {
             ServerError::InvalidRequest("invalid prompt-free lease authorization".into())
         })?;
-        Ok((authorization, quote))
+        Ok((LeaseMode::Metered(authorization), quote))
     }
 
     /// Admission only: the frozen terms must also match the live deployment.
     fn lease_authorization(
         &self,
         request: &ApiRequestV2,
-    ) -> Result<(OpenRouterLeaseAuthorization, NativeBillingQuote), ServerError> {
+    ) -> Result<(LeaseMode, NativeBillingQuote), ServerError> {
         let (authorization, quote) = Self::lease_terms(request)?;
         let config = self.config.native_billing.as_ref().ok_or_else(|| {
             ServerError::InvalidRequest("native ETH billing configuration is required".into())
@@ -1183,6 +1207,12 @@ impl RequestProcessor {
         // A new reservation's quote is checked against the live deployment by
         // the oracle below; an exact retry keeps its frozen quote.
         let (authorization, billing_quote) = Self::lease_terms(request)?;
+        let authorization = match authorization {
+            LeaseMode::Ticket(ticket) => {
+                return self.issue_ticket(request, ticket, billing_quote).await
+            }
+            LeaseMode::Metered(authorization) => authorization,
+        };
         if authorization != OpenRouterLeaseAuthorization::default() {
             return Err(ServerError::InvalidRequest(
                 "unsupported OpenRouter lease authorization".to_string(),
@@ -1258,6 +1288,7 @@ impl RequestProcessor {
             lease_config,
             spending_limit_usd,
             oa_request_id: oa_request_id.as_deref(),
+            ttl_seconds: None,
         });
         if self
             .validate_and_reserve_with(request, issuance.as_ref())?
@@ -1524,7 +1555,377 @@ impl RequestProcessor {
             key_source: lease_config.source.label().to_string(),
             verification,
             billing_quote,
+            ticket: None,
+            request_response: None,
         })
+    }
+
+    /// The tiers this server sells (`GET /v2/tickets`); None sells none.
+    pub fn ticket_catalog(&self) -> Option<zkapi_types::wire::TicketCatalogResponse> {
+        let catalog = self.config.ticket_catalog.as_ref()?;
+        Some(zkapi_types::wire::TicketCatalogResponse {
+            version: crate::tickets::TICKET_CATALOG_VERSION,
+            key_source: self.lease_config().ok()?.source.label().to_string(),
+            tiers: catalog.tiers().to_vec(),
+        })
+    }
+
+    /// Buy one fixed-price ticket: reserve the request, issue its OA key,
+    /// settle the request at exactly the ticket's price as the key is marked
+    /// delivered, and sign the successor, all before returning. An exact
+    /// retry never charges again: a paid ticket returns its signed successor
+    /// and the same key, replayed by the org; a ticket whose key was never
+    /// delivered settles at zero like any undelivered lease.
+    async fn issue_ticket(
+        &self,
+        request: &ApiRequestV2,
+        authorization: TicketAuthorization,
+        billing_quote: NativeBillingQuote,
+    ) -> Result<IssuedOpenRouterLease, ServerError> {
+        let lease_config = self.config.openrouter_leases.as_ref().ok_or_else(|| {
+            ServerError::InvalidRequest("prompt-private leases are not enabled".into())
+        })?;
+        if !matches!(
+            lease_config.source,
+            OpenRouterLeaseSourceConfig::OaOrg { .. }
+        ) {
+            return Err(ServerError::InvalidRequest(
+                "tickets need the OA org key source".into(),
+            ));
+        }
+        let catalog = self.config.ticket_catalog.as_ref().ok_or_else(|| {
+            ServerError::TicketTermsMismatch("this server sells no tickets".into())
+        })?;
+        let terms = authorization.ticket.clone();
+        // Intrinsic to the bound request, so checked on every retry too.
+        let price_units = crate::tickets::price_units(
+            &authorization,
+            &billing_quote,
+            request.public_inputs.solvency_bound,
+        )?;
+        let credit_micro_usd = u128::from(terms.credit_limit_micro_usd);
+        let credit_limit_usd = pricing::micro_usd_to_usd(credit_micro_usd);
+        let ttl_seconds = terms.duration_seconds;
+        let _issue_guard = self.lease_issue_lock.lock().await;
+        let oa_request_id = Self::native_oa_request_id(request)?;
+        let existing_lease = self
+            .store
+            .try_lookup_openrouter_lease(&request.client_request_id)?;
+        let existing_reservation = self
+            .store
+            .try_lookup_by_nullifier(&request.public_inputs.request_nullifier)?;
+        if let Some(existing) = existing_lease.as_ref() {
+            if api_request_binding(&existing.api_request)? != api_request_binding(request)? {
+                return Err(ServerError::Replay);
+            }
+        }
+        if existing_reservation.is_none() {
+            // Only a new purchase is checked against the terms on sale now;
+            // a reserved one keeps the terms its proof bound.
+            crate::tickets::check_on_sale(catalog, &terms)?;
+            if let Some(max_micro_usd) = self.config.request_limit_max_usd_micros {
+                if credit_micro_usd > max_micro_usd {
+                    return Err(ServerError::RequestLimitExceeded {
+                        limit_micro_usd: credit_micro_usd,
+                        max_micro_usd,
+                    });
+                }
+            }
+            self.native_oracle
+                .validate(&billing_quote, current_timestamp())
+                .await?;
+            self.native_oracle
+                .assert_fresh(&billing_quote, current_timestamp())?;
+        }
+        let issuance = existing_lease.is_none().then_some(IssuanceLease {
+            lease_config,
+            spending_limit_usd: credit_limit_usd,
+            oa_request_id: Some(&oa_request_id),
+            ttl_seconds: Some(ttl_seconds),
+        });
+        // A finalized reservation answers with its transcript; the lease row
+        // below decides what that means for a ticket.
+        self.validate_and_reserve_with(request, issuance.as_ref())?;
+        let lease = self
+            .store
+            .try_lookup_openrouter_lease(&request.client_request_id)?
+            .ok_or_else(|| ServerError::Internal("a ticket reservation has no lease row".into()))?;
+        if lease.request_nullifier != request.public_inputs.request_nullifier
+            || api_request_binding(&lease.api_request)? != api_request_binding(request)?
+            || lease.key_source != "oa_org"
+            || lease.spending_limit_usd.to_bits() != credit_limit_usd.to_bits()
+            || self.lease_ttl_seconds(&lease)? != ttl_seconds
+        {
+            return Err(ServerError::Internal(
+                "ticket lease row does not match its bound request".into(),
+            ));
+        }
+        self.persisted_oa_request_id(&lease)?;
+        match lease.charge_basis.as_deref() {
+            Some(crate::tickets::CHARGE_BASIS) => {
+                return self
+                    .redeliver_ticket(request, &lease, terms, billing_quote, &oa_request_id)
+                    .await;
+            }
+            Some(_) => {
+                // Committed to a zero (or conceded) settlement: never a key.
+                if !lease_terminal(&lease.status) {
+                    let _ = self.finalize_never_delivered_lease(&lease.client_request_id);
+                }
+                self.sign_if_settled(request).await;
+                return Err(ServerError::TicketUnissued);
+            }
+            None => {}
+        }
+        if lease.status == "cancelled" {
+            return Err(ServerError::NullifierUsed);
+        }
+        if lease.status == "provisioning"
+            && lease.oa_provisioning_outcome == OaProvisioningOutcome::ConfirmedUnissued
+        {
+            self.finalize_never_delivered_lease(&lease.client_request_id)?;
+            self.sign_if_settled(request).await;
+            return Err(ServerError::OaKeyPolicyRejected);
+        }
+        if !matches!(lease.status.as_str(), "provisioning" | "active")
+            || lease.delivered == Some(true)
+        {
+            return Err(ServerError::LeasePending);
+        }
+        if let Some(deadline) = lease.settlement_deadline_at {
+            let latest_start = current_timestamp()
+                .saturating_add(ttl_seconds)
+                .saturating_add(lease_config.settlement_grace_seconds)
+                .saturating_add(MIN_SETTLEMENT_RETRY_WINDOW_SECONDS);
+            if latest_start > deadline {
+                return Err(ServerError::LeasePending);
+            }
+        }
+        self.native_oracle
+            .assert_request_unspent(&request.public_inputs.request_nullifier)
+            .await?;
+        let created = self
+            .create_ticket_key(request, &lease, &oa_request_id, credit_limit_usd)
+            .await?;
+        let key_hash = created.hash.clone();
+        let expires_at = created
+            .expires_at
+            .saturating_sub(OA_LEASE_EXPIRY_SAFETY_SECONDS);
+        if lease.status == "provisioning" {
+            self.store.update_openrouter_lease_timing(
+                &request.client_request_id,
+                expires_at,
+                expires_at.saturating_add(lease_config.settlement_grace_seconds),
+            )?;
+            self.store.activate_openrouter_lease_from(
+                &request.client_request_id,
+                &key_hash,
+                Some(&lease_config.source.identity()),
+            )?;
+        }
+        // The fixed charge is committed only while the request is unspent,
+        // in the transaction that marks the key delivered. Before it, the key
+        // is undelivered and settles at zero; after it, nothing changes it.
+        self.native_oracle
+            .assert_request_unspent(&request.public_inputs.request_nullifier)
+            .await?;
+        let lease = self
+            .store
+            .try_lookup_openrouter_lease(&request.client_request_id)?
+            .ok_or_else(|| ServerError::Internal("ticket lease disappeared".into()))?;
+        let payload = self.settlement_payload(
+            request,
+            serde_json::json!({
+                "type": zkapi_types::wire::TICKET_SETTLEMENT_TYPE,
+                "issued": true,
+                "delivered": true,
+                "ticket": &terms,
+                "price_units": price_units.to_string(),
+                "charge_basis": crate::tickets::CHARGE_BASIS,
+                "issued_at": lease.issued_at,
+                "expires_at": lease.expires_at,
+                "station_id": created.verification.station_id,
+            }),
+        )?;
+        let settled = self.settle_lease(
+            &lease,
+            SettlementResult {
+                status_code: 200,
+                payload,
+                charge_applied: price_units,
+                usage: None,
+                billing_label: format!("ticket:{}", terms.tier_name),
+            },
+            crate::tickets::CHARGE_BASIS,
+            0.0,
+            None,
+            None,
+            FinalizeGuard::DeliverTicket,
+        )?;
+        match settled {
+            Some(settled) if settled.charge == price_units => {}
+            Some(_) => {
+                return Err(ServerError::Internal(
+                    "the ticket's request settled at another charge".into(),
+                ))
+            }
+            // The row changed under the issuance lock: only an operator's
+            // concession or corruption repair can do that.
+            None => return Err(ServerError::TicketUnissued),
+        }
+        let response = self.signed_ticket_successor(request).await?;
+        tracing::info!(
+            client_request_id = %request.client_request_id,
+            tier = terms.tier_id,
+            price_units,
+            "ticket sold and settled at its fixed price"
+        );
+        Ok(self.ticket_response(request, &lease, created, terms, billing_quote, response))
+    }
+
+    /// Ask the org for the ticket's key, recording the issuance attempt first
+    /// (as for any OA lease). A key activated earlier must come back
+    /// unchanged: the org replays one key per upstream request ID.
+    async fn create_ticket_key(
+        &self,
+        request: &ApiRequestV2,
+        lease: &OpenRouterLeaseRecord,
+        oa_request_id: &str,
+        credit_limit_usd: f64,
+    ) -> Result<crate::oa_org::OaOrgCreatedKey, ServerError> {
+        let provisioner = self.oa_org.as_ref().ok_or_else(|| {
+            ServerError::Internal("OA org lease provider is unavailable".to_string())
+        })?;
+        let ttl_seconds = self.lease_ttl_seconds(lease)?;
+        // A new issuance commits its uncertainty first (and only a first
+        // attempt's definitive rejection is nonissuance evidence). A ticket
+        // whose key was already activated, or paid and delivered, passed that
+        // fence: this is a replay of the same key, never a first attempt.
+        let first_attempt = if lease.status == "provisioning" && lease.key_hash.is_none() {
+            self.store.begin_oa_issuance(&request.client_request_id)?
+        } else if lease.key_hash.is_some()
+            && lease.oa_provisioning_outcome == OaProvisioningOutcome::MayHaveIssued
+        {
+            false
+        } else {
+            return Err(ServerError::Internal(
+                "ticket lease cannot request its key".into(),
+            ));
+        };
+        let limit_micro_usd = (credit_limit_usd * 1_000_000.0).round() as u128;
+        let created = match provisioner
+            .create_key(
+                oa_request_id,
+                credit_limit_usd,
+                limit_micro_usd,
+                ttl_seconds,
+            )
+            .await
+        {
+            Ok(created) => created,
+            Err(ServerError::OaKeyPolicyRejected) if first_attempt => {
+                self.store.confirm_oa_unissued(&request.client_request_id)?;
+                self.finalize_never_delivered_lease(&request.client_request_id)?;
+                self.sign_if_settled(request).await;
+                return Err(ServerError::OaKeyPolicyRejected);
+            }
+            Err(error) => {
+                let _ = self
+                    .store
+                    .record_openrouter_lease_error(&request.client_request_id, &error.to_string());
+                return Err(error);
+            }
+        };
+        if let Some(previous) = lease.key_hash.as_deref() {
+            if previous != created.hash {
+                return Err(ServerError::Internal(
+                    "the OA org returned another key for a ticket it already issued".into(),
+                ));
+            }
+        }
+        if created
+            .expires_at
+            .saturating_sub(OA_LEASE_EXPIRY_SAFETY_SECONDS)
+            <= current_timestamp()
+        {
+            return Err(ServerError::TicketKeyExpired);
+        }
+        Ok(created)
+    }
+
+    /// An exact retry of a paid ticket: its successor (signed now if the
+    /// first attempt could not), and the same key, replayed by the org while
+    /// it is still valid. Nothing is charged again.
+    async fn redeliver_ticket(
+        &self,
+        request: &ApiRequestV2,
+        lease: &OpenRouterLeaseRecord,
+        terms: zkapi_types::wire::TicketTermsV1,
+        billing_quote: NativeBillingQuote,
+        oa_request_id: &str,
+    ) -> Result<IssuedOpenRouterLease, ServerError> {
+        if lease.delivered != Some(true) || lease.key_hash.is_none() {
+            return Err(ServerError::Internal(
+                "a paid ticket has no delivered key".into(),
+            ));
+        }
+        let response = self.signed_ticket_successor(request).await?;
+        if current_timestamp() >= lease.expires_at {
+            return Err(ServerError::TicketKeyExpired);
+        }
+        let created = self
+            .create_ticket_key(request, lease, oa_request_id, lease.spending_limit_usd)
+            .await?;
+        Ok(self.ticket_response(request, lease, created, terms, billing_quote, response))
+    }
+
+    /// The successor of a settled ticket, which a purchase returns. An exit
+    /// consuming the nullifier defers it (the challenger raises that exit to
+    /// the ticket's price), so the purchase fails without its key.
+    async fn signed_ticket_successor(
+        &self,
+        request: &ApiRequestV2,
+    ) -> Result<RequestResponseV2, ServerError> {
+        match self.sign_successor(request).await? {
+            SignOutcome::Signed(response) => Ok(*response),
+            SignOutcome::Deferred { .. } | SignOutcome::ExitedUnsigned => {
+                Err(ServerError::NullifierUsed)
+            }
+        }
+    }
+
+    fn ticket_response(
+        &self,
+        request: &ApiRequestV2,
+        lease: &OpenRouterLeaseRecord,
+        created: crate::oa_org::OaOrgCreatedKey,
+        terms: zkapi_types::wire::TicketTermsV1,
+        billing_quote: NativeBillingQuote,
+        response: RequestResponseV2,
+    ) -> IssuedOpenRouterLease {
+        let expires_at = created
+            .expires_at
+            .saturating_sub(OA_LEASE_EXPIRY_SAFETY_SECONDS)
+            .min(lease.expires_at.max(lease.issued_at));
+        IssuedOpenRouterLease {
+            lease: OpenRouterLeaseResponse {
+                status: "active".to_string(),
+                client_request_id: request.client_request_id.clone(),
+                api_key: created.key,
+                openrouter_api_base: created.openrouter_api_base,
+                issued_at: lease.issued_at,
+                expires_at,
+                valid_for_seconds: expires_at.saturating_sub(lease.issued_at),
+                // Nothing is left to settle.
+                settle_after: lease.issued_at,
+                spending_limit_usd: lease.spending_limit_usd,
+            },
+            key_source: "oa_org".to_string(),
+            verification: Some(created.verification),
+            billing_quote,
+            ticket: Some(terms),
+            request_response: Some(response),
+        }
     }
 
     /// A provisioning lease row for issuance, with its TTL and write-once
@@ -1543,6 +1944,7 @@ impl RequestProcessor {
                     lease_config,
                     spending_limit_usd,
                     oa_request_id,
+                    ttl_seconds: None,
                 },
                 current_timestamp(),
             ))
@@ -1555,7 +1957,8 @@ impl RequestProcessor {
         now: u64,
     ) -> NewOpenRouterLease<'a> {
         let lease_config = issuance.lease_config;
-        let expires_at = now.saturating_add(lease_config.ttl_seconds);
+        let ttl_seconds = issuance.ttl_seconds.unwrap_or(lease_config.ttl_seconds);
+        let expires_at = now.saturating_add(ttl_seconds);
         NewOpenRouterLease {
             request,
             key_source: lease_config.source.label(),
@@ -1564,8 +1967,12 @@ impl RequestProcessor {
             settle_after: expires_at.saturating_add(lease_config.settlement_grace_seconds),
             spending_limit_usd: issuance.spending_limit_usd,
             oa_client_request_id: issuance.oa_request_id,
-            ttl_seconds: Some(lease_config.ttl_seconds),
-            settlement_deadline_at: Some(self.new_lease_deadline(lease_config, now)),
+            ttl_seconds: Some(ttl_seconds),
+            settlement_deadline_at: Some(
+                self.new_lease_deadline(lease_config, now)
+                    .saturating_sub(lease_config.ttl_seconds)
+                    .saturating_add(ttl_seconds),
+            ),
             delivered: Some(false),
         }
     }
@@ -1614,7 +2021,7 @@ impl RequestProcessor {
         request: &ApiRequestV2,
     ) -> Result<serde_json::Value, ServerError> {
         let (authorization, quote) = Self::lease_terms(request)?;
-        if authorization != OpenRouterLeaseAuthorization::default()
+        if !authorization.is_supported()
             || request.client_request_id != client_request_id
             || canonical_payload_hash(request.payload.as_bytes()) != request.payload_hash
         {
@@ -7167,6 +7574,7 @@ mod tests {
             lease_config: &lease_config,
             spending_limit_usd: 0.4,
             oa_request_id: Some("bound-upstream-id"),
+            ttl_seconds: None,
         };
         processor.store.execute_for_test(
             "CREATE TRIGGER inject_lease_failure BEFORE INSERT ON openrouter_leases
@@ -7235,6 +7643,7 @@ mod tests {
                 lease_config: &lease_config,
                 spending_limit_usd: 3.0,
                 oa_request_id: Some("root-race-issuance"),
+                ttl_seconds: None,
             };
             let result =
                 processor.validate_and_reserve_verifying(&request, Some(&issuance), || {
@@ -12677,3 +13086,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "processor_ticket_tests.rs"]
+mod ticket_tests;

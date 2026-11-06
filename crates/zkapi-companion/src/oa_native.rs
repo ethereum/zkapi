@@ -109,6 +109,24 @@ impl Quote {
         }
         Ok(units)
     }
+    /// The charge in gwei of `micro_usd` at this quote, rounded up (the
+    /// server's conversion of a ticket's fixed price).
+    pub fn charge_units(&self, micro_usd: u128) -> Result<u128, AuthError> {
+        if micro_usd == 0 || micro_usd > 9_007_199_254_740_991 {
+            return Err(invalid());
+        }
+        let numerator = micro_usd
+            .checked_mul(100_000_000_000_000_000u128)
+            .ok_or_else(invalid)?;
+        let denominator = decimal(&self.answer)?
+            .checked_mul(1_000_000)
+            .ok_or_else(invalid)?;
+        let units = numerator / denominator + u128::from(numerator % denominator != 0);
+        if units == 0 || units > 9_007_199_254_740_991 {
+            return Err(invalid());
+        }
+        Ok(units)
+    }
     pub fn usd_micros(&self, units: u128) -> Result<u128, AuthError> {
         if units == 0 || units > 9_007_199_254_740_991 {
             return Err(invalid());
@@ -280,10 +298,19 @@ pub(crate) fn saved_quote(config: &AuthConfig, payload: &str) -> Result<Option<Q
         .map(serde_json::from_value::<Quote>)
         .transpose()
         .map_err(|_| invalid())?;
-    let authorization: zkapi_types::wire::OpenRouterLeaseAuthorization =
-        serde_json::from_value(value).map_err(|_| invalid())?;
-    if authorization != Default::default() {
-        return Err(invalid());
+    if value.get("mode").and_then(Value::as_str) == Some(zkapi_types::wire::TICKET_MODE) {
+        // A fixed-price ticket purchase carries its terms and price too.
+        let ticket: zkapi_types::wire::TicketAuthorization =
+            serde_json::from_value(value).map_err(|_| invalid())?;
+        if ticket.version != 1 {
+            return Err(invalid());
+        }
+    } else {
+        let authorization: zkapi_types::wire::OpenRouterLeaseAuthorization =
+            serde_json::from_value(value).map_err(|_| invalid())?;
+        if authorization != Default::default() {
+            return Err(invalid());
+        }
     }
     match (&*config.billing_asset, &quote) {
         ("native_eth", Some(quote)) => quote.validate_intrinsic(config.chain_id)?,

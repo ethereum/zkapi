@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/server"
+	"github.com/OpenAnonymity/oa-chat/oa-clientd/pkg/server"
 )
 
 const model = "zkapi-e2e-streaming"

@@ -267,6 +267,7 @@ function request(port, { method = 'POST', path, headers = {}, body = '{}' }) {
                 elapsed: performance.now() - started }));
         });
         req.on('error', fail);
+        req.setTimeout(5_000, () => req.destroy(new Error('gateway request timed out')));
         if (method === 'POST') req.end(body); else req.end();
     });
 }
@@ -294,18 +295,24 @@ test('the gateway limits per source, answers 429 JSON and passes API errors thro
     await new Promise(done => upstream.listen(0, '127.0.0.1', done));
     const port = await freePort();
     // Same configuration, with local ports and paths. JIT is off so the
-    // hostile-header timings measure the pattern itself.
+    // hostile-header timings measure the pattern itself. Node's piped stdio
+    // uses sockets on Linux, which nginx cannot reopen through /dev/stdout
+    // or /dev/stderr; give the test its own log files instead.
+    const accessLog = join(dir, 'access.log');
+    const errorLog = join(dir, 'error.log');
     const local = config
         .replaceAll('/tmp/', `${dir}/`)
+        .replaceAll('/dev/stdout', accessLog)
+        .replaceAll('/dev/stderr', errorLog)
         .replace('pcre_jit on;', 'pcre_jit off;')
         .replace('listen 8080;', `listen 127.0.0.1:${port};`)
         .replaceAll(/http:\/\/(server|indexer):300[01]/g, `http://127.0.0.1:${upstream.address().port}`);
     const configPath = join(dir, 'nginx.conf');
     await writeFile(configPath, local);
-    let stdout = '';
     let stderr = '';
     const child = spawn(nginx, ['-p', `${dir}/`, '-e', 'stderr', '-c', configPath, '-g', 'daemon off;']);
-    child.stdout.on('data', chunk => { stdout += chunk; });
+    // Subscribe before startup: nginx may have exited by the time cleanup runs.
+    const exited = new Promise(done => child.once('exit', done));
     child.stderr.on('data', chunk => { stderr += chunk; });
     try {
         for (let attempt = 0; ; attempt += 1) {
@@ -313,6 +320,9 @@ test('the gateway limits per source, answers 429 JSON and passes API errors thro
                 await request(port, { method: 'GET', path: '/health' });
                 break;
             } catch (error) {
+                if (child.exitCode !== null || child.signalCode !== null) {
+                    throw new Error(`nginx exited during startup: ${stderr}`, { cause: error });
+                }
                 if (attempt > 100) throw new Error(`nginx did not start: ${stderr}`, { cause: error });
                 await new Promise(done => setTimeout(done, 50));
             }
@@ -386,6 +396,8 @@ test('the gateway limits per source, answers 429 JSON and passes API errors thro
 
         // Throttling is logged as status and zone, without addresses or URIs.
         await new Promise(done => setTimeout(done, 200));
+        const stdout = await readFile(accessLog, 'utf8');
+        stderr += await readFile(errorLog, 'utf8');
         const lines = stdout.trim().split('\n').filter(Boolean);
         assert.ok(lines.length >= 2, stdout);
         for (const line of lines) {
@@ -394,7 +406,8 @@ test('the gateway limits per source, answers 429 JSON and passes API errors thro
         assert.ok(!/203\.0\.113\.9|192\.0\.2\.10|\/v2\//.test(stdout + stderr), 'a log line names a source or URI');
     } finally {
         child.kill('SIGTERM');
-        await new Promise(done => child.once('exit', done));
+        await exited;
+        upstream.closeAllConnections();
         await new Promise(done => upstream.close(done));
         await rm(dir, { recursive: true, force: true });
     }

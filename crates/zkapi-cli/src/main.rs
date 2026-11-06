@@ -167,6 +167,11 @@ enum Commands {
             hide_env_values = true
         )]
         allow_key_source_switch: bool,
+        /// Sell fixed-price tickets from this JSON catalog (version 1, its
+        /// tiers mirroring the OA org's): each settles at its price when
+        /// bought. Needs --oa-org-url; see docs/tickets.md. Off by default.
+        #[arg(long, env = "ZKAPI_TICKET_CATALOG", hide_env_values = true)]
+        ticket_catalog: Option<std::path::PathBuf>,
         /// Required native ETH oracle RPC for gwei billing and the startup vault
         /// signing-key check; must serve --chain-id. May embed a provider key.
         #[arg(
@@ -423,6 +428,7 @@ async fn main() -> anyhow::Result<()> {
             request_root_grace_seconds,
             clearance_root_window_seconds,
             allow_key_source_switch,
+            ticket_catalog,
             native_billing_rpc_url,
             native_price_feed_address,
             native_price_feed_decimals,
@@ -520,6 +526,11 @@ async fn main() -> anyhow::Result<()> {
                     .map(zkapi_serverd::deployment::DeploymentManifest::load)
                     .transpose()?,
                 allow_key_source_switch,
+                ticket_catalog: ticket_catalog
+                    .as_deref()
+                    .map(zkapi_serverd::tickets::TicketCatalog::load)
+                    .transpose()?
+                    .map(std::sync::Arc::new),
             };
             zkapi_serverd::routes::run_server(config).await?;
         }

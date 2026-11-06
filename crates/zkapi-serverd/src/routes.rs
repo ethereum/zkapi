@@ -129,6 +129,16 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         establish_deployment_binding(&config, &signer, &manifest, &identity, retry).await?;
     if let Some(lease) = config.openrouter_leases.as_ref() {
         lease.validate_settlement_timing(binding.challenge_period_seconds)?;
+        // A ticket row that is never delivered settles at zero by its own
+        // deadline, which its tier's duration sets instead of the lease TTL.
+        if let Some(catalog) = config.ticket_catalog.as_ref() {
+            crate::config::OpenRouterLeaseConfig {
+                ttl_seconds: catalog.max_duration_seconds(),
+                ..lease.clone()
+            }
+            .validate_settlement_timing(binding.challenge_period_seconds)
+            .context("refusing to start: a ticket tier's duration is too long")?;
+        }
     }
     // O7: how long a settled request's signature waits for a consuming exit
     // to be defeated.
@@ -771,6 +781,7 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
         .route("/v2/auth", get(handle_auth_check))
         .route("/v2/billing/quote", get(handle_native_billing_quote))
         .route("/v2/openrouter/leases", post(handle_openrouter_lease))
+        .route("/v2/tickets", get(handle_ticket_catalog))
         .route(
             "/v2/openrouter/leases/{client_request_id}",
             get(handle_openrouter_lease_status).post(handle_openrouter_lease_retirement),
@@ -1010,6 +1021,18 @@ async fn handle_openrouter_lease(
         .await
         .map(|response| (StatusCode::CREATED, Json(response)))
         .map_err(|error| error_to_response(&error, &api_request.client_request_id, &processor))
+}
+
+/// The fixed-price ticket tiers this server sells; 404 when it sells none.
+async fn handle_ticket_catalog(State(processor): State<AppState>) -> Response {
+    match processor.ticket_catalog() {
+        Some(catalog) => (
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(catalog),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// 404 for a lease the store does not hold, and (with error_code
@@ -1308,6 +1331,7 @@ fn build_error_response(
         ServerError::InvalidProof(_)
         | ServerError::InvalidRequest(_)
         | ServerError::OaKeyPolicyRejected
+        | ServerError::TicketTermsMismatch(_)
         | ServerError::ClearanceOwnershipRequired
         | ServerError::ProtocolMismatch(_) => StatusCode::BAD_REQUEST,
         ServerError::StaleRoot { .. }
@@ -1317,9 +1341,10 @@ fn build_error_response(
         ServerError::NoteLeafMismatch { .. } | ServerError::NoteNotActive { .. } => {
             StatusCode::CONFLICT
         }
-        ServerError::LeasePending | ServerError::LeaseSettlementPending { .. } => {
-            StatusCode::CONFLICT
-        }
+        ServerError::LeasePending
+        | ServerError::LeaseSettlementPending { .. }
+        | ServerError::TicketUnissued
+        | ServerError::TicketKeyExpired => StatusCode::CONFLICT,
         ServerError::NoteExpired => StatusCode::GONE,
         // Like an unknown lease, it sends clients to the authoritative
         // nullifier record (GET /v2/nullifiers/{request_nullifier}).

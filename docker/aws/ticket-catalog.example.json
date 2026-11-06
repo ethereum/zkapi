@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "tiers": [
+    {"tier_id": 1, "tier_name": "Instant", "oa_tickets": 1, "price_micro_usd": 140000, "credit_limit_micro_usd": 250000, "duration_seconds": 600},
+    {"tier_id": 2, "tier_name": "Thinking", "oa_tickets": 3, "price_micro_usd": 420000, "credit_limit_micro_usd": 750000, "duration_seconds": 600},
+    {"tier_id": 3, "tier_name": "Premium & Image", "oa_tickets": 5, "price_micro_usd": 700000, "credit_limit_micro_usd": 1000000, "duration_seconds": 600}
+  ]
+}

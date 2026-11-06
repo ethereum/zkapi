@@ -2,6 +2,8 @@
 
 A local OpenAI-compatible API, paid from your private ETH balance. No OA account or OpenRouter API key needed.
 
+To pay with OA account inference tickets instead, see `oa-clientd` in [OpenAnonymity/oa-chat](https://github.com/OpenAnonymity/oa-chat) (directory `oa-clientd/`), a separate project with its own guide.
+
 > **Local migration build:** this worktree targets the new concession protocol.
 > Sepolia ships its leaf-bound staging deployment, shown as **zkAPI v0.2**
 > (`zkapi-native-eth-sepolia-leaf-v4-20261020`, development proving setup; see
@@ -47,6 +49,18 @@ configures direct normalization with an immediate streamed preview. Saved
 rewrites form a separate target-side history; normal continuations send only
 new user text to the rewriter. Cache misses rewrite unknown historical user
 turns rather than passing them raw. This discloses original text to the rewriter. See [configuration, privacy limits and client display](docs/REWRITER.md).
+
+## Delegation for other AI programs (MCP)
+
+`zkapi-clientd --config-dir PROFILE mcp` is a stdio MCP server for AI hosts.
+It attaches to the running `serve` daemon (never starts, funds or configures
+it) and offers `zkapi_delegate`, one paid, independent frontier-model
+completion per call, plus free `zkapi_list_models`. Delegation requires
+`tor://` routing with `IsolateSOCKSAuth`; each call gets a fresh key and Tor
+identity, never web search. The provider (and any configured rewriter) still
+reads the task, and network anonymity is not guaranteed. Development
+builds only. See [MCP delegation](docs/MCP_DELEGATION.md) and the portable
+agent skill in [skills/zkapi-delegate](skills/zkapi-delegate/SKILL.md).
 
 ## Build this branch
 
@@ -132,6 +146,10 @@ while the daemon is stopped. The ordinary OpenAI endpoint now retains a Tor
 isolation identity for prefix-continuing message histories and rotates both
 identity and provider key for unrelated histories. No wrapper CLI is required.
 See [Tor mode and its limits](docs/CLI_ZKAPI.md#tor).
+
+For fixed-price tickets that run requests concurrently, stop `serve`, run
+`zkapi-clientd config --billing-mode ticket`, then restart `serve`; see
+[ticket billing](docs/CLI_ZKAPI.md#ticket-billing).
 
 For a fresh key per inference request, stop `serve`, run
 `zkapi-clientd config --key-reuse-window-seconds 0`, then restart `serve`.

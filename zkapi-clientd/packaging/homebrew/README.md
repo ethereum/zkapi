@@ -5,7 +5,14 @@
 proof setup. The release archive checksums come from
 `packaging/releases/clientd-0.1.6.json`. `zkapi-clientd.rb.in` is the release template.
 
-The formula can be placed in a tap's `Formula/` directory. To install from this
+The publication workflow updates a configured tap's `Formula/zkapi-clientd.rb`
+on every published client release. See [tap creation and release credentials](../../docs/CLI_PACKAGING.md#homebrew).
+Once configured, install with `brew install OWNER/zkapi/zkapi-clientd` and start
+it with `brew services start OWNER/zkapi/zkapi-clientd` after wallet setup.
+Stop the service before `brew update && brew upgrade zkapi-clientd`, then start
+it again to run the upgraded executable.
+
+To install from this
 checkout without publishing a tap, run from the repository root:
 
 ```sh
