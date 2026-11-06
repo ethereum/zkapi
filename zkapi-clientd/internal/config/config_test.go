@@ -15,8 +15,8 @@ func TestInitPrivateAndNeverClobbers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.RelayURL != "" {
-		t.Fatal("default configuration enabled the network proxy")
+	if c.RelayURL != "" || c.LeCoreContextRecall {
+		t.Fatal("default configuration enabled optional request processing")
 	}
 	if c.ZKAPI.Network != "mainnet" || c.VerifierURL != mainnetVerifierURL {
 		t.Fatal("new Mainnet profile did not select the production verifier")
@@ -48,6 +48,38 @@ func TestInitPrivateAndNeverClobbers(t *testing.T) {
 	}
 	if _, err := Load(dir); err == nil {
 		t.Fatal("accepted readable secrets")
+	}
+}
+
+func TestLeCoreContextRecallProfileRoundTrip(t *testing.T) {
+	c, err := Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "config")
+	if err := Init(dir, c); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil || loaded.LeCoreContextRecall {
+		t.Fatal("recall was not off in the saved default profile", err)
+	}
+	original := loaded
+	selected := loaded
+	selected.LeCoreContextRecall = true
+	if err := Update(dir, loaded, selected); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = Load(dir)
+	if err != nil || !loaded.LeCoreContextRecall || loaded.APIKey != c.APIKey {
+		t.Fatal("recall opt-in did not persist without changing credentials", err)
+	}
+	if err := Update(dir, loaded, original); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = Load(dir)
+	if err != nil || loaded.LeCoreContextRecall {
+		t.Fatal("recall opt-out did not persist", err)
 	}
 }
 

@@ -492,6 +492,39 @@ func TestConfigureAPIKeyRequirementCanBeEnabledAndDisabled(t *testing.T) {
 	}
 }
 
+func TestConfigureLeCoreContextRecallRequiresExplicitOptIn(t *testing.T) {
+	dir, original := startTestConfig(t)
+	if original.LeCoreContextRecall {
+		t.Fatal("new profiles must leave context recall off")
+	}
+	for _, test := range []struct {
+		args    []string
+		enabled bool
+	}{
+		{[]string{"--lecore-context-recall"}, true},
+		{[]string{"--lecore-context-recall=false"}, false},
+	} {
+		ui := &fundingWizardUI{}
+		err := configure(context.Background(), dir, test.args, ui, io.Discard,
+			func(_ context.Context, _ string, c config.Config, _ string, _ setupPrompter, _ io.Writer) error {
+				if c.LeCoreContextRecall != test.enabled || c.APIKey != original.APIKey || c.ManagementToken != original.ManagementToken {
+					t.Fatal("recall option changed credentials or was not applied")
+				}
+				return nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		saved, err := config.Load(dir)
+		if err != nil || saved.LeCoreContextRecall != test.enabled {
+			t.Fatal("recall preference was not saved", err)
+		}
+		if strings.Contains(ui.String(), original.APIKey) || strings.Contains(ui.String(), dir) {
+			t.Fatal("recall configuration exposed credentials or private paths")
+		}
+	}
+}
+
 func TestConfigureOutputHidesProfilePaths(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "private-profile-unique")
 	for _, args := range [][]string{{"--status"}, nil, {"--status"}} {

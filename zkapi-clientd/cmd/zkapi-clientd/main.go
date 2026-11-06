@@ -498,6 +498,12 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 			}
 		}()
 	}
+	if c.LeCoreContextRecall {
+		// The shared API has no recall field. Wrap the paid backend so the
+		// sanitized chat body is reduced locally before inference. Delegation
+		// stays available when this backend already implements it.
+		backend = withLeCoreRecall(backend)
+	}
 	api, err := server.New(backend, c.APIKey, c.Concurrency)
 	if err != nil {
 		return err
@@ -539,6 +545,9 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	}
 	logger.Printf("zkAPI client %s listening at http://%s/v1 (%s); %s", version, c.Listen, c.Backend, transport)
 	logger.Printf("zkAPI network: %s", deploymentSummary(c.ZKAPI.Network))
+	if c.LeCoreContextRecall {
+		logger.Print("OpenZoo leCore context recall enabled for long text requests")
+	}
 	if c.WebSearch {
 		logger.Print("Web search: on by default (OpenRouter; search charges apply)")
 	} else {
