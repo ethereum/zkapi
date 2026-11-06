@@ -127,9 +127,11 @@ export async function assertNativeVault(funding, { signal = AbortSignal.timeout(
 // Reads only: no injected provider, wallet connection, note preparation, or signing.
 // One finalized block pins all feed reads. New server quotes must match its
 // latest round; saved requests and settlements retain their original quote.
-export async function readNativeQuote(funding, { expected = null, signal = AbortSignal.timeout(20_000) } = {}) {
+export async function readNativeQuote(funding, { expected = null, signal = AbortSignal.timeout(20_000), now } = {}) {
     validateNativeFunding(funding);
-    if (expected) validateNativeQuote(expected, funding);
+    // Callers on the lease path pass trusted server seconds; others keep the device clock.
+    const timing = now == null ? {} : { now };
+    if (expected) validateNativeQuote(expected, funding, timing);
     const chain = await rpc(funding, 'eth_chainId', [], signal);
     if (BigInt(chain) !== BigInt(funding.chain_id)) throw new Error('The ETH price RPC is on the wrong chain.');
     const block = await rpc(funding, 'eth_getBlockByNumber', ['finalized', false], signal);
@@ -151,7 +153,7 @@ export async function readNativeQuote(funding, { expected = null, signal = Abort
     const quote = validateNativeQuote({ asset: 'native_eth', units_per_eth: Number(NATIVE_UNITS_PER_ETH),
         chain_id: funding.chain_id, feed_address: funding.native_price_feed_address.toLowerCase(),
         round_id: String(round), answer: String(answer), decimals: funding.native_price_feed_decimals,
-        updated_at: Number(updated), expires_at: Number(updated) + funding.native_price_max_age_seconds }, funding);
+        updated_at: Number(updated), expires_at: Number(updated) + funding.native_price_max_age_seconds }, funding, timing);
     if (expected && !sameNativeQuote(quote, expected)) throw new Error('The billing quote does not match the pinned ETH/USD feed.');
     const canonical = await rpc(funding, 'eth_getBlockByNumber', [block.number, false], signal);
     const finalChain = await rpc(funding, 'eth_chainId', [], signal);

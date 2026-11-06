@@ -146,7 +146,13 @@ has also waited for earlier in-flight attempts. A local clock or an unknown GET
 alone does not authorize deleting a journal; startup remains read-only.
 `POST /v2/openrouter/leases/{id}/expire` accepts the exact saved request and waits
 on the same issuance lock. It returns `expired_unaccepted` when the server clock
-says expired, or `superseded_unaccepted` when a newer finalized round exists,
+says the quote expired, or when the exact request's public `request_time` is
+older than the 300-second admission window (`request_time + 300 < now`), which
+admission can never accept again because its age only grows. A future
+`request_time` alone never justifies expiry, because such a request can become
+admissible; an independently expired or superseded quote still can, under the
+same exact-binding and unaccepted checks. It returns
+`superseded_unaccepted` when a newer finalized round exists,
 with the exact request ID, nullifier and payload hash. Both acknowledgments
 require that neither its nullifier nor request ID has a reservation. Superseded
 recovery relies on Ethereum finality: an ordinary head reorganization cannot

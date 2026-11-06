@@ -13,7 +13,7 @@ The public `GET /health` response reports `chain_id` and
 `testnet_password_required`. Clients validate a supplied password with
 `GET /v2/auth` and header `X-ZKAPI-Testnet-Password`; success returns
 `{"authenticated":true}`. Send this header to the configured Sepolia protocol
-server for every `/v2/*` call, including quotes, lease status/retirement,
+server for every `/v2/*` call, including server time (`/v2/time`), quotes, lease status/retirement,
 settlement recovery, expiry recovery and withdrawal clearance. Never send it
 to an RPC, indexer, verifier, OA org, provider, or another network. Clients
 must not follow cross-origin redirects with this header.

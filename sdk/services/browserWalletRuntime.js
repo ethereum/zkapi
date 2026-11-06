@@ -2,6 +2,7 @@ import { browserSdkOptions, beginBrowserSdkInitialization, browserSdkTransport }
 import { assertNativeVault, validateNativeFunding, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote } from './zkapiNativeEth.mjs';
 import { CHAT_SPENDING_TIER_USD } from './zkapiRequestCompat.mjs';
 import { TestnetPasswordAuth, testnetPasswordRequired } from './testnetPasswordAuth.mjs';
+import { ZkapiServerClock } from './zkapiServerClock.mjs';
 import { sameFelt, waitForExpectedActiveRoot } from './zkapiWithdrawalRoot.mjs';
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import {
@@ -63,6 +64,12 @@ const LEASE_ISSUE_MAX_RETRY_MS = 30_000;
 // the server's independent settlement boundary. A follow-up inside this
 // window transparently closes the old key and obtains a fresh key at the selected model tier.
 const MIN_REQUEST_LEASE_REMAINING_SECONDS = 90;
+// New request timestamps and quote checks use a server-clock sample no older
+// than this; lease checks inside one acquisition may reuse a slightly older one.
+const SERVER_TIME_REQUEST_MAX_AGE_MS = 30_000;
+const SERVER_TIME_LEASE_CHECK_MAX_AGE_MS = 60_000;
+const SERVER_TIME_REUSE_MAX_AGE_MS = 5 * 60_000;
+const FRESHNESS_REJECTION = 'request_time is outside the accepted freshness window';
 const TAB_OWNER_STORAGE_KEY = 'zkapi-browser-tab-owner-v1';
 const LATE_WITHDRAWAL_TERMINAL_STATUSES = new Set([
     'closed',
@@ -73,6 +80,28 @@ const LATE_WITHDRAWAL_TERMINAL_STATUSES = new Set([
     'quarantined'
 ]);
 const LATE_DEPOSIT_TERMINAL_STATUSES = new Set(['confirmed', 'reverted', 'superseded']);
+
+// A saved request's quote was strictly validated when it was proved. Recovery
+// and receipt installation re-check only its structure and deployment
+// binding: the server's exact /expire answer or signed receipt decides its
+// fate, never the device clock or a /v2/time sample.
+function validateSavedNativeQuote(quote, funding) {
+    return validateNativeQuote(quote, funding, { allowExpired: true, now: Number.MAX_SAFE_INTEGER });
+}
+
+function isFreshnessRejection(error) {
+    return error?.code === 'invalid_request' && String(error?.message || '').includes(FRESHNESS_REJECTION);
+}
+
+function waitUnlessAborted(promise, signal) {
+    if (!signal) return promise;
+    return new Promise((resolve, reject) => {
+        const abort = () => reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+        if (signal.aborted) return abort();
+        signal.addEventListener('abort', abort, { once: true });
+        promise.then(resolve, resolve).finally(() => signal.removeEventListener('abort', abort));
+    });
+}
 
 class BrowserWalletHttpError extends Error {
     constructor(message, status, code, data = null) {
@@ -319,6 +348,7 @@ class BrowserWalletRuntime extends EventTarget {
             fetch: (url, init) => this.remoteFetchRaw(url, init),
             requestPassword: browserSdkOptions().requestTestnetPassword
         });
+        this.installServerClock();
         await assertNativeVault(this.config.funding);
         this.worker = new WorkerBridge();
         // Initialization participates in the same global lock as every later
@@ -553,7 +583,7 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     snapshot() {
-        const active = this.activeLease && this.activeLease.expires_at > Math.floor(Date.now() / 1000)
+        const active = this.activeLease && this.activeLease.expires_at > Math.floor(this.protocolEstimateMs() / 1000)
             ? {
                 session_id: this.activeLease.sessionId,
                 client_request_id: this.activeLease.client_request_id,
@@ -776,6 +806,8 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     async remoteFetchRaw(url, init = {}) {
+        const { zkapiAuthoritativeProxy = false, ...request } = init;
+        init = request;
         const proxyUrl = this.deploymentProxyUrl(url);
         if (proxyUrl) {
             try {
@@ -783,7 +815,10 @@ class BrowserWalletRuntime extends EventTarget {
                     ...init,
                     credentials: 'omit'
                 });
-                if (response.status !== 404) return response;
+                // The production rewrite forwards the deployment's own status.
+                // A server-time 404 there means an older server, not a missing
+                // rewrite, so it must not fall through to a direct request.
+                if (response.status !== 404 || zkapiAuthoritativeProxy) return response;
             } catch {
                 // A local static development server may not implement the
                 // production rewrite. Keep the existing privacy-proxy/direct
@@ -791,6 +826,51 @@ class BrowserWalletRuntime extends EventTarget {
             }
         }
         return browserSdkTransport(url, init, { preferProxy: true });
+    }
+
+    // Memory only: a new deployment configuration or page load starts a new
+    // clock, and nothing samples it until a new authorization needs it.
+    installServerClock({ monotonicNow, wallNow, lifecycle = true } = {}) {
+        this.serverClock = new ZkapiServerClock({
+            baseUrl: this.config.funding.protocol_server_url,
+            chainId: this.config.funding.chain_id,
+            fetch: (url, init) => this.serverClockFetch(url, init),
+            ...(monotonicNow ? { monotonicNow } : {}),
+            ...(wallNow ? { wallNow } : {})
+        });
+        if (lifecycle) this.serverClock.attachLifecycle();
+        return this.serverClock;
+    }
+
+    async serverClockFetch(url, init = {}) {
+        const response = await this.remoteFetch(url, { ...init, zkapiAuthoritativeProxy: true });
+        if (response.status === 401 && this.testnetAuth?.protects(url)) throw testnetPasswordRequired();
+        return response;
+    }
+
+    /** Server milliseconds. New authorizations pass required: true and never
+     * fall back after a failed sample; other checks may use the best estimate. */
+    // Callers skip this await when no clock exists (an uninitialized runtime),
+    // so that legacy path stays synchronous and byte-for-byte equivalent.
+    async protocolTimeMs(signal = null, { required = false, maxAgeMs = SERVER_TIME_LEASE_CHECK_MAX_AGE_MS } = {}) {
+        if (!this.serverClock) return Date.now();
+        try {
+            return await this.serverClock.nowMs({ signal, maxAgeMs });
+        } catch (error) {
+            if (required || signal?.aborted || error?.name === 'AbortError') throw error;
+            return this.serverClock.estimateMs() ?? Date.now();
+        }
+    }
+
+    // Display and settlement timers only; never authorizes a key.
+    protocolEstimateMs() {
+        return this.serverClock?.estimateMs() ?? Date.now();
+    }
+
+    // Strict synchronous authorization time (host callbacks, checkout): fails
+    // closed (Infinity) after a suspend or clock change, or an aged anchor.
+    protocolAuthorizationNowMs(maxAgeMs = SERVER_TIME_LEASE_CHECK_MAX_AGE_MS) {
+        return this.serverClock ? this.serverClock.authorizationNowMs(maxAgeMs) : Date.now();
     }
 
     async remoteJson(url, init = {}) {
@@ -1596,15 +1676,19 @@ class BrowserWalletRuntime extends EventTarget {
     async nativeBillingQuote(signal) {
         const funding = this.config.funding;
         const quoted = await this.remoteJson(`${funding.protocol_server_url}/v2/billing/quote`, { signal });
-        validateNativeQuote(quoted, funding);
-        const verified = await readNativeQuote(funding, { expected: quoted, signal });
+        const now = Math.floor(await this.protocolTimeMs(signal, {
+            required: true, maxAgeMs: SERVER_TIME_REQUEST_MAX_AGE_MS
+        }) / 1000);
+        validateNativeQuote(quoted, funding, { now });
+        const verified = await readNativeQuote(funding, { expected: quoted, signal, now });
         this.ethUsdQuote = verified;
         return verified;
     }
 
-    leaseBudget(spendingLimitUsd, quote = null, { checkBalance = false } = {}) {
+    leaseBudget(spendingLimitUsd, quote = null, { checkBalance = false, now, saved = false } = {}) {
         if (!CHAT_SPENDING_TIER_USD.includes(Number(spendingLimitUsd))) throw new Error('Invalid private-balance model budget configuration.');
-        validateNativeQuote(quote, this.config.funding, { allowExpired: true });
+        if (saved) validateSavedNativeQuote(quote, this.config.funding);
+        else validateNativeQuote(quote, this.config.funding, { allowExpired: true, ...(now == null ? {} : { now }) });
         const amount = Number(nativeUnitsForUsd(spendingLimitUsd, quote));
         if (checkBalance) {
             const balance = Number(this.runtime.state.current_balance);
@@ -1634,12 +1718,25 @@ class BrowserWalletRuntime extends EventTarget {
         if (this.runtime.journal) return this.runtime.journal.prepared_request;
         if (this.runtime.preparedWithdrawal) throw new Error('Finish the prepared withdrawal before sending another message.');
         onProgress('syncing', 'Checking your private balance…');
+        // Load the request prover before choosing request_time, so a slow
+        // proving-key download cannot consume the server's admission window.
+        const warmup = this.prewarmRequestProver();
         const path = await this.treePath(this.runtime.state.note_id, true);
         throwIfAborted(signal);
-        const now = Date.now();
+        await waitUnlessAborted(warmup, signal);
+        throwIfAborted(signal);
         const quote = await this.nativeBillingQuote(signal);
         throwIfAborted(signal);
-        const spendingLimitCredits = this.leaseBudget(spendingLimitUsd, quote, { checkBalance: true });
+        const quoteCheckedAt = Math.floor(await this.protocolTimeMs(signal, {
+            required: true, maxAgeMs: SERVER_TIME_REQUEST_MAX_AGE_MS
+        }) / 1000);
+        const spendingLimitCredits = this.leaseBudget(spendingLimitUsd, quote, { checkBalance: true, now: quoteCheckedAt });
+        // Select the public timestamp last, from a bounded server sample.
+        const requestTimeMs = await this.protocolTimeMs(signal, {
+            required: true, maxAgeMs: SERVER_TIME_REQUEST_MAX_AGE_MS
+        });
+        throwIfAborted(signal);
+        const createdAtMs = Date.now();
         onProgress('proving', 'Proving this chat is funded…');
         const prepared = await this.worker.call('prepareRequest', {
             config: {
@@ -1655,8 +1752,8 @@ class BrowserWalletRuntime extends EventTarget {
                 active_root: path.active_root,
                 merkle_siblings: path.siblings,
                 client_request_id: uuid(),
-                request_time: Math.floor(now / 1000),
-                created_at_ms: now
+                request_time: Math.floor(requestTimeMs / 1000),
+                created_at_ms: createdAtMs
             },
             provingKey: this.config.proving_keys.request
         });
@@ -1667,13 +1764,15 @@ class BrowserWalletRuntime extends EventTarget {
 
     async verifyLease(lease, expectedLimitCredits, expectedRequestId, onProgress = () => {}, signal = null, expectedQuote = null) {
         throwIfAborted(signal);
+        const checkedAt = Math.floor((this.serverClock ? await this.protocolTimeMs(signal) : Date.now()) / 1000);
+        throwIfAborted(signal);
         if (lease.status !== 'active'
             || lease.client_request_id !== expectedRequestId
             || !lease.api_key
-            || Number(lease.expires_at) <= Math.floor(Date.now() / 1000)) {
+            || Number(lease.expires_at) <= checkedAt) {
             throw new Error('The zkAPI server returned an unusable OpenRouter lease.');
         }
-        validateNativeQuote(expectedQuote, this.config.funding, { allowExpired: true });
+        validateSavedNativeQuote(expectedQuote, this.config.funding);
         if (!sameNativeQuote(lease.billing_quote, expectedQuote)
             || Number(lease.spending_limit_usd) !== Number(nativeUsdMicros(expectedLimitCredits, expectedQuote)) / 1_000_000) {
             throw new Error('The zkAPI server returned a child key with the wrong native ETH spending cap or quote.');
@@ -1706,6 +1805,20 @@ class BrowserWalletRuntime extends EventTarget {
                 })
             });
             if (verification.status !== 'verified') throw new Error('The trusted OA verifier rejected the ephemeral key.');
+        }
+        // Verification is asynchronous and the device may have slept during
+        // it. Recheck with a bounded fresh server sample before the key can be
+        // installed; a failure leaves the exact journal for recovery and never
+        // starts a second authorization by itself.
+        const verifiedAt = Math.floor((this.serverClock
+            ? await this.protocolTimeMs(signal, { required: true, maxAgeMs: SERVER_TIME_LEASE_CHECK_MAX_AGE_MS })
+            : Date.now()) / 1000);
+        throwIfAborted(signal);
+        const evidenceExpiry = lease.verification?.key_valid_till;
+        if (Number(lease.expires_at) <= verifiedAt
+            || (evidenceExpiry != null && Number(evidenceExpiry) <= verifiedAt)) {
+            throw new BrowserWalletHttpError('The new private key expired before it could be verified. Send again to finish it safely.',
+                409, 'lease_expired');
         }
     }
 
@@ -1770,6 +1883,10 @@ class BrowserWalletRuntime extends EventTarget {
         } catch (error) {
             if (['native_quote_expired', 'native_quote_superseded'].includes(error?.code)) {
                 await this.recoverUnacceptedNativeQuote(request, signal);
+            } else if (isFreshnessRejection(error)) {
+                // Keep the admission error; a failed check leaves the journal.
+                try { await this.recoverUnacceptedNativeQuote(request, signal); }
+                catch (recoveryError) { if (signal?.aborted) throw recoveryError; }
             }
             throw error;
         }
@@ -1793,7 +1910,7 @@ class BrowserWalletRuntime extends EventTarget {
             // spending policy. Finish that byte-identical request safely, but
             // never expose its legacy-cap key to the host application. Settle it
             // unused, install the signed receipt, then prove the selected budget.
-            const desiredLimitCredits = this.leaseBudget(spendingLimitUsd, requestBillingQuote(request));
+            const desiredLimitCredits = this.leaseBudget(spendingLimitUsd, requestBillingQuote(request), { saved: true });
             if (Number(request.public_inputs.solvency_bound) !== desiredLimitCredits) {
                 try {
                     this.legacyMigrationInProgress = true;
@@ -1967,10 +2084,15 @@ class BrowserWalletRuntime extends EventTarget {
         const normalized = String(sessionId || 'default').slice(0, 160);
         spendingLimitUsd = Number(spendingLimitUsd);
         if (!CHAT_SPENDING_TIER_USD.includes(spendingLimitUsd)) throw new Error('Invalid private-balance model budget configuration.');
+        // Await before the synchronous lease-promise section below, so no
+        // concurrent caller can start a second issuance in between.
+        const now = Math.floor((this.serverClock
+            ? await this.protocolTimeMs(signal, { required: true, maxAgeMs: SERVER_TIME_REUSE_MAX_AGE_MS })
+            : Date.now()) / 1000);
+        throwIfAborted(signal);
         if (this.leasePromise) {
             return this.waitForLeasePromise(normalized, onProgress, signal, spendingLimitUsd);
         }
-        const now = Math.floor(Date.now() / 1000);
         const isSafeForNewRequest = this.activeLease
             && Number(this.activeLease.expires_at) > now + MIN_REQUEST_LEASE_REMAINING_SECONDS;
         const activeLeaseMatchesPolicy = this.activeLease?.selectedSpendingLimitUsd === spendingLimitUsd;
@@ -2050,7 +2172,7 @@ class BrowserWalletRuntime extends EventTarget {
         if (this.settlementTimer) clearTimeout(this.settlementTimer);
         const delayMs = delayOverrideMs ?? Math.max(
             0,
-            Number(this.activeLease.settle_after) * 1000 - Date.now() + 250
+            Number(this.activeLease.settle_after) * 1000 - this.protocolEstimateMs() + 250
         );
         this.settlementTimer = setTimeout(() => {
             this.settlementTimer = null;
@@ -2213,7 +2335,7 @@ class BrowserWalletRuntime extends EventTarget {
         const recovery = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/requests/${encodeURIComponent(clientRequestId)}`);
         if (!recovery.request_response) return false;
         const quote = requestBillingQuote(this.runtime.journal?.prepared_request);
-        validateNativeQuote(quote, this.config.funding, { allowExpired: true });
+        validateSavedNativeQuote(quote, this.config.funding); // The signed receipt must bind this exact quote.
         let payload;
         try { payload = JSON.parse(recovery.request_response.response_payload); } catch { /* Reject below. */ }
         if (!sameNativeQuote(payload?.billing_quote, quote)) throw new Error('The settlement receipt changed the authorized ETH/USD quote.');
@@ -2243,7 +2365,7 @@ class BrowserWalletRuntime extends EventTarget {
             || request.public_inputs?.request_nullifier == null
             || !sameFelt(journal?.nullifier, request.public_inputs.request_nullifier)
             || body !== JSON.stringify(journal?.prepared_request)) return false;
-        validateNativeQuote(requestBillingQuote(request), this.config.funding, { allowExpired: true });
+        validateSavedNativeQuote(requestBillingQuote(request), this.config.funding);
         // This endpoint only observes quote validity and acceptance under the server's
         // issuance lock. Neither local time nor an unknown nullifier proves an
         // older in-flight request can no longer reserve the note.
@@ -2279,7 +2401,8 @@ class BrowserWalletRuntime extends EventTarget {
                 const ownershipDeadline = Number(
                     this.runtime.lease?.settle_after || this.runtime.lease?.expires_at
                 );
-                if (this.runtime.lease && ownershipDeadline > Math.floor(Date.now() / 1000)
+                const ownershipNow = Math.floor((this.serverClock ? await this.protocolTimeMs(signal) : Date.now()) / 1000);
+                if (this.runtime.lease && ownershipDeadline > ownershipNow
                     && this.runtime.lease.ownerId !== this.ownerId) {
                     return false;
                 }
@@ -2343,6 +2466,9 @@ class BrowserWalletRuntime extends EventTarget {
                 'lease_pending'
             );
         }
+        if (Number(lease.expires_at) * 1000 <= this.protocolAuthorizationNowMs(SERVER_TIME_REUSE_MAX_AGE_MS)) {
+            throw new BrowserWalletHttpError('This private key has expired. Send again to continue.', 409, 'lease_expired');
+        }
         lease.inFlight += 1;
         let released = false;
         return {
@@ -2363,7 +2489,7 @@ class BrowserWalletRuntime extends EventTarget {
                 // finished. Keep the lease checked out for the entire stream.
                 lease.inFlight = Math.max(0, lease.inFlight - 1);
                 if (lease.inFlight === 0
-                    && Number(lease.settle_after) * 1000 <= Date.now()) {
+                    && Number(lease.settle_after) * 1000 <= this.protocolEstimateMs()) {
                     this.scheduleSettlement(0);
                 }
                 this.dispatchEvent(new Event('change'));

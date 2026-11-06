@@ -38,6 +38,23 @@ const MAX_FUTURE_SKEW_SECONDS: u64 = 30;
 // usable lease end and leave room for clock skew and in-flight requests.
 const OA_LEASE_EXPIRY_SAFETY_SECONDS: u64 = 30;
 
+/// Response body of the additive `GET /v2/time` endpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServerTimeResponse {
+    pub server_time_ms: u64,
+    pub protocol_version: u16,
+    pub chain_id: u64,
+    pub max_request_age_seconds: u64,
+    pub max_future_skew_seconds: u64,
+}
+
+/// A request older than the admission window can never be admitted again:
+/// admission refuses it before any reservation, and its age only grows.
+/// Future-dated requests are deliberately excluded; they can become valid.
+fn request_time_irrevocably_expired(request_time: u64, now: u64) -> bool {
+    request_time.saturating_add(MAX_REQUEST_AGE_SECONDS) < now
+}
+
 pub struct RequestProcessor {
     config: ServerConfig,
     store: Arc<NullifierStore>,
@@ -197,6 +214,19 @@ impl RequestProcessor {
 
     pub fn clearance_signing_key(&self) -> CurvePointWire {
         self.signer.clearance_public_key()
+    }
+
+    /// Public, read-only freshness context for `GET /v2/time`. It reports only
+    /// this deployment's clock and the existing fixed admission window; it
+    /// reads no request, wallet, nullifier or user state and creates none.
+    pub fn server_time(&self) -> ServerTimeResponse {
+        ServerTimeResponse {
+            server_time_ms: current_timestamp_ms(),
+            protocol_version: self.config.protocol_version,
+            chain_id: self.config.chain_id,
+            max_request_age_seconds: MAX_REQUEST_AGE_SECONDS,
+            max_future_skew_seconds: MAX_FUTURE_SKEW_SECONDS,
+        }
     }
 
     pub async fn native_billing_quote(&self) -> Result<NativeBillingQuote, ServerError> {
@@ -586,7 +616,13 @@ impl RequestProcessor {
         {
             return Err(ServerError::LeasePending);
         }
-        let status = if quote.expires_at <= current_timestamp() {
+        // Still under the issuance lock with no reservation for this exact
+        // request: the same age rule admission applies is final here.
+        let status = if quote.expires_at <= current_timestamp()
+            || request_time_irrevocably_expired(
+                request.public_inputs.request_time,
+                current_timestamp(),
+            ) {
             "expired_unaccepted"
         } else {
             let oracle = &self.native_oracle;
@@ -1203,7 +1239,7 @@ impl RequestProcessor {
             ));
         }
         let now = current_timestamp();
-        if public.request_time.saturating_add(MAX_REQUEST_AGE_SECONDS) < now
+        if request_time_irrevocably_expired(public.request_time, now)
             || public.request_time > now.saturating_add(MAX_FUTURE_SKEW_SECONDS)
         {
             return Err(ServerError::InvalidRequest(
@@ -3458,5 +3494,142 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.current_balance, 2_000_000 - charge);
+    }
+
+    #[test]
+    fn server_time_reports_only_clock_and_existing_fixed_window() {
+        let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        let before = current_timestamp_ms();
+        let time = processor.server_time();
+        let after = current_timestamp_ms();
+        assert!(before <= time.server_time_ms && time.server_time_ms <= after);
+        assert_eq!(time.max_request_age_seconds, 300);
+        assert_eq!(time.max_future_skew_seconds, 30);
+        let body = serde_json::to_value(&time).unwrap();
+        let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "chain_id",
+                "max_future_skew_seconds",
+                "max_request_age_seconds",
+                "protocol_version",
+                "server_time_ms"
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_admission_freshness_window_is_unchanged() {
+        let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        let now = current_timestamp();
+        for (offset, admitted_by_freshness) in [
+            (-301i64, false),
+            (-299, true),
+            (0, true),
+            (29, true),
+            (31, false),
+        ] {
+            let mut request = unverified_lease_request(&processor);
+            request.public_inputs.request_time = (now as i64 + offset) as u64;
+            let error = processor.validate_and_reserve(&request).unwrap_err();
+            let freshness = error
+                .to_string()
+                .contains("request_time is outside the accepted freshness window");
+            assert_eq!(
+                freshness, !admitted_by_freshness,
+                "offset {offset}: {error}"
+            );
+            assert!(processor
+                .store
+                .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+                .is_none());
+        }
+        assert!(!request_time_irrevocably_expired(now - 300, now));
+        assert!(request_time_irrevocably_expired(now - 301, now));
+        assert!(!request_time_irrevocably_expired(now + 86_400, now));
+    }
+
+    #[tokio::test]
+    async fn expire_declares_only_aged_unaccepted_exact_requests_expired() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let processor = oa_lease_processor(store.clone());
+        let now = current_timestamp();
+        // The bound quote is still live, so the legacy quote rule alone would
+        // answer LeasePending (after an oracle read) forever.
+        let mut aged = unverified_lease_request(&processor);
+        aged.public_inputs.request_time = now - 301;
+        let ack = processor
+            .expire_unaccepted_native_lease(&aged.client_request_id, &aged)
+            .await
+            .unwrap();
+        assert_eq!(ack["status"], "expired_unaccepted");
+        assert_eq!(ack["client_request_id"], aged.client_request_id);
+        assert_eq!(
+            ack["request_nullifier"],
+            serde_json::to_value(aged.public_inputs.request_nullifier).unwrap()
+        );
+        assert_eq!(
+            ack["payload_hash"],
+            serde_json::to_value(aged.payload_hash).unwrap()
+        );
+        assert!(store
+            .lookup_by_nullifier(&aged.public_inputs.request_nullifier)
+            .is_none());
+        assert!(store
+            .lookup_openrouter_lease(&aged.client_request_id)
+            .is_none());
+
+        // Exact request binding still applies before any age answer.
+        let other_id = processor
+            .expire_unaccepted_native_lease("another-request", &aged)
+            .await;
+        assert!(matches!(other_id, Err(ServerError::InvalidRequest(_))));
+        let mut tampered = aged.clone();
+        tampered.payload_hash = Felt252::from_u64(1);
+        assert!(matches!(
+            processor
+                .expire_unaccepted_native_lease(&tampered.client_request_id, &tampered)
+                .await,
+            Err(ServerError::InvalidRequest(_))
+        ));
+        let mut foreign = aged.clone();
+        foreign.public_inputs.chain_id = 999;
+        assert!(matches!(
+            processor
+                .expire_unaccepted_native_lease(&foreign.client_request_id, &foreign)
+                .await,
+            Err(ServerError::ProtocolMismatch(_))
+        ));
+
+        // Fresh and future-dated requests can still be admitted: they are not
+        // discarded by age and fall through to the unchanged quote rule (the
+        // unreachable fixture oracle makes that an error, never an expiry).
+        for offset in [-299i64, 0, 31, 86_400] {
+            let mut request = unverified_lease_request(&processor);
+            request.public_inputs.request_time = (now as i64 + offset) as u64;
+            let result = processor
+                .expire_unaccepted_native_lease(&request.client_request_id, &request)
+                .await;
+            assert!(
+                result.is_err(),
+                "offset {offset} must not be expired: {result:?}"
+            );
+        }
+
+        // An accepted (reserved) aged request is never declared expired, and
+        // the age answer serializes behind in-flight issuance.
+        let guard = processor.lease_issue_lock.lock().await;
+        let check = processor.expire_unaccepted_native_lease(&aged.client_request_id, &aged);
+        tokio::pin!(check);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut check)
+                .await
+                .is_err()
+        );
+        store.reserve_openrouter_lease(&aged).unwrap();
+        drop(guard);
+        assert!(matches!(check.await, Err(ServerError::LeasePending)));
     }
 }

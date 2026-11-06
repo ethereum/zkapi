@@ -33,6 +33,24 @@ paths:
                 properties:
                   authenticated: {const: true}
         "401": {$ref: "#/components/responses/TestnetPasswordRequired"}
+  /v2/time:
+    get:
+      summary: Read the server clock for new request timestamps (no-store, state-free)
+      responses:
+        "200":
+          description: Server time and the existing fixed admission window
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [server_time_ms, protocol_version, chain_id, max_request_age_seconds, max_future_skew_seconds]
+                properties:
+                  server_time_ms: {type: integer}
+                  protocol_version: {type: integer}
+                  chain_id: {type: integer}
+                  max_request_age_seconds: {type: integer, const: 300}
+                  max_future_skew_seconds: {type: integer, const: 30}
+        "401": {$ref: "#/components/responses/TestnetPasswordRequired"}
   /v2/billing/quote:
     get:
       summary: Read the pinned finalized native ETH billing quote

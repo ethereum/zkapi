@@ -57,6 +57,7 @@ async fn all_service_routes_reject_missing_or_wrong_password_before_body_parsing
         ("GET", "/v2/auth"),
         ("POST", "/v2/requests"),
         ("GET", "/v2/billing/quote"),
+        ("GET", "/v2/time"),
         ("POST", "/v2/openrouter/leases"),
         ("GET", "/v2/openrouter/leases/example"),
         ("POST", "/v2/openrouter/leases/example"),
@@ -235,4 +236,113 @@ async fn mainnet_remains_ungated_and_rejects_accidental_password_configuration()
         ..Default::default()
     };
     assert!(config.validate_testnet_auth().is_err());
+}
+
+async fn time_response(
+    app: &axum::Router,
+    method: &str,
+    password: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method(method)
+        .uri("/v2/time")
+        .header("origin", "https://client.example");
+    if let Some(password) = password {
+        request = request.header(TESTNET_PASSWORD_HEADER, password);
+    }
+    app.clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn assert_time_body(body: &serde_json::Value, chain_id: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let server = body["server_time_ms"].as_u64().unwrap();
+    assert!(server <= now && now - server < 5_000);
+    assert_eq!(body["chain_id"], chain_id);
+    assert_eq!(body["max_request_age_seconds"], 300);
+    assert_eq!(body["max_future_skew_seconds"], 30);
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        5,
+        "no identifiers or state: {body}"
+    );
+}
+
+#[tokio::test]
+async fn ungated_server_time_is_public_non_cacheable_and_browser_readable() {
+    let app = router(false);
+    let response = time_response(&app, "GET", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response
+            .headers()
+            .get_all("access-control-allow-origin")
+            .iter()
+            .collect::<Vec<_>>(),
+        ["*"]
+    );
+    assert!(!response
+        .headers()
+        .contains_key("access-control-allow-credentials"));
+    assert!(!response.headers().contains_key("set-cookie"));
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_time_body(&body, 1);
+
+    let head = time_response(&app, "HEAD", None).await;
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers()["cache-control"], "no-store");
+    // Mutating methods do not exist on this read-only route.
+    assert_eq!(
+        time_response(&app, "POST", None).await.status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+}
+
+#[tokio::test]
+async fn gated_server_time_requires_the_password_and_keeps_single_cors_policy() {
+    let app = router(true);
+    assert_eq!(
+        time_response(&app, "GET", None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = time_response(&app, "GET", Some(PASSWORD)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response
+            .headers()
+            .get_all("access-control-allow-origin")
+            .iter()
+            .collect::<Vec<_>>(),
+        ["*"]
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_time_body(&body, SEPOLIA_CHAIN_ID);
+    assert!(!body.to_string().contains(PASSWORD));
+    let preflight = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v2/time")
+                .header("origin", "https://client.example")
+                .header("access-control-request-method", "GET")
+                .header("access-control-request-headers", TESTNET_PASSWORD_HEADER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(preflight.status().is_success());
+    assert!(preflight.headers()["access-control-allow-headers"]
+        .to_str()
+        .unwrap()
+        .contains(TESTNET_PASSWORD_HEADER));
 }

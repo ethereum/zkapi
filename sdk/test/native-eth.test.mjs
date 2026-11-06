@@ -366,7 +366,9 @@ test('a finalized price update cannot reprice a pending proof until exact supers
     runtime.treePath = async () => ({ active_root: '0x1', siblings: [] });
     runtime.commit = async next => { runtime.runtime = next; };
     let proofs = 0;
-    runtime.worker = { call: async (_operation, input) => {
+    runtime.worker = { call: async (operation, input) => {
+        // Preparation preloads the prover before selecting request_time.
+        if (operation === 'preloadRequestProver') return true;
         const request = { client_request_id: `request-${++proofs}`, payload_hash: `0x${proofs}`,
             payload: input.args.payload, public_inputs: { request_nullifier: '0x42', solvency_bound: input.config.request_charge_cap } };
         return { request, journal: { nullifier: '0x42', prepared_request: request } };

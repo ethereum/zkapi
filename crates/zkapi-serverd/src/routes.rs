@@ -3,6 +3,7 @@
 //! Endpoints:
 //! - GET  /health                   -- process health and config summary
 //! - GET  /v1/attestation           -- published signer metadata for deployments
+//! - GET  /v2/time                  -- non-cacheable server clock for request_time
 //! - POST /v2/openrouter/leases     -- open a prompt-private runtime-key lease
 //! - POST /v2/openrouter/leases/:id -- retire a rejected runtime-key lease
 //! - POST /v2/withdraw/clearance    -- request mutual-close clearance
@@ -114,6 +115,21 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
         .route("/v1/dashboard/events", get(handle_dashboard_events))
         .layer(CorsLayer::very_permissive());
 
+    // Read-only, state-free server clock for new clients. Ungated deployments
+    // give it the same simple GET/HEAD CORS as /health so a direct browser
+    // read works; a Sepolia gate keeps it behind the password and its outer
+    // CORS policy alone, so the response never carries duplicate CORS headers.
+    let time = Router::new().route("/v2/time", get(handle_server_time));
+    let time = if password.is_some() {
+        time
+    } else {
+        time.layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::HEAD]),
+        )
+    };
+
     let router = Router::new()
         .route("/", get(handle_health))
         .route("/health", get(handle_health))
@@ -143,6 +159,7 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
             "/v2/nullifiers/{nullifier}",
             get(handle_recovery_by_nullifier),
         )
+        .merge(time)
         .merge(dashboard)
         .layer(DefaultBodyLimit::max(PROTOCOL_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
@@ -313,6 +330,17 @@ async fn handle_native_lease_expiry(
         HeaderValue::from_static("no-store"),
     );
     Ok((headers, Json(status)))
+}
+
+async fn handle_server_time(
+    State(processor): State<AppState>,
+) -> (HeaderMap, Json<crate::processor::ServerTimeResponse>) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    (headers, Json(processor.server_time()))
 }
 
 async fn handle_native_billing_quote(

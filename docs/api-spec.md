@@ -9,6 +9,7 @@ Inference runs directly against the issued provider key.
 | GET | `/v1/attestation` | Public signing keys and protocol pins |
 | GET | `/v2/auth` | Validate the configured Sepolia shared password without side effects |
 | GET | `/v2/billing/quote` | Pinned finalized native ETH billing quote |
+| GET | `/v2/time` | Non-cacheable server clock for new `request_time` values (additive) |
 | POST | `/v2/openrouter/leases` | Verify proof and reserve a bounded runtime key |
 | GET | `/v2/openrouter/leases/{client_request_id}` | Non-secret lease status |
 | POST | `/v2/openrouter/leases/{client_request_id}` | Retire and settle the exact lease |
@@ -29,6 +30,42 @@ The authorization payload includes mode/version and its frozen `billing_quote`.
 The server recomputes payload/request binding, validates the native quote and
 verifies the proof. Proof bytes contain eight canonical 32-byte coordinates
 (256 bytes total). Public inputs, proof coordinates and circuit ID are unchanged.
+
+## Server time (`GET /v2/time`)
+
+An additive, read-only, state-free endpoint. It reads no request, wallet or
+nullifier state, creates none and returns no identifiers:
+
+```json
+{"server_time_ms":1793966400000,"protocol_version":2,"chain_id":1,
+ "max_request_age_seconds":300,"max_future_skew_seconds":30}
+```
+
+Responses carry `Cache-Control: no-store`; GET/HEAD only (other methods 405).
+Ungated deployments add the same simple `Access-Control-Allow-Origin: *`
+GET/HEAD policy as `/health`; a Sepolia password gate keeps it behind the
+password and its single outer CORS policy. Admission is unchanged: the server
+still accepts `request_time` in `[server_now - 300 s, server_now + 30 s]` on its
+own clock. Existing request and proof formats, routes, bodies and admission
+bounds are unchanged; old clients are unaffected. One additive recovery
+semantic: `/expire` also acknowledges an exact, unreserved request as
+`expired_unaccepted` once its `request_time` is past the age window (see
+[native ETH billing](native-eth-billing.md)). A future `request_time` alone
+never does.
+
+New SDKs anchor a sample to the monotonic clock as a lower bound (the response
+time is assumed to be its arrival time), reject samples slower than 5 s or that
+straddle a wall/monotonic discontinuity, resample after 30 s for new request
+timestamps and after a detected wall/monotonic discontinuity (an OS suspend or a clock change larger than the 2-second tolerance), and keep samples in
+memory per deployment only. Only HTTP 404/405 (an older server) selects the
+legacy device clock; 401/403, 5xx, malformed JSON, a different `chain_id` and
+transport failures never downgrade. Browser-clock protection therefore requires
+this endpoint. Roll out the server first, then clients.
+
+Exact `/expire` handshakes and signed-receipt installation never need this
+endpoint: they validate saved quotes structurally and rely on the server
+acknowledgement or signed receipt. Re-admitting an issued key after an
+interrupted operation still requires a bounded clock check before use.
 
 The runtime key is returned once. Retry/recovery must preserve the exact saved
 request and journal, including quote and proof. A native gwei solvency bound is

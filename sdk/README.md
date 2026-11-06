@@ -292,7 +292,23 @@ is superseded before acceptance can be discarded only after the read-only
 request expired or was superseded without acceptance under the server’s
 issuance lock. The response must match the saved request ID, nullifier, and
 payload hash. Local wall-clock expiry, a changed market price, or a missing
-nullifier alone never clears a proof. Wallet balances continue to display their
+nullifier alone never clears a proof.
+
+New request timestamps, new-quote freshness, issued-lease validity, active-key
+reuse and checkout use the deployment's `GET /v2/time` clock
+(`services/zkapiServerClock.mjs`), never a global `Date.now` override.
+`nowMs()` is authoritative and resamples a suspect, aged or discontinuous
+anchor; `authorizationNowMs()` is the strict synchronous check and fails closed
+(`Infinity`) after a detected wall/monotonic discontinuity (an OS suspend or a clock change larger than the 2-second tolerance); `estimateMs()` serves only
+display and settlement timers. The prover is preloaded before `request_time` is
+chosen. After asynchronous verification the lease is rechecked against a fresh
+sample before installation; failure keeps the exact journal and starts no
+second authorization. Only 404/405 selects the legacy device clock. A
+`request_time` freshness rejection asks `/expire`; only an exactly bound
+server acknowledgement (`expired_unaccepted` or `superseded_unaccepted`)
+clears the journal. The exact `/expire` handshake
+and signed-receipt installation check the saved quote structurally only and
+never query `/v2/time`; they work with a failed endpoint and any device clock. Wallet balances continue to display their
 current USD value independently of a running key's frozen conversion.
 
 ## Default deployments
